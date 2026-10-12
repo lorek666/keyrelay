@@ -114,10 +114,16 @@ impl<T: HttpTransport> NewApi<T> {
                 Some(Value::Bool(flag)) => *flag,
                 // 端点存在、返回了 JSON 信封，却没有 `enabled` 字段 → 无法判定，fail-closed。
                 // 与 `enabled: null` 同策略：把「读不懂」和「明确关闭」区分开（复核 N-2）。
-                None => return Err(Error::Transport(
-                    "登录加密探测响应缺少 enabled 字段；无法确认站点是否要求加密登录，拒绝退回明文"
-                        .to_string(),
-                )),
+                //
+                // 站点常见的失败信封是 `{"success":false,"message":"Database error…"}`（HTTP 200）。
+                // 方向（拒绝退回明文）是对的，但**必须把站点原文带出来**，否则用户无法排障（复核 P2）。
+                None => {
+                    let site_message = json_str(&value, "/message").unwrap_or("(无 message)");
+                    return Err(Error::Transport(format!(
+                        "登录加密探测响应缺少 enabled 字段，无法确认站点是否要求加密登录；站点返回: {}",
+                        crate::redact::scrub(site_message)
+                    )));
+                }
                 Some(other) => {
                     return Err(Error::Transport(format!(
                         "登录加密探测响应异常：enabled 字段类型不可识别（{}）",
@@ -209,9 +215,13 @@ fn numeric_id(key: &KeyMeta) -> i64 {
 /// 复核 N-4：`id` 是站点响应里的字符串，直接拼进路径可被构造成跨端点请求——
 /// 实测 `id = "../user/self"` 会真的发出 `POST /api/user/self/key`（带会话 Cookie）。
 /// 因此只接受单段安全字符，其余一律拒绝，不做「转义后照发」。
+///
+/// `"."` / `".."` 单独排除：`.` 虽然不含 `..`，但会被 URL 归一化抹掉，
+/// 实测 `id = "."` 会退化成 `POST /api/token/key`（打到另一个资源，复核 P2）。
 fn safe_path_segment(id: &str) -> Result<&str> {
     let ok = !id.is_empty()
         && id.len() <= 128
+        && id != "."
         && !id.contains("..")
         && id
             .bytes()
@@ -379,9 +389,10 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
         let mut collected: Vec<KeyMeta> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut page: u32 = 1;
-        // 每页 100、最多 10 页（1000 把令牌）：防止对异常站点无限翻页（复审 P2-2）。
+        // 每页请求 100 条；页数上限纯粹是「跑飞保护」，不承担「取全」的判断
+        // —— 取全一律以站点声明的 `total` 为准（见下）。
         const PAGE_SIZE: u32 = 100;
-        const MAX_PAGES: u32 = 10;
+        const MAX_PAGES: u32 = 100;
 
         loop {
             let url = format!("{base}/api/token/?p={page}&page_size={PAGE_SIZE}");
@@ -402,33 +413,61 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
             let total = value.pointer("/data/total").and_then(|v| v.as_i64());
             let page_len = items.len();
 
+            let parsed: Vec<KeyMeta> = items.iter().filter_map(parse_key_meta).collect();
+            // 有条目却一条都解析不出 id：这是解析异常，不是「站点忽略分页」。
+            // 若在这里当成「翻到底了」收工，会静默丢掉后面的页（第二轮复核 N-3 回归）。
+            if page_len > 0 && parsed.is_empty() {
+                return Err(Error::Transport(format!(
+                    "站点返回的第 {page} 页有 {page_len} 条令牌，但都缺少可用的 id，无法安全分页"
+                )));
+            }
+
             let mut added = 0usize;
-            for meta in items.iter().filter_map(parse_key_meta) {
+            for meta in parsed {
                 if seen.insert(meta.remote_id.clone()) {
                     collected.push(meta);
                     added += 1;
                 }
             }
 
-            // 终止条件一：本页未满 → 已是最后一页。
-            if (page_len as u32) < PAGE_SIZE {
-                return Ok(collected);
+            // 终止条件一（**权威**）：站点声明了总数，且已取够。
+            //
+            // 不能用「本页不满 PAGE_SIZE 即收工」——那等于假设站点按我们请求的
+            // 每页条数返回。真实站点可能忽略 `page_size`（旧版读的是别的参数名，
+            // 默认每页 10 条），于是「首页只有 10 条」会被误判成「只有 10 条令牌」，
+            // 静默交付截断列表，并让 create_key 在令牌其实已创建时误报 NotFound
+            // （第二轮复核 P1）。
+            if let Some(total) = total {
+                if (collected.len() as i64) >= total {
+                    return Ok(collected);
+                }
             }
-            // 终止条件二：本页没有新增 id → 站点忽略分页参数（或无 total），再翻也是重复。
+
+            if page_len == 0 {
+                return match total {
+                    // 声明还有更多，却给了空页：矛盾，不能假装取全了。
+                    Some(total) => Err(Error::Transport(format!(
+                        "站点声明共有 {total} 条令牌，但第 {page} 页返回空列表，无法确认列表完整性"
+                    ))),
+                    // 没有 total 且本页为空 → 确实没有更多（含「一把令牌都没有」）。
+                    None => Ok(collected),
+                };
+            }
+
+            // 终止条件二：本页全是重复 id → 站点忽略了分页参数，再翻也是同一页。
             if added == 0 {
                 return Ok(collected);
             }
+
+            // 终止条件三：跑飞保护。宁可显式报错，也不交付被截断的列表。
             if page >= MAX_PAGES {
-                // 命中页数上限且「可能还有更多」：宁可显式报错，也不交付被截断的列表——
-                // 截断会让 create_key 在令牌其实已创建时误报 NotFound，诱导用户重复建键（复核 N-3）。
-                let possibly_more = total.map(|t| (collected.len() as i64) < t).unwrap_or(true);
-                if possibly_more {
-                    return Err(Error::Transport(format!(
-                        "站点令牌数量超过列举上限（{} 条），无法确认完整列表；请先在站点端清理后重试",
-                        MAX_PAGES * PAGE_SIZE
-                    )));
-                }
-                return Ok(collected);
+                return Err(Error::Transport(format!(
+                    "已翻 {MAX_PAGES} 页仍未取全（已取 {} 条{}）；为避免交付不完整列表已中止，请先在站点端清理",
+                    collected.len(),
+                    total
+                        .map(|t| format!("，站点声明共 {t} 条"))
+                        .unwrap_or_default()
+                )));
             }
             page += 1;
         }
