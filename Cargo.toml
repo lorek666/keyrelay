@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/keyrelay-core", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.77"
+
+[workspace.dependencies]
+keyrelay-core = { path = "crates/keyrelay-core" }

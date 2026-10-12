@@ -1,0 +1,24 @@
+[package]
+name = "keyrelay"
+description = "KeyRelay 桌面壳（Tauri 2）：只做命令与平台胶水，业务逻辑在 keyrelay-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "keyrelay_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "keyrelay"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+keyrelay-core = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
