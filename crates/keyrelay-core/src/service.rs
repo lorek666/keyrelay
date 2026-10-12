@@ -748,6 +748,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         }
     }
 
+    /// 底层存储的只读借用（诊断与测试用；业务逻辑请走本层的具名方法）。
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
     /// 本地已存的密钥（**不含密钥本体**）。UI 的「密钥」页用这个，而不是站点侧列表——
     /// 因为投递需要的是**本地 key_id**，站点返回的 `remote_id` 不能当本地主键用。
     pub fn stored_keys(&self) -> Result<Vec<crate::store::KeyRow>> {

@@ -1,11 +1,14 @@
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, KeyRound, Server, ShieldCheck } from "lucide-react";
+import { useMutation } from "@tanstack/react-query";
 import {
   appInfo,
+  driftReport,
   listConsents,
   listSites,
   listStoredKeys,
   recentEvents,
+  refreshAll,
   runtimeMode,
 } from "../lib/api";
 
@@ -15,6 +18,20 @@ export default function Overview() {
   const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
   const consents = useQuery({ queryKey: ["consents"], queryFn: listConsents });
   const events = useQuery({ queryKey: ["events"], queryFn: () => recentEvents(20) });
+  const drift = useQuery({ queryKey: ["drift"], queryFn: driftReport });
+
+  const refresh = useMutation({
+    mutationFn: refreshAll,
+    onSuccess: async () => {
+      await events.refetch();
+      await sites.refetch();
+      await keys.refetch();
+    },
+  });
+
+  const drifted = (drift.data ?? []).filter(
+    (r) => r.state === "modified" || r.state === "missing",
+  );
 
   const warnings = (events.data ?? []).filter(
     (e) => e.level === "warn" || e.level === "error",
@@ -43,6 +60,11 @@ export default function Overview() {
           label="告警事件"
           value={warnings.length}
         />
+        <Stat
+          icon={<ShieldCheck size={16} aria-hidden />}
+          label="配置漂移"
+          value={drifted.length}
+        />
       </div>
 
       <div className="card">
@@ -64,6 +86,24 @@ export default function Overview() {
           <dd className="mono">{info.data?.vaultBackend ?? "…"}</dd>
         </dl>
 
+        <button
+          type="button"
+          className="btn"
+          disabled={refresh.isPending}
+          onClick={() => refresh.mutate()}
+        >
+          {refresh.isPending ? "刷新中…" : "立即刷新全部站点"}
+        </button>
+        {refresh.data ? (
+          <p className="muted">
+            成功 {refresh.data.sitesOk} / 失败 {refresh.data.sitesFailed} /
+            密钥 {refresh.data.keysTotal}
+            {refresh.data.balanceAlerts.length
+              ? ` / 余额告警 ${refresh.data.balanceAlerts.length} 个站点`
+              : ""}
+          </p>
+        ) : null}
+
         {info.data?.vaultBackend === "memory" ? (
           <p className="error" role="alert">
             <AlertTriangle size={14} aria-hidden /> 当前用的是内存钥匙串：
@@ -78,6 +118,29 @@ export default function Overview() {
           </p>
         ) : null}
       </div>
+
+      {drifted.length ? (
+        <div className="card">
+          <h3>
+            <AlertTriangle size={15} aria-hidden /> 投递目标已被外部改动（{drifted.length}）
+          </h3>
+          <ul className="list">
+            {drifted.map((r) => (
+              <li key={r.targetPath}>
+                <span className="badge badge-warn">{r.state}</span>{" "}
+                <span className="mono">{r.agentId}</span>{" "}
+                <span className="mono ellipsis" title={r.targetPath}>
+                  {r.targetPath}
+                </span>
+              </li>
+            ))}
+          </ul>
+          <p className="muted">
+            KeyRelay 不会自动覆盖外部改动。要恢复请到「Agent 投递」页重新投递，
+            或到「变更历史」页回滚。
+          </p>
+        </div>
+      ) : null}
 
       {warnings.length ? (
         <div className="card">
