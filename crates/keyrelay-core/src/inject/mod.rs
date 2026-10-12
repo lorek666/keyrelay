@@ -195,8 +195,21 @@ fn write_atomic(
 ) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| Error::inject(path, "路径没有父目录"))?;
+        .ok_or_else(|| Error::inject(path, "没有父目录"))?;
     fs::create_dir_all(parent).map_err(|e| Error::inject(parent, format!("创建目录失败: {e}")))?;
+
+    // 目标是符号链接时**拒绝写入**：`rename` 会把符号链接换成普通文件，
+    // 用户精心搭的软链（例如 `~/.codex` 指向另一块盘）就被静默拆掉了，
+    // 而且回滚也还原不了那层链接（备份复制的是**被指向文件**的内容）。
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(Error::inject(
+                path,
+                "目标是符号链接；写入会把它替换成普通文件，且回滚无法还原链接。\
+                 请手工改成普通文件，或直接对链接指向的真实路径操作",
+            ));
+        }
+    }
 
     let file_name = path
         .file_name()
@@ -210,14 +223,20 @@ fn write_atomic(
     // 并加 `create_new` 防止跟随已存在的符号链接。
     #[cfg(unix)]
     let write_result = {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mode = resolve_mode(path, new_file_mode, mode_from);
         fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(mode)
             .open(&tmp)
-            .and_then(|mut file| std::io::Write::write_all(&mut file, contents.as_bytes()))
+            .and_then(|mut file| {
+                // `OpenOptions::mode` 会被 **umask 剥位**（0664 在 umask 022 下变成 0644、
+                // 0777 变成 0755），因此必须再 `fchmod` 一次把请求的权限位钉死。
+                // `File::set_permissions` 走的是 fd，不受 umask 影响。
+                file.set_permissions(fs::Permissions::from_mode(mode))?;
+                std::io::Write::write_all(&mut file, contents.as_bytes())
+            })
     };
 
     #[cfg(not(unix))]
@@ -931,6 +950,59 @@ mod tests {
         assert!(matches!(err, Error::FileBusy(_)), "{err:?}");
         assert_eq!(fs::read_to_string(&target).unwrap(), "v0");
         drop(held);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn requested_mode_is_not_masked_by_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // 回归：`OpenOptions::mode(0o664)` 在 umask 022 下会变成 0644。
+        // 现在创建后再 `fchmod` 一次，请求什么就是什么。
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        fs::write(&target, "{}").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o664)).unwrap();
+
+        let patch = Patch::secret_bearing(&target, "{}", r#"{"k":"v"}"#);
+        let journal = apply(&[patch], &dir.path().join("backups")).unwrap();
+
+        // 含密钥的文件会被收紧到 0600（`clamp_secret_mode`）
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        rollback(&journal).unwrap();
+        // 回滚必须还原成**原始**的 0664，而不是被 umask 剥成 0644
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o664,
+            "回滚必须还原原始权限位（0664），不能被 umask 剥成 0644"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_write_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        fs::write(&real, "{}").unwrap();
+        let link = dir.path().join("link.json");
+        symlink(&real, &link).unwrap();
+
+        let patch = Patch::secret_bearing(&link, "{}", r#"{"k":"v"}"#);
+        let err = apply(&[patch], &dir.path().join("backups")).unwrap_err();
+        assert!(matches!(err, Error::Inject { .. }), "{err:?}");
+        assert!(err.to_string().contains("符号链接"), "{err}");
+
+        // 链接还在、指向的文件一个字节没动
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&real).unwrap(), "{}");
     }
 
     #[test]

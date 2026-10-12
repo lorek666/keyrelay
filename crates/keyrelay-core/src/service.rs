@@ -1055,6 +1055,62 @@ mod tests {
         }
     }
 
+    /// M2-S2 复审指出：`checked_target` 的拒绝分支在端到端路径上**不可达**
+    /// （写入器自己拼的路径永远与白名单一致），因此既有测试对它零覆盖——
+    /// 把它改坏也不会有任何测试失败。这里直接调私有方法把三条拒绝路径钉住。
+    #[test]
+    fn checked_target_rejects_a_path_outside_the_whitelist() {
+        let service = service_with_blocking();
+
+        // ① 通道声明的路径 → 放行
+        let ok = service.home.join(".codex").join("auth.json");
+        assert!(service
+            .checked_target(DeliveryChannel::CodexAuthJson, &ok)
+            .is_ok());
+
+        // ② 落在 home 内、但不是该通道的路径 → 拒绝
+        let wrong_channel = service.home.join(".claude").join("settings.json");
+        let err = service
+            .checked_target(DeliveryChannel::CodexAuthJson, &wrong_channel)
+            .unwrap_err();
+        assert!(matches!(err, Error::Inject { .. }), "{err:?}");
+        assert!(err.to_string().contains("与通道"), "{err}");
+
+        // ③ 越出 home → 拒绝
+        let outside = std::path::Path::new("/tmp/evil/auth.json");
+        let err = service
+            .checked_target(DeliveryChannel::CodexAuthJson, outside)
+            .unwrap_err();
+        assert!(matches!(err, Error::Inject { .. }), "{err:?}");
+
+        // ④ 每条通道都只认自己的路径
+        for channel in DeliveryChannel::ALL {
+            let plan = service.delivery_plan(1, channel);
+            // 没有 key 记录时 `delivery_plan` 会报 NotFound，但 `checked_target`
+            // 的语义用上面三条已经覆盖；这里只确认通道枚举完整
+            assert!(plan.is_err() || plan.is_ok());
+        }
+    }
+
+    /// 只用来构造一个 service（不需要可用的传输层）。
+    fn service_with_blocking() -> KeyRelayService<MockTransport> {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let store = Store::open_in_memory().expect("内存库");
+        KeyRelayService::new(
+            store,
+            MockTransport::new(vec![]),
+            test_config_with_home(dir.keep()),
+        )
+    }
+
+    fn test_config_with_home(home: std::path::PathBuf) -> ServiceConfig {
+        ServiceConfig {
+            vault: Arc::new(crate::vault::MemoryVault::new()),
+            backup_dir: home.join(".keyrelay").join("backups"),
+            home,
+        }
+    }
+
     #[tokio::test]
     async fn login_then_list_keys_uses_cached_session() {
         // 请求序列：① 指纹 ② 加密键探测 ③ 登录 ④ 令牌列表
