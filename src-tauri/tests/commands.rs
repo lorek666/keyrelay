@@ -447,8 +447,39 @@ fn gateway_stop_is_idempotent() {
 }
 
 #[test]
+fn gateway_start_is_refused_while_the_master_switch_is_off() {
+    // M4-S2 复审 P2-8：以前只有 UI 把按钮置灰，直接调 IPC 就能把端口打开。
+    // 默认 `gateway_enabled = false`，所以这条走的是全新实例。
+    let err = invoke_impl("gateway_start", json!({"args": {"siteId": 1, "keyId": 1}}))
+        .expect_err("总开关关着时不许启动网关");
+    assert_not_acl_rejection("gateway_start", &err);
+    let message = err.as_str().unwrap_or_default();
+    assert!(message.contains("总开关"), "{message}");
+    assert!(
+        message.contains("设置"),
+        "错误里要告诉用户去哪儿打开: {message}"
+    );
+}
+
+#[test]
 fn gateway_start_on_an_unknown_key_reports_a_business_error() {
-    let err = invoke_impl(
+    // 先打开总开关，否则会先撞上 P2-8 那道门，测不到「未知密钥」这条业务错误
+    let (_app, webview) = build_app();
+    invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": {
+            "refreshIntervalSecs": 0,
+            "balanceAlertThreshold": 0.0,
+            "driftCheckOnStart": true,
+            "gatewayEnabled": true,
+            "gatewayPort": 8787
+        }}}),
+    )
+    .expect("打开网关总开关");
+
+    let err = invoke_on(
+        &webview,
         "gateway_start",
         json!({"args": {"siteId": 999, "keyId": 999}}),
     )

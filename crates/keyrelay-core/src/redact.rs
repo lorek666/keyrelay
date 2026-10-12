@@ -83,7 +83,7 @@ pub fn contains_secret(input: &str) -> bool {
 /// 它们恰好是 64 位 hex，会被 [`contains_secret`] 的「≥32 位 hex」规则误报。
 /// 审计若天天报假警，就等于没有审计。
 ///
-/// **代价（明确记录）**：一条恰好 64 位的十六进制凭证不会被审计发现。
+/// **代价（明确记录，复审 P2-1 已补全）**：一条恰好 64 位的十六进制凭证不会被审计发现。
 /// 本产品支持的两类中转站（NewAPI / Sub2API）签发的密钥都是 `sk-` 前缀，
 /// 不是裸 hex，因此这个代价可接受。事件表那条守护仍然用严格的
 /// [`contains_secret`]（那里不该出现哈希）。
@@ -98,10 +98,23 @@ pub fn contains_secret_outside_hashes(input: &str) -> bool {
 /// 后者会拼成 65/66 位的 run，任何基于长度的规则都会误报
 /// （M4-S1 实测：`journals.after_sha256` 紧邻下一列的 serial-type 字节，run 变成 65/66）。
 ///
-/// **代价**：一条裸 hex 的凭证写在二进制文件里不会被发现。
-/// 本产品支持的两类中转站（NewAPI / Sub2API）签发的密钥都是 `sk-` 前缀，
-/// 因此这个代价可接受；**文本**产物（备份、导出）仍然用完整的
+/// # 已知漏报清单（复审 P2-1 实测，**不是**只有「64 位 hex」一种）
+///
+/// 用这个变体时，下面这些形态**全部**不会被发现：
+///
+/// | 形态 | 例 |
+/// |------|-----|
+/// | **任意长度**的裸 hex | 32 / 33 / 64 / 65 / 128 位，**整条 hex 规则都被关掉** |
+/// | 前缀后不足 8 个字符 | `sk-` 或 `Bearer ` 后只有 3 / 7 个字符 |
+/// | 前缀被 NUL 打断 | `sk-\0<8 字符>`（UTF-16 形态） |
+///
+/// 前两行同样适用于 [`contains_secret`]（严格变体）：**事件表守护也会漏**「前缀 + 不足
+/// 8 字符」这一种。本产品支持的两类中转站（NewAPI / Sub2API）签发的密钥都是
+/// `sk-` 加长随机串，因此这个代价可接受；**文本**产物（备份、导出）仍然用完整的
 /// [`contains_secret_outside_hashes`]。
+///
+/// 边界由 `tests` 模块里的 `binary_variant_leak_list_is_pinned` 钉住——
+/// 改阈值或改规则时那条测试会红，逼着人回来更新这份清单。
 pub fn contains_secret_prefix_only(input: &str) -> bool {
     scrub_prefixes_only(input) != input
 }
@@ -339,6 +352,45 @@ mod tests {
         assert!(contains_secret_prefix_only("sk-abcdefgh12345678"));
         assert!(contains_secret_prefix_only("Bearer eyJhbGciOiJ"));
         assert!(!contains_secret_prefix_only("普通文本 12.5 USD"));
+    }
+
+    /// 把「已知漏报」钉死（复审 P2-1）。
+    ///
+    /// 这条测试**断言的是漏报**，看起来像写反了——它是在给代价记账：
+    /// 哪天有人改了阈值或规则，这里会红，逼着人回来同步
+    /// [`contains_secret_prefix_only`] 的文档清单，而不是让代价悄悄变化。
+    #[test]
+    fn binary_variant_leak_list_is_pinned() {
+        // ① 整条 hex 规则被关掉：**任意长度**的裸 hex 都漏
+        for len in [32usize, 33, 64, 65, 128] {
+            let hex = "a".repeat(len);
+            assert!(
+                !contains_secret_prefix_only(&hex),
+                "{len} 位裸 hex 在二进制变体里应漏报（已知代价）"
+            );
+            assert!(contains_secret(&hex), "{len} 位裸 hex 在严格变体里必须被抓");
+        }
+
+        // ② 前缀后不足 8 个字符：三个变体全漏（含事件表守护用的严格变体）
+        for short in ["sk-abc", "sk-abcdefg", "Bearer abc", "Bearer abcdefg"] {
+            assert!(
+                !contains_secret_prefix_only(short),
+                "「{short}」不足 8 字符，二进制变体应漏报"
+            );
+            assert!(
+                !contains_secret_outside_hashes(short),
+                "「{short}」不足 8 字符，审计变体应漏报"
+            );
+            assert!(
+                !contains_secret(short),
+                "「{short}」不足 8 字符，严格变体也应漏报 —— 事件表守护同样盖不住这种形态"
+            );
+        }
+
+        // ③ 边界另一侧：正好 8 个字符就必须抓到，否则阈值漂了没人知道
+        assert!(contains_secret_prefix_only("sk-abcdefgh"));
+        assert!(contains_secret_prefix_only("Bearer abcdefgh"));
+        assert!(contains_secret("sk-abcdefgh"));
     }
 
     #[test]

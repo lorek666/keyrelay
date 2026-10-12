@@ -91,6 +91,17 @@ fn spawn_fake_upstream() -> FakeUpstream {
                     r#"{"error":"slow down"}"#,
                     &[],
                 );
+            } else if first_line.contains("/v1/stream") {
+                // 先发第一个分片，**停 1.5 秒**，再发第二个。
+                // 整段缓冲的实现会让客户端在 1.5 秒后才见到第一个字节。
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                            Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(b"6\r\nfirst\n\r\n");
+                let _ = stream.flush();
+                thread::sleep(std::time::Duration::from_millis(1500));
+                let _ = stream.write_all(b"7\r\nsecond\n\r\n0\r\n\r\n");
+                let _ = stream.flush();
             } else {
                 respond(&mut stream, "404 Not Found", r#"{"error":"no route"}"#, &[]);
             }
@@ -127,6 +138,71 @@ fn http_request(url: &str, token: Option<&str>, path: &str, method: &str) -> (u1
         .unwrap_or(0);
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
     (status, head.to_string(), body.to_string())
+}
+
+/// 与 [`http_request`] 相同，但可以带任意额外请求头（用来验证「本地令牌不管放在
+/// 哪个头里都不会被转发出去」）。
+fn http_request_with_headers(
+    url: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+) -> (u16, String, String) {
+    let without_scheme = url.trim_start_matches("http://");
+    let mut stream = TcpStream::connect(without_scheme).expect("连接网关");
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {without_scheme}\r\n");
+    for (name, value) in extra {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).expect("发送请求");
+    stream.flush().ok();
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).expect("读响应");
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    (status, head.to_string(), body.to_string())
+}
+
+/// 读到「响应头之后的第一批 body 字节」就返回——用来证明网关**没有**把整段响应缓冲下来。
+/// 整段缓冲的实现会在上游吐完（本例 1.5 秒）之后才有第一批字节。
+fn read_first_body_bytes(url: &str, token: &str, path: &str) -> String {
+    let without_scheme = url.trim_start_matches("http://");
+    let mut stream = TcpStream::connect(without_scheme).expect("连接网关");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {without_scheme}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).expect("发送请求");
+    stream.flush().ok();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok();
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    if text.len() > head_end + 4 {
+                        return text[head_end + 4..].to_string();
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    String::new()
 }
 
 async fn start_gateway(upstream: &FakeUpstream) -> (keyrelay_core::gateway::GatewayHandle, String) {
@@ -242,6 +318,126 @@ async fn authorized_requests_forward_with_the_site_key_not_the_local_token() {
     assert!(
         !head.to_ascii_lowercase().contains("set-cookie"),
         "Set-Cookie 不该回传给调用方: {head}"
+    );
+
+    handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn traversal_paths_are_refused_and_never_reach_the_upstream() {
+    // M4-S2 复审 P1-1 的回归：这些形态在旧实现里会被 `url` 规整成 `/admin` 转发出去
+    let upstream = spawn_fake_upstream();
+    let (handle, token) = start_gateway(&upstream).await;
+    let url = handle.local_url();
+
+    for path in [
+        "/v1/../../admin",
+        "/v1/a/../../admin",
+        "/v1/%2e%2e/admin",
+        "/v1/../..%2fadmin",
+    ] {
+        let (status, _, body) = tokio::task::spawn_blocking({
+            let url = url.clone();
+            let token = token.clone();
+            let path = path.to_string();
+            move || http_request(&url, Some(&token), &path, "GET")
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, 400, "「{path}」必须被拒: {body}");
+    }
+
+    assert_eq!(
+        upstream.seen.lock().unwrap().len(),
+        0,
+        "被拒的路径一个字节都不该打到上游"
+    );
+
+    // 对照：正常路径照旧放行（否则「全拒」也能让上面通过）
+    let (status, _, _) = tokio::task::spawn_blocking({
+        let url = url.clone();
+        let token = token.clone();
+        move || http_request(&url, Some(&token), "/v1/chat/completions", "POST")
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(upstream.seen.lock().unwrap().len(), 1);
+
+    handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_response_is_forwarded_as_a_stream_not_buffered() {
+    // M4-S2 复审 P1-2 的回归：假上游先发 `first`、停 1.5 秒、再发 `second`。
+    // 整段缓冲的实现要等 1.5 秒才让客户端见到第一个字节。
+    let upstream = spawn_fake_upstream();
+    let (handle, token) = start_gateway(&upstream).await;
+    let url = handle.local_url();
+
+    let started = std::time::Instant::now();
+    let first = tokio::task::spawn_blocking({
+        let url = url.clone();
+        let token = token.clone();
+        move || read_first_body_bytes(&url, &token, "/v1/stream")
+    })
+    .await
+    .unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(first.contains("first"), "应读到第一个分片: {first:?}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(1000),
+        "第一个分片应远早于上游那 1.5 秒的停顿到达（实测 {elapsed:?}）——\
+         超过就说明响应被整段缓冲了"
+    );
+
+    handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_local_token_never_reaches_the_upstream_in_any_header() {
+    // 复审 P2-2：本地令牌可能被调用方塞进**任意**头名里；
+    // 不管叫什么名字，只要值里带着本地令牌就不许转发。
+    let upstream = spawn_fake_upstream();
+    let (handle, token) = start_gateway(&upstream).await;
+    let url = handle.local_url();
+
+    let (status, _, _) = tokio::task::spawn_blocking({
+        let url = url.clone();
+        let token = token.clone();
+        move || {
+            http_request_with_headers(
+                &url,
+                "/v1/chat/completions",
+                &[
+                    ("Authorization", &format!("Bearer {token}")),
+                    ("X-Custom-Auth", &format!("token={token}")),
+                    ("Cookie", "session=local-cookie-value"),
+                    ("Proxy-Authorization", "Basic bG9jYWw6c2VjcmV0"),
+                ],
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, 200);
+
+    let seen = upstream.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    let raw = &seen[0];
+    assert!(!raw.contains(&token), "本地令牌从某个头里漏到了上游: {raw}");
+    assert!(
+        !raw.to_ascii_lowercase().contains("local-cookie-value"),
+        "Cookie 不该被转发: {raw}"
+    );
+    assert!(
+        !raw.to_ascii_lowercase().contains("proxy-authorization"),
+        "Proxy-Authorization 不该被转发: {raw}"
+    );
+    assert!(
+        raw.contains(&format!("Bearer {SITE_KEY}")),
+        "应换成站点密钥: {raw}"
     );
 
     handle.shutdown();

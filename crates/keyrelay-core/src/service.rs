@@ -955,6 +955,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         }
         paths.push(self.backup_dir.clone());
 
+        // 导出产物（M4-S2 复审 P2-11）：默认落在 `<app_data>/exports`，而 `backup_dir`
+        // 是 `<app_data>/backups`，所以同级的 `exports` 就是默认导出目录。
+        // 之前审计只扫 db + backups，导出物是审计盲区 —— 而「自我证明没有明文落盘」
+        // 恰恰是审计存在的理由。用户自选的导出路径不在我们知道的范围内（见 BACKLOG B-60）。
+        if let Some(app_data) = self.backup_dir.parent() {
+            paths.push(app_data.join("exports"));
+        }
+
         let mut report = audit::scan_paths(&paths);
 
         let event_hits = self.store.count_events_with_secrets()?;

@@ -30,8 +30,13 @@ export default function Overview() {
   });
 
   const drifted = (drift.data ?? []).filter(
-    (r) => r.state === "modified" || r.state === "missing",
+    (r) =>
+      r.state === "modified" ||
+      r.state === "missing" ||
+      // 文件存在但读不到：不是「被删了」，但同样要用户处理（复审 P2-4）
+      r.state === "unreadable",
   );
+  const hasUnreadable = drifted.some((r) => r.state === "unreadable");
 
   const warnings = (events.data ?? []).filter(
     (e) => e.level === "warn" || e.level === "error",
@@ -122,7 +127,7 @@ export default function Overview() {
       {drifted.length ? (
         <div className="card">
           <h3>
-            <AlertTriangle size={15} aria-hidden /> 投递目标已被外部改动（{drifted.length}）
+            <AlertTriangle size={15} aria-hidden /> 投递目标需要处理（{drifted.length}）
           </h3>
           <ul className="list">
             {drifted.map((r) => (
@@ -139,6 +144,13 @@ export default function Overview() {
             KeyRelay 不会自动覆盖外部改动。要恢复请到「Agent 投递」页重新投递，
             或到「变更历史」页回滚。
           </p>
+          {hasUnreadable ? (
+            <p className="muted">
+              标记为 <span className="mono">unreadable</span> 的目标
+              <strong>文件还在</strong>，只是读不到（权限或路径类型问题）。
+              这不是「被删了」——请先检查文件权限，不要直接重新投递。
+            </p>
+          ) : null}
         </div>
       ) : null}
 

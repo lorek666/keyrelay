@@ -154,6 +154,104 @@ fn audit_catches_plaintext_in_the_events_table() {
 }
 
 #[test]
+fn the_events_table_guard_scans_every_row_not_just_the_newest_ones() {
+    // 复审 P2-13：`count_events_with_secrets` 以前靠 `list_events(usize::MAX)`，
+    // 而 `usize::MAX as i64 == -1` 恰好被 SQLite 解释成「不限制」。
+    // 一旦给 `list_events` 加上限（`recent_events` 就有 `min(1000)`），
+    // 这条红线守护会静默只扫最近的若干条 —— 所以这里把明文塞进**最老**的一条，
+    // 后面再压上远超任何合理上限的干净事件。
+    let f = setup();
+    let store = Store::open(&f.db_path).unwrap();
+
+    let raw = keyrelay_core::observability::Event {
+        ts: 0,
+        level: keyrelay_core::observability::Level::Info,
+        source: "app".to_string(),
+        message: format!("最老的一条手工明文 {SECRET}"),
+        payload: None,
+    };
+    store.insert_event(&raw).unwrap();
+
+    for i in 0..1500 {
+        let clean = keyrelay_core::observability::Event {
+            ts: i,
+            level: keyrelay_core::observability::Level::Debug,
+            source: "app".to_string(),
+            message: format!("干净事件 {i}"),
+            payload: None,
+        };
+        store.insert_event(&clean).unwrap();
+    }
+
+    assert_eq!(
+        store.count_events_with_secrets().unwrap(),
+        1,
+        "最老那条明文必须仍然被扫到——被条数上限截断就说明守护在空跑"
+    );
+
+    // 端到端：审计报告同样要报出来
+    let report = f.service.audit_redaction().unwrap();
+    assert!(!report.is_clean(), "事件表里的明文必须被发现");
+}
+
+#[test]
+fn audit_covers_the_export_directory() {
+    // M4-S2 复审 P2-11：审计以前只扫 db/-wal/-shm + backups，导出产物是盲区。
+    // 这里两头都要断言：① 导出物**在扫描范围内**（files_scanned 有增量），
+    // ② 密文导出**不误报**、明文导出**必须被抓**。
+    // 只断言 ② 是不够的 —— 「没报」也可能只是「压根没扫」。
+    let f = setup();
+    let exports_dir = f.backup_dir.parent().unwrap().join("exports");
+    fs::create_dir_all(&exports_dir).unwrap();
+
+    let baseline = f.service.audit_redaction().unwrap();
+    assert!(baseline.is_clean(), "空导出目录不该影响结论");
+
+    // ① 加密导出：不误报，但确实被扫到了
+    let encrypted_path = exports_dir.join("encrypted.json");
+    let (_, encrypted, _) = f
+        .service
+        .export_to_file(&encrypted_path, Some("correct horse battery staple"))
+        .unwrap();
+    assert!(encrypted);
+
+    let with_export = f.service.audit_redaction().unwrap();
+    assert!(
+        with_export.is_clean(),
+        "加密导出物不该被误报成明文: {:?}",
+        with_export.findings
+    );
+    assert!(
+        with_export.files_scanned > baseline.files_scanned,
+        "导出产物必须真的进了扫描范围（基线 {} → 现在 {}）——没增量就是盲区还在",
+        baseline.files_scanned,
+        with_export.files_scanned
+    );
+
+    // ② 明文落进导出目录：必须被抓出来。
+    //    注意不能靠「明文导出物」来测 —— 导出**按设计**就不含密钥本体
+    //    （`plaintext_export_has_no_key_material` 钉着这条），所以这里手工塞一个。
+    let smuggled = exports_dir.join("smuggled.json");
+    fs::write(&smuggled, format!("{{\"leaked\":\"{SECRET}\"}}")).unwrap();
+
+    let dirty = f.service.audit_redaction().unwrap();
+    assert!(
+        !dirty.is_clean(),
+        "导出目录里的明文必须被审计抓出来: {:?}",
+        dirty.findings
+    );
+    assert!(
+        dirty.findings.iter().any(|finding| matches!(
+            finding,
+            keyrelay_core::audit::AuditFinding::PlaintextInFile { path, .. }
+                if path == &smuggled
+        )),
+        "发现项必须指向导出目录里那个文件: {:?}",
+        dirty.findings
+    );
+}
+
+#[test]
 fn audit_reports_do_not_leak_the_secret_themselves() {
     // 审计报告会被写进事件表与 UI——它自己不能成为泄漏通道
     let f = setup();

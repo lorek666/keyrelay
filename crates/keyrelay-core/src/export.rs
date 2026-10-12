@@ -19,6 +19,11 @@ pub const EXPORT_VERSION: u32 = 1;
 pub const ENCRYPTED_FORMAT: &str = "keyrelay-export-v1";
 /// PBKDF2 迭代次数（OWASP 对 PBKDF2-HMAC-SHA256 的 2023 年建议下限）。
 pub const PBKDF2_ITERATIONS: u32 = 210_000;
+/// 解密时允许的信封迭代次数下限：低于这个值说明信封来自「弱 KDF」，
+/// 我们不该假装它是合法的（M4-S2 复审 P2-4）。
+pub const MIN_KDF_ITERATIONS: u32 = 100_000;
+/// 解密时允许的上限：防「伪造信封 → App 卡死」的 DoS。
+pub const MAX_KDF_ITERATIONS: u32 = 1_000_000;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
@@ -169,6 +174,16 @@ pub fn decrypt(envelope_json: &str, password: &str) -> Result<ExportBundle> {
         return Err(Error::Store(format!(
             "不认识的密钥派生算法: {}",
             envelope.kdf.algorithm
+        )));
+    }
+    // 信封里的迭代次数是**不可信输入**（M4-S2 复审 P2-4）：
+    // 不设上限，一个伪造的 `iterations: 5_000_000` 就能让 App 卡上几十秒
+    // （复审实测 39.1s，线性外推到 u32::MAX 约 9 小时）；不设下限，
+    // 一个「1 轮 PBKDF2」的信封等于把离线爆破成本降到最低，我们却照收。
+    if !(MIN_KDF_ITERATIONS..=MAX_KDF_ITERATIONS).contains(&envelope.kdf.iterations) {
+        return Err(Error::Store(format!(
+            "加密信封里的 KDF 迭代次数 {} 不在允许范围 {}..={} 内，拒绝解密",
+            envelope.kdf.iterations, MIN_KDF_ITERATIONS, MAX_KDF_ITERATIONS
         )));
     }
 

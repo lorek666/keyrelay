@@ -885,51 +885,67 @@ mod tests {
         // 复审 P1-1 的回归：旧实现用 `fs::write`（umask 022 → 0644）建临时文件、
         // 写入密钥正文、**再** chmod 0600，留下一个「内容是密钥、权限 0644」的窗口。
         // 这里用一个观察线程在整个写入过程中轮询临时文件的权限位。
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("auth.json");
-        let stop = Arc::new(AtomicBool::new(false));
+        //
+        // 为什么带重试（复审 P2-12）：采样是竞态的——写入太快时观察线程可能**一个
+        // 样本都没采到**（实测 1/19 次），于是门禁在负载高时无缘无故变红。
+        // 单次采不到样本 ≠ 实现有问题，所以改成最多 `ATTEMPTS` 轮、累加所有样本：
+        // 只要**任意一轮**采到样本就足以判定；轮数多了之后「全都采不到」几乎不可能，
+        // 而「临时文件权限真的宽了」这种回归在每一轮都会被采到。
+        const ATTEMPTS: usize = 12;
+        let mut observed: Vec<u32> = Vec::new();
+        let mut last_target = None;
 
-        let watcher = {
-            let dir = dir.path().to_path_buf();
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                let mut observed: Vec<u32> = Vec::new();
-                while !stop.load(Ordering::Relaxed) {
-                    if let Ok(entries) = fs::read_dir(&dir) {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            if name.ends_with(".tmp") {
-                                if let Ok(meta) = entry.metadata() {
-                                    observed.push(meta.permissions().mode() & 0o777);
+        for _ in 0..ATTEMPTS {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("auth.json");
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let watcher = {
+                let dir = dir.path().to_path_buf();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut seen: Vec<u32> = Vec::new();
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Ok(entries) = fs::read_dir(&dir) {
+                            for entry in entries.flatten() {
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                if name.ends_with(".tmp") {
+                                    if let Ok(meta) = entry.metadata() {
+                                        seen.push(meta.permissions().mode() & 0o777);
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                observed
-            })
-        };
+                    seen
+                })
+            };
 
-        // 内容足够大，让写入过程持续可观测
-        let big = "x".repeat(16 * 1024 * 1024);
-        let patch = Patch::secret_bearing(&target, "", big.clone());
-        apply(&[patch], &dir.path().join("backups")).unwrap();
+            // 内容足够大，让写入过程持续可观测
+            let big = "x".repeat(16 * 1024 * 1024);
+            let patch = Patch::secret_bearing(&target, "", big.clone());
+            apply(&[patch], &dir.path().join("backups")).unwrap();
 
-        stop.store(true, Ordering::Relaxed);
-        let observed = watcher.join().expect("观察线程");
+            stop.store(true, Ordering::Relaxed);
+            observed.extend(watcher.join().expect("观察线程"));
+
+            // 终态每轮都要对：临时文件已改名成目标文件，权限必须是 0600
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            last_target = Some(target);
+        }
 
         assert!(
             !observed.is_empty(),
-            "观察线程一个样本都没采到 → 该门禁是空跑"
+            "连续 {ATTEMPTS} 轮、每轮 16 MiB 写入都没采到任何样本 → 该门禁是空跑"
         );
         assert!(
             observed.iter().all(|m| *m == 0o600),
             "临时文件出现过非 0600 的权限位: {observed:?}"
         );
-        assert_eq!(
-            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        assert!(last_target.is_some());
     }
 
     #[test]

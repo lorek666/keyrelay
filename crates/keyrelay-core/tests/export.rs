@@ -119,6 +119,68 @@ fn encrypted_export_round_trips_and_hides_metadata() {
     assert!(export::decrypt(&text, "wrong").is_err());
 }
 
+/// 把信封里的 `iterations` 换掉（其余字段原样），用来测 KDF 迭代次数的区间校验。
+fn with_iterations(envelope_json: &str, iterations: u32) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(envelope_json).unwrap();
+    value["kdf"]["iterations"] = serde_json::json!(iterations);
+    serde_json::to_string(&value).unwrap()
+}
+
+#[test]
+fn a_tampered_envelope_with_an_absurd_iteration_count_is_refused() {
+    // M4-S2 复审 P2-4：`decrypt` 完全信任信封里的 `iterations`。
+    // 不设上限 → 伪造信封让 App 卡死（复审实测 5_000_000 次 = 39.1s）；
+    // 不设下限 → 「1 轮 PBKDF2」的弱信封被照收。
+    let f = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.json");
+    let password = "correct horse battery staple";
+    f.service.export_to_file(&path, Some(password)).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+
+    // 对照组：区间内的值必须**过掉区间校验**、走到真正的解密那一步。
+    // 注意这里不能断言「解密成功」——改了 `iterations` 就改了派生密钥，
+    // 密文必然解不开。所以判据是「错误**不是**迭代次数那条」。
+    for in_range in [
+        export::MIN_KDF_ITERATIONS,
+        export::MAX_KDF_ITERATIONS,
+        150_000,
+    ] {
+        assert_ne!(
+            in_range,
+            export::PBKDF2_ITERATIONS,
+            "对照组不能撞上信封里的原值，否则会解密成功"
+        );
+        let err = export::decrypt(&with_iterations(&text, in_range), password)
+            .expect_err("改了迭代次数，密钥就不一样了，必然解不开");
+        assert!(
+            !err.to_string().contains("迭代次数"),
+            "iterations={in_range} 在允许区间内，不该被区间校验拦下: {err}"
+        );
+    }
+    // 前提检查：原封不动的信封能解开，否则上面那些「解不开」的判据都不成立
+    assert!(
+        export::decrypt(&text, password).is_ok(),
+        "原始信封必须能解开"
+    );
+
+    // 越界的值必须被**区间校验**当场拒绝，而不是先去算 KDF
+    for absurd in [0u32, 1, 1_000, 99_999, 1_000_001, 5_000_000, u32::MAX] {
+        let started = std::time::Instant::now();
+        let err = export::decrypt(&with_iterations(&text, absurd), password)
+            .expect_err(&format!("iterations={absurd} 必须被拒"));
+        let elapsed = started.elapsed();
+        assert!(
+            err.to_string().contains("迭代次数"),
+            "错误文案应点明是迭代次数的问题: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "iterations={absurd} 被拒得太慢（{elapsed:?}）——说明还是先算了 KDF 才判"
+        );
+    }
+}
+
 #[test]
 fn export_includes_consents_settings_and_events() {
     let f = setup();
@@ -155,9 +217,16 @@ fn prune_backups_keeps_the_newest_entries() {
     }
     // 再放一个不像 journal 的文件，确认不会被误删
     fs::write(f.backup_dir.join("README.txt"), "别删我").unwrap();
+    // **还要放一个不像 journal 的目录**（M4-S2 复审 P2-3）：只有文件的话，
+    // `path.is_dir()` 这一条天然挡住变异，`starts_with('j')` 这条防呆就零覆盖 ——
+    // 复审实测把 `j` 前缀判断删掉后，既有测试 9 passed 全部逃逸。
+    // 名字故意排在 `j` **之前**，这样「取前 N 个删掉」的实现会先删到它。
+    fs::create_dir_all(f.backup_dir.join("aaa-notes")).unwrap();
+    fs::write(f.backup_dir.join("aaa-notes/keep.md"), "用户自己的东西").unwrap();
+    fs::create_dir_all(f.backup_dir.join("J-uppercase")).unwrap();
 
     let removed = f.service.prune_backups(2).unwrap();
-    assert_eq!(removed, 3, "5 个留 2 个应删 3 个");
+    assert_eq!(removed, 3, "5 个留 2 个应删 3 个 —— 只能删 journal 目录");
 
     let left: Vec<String> = fs::read_dir(&f.backup_dir)
         .unwrap()
@@ -165,13 +234,30 @@ fn prune_backups_keeps_the_newest_entries() {
         .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
-    assert_eq!(left.len(), 2);
-    assert!(left.iter().all(|name| name.starts_with('j')));
+    assert_eq!(
+        left.len(),
+        4,
+        "2 个 journal + 2 个非 journal 目录: {left:?}"
+    );
+    assert_eq!(
+        left.iter().filter(|name| name.starts_with('j')).count(),
+        2,
+        "只该剩最新的 2 个 journal: {left:?}"
+    );
     // 最新的两个还在
     assert!(f.backup_dir.join("j00000000000000000003-0").exists());
     assert!(f.backup_dir.join("j00000000000000000004-0").exists());
     // 非 journal 文件没被动
     assert!(f.backup_dir.join("README.txt").exists());
+    // 非 journal **目录**也不能被动（含内容）
+    assert!(
+        f.backup_dir.join("aaa-notes/keep.md").exists(),
+        "非 journal 目录被误删了 —— `j` 前缀防呆失效"
+    );
+    assert!(
+        f.backup_dir.join("J-uppercase").exists(),
+        "大小写不同也不该删"
+    );
 }
 
 #[test]

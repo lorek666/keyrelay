@@ -118,7 +118,13 @@ export type EventRow = {
   payload?: string | null;
 };
 
-export type DriftState = "intact" | "modified" | "missing" | "unknown";
+export type DriftState =
+  | "intact"
+  | "modified"
+  | "missing"
+  // 文件**存在但读不到**（权限/路径类型）：与「被删了」不同，处理方式也不同
+  | "unreadable"
+  | "unknown";
 
 export type DriftReport = {
   targetPath: string;
