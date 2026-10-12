@@ -273,7 +273,12 @@ async fn list_keys_parses_paginated_shape() {
     assert_eq!(keys[1].status, KeyStatus::Disabled);
 
     let req = adapter.transport().nth_request(0).unwrap();
-    assert_eq!(req.url, "https://relay.example.com/api/token/");
+    assert!(
+        req.url.starts_with("https://relay.example.com/api/token/?"),
+        "列表请求应带分页参数: {}",
+        req.url
+    );
+    assert!(req.url.contains("page_size="), "实际: {}", req.url);
     assert_eq!(
         req.headers
             .iter()
@@ -316,7 +321,9 @@ async fn create_key_flow_is_create_then_list_then_reveal() {
     let requests = adapter.transport().requests();
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].url, "https://relay.example.com/api/token/");
-    assert_eq!(requests[1].url, "https://relay.example.com/api/token/");
+    assert!(requests[1]
+        .url
+        .starts_with("https://relay.example.com/api/token/?"));
     assert_eq!(
         requests[2].url,
         "https://relay.example.com/api/token/12/key"
@@ -428,4 +435,156 @@ async fn mock_queue_exhaustion_is_reported() {
     let adapter = NewApi::new(transport);
     let err = adapter.detect(BASE).await.unwrap_err();
     assert!(matches!(err, Error::Transport(_)));
+}
+
+// ---------- M1-S1 复审修复：fail-closed、定位、归一化、分页 ----------
+
+#[tokio::test]
+async fn encryption_enabled_without_public_key_fails_closed() {
+    // 复审 P1-1 ①：站点声明启用加密但载荷缺失 → 必须报错，绝不退回明文
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"enabled": true, "kid": "kid-1"}}),
+    )]);
+    let adapter = NewApi::new(transport);
+
+    let err = adapter
+        .login(BASE, Credentials::new("me", "hunter2"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Transport(_)), "实际: {err:?}");
+    assert_eq!(
+        adapter.transport().request_count(),
+        1,
+        "探测失败后不得再发登录请求"
+    );
+}
+
+#[tokio::test]
+async fn encryption_enabled_with_wrong_type_fails_closed() {
+    // 复审 P1-1 ②：enabled 非布尔（字符串 "true"）→ 报错
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"enabled": "true", "kid": "k", "public_key": "p"}}),
+    )]);
+    let adapter = NewApi::new(transport);
+
+    let err = adapter
+        .login(BASE, Credentials::new("me", "hunter2"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Transport(_)), "实际: {err:?}");
+}
+
+#[tokio::test]
+async fn encryption_probe_server_error_fails_closed() {
+    // 复审 P1-1 ③：探测端点 500 → 报错，不降级
+    let transport = MockTransport::new(vec![HttpResponse::new(500, b"boom".to_vec())]);
+    let adapter = NewApi::new(transport);
+
+    let err = adapter
+        .login(BASE, Credentials::new("me", "hunter2"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Transport(_)), "实际: {err:?}");
+    assert_eq!(adapter.transport().request_count(), 1);
+}
+
+#[tokio::test]
+async fn encryption_probe_rate_limited_fails_closed() {
+    // 复审 P1-1 ④：探测端点 429 → 报 RateLimited，不降级
+    let transport = MockTransport::new(vec![
+        HttpResponse::new(429, b"{}".to_vec()).with_header("Retry-After", "9")
+    ]);
+    let adapter = NewApi::new(transport);
+
+    let err = adapter
+        .login(BASE, Credentials::new("me", "hunter2"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        Error::RateLimited {
+            retry_after_secs: 9
+        }
+    );
+}
+
+#[tokio::test]
+async fn create_key_prefers_highest_id_when_timestamps_missing() {
+    // 复审 P2-1：同名令牌且列表无 created_time 时，必须取 id 最大者（最新），而不是末位元素
+    let transport = MockTransport::new(vec![
+        json_resp(200, json!({"success": true, "message": ""})),
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": [
+                {"id": 12, "name": "dup", "status": 1},
+                {"id": 11, "name": "dup", "status": 1}
+            ], "total": 2}}),
+        ),
+        json_resp(
+            200,
+            json!({"success": true, "data": {"key": "sk-newest12345678"}}),
+        ),
+    ]);
+    let adapter = NewApi::new(transport);
+
+    let material = adapter
+        .create_key(BASE, &session(), KeySpec::named("dup"))
+        .await
+        .unwrap();
+
+    assert_eq!(material.remote_id, "12", "必须定位到 id 最大的同名令牌");
+    assert_eq!(
+        adapter.transport().nth_request(2).unwrap().url,
+        "https://relay.example.com/api/token/12/key"
+    );
+}
+
+#[tokio::test]
+async fn inline_key_response_normalizes_string_id() {
+    // 复审 P2-3：data.id 为字符串时不得带引号
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"id": "99", "key": "sk-inline12345678"}}),
+    )]);
+    let adapter = NewApi::new(transport);
+
+    let material = adapter
+        .create_key(BASE, &session(), KeySpec::named("inline"))
+        .await
+        .unwrap();
+    assert_eq!(
+        material.remote_id, "99",
+        "不得出现引号: {:?}",
+        material.remote_id
+    );
+}
+
+#[tokio::test]
+async fn list_keys_follows_pagination() {
+    // 复审 P2-2：首页满页且 total 更大时必须继续翻页
+    let page1: Vec<serde_json::Value> = (1..=100)
+        .map(|i| json!({"id": i, "name": format!("bulk-{i}"), "status": 1}))
+        .collect();
+    let transport = MockTransport::new(vec![
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": page1, "total": 101}}),
+        ),
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": [{"id": 101, "name": "codex/daily", "status": 1}], "total": 101}}),
+        ),
+    ]);
+    let adapter = NewApi::new(transport);
+
+    let keys = adapter.list_keys(BASE, &session()).await.unwrap();
+    assert_eq!(keys.len(), 101);
+    assert!(keys.iter().any(|k| k.name == "codex/daily"));
+
+    let requests = adapter.transport().requests();
+    assert_eq!(requests.len(), 2, "应请求两页");
+    assert!(requests[0].url.contains("p=1"));
+    assert!(requests[1].url.contains("p=2"));
 }

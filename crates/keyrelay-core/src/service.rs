@@ -162,6 +162,15 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         err
     }
 
+    /// 删除站点记录，**同时清掉该 id 的会话缓存**。
+    ///
+    /// 复审 P2-6：SQLite rowid 会复用（删掉最大 id 后新站点可能拿到同一 id），
+    /// 若不联动清理，旧站点的会话会被套用到新站点上，造成跨站串号。
+    pub fn remove_site(&self, site_id: i64) -> Result<()> {
+        self.sessions.invalidate(site_id);
+        self.store.delete_site(site_id)
+    }
+
     fn site(&self, site_id: i64) -> Result<SiteRow> {
         self.store
             .get_site(site_id)?
@@ -272,7 +281,13 @@ mod tests {
 
         // 列表请求必须带登录拿到的 cookie
         let list_request = mock.nth_request(3).expect("第四个请求是列表");
-        assert_eq!(list_request.url, "https://relay.example.com/api/token/");
+        assert!(
+            list_request
+                .url
+                .starts_with("https://relay.example.com/api/token/?"),
+            "列表请求应带分页参数: {}",
+            list_request.url
+        );
         assert_eq!(
             list_request
                 .headers
@@ -315,6 +330,33 @@ mod tests {
         let service = service_with(vec![]).await;
         let err = service.list_keys(999).await.unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "实际: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn remove_site_also_clears_session_cache() {
+        // 复审 P2-6：删除站点必须联动清会话，否则 rowid 复用会造成跨站串号
+        let transport_responses = vec![
+            status_response(),
+            encryption_disabled_response(),
+            login_response(),
+        ];
+        let store = Store::open_in_memory().unwrap();
+        let service = KeyRelayService::new(store, MockTransport::new(transport_responses));
+
+        let site = service.add_site("https://relay.example.com").await.unwrap();
+        service
+            .login(site.id, Credentials::new("me", "pw"))
+            .await
+            .unwrap();
+        assert!(service.sessions.get(site.id).is_some());
+
+        service.remove_site(site.id).unwrap();
+
+        assert!(
+            service.sessions.get(site.id).is_none(),
+            "删除站点后会话缓存必须一并清掉"
+        );
+        assert!(service.sites().unwrap().is_empty());
     }
 
     #[test]

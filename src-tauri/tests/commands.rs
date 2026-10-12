@@ -171,3 +171,58 @@ fn detect_site_reaches_real_transport_layer() {
         "应是传输/探测错误: {message}"
     );
 }
+
+// ---------- M1-S1：成功路径的返回值结构（复审 P2-4）----------
+
+/// 极简假站点：只应答 `GET /api/status`，用于让 `add_site` 走通真实 HTTP 链路
+fn spawn_status_only_site() -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+    let addr = listener.local_addr().expect("读取本地地址");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"success":true,"data":{"version":"v0.9.1","quota_per_unit":500000,"system_name":"假站点"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn add_site_returns_expected_shape_against_fake_site() {
+    let base_url = spawn_status_only_site();
+    let value =
+        invoke_impl("add_site", json!({"baseUrl": base_url.clone()})).expect("add_site 应成功");
+
+    assert_eq!(value["id"], 1);
+    assert_eq!(value["kind"], "newapi");
+    assert_eq!(value["displayName"], "假站点");
+    assert_eq!(value["health"], "unknown");
+    assert_eq!(value["baseUrl"], base_url);
+    assert!(
+        value.get("base_url").is_none(),
+        "不得出现 snake_case: {value}"
+    );
+}
+
+#[test]
+fn detect_site_returns_fingerprint_shape_against_fake_site() {
+    let base_url = spawn_status_only_site();
+    let value =
+        invoke_impl("detect_site", json!({"baseUrl": base_url})).expect("detect_site 应成功");
+
+    assert_eq!(value["kind"], "newapi");
+    assert_eq!(value["displayName"], "假站点");
+    assert_eq!(value["version"], "v0.9.1");
+}

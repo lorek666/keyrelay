@@ -89,16 +89,35 @@ impl<T: HttpTransport> NewApi<T> {
             .request(HttpRequest::new(Method::Get, url))
             .await?;
 
-        if resp.status != 200 {
+        // 只有两种情形允许按「未启用加密」处理（fail-open）：
+        // ① 端点不存在（404，旧版本 NewAPI）；② 响应不是 JSON（SPA 兜底页等）。
+        // 其余一切异常都必须 fail-closed：站点已声明启用加密时，
+        // 静默退回明文登录会把密码暴露给一个本应加密的通道（M1-S1 复审 P1-1）。
+        if resp.status == 404 {
             return Ok(None);
+        }
+        if resp.status != 200 {
+            return Err(map_http_error(
+                resp.status,
+                &resp.body,
+                resp.retry_after_secs(),
+            ));
         }
         let Ok(value) = resp.json_value() else {
             return Ok(None);
         };
-        let enabled = value
-            .pointer("/data/enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+
+        let enabled_field = value.pointer("/data/enabled");
+        let enabled = match enabled_field {
+            Some(Value::Bool(flag)) => *flag,
+            None => false,
+            Some(other) => {
+                return Err(Error::Transport(format!(
+                    "登录加密探测响应异常：enabled 字段类型不可识别（{}）",
+                    json_kind(other)
+                )))
+            }
+        };
         if !enabled {
             return Ok(None);
         }
@@ -110,7 +129,9 @@ impl<T: HttpTransport> NewApi<T> {
             .unwrap_or_default()
             .to_string();
         if kid.is_empty() || public_key_pem.is_empty() {
-            return Ok(None);
+            return Err(Error::Transport(
+                "站点已启用登录加密，但响应缺少 kid / public_key；拒绝退回明文登录".to_string(),
+            ));
         }
         Ok(Some(PasswordEncryptionKey {
             kid,
@@ -135,6 +156,45 @@ impl<T: HttpTransport> NewApi<T> {
             })),
         }
     }
+}
+
+/// JSON 值的类型名（用于错误信息，不回显内容）
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// 令牌 id 归一化：数字与字符串统一成无引号字符串（复审 P2-3：`data.id` 为
+/// `"99"` 时曾产出 `"\"99\""`，会污染 DTO 与后续落库定位）
+fn normalize_id(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// 从同名候选中挑出「最新」的一把：优先按 `created_at`，缺失或平局时按数值 id 最大者。
+///
+/// 复审 P2-1：原实现 `max_by_key(created_at.unwrap_or_default())` 在时间戳缺失时会
+/// 平局取**末位**元素，真实站点按 id 倒序返回时会静默交付**旧**令牌。
+fn pick_newest_token<'a>(keys: &'a [KeyMeta], name: &str) -> Option<&'a KeyMeta> {
+    keys.iter().filter(|k| k.name == name).max_by(|a, b| {
+        a.created_at
+            .unwrap_or(i64::MIN)
+            .cmp(&b.created_at.unwrap_or(i64::MIN))
+            .then_with(|| numeric_id(a).cmp(&numeric_id(b)))
+    })
+}
+
+fn numeric_id(key: &KeyMeta) -> i64 {
+    key.remote_id.parse().unwrap_or(0)
 }
 
 /// 把站点返回的失败文案归类成可操作错误。
@@ -191,14 +251,7 @@ fn extract_items(value: &Value) -> Vec<Value> {
 }
 
 fn parse_key_meta(item: &Value) -> Option<KeyMeta> {
-    let remote_id = item.get("id").map(|v| match v {
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => s.clone(),
-        _ => String::new(),
-    })?;
-    if remote_id.is_empty() {
-        return None;
-    }
+    let remote_id = normalize_id(item.get("id"))?;
     let name = json_str(item, "/name").unwrap_or_default().to_string();
     let group = json_str(item, "/group")
         .filter(|g| !g.is_empty())
@@ -294,23 +347,45 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
     }
 
     async fn list_keys(&self, base_url: &str, session: &Session) -> Result<Vec<KeyMeta>> {
-        let url = format!("{}/api/token/", normalize_base_url(base_url));
-        let resp = self
-            .transport
-            .request(self.request(Method::Get, url, session))
-            .await?;
-        if resp.status != 200 {
-            return Err(map_http_error(
-                resp.status,
-                &resp.body,
-                resp.retry_after_secs(),
-            ));
+        let base = normalize_base_url(base_url);
+        let mut collected: Vec<KeyMeta> = Vec::new();
+        let mut page: u32 = 1;
+        // 每页 100、最多 10 页（1000 把令牌）：避免令牌很多的站点上「新建后定位不到」，
+        // 同时防止对异常站点无限翻页（复审 P2-2）。
+        const PAGE_SIZE: u32 = 100;
+        const MAX_PAGES: u32 = 10;
+
+        loop {
+            let url = format!("{base}/api/token/?p={page}&page_size={PAGE_SIZE}");
+            let resp = self
+                .transport
+                .request(self.request(Method::Get, url, session))
+                .await?;
+            if resp.status != 200 {
+                return Err(map_http_error(
+                    resp.status,
+                    &resp.body,
+                    resp.retry_after_secs(),
+                ));
+            }
+            let value = Self::unwrap_success(&resp)?;
+            let items = extract_items(&value);
+            let total = value
+                .pointer("/data/total")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(items.len() as i64);
+            let page_len = items.len();
+            collected.extend(items.iter().filter_map(parse_key_meta));
+
+            let more = page_len > 0
+                && (page_len as u32) >= PAGE_SIZE
+                && (collected.len() as i64) < total
+                && page < MAX_PAGES;
+            if !more {
+                return Ok(collected);
+            }
+            page += 1;
         }
-        let value = Self::unwrap_success(&resp)?;
-        Ok(extract_items(&value)
-            .iter()
-            .filter_map(parse_key_meta)
-            .collect())
     }
 
     async fn create_key(
@@ -342,22 +417,15 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
 
         // 少数版本直接在响应里回明文
         if let Some(key) = json_str(&value, "/data/key") {
-            let remote_id = value
-                .pointer("/data/id")
-                .map(|v| v.to_string())
-                .unwrap_or_default();
+            let remote_id = normalize_id(value.pointer("/data/id")).unwrap_or_default();
             return Ok(KeyMaterial::new(remote_id, key));
         }
 
-        // 常规路径：创建成功后按名字定位刚建好的令牌
+        // 常规路径：创建成功后按名字定位刚建好的令牌（时间戳缺失/平局时取 id 最大者）
         let keys = self.list_keys(base_url, session).await?;
-        let target = keys
-            .iter()
-            .filter(|k| k.name == spec.name)
-            .max_by_key(|k| k.created_at.unwrap_or_default())
-            .ok_or_else(|| {
-                Error::NotFound(format!("创建后未在令牌列表中找到名为 {} 的令牌", spec.name))
-            })?;
+        let target = pick_newest_token(&keys, &spec.name).ok_or_else(|| {
+            Error::NotFound(format!("创建后未在令牌列表中找到名为 {} 的令牌", spec.name))
+        })?;
         self.reveal_key(base_url, session, &target.remote_id).await
     }
 
