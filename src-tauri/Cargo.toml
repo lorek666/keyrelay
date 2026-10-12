@@ -27,3 +27,4 @@ tauri = { version = "2", features = [] }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
+tempfile = "3.27.0"

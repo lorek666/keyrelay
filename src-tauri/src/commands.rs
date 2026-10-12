@@ -148,6 +148,8 @@ pub struct SettingsDto {
     refresh_interval_secs: u64,
     balance_alert_threshold: f64,
     drift_check_on_start: bool,
+    gateway_enabled: bool,
+    gateway_port: u16,
 }
 
 #[derive(Serialize)]
@@ -183,6 +185,52 @@ pub struct AuditReportDto {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettingsArgs {
     settings: SettingsDto,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayStatusDto {
+    running: bool,
+    url: Option<String>,
+    /// 本地令牌：**只在这里返回给 UI 显示**，不写日志、不入库。
+    token: Option<String>,
+    site: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayStartArgs {
+    site_id: i64,
+    key_id: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportResultDto {
+    path: String,
+    encrypted: bool,
+    bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportArgs {
+    /// 空/缺省 = 明文导出
+    password: Option<String>,
+    /// 缺省写到 `~/.keyrelay/exports/keyrelay-export-<时间戳>.json`
+    path: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PruneResultDto {
+    removed: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PruneArgs {
+    keep: usize,
 }
 
 #[derive(Deserialize)]
@@ -514,6 +562,8 @@ fn settings_from_dto(dto: &SettingsDto) -> keyrelay_core::settings::Settings {
         refresh_interval_secs: dto.refresh_interval_secs,
         balance_alert_threshold: dto.balance_alert_threshold,
         drift_check_on_start: dto.drift_check_on_start,
+        gateway_enabled: dto.gateway_enabled,
+        gateway_port: dto.gateway_port,
     }
 }
 
@@ -522,6 +572,8 @@ fn settings_to_dto(settings: &keyrelay_core::settings::Settings) -> SettingsDto 
         refresh_interval_secs: settings.refresh_interval_secs,
         balance_alert_threshold: settings.balance_alert_threshold,
         drift_check_on_start: settings.drift_check_on_start,
+        gateway_enabled: settings.gateway_enabled,
+        gateway_port: settings.gateway_port,
     }
 }
 
@@ -567,6 +619,122 @@ pub fn update_settings(
         .update_settings(&settings)
         .map_err(|e| e.to_string())?;
     Ok(settings_to_dto(&settings))
+}
+
+// ============================================ 网关 / 导出 / 备份清理（M4-S2）
+
+fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
+    let empty = GatewayStatusDto {
+        running: false,
+        url: None,
+        token: None,
+        site: None,
+    };
+    let Ok(guard) = state.gateway.lock() else {
+        return empty;
+    };
+    match guard.as_ref() {
+        Some(handle) => GatewayStatusDto {
+            running: true,
+            url: Some(handle.local_url()),
+            token: Some(handle.token.clone()),
+            site: Some(handle.site_display_name.clone()),
+        },
+        None => empty,
+    }
+}
+
+#[tauri::command]
+pub fn gateway_status(state: State<'_, AppState>) -> Result<GatewayStatusDto, String> {
+    Ok(gateway_status_of(&state))
+}
+
+/// 启动本地网关。同一时刻只允许一个：启动前会先停掉旧的。
+#[tauri::command]
+pub async fn gateway_start(
+    state: State<'_, AppState>,
+    args: GatewayStartArgs,
+) -> Result<GatewayStatusDto, String> {
+    if let Ok(mut guard) = state.gateway.lock() {
+        if let Some(old) = guard.take() {
+            old.shutdown();
+        }
+    }
+
+    let port = state
+        .service
+        .settings()
+        .map_err(|e| e.to_string())?
+        .gateway_port;
+    let config = state
+        .service
+        .gateway_config(args.site_id, args.key_id, port)
+        .map_err(|e| e.to_string())?;
+
+    let handle = keyrelay_core::gateway::start(config)
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = GatewayStatusDto {
+        running: true,
+        url: Some(handle.local_url()),
+        token: Some(handle.token.clone()),
+        site: Some(handle.site_display_name.clone()),
+    };
+    if let Ok(mut guard) = state.gateway.lock() {
+        *guard = Some(handle);
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+pub fn gateway_stop(state: State<'_, AppState>) -> Result<GatewayStatusDto, String> {
+    if let Ok(mut guard) = state.gateway.lock() {
+        if let Some(handle) = guard.take() {
+            handle.shutdown();
+        }
+    }
+    Ok(gateway_status_of(&state))
+}
+
+#[tauri::command]
+pub fn export_bundle(
+    state: State<'_, AppState>,
+    args: ExportArgs,
+) -> Result<ExportResultDto, String> {
+    let path = match args.path {
+        Some(path) if !path.trim().is_empty() => std::path::PathBuf::from(path),
+        _ => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            crate::home_dir()
+                .join(".keyrelay")
+                .join("exports")
+                .join(format!("keyrelay-export-{stamp}.json"))
+        }
+    };
+    state
+        .service
+        .export_to_file(&path, args.password.as_deref())
+        .map(|(path, encrypted, bytes)| ExportResultDto {
+            path: path.display().to_string(),
+            encrypted,
+            bytes,
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn prune_backups(
+    state: State<'_, AppState>,
+    args: PruneArgs,
+) -> Result<PruneResultDto, String> {
+    state
+        .service
+        .prune_backups(args.keep)
+        .map(|removed| PruneResultDto { removed })
+        .map_err(|e| e.to_string())
 }
 
 /// 脱敏审计：扫描数据库（含 WAL/SHM）、备份目录与事件表，确认零明文。

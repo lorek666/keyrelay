@@ -136,6 +136,10 @@ export type Settings = {
   /** USD；0 = 不告警 */
   balanceAlertThreshold: number;
   driftCheckOnStart: boolean;
+  /** 本地网关开关。默认关闭。 */
+  gatewayEnabled: boolean;
+  /** 网关端口（只绑 127.0.0.1） */
+  gatewayPort: number;
 };
 
 export type RefreshSummary = {
@@ -160,6 +164,22 @@ export type AuditReport = {
   findings: AuditFinding[];
   summary: string;
 };
+
+export type GatewayStatus = {
+  running: boolean;
+  url?: string | null;
+  /** 本地令牌：只在界面上显示给用户，用于配置 agent 连本地网关 */
+  token?: string | null;
+  site?: string | null;
+};
+
+export type ExportResult = {
+  path: string;
+  encrypted: boolean;
+  bytes: number;
+};
+
+export type PruneResult = { removed: number };
 
 export type LoginArgs = {
   siteId: number;
@@ -394,6 +414,57 @@ export async function recentEvents(limit = 100): Promise<EventRow[]> {
   return invokeCommand<EventRow[]>("recent_events", { limit });
 }
 
+export async function gatewayStatus(): Promise<GatewayStatus> {
+  if (!hasTauri) {
+    return mock({ running: false, url: null, token: null, site: null });
+  }
+  return invokeCommand<GatewayStatus>("gateway_status");
+}
+
+export async function gatewayStart(
+  siteId: number,
+  keyId: number,
+): Promise<GatewayStatus> {
+  if (!hasTauri) {
+    return mock({
+      running: true,
+      url: "http://127.0.0.1:8787",
+      token: "kr-gw-mock0000000000000000000000000",
+      site: "示例中转站（mock）",
+    });
+  }
+  return invokeCommand<GatewayStatus>("gateway_start", {
+    args: { siteId, keyId },
+  });
+}
+
+export async function gatewayStop(): Promise<GatewayStatus> {
+  if (!hasTauri) {
+    return mock({ running: false, url: null, token: null, site: null });
+  }
+  return invokeCommand<GatewayStatus>("gateway_stop");
+}
+
+export async function exportBundle(
+  password?: string,
+): Promise<ExportResult> {
+  if (!hasTauri) {
+    return mock({
+      path: "/Users/you/.keyrelay/exports/keyrelay-export-mock.json",
+      encrypted: Boolean(password),
+      bytes: 2048,
+    });
+  }
+  return invokeCommand<ExportResult>("export_bundle", {
+    args: { password: password ?? null },
+  });
+}
+
+export async function pruneBackups(keep: number): Promise<PruneResult> {
+  if (!hasTauri) return mock({ removed: 0 });
+  return invokeCommand<PruneResult>("prune_backups", { args: { keep } });
+}
+
 export async function auditRedaction(): Promise<AuditReport> {
   if (!hasTauri) {
     return mock({
@@ -430,6 +501,8 @@ export async function getSettings(): Promise<Settings> {
       refreshIntervalSecs: 0,
       balanceAlertThreshold: 0,
       driftCheckOnStart: true,
+      gatewayEnabled: false,
+      gatewayPort: 8787,
     });
   }
   return invokeCommand<Settings>("get_settings");

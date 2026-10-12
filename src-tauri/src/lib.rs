@@ -26,6 +26,8 @@ pub struct AppState {
     pub db_path: PathBuf,
     /// 数据库打开失败时的原因（用于在 UI 上明确提示，而不是静默降级）
     pub db_error: Option<String>,
+    /// 正在运行的本地网关（同一时刻只允许一个）。
+    pub gateway: std::sync::Mutex<Option<keyrelay_core::gateway::GatewayHandle>>,
 }
 
 /// 用户主目录。解析逻辑在 `keyrelay_core::platform`（按平台处理 `KEYRELAY_HOME` /
@@ -94,6 +96,7 @@ fn state_with_config(
         service: KeyRelayService::new(store, build_transport(), config),
         db_path,
         db_error,
+        gateway: std::sync::Mutex::new(None),
     }
 }
 
@@ -154,7 +157,12 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::get_settings,
             commands::update_settings,
             commands::refresh_all,
-            commands::audit_redaction
+            commands::audit_redaction,
+            commands::gateway_status,
+            commands::gateway_start,
+            commands::gateway_stop,
+            commands::export_bundle,
+            commands::prune_backups
         ])
 }
 

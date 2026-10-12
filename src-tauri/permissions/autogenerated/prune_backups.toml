@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-prune-backups"
+description = "Enables the prune_backups command without any pre-configured scope."
+commands.allow = ["prune_backups"]
+
+[[permission]]
+identifier = "deny-prune-backups"
+description = "Denies the prune_backups command without any pre-configured scope."
+commands.deny = ["prune_backups"]
