@@ -10,7 +10,9 @@
 
 pub mod claude_code;
 pub mod codex_auth;
+pub mod gemini_cli;
 pub mod json_text;
+pub mod opencode;
 pub mod shell_block;
 
 use std::path::{Path, PathBuf};
@@ -28,13 +30,19 @@ pub enum DeliveryChannel {
     ClaudeCodeSettings,
     /// shell rc 文件的标记块（M1-S3）
     ShellBlock,
+    /// `~/.config/opencode/opencode.json` 的 `provider.<id>.options`（M6-S1）
+    OpenCode,
+    /// `~/.gemini/.env`（M6-S1）
+    GeminiCli,
 }
 
 impl DeliveryChannel {
-    pub const ALL: [DeliveryChannel; 3] = [
+    pub const ALL: [DeliveryChannel; 5] = [
         DeliveryChannel::CodexAuthJson,
         DeliveryChannel::ClaudeCodeSettings,
         DeliveryChannel::ShellBlock,
+        DeliveryChannel::OpenCode,
+        DeliveryChannel::GeminiCli,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -42,6 +50,8 @@ impl DeliveryChannel {
             DeliveryChannel::CodexAuthJson => "codex-auth-json",
             DeliveryChannel::ClaudeCodeSettings => "claude-code-settings",
             DeliveryChannel::ShellBlock => "shell-block",
+            DeliveryChannel::OpenCode => "opencode",
+            DeliveryChannel::GeminiCli => "gemini-cli",
         }
     }
 
@@ -50,6 +60,8 @@ impl DeliveryChannel {
             "codex-auth-json" => Ok(DeliveryChannel::CodexAuthJson),
             "claude-code-settings" => Ok(DeliveryChannel::ClaudeCodeSettings),
             "shell-block" => Ok(DeliveryChannel::ShellBlock),
+            "opencode" => Ok(DeliveryChannel::OpenCode),
+            "gemini-cli" => Ok(DeliveryChannel::GeminiCli),
             other => Err(Error::NotFound(format!("未知的投递通道: {other}"))),
         }
     }
@@ -60,6 +72,8 @@ impl DeliveryChannel {
             DeliveryChannel::CodexAuthJson => "codex",
             DeliveryChannel::ClaudeCodeSettings => "claude-code",
             DeliveryChannel::ShellBlock => "shell",
+            DeliveryChannel::OpenCode => "opencode",
+            DeliveryChannel::GeminiCli => "gemini-cli",
         }
     }
 
@@ -77,6 +91,9 @@ impl DeliveryChannel {
     ///
     /// 这是**安全边界**：`checked_target` 用它逐字比对投递目标，因此这里返回的路径
     /// 必须与写入器实际写入的路径一致，否则投递会被拒绝（fail-closed）。
+    ///
+    /// 两条 M6-S1 通道的路径都是**常量**，不随磁盘状态变化：`.jsonc` 存在而 `.json`
+    /// 不存在时仍返回 `.json`（见 `docs/specs/M6-S1-通道扩展.md` §11 D-1）。
     pub fn relative_target(self) -> PathBuf {
         match self {
             DeliveryChannel::CodexAuthJson => PathBuf::from(".codex").join("auth.json"),
@@ -84,6 +101,10 @@ impl DeliveryChannel {
             DeliveryChannel::ShellBlock => PathBuf::from(
                 shell_block::ShellSyntax::for_current_platform().default_rc_relative_path(),
             ),
+            DeliveryChannel::OpenCode => PathBuf::from(".config")
+                .join("opencode")
+                .join("opencode.json"),
+            DeliveryChannel::GeminiCli => PathBuf::from(".gemini").join(".env"),
         }
     }
 }
@@ -179,14 +200,40 @@ pub fn resolve(channel: DeliveryChannel, home: &Path) -> Result<Box<dyn Delivery
     resolve_for(channel, home, "")
 }
 
-/// 带站点 `base_url` 的解析。三条通道都走这里。
+/// 带站点 `base_url` 的解析。**签名保持不变**——`service.rs` 的调用点在这里，
+/// 本步的作者写域不含 `service.rs`（M6-S0 章程 §3）。
 ///
-/// `base_url` 为空表示「只投递密钥，不动 endpoint」——两个会写 base_url 的通道
-/// （Claude Code / shell 块）据此少写一行。
+/// `base_url` 为空表示「只投递密钥，不动 endpoint」——会写 base_url 的通道
+/// （Claude Code / shell 块 / OpenCode / Gemini CLI）据此少写一行。
+///
+/// OpenCode 通道在这里走**默认 provider 名**
+/// （[`opencode::OpenCodeWriter::DEFAULT_PROVIDER_ID`]）且不写 `model`。
+/// 需要站点自选的 provider 名与模型时用 [`resolve_for_binding`]（S5 接线面）。
 pub fn resolve_for(
     channel: DeliveryChannel,
     home: &Path,
     base_url: &str,
+) -> Result<Box<dyn DeliveryWriter>> {
+    resolve_for_binding(
+        channel,
+        home,
+        base_url,
+        opencode::OpenCodeWriter::DEFAULT_PROVIDER_ID,
+        None,
+    )
+}
+
+/// 完整入口：`provider_id` / `model` **只对 [`DeliveryChannel::OpenCode`] 生效**，其余通道忽略。
+///
+/// `provider_id` 为空（trim 后）时**在这里就报错**，而不是等到 `plan()`：
+/// 调用方传空 provider 名是接线错误，早报比写到一个 `provider.""` 上强。
+/// `model` 为 `None` 或 trim 后为空 → 不写、也不动已有的 `model` 键。
+pub fn resolve_for_binding(
+    channel: DeliveryChannel,
+    home: &Path,
+    base_url: &str,
+    provider_id: &str,
+    model: Option<&str>,
 ) -> Result<Box<dyn DeliveryWriter>> {
     match channel {
         DeliveryChannel::CodexAuthJson => Ok(Box::new(codex_auth::CodexAuthWriter::new(home))),
@@ -195,6 +242,23 @@ pub fn resolve_for(
         }
         DeliveryChannel::ShellBlock => {
             Ok(Box::new(shell_block::ShellBlockWriter::new(home, base_url)))
+        }
+        DeliveryChannel::OpenCode => {
+            if provider_id.trim().is_empty() {
+                return Err(Error::inject(
+                    home.join(channel.relative_target()),
+                    "provider id 为空，拒绝写入",
+                ));
+            }
+            Ok(Box::new(opencode::OpenCodeWriter::new(
+                home,
+                provider_id,
+                base_url,
+                model,
+            )))
+        }
+        DeliveryChannel::GeminiCli => {
+            Ok(Box::new(gemini_cli::GeminiCliWriter::new(home, base_url)))
         }
     }
 }
@@ -301,6 +365,123 @@ fn split_lines(text: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_strings_are_exact() {
+        // M6-S1 章程 §4.1 冻结：两条新通道的字符串逐字如下，且 `ALL` 的顺序是稳定契约。
+        let strings: Vec<&str> = DeliveryChannel::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(
+            strings,
+            vec![
+                "codex-auth-json",
+                "claude-code-settings",
+                "shell-block",
+                "opencode",
+                "gemini-cli"
+            ]
+        );
+        assert_eq!(DeliveryChannel::OpenCode.agent_id(), "opencode");
+        assert_eq!(DeliveryChannel::GeminiCli.agent_id(), "gemini-cli");
+    }
+
+    #[test]
+    fn new_channel_relative_targets_are_exact() {
+        assert_eq!(
+            DeliveryChannel::OpenCode.relative_target(),
+            PathBuf::from(".config")
+                .join("opencode")
+                .join("opencode.json")
+        );
+        assert_eq!(
+            DeliveryChannel::GeminiCli.relative_target(),
+            PathBuf::from(".gemini").join(".env")
+        );
+    }
+
+    #[test]
+    fn resolve_target_matches_relative_target_for_every_channel() {
+        // **安全边界**：`service.rs::checked_target` 用 `home.join(relative_target())`
+        // 逐字比对投递目标。写入器声明的路径只要差一个字节，投递就会被拒绝（fail-closed）。
+        let home = Path::new("/tmp/nobody");
+        for channel in DeliveryChannel::ALL {
+            let writer = resolve_for(channel, home, "https://relay.example.com")
+                .unwrap_or_else(|e| panic!("{} 应可解析: {e}", channel.as_str()));
+            assert_eq!(
+                writer.target_path(),
+                home.join(channel.relative_target()),
+                "{} 的 target_path 与 relative_target 不一致",
+                channel.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_for_binding_uses_provider_and_model() {
+        let home = Path::new("/tmp/nobody");
+        let writer = resolve_for_binding(
+            DeliveryChannel::OpenCode,
+            home,
+            "https://relay.example.com",
+            "my-relay",
+            Some("my-relay/gpt-4o"),
+        )
+        .unwrap();
+        assert_eq!(
+            writer.field_names(),
+            vec![
+                "provider.my-relay.options.apiKey",
+                "provider.my-relay.options.baseURL",
+                "model"
+            ]
+        );
+        // 目标路径与 provider 名无关，仍是通道声明的常量路径
+        assert_eq!(
+            writer.target_path(),
+            home.join(DeliveryChannel::OpenCode.relative_target())
+        );
+    }
+
+    #[test]
+    fn resolve_for_defaults_opencode_provider_and_skips_model() {
+        let home = Path::new("/tmp/nobody");
+        let writer = resolve_for(DeliveryChannel::OpenCode, home, "https://x").unwrap();
+        assert_eq!(
+            writer.field_names(),
+            vec![
+                "provider.keyrelay.options.apiKey",
+                "provider.keyrelay.options.baseURL"
+            ],
+            "默认 provider 名 + 不写 model"
+        );
+    }
+
+    #[test]
+    fn resolve_for_binding_rejects_empty_provider_id() {
+        let home = Path::new("/tmp/nobody");
+        for bad in ["", "   "] {
+            // `Box<dyn DeliveryWriter>` 不实现 `Debug`，因此用 match 而不是 `unwrap_err()`
+            match resolve_for_binding(DeliveryChannel::OpenCode, home, "https://x", bad, None) {
+                Err(err) => {
+                    assert!(matches!(err, Error::Inject { .. }), "{bad:?}");
+                    assert!(err.to_string().contains("provider id"), "{err}");
+                }
+                Ok(_) => panic!("provider_id={bad:?} 应当被拒绝"),
+            }
+        }
+        // 其余通道不受 provider_id 影响（它们根本没有 provider 概念）
+        for channel in [
+            DeliveryChannel::CodexAuthJson,
+            DeliveryChannel::ClaudeCodeSettings,
+            DeliveryChannel::ShellBlock,
+            DeliveryChannel::GeminiCli,
+        ] {
+            assert!(
+                resolve_for_binding(channel, home, "https://x", "", None).is_ok(),
+                "{} 不该被 provider_id 校验误伤",
+                channel.as_str()
+            );
+        }
+    }
 
     #[test]
     fn channel_roundtrip_and_agent_id() {

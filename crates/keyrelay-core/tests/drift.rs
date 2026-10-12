@@ -153,13 +153,19 @@ fn tracks_every_channel_independently() {
     }
 
     let reports = f.service.drift_report().unwrap();
-    assert_eq!(reports.len(), 3, "三条通道各一条报告");
+    // 期望值从 `ALL` 推导，而不是写死 3 或写死那三个字符串。
+    // M6-S1 把 `ALL` 从 3 扩到 5 时，这个测试的两处硬编码会**同时**变红，
+    // 而它要断言的其实是「每条通道各一条报告」这个关系，不是通道总数本身。
+    assert_eq!(
+        reports.len(),
+        DeliveryChannel::ALL.len(),
+        "每条通道各一条报告"
+    );
     let mut channels: Vec<&str> = reports.iter().map(|r| r.channel.as_str()).collect();
     channels.sort_unstable();
-    assert_eq!(
-        channels,
-        vec!["claude-code-settings", "codex-auth-json", "shell-block"]
-    );
+    let mut expected: Vec<&str> = DeliveryChannel::ALL.iter().map(|c| c.as_str()).collect();
+    expected.sort_unstable();
+    assert_eq!(channels, expected);
     assert!(reports.iter().all(|r| r.state == DriftState::Intact));
 }
 

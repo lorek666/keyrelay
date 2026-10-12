@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-rotation-plan"
+description = "Enables the rotation_plan command without any pre-configured scope."
+commands.allow = ["rotation_plan"]
+
+[[permission]]
+identifier = "deny-rotation-plan"
+description = "Denies the rotation_plan command without any pre-configured scope."
+commands.deny = ["rotation_plan"]

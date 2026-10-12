@@ -32,6 +32,13 @@
     "allow-gateway-start",
     "allow-gateway-stop",
     "allow-export-bundle",
-    "allow-prune-backups"
+    "allow-prune-backups",
+    "allow-available-groups",
+    "allow-sync-site-keys",
+    "allow-rotation-due",
+    "allow-rotation-plan",
+    "allow-rotate-key",
+    "allow-autostart-status",
+    "allow-autostart-set"
   ]
 }

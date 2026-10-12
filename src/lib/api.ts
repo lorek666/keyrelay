@@ -92,6 +92,14 @@ export type DeliveryPlan = {
   consent: ConsentState;
   consentGrantedAt?: number | null;
   consentRevokedAt?: number | null;
+  /**
+   * 提示项（**不是错误**，投递照常可做）。
+   *
+   * 当前唯一来源：同目录下存在「同主名、不同扩展名」的兄弟文件
+   * （例如 `opencode.jsonc` 与 `opencode.json` 并存），agent 可能优先读另一个，
+   * 于是本次投递**静默不生效**（BACKLOG B-76）。
+   */
+  warnings: string[];
 };
 
 export type ConsentRow = {
@@ -150,6 +158,35 @@ export type Settings = {
   gatewayEnabled: boolean;
   /** 网关端口（只绑 127.0.0.1） */
   gatewayPort: number;
+  // ---- M6-S5：FR-9 界面与隐私 ----
+  /** "system" | "light" | "dark" */
+  theme: string;
+  /** "zh-CN" | "en-US" */
+  language: string;
+  /** 空 = 直连。合法性由传输层判定，这里只存。 */
+  proxyUrl: string;
+  /** 默认关（PRD §5「默认零遥测」）。当前只记录意愿，不发送任何数据。 */
+  telemetryEnabled: boolean;
+  /** 默认关。当前只记录意愿，未接更新服务器。 */
+  autoUpdateEnabled: boolean;
+  // ---- M6-S5：FR-3 通知 ----
+  /** 系统通知。默认开。 */
+  notifySystemEnabled: boolean;
+  /** 空 = 不启用 Webhook。 */
+  notifyWebhookUrl: string;
+  /** Webhook 超时（秒），上限 60。 */
+  notifyTimeoutSecs: number;
+  // ---- M6-S5：FR-7 轮换与常驻 ----
+  /** 轮换周期（天）；0 = 关闭轮换提醒。 */
+  rotationMaxAgeDays: number;
+  /** 到期前多少天开始提醒；不得超过 rotationMaxAgeDays。 */
+  rotationWarnBeforeDays: number;
+  /** 登录自启。默认关。 */
+  autostartEnabled: boolean;
+  /** 关窗时隐藏到托盘。默认开。 */
+  closeToTray: boolean;
+  /** 启动时不显示主窗口。默认关。 */
+  startHidden: boolean;
 };
 
 export type RefreshSummary = {
@@ -290,6 +327,7 @@ const MOCK_PLAN: DeliveryPlan = {
   consent: "missing",
   consentGrantedAt: null,
   consentRevokedAt: null,
+  warnings: [],
 };
 
 const MOCK_EVENTS: EventRow[] = [
@@ -526,6 +564,19 @@ export async function getSettings(): Promise<Settings> {
       driftCheckOnStart: true,
       gatewayEnabled: false,
       gatewayPort: 8787,
+      theme: "system",
+      language: "zh-CN",
+      proxyUrl: "",
+      telemetryEnabled: false,
+      autoUpdateEnabled: false,
+      notifySystemEnabled: true,
+      notifyWebhookUrl: "",
+      notifyTimeoutSecs: 10,
+      rotationMaxAgeDays: 30,
+      rotationWarnBeforeDays: 7,
+      autostartEnabled: false,
+      closeToTray: true,
+      startHidden: false,
     });
   }
   return invokeCommand<Settings>("get_settings");
@@ -548,4 +599,173 @@ export async function refreshAll(): Promise<RefreshSummary> {
     });
   }
   return invokeCommand<RefreshSummary>("refresh_all");
+}
+
+// ============================================ M6-S5：FR-2 / FR-7
+
+export type Group = {
+  name: string;
+  /** 分组倍率。`null` = 站点没给（**不是 0**，0 表示免费分组）。 */
+  rate: number | null;
+  description: string | null;
+};
+
+export async function availableGroups(siteId: number): Promise<Group[]> {
+  if (!hasTauri) {
+    return mock([
+      { name: "default", rate: 1, description: null },
+      { name: "vip", rate: 0.5, description: "折扣分组" },
+    ]);
+  }
+  return invokeCommand<Group[]>("available_groups", { siteId });
+}
+
+export type KeySyncSummary = {
+  siteId: number;
+  siteTotal: number;
+  alreadyLocal: number;
+  imported: number;
+  /** 站点没给明文的 key。界面据此引导「新建一把」而不是以为对齐成功了。 */
+  unreadable: string[];
+};
+
+/**
+ * 把站点侧已有密钥的明文一次性对齐到本地钥匙串。
+ *
+ * **不返回任何明文**——这是刻意的：命令层至今没有任何一条命令返回过密钥明文，
+ * 批量明文一旦过 IPC 就会进入 WebView 的内存与开发者工具。
+ */
+export async function syncSiteKeys(siteId: number): Promise<KeySyncSummary> {
+  if (!hasTauri) {
+    return mock({
+      siteId,
+      siteTotal: 2,
+      alreadyLocal: 1,
+      imported: 1,
+      unreadable: [],
+    });
+  }
+  return invokeCommand<KeySyncSummary>("sync_site_keys", { siteId });
+}
+
+export type RotationDue = {
+  keyId: number;
+  siteId: number;
+  name: string;
+  createdAt: number;
+  dueAt: number;
+};
+
+/** 该轮换的密钥。纯本地判定，不联网、不读密钥。 */
+export async function rotationDue(): Promise<RotationDue[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<RotationDue[]>("rotation_due");
+}
+
+export type RotationPlan = {
+  keyId: number;
+  siteId: number;
+  keyName: string;
+  /** 固定三步的稳定标识 */
+  steps: string[];
+  /** 会被重注入的通道 */
+  channels: string[];
+  /** 认不出通道的目标。非空 = 必须禁用「开始轮换」。 */
+  unmappedTargets: string[];
+  oldRemoteId: string | null;
+};
+
+/**
+ * 轮换预览（FR-7）。只读，一个请求都不发。
+ *
+ * 「回收旧钥匙」不可逆，所以 PRD §7 的二次确认必须建立在这份预览上——
+ * 没有预览的二次确认只是「真的要删吗」，用户看不到真正需要他判断的东西：
+ * **会波及哪些投递目标**。
+ */
+export async function rotationPlan(keyId: number): Promise<RotationPlan> {
+  if (!hasTauri) {
+    return mock({
+      keyId,
+      siteId: 1,
+      keyName: "codex/daily",
+      steps: ["create_new", "reinject_all", "revoke_old"],
+      channels: ["codex-auth-json"],
+      unmappedTargets: [],
+      oldRemoteId: "1",
+    });
+  }
+  return invokeCommand<RotationPlan>("rotation_plan", { keyId });
+}
+
+export type RotationRun = {
+  newKeyId: number;
+  /** 新密钥的掩码形态。明文只在钥匙串里，绝不过 IPC。 */
+  newKeyMasked: string;
+  reinjected: string[];
+  revoke: "revoked" | "skippedNoRemoteId" | "notAttempted" | "failed";
+  revokeReason: string | null;
+  /** `null` = 没中途失败 */
+  stoppedAt: string | null;
+  stopReason: string | null;
+  /** 三步是否都没中途失败。**不得只看它**：`skippedNoRemoteId` 也算完成。 */
+  completed: boolean;
+};
+
+/** 执行轮换（FR-7「一键三连」）。破坏性操作，调用前必须走过 `rotationPlan` + 二次确认。 */
+export async function rotateKey(keyId: number, name: string): Promise<RotationRun> {
+  if (!hasTauri) {
+    return mock({
+      newKeyId: 2,
+      newKeyMasked: "…6789",
+      reinjected: ["codex-auth-json"],
+      revoke: "revoked" as const,
+      revokeReason: null,
+      stoppedAt: null,
+      stopReason: null,
+      completed: true,
+    });
+  }
+  return invokeCommand<RotationRun>("rotate_key", { keyId, name });
+}
+
+/**
+ * 分组倍率的展示口径（M6-S4 复审 P2-4 / P2-5 的裁决）。
+ *
+ * 只在**展示层**收紧，核心层不加校验：我们没有站点事实支撑「倍率 0 是不是合法值」
+ * （有的部署可能用它表示免费分组），所以在核心层拒绝会改掉冻结接口的语义；
+ * 而直接显示 `0` 或 `-1` 又会让用户以为「这个分组不要钱」。
+ *
+ * 因此只渲染能确定是倍率的取值，其余一律显示为「倍率未知」——**绝不用 1.0 兜底**：
+ * 那会让用户按错误的成本预期选分组，而选错分组的代价是真实的钱。
+ */
+export function formatGroupRate(rate: number | null): string {
+  if (rate === null || !Number.isFinite(rate) || rate <= 0) return "倍率未知";
+  return `${rate}×`;
+}
+
+export type AutostartState = "enabled" | "disabled" | "unknown";
+
+export type Autostart = {
+  state: AutostartState;
+  /** 计划的人类可读摘要（不含任何值）。仅 `setAutostart` 返回时有内容。 */
+  plan: string | null;
+  manualAction: string | null;
+};
+
+export async function autostartStatus(): Promise<Autostart> {
+  if (!hasTauri) {
+    return mock({ state: "disabled" as AutostartState, plan: null, manualAction: null });
+  }
+  return invokeCommand<Autostart>("autostart_status");
+}
+
+export async function setAutostart(enabled: boolean): Promise<Autostart> {
+  if (!hasTauri) {
+    return mock({
+      state: (enabled ? "enabled" : "disabled") as AutostartState,
+      plan: enabled ? "新建 ~/Library/LaunchAgents/keyrelay-autostart.plist" : "删除自启项",
+      manualAction: null,
+    });
+  }
+  return invokeCommand<Autostart>("autostart_set", { enabled });
 }

@@ -91,9 +91,16 @@ fn platform_specific_files_match_the_known_inventory() {
 
     // 已知清单。**新增平台相关代码时必须在这里显式登记**——
     // 登记这个动作本身就是「我想过另一个平台了」的检查点。
+    //
+    // M6 波次新增两项（2026-10-12）：
+    // - `autostart.rs`（M6-S2）：`cfg!(target_os = "windows")` 分派到注册表形态，macOS 走 LaunchAgent plist
+    // - `notify/system.rs`（M6-S3）：macOS 走 `osascript`，Windows 走 PowerShell toast
+    // 两者都在 `docs/evidence/platform-parity.md` §1 补了双端说明。
     let expected = vec![
+        "autostart.rs".to_string(),
         "delivery/shell_block.rs".to_string(),
         "inject/mod.rs".to_string(),
+        "notify/system.rs".to_string(),
         "vault/keychain.rs".to_string(),
     ];
 

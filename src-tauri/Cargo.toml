@@ -25,8 +25,10 @@ tokio = { version = "1.53.2", features = ["time", "sync"] }
 keyrelay-core = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2", features = [] }
+# `tray-icon`：M6-S5 的托盘常驻（BACKLOG B-53）。不加这个 feature，
+# `tauri::tray` 整个模块不存在，托盘代码连编译都过不去。
+tauri = { version = "2", features = ["tray-icon"] }
 
 [dev-dependencies]
-tauri = { version = "2", features = ["test"] }
+tauri = { version = "2", features = ["test", "tray-icon"] }
 tempfile = "3.27.0"

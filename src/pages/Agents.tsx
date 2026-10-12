@@ -15,11 +15,13 @@ import {
 } from "../lib/api";
 import ConfirmDialog from "../components/ConfirmDialog";
 
-/** 目前只有 codex 通道实现了；其余通道后端会返回 Unimplemented。 */
+/** 五条投递通道（M6-S1 把 OpenCode 与 Gemini CLI 补齐，现在全部有实现）。 */
 const CHANNELS = [
   { id: "codex-auth-json", label: "Codex CLI（~/.codex/auth.json）", agent: "codex" },
-  { id: "claude-code-settings", label: "Claude Code（M2 支持）", agent: "claude-code" },
-  { id: "shell-block", label: "Shell 标记块（M2 支持）", agent: "shell" },
+  { id: "claude-code-settings", label: "Claude Code（~/.claude/settings.json）", agent: "claude-code" },
+  { id: "shell-block", label: "Shell 标记块", agent: "shell" },
+  { id: "opencode", label: "OpenCode（~/.config/opencode/opencode.json）", agent: "opencode" },
+  { id: "gemini-cli", label: "Gemini CLI（~/.gemini/.env）", agent: "gemini-cli" },
 ];
 
 export default function Agents() {
@@ -375,6 +377,16 @@ function PlanView({
           ))}
         </dd>
       </dl>
+
+      {plan.warnings.length > 0 ? (
+        <div className="warnbox" role="status">
+          {plan.warnings.map((w) => (
+            <p key={w} className="warnline">
+              <AlertTriangle size={14} aria-hidden /> {w}
+            </p>
+          ))}
+        </div>
+      ) : null}
 
       <h4>差异预览（已脱敏）</h4>
       <pre className="diff">{plan.preview}</pre>

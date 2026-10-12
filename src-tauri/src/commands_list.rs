@@ -35,4 +35,12 @@ pub const COMMANDS: &[&str] = &[
     "gateway_stop",
     "export_bundle",
     "prune_backups",
+    // M6-S5：FR-2 / FR-7 接线
+    "available_groups",
+    "sync_site_keys",
+    "rotation_due",
+    "rotation_plan",
+    "rotate_key",
+    "autostart_status",
+    "autostart_set",
 ];

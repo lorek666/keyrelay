@@ -25,6 +25,11 @@ use crate::vault::{KeychainVault, Vault};
 
 /// 服务装配参数。核心层**不读环境变量**，`home` 与 `backup_dir` 一律由壳层传入，
 /// 这样测试可以把它们指向临时目录。
+///
+/// **通知不在这里**（M6-S5）：见 [`KeyRelayService::with_notify`]。把 `notify` 做成
+/// `ServiceConfig` 的字段会让全仓 10 个集成测试文件的结构体字面量一次性编译失败——
+/// 为了一个默认关闭的可选功能去改 10 个别人的测试文件，代价与收益不成比例。
+/// 做成 `KeyRelayService` 上的构造器方法之后，不关心通知的调用方一个字节都不用改。
 pub struct ServiceConfig {
     pub vault: Arc<dyn Vault>,
     pub home: PathBuf,
@@ -184,6 +189,25 @@ pub struct RefreshSummary {
     pub needs_login: Vec<i64>,
 }
 
+/// 一次「站点侧密钥对齐到本地」的结果（M6-S5 / FR-2）。
+///
+/// **不含任何密钥明文，也不含 `secret_ref`**——它会被序列化到 UI。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeySyncSummary {
+    pub site_id: i64,
+    /// 站点侧一共多少条
+    pub site_total: usize,
+    /// 其中本地已经有了多少条
+    pub already_local: usize,
+    /// 本次新导入本地钥匙串多少条
+    pub imported: usize,
+    /// 站点没给明文（或写入钥匙串失败）的 `remote_id`。
+    ///
+    /// 不静默跳过：PRD §10 的风险表里明确有「站点不提供密钥明文回读」这一条，
+    /// 界面需要据此引导用户「新建一把」而不是以为对齐成功了。
+    pub unreadable: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SiteSummary {
     pub id: i64,
@@ -191,6 +215,65 @@ pub struct SiteSummary {
     pub base_url: String,
     pub display_name: String,
     pub health: String,
+}
+
+/// 轮换预览（M6-S5 / FR-7）。**只读**，不含密钥。
+///
+/// 菜单上必须先看预览再动手：第三步（回收旧 key）是不可逆的，而 PRD §7 要求
+/// 「危险操作二次确认」——没有预览，二次确认就只是「真的要删吗」的空话，
+/// 用户看不到「会波及哪些投递目标」这个真正需要他判断的东西。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RotationPlan {
+    pub key_id: i64,
+    pub site_id: i64,
+    /// 密钥名（**上游自由文本**：只用于界面上确认「是哪一把」，不得进通知正文）
+    pub key_name: String,
+    /// 固定三步（`rotation::rotation_steps()`；顺序不可重排）
+    pub steps: Vec<crate::rotation::RotationStep>,
+    /// 会被重注入的通道（`channel.as_str()`，升序去重）
+    pub channels: Vec<String>,
+    /// 绑定了这把 key、但 `agent_id` 认不出通道的目标，升序去重。
+    /// **非空 = 不能轮换**（见 [`KeyRelayService::rotate_key`] 的前置拒绝）。
+    pub unmapped_targets: Vec<String>,
+    /// 旧 key 的站点侧 id；`None` = 本地记录里就没有，第三步会被跳过并说明
+    pub old_remote_id: Option<String>,
+}
+
+/// 「回收旧 key」这一步的结局。四态**互斥且穷尽**，界面必须逐态给出不同文案——
+/// 「跳过了」与「做了但失败」是两件完全不同的事，合并成一个 `bool` 会让
+/// 「旧密钥是否还活着」变成猜谜。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RevokeOutcome {
+    /// 已在站点侧删除
+    Revoked,
+    /// 本地记录里没有站点侧 id（老库 / 手工导入），**跳过**
+    SkippedNoRemoteId,
+    /// 没走到这一步（前一步失败了）
+    NotAttempted,
+    /// 走到了，站点侧拒绝（原因已脱敏）
+    Failed(String),
+}
+
+/// 一次轮换的完整结果。**不含密钥明文**（新 key 只有掩码形态）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RotationRun {
+    /// 新建的 key（明文只进钥匙串）
+    pub new_key: StoredKey,
+    /// 已成功重注入的通道（按注入顺序）
+    pub reinjected: Vec<String>,
+    pub revoke: RevokeOutcome,
+    /// 停在哪一步（`None` = 三步全部走完，或第三步按规跳过）
+    pub stopped_at: Option<crate::rotation::RotationStep>,
+    /// 停下的人话原因（已脱敏）；与 `stopped_at` 同生共死
+    pub stop_reason: Option<String>,
+}
+
+impl RotationRun {
+    /// 是否「没有中途失败」。注意 `SkippedNoRemoteId` **算完成**——
+    /// 那是「本来就没得回收」，不是失败；界面仍要把它单独说明。
+    pub fn completed(&self) -> bool {
+        self.stopped_at.is_none()
+    }
 }
 
 impl From<SiteRow> for SiteSummary {
@@ -219,6 +302,116 @@ pub struct ExportOutcome {
     pub registered: bool,
 }
 
+/// 当前 unix 秒。
+///
+/// 只给 [`KeyRelayService::dispatch_notifications`] 与 [`KeyRelayService::rotation_due`] 用：
+/// `notify::evaluate` 与 `rotation::due_keys` 都是纯函数，时间必须由调用方传入
+/// （这样它们才能被单测）。这里是唯一的「读时钟」点。
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 「什么都还不知道」的基线项：字段名与真实快照一致，取值一律是「从未取到过」
+/// （`balance: None`、`needs_login: false`、`drift: []` …）。
+///
+/// 刻意**不**从 `current` 复制任何取值：复制取值等于把当前状态当成历史，
+/// 边沿会被去重吃掉（修 W-1 时踩到的正是这个坑）。保留 `site_id` / `display_name`：
+/// 规则按 `site_id` 找基线，找不到就等于没有基线。
+fn neutral_site(site: &crate::notify::SiteSnapshot) -> crate::notify::SiteSnapshot {
+    crate::notify::SiteSnapshot {
+        site_id: site.site_id,
+        display_name: site.display_name.clone(),
+        ..Default::default()
+    }
+}
+
+/// 上一轮快照 + 给「本轮才出现的站点」补的中性项。
+///
+/// `prev == None`（进程刚起来 / 刚开通知）时，结果就是「全部站点都用中性项」；
+/// `prev == Some` 时**只**追加缺失的站点，已有站点一律沿用真实的上一轮值——
+/// 历史不能被中性值冲掉，否则每一轮都变成「第一次见到它」，边沿型规则会退化成每轮都报。
+fn filled_baseline(
+    prev: Option<crate::notify::Snapshot>,
+    current: &crate::notify::Snapshot,
+) -> crate::notify::Snapshot {
+    let mut sites = prev.map(|snapshot| snapshot.sites).unwrap_or_default();
+    for site in &current.sites {
+        // 追加是安全的：`Snapshot::site()` 取**第一个**匹配项，所以已有站点一定先被找到。
+        if !sites.iter().any(|known| known.site_id == site.site_id) {
+            sites.push(neutral_site(site));
+        }
+    }
+    crate::notify::Snapshot { sites }
+}
+
+/// 自启用的应用标识。固定值：一个用户只该有一份自启项，
+/// 让它随 `base_url` 或版本变化会产生「升级一次多一个自启项」。
+///
+/// 只允许 `[A-Za-z0-9._-]`——`platform_env` 与 `autostart` 的入口会校验，
+/// 含 `/` 或 `..` 一律拒绝（路径穿越防线）。
+pub const AUTOSTART_APP_ID: &str = "keyrelay";
+
+/// 同一目录下「同主名、不同扩展名」的兄弟文件（M6-S5 / BACKLOG B-76）。
+///
+/// # 为什么需要它
+///
+/// 投递通道的落点是被冻结的常量（例如 OpenCode 写 `~/.config/opencode/opencode.json`）。
+/// 但有些 agent 会**优先读另一个扩展名的文件**——本机实测 `~/.config/opencode/` 下
+/// `.json` 与 `.jsonc` 并存。若 opencode 读的是 `.jsonc`，我们写进 `.json` 的密钥
+/// 会被**静默忽略**：用户看到「已投递成功」，agent 却拿不到 key，而且没有任何报错。
+///
+/// 这个函数只负责**发现**，不做判定、不产生文案——「是不是问题」取决于具体 agent，
+/// 由调用方决定怎么呈现。
+///
+/// 返回排序后的绝对路径列表（排序是为了让 UI 输出稳定、让测试可断言）。
+/// 读目录失败、目标没有扩展名、目标是目录 —— 一律返回空列表（探测失败不该阻断投递）。
+pub fn sibling_config_files(target: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Some(stem) = target.file_stem() else {
+        return Vec::new();
+    };
+    // 目标自己没有扩展名时「另一个扩展名」无从谈起（`rc` vs `rc.sh` 是**另一个名字**，
+    // 不是同一份配置的另一种写法）。直接返回空，避免制造无从处置的警告。
+    let Some(target_ext) = target.extension() else {
+        return Vec::new();
+    };
+    let Some(parent) = target.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .filter(|entry| {
+            let path = entry.path();
+            // 只要普通文件：目录名碰巧同主名（例如 `opencode.json/`）不是配置文件
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                return false;
+            }
+            // 主名必须逐字相同（`opencode.json` ↔ `opencode.jsonc`；`auth.json` ↔ `auth.jsonc`）
+            if path.file_stem() != Some(stem) {
+                return false;
+            }
+            // 扩展名必须**存在且不同**：
+            // - 同名文件（扩展名相同）就是目标自己，不算兄弟；
+            // - 无扩展名的同主名文件（`config.toml` vs `config`）是**另一个名字**，
+            //   不是同一份配置的另一种写法，报出来只会制造噪声。
+            match path.extension() {
+                Some(ext) => ext != target_ext,
+                None => false,
+            }
+        })
+        .map(|entry| entry.path())
+        .collect();
+
+    out.sort();
+    out
+}
+
 pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     registry: SiteRegistry<T>,
     store: Store,
@@ -226,6 +419,18 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     vault: Arc<dyn Vault>,
     home: PathBuf,
     backup_dir: PathBuf,
+    /// 通知装配 + 跨轮快照（M6-S5 / FR-3）。
+    ///
+    /// `last` 用 `Mutex` 是因为 [`Self::refresh_all`] 取 `&self`——快照要在多轮之间
+    /// 存活，而 `evaluate` 的「边沿型」规则（用量跳变 / 登录态失效 / 额度耗尽 / 漂移）
+    /// 必须拿上一轮做基线，否则每一轮都会被当成「新事件」重复通知。
+    notify: Option<NotifyState>,
+}
+
+/// 通知的运行时状态。`config` 是冻结的装配参数，`last` 是上一轮快照。
+struct NotifyState {
+    config: crate::notify::NotifyConfig,
+    last: std::sync::Mutex<Option<crate::notify::Snapshot>>,
 }
 
 impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
@@ -237,7 +442,21 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             vault: config.vault,
             home: config.home,
             backup_dir: config.backup_dir,
+            // 默认**不通知**：通知会弹窗并发网络请求，测试与纯核心用例不该意外触发。
+            notify: None,
         }
+    }
+
+    /// 打开通知（M6-S5 / FR-3）。不调用 = 完全不通知。
+    ///
+    /// 做成构造器方法而不是 [`ServiceConfig`] 的字段，是为了让既有调用方零改动
+    /// （理由见 `ServiceConfig` 的文档）。
+    pub fn with_notify(mut self, config: crate::notify::NotifyConfig) -> Self {
+        self.notify = Some(NotifyState {
+            config,
+            last: std::sync::Mutex::new(None),
+        });
+        self
     }
 
     /// 钥匙串后端标识（诊断用；`"memory"` 出现在生产装配里即为缺陷）。
@@ -676,6 +895,13 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         for (key, value) in settings.to_pairs() {
             self.store.set_setting(key, &value)?;
         }
+        // 事件里**只**记这三个「纯数值/布尔」的项。
+        //
+        // M6-S5 新增的字段刻意不记：
+        // - `proxy_url` 与 `notify_webhook_url` 都可能内嵌凭证（`https://user:pass@…`），
+        //   事件表是会被导出与审计的地方，不能作为它们的出口；
+        // - `theme` / `language` / 各类开关没有诊断价值，记了只是噪声。
+        // 需要确认「设置被改过」时，事件本身（`设置已更新`）已经够了。
         self.log(observability::event_with_payload(
             Level::Info,
             "app",
@@ -704,19 +930,48 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             sites_total: sites.len(),
             ..Default::default()
         };
+        // 本轮快照（M6-S5 / FR-3）。即使没开通知也照常收集——收集是纯内存操作，
+        // 而「开通知」是本轮之后才可能发生的设置变更；这样开关打开时不需要先空跑一轮。
+        let mut snapshots: Vec<crate::notify::SiteSnapshot> = Vec::with_capacity(sites.len());
+
+        // 漂移与轮换到期是**纯本地**判定，每轮各算一次再按站点归组（M6-S5 / W-1）。
+        //
+        // 放在循环外：两者的结果与「哪个站点」无关，放进循环会变成每站点一次文件哈希
+        // 加一次全表查询。
+        // 必须采集：不采集时这两类事实恒为空集——W-1 实测的后果是
+        // `NotifyKind::Drift` 与 `RotationDue` 在生产上**永不触发**（FR-3 的漂移告警与
+        // FR-7 的到期提醒没有任何出口），而四份包内复审都没看见，因为它落在包与包的缝里。
+        let drift_by_site = self.collect_notify_input("漂移", || self.drift_facts_by_site());
+        let rotation_by_site =
+            self.collect_notify_input("轮换到期", || self.rotation_facts_by_site());
 
         for site in sites {
             // 没有会话：要么用户从没登录过它（跳过），要么上一轮已判过「需要重新登录」
             // ——后者必须每轮都带出来，且不发任何请求（纯本地判定）。
             if self.sessions.get(site.id).is_none() {
-                if site.health == HEALTH_NEEDS_LOGIN {
+                let needs_login = site.health == HEALTH_NEEDS_LOGIN;
+                if needs_login {
                     summary.needs_login.push(site.id);
                 }
+                snapshots.push(crate::notify::SiteSnapshot {
+                    site_id: site.id,
+                    display_name: site.display_name.clone(),
+                    balance: None,
+                    needs_login,
+                    quota_exceeded: false,
+                    models: None,
+                    // 漂移与轮换到期都**不依赖会话**（前者由投递绑定推出、后者只看本地密钥
+                    // 的创建时间），所以「没会话」这个分支同样要带上——否则用户在一个会话
+                    // 失效的站点上反而看不到「这个站点的密钥该换了」。
+                    drift: drift_by_site.get(&site.id).cloned().unwrap_or_default(),
+                    rotation_due: rotation_by_site.get(&site.id).cloned().unwrap_or_default(),
+                });
                 continue;
             }
 
             let balance = self.balance(site.id).await;
             let keys = self.list_keys(site.id).await;
+            let mut quota_exceeded = false;
 
             match (&balance, &keys) {
                 (Ok(_), Ok(list)) => {
@@ -732,6 +987,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                     if failure.is_some_and(is_auth_failure) {
                         summary.needs_login.push(site.id);
                     }
+                    // 额度耗尽（HTTP 403 + 已知错误码）是**独立**于会话失效的一种状态：
+                    // 会话是好的，只是没钱了。分开判定，否则用户会去重新登录一个
+                    // 根本不需要登录的站点（PRD FR-3 的告警清单里两条并列）。
+                    quota_exceeded = matches!(failure, Some(Error::QuotaExhausted));
                     self.log(observability::event_with_payload(
                         Level::Warn,
                         "site",
@@ -761,6 +1020,27 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                     ));
                 }
             }
+
+            snapshots.push(crate::notify::SiteSnapshot {
+                site_id: site.id,
+                display_name: site.display_name.clone(),
+                balance: balance
+                    .as_ref()
+                    .ok()
+                    .map(|b| crate::notify::BalanceSnapshot {
+                        remaining: b.remaining,
+                        used: b.used,
+                        currency: b.currency.clone(),
+                    }),
+                needs_login: summary.needs_login.contains(&site.id),
+                quota_exceeded,
+                // `models` 本轮不取：拿模型列表要先用某把 key 调 `/v1/models`，
+                // 那是「每个站点每轮一次额外的带密钥请求」。见 spec §6 的
+                // `ModelsChanged` 未接线说明（已登记为**有意取舍**，见 BACKLOG B-80）。
+                models: None,
+                drift: drift_by_site.get(&site.id).cloned().unwrap_or_default(),
+                rotation_due: rotation_by_site.get(&site.id).cloned().unwrap_or_default(),
+            });
         }
 
         // `list_sites` 已按 id 升序，这里的排序是让「升序去重」成为实现自身的性质，
@@ -783,7 +1063,591 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 "needs_login": &summary.needs_login,
             }),
         ));
+
+        self.dispatch_notifications(snapshots);
         Ok(summary)
+    }
+
+    /// 把本轮快照交给通知规则，并把产生的通知发出去（M6-S5 / FR-3）。
+    ///
+    /// 四条硬约束：
+    /// 1. **不 panic、不 `?`**：通知是后台任务的一部分，任何失败只记事件。
+    ///    一个坏掉的 webhook 不该让整轮刷新算失败。
+    /// 2. **快照在发送之后推进**：`evaluate` 的边沿型规则需要上一轮做基线。
+    ///    代价是「发送失败的那条边沿通知不会重试」——这是**有意**的取舍：
+    ///    反过来（不推进）会让一个永久坏掉的 webhook 每轮都重发，
+    ///    而事件表里已经留下了失败记录。
+    /// 3. **webhook 地址进事件前必须剥掉 userinfo**：`https://user:pass@hook` 里的
+    ///    凭证不能因为「记一条发送失败」而落进事件表（事件表会被导出与审计）。
+    /// 4. **系统通知与 webhook 互不阻塞**：一个失败不影响另一个。
+    fn dispatch_notifications(&self, snapshots: Vec<crate::notify::SiteSnapshot>) {
+        let Some(state) = &self.notify else {
+            return;
+        };
+        let prev = state.last.lock().ok().and_then(|guard| guard.clone());
+        let now = unix_now_secs();
+        let snapshot = crate::notify::Snapshot { sites: snapshots };
+        // 基线：上一轮快照，**并给「本轮才出现的站点」补中性值**（M6-S5 接线决定，见 spec §6 D-4）。
+        //
+        // 为什么不能直接把 `None` 交给 `evaluate`：它的冻结口径是「`prev == None` → 只发事实型
+        // 规则」，而它取基线是**按站点**取的（`prev.and_then(|s| s.site(id))`）——所以「传 `None`」
+        // 与「传一条没有站点的空快照」对规则的效果完全相同，都给不出基线。
+        //
+        // 为什么不给基线会出事：`NotifyKind::Drift` 报不出「开着通知之前就已经漂移了」的目标
+        // ——第一次见到它时规则整条不评估，而这一轮的事实**已经写进了快照**，下一轮的
+        // `same_fact` 会把它当成「报过了」，于是**那条漂移永远不会被报出来**。
+        //
+        // 为什么**每一轮**都要补、而不是只在首轮补：站点可以是运行期新加的（新站点相对上一轮
+        // 快照同样「不存在」，按站点的 `before` 同样是 `None`）——上面那条链在它身上一模一样地
+        // 成立。这是与 W-1 同一类的缺陷（去重基线吞掉第一次），只是触发窗口窄得多。
+        //
+        // 代价：**进程重启后**处于坏状态的项会各再报一次。这不是新引入的一类噪声——
+        // `BalanceLow` 与 `RotationDue` 本来就是事实型，首轮也发，实际行为不变；
+        // 跨重启持久化基线登记为 BACKLOG B-81。
+        let baseline = filled_baseline(prev, &snapshot);
+        let items = crate::notify::evaluate(Some(&baseline), &snapshot, &state.config, now);
+
+        for item in &items {
+            self.log(observability::event_with_payload(
+                Level::Info,
+                "app",
+                format!("通知: {}", item.title),
+                serde_json::json!({
+                    "kind": format!("{:?}", item.kind),
+                    "site_id": item.site_id,
+                }),
+            ));
+
+            let mut failures: Vec<String> = Vec::new();
+            // `send` 是 `Notifier` trait 上的方法，必须把 trait 带进作用域才能调用。
+            use crate::notify::Notifier as _;
+            if state.config.system_enabled {
+                let notifier =
+                    crate::notify::SystemNotifier::new(Box::new(crate::notify::StdCommandRunner));
+                if let Err(err) = notifier.send(item) {
+                    failures.push(format!("系统通知: {err}"));
+                }
+            }
+            let has_webhook = state
+                .config
+                .webhook_url
+                .as_deref()
+                .is_some_and(|url| !url.trim().is_empty());
+            if has_webhook {
+                let notifier = crate::notify::WebhookNotifier::new(state.config.clone());
+                if let Err(err) = notifier.send(item) {
+                    failures.push(format!("webhook: {err}"));
+                }
+            }
+            if !failures.is_empty() {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "app",
+                    format!("通知发送失败: {}", failures.join(" | ")),
+                    serde_json::json!({
+                        "kind": format!("{:?}", item.kind),
+                        "webhook": crate::redact::strip_url_userinfo(
+                            state.config.webhook_url.as_deref().unwrap_or("")
+                        ),
+                    }),
+                ));
+            }
+        }
+
+        if let Ok(mut guard) = state.last.lock() {
+            *guard = Some(snapshot);
+        }
+    }
+
+    // ============================================ M6-S5 接线：FR-2 / FR-7
+
+    /// 该轮换的密钥（FR-7）。**纯本地判定**，不联网。
+    ///
+    /// 关闭轮换（`rotation_max_age_days == 0`）时直接返回空——不要在调用方各写一遍
+    /// 这个判断，否则总有一处会漏。
+    pub fn rotation_due(&self) -> Result<Vec<crate::rotation::RotationDue>> {
+        let settings = self.settings()?;
+        if !settings.rotation_enabled() {
+            return Ok(Vec::new());
+        }
+        // `store::KeyRow` 与 `rotation::KeyRow` 是同名不同字段的两个类型：
+        // 前者没有 `created_at`（现在补上了），后者只要 4 个字段。
+        // 编译器会挡住传错类型，这里的映射是显式的。
+        let rows: Vec<crate::rotation::KeyRow> = self
+            .store
+            .list_keys()?
+            .into_iter()
+            .map(|row| {
+                crate::rotation::KeyRow::new(row.id, row.site_id, row.name, Some(row.created_at))
+            })
+            .collect();
+        Ok(crate::rotation::due_keys(
+            &rows,
+            crate::rotation::RotationPolicy {
+                max_age_days: settings.rotation_max_age_days,
+                warn_before_days: settings.rotation_warn_before_days,
+            },
+            unix_now_secs(),
+        ))
+    }
+
+    /// 把「该轮换的密钥」按站点归组（通知快照的输入）。
+    ///
+    /// `SiteSnapshot::rotation_due` 的语义是「**已进入提醒窗口**的密钥」，窗口过滤由
+    /// [`Self::rotation_due`]（即 M6-S4 的 `due_keys`）完成——`evaluate` **不二次过滤**：
+    /// 它的冻结签名里没有窗口宽度参数，自己猜一个宽度只会把「还没到期」的钥匙也报出来。
+    fn rotation_facts_by_site(&self) -> Result<HashMap<i64, Vec<crate::notify::RotationDueFact>>> {
+        let mut grouped: HashMap<i64, Vec<crate::notify::RotationDueFact>> = HashMap::new();
+        for due in self.rotation_due()? {
+            grouped
+                .entry(due.site_id)
+                .or_default()
+                .push(crate::notify::RotationDueFact {
+                    key_id: due.key_id,
+                    // 密钥名是**上游自由文本**：这里带上只为与 `rotation::RotationDue` 对齐，
+                    // 规则的正文只输出 `key_id`（见 `notify/rules.rs` 的 `rotation_due`）。
+                    name: due.name,
+                    due_at: due.due_at,
+                });
+        }
+        Ok(grouped)
+    }
+
+    /// 把投递目标的漂移事实按站点归组（通知快照的输入）。
+    ///
+    /// 与 [`Self::drift_report`] 的分工——两者都要读一次文件哈希，但**用途不同**：
+    /// - `drift_report` 是**用户主动触发**的检查（命令层 / 启动检查），会为每个需注意的
+    ///   目标写一条 `warn` 事件；
+    /// - 本函数是**每轮刷新**的通知输入，**不写事件**。否则同一处漂移每轮被记一遍，
+    ///   事件表会被这一件事灌满（`refresh_all` 每轮已经有一条汇总事件）。
+    ///
+    /// 放进来的事实是**全集**（含 `Intact` / `Unknown`）：「要不要报」是规则的事，
+    /// 装配层先筛一遍会让「同状态去重」失去基线（`Intact → Modified` 是一次新的边沿）。
+    fn drift_facts_by_site(&self) -> Result<HashMap<i64, Vec<crate::notify::DriftFact>>> {
+        let mut grouped: HashMap<i64, Vec<crate::notify::DriftFact>> = HashMap::new();
+        for row in &self.store.binding_drift_rows()? {
+            let report = drift::report_for(row);
+            grouped
+                .entry(row.site_id)
+                .or_default()
+                .push(crate::notify::DriftFact {
+                    target_path: report.target_path.display().to_string(),
+                    agent_id: report.agent_id,
+                    channel: report.channel,
+                    state: report.state,
+                });
+        }
+        Ok(grouped)
+    }
+
+    /// 采集一类通知输入；失败时记一条事件并回落到空集。
+    ///
+    /// 为什么吞掉错误：[`Self::refresh_all`] 的返回值描述的是**站点刷新**的结果，
+    /// 通知输入采集失败不该让整轮算失败（与 `dispatch_notifications` 的
+    /// 「不 panic、不 `?`」同一口径）。
+    ///
+    /// 为什么不能静默：静默会让「通知为什么没来」变成一件无从查起的事——
+    /// 而这正是 W-1 能藏住的原因（恒空的 `Vec::new()` 不带任何痕迹）。
+    fn collect_notify_input<V>(&self, label: &str, collect: impl FnOnce() -> Result<V>) -> V
+    where
+        V: Default,
+    {
+        match collect() {
+            Ok(value) => value,
+            Err(err) => {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "app",
+                    format!("采集通知输入失败: {label}"),
+                    serde_json::json!({
+                        "kind": label,
+                        "error": crate::redact::scrub(&err.to_string()),
+                    }),
+                ));
+                V::default()
+            }
+        }
+    }
+
+    /// 这把 key 当前服务的投递通道（升序去重）+ 认不出通道的目标（升序去重）。
+    ///
+    /// 只查库、不读文件哈希：这是**归属关系**查询，`binding_drift_rows` 顺带给出的
+    /// 哈希列在这里没有任何用处（漂移检测才需要它）。
+    fn rotation_targets(&self, key_id: i64) -> Result<(Vec<DeliveryChannel>, Vec<String>)> {
+        let mut channels: Vec<DeliveryChannel> = Vec::new();
+        let mut unmapped: Vec<String> = Vec::new();
+        for binding in self.store.binding_drift_rows()? {
+            // 只看「这个目标**现在**由这把 key 服务」的绑定：查询已经按
+            // target_path 取了最新一条，所以这里筛掉的都是被别的 key 取代过的历史绑定。
+            if binding.key_id != key_id {
+                continue;
+            }
+            match DeliveryChannel::from_agent_id(&binding.agent_id) {
+                Some(channel) => {
+                    if !channels.contains(&channel) {
+                        channels.push(channel);
+                    }
+                }
+                // 认不出来的 `agent_id` 说明这个目标曾经由本产品投递过、而现在本产品
+                // 已经不认这个通道了（通道改名 / 被删 / 手工写的绑定行）。
+                // **必须报出来**，不能让 `filter_map` 把它悄悄滤掉：它会被漏在重注入之外，
+                // 而第三步要回收的正是它还在用的那把旧 key。
+                None => {
+                    if !unmapped.contains(&binding.agent_id) {
+                        unmapped.push(binding.agent_id.clone());
+                    }
+                }
+            }
+        }
+        channels.sort_by_key(|channel| channel.as_str());
+        unmapped.sort();
+        Ok((channels, unmapped))
+    }
+
+    /// 轮换预览（FR-7）。**只读**：两次库查询，不联网、不写盘、不含密钥明文。
+    pub fn rotation_plan(&self, key_id: i64) -> Result<RotationPlan> {
+        let row = self
+            .store
+            .get_key(key_id)?
+            .ok_or_else(|| Error::NotFound(format!("密钥 #{key_id} 不存在")))?;
+        let (channels, unmapped_targets) = self.rotation_targets(key_id)?;
+
+        Ok(RotationPlan {
+            key_id,
+            site_id: row.site_id,
+            key_name: row.name,
+            steps: crate::rotation::rotation_steps().to_vec(),
+            channels: channels
+                .into_iter()
+                .map(|channel| channel.as_str().to_string())
+                .collect(),
+            unmapped_targets,
+            old_remote_id: row.remote_id,
+        })
+    }
+
+    /// 执行一次轮换：`CreateNew → ReinjectAll → RevokeOld`（FR-7 / PRD §176 的「一键」）。
+    ///
+    /// **任一环失败即停**（章程 §4.5 / spec §4.1）。这不是保守，是唯一能避免死局的顺序：
+    /// 一旦在重注入没做完的情况下回收旧 key，用户会同时失去「旧 key 还能用」与
+    /// 「新 key 已生效」两个前提，而这两件事都不在他手里。
+    ///
+    /// 所以**部分失败照样返回 `Ok`**：`RotationRun` 带着「停在哪一步、为什么」，
+    /// 那是用户必须知道的可操作信息（「新 key 已建好，只注入成功了 1 个目标，
+    /// 旧 key 还在站点上」），压成一条 `Err(String)` 只会被界面读成一句「轮换失败」。
+    /// 只有**连开始都开始不了**的情形才返回 `Err`：key 不存在、或有目标认不出通道。
+    pub async fn rotate_key(&self, key_id: i64, spec: KeySpec) -> Result<RotationRun> {
+        let plan = self.rotation_plan(key_id)?;
+        if !plan.unmapped_targets.is_empty() {
+            // 前置拒绝，而且是**在动手之前**：这个判断是纯本地的，没有任何理由带着
+            // 「有目标认不出通道」的不确定性去建一把新 key。
+            return Err(Error::Inject {
+                path: plan.unmapped_targets.join(", "),
+                reason: "这些投递目标的通道无法识别，轮换会漏掉它们；若继续并回收旧密钥，\
+                         它们会永久停在旧密钥上"
+                    .to_string(),
+            });
+        }
+        // 通道用**解析好的枚举**迭代（而不是回头 `parse` 一遍 `plan.channels` 的字符串）：
+        // 认不出通道这件事上面已经拒绝过了，循环里不该再有一个「理论上不可达」的分支。
+        let (channels, _) = self.rotation_targets(key_id)?;
+
+        // ① 建新 key（明文只进钥匙串，本函数全程不持有它）
+        let new_key = self.create_key(plan.site_id, spec).await?;
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "key",
+            "轮换: 已创建新密钥",
+            serde_json::json!({
+                "step": crate::rotation::RotationStep::CreateNew.as_str(),
+                "site_id": plan.site_id,
+                "old_key_id": key_id,
+                "new_key_id": new_key.id,
+                "masked": new_key.masked,
+            }),
+        ));
+
+        // ② 全量重注入
+        let mut reinjected: Vec<String> = Vec::new();
+        for channel in channels {
+            let channel_name = channel.as_str();
+            if let Err(err) = self.apply_delivery(new_key.id, channel) {
+                let reason = crate::redact::scrub(&err.to_string());
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "key",
+                    "轮换中断: 重注入失败",
+                    serde_json::json!({
+                        "step": crate::rotation::RotationStep::ReinjectAll.as_str(),
+                        "site_id": plan.site_id,
+                        "new_key_id": new_key.id,
+                        "channel": channel_name,
+                        "reinjected": &reinjected,
+                    }),
+                ));
+                return Ok(RotationRun {
+                    new_key,
+                    reinjected,
+                    revoke: RevokeOutcome::NotAttempted,
+                    stopped_at: Some(crate::rotation::RotationStep::ReinjectAll),
+                    stop_reason: Some(format!("重注入 {channel_name} 失败: {reason}")),
+                });
+            }
+            reinjected.push(channel_name.to_string());
+        }
+
+        // ③ 回收旧 key
+        let Some(remote_id) = plan.old_remote_id.clone() else {
+            // 本地记录里就没有站点侧 id（老库 / 手工导入的行）——**不是失败**，
+            // 但也绝不能假装回收过。跳过并如实说明。
+            self.log(observability::event_with_payload(
+                Level::Info,
+                "key",
+                "轮换: 旧密钥没有站点侧 id，跳过回收",
+                serde_json::json!({
+                    "step": crate::rotation::RotationStep::RevokeOld.as_str(),
+                    "site_id": plan.site_id,
+                    "old_key_id": key_id,
+                }),
+            ));
+            return Ok(RotationRun {
+                new_key,
+                reinjected,
+                revoke: RevokeOutcome::SkippedNoRemoteId,
+                stopped_at: None,
+                stop_reason: None,
+            });
+        };
+        match self.revoke_key(plan.site_id, &remote_id).await {
+            Ok(()) => {
+                self.log(observability::event_with_payload(
+                    Level::Info,
+                    "key",
+                    "轮换完成: 新密钥已全量注入，旧密钥已回收",
+                    serde_json::json!({
+                        "site_id": plan.site_id,
+                        "old_key_id": key_id,
+                        "new_key_id": new_key.id,
+                        "reinjected": &reinjected,
+                    }),
+                ));
+                Ok(RotationRun {
+                    new_key,
+                    reinjected,
+                    revoke: RevokeOutcome::Revoked,
+                    // 本地那一行**刻意不删**：`bindings.key_id` 是 `ON DELETE CASCADE`，
+                    // 删行会连带丢掉旧 key 的绑定与漂移追溯；对账交给 `sync_site_keys`。
+                    stopped_at: None,
+                    stop_reason: None,
+                })
+            }
+            Err(err) => {
+                let reason = crate::redact::scrub(&err.to_string());
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "key",
+                    "轮换中断: 旧密钥回收失败",
+                    serde_json::json!({
+                        "step": crate::rotation::RotationStep::RevokeOld.as_str(),
+                        "site_id": plan.site_id,
+                        "old_key_id": key_id,
+                        "new_key_id": new_key.id,
+                    }),
+                ));
+                Ok(RotationRun {
+                    new_key,
+                    reinjected,
+                    revoke: RevokeOutcome::Failed(reason.clone()),
+                    stopped_at: Some(crate::rotation::RotationStep::RevokeOld),
+                    stop_reason: Some(format!("回收旧密钥失败: {reason}")),
+                })
+            }
+        }
+    }
+
+    /// 站点侧可用分组与倍率（FR-2）。
+    pub async fn available_groups(&self, site_id: i64) -> Result<Vec<crate::site::GroupInfo>> {
+        let site = self.site(site_id)?;
+        let session = self.session(site_id)?;
+        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        adapter.available_groups(&site.base_url, &session).await
+    }
+
+    /// 把站点侧已有密钥的明文**一次性对齐到本地钥匙串**（FR-2 的批量读明文）。
+    ///
+    /// # 为什么不做成「把明文返回给前端」
+    ///
+    /// 命令层的现有设计里**没有任何一条命令返回过密钥明文**（`reveal_key` 至今
+    /// 只在核心层与测试里用）。批量明文一旦过 IPC，它就会进入 WebView 的内存、
+    /// 开发者工具、以及任何注入到页面的东西——这与 FR-8 的「密钥只存在于系统钥匙串
+    /// 与内存」相比，是把「内存」的边界扩大到了整个渲染进程。
+    ///
+    /// PRD 附录 A 对 `POST /api/token/batch/keys` 的说明是「**一次性对齐本地**」，
+    /// 也就是说它的用途本来就是本地记账，不是展示。所以这里把它做成一个
+    /// **不外流明文**的对齐操作：取回 → 写钥匙串 → 记 `secret_ref` → 只回计数。
+    pub async fn sync_site_keys(&self, site_id: i64) -> Result<KeySyncSummary> {
+        let site = self.site(site_id)?;
+        let session = self.session(site_id)?;
+        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        let metas = adapter.list_keys(&site.base_url, &session).await?;
+
+        // 本地已有的（按 remote_id 判重）。**只在同一个站点内判重**：
+        // 不同站点的 remote_id 会撞（NewAPI 与 Sub2API 都从 1 开始编号）。
+        let existing: Vec<Option<String>> = self
+            .store
+            .list_keys()?
+            .into_iter()
+            .filter(|row| row.site_id == site_id)
+            .map(|row| row.remote_id)
+            .collect();
+
+        let missing: Vec<String> = metas
+            .iter()
+            .filter(|meta| {
+                !existing
+                    .iter()
+                    .any(|known| known.as_deref() == Some(meta.remote_id.as_str()))
+            })
+            .map(|meta| meta.remote_id.clone())
+            .collect();
+
+        if missing.is_empty() {
+            return Ok(KeySyncSummary {
+                site_id,
+                site_total: metas.len(),
+                already_local: metas.len(),
+                imported: 0,
+                unreadable: Vec::new(),
+            });
+        }
+
+        let materials = adapter
+            .reveal_keys(&site.base_url, &session, &missing)
+            .await?;
+
+        let mut imported = 0usize;
+        let mut unreadable: Vec<String> = Vec::new();
+        for (remote_id, material) in materials {
+            let name = metas
+                .iter()
+                .find(|meta| meta.remote_id == remote_id)
+                .map(|meta| meta.name.clone())
+                .unwrap_or_else(|| remote_id.clone());
+            if material.secret.trim().is_empty() {
+                // 站点给了条目但没给明文（「不提供密钥明文回读」，PRD §10 风险表）。
+                // 不静默跳过：把它列出来，UI 才能引导用户新建。
+                unreadable.push(remote_id);
+                continue;
+            }
+            match self.store_key_material(site_id, &name, Some(&remote_id), &material.secret) {
+                Ok(_) => imported += 1,
+                Err(err) => {
+                    // 单条失败不中断整批：对齐是尽力而为的，失败的那条下一轮还能再来。
+                    self.log(observability::event_with_payload(
+                        Level::Warn,
+                        "key",
+                        format!("对齐密钥失败: {err}"),
+                        serde_json::json!({ "site_id": site_id, "remote_id": remote_id }),
+                    ));
+                    unreadable.push(remote_id);
+                }
+            }
+        }
+
+        let summary = KeySyncSummary {
+            site_id,
+            site_total: metas.len(),
+            already_local: metas.len() - missing.len(),
+            imported,
+            unreadable,
+        };
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "key",
+            format!(
+                "密钥对齐完成: 站点 {} 条 / 已有 {} / 新导入 {} / 不可读 {}",
+                summary.site_total,
+                summary.already_local,
+                summary.imported,
+                summary.unreadable.len()
+            ),
+            // **不含明文，也不含 `secret_ref`**：事件表会被导出与审计。
+            serde_json::json!({
+                "site_id": summary.site_id,
+                "site_total": summary.site_total,
+                "already_local": summary.already_local,
+                "imported": summary.imported,
+                "unreadable_count": summary.unreadable.len(),
+            }),
+        ));
+        Ok(summary)
+    }
+
+    /// 批量读明文（FR-2）。
+    ///
+    /// **事件里只记条数与 id，不记明文**——这里与 [`Self::reveal_key`] 同一条红线。
+    /// 空入参不发请求（由适配器保证），因此这里也不需要特判。
+    pub async fn reveal_keys_batch(
+        &self,
+        site_id: i64,
+        remote_ids: &[String],
+    ) -> Result<Vec<(String, KeyMaterial)>> {
+        let site = self.site(site_id)?;
+        let session = self.session(site_id)?;
+        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        let materials = adapter
+            .reveal_keys(&site.base_url, &session, remote_ids)
+            .await?;
+        self.log(observability::event_with_payload(
+            Level::Debug,
+            "key",
+            format!("批量读取密钥明文: {} 条", materials.len()),
+            serde_json::json!({
+                "site_id": site_id,
+                // 只记 id：`remote_id` 不是秘密，但**条数与 id 一起**已经足够诊断
+                "remote_ids": remote_ids,
+            }),
+        ));
+        Ok(materials)
+    }
+
+    /// 登录自启的当前状态（FR-7）。
+    pub fn autostart_state(&self) -> Result<crate::autostart::AutostartState> {
+        crate::autostart::state(&self.home, AUTOSTART_APP_ID)
+    }
+
+    /// 生成「开启 / 关闭登录自启」的计划（FR-7）。**纯产出，不落盘**。
+    ///
+    /// `exe` 是当前可执行文件路径；`hidden` 固定为 `true`——自启的用途就是后台刷新，
+    /// 弹窗会破坏它。`--hidden` 在托盘不可用时会被壳层降级成显示窗口（`lib.rs`）。
+    pub fn autostart_plan(&self, enable: bool, exe: &Path) -> Result<crate::platform_env::EnvPlan> {
+        if enable {
+            crate::autostart::plan_enable(&self.home, AUTOSTART_APP_ID, exe, true)
+        } else {
+            crate::autostart::plan_disable(&self.home, AUTOSTART_APP_ID)
+        }
+    }
+
+    /// 把一份环境/自启计划落盘（FR-4 / FR-7）。
+    ///
+    /// Windows 形态（`EnvPlan::Registry`）在这里返回 `Ok(None)` 并**记一条事件**——
+    /// 真正的注册表写入由壳层执行（`reg.exe`），核心层不执行外部程序。
+    pub fn apply_env_plan(
+        &self,
+        plan: &crate::platform_env::EnvPlan,
+    ) -> Result<Option<crate::inject::Journal>> {
+        let journal = plan.apply_files(&self.backup_dir)?;
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "app",
+            "环境/自启计划已处理",
+            serde_json::json!({
+                // `describe()` 只含路径、字节数与键名，**不含任何值**（可能是密钥）
+                "plan": plan.describe(),
+                "journal": journal.as_ref().map(|j| j.id.clone()),
+            }),
+        ));
+        Ok(journal)
     }
 
     /// 读某把令牌的明文。**只有显式调用才会返回密钥本体**——列举接口一律不含明文。
@@ -1299,6 +2163,82 @@ mod tests {
     use super::*;
     use crate::site::transport::{HttpResponse, MockTransport};
     use serde_json::json;
+
+    // ============================================ sibling_config_files（B-76）
+
+    #[test]
+    fn sibling_config_files_finds_a_differently_extensioned_twin() {
+        // 本机真实形态：~/.config/opencode/ 下 .json 与 .jsonc 并存
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("opencode.json");
+        std::fs::write(&target, "{}").unwrap();
+        std::fs::write(dir.path().join("opencode.jsonc"), "{/* c */}").unwrap();
+
+        let found = sibling_config_files(&target);
+        assert_eq!(found, vec![dir.path().join("opencode.jsonc")]);
+    }
+
+    #[test]
+    fn sibling_config_files_ignores_the_target_itself() {
+        // 只有目标自己存在时不得把它当兄弟（否则每条通道都会「警告」一次）
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+        std::fs::write(&target, "{}").unwrap();
+        assert!(sibling_config_files(&target).is_empty());
+
+        // 目标不存在时同样为空——探测失败不该阻断投递
+        let missing = dir.path().join("nope.json");
+        assert!(sibling_config_files(&missing).is_empty());
+    }
+
+    #[test]
+    fn sibling_config_files_requires_an_exact_stem_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        std::fs::write(&target, "").unwrap();
+        // 这些都不该命中：主名不同
+        std::fs::write(dir.path().join("config.local.toml"), "").unwrap();
+        std::fs::write(dir.path().join("myconfig.yaml"), "").unwrap();
+        // 主名相同但**没有扩展名**：那是另一个名字，不是同一份配置的另一种写法
+        std::fs::write(dir.path().join("config"), "").unwrap();
+        // 这个该命中：主名逐字相同、扩展名存在且不同
+        std::fs::write(dir.path().join("config.yaml"), "").unwrap();
+
+        let found = sibling_config_files(&target);
+        assert_eq!(found, vec![dir.path().join("config.yaml")]);
+    }
+
+    #[test]
+    fn sibling_config_files_skips_directories_with_the_same_stem() {
+        // `opencode.json/` 这种目录名不是配置文件，不该被报成「agent 可能读的那个」
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("opencode.json");
+        std::fs::write(&target, "{}").unwrap();
+        std::fs::create_dir(dir.path().join("opencode.jsonc")).unwrap();
+
+        assert!(sibling_config_files(&target).is_empty());
+    }
+
+    #[test]
+    fn sibling_config_files_is_sorted_and_handles_extensionless_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("rc");
+        std::fs::write(&target, "").unwrap();
+        std::fs::write(dir.path().join("rc.sh"), "").unwrap();
+
+        // 目标没有扩展名 → 不做探测（「兄弟」的语义在这里不成立）
+        assert!(sibling_config_files(&target).is_empty());
+
+        // 多个兄弟时输出必须有序，UI 与测试才稳定
+        let target2 = dir.path().join("app.json");
+        std::fs::write(&target2, "").unwrap();
+        std::fs::write(dir.path().join("app.zsh"), "").unwrap();
+        std::fs::write(dir.path().join("app.bash"), "").unwrap();
+        let found = sibling_config_files(&target2);
+        let mut expected = vec![dir.path().join("app.bash"), dir.path().join("app.zsh")];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
 
     fn status_response() -> HttpResponse {
         HttpResponse::json(

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-available-groups"
+description = "Enables the available_groups command without any pre-configured scope."
+commands.allow = ["available_groups"]
+
+[[permission]]
+identifier = "deny-available-groups"
+description = "Denies the available_groups command without any pre-configured scope."
+commands.deny = ["available_groups"]

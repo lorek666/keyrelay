@@ -36,6 +36,18 @@ fn settings_survive_a_reopen() {
         drift_check_on_start: false,
         gateway_enabled: true,
         gateway_port: 9999,
+        // M6-S5 新增字段也走一遍真实的落库 / 重开往返
+        theme: "dark".to_string(),
+        language: "en-US".to_string(),
+        notify_webhook_url: "https://hooks.example.com/kr".to_string(),
+        notify_timeout_secs: 25,
+        rotation_max_age_days: 45,
+        rotation_warn_before_days: 10,
+        close_to_tray: false,
+        start_hidden: true,
+        telemetry_enabled: true,
+        autostart_enabled: true,
+        ..Settings::default()
     };
     service_on(&path).update_settings(&wanted).unwrap();
 

@@ -7,8 +7,11 @@
 
 mod commands;
 pub mod commands_list;
+pub mod tray;
 
 use std::path::PathBuf;
+
+use tauri::Manager;
 
 use keyrelay_core::service::{KeyRelayService, ServiceConfig};
 use keyrelay_core::site::registry::SiteRegistry;
@@ -34,6 +37,12 @@ pub struct AppState {
     /// 而 `std::sync::MutexGuard` 不能跨 `await`（不是 `Send`）。
     /// 用 std 锁只在取 `Option` 时上锁，等于没修 —— 两个并发启动仍会各自 bind。
     pub gateway_op: tokio::sync::Mutex<()>,
+    /// 托盘图标是否真的建起来了（M6-S5）。
+    ///
+    /// 这个标志位决定「能不能隐藏窗口」：托盘不可用时隐藏窗口会把应用变成
+    /// 用户碰不到的后台进程。无 GUI 会话（CI / SSH / headless）下建不出托盘是**正常**结果，
+    /// 所以默认 `false`，由 `setup` 里的真实结果覆盖。
+    pub tray_available: std::sync::atomic::AtomicBool,
 }
 
 /// 用户主目录。解析逻辑在 `keyrelay_core::platform`（按平台处理 `KEYRELAY_HOME` /
@@ -104,6 +113,8 @@ fn state_with_config(
         db_error,
         gateway: std::sync::Mutex::new(None),
         gateway_op: tokio::sync::Mutex::new(()),
+        // 真实结果由 `setup` 里的 `tray::build` 覆盖；测试里永远保持 false
+        tray_available: std::sync::atomic::AtomicBool::new(false),
     }
 }
 
@@ -169,7 +180,15 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::gateway_start,
             commands::gateway_stop,
             commands::export_bundle,
-            commands::prune_backups
+            commands::prune_backups,
+            // M6-S5：FR-2 / FR-7 接线
+            commands::available_groups,
+            commands::sync_site_keys,
+            commands::rotation_due,
+            commands::rotation_plan,
+            commands::rotate_key,
+            commands::autostart_status,
+            commands::autostart_set
         ])
 }
 
@@ -243,7 +262,73 @@ pub fn run() {
     let result = configure(tauri::Builder::default())
         .setup(|app| {
             spawn_maintenance_tasks(app.handle());
+
+            // 托盘（M6-S5 / B-53）。**失败不阻断启动**：无 GUI 会话的环境
+            // （CI、SSH、headless）建不出托盘图标，但那不该让整个应用起不来。
+            let tray_available = match tray::build(app.handle()) {
+                Ok(()) => true,
+                Err(err) => {
+                    eprintln!("[keyrelay] 托盘图标创建失败（应用继续运行）: {err}");
+                    false
+                }
+            };
+            if let Some(state) = app.try_state::<AppState>() {
+                state
+                    .tray_available
+                    .store(tray_available, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            // 启动隐藏：命令行 `--hidden` 与设置项 `start_hidden` 任一为真。
+            // **托盘不可用时降级为显示窗口**（`should_start_hidden` 的语义）——
+            // 否则用户会以为应用根本没启动，而实际上它只是没有入口。
+            let hidden_flag = tray::has_hidden_flag(std::env::args());
+            let settings = app
+                .try_state::<AppState>()
+                .and_then(|state| state.service.settings().ok());
+            let want_hidden = settings
+                .as_ref()
+                .map(|s| s.should_start_hidden(hidden_flag, tray_available))
+                .unwrap_or(false);
+            if want_hidden {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            } else if hidden_flag || settings.map(|s| s.start_hidden).unwrap_or(false) {
+                eprintln!(
+                    "[keyrelay] 托盘不可用，已忽略「启动时隐藏窗口」的请求：\
+                     隐藏之后没有任何入口能把窗口调回来"
+                );
+            }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // 关窗 → 隐藏到托盘（默认），除非用户在设置里关掉了 `close_to_tray`，
+            // 或托盘压根没建起来（此时隐藏 = 应用不可达）。
+            //
+            // 为什么每次读设置而不是读一个启动时快照：用户可能在运行中改这个开关，
+            // 而关窗行为要立刻跟着变。读库失败时**放行关闭**（fail-open）——
+            // 让用户关得掉窗口，比让他关不掉更不容易出事。
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            let handle = window.app_handle();
+            let tray_ok = handle
+                .try_state::<AppState>()
+                .map(|state| {
+                    state
+                        .tray_available
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .unwrap_or(false);
+            let hide = handle
+                .try_state::<AppState>()
+                .and_then(|state| state.service.settings().ok())
+                .map(|settings| settings.should_hide_on_close(tray_ok))
+                .unwrap_or(false);
+            if hide {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .run(tauri::generate_context!());
 
