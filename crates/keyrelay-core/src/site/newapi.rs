@@ -11,6 +11,7 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 use super::password_crypto::{encrypt_password, PasswordEncryptionKey};
 use super::transport::{HttpRequest, HttpTransport, Method};
@@ -108,16 +109,22 @@ impl<T: HttpTransport> NewApi<T> {
         };
 
         let enabled_field = value.pointer("/data/enabled");
-        let enabled = match enabled_field {
-            Some(Value::Bool(flag)) => *flag,
-            None => false,
-            Some(other) => {
-                return Err(Error::Transport(format!(
-                    "登录加密探测响应异常：enabled 字段类型不可识别（{}）",
-                    json_kind(other)
-                )))
-            }
-        };
+        let enabled =
+            match enabled_field {
+                Some(Value::Bool(flag)) => *flag,
+                // 端点存在、返回了 JSON 信封，却没有 `enabled` 字段 → 无法判定，fail-closed。
+                // 与 `enabled: null` 同策略：把「读不懂」和「明确关闭」区分开（复核 N-2）。
+                None => return Err(Error::Transport(
+                    "登录加密探测响应缺少 enabled 字段；无法确认站点是否要求加密登录，拒绝退回明文"
+                        .to_string(),
+                )),
+                Some(other) => {
+                    return Err(Error::Transport(format!(
+                        "登录加密探测响应异常：enabled 字段类型不可识别（{}）",
+                        json_kind(other)
+                    )))
+                }
+            };
         if !enabled {
             return Ok(None);
         }
@@ -195,6 +202,27 @@ fn pick_newest_token<'a>(keys: &'a [KeyMeta], name: &str) -> Option<&'a KeyMeta>
 
 fn numeric_id(key: &KeyMeta) -> i64 {
     key.remote_id.parse().unwrap_or(0)
+}
+
+/// 把站点返回的令牌 id 当 URL 路径段使用前的校验。
+///
+/// 复核 N-4：`id` 是站点响应里的字符串，直接拼进路径可被构造成跨端点请求——
+/// 实测 `id = "../user/self"` 会真的发出 `POST /api/user/self/key`（带会话 Cookie）。
+/// 因此只接受单段安全字符，其余一律拒绝，不做「转义后照发」。
+fn safe_path_segment(id: &str) -> Result<&str> {
+    let ok = !id.is_empty()
+        && id.len() <= 128
+        && !id.contains("..")
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    if !ok {
+        return Err(Error::Transport(format!(
+            "站点返回的令牌 id 不是合法的路径段（长度 {}），已拒绝用它拼接请求",
+            id.len()
+        )));
+    }
+    Ok(id)
 }
 
 /// 把站点返回的失败文案归类成可操作错误。
@@ -349,9 +377,9 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
     async fn list_keys(&self, base_url: &str, session: &Session) -> Result<Vec<KeyMeta>> {
         let base = normalize_base_url(base_url);
         let mut collected: Vec<KeyMeta> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
         let mut page: u32 = 1;
-        // 每页 100、最多 10 页（1000 把令牌）：避免令牌很多的站点上「新建后定位不到」，
-        // 同时防止对异常站点无限翻页（复审 P2-2）。
+        // 每页 100、最多 10 页（1000 把令牌）：防止对异常站点无限翻页（复审 P2-2）。
         const PAGE_SIZE: u32 = 100;
         const MAX_PAGES: u32 = 10;
 
@@ -370,18 +398,36 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
             }
             let value = Self::unwrap_success(&resp)?;
             let items = extract_items(&value);
-            let total = value
-                .pointer("/data/total")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(items.len() as i64);
+            // `total` 缺失或非数字时不能当作「本页条数」，否则会在第一页就静默停住（复核 N-3）。
+            let total = value.pointer("/data/total").and_then(|v| v.as_i64());
             let page_len = items.len();
-            collected.extend(items.iter().filter_map(parse_key_meta));
 
-            let more = page_len > 0
-                && (page_len as u32) >= PAGE_SIZE
-                && (collected.len() as i64) < total
-                && page < MAX_PAGES;
-            if !more {
+            let mut added = 0usize;
+            for meta in items.iter().filter_map(parse_key_meta) {
+                if seen.insert(meta.remote_id.clone()) {
+                    collected.push(meta);
+                    added += 1;
+                }
+            }
+
+            // 终止条件一：本页未满 → 已是最后一页。
+            if (page_len as u32) < PAGE_SIZE {
+                return Ok(collected);
+            }
+            // 终止条件二：本页没有新增 id → 站点忽略分页参数（或无 total），再翻也是重复。
+            if added == 0 {
+                return Ok(collected);
+            }
+            if page >= MAX_PAGES {
+                // 命中页数上限且「可能还有更多」：宁可显式报错，也不交付被截断的列表——
+                // 截断会让 create_key 在令牌其实已创建时误报 NotFound，诱导用户重复建键（复核 N-3）。
+                let possibly_more = total.map(|t| (collected.len() as i64) < t).unwrap_or(true);
+                if possibly_more {
+                    return Err(Error::Transport(format!(
+                        "站点令牌数量超过列举上限（{} 条），无法确认完整列表；请先在站点端清理后重试",
+                        MAX_PAGES * PAGE_SIZE
+                    )));
+                }
                 return Ok(collected);
             }
             page += 1;
@@ -438,7 +484,7 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
         let url = format!(
             "{}/api/token/{}/key",
             normalize_base_url(base_url),
-            remote_id
+            safe_path_segment(remote_id)?
         );
         let resp = self
             .transport
@@ -459,7 +505,11 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
     }
 
     async fn revoke_key(&self, base_url: &str, session: &Session, remote_id: &str) -> Result<()> {
-        let url = format!("{}/api/token/{}", normalize_base_url(base_url), remote_id);
+        let url = format!(
+            "{}/api/token/{}",
+            normalize_base_url(base_url),
+            safe_path_segment(remote_id)?
+        );
         let resp = self
             .transport
             .request(self.request(Method::Delete, url, session))

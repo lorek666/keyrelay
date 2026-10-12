@@ -77,15 +77,21 @@ impl std::fmt::Debug for ReqwestTransport {
     }
 }
 
-/// 只保留 scheme 与 host，去掉 `user:pass@` 等用户信息（复审 P2-1）。
+/// 只保留 `scheme://host[:port]`，丢弃 userinfo、path、query、fragment。
+///
+/// 复审 P2-1 只处理了 `user:pass@`；复核 N-1 补上 `@` 之后的秘密：
+/// `http://u:p@host/x?token=SECRET` 旧实现会原样回显 `?token=SECRET`。
 fn mask_proxy(raw: &str) -> String {
-    match raw.split_once("://") {
-        Some((scheme, rest)) => {
-            let host = rest.rsplit('@').next().unwrap_or(rest);
-            format!("{scheme}://{host}")
-        }
-        None => "<非法代理串>".to_string(),
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return "<非法代理串>".to_string();
+    };
+    // authority 截止到 path / query / fragment 的第一个分隔符
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    if host.is_empty() {
+        return format!("{scheme}://<已隐藏>");
     }
+    format!("{scheme}://{host}")
 }
 
 impl ReqwestTransport {
@@ -240,6 +246,24 @@ mod tests {
             "socks5://127.0.0.1:1080"
         );
         assert_eq!(mask_proxy("这不是一个 URL"), "<非法代理串>");
+    }
+
+    #[test]
+    fn mask_proxy_drops_path_query_fragment() {
+        // 复核 N-1：`@` 之后的 path / query / fragment 同样是秘密
+        assert_eq!(
+            mask_proxy("http://alice:s3cr3t@127.0.0.1:7897/pac?token=s3cr3t#frag"),
+            "http://127.0.0.1:7897"
+        );
+        assert_eq!(
+            mask_proxy("http://127.0.0.1:7897?k=v"),
+            "http://127.0.0.1:7897"
+        );
+        assert_eq!(mask_proxy("http://alice:s3cr3t@"), "http://<已隐藏>");
+        assert_eq!(
+            mask_proxy("http://alice:s3cr3t@/x?token=SECRET"),
+            "http://<已隐藏>"
+        );
     }
 
     #[test]

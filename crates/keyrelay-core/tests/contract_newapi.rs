@@ -588,3 +588,145 @@ async fn list_keys_follows_pagination() {
     assert!(requests[0].url.contains("p=1"));
     assert!(requests[1].url.contains("p=2"));
 }
+
+// ================================================================ M1-S1 复核 N-1…N-4 回归
+
+#[tokio::test]
+async fn encryption_probe_missing_enabled_field_fails_closed() {
+    // 复核 N-2：端点存在且返回 JSON 信封，但没有 `enabled` 字段 → 不得按「未启用」放行
+    let transport = MockTransport::new(vec![json_resp(200, json!({"success": true, "data": {}}))]);
+    let adapter = NewApi::new(transport);
+
+    let err = adapter
+        .login(BASE, Credentials::new("me", "hunter2-probe-pw"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Transport(ref m) if m.contains("缺少 enabled")),
+        "{err:?}"
+    );
+    let requests = adapter.transport().requests();
+    assert_eq!(requests.len(), 1, "只应发生加密探测，不得发出登录请求");
+    assert_eq!(
+        requests[0].url,
+        format!("{BASE}api/user/login/encryption-key")
+    );
+}
+
+#[tokio::test]
+async fn list_keys_keeps_paging_when_total_is_not_a_number() {
+    // 复核 N-3：`total` 非数字时曾按「本页条数」处理 → 首页满页就静默停住
+    let page1: Vec<serde_json::Value> = (1..=100)
+        .map(|i| json!({"id": i, "name": format!("bulk-{i}"), "status": 1}))
+        .collect();
+    let transport = MockTransport::new(vec![
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": page1, "total": "many"}}),
+        ),
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": [{"id": 101, "name": "codex/daily", "status": 1}]}}),
+        ),
+    ]);
+    let adapter = NewApi::new(transport);
+
+    let keys = adapter.list_keys(BASE, &session()).await.unwrap();
+    assert_eq!(
+        keys.len(),
+        101,
+        "total 不可用时应靠「本页是否满」判断继续翻页"
+    );
+    assert_eq!(adapter.transport().requests().len(), 2);
+}
+
+#[tokio::test]
+async fn list_keys_stops_when_site_ignores_pagination() {
+    // 复核 N-3 反例：站点忽略 `p` 参数时不得无限翻页或产出重复项
+    let page: Vec<serde_json::Value> = (1..=100)
+        .map(|i| json!({"id": i, "name": format!("bulk-{i}"), "status": 1}))
+        .collect();
+    let same_page = || {
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": page, "total": 500}}),
+        )
+    };
+    let transport = MockTransport::new(vec![same_page(), same_page()]);
+    let adapter = NewApi::new(transport);
+
+    let keys = adapter.list_keys(BASE, &session()).await.unwrap();
+    assert_eq!(keys.len(), 100, "同一页重复返回时不得重复计入");
+    assert_eq!(
+        adapter.transport().requests().len(),
+        2,
+        "第二页无新增即应停止"
+    );
+}
+
+#[tokio::test]
+async fn list_keys_reports_truncation_instead_of_silently_capping() {
+    // 复核 N-3：命中页数上限且可能还有更多 → 显式报错，不交付被截断的列表
+    let full_page: Vec<serde_json::Value> = (0..100)
+        .map(|i| json!({"id": i, "name": format!("bulk-{i}"), "status": 1}))
+        .collect();
+    let pages: Vec<HttpResponse> = (0..10)
+        .map(|p| {
+            let items: Vec<serde_json::Value> = full_page
+                .iter()
+                .map(|item| {
+                    let mut item = item.clone();
+                    let id = item.get("id").unwrap().as_i64().unwrap() + p * 100;
+                    item["id"] = json!(id);
+                    item["name"] = json!(format!("bulk-{id}"));
+                    item
+                })
+                .collect();
+            json_resp(
+                200,
+                json!({"success": true, "data": {"items": items, "total": 1500}}),
+            )
+        })
+        .collect();
+    let adapter = NewApi::new(MockTransport::new(pages));
+
+    let err = adapter.list_keys(BASE, &session()).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Transport(ref m) if m.contains("列举上限")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn reveal_key_rejects_remote_id_that_escapes_the_path_segment() {
+    // 复核 N-4：站点返回的 id 被直接拼进路径 → `../user/self` 会打到别的端点
+    for hostile in ["../user/self", "1/../user/self", "1?x=2", "1#f", "a b", ""] {
+        let adapter = NewApi::new(MockTransport::new(vec![]));
+        let err = adapter
+            .reveal_key(BASE, &session(), hostile)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Transport(ref m) if m.contains("路径段")),
+            "id={hostile:?} → {err:?}"
+        );
+        assert!(
+            adapter.transport().requests().is_empty(),
+            "id={hostile:?} 不得发出任何请求"
+        );
+    }
+}
+
+#[tokio::test]
+async fn revoke_key_rejects_remote_id_that_escapes_the_path_segment() {
+    let adapter = NewApi::new(MockTransport::new(vec![]));
+    let err = adapter
+        .revoke_key(BASE, &session(), "../../user/self")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Transport(ref m) if m.contains("路径段")),
+        "{err:?}"
+    );
+    assert!(adapter.transport().requests().is_empty());
+}
