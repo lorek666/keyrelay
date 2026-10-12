@@ -821,7 +821,8 @@ async fn list_keys_reports_truncation_instead_of_silently_capping() {
     let full_page: Vec<serde_json::Value> = (0..100)
         .map(|i| json!({"id": i, "name": format!("bulk-{i}"), "status": 1}))
         .collect();
-    let pages: Vec<HttpResponse> = (0..100)
+    // 第 101 页仍有新数据 → 上限保护才应触发（第 100 页之后允许一次探测）
+    let pages: Vec<HttpResponse> = (0..101)
         .map(|p| {
             let items: Vec<serde_json::Value> = full_page
                 .iter()
@@ -845,6 +846,35 @@ async fn list_keys_reports_truncation_instead_of_silently_capping() {
     assert!(
         matches!(err, Error::Transport(ref m) if m.contains("仍未取全")),
         "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_keys_reaches_the_last_page_without_a_total_field() {
+    // 第三轮复核 P2-2：站点忽略 `page_size`（每页 10 条）+ 恰好 1000 条 + 响应无 `total`。
+    // 第 100 页取满 1000 条后还需要一次探测才能确认到底，不能在这里误报「取不全」。
+    let page = |offset: i64| -> HttpResponse {
+        let items: Vec<serde_json::Value> = (0..10)
+            .map(|i| {
+                let id = offset + i + 1;
+                json!({"id": id, "name": format!("bulk-{id}"), "status": 1})
+            })
+            .collect();
+        json_resp(200, json!({"success": true, "data": {"items": items}}))
+    };
+    let mut pages: Vec<HttpResponse> = (0..100).map(|p| page(p * 10)).collect();
+    pages.push(json_resp(
+        200,
+        json!({"success": true, "data": {"items": []}}),
+    ));
+    let adapter = NewApi::new(MockTransport::new(pages));
+
+    let keys = adapter.list_keys(BASE, &session()).await.unwrap();
+    assert_eq!(keys.len(), 1000, "恰好 1000 条必须取全，不得误报上限");
+    assert_eq!(
+        adapter.transport().requests().len(),
+        101,
+        "含一次收尾探测请求"
     );
 }
 
