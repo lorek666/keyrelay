@@ -118,6 +118,34 @@ export type EventRow = {
   payload?: string | null;
 };
 
+export type DriftState = "intact" | "modified" | "missing" | "unknown";
+
+export type DriftReport = {
+  targetPath: string;
+  agentId: string;
+  channel: string;
+  state: DriftState;
+  journalId: string;
+  currentSha256?: string | null;
+  expectedSha256?: string | null;
+};
+
+export type Settings = {
+  /** 秒；0 = 关闭定时刷新 */
+  refreshIntervalSecs: number;
+  /** USD；0 = 不告警 */
+  balanceAlertThreshold: number;
+  driftCheckOnStart: boolean;
+};
+
+export type RefreshSummary = {
+  sitesTotal: number;
+  sitesOk: number;
+  sitesFailed: number;
+  keysTotal: number;
+  balanceAlerts: number[];
+};
+
 export type LoginArgs = {
   siteId: number;
   username: string;
@@ -349,4 +377,50 @@ export async function rollbackDelivery(journalId: string): Promise<void> {
 export async function recentEvents(limit = 100): Promise<EventRow[]> {
   if (!hasTauri) return mock(MOCK_EVENTS);
   return invokeCommand<EventRow[]>("recent_events", { limit });
+}
+
+export async function driftReport(): Promise<DriftReport[]> {
+  if (!hasTauri) {
+    return mock([
+      {
+        targetPath: "/Users/you/.codex/auth.json",
+        agentId: "codex",
+        channel: "codex-auth-json",
+        state: "intact",
+        journalId: "j-mock-0",
+        currentSha256: "deadbeef",
+        expectedSha256: "deadbeef",
+      },
+    ]);
+  }
+  return invokeCommand<DriftReport[]>("drift_report");
+}
+
+export async function getSettings(): Promise<Settings> {
+  if (!hasTauri) {
+    return mock({
+      refreshIntervalSecs: 0,
+      balanceAlertThreshold: 0,
+      driftCheckOnStart: true,
+    });
+  }
+  return invokeCommand<Settings>("get_settings");
+}
+
+export async function updateSettings(settings: Settings): Promise<Settings> {
+  if (!hasTauri) return mock(settings);
+  return invokeCommand<Settings>("update_settings", { args: { settings } });
+}
+
+export async function refreshAll(): Promise<RefreshSummary> {
+  if (!hasTauri) {
+    return mock({
+      sitesTotal: 1,
+      sitesOk: 1,
+      sitesFailed: 0,
+      keysTotal: 1,
+      balanceAlerts: [],
+    });
+  }
+  return invokeCommand<RefreshSummary>("refresh_all");
 }

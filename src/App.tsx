@@ -7,12 +7,14 @@ import {
   LayoutDashboard,
   Plug,
   Server,
+  Settings as SettingsIcon,
 } from "lucide-react";
 import Overview from "./pages/Overview";
 import Sites from "./pages/Sites";
 import Keys from "./pages/Keys";
 import Agents from "./pages/Agents";
 import History from "./pages/History";
+import SettingsPage from "./pages/Settings";
 import { appInfo, runtimeMode } from "./lib/api";
 
 const PAGES = [
@@ -21,6 +23,7 @@ const PAGES = [
   { id: "keys", label: "密钥", icon: KeyRound, render: () => <Keys /> },
   { id: "agents", label: "Agent 投递", icon: Plug, render: () => <Agents /> },
   { id: "history", label: "变更历史", icon: HistoryIcon, render: () => <History /> },
+  { id: "settings", label: "设置", icon: SettingsIcon, render: () => <SettingsPage /> },
 ] as const;
 
 type PageId = (typeof PAGES)[number]["id"];

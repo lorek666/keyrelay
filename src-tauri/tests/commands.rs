@@ -21,16 +21,33 @@ use tauri::ipc::{CallbackFn, InvokeBody};
 use tauri::test::{get_ipc_response, mock_builder, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
 
-fn invoke_impl(cmd: &str, args: Value) -> Result<Value, Value> {
+/// 建一个应用实例，并把 `main` 窗口也建好。
+///
+/// 窗口标签必须是 `main`：`capabilities/default.json` 的 `windows` 只列了它，
+/// 换个标签会拿不到权限（ACL 会拒），测试就变成「验证 ACL」而不是「验证业务」。
+fn build_app() -> (
+    tauri::App<tauri::test::MockRuntime>,
+    tauri::WebviewWindow<tauri::test::MockRuntime>,
+) {
     let app =
         keyrelay_lib::configure_with_state(mock_builder(), keyrelay_lib::init_state_in_memory())
             .build(tauri::generate_context!())
             .expect("构建 mock 应用");
-
     let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
         .build()
         .expect("构建 mock 窗口");
+    (app, webview)
+}
 
+/// 在**指定的**窗口上发命令。
+///
+/// 需要跨调用保持状态（例如「写设置 → 读设置」）时必须用这个：
+/// `invoke_impl` 每次都会新建应用，而内存库随应用创建，状态不会跨调用保留。
+fn invoke_on(
+    webview: &tauri::WebviewWindow<tauri::test::MockRuntime>,
+    cmd: &str,
+    args: Value,
+) -> Result<Value, Value> {
     // 本地源按平台不同：capabilities 的 `local: true` 只覆盖本平台的本地源，用错会被 ACL 拒绝
     let origin = if cfg!(windows) {
         "http://tauri.localhost"
@@ -39,7 +56,7 @@ fn invoke_impl(cmd: &str, args: Value) -> Result<Value, Value> {
     };
 
     get_ipc_response(
-        &webview,
+        webview,
         InvokeRequest {
             cmd: cmd.to_string(),
             callback: CallbackFn(0),
@@ -51,6 +68,11 @@ fn invoke_impl(cmd: &str, args: Value) -> Result<Value, Value> {
         },
     )
     .map(|body| body.deserialize::<Value>().expect("反序列化返回值"))
+}
+
+fn invoke_impl(cmd: &str, args: Value) -> Result<Value, Value> {
+    let (_app, webview) = build_app();
+    invoke_on(&webview, cmd, args)
 }
 
 fn invoke(cmd: &str) -> Result<Value, Value> {
@@ -307,4 +329,72 @@ fn delivery_plan_dto_is_camel_case_and_has_no_secret_field() {
     .expect_err("应报错");
     let text = err.to_string();
     assert!(!text.contains("sk-"), "错误里不得出现密钥形态: {text}");
+}
+
+// ============================================ 漂移 / 设置 / 刷新（M3-S1）
+
+#[test]
+fn drift_report_is_empty_on_a_fresh_install() {
+    let value = invoke("drift_report").expect("drift_report 应成功");
+    assert_eq!(value, json!([]));
+}
+
+#[test]
+fn get_settings_returns_defaults() {
+    let value = invoke("get_settings").expect("get_settings 应成功");
+    assert_eq!(value["refreshIntervalSecs"], 0, "定时刷新必须默认关闭");
+    assert_eq!(value["balanceAlertThreshold"], 0.0);
+    assert_eq!(value["driftCheckOnStart"], true);
+    assert!(
+        value.get("refresh_interval_secs").is_none(),
+        "不得出现 snake_case: {value}"
+    );
+}
+
+#[test]
+fn update_settings_round_trips_and_rejects_bad_values() {
+    // 跨调用保持状态：同一个应用实例里「写 → 读」
+    let (_app, webview) = build_app();
+    let updated = invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": {
+            "refreshIntervalSecs": 600,
+            "balanceAlertThreshold": 3.5,
+            "driftCheckOnStart": false
+        }}}),
+    )
+    .expect("update_settings 应成功");
+    assert_eq!(updated["refreshIntervalSecs"], 600);
+    assert_eq!(updated["balanceAlertThreshold"], 3.5);
+    assert_eq!(updated["driftCheckOnStart"], false);
+
+    let read = invoke_on(&webview, "get_settings", json!({})).expect("get_settings");
+    assert_eq!(read, updated, "同一实例内写后读必须一致");
+
+    // 非法值被拒
+    let err = invoke_impl(
+        "update_settings",
+        json!({"args": {"settings": {
+            "refreshIntervalSecs": 99999999,
+            "balanceAlertThreshold": 0.0,
+            "driftCheckOnStart": true
+        }}}),
+    )
+    .expect_err("超上限的间隔应被拒绝");
+    assert_not_acl_rejection("update_settings", &err);
+    assert!(
+        err.as_str().unwrap_or_default().contains("刷新间隔"),
+        "{err}"
+    );
+}
+
+#[test]
+fn refresh_all_is_a_noop_on_an_empty_installation() {
+    let value = invoke("refresh_all").expect("refresh_all 应成功");
+    assert_eq!(value["sitesTotal"], 0);
+    assert_eq!(value["sitesOk"], 0);
+    assert_eq!(value["sitesFailed"], 0);
+    assert_eq!(value["keysTotal"], 0);
+    assert_eq!(value["balanceAlerts"], json!([]));
 }
