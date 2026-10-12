@@ -1246,18 +1246,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 目标路径白名单：既要落在 `home` 之内，也要与**该通道声明的相对路径**逐字相等。
     ///
     /// 只做 `starts_with(home)` 是不够的：任何落在 home 下的路径都会放行（复核 P2）。
-    /// 新增通道时必须在这里登记期望路径，否则一律拒绝——这样「通道写错文件」不可能悄悄发生。
+    /// 期望路径由 [`DeliveryChannel::relative_target`] 提供（M6-S0 从本函数搬走）——
+    /// 新增通道只需改 `delivery/mod.rs` 一处，本文件不再需要跟着改。
     fn checked_target(&self, channel: DeliveryChannel, target: &Path) -> Result<PathBuf> {
-        let expected_rel = match channel {
-            DeliveryChannel::CodexAuthJson => PathBuf::from(".codex").join("auth.json"),
-            DeliveryChannel::ClaudeCodeSettings => PathBuf::from(".claude").join("settings.json"),
-            DeliveryChannel::ShellBlock => PathBuf::from(
-                delivery::shell_block::ShellSyntax::for_current_platform()
-                    .default_rc_relative_path(),
-            ),
-        };
-
-        let expected = self.home.join(&expected_rel);
+        let expected = self.home.join(channel.relative_target());
         if target != expected {
             return Err(Error::Inject {
                 path: target.display().to_string(),

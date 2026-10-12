@@ -67,6 +67,25 @@ impl DeliveryChannel {
     pub fn from_agent_id(agent_id: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|c| c.agent_id() == agent_id)
     }
+
+    /// 该通道声明的目标路径，**相对于用户目录**。
+    ///
+    /// 存在的理由（M6-S0）：`service.rs::checked_target` 原先对 `DeliveryChannel` 做穷举
+    /// `match` 来取得期望路径，于是「新增一条通道」必须同时改 `delivery` 与 `service`
+    /// 两个文件——两个包各改一处就会编译中断。把映射收到通道自己身上之后，
+    /// 新增通道只需要改本文件一处，路径白名单自动跟着走。
+    ///
+    /// 这是**安全边界**：`checked_target` 用它逐字比对投递目标，因此这里返回的路径
+    /// 必须与写入器实际写入的路径一致，否则投递会被拒绝（fail-closed）。
+    pub fn relative_target(self) -> PathBuf {
+        match self {
+            DeliveryChannel::CodexAuthJson => PathBuf::from(".codex").join("auth.json"),
+            DeliveryChannel::ClaudeCodeSettings => PathBuf::from(".claude").join("settings.json"),
+            DeliveryChannel::ShellBlock => PathBuf::from(
+                shell_block::ShellSyntax::for_current_platform().default_rc_relative_path(),
+            ),
+        }
+    }
 }
 
 /// 预览里的一个字段。两个字段都是「可以给用户看」的值。
