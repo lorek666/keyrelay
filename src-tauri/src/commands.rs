@@ -5,6 +5,8 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use keyrelay_core::delivery::ConsentState;
+
 use crate::AppState;
 
 #[derive(Serialize)]
@@ -63,6 +65,70 @@ pub struct BalanceDto {
     used: f64,
     raw_quota: Option<i64>,
     quota_per_unit: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryFieldDto {
+    key: String,
+    /// 已掩码的值（密钥只暴露末 4 位）
+    masked: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryPlanDto {
+    agent_id: String,
+    channel: String,
+    target_path: String,
+    target_exists: bool,
+    fields: Vec<DeliveryFieldDto>,
+    /// **已脱敏**的 diff 预览
+    preview: String,
+    /// `"missing"` | `"granted"` | `"revoked"`
+    consent: String,
+    consent_granted_at: Option<i64>,
+    consent_revoked_at: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsentDto {
+    agent_id: String,
+    channel: String,
+    target_path: String,
+    fields: String,
+    granted_at: i64,
+    revoked_at: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryOutcomeDto {
+    channel: String,
+    target_path: String,
+    journal_id: String,
+    backup_path: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventDto {
+    id: i64,
+    ts: i64,
+    level: String,
+    source: String,
+    /// 已脱敏
+    message: String,
+    /// 已脱敏
+    payload: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryArgs {
+    key_id: i64,
+    channel: String,
 }
 
 #[derive(Deserialize)]
@@ -215,6 +281,136 @@ pub async fn site_balance(state: State<'_, AppState>, site_id: i64) -> Result<Ba
         .map_err(|e| e.to_string())
 }
 
+// ================================================================ 密钥投递（M1-S3）
+
+fn parse_channel(raw: &str) -> Result<keyrelay_core::delivery::DeliveryChannel, String> {
+    keyrelay_core::delivery::DeliveryChannel::parse(raw).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delivery_plan(
+    state: State<'_, AppState>,
+    args: DeliveryArgs,
+) -> Result<DeliveryPlanDto, String> {
+    let channel = parse_channel(&args.channel)?;
+    state
+        .service
+        .delivery_plan(args.key_id, channel)
+        .map(|plan| {
+            let (consent, granted_at, revoked_at) = match plan.consent {
+                ConsentState::Missing => ("missing", None, None),
+                ConsentState::Granted { granted_at } => ("granted", Some(granted_at), None),
+                ConsentState::Revoked { revoked_at } => ("revoked", None, Some(revoked_at)),
+            };
+            DeliveryPlanDto {
+                agent_id: plan.agent_id,
+                channel: plan.channel.as_str().to_string(),
+                target_path: plan.target_path.display().to_string(),
+                target_exists: plan.target_exists,
+                fields: plan
+                    .fields
+                    .into_iter()
+                    .map(|f| DeliveryFieldDto {
+                        key: f.key,
+                        masked: f.masked,
+                    })
+                    .collect(),
+                preview: plan.preview,
+                consent: consent.to_string(),
+                consent_granted_at: granted_at,
+                consent_revoked_at: revoked_at,
+            }
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn grant_consent(state: State<'_, AppState>, args: DeliveryArgs) -> Result<(), String> {
+    let channel = parse_channel(&args.channel)?;
+    state
+        .service
+        .grant_consent(args.key_id, channel)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn revoke_consent(state: State<'_, AppState>, args: DeliveryArgs) -> Result<(), String> {
+    let channel = parse_channel(&args.channel)?;
+    state
+        .service
+        .revoke_consent(args.key_id, channel)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_consents(state: State<'_, AppState>) -> Result<Vec<ConsentDto>, String> {
+    state
+        .service
+        .list_consents()
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| ConsentDto {
+                    agent_id: row.agent_id,
+                    channel: row.channel,
+                    target_path: row.target_path,
+                    fields: row.fields,
+                    granted_at: row.granted_at,
+                    revoked_at: row.revoked_at,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn apply_delivery(
+    state: State<'_, AppState>,
+    args: DeliveryArgs,
+) -> Result<DeliveryOutcomeDto, String> {
+    let channel = parse_channel(&args.channel)?;
+    state
+        .service
+        .apply_delivery(args.key_id, channel)
+        .map(|outcome| DeliveryOutcomeDto {
+            channel: outcome.channel.as_str().to_string(),
+            target_path: outcome.target_path.display().to_string(),
+            journal_id: outcome.journal_id,
+            backup_path: outcome.backup_path.map(|p| p.display().to_string()),
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn rollback_delivery(state: State<'_, AppState>, journal_id: String) -> Result<(), String> {
+    state
+        .service
+        .rollback_delivery(&journal_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn recent_events(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<EventDto>, String> {
+    state
+        .service
+        .recent_events(limit.unwrap_or(100))
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| EventDto {
+                    id: row.id,
+                    ts: row.ts,
+                    level: row.level,
+                    source: row.source,
+                    message: row.message,
+                    payload: row.payload,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +494,94 @@ mod tests {
         assert_eq!(value["dbPath"], ":memory:");
         assert_eq!(value["siteCount"], 0);
         assert_eq!(value["dbError"], Value::Null);
+    }
+
+    /// M1-S3：投递相关 DTO 的线上字段名与「不含密钥」双重断言。
+    #[test]
+    fn delivery_dtos_serialize_in_camel_case_without_secrets() {
+        let plan = DeliveryPlanDto {
+            agent_id: "codex".into(),
+            channel: "codex-auth-json".into(),
+            target_path: "/home/u/.codex/auth.json".into(),
+            target_exists: false,
+            fields: vec![
+                DeliveryFieldDto {
+                    key: "auth_mode".into(),
+                    masked: "apikey".into(),
+                },
+                DeliveryFieldDto {
+                    key: "OPENAI_API_KEY".into(),
+                    masked: "…cdef".into(),
+                },
+            ],
+            preview: "+ \"OPENAI_API_KEY\": \"…cdef\"\n".into(),
+            consent: "missing".into(),
+            consent_granted_at: None,
+            consent_revoked_at: None,
+        };
+        let value = to_value(&plan);
+        assert_eq!(value["agentId"], "codex");
+        assert_eq!(value["targetPath"], "/home/u/.codex/auth.json");
+        assert_eq!(value["targetExists"], false);
+        assert_eq!(value["fields"][1]["key"], "OPENAI_API_KEY");
+        assert_eq!(value["fields"][1]["masked"], "…cdef");
+        assert_eq!(value["consent"], "missing");
+        assert_eq!(value["consentGrantedAt"], Value::Null);
+        assert!(value.get("target_path").is_none(), "不得出现 snake_case");
+
+        let outcome = DeliveryOutcomeDto {
+            channel: "codex-auth-json".into(),
+            target_path: "/home/u/.codex/auth.json".into(),
+            journal_id: "j1-0".into(),
+            backup_path: Some("/home/u/.keyrelay/backups/j1-0/0-auth.json".into()),
+        };
+        let value = to_value(&outcome);
+        assert_eq!(value["journalId"], "j1-0");
+        assert_eq!(
+            value["backupPath"],
+            "/home/u/.keyrelay/backups/j1-0/0-auth.json"
+        );
+        assert!(
+            !value.to_string().contains("sk-"),
+            "投递结果不得携带密钥: {value}"
+        );
+
+        let event = EventDto {
+            id: 1,
+            ts: 1_700_000_000,
+            level: "info".into(),
+            source: "delivery".into(),
+            message: "投递完成: codex-auth-json".into(),
+            payload: Some(r#"{"journal_id":"j1-0"}"#.into()),
+        };
+        let value = to_value(&event);
+        assert_eq!(value["level"], "info");
+        assert_eq!(value["source"], "delivery");
+        assert!(value["payload"].is_string());
+
+        let consent = ConsentDto {
+            agent_id: "codex".into(),
+            channel: "codex-auth-json".into(),
+            target_path: "/home/u/.codex/auth.json".into(),
+            fields: r#"["auth_mode","OPENAI_API_KEY"]"#.into(),
+            granted_at: 1,
+            revoked_at: None,
+        };
+        let value = to_value(&consent);
+        assert_eq!(value["agentId"], "codex");
+        assert_eq!(value["grantedAt"], 1);
+        assert_eq!(value["revokedAt"], Value::Null);
+    }
+
+    #[test]
+    fn delivery_args_deserialize_from_camel_case() {
+        let args: DeliveryArgs = serde_json::from_value(serde_json::json!({
+            "keyId": 7,
+            "channel": "codex-auth-json"
+        }))
+        .expect("解析 DeliveryArgs");
+        assert_eq!(args.key_id, 7);
+        assert_eq!(args.channel, "codex-auth-json");
     }
 
     #[test]

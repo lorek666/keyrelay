@@ -17,4 +17,11 @@ pub const COMMANDS: &[&str] = &[
     "list_keys",
     "create_key",
     "site_balance",
+    "delivery_plan",
+    "grant_consent",
+    "revoke_consent",
+    "list_consents",
+    "apply_delivery",
+    "rollback_delivery",
+    "recent_events",
 ];

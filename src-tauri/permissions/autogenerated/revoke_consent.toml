@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-revoke-consent"
+description = "Enables the revoke_consent command without any pre-configured scope."
+commands.allow = ["revoke_consent"]
+
+[[permission]]
+identifier = "deny-revoke-consent"
+description = "Denies the revoke_consent command without any pre-configured scope."
+commands.deny = ["revoke_consent"]

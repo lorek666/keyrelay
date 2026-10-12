@@ -7,6 +7,7 @@
 pub mod delivery;
 pub mod error;
 pub mod inject;
+pub mod observability;
 pub mod redact;
 pub mod service;
 pub mod site;

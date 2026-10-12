@@ -66,7 +66,10 @@ impl<T: HttpTransport> NewApi<T> {
     }
 
     /// 登录/业务响应统一解包：NewAPI 约定 `{success: bool, message: string, data: ...}`
-    fn unwrap_success(resp: &super::transport::HttpResponse) -> Result<Value> {
+    ///
+    /// `op` 是操作名（「登录」/「列举令牌」/…），会进入错误文案——
+    /// 站点对任何需要认证的操作都可能回 `success:false`，不带操作名会让用户误判（复核 P2-4）。
+    fn unwrap_success(resp: &super::transport::HttpResponse, op: &str) -> Result<Value> {
         let value = resp.json_value()?;
         let ok = value
             .get("success")
@@ -76,7 +79,7 @@ impl<T: HttpTransport> NewApi<T> {
             let message = json_str(&value, "/message")
                 .unwrap_or("站点返回失败")
                 .to_string();
-            return Err(classify_login_message(&message));
+            return Err(classify_failure(op, &message));
         }
         Ok(value)
     }
@@ -192,6 +195,21 @@ fn normalize_id(value: Option<&Value>) -> Option<String> {
     }
 }
 
+/// 宽松解析站点声明的 `total`：接受整数、可解析为整数的字符串、以及整数值的浮点。
+///
+/// 返回 `None` 表示「站点没给可用的总数」——此时靠「空页 / 全重复页」判定到底。
+fn parse_total(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(n) => n.as_i64().or_else(|| {
+            // 25.0 这类浮点：只在小数部分为 0 时接受，避免把 25.5 当成 25
+            let f = n.as_f64()?;
+            (f.fract() == 0.0).then_some(f as i64)
+        }),
+        Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
 /// 从同名候选中挑出「最新」的一把：优先按 `created_at`，缺失或平局时按数值 id 最大者。
 ///
 /// 复审 P2-1：原实现 `max_by_key(created_at.unwrap_or_default())` 在时间戳缺失时会
@@ -232,6 +250,19 @@ fn safe_path_segment(id: &str) -> Result<&str> {
         )));
     }
     Ok(id)
+}
+
+/// 带操作上下文的失败归类。
+///
+/// 站点原文先过 `redact::scrub`（BACKLOG B-36：`AuthFailed` 直接携带站点原文，
+/// 若站点把密钥回显在错误文案里就会原样外流）。
+fn classify_failure(op: &str, message: &str) -> Error {
+    let scrubbed = crate::redact::scrub(message);
+    match classify_login_message(&scrubbed) {
+        Error::AuthFailed(detail) => Error::AuthFailed(format!("{op}被站点拒绝（{detail}）")),
+        // 验证码 / 二次验证与操作无关，保持原样
+        other => other,
+    }
 }
 
 /// 把站点返回的失败文案归类成可操作错误。
@@ -365,7 +396,7 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
 
         match resp.status {
             200 => {
-                let value = Self::unwrap_success(&resp)?;
+                let value = Self::unwrap_success(&resp, "登录")?;
                 let user_id = value
                     .pointer("/data/id")
                     .and_then(|v| v.as_i64())
@@ -406,10 +437,12 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
                     resp.retry_after_secs(),
                 ));
             }
-            let value = Self::unwrap_success(&resp)?;
+            let value = Self::unwrap_success(&resp, "列举令牌")?;
             let items = extract_items(&value);
-            // `total` 缺失或非数字时不能当作「本页条数」，否则会在第一页就静默停住（复核 N-3）。
-            let total = value.pointer("/data/total").and_then(|v| v.as_i64());
+            // `total` 缺失或不可解析时不能当作「本页条数」，否则会在第一页就静默停住（复核 N-3）。
+            // 字符串 `"25"` / 浮点 `25.0` 也接受（复核 P2-5：真实站点理论上应回整数，
+            // 但把它当成「缺失」会白白多探一页）。
+            let total = value.pointer("/data/total").and_then(parse_total);
             let page_len = items.len();
 
             let parsed: Vec<KeyMeta> = items.iter().filter_map(parse_key_meta).collect();
@@ -502,7 +535,7 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
                 resp.retry_after_secs(),
             ));
         }
-        let value = Self::unwrap_success(&resp)?;
+        let value = Self::unwrap_success(&resp, "创建令牌")?;
 
         // 少数版本直接在响应里回明文
         if let Some(key) = json_str(&value, "/data/key") {
@@ -540,7 +573,7 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
                 resp.retry_after_secs(),
             ));
         }
-        let value = Self::unwrap_success(&resp)?;
+        let value = Self::unwrap_success(&resp, "读取令牌明文")?;
         let secret = json_str(&value, "/data/key")
             .or_else(|| value.get("data").and_then(|d| d.as_str()))
             .ok_or_else(|| Error::Transport("读令牌明文响应缺少 key 字段".into()))?;
@@ -564,7 +597,7 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
                 resp.retry_after_secs(),
             ));
         }
-        Self::unwrap_success(&resp)?;
+        Self::unwrap_success(&resp, "删除令牌")?;
         Ok(())
     }
 
@@ -581,7 +614,7 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
                 resp.retry_after_secs(),
             ));
         }
-        let value = Self::unwrap_success(&resp)?;
+        let value = Self::unwrap_success(&resp, "查询余额")?;
         let raw_quota = value.pointer("/data/quota").and_then(|v| v.as_i64());
         let used_quota = value
             .pointer("/data/used_quota")

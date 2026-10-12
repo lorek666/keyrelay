@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS consents(
   UNIQUE(agent_id, channel, target_path)
 );
 CREATE INDEX IF NOT EXISTS idx_consents_agent ON consents(agent_id, channel);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
 "#;
 
 fn now_secs() -> i64 {
@@ -124,6 +125,17 @@ pub struct KeyRow {
     pub group_name: Option<String>,
     pub secret_ref: String,
     pub status: String,
+}
+
+/// 事件行。`message` / `payload` 在写入时已脱敏。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventRow {
+    pub id: i64,
+    pub ts: i64,
+    pub level: String,
+    pub source: String,
+    pub message: String,
+    pub payload: Option<String>,
 }
 
 /// 投递授权行。`fields` 是 JSON 数组，**只有键名**。
@@ -509,6 +521,72 @@ impl Store {
             .map_err(|e| Error::Store(format!("列举投递授权失败: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Store(format!("读取投递授权行失败: {e}")))
+    }
+
+    // ============================================================ 事件（M1-S3）
+
+    /// 写入一条**已脱敏**的事件。
+    ///
+    /// 只接受 [`crate::observability::Event`]（其构造器已过 `scrub`），
+    /// 从类型上挡住「直接塞原文」这条路径。
+    pub fn insert_event(&self, event: &crate::observability::Event) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO events(ts, level, source, message, payload_redacted_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                event.ts,
+                event.level.as_str(),
+                event.source,
+                event.message,
+                event.payload,
+            ],
+        )
+        .map_err(|e| Error::Store(format!("写入事件失败: {e}")))?;
+        Ok(())
+    }
+
+    pub fn list_events(&self, limit: usize) -> Result<Vec<EventRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, ts, level, source, message, payload_redacted_json
+                 FROM events ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(EventRow {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    level: row.get(2)?,
+                    source: row.get(3)?,
+                    message: row.get(4)?,
+                    payload: row.get(5)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("查询事件失败: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("读取事件行失败: {e}")))
+    }
+
+    /// 扫描整表，返回**疑似**含未脱敏凭证的行数（正常应为 0）。
+    ///
+    /// 用 `redact::scrub` 做判定，而不是硬编码正则：脱敏规则只有一处定义，
+    /// 规则升级后本方法自动跟随。
+    pub fn count_events_with_secrets(&self) -> Result<i64> {
+        let events = self.list_events(usize::MAX)?;
+        let hits = events
+            .iter()
+            .filter(|row| {
+                crate::redact::contains_secret(&row.message)
+                    || row
+                        .payload
+                        .as_deref()
+                        .is_some_and(crate::redact::contains_secret)
+            })
+            .count();
+        Ok(hits as i64)
     }
 }
 

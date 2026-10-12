@@ -226,3 +226,85 @@ fn detect_site_returns_fingerprint_shape_against_fake_site() {
     assert_eq!(value["displayName"], "假站点");
     assert_eq!(value["version"], "v0.9.1");
 }
+
+// ================================================================ 密钥投递（M1-S3）
+
+/// 全新内存状态下没有密钥记录 → 投递相关命令都应报**业务错误**，
+/// 而不是「命令未注册 / 未授权」这类装配问题。
+#[test]
+fn delivery_commands_report_business_errors_on_unknown_key() {
+    for (cmd, args) in [
+        (
+            "delivery_plan",
+            json!({"args": {"keyId": 999, "channel": "codex-auth-json"}}),
+        ),
+        (
+            "grant_consent",
+            json!({"args": {"keyId": 999, "channel": "codex-auth-json"}}),
+        ),
+        (
+            "revoke_consent",
+            json!({"args": {"keyId": 999, "channel": "codex-auth-json"}}),
+        ),
+        (
+            "apply_delivery",
+            json!({"args": {"keyId": 999, "channel": "codex-auth-json"}}),
+        ),
+    ] {
+        let err = invoke_impl(cmd, args).expect_err(&format!("{cmd} 应报错"));
+        assert_not_acl_rejection(cmd, &err);
+        let text = err.as_str().unwrap_or_default();
+        assert!(text.contains("999"), "{cmd} 的错误应说明是哪个 key: {text}");
+    }
+}
+
+#[test]
+fn delivery_rejects_unknown_channel_before_touching_state() {
+    let err = invoke_impl(
+        "delivery_plan",
+        json!({"args": {"keyId": 1, "channel": "does-not-exist"}}),
+    )
+    .expect_err("未知通道应报错");
+    assert_not_acl_rejection("delivery_plan", &err);
+    assert!(
+        err.as_str().unwrap_or_default().contains("未知的投递通道"),
+        "{err}"
+    );
+}
+
+#[test]
+fn list_consents_is_empty_on_fresh_state() {
+    let value = invoke("list_consents").expect("list_consents 应成功");
+    assert_eq!(value, json!([]));
+}
+
+#[test]
+fn recent_events_returns_array_and_honours_limit() {
+    let value = invoke_impl("recent_events", json!({"limit": 10})).expect("recent_events 应成功");
+    assert!(value.is_array(), "{value}");
+
+    // limit 缺省也能跑（Option<usize>）
+    let value = invoke("recent_events").expect("recent_events 无参应成功");
+    assert!(value.is_array(), "{value}");
+}
+
+#[test]
+fn rollback_of_unknown_journal_reports_business_error() {
+    let err = invoke_impl("rollback_delivery", json!({"journalId": "j-nope"}))
+        .expect_err("未知 journal 应报错");
+    assert_not_acl_rejection("rollback_delivery", &err);
+    assert!(err.as_str().unwrap_or_default().contains("j-nope"), "{err}");
+}
+
+#[test]
+fn delivery_plan_dto_is_camel_case_and_has_no_secret_field() {
+    // 用未知 key 走不通，这里直接对 DTO 做序列化断言（在 commands.rs 的单测里已钉死字段名），
+    // IPC 侧只验证「错误路径下不泄漏任何密钥形态的字符串」
+    let err = invoke_impl(
+        "delivery_plan",
+        json!({"args": {"keyId": 1, "channel": "codex-auth-json"}}),
+    )
+    .expect_err("应报错");
+    let text = err.to_string();
+    assert!(!text.contains("sk-"), "错误里不得出现密钥形态: {text}");
+}
