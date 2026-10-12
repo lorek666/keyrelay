@@ -398,3 +398,24 @@ fn refresh_all_is_a_noop_on_an_empty_installation() {
     assert_eq!(value["keysTotal"], 0);
     assert_eq!(value["balanceAlerts"], json!([]));
 }
+
+// ============================================ 脱敏审计（M4-S1）
+
+#[test]
+fn audit_redaction_reports_clean_on_a_fresh_install() {
+    let value = invoke("audit_redaction").expect("audit_redaction 应成功");
+    assert_eq!(value["clean"], true, "{value}");
+    assert_eq!(value["findings"], json!([]));
+    assert!(value["summary"]
+        .as_str()
+        .unwrap_or("")
+        .contains("未发现明文"));
+    // IPC 测试用的是**内存库**（没有 db 文件），备份目录也还没建，
+    // 因此 `filesScanned` 可能是 0——这里只断言它是数字，不假设一定扫到了文件。
+    assert!(value["filesScanned"].is_number(), "{value}");
+    assert!(value["bytesScanned"].is_number(), "{value}");
+    assert!(
+        value.get("files_scanned").is_none(),
+        "不得出现 snake_case: {value}"
+    );
+}

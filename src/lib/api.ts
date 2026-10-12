@@ -146,6 +146,21 @@ export type RefreshSummary = {
   balanceAlerts: number[];
 };
 
+export type AuditFinding = {
+  /** `"plaintext-in-file"` | `"unreadable"` | `"plaintext-in-events"` */
+  kind: string;
+  path?: string | null;
+  detail: string;
+};
+
+export type AuditReport = {
+  filesScanned: number;
+  bytesScanned: number;
+  clean: boolean;
+  findings: AuditFinding[];
+  summary: string;
+};
+
 export type LoginArgs = {
   siteId: number;
   username: string;
@@ -377,6 +392,19 @@ export async function rollbackDelivery(journalId: string): Promise<void> {
 export async function recentEvents(limit = 100): Promise<EventRow[]> {
   if (!hasTauri) return mock(MOCK_EVENTS);
   return invokeCommand<EventRow[]>("recent_events", { limit });
+}
+
+export async function auditRedaction(): Promise<AuditReport> {
+  if (!hasTauri) {
+    return mock({
+      filesScanned: 3,
+      bytesScanned: 123456,
+      clean: true,
+      findings: [],
+      summary: "已扫描 3 个文件 / 123456 字节，未发现明文凭证",
+    });
+  }
+  return invokeCommand<AuditReport>("audit_redaction");
 }
 
 export async function driftReport(): Promise<DriftReport[]> {

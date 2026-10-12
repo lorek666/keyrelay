@@ -160,6 +160,25 @@ pub struct RefreshSummaryDto {
     balance_alerts: Vec<i64>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditFindingDto {
+    /// `"plaintext-in-file"` | `"unreadable"` | `"plaintext-in-events"`
+    kind: String,
+    path: Option<String>,
+    detail: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditReportDto {
+    files_scanned: usize,
+    bytes_scanned: u64,
+    clean: bool,
+    findings: Vec<AuditFindingDto>,
+    summary: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettingsArgs {
@@ -548,6 +567,47 @@ pub fn update_settings(
         .update_settings(&settings)
         .map_err(|e| e.to_string())?;
     Ok(settings_to_dto(&settings))
+}
+
+/// 脱敏审计：扫描数据库（含 WAL/SHM）、备份目录与事件表，确认零明文。
+#[tauri::command]
+pub fn audit_redaction(state: State<'_, AppState>) -> Result<AuditReportDto, String> {
+    use keyrelay_core::audit::AuditFinding;
+
+    state
+        .service
+        .audit_redaction()
+        .map(|report| AuditReportDto {
+            files_scanned: report.files_scanned,
+            bytes_scanned: report.bytes_scanned,
+            clean: report.is_clean(),
+            summary: report.summary(),
+            findings: report
+                .findings
+                .into_iter()
+                .map(|finding| {
+                    let (kind, path, detail) = match finding {
+                        AuditFinding::PlaintextInFile { path, hits } => (
+                            "plaintext-in-file",
+                            Some(path.display().to_string()),
+                            format!("{hits} 处疑似明文凭证"),
+                        ),
+                        AuditFinding::Unreadable { path, reason } => {
+                            ("unreadable", Some(path.display().to_string()), reason)
+                        }
+                        AuditFinding::PlaintextInEvents { rows } => {
+                            ("plaintext-in-events", None, format!("{rows} 行"))
+                        }
+                    };
+                    AuditFindingDto {
+                        kind: kind.to_string(),
+                        path,
+                        detail,
+                    }
+                })
+                .collect(),
+        })
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

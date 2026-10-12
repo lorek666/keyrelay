@@ -28,12 +28,19 @@ pub struct AppState {
     pub db_error: Option<String>,
 }
 
-/// 用户主目录。Windows 上 `HOME` 可能缺失（BACKLOG B-14，M4-S1 换 `platform::home_dir()`）。
+/// 用户主目录。解析逻辑在 `keyrelay_core::platform`（按平台处理 `KEYRELAY_HOME` /
+/// `USERPROFILE` / `HOMEDRIVE`+`HOMEPATH` / `HOME`）。
+///
+/// 壳层这里只做「解析不出来就明确退出」——**不静默退化成当前目录**
+/// （否则在 Windows 上会把密钥写到 `C:\Program Files\...`，用户找不到）。
 pub fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+    match keyrelay_core::platform::home_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("[keyrelay] {err}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `~/.keyrelay/keyrelay.db`
@@ -146,7 +153,8 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::drift_report,
             commands::get_settings,
             commands::update_settings,
-            commands::refresh_all
+            commands::refresh_all,
+            commands::audit_redaction
         ])
 }
 

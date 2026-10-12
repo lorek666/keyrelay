@@ -1,7 +1,13 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Save } from "lucide-react";
-import { getSettings, updateSettings, type Settings } from "../lib/api";
+import { ShieldCheck } from "lucide-react";
+import {
+  auditRedaction,
+  getSettings,
+  updateSettings,
+  type Settings,
+} from "../lib/api";
 
 const PRESETS = [
   { label: "关闭", value: 0 },
@@ -9,6 +15,55 @@ const PRESETS = [
   { label: "15 分钟", value: 900 },
   { label: "1 小时", value: 3600 },
 ];
+
+function AuditCard() {
+  const report = useQuery({
+    queryKey: ["audit"],
+    queryFn: auditRedaction,
+    enabled: false,
+  });
+
+  return (
+    <div className="card">
+      <h3>
+        <ShieldCheck size={15} aria-hidden /> 脱敏审计
+      </h3>
+      <p className="muted">
+        扫描本产品的全部落盘产物（数据库、WAL、备份目录、事件表），确认没有明文凭证。
+        只扫自己的产物，不做全盘扫描。
+      </p>
+      <button
+        type="button"
+        className="btn"
+        disabled={report.isFetching}
+        onClick={() => report.refetch()}
+      >
+        {report.isFetching ? "扫描中…" : "开始扫描"}
+      </button>
+      {report.data ? (
+        <>
+          <p className={report.data.clean ? "ok" : "error"}>
+            {report.data.summary}
+          </p>
+          {report.data.findings.length ? (
+            <ul className="list">
+              {report.data.findings.map((f, i) => (
+                <li key={`${f.kind}-${i}`}>
+                  <span className="badge badge-warn">{f.kind}</span>{" "}
+                  <span className="mono ellipsis">{f.path ?? "事件表"}</span>{" "}
+                  {f.detail}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </>
+      ) : null}
+      {report.isError ? (
+        <p className="error">{(report.error as Error).message}</p>
+      ) : null}
+    </div>
+  );
+}
 
 export default function SettingsPage() {
   const qc = useQueryClient();
@@ -131,6 +186,8 @@ export default function SettingsPage() {
             </button>
             {dirty ? <span className="muted">有未保存的修改</span> : null}
           </div>
+
+          <AuditCard />
         </>
       )}
     </section>
