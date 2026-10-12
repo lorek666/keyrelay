@@ -24,3 +24,6 @@ src-tauri/gen/schemas/
 /backups/
 *.bak
 *.tmp
+
+# macOS
+.DS_Store
