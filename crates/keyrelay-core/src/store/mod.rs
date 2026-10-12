@@ -85,6 +85,15 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// 钥匙串引用形状：`kr/<scope>/<id>/<field>`（与 `vault::secret_ref` 一致）。
+///
+/// 采用白名单而非黑名单：只拦 `sk-` / `nap-` 前缀会放过 32 位 hex 之类的明文
+/// （复审 P2-4 的探针即用该形状入库成功）。
+fn is_valid_secret_ref(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('/').collect();
+    parts.len() == 4 && parts[0] == "kr" && parts[1..].iter().all(|p| !p.is_empty())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SiteRow {
     pub id: i64,
@@ -117,7 +126,9 @@ impl Store {
         }
         let conn =
             Connection::open(path).map_err(|e| Error::Store(format!("打开数据库失败: {e}")))?;
-        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        // 文件库必须真的跑在 WAL 上（并发读+写）。内存库不支持 WAL，只在 open_in_memory 分支跳过。
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| Error::Store(format!("切换 WAL 模式失败: {e}")))?;
         Self::from_conn(conn)
     }
 
@@ -207,7 +218,7 @@ impl Store {
         Ok(())
     }
 
-    /// `secret_ref` 必须是钥匙串引用，禁止传明文
+    /// `secret_ref` 必须是钥匙串引用（`kr/<scope>/<id>/<field>`），禁止传明文
     pub fn insert_key(
         &self,
         site_id: i64,
@@ -215,10 +226,11 @@ impl Store {
         secret_ref: &str,
         remote_id: Option<&str>,
     ) -> Result<i64> {
-        if secret_ref.starts_with("sk-") || secret_ref.starts_with("nap-") {
-            return Err(Error::Store(
-                "拒绝把明文密钥写入数据库，请传钥匙串引用".into(),
-            ));
+        if !is_valid_secret_ref(secret_ref) {
+            return Err(Error::Store(format!(
+                "secret_ref 必须是钥匙串引用（kr/<scope>/<id>/<field>），拒绝写入疑似明文: {}",
+                crate::redact::scrub(secret_ref)
+            )));
         }
         let conn = self.lock()?;
         conn.execute(
@@ -337,6 +349,29 @@ mod tests {
             .insert_key(site, "bad", "sk-abcdefgh12345678", None)
             .unwrap_err();
         assert!(matches!(err, Error::Store(_)));
+    }
+
+    #[test]
+    fn refuses_non_keychain_shaped_refs() {
+        let store = Store::open_in_memory().unwrap();
+        let site = store
+            .upsert_site("newapi", "https://d.example.com", "D")
+            .unwrap();
+
+        // 32 位 hex 明文（复审 P2-4 探针形状）：黑名单时代会被放过
+        assert!(matches!(
+            store.insert_key(site, "hex", "9f3c1a7b2e5d8046c1b9f4a7d2e83b15", None),
+            Err(Error::Store(_))
+        ));
+        // 段数不对的引用
+        assert!(matches!(
+            store.insert_key(site, "short", "kr/key/1", None),
+            Err(Error::Store(_))
+        ));
+        // 合法引用
+        assert!(store
+            .insert_key(site, "ok", "kr/key/9/secret", None)
+            .is_ok());
     }
 
     #[test]

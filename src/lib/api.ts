@@ -20,6 +20,8 @@ export type AppInfo = {
   version: string;
   dbPath: string;
   siteCount: number;
+  /** 数据库降级原因；非空表示当前跑在内存库上（复审 P2-11） */
+  dbError?: string | null;
 };
 
 const hasTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -39,6 +41,7 @@ const MOCK_INFO: AppInfo = {
   version: "0.1.0-dev",
   dbPath: "（浏览器预览模式，无本地数据库）",
   siteCount: MOCK_SITES.length,
+  dbError: null,
 };
 
 async function invokeCommand<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {

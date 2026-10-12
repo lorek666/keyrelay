@@ -31,6 +31,11 @@ export default function App() {
             {info ? `${info.name} ${info.version}` : ""}
           </span>
         </header>
+        {info?.dbError ? (
+          <p className="error" role="alert">
+            本地数据库降级：{info.dbError}（当前数据仅存内存，重启即丢失）
+          </p>
+        ) : null}
         <Overview />
       </main>
     </div>
