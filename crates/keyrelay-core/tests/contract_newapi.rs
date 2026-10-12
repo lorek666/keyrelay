@@ -850,6 +850,39 @@ async fn list_keys_reports_truncation_instead_of_silently_capping() {
 }
 
 #[tokio::test]
+async fn list_keys_ignores_a_negative_total_instead_of_truncating() {
+    // M1-S3/S4 复审 P2-1：`total: -5` 曾让 `collected.len() >= total` 在第一页就成立，
+    // 于是只发 1 次请求、静默交付被截断的列表。负数必须被当作「没给可用总数」。
+    let page = |offset: i64, count: i64| -> HttpResponse {
+        let items: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                let id = offset + i + 1;
+                json!({"id": id, "name": format!("bulk-{id}"), "status": 1})
+            })
+            .collect();
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": items, "total": -5}}),
+        )
+    };
+    // total 被当作「缺失」后，靠空页收尾 → 需要第 4 次请求
+    let transport = MockTransport::new(vec![
+        page(0, 10),
+        page(10, 10),
+        page(20, 5),
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": [], "total": -5}}),
+        ),
+    ]);
+    let adapter = NewApi::new(transport);
+
+    let keys = adapter.list_keys(BASE, &session()).await.unwrap();
+    assert_eq!(keys.len(), 25, "负数 total 不得导致提前收工");
+    assert_eq!(adapter.transport().requests().len(), 4);
+}
+
+#[tokio::test]
 async fn list_keys_reaches_the_last_page_without_a_total_field() {
     // 第三轮复核 P2-2：站点忽略 `page_size`（每页 10 条）+ 恰好 1000 条 + 响应无 `total`。
     // 第 100 页取满 1000 条后还需要一次探测才能确认到底，不能在这里误报「取不全」。

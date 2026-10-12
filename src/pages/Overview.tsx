@@ -60,7 +60,16 @@ export default function Overview() {
           <dd className="mono">
             {info.data ? `${info.data.name} ${info.data.version}` : "…"}
           </dd>
+          <dt>系统钥匙串</dt>
+          <dd className="mono">{info.data?.vaultBackend ?? "…"}</dd>
         </dl>
+
+        {info.data?.vaultBackend === "memory" ? (
+          <p className="error" role="alert">
+            <AlertTriangle size={14} aria-hidden /> 当前用的是内存钥匙串：
+            密钥不会进系统钥匙串，进程退出即丢失。真实运行里出现这个后端即为缺陷。
+          </p>
+        ) : null}
 
         {runtimeMode === "browser" ? (
           <p className="warn" role="status">

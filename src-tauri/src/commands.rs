@@ -18,6 +18,8 @@ pub struct AppInfoDto {
     site_count: usize,
     /// 数据库降级原因（正常为 null）
     db_error: Option<String>,
+    /// 钥匙串后端标识。`"memory"` 出现在真实运行里即为缺陷（意味着密钥没进系统钥匙串）。
+    vault_backend: String,
 }
 
 #[derive(Serialize)]
@@ -179,6 +181,7 @@ pub fn app_info(state: State<'_, AppState>) -> Result<AppInfoDto, String> {
         db_path: state.db_path.display().to_string(),
         site_count,
         db_error: state.db_error.clone(),
+        vault_backend: state.service.vault_backend().to_string(),
     })
 }
 
@@ -533,11 +536,13 @@ mod tests {
             db_path: ":memory:".into(),
             site_count: 0,
             db_error: None,
+            vault_backend: "memory".into(),
         };
         let value = to_value(&info);
         assert_eq!(value["dbPath"], ":memory:");
         assert_eq!(value["siteCount"], 0);
         assert_eq!(value["dbError"], Value::Null);
+        assert_eq!(value["vaultBackend"], "memory");
     }
 
     /// M1-S3：投递相关 DTO 的线上字段名与「不含密钥」双重断言。

@@ -38,6 +38,7 @@ export default function Agents() {
   const [agreeChecked, setAgreeChecked] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [revoking, setRevoking] = useState(false);
+  const [confirmingRollback, setConfirmingRollback] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastOutcome, setLastOutcome] = useState<DeliveryOutcome | null>(null);
@@ -101,9 +102,13 @@ export default function Agents() {
     onSuccess: async () => {
       setNotice(`已回滚 ${lastOutcome?.journalId}`);
       setLastOutcome(null);
+      setConfirmingRollback(false);
       await qc.invalidateQueries({ queryKey: ["events"] });
     },
-    onError: (err: Error) => setError(err.message),
+    onError: (err: Error) => {
+      setError(err.message);
+      setConfirmingRollback(false);
+    },
   });
 
   const consentLabel = useMemo(() => {
@@ -118,7 +123,7 @@ export default function Agents() {
       <h2>Agent 投递</h2>
       <p className="muted">
         投递会把钥匙串里的密钥写进所选 agent 的配置文件。
-        **任何写入都必须先勾选同意**；写入前会展示脱敏后的差异预览。
+        任何写入都必须先勾选同意；写入前会展示脱敏后的差异预览。
       </p>
 
       {notice ? <p className="ok" role="status">{notice}</p> : null}
@@ -214,7 +219,7 @@ export default function Agents() {
             type="button"
             className="btn btn-danger"
             disabled={rollback.isPending}
-            onClick={() => rollback.mutate()}
+            onClick={() => setConfirmingRollback(true)}
           >
             <Undo2 size={14} aria-hidden /> 回滚这次投递
           </button>
@@ -245,9 +250,13 @@ export default function Agents() {
                   <td className="mono">{row.fields}</td>
                   <td>
                     {row.revokedAt ? (
-                      <span className="badge badge-warn">已撤销</span>
+                      <span className="badge badge-warn" title={formatTs(row.revokedAt)}>
+                        已撤销 {formatTs(row.revokedAt)}
+                      </span>
                     ) : (
-                      <span className="badge badge-ok">有效</span>
+                      <span className="badge badge-ok" title={formatTs(row.grantedAt)}>
+                        有效 · 同意于 {formatTs(row.grantedAt)}
+                      </span>
                     )}
                   </td>
                 </tr>
@@ -284,6 +293,21 @@ export default function Agents() {
       </ConfirmDialog>
 
       <ConfirmDialog
+        open={confirmingRollback}
+        title="回滚这次投递"
+        danger
+        confirmLabel={rollback.isPending ? "回滚中…" : "回滚"}
+        onCancel={() => setConfirmingRollback(false)}
+        onConfirm={() => rollback.mutate()}
+      >
+        <p>
+          会把目标文件还原到这次投递之前的内容（逐字节比对）。
+          如果文件在那之后被别的程序改过，回滚会被拒绝，而不是覆盖掉别人的改动。
+        </p>
+        <p className="muted mono">{lastOutcome?.targetPath}</p>
+      </ConfirmDialog>
+
+      <ConfirmDialog
         open={revoking}
         title="撤销投递同意"
         danger
@@ -292,12 +316,17 @@ export default function Agents() {
         onConfirm={() => revoke.mutate()}
       >
         <p>
-          撤销后无法再向该通道投递，**已经写入的文件不会被自动还原**。
+          撤销后无法再向该通道投递，已经写入的文件不会被自动还原。
           如需还原内容，请到「变更历史」页回滚。
         </p>
       </ConfirmDialog>
     </section>
   );
+}
+
+function formatTs(ts: number): string {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleString();
 }
 
 function PlanView({

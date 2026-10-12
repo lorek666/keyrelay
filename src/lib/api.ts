@@ -24,6 +24,8 @@ export type AppInfo = {
   siteCount: number;
   /** 数据库降级原因；非空表示当前跑在内存库上 */
   dbError?: string | null;
+  /** 钥匙串后端。`"memory"` 表示密钥没进系统钥匙串（真实运行里即为缺陷）。 */
+  vaultBackend: string;
 };
 
 export type SiteFingerprint = {
@@ -176,6 +178,7 @@ const MOCK_INFO: AppInfo = {
   dbPath: "（浏览器预览模式，无本地数据库）",
   siteCount: MOCK_SITES.length,
   dbError: null,
+  vaultBackend: "memory",
 };
 
 const MOCK_KEYS: KeyRow[] = [
@@ -347,23 +350,3 @@ export async function recentEvents(limit = 100): Promise<EventRow[]> {
   if (!hasTauri) return mock(MOCK_EVENTS);
   return invokeCommand<EventRow[]>("recent_events", { limit });
 }
-
-/** 本文件覆盖的命令名集合（供 `scripts/check-commands.mjs` 与后端比对）。 */
-export const INVOKED_COMMANDS: string[] = [
-  "app_info",
-  "list_sites",
-  "detect_site",
-  "add_site",
-  "login_site",
-  "list_keys",
-  "create_key",
-  "site_balance",
-  "delivery_plan",
-  "grant_consent",
-  "revoke_consent",
-  "list_consents",
-  "apply_delivery",
-  "rollback_delivery",
-  "recent_events",
-  "list_stored_keys",
-];
