@@ -218,7 +218,7 @@ mod tests {
     fn keys_response() -> HttpResponse {
         HttpResponse::json(
             200,
-            json!({"success": true, "data": {"items": [{"id": 1, "name": "codex/daily", "status": 1}]}}),
+            json!({"success": true, "data": {"items": [{"id": 1, "name": "codex/daily", "status": 1}], "total": 1}}),
         )
         .expect("构造响应")
     }

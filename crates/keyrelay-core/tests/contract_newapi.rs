@@ -301,7 +301,9 @@ async fn create_key_flow_is_create_then_list_then_reveal() {
                 {"id": 12, "name": "codex/daily", "status": 1, "created_time": 2}
             ]}}),
         ),
-        // 3) 读明文
+        // 3) 站点未声明 total → 必须再探一页才能确认取全（空页即到底）
+        json_resp(200, json!({"success": true, "data": {"items": []}})),
+        // 4) 读明文
         json_resp(
             200,
             json!({"success": true, "data": {"key": "sk-abcdefgh12345678"}}),
@@ -319,13 +321,15 @@ async fn create_key_flow_is_create_then_list_then_reveal() {
     assert_eq!(material.secret, "sk-abcdefgh12345678");
 
     let requests = adapter.transport().requests();
-    assert_eq!(requests.len(), 3);
+    // 创建 + 列表第 1 页 + 列表第 2 页（空页，用于确认到底）+ 读明文
+    assert_eq!(requests.len(), 4);
     assert_eq!(requests[0].url, "https://relay.example.com/api/token/");
     assert!(requests[1]
         .url
         .starts_with("https://relay.example.com/api/token/?"));
+    assert_eq!(requests[2].url, "https://relay.example.com/api/token/?p=2&page_size=100");
     assert_eq!(
-        requests[2].url,
+        requests[3].url,
         "https://relay.example.com/api/token/12/key"
     );
     let create_body: serde_json::Value =
@@ -614,6 +618,149 @@ async fn encryption_probe_missing_enabled_field_fails_closed() {
 }
 
 #[tokio::test]
+async fn encryption_probe_failure_envelope_keeps_site_message() {
+    // 复核 P2：上游真实存在的 `{"success":false,"message":"Database error…"}`（HTTP 200）
+    // 方向是 fail-closed，但站点原文必须带出来，否则用户无法排障
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": false, "message": "Database error while fetching key"}),
+    )]);
+    let adapter = NewApi::new(transport);
+
+    let err = adapter
+        .login(BASE, Credentials::new("me", "pw-12345678"))
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("缺少 enabled"), "{text}");
+    assert!(text.contains("Database error"), "站点原文被丢弃: {text}");
+    assert_eq!(adapter.transport().requests().len(), 1, "不得发出登录请求");
+}
+
+#[tokio::test]
+async fn list_keys_does_not_assume_the_server_honors_page_size() {
+    // 第二轮复核 P1：站点忽略 `page_size`（旧版默认每页 10 条）时，
+    // 「本页不满 100 即收工」会把首页 10 条当成全部 → 静默交付截断列表
+    let page = |offset: i64, count: i64| -> HttpResponse {
+        let items: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                let id = offset + i + 1;
+                json!({"id": id, "name": format!("bulk-{id}"), "status": 1})
+            })
+            .collect();
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": items, "total": 25}}),
+        )
+    };
+    let transport = MockTransport::new(vec![
+        page(0, 10),
+        page(10, 10),
+        page(20, 5),
+    ]);
+    let adapter = NewApi::new(transport);
+
+    let keys = adapter.list_keys(BASE, &session()).await.unwrap();
+    assert_eq!(keys.len(), 25, "必须按 total 翻到底，而不是首页不满就收工");
+    assert_eq!(adapter.transport().requests().len(), 3);
+}
+
+#[tokio::test]
+async fn create_key_finds_token_beyond_the_first_short_page() {
+    // 与上一条同源：站点每页只给 10 条时，刚建好的令牌在第 3 页
+    let page = |offset: i64, count: i64| -> HttpResponse {
+        let items: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                let id = offset + i + 1;
+                let name = if id == 25 { "codex/daily" } else { "bulk" };
+                json!({"id": id, "name": name, "status": 1})
+            })
+            .collect();
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": items, "total": 25}}),
+        )
+    };
+    let transport = MockTransport::new(vec![
+        json_resp(200, json!({"success": true, "data": {}})), // 创建
+        page(0, 10),
+        page(10, 10),
+        page(20, 5),
+        json_resp(200, json!({"success": true, "data": {"key": "sk-fresh"}})), // 读明文
+    ]);
+    let adapter = NewApi::new(transport);
+
+    let material = adapter
+        .create_key(
+            BASE,
+            &session(),
+            KeySpec {
+                name: "codex/daily".into(),
+                quota_limit: None,
+                expires_at: None,
+                group: None,
+            },
+        )
+        .await
+        .expect("不得因短页误报 NotFound");
+    assert_eq!(material.remote_id, "25");
+    assert_eq!(material.secret, "sk-fresh");
+}
+
+#[tokio::test]
+async fn list_keys_errors_when_a_page_has_items_but_no_usable_id() {
+    // 第二轮复核 P2：有条目却解析不出 id 是解析异常，不能被当成「翻到底了」
+    let items: Vec<serde_json::Value> = (0..100)
+        .map(|i| json!({"name": format!("no-id-{i}"), "status": 1}))
+        .collect();
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"items": items, "total": 500}}),
+    )]);
+    let adapter = NewApi::new(transport);
+
+    let err = adapter.list_keys(BASE, &session()).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Transport(ref m) if m.contains("缺少可用的 id")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_keys_errors_on_empty_page_that_contradicts_total() {
+    // 声明 total=1500 却给空页：不能假装取全了
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"items": [], "total": 1500}}),
+    )]);
+    let adapter = NewApi::new(transport);
+
+    let err = adapter.list_keys(BASE, &session()).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Transport(ref m) if m.contains("空列表")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_keys_accepts_empty_account_with_zero_total() {
+    // 反例保护：一把令牌都没有的账号必须正常返回空列表，不能报错
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"items": [], "total": 0}}),
+    )]);
+    let adapter = NewApi::new(transport);
+    assert!(adapter.list_keys(BASE, &session()).await.unwrap().is_empty());
+
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"items": []}}),
+    )]);
+    let adapter = NewApi::new(transport);
+    assert!(adapter.list_keys(BASE, &session()).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn list_keys_keeps_paging_when_total_is_not_a_number() {
     // 复核 N-3：`total` 非数字时曾按「本页条数」处理 → 首页满页就静默停住
     let page1: Vec<serde_json::Value> = (1..=100)
@@ -628,16 +775,13 @@ async fn list_keys_keeps_paging_when_total_is_not_a_number() {
             200,
             json!({"success": true, "data": {"items": [{"id": 101, "name": "codex/daily", "status": 1}]}}),
         ),
+        json_resp(200, json!({"success": true, "data": {"items": []}})),
     ]);
     let adapter = NewApi::new(transport);
 
     let keys = adapter.list_keys(BASE, &session()).await.unwrap();
-    assert_eq!(
-        keys.len(),
-        101,
-        "total 不可用时应靠「本页是否满」判断继续翻页"
-    );
-    assert_eq!(adapter.transport().requests().len(), 2);
+    assert_eq!(keys.len(), 101, "total 不可用时必须继续翻页直到空页");
+    assert_eq!(adapter.transport().requests().len(), 3);
 }
 
 #[tokio::test]
@@ -670,7 +814,7 @@ async fn list_keys_reports_truncation_instead_of_silently_capping() {
     let full_page: Vec<serde_json::Value> = (0..100)
         .map(|i| json!({"id": i, "name": format!("bulk-{i}"), "status": 1}))
         .collect();
-    let pages: Vec<HttpResponse> = (0..10)
+    let pages: Vec<HttpResponse> = (0..100)
         .map(|p| {
             let items: Vec<serde_json::Value> = full_page
                 .iter()
@@ -684,7 +828,7 @@ async fn list_keys_reports_truncation_instead_of_silently_capping() {
                 .collect();
             json_resp(
                 200,
-                json!({"success": true, "data": {"items": items, "total": 1500}}),
+                json!({"success": true, "data": {"items": items, "total": 20000}}),
             )
         })
         .collect();
@@ -692,7 +836,7 @@ async fn list_keys_reports_truncation_instead_of_silently_capping() {
 
     let err = adapter.list_keys(BASE, &session()).await.unwrap_err();
     assert!(
-        matches!(err, Error::Transport(ref m) if m.contains("列举上限")),
+        matches!(err, Error::Transport(ref m) if m.contains("仍未取全")),
         "{err:?}"
     );
 }

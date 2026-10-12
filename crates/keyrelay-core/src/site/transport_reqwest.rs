@@ -118,6 +118,22 @@ impl ReqwestTransport {
             .gzip(true);
 
         if let Some(proxy_url) = config.proxy.as_deref() {
+            // 先自校验 scheme：`Proxy::all` 对 `file:///etc/passwd`、无 scheme 的
+            // `alice:pw@host:1080` 都会**构造成功**，与模块文档「配置非法时构造即失败」
+            // 不符（复核 P2-4）。这里按 reqwest 实际支持的代理 scheme 白名单收口。
+            let scheme = proxy_url
+                .split_once("://")
+                .map(|(s, _)| s.to_ascii_lowercase())
+                .unwrap_or_default();
+            const ALLOWED: [&str; 6] = ["http", "https", "socks4", "socks4a", "socks5", "socks5h"];
+            if !ALLOWED.contains(&scheme.as_str()) {
+                return Err(Error::Transport(format!(
+                    "代理配置无效（{}）：scheme 必须是 {} 之一，拒绝静默直连",
+                    mask_proxy(proxy_url),
+                    ALLOWED.join(" / ")
+                )));
+            }
+
             let proxy = Proxy::all(proxy_url.to_string()).map_err(|e| {
                 Error::Transport(format!(
                     "代理配置无效（{}），拒绝静默直连: {e}",
@@ -283,6 +299,42 @@ mod tests {
             !message.contains("alice"),
             "错误串泄漏代理用户名: {message}"
         );
+    }
+
+    #[test]
+    fn proxy_scheme_whitelist_rejects_non_proxy_urls() {
+        // 复核 P2-4：`Proxy::all` 会接受 `file:///...` 与无 scheme 的串，
+        // 与「配置非法时构造即失败」的模块约定不符 → 由本层白名单收口
+        for bad in [
+            "file:///etc/passwd",
+            "alice:s3cr3t-token@127.0.0.1:1080",
+            "ftp://127.0.0.1:21",
+            "",
+        ] {
+            let config = TransportConfig {
+                proxy: Some(bad.to_string()),
+                ..TransportConfig::default()
+            };
+            let err = ReqwestTransport::new(config)
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} 应被拒绝"));
+            let message = err.to_string();
+            assert!(message.contains("代理配置无效"), "{bad:?} → {message}");
+            assert!(!message.contains("s3cr3t-token"), "{message}");
+        }
+
+        for good in [
+            "http://127.0.0.1:7897",
+            "https://proxy.example.com:8443",
+            "socks5://127.0.0.1:1080",
+            "socks5h://user:pw@127.0.0.1:1080",
+        ] {
+            let config = TransportConfig {
+                proxy: Some(good.to_string()),
+                ..TransportConfig::default()
+            };
+            assert!(ReqwestTransport::new(config).is_ok(), "{good} 应被接受");
+        }
     }
 
     #[test]
