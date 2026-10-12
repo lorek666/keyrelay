@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-detect-site"
+description = "Enables the detect_site command without any pre-configured scope."
+commands.allow = ["detect_site"]
+
+[[permission]]
+identifier = "deny-detect-site"
+description = "Denies the detect_site command without any pre-configured scope."
+commands.deny = ["detect_site"]

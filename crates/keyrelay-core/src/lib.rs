@@ -7,6 +7,7 @@
 pub mod error;
 pub mod inject;
 pub mod redact;
+pub mod service;
 pub mod site;
 pub mod store;
 pub mod vault;

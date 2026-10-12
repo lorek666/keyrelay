@@ -211,6 +211,30 @@ impl Store {
             .map_err(|e| Error::Store(format!("读取站点行失败: {e}")))
     }
 
+    pub fn get_site(&self, id: i64) -> Result<Option<SiteRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT id, kind, base_url, display_name, health FROM sites WHERE id = ?1")
+            .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
+        let mut rows = stmt
+            .query_map(params![id], |row| {
+                Ok(SiteRow {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    base_url: row.get(2)?,
+                    display_name: row.get(3)?,
+                    health: row.get(4)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("查询站点失败: {e}")))?;
+
+        match rows.next() {
+            Some(Ok(row)) => Ok(Some(row)),
+            Some(Err(e)) => Err(Error::Store(format!("读取站点行失败: {e}"))),
+            None => Ok(None),
+        }
+    }
+
     pub fn delete_site(&self, id: i64) -> Result<()> {
         let conn = self.lock()?;
         conn.execute("DELETE FROM sites WHERE id = ?1", params![id])

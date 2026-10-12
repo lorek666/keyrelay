@@ -15,7 +15,7 @@ use reqwest::{redirect, Method as HttpMethod, Proxy};
 use super::transport::{HttpRequest, HttpResponse, HttpTransport, Method};
 use crate::error::{Error, Result};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TransportConfig {
     pub timeout: Duration,
     pub connect_timeout: Duration,
@@ -24,6 +24,23 @@ pub struct TransportConfig {
     pub user_agent: String,
     /// 允许跟随的重定向次数，默认 0
     pub follow_redirects: usize,
+}
+
+/// 手写 `Debug`：代理 URL 可能内嵌 `user:pass`，而 `config()` 是公开 API，
+/// 用 derive 会让任何 `{:?}` 把凭据打进日志（M1-S0 复核 N-1 / BACKLOG B-22）。
+impl std::fmt::Debug for TransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportConfig")
+            .field("timeout", &self.timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field(
+                "proxy",
+                &self.proxy.as_ref().map(|_| "<已配置（内容脱敏）>"),
+            )
+            .field("user_agent", &self.user_agent)
+            .field("follow_redirects", &self.follow_redirects)
+            .finish()
+    }
 }
 
 impl Default for TransportConfig {

@@ -8,8 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait = "0.1.92"
+base64 = "0.23.1"
 hex = "0.4.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "socks", "gzip"] }
+rsa = { version = "0.9.10", features = ["sha2", "pem", "getrandom"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
@@ -19,5 +21,7 @@ tokio = { version = "1.53.2", features = ["time"] }
 toml_edit = "0.25.5"
 
 [dev-dependencies]
+base64 = "0.23.1"
+rsa = { version = "0.9.10", features = ["sha2", "pem", "getrandom"] }
 tempfile = "3.27.0"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros"] }

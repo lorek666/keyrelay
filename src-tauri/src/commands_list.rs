@@ -8,4 +8,13 @@
 // 漏登记的后果是**运行期**被 ACL 拒绝（`not allowed. Plugin not found`），
 // 编译期不报错，因此由 `tests/commands.rs` 的守护测试兜底。
 
-pub const COMMANDS: &[&str] = &["list_sites", "app_info"];
+pub const COMMANDS: &[&str] = &[
+    "list_sites",
+    "app_info",
+    "detect_site",
+    "add_site",
+    "login_site",
+    "list_keys",
+    "create_key",
+    "site_balance",
+];
