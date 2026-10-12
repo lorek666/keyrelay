@@ -243,18 +243,22 @@ async fn login_maps_rate_limit_and_auth_failures() {
 
 #[tokio::test]
 async fn list_keys_strips_the_plaintext_key_field() {
-    let transport = MockTransport::new(vec![ok(json!([
-        {
-            "id": 12, "user_id": 3, "key": SECRET, "name": "codex/daily",
-            "group_id": 1, "status": "active",
-            "created_at": "2026-07-27T05:03:01.628Z", "last_used_at": null,
-            "quota": 10.0, "quota_used": 2.5
-        },
-        {
-            "id": 13, "key": "sk-ANOTHER-LEAK-0000000000", "name": "claude/daily",
-            "status": "inactive"
-        }
-    ]))]);
+    // **真实形态**：`response.Paginated` → `data = {items, total, page, page_size, pages}`
+    let transport = MockTransport::new(vec![ok(json!({
+        "items": [
+            {
+                "id": 12, "user_id": 3, "key": SECRET, "name": "codex/daily",
+                "group_id": 1, "status": "active",
+                "created_at": "2026-07-27T05:03:01.628Z", "last_used_at": null,
+                "quota": 10.0, "quota_used": 2.5
+            },
+            {
+                "id": 13, "key": "sk-ANOTHER-LEAK-0000000000", "name": "claude/daily",
+                "status": "inactive"
+            }
+        ],
+        "total": 2, "page": 1, "page_size": 100, "pages": 1
+    }))]);
     let adapter = Sub2Api::new(transport);
 
     let keys = adapter.list_keys(BASE, &session()).await.unwrap();
@@ -274,7 +278,10 @@ async fn list_keys_strips_the_plaintext_key_field() {
 
     // 列表请求必须带 Bearer
     let requests = adapter.transport().requests();
-    assert_eq!(requests[0].url, "https://sub.example.com/api/v1/keys");
+    assert_eq!(
+        requests[0].url,
+        "https://sub.example.com/api/v1/keys?page=1&page_size=100"
+    );
     assert!(
         requests[0]
             .headers
@@ -286,14 +293,87 @@ async fn list_keys_strips_the_plaintext_key_field() {
 }
 
 #[tokio::test]
-async fn list_keys_accepts_empty_array() {
-    let transport = MockTransport::new(vec![ok(json!([]))]);
+async fn list_keys_accepts_empty_paginated_result() {
+    let transport = MockTransport::new(vec![ok(json!({
+        "items": [], "total": 0, "page": 1, "page_size": 100, "pages": 1
+    }))]);
     let adapter = Sub2Api::new(transport);
     assert!(adapter
         .list_keys(BASE, &session())
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn list_keys_still_accepts_a_bare_array() {
+    // 兼容老版本/异常部署：裸数组形态也认。
+    // 裸数组没有 total，因此会多探一页（空页即到底）。
+    let transport = MockTransport::new(vec![
+        ok(json!([{"id": 1, "key": "sk-x", "name": "a", "status": "active"}])),
+        ok(json!([])),
+    ]);
+    let adapter = Sub2Api::new(transport);
+    assert_eq!(adapter.list_keys(BASE, &session()).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn list_keys_errors_on_unrecognized_shape_instead_of_silently_empty() {
+    // 复审 P1-1 的教训：认不出的形态**必须报错**，不能静默返回空列表
+    let transport = MockTransport::new(vec![ok(json!({"something": "else"}))]);
+    let adapter = Sub2Api::new(transport);
+    let err = adapter.list_keys(BASE, &session()).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Transport(ref m) if m.contains("形态无法识别")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_keys_follows_pagination() {
+    let page = |page: u32, ids: &[i64]| -> HttpResponse {
+        let items: Vec<Value> = ids
+            .iter()
+            .map(
+                |id| json!({"id": id, "key": "sk-x", "name": format!("k{id}"), "status": "active"}),
+            )
+            .collect();
+        ok(json!({"items": items, "total": 3, "page": page, "page_size": 2, "pages": 2}))
+    };
+    let transport = MockTransport::new(vec![page(1, &[1, 2]), page(2, &[3])]);
+    let adapter = Sub2Api::new(transport);
+
+    let keys = adapter.list_keys(BASE, &session()).await.unwrap();
+    assert_eq!(keys.len(), 3);
+    let requests = adapter.transport().requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].url.ends_with("page=2&page_size=100"),
+        "{}",
+        requests[1].url
+    );
+}
+
+#[tokio::test]
+async fn create_key_sends_an_idempotency_key() {
+    // 复审 P1-2：`observe_only=false` 的部署会强制要求该头
+    let transport = MockTransport::new(vec![json_resp(
+        201,
+        json!({"code": 0, "message": "success", "data": {"id": 21, "key": SECRET, "name": "k"}}),
+    )]);
+    let adapter = Sub2Api::new(transport);
+    adapter
+        .create_key(BASE, &session(), KeySpec::named("k"))
+        .await
+        .unwrap();
+
+    let requests = adapter.transport().requests();
+    let key = requests[0]
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("idempotency-key"))
+        .map(|(_, v)| v.clone());
+    assert!(!key.expect("必须带 Idempotency-Key").is_empty());
 }
 
 #[tokio::test]

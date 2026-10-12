@@ -125,8 +125,19 @@ fn spawn_fake_sub2api() -> FakeSite {
             let auth = header_of(&raw, "authorization").unwrap_or_default();
             let authed = auth == format!("Bearer {TOKEN}");
 
-            match first_line.as_str() {
-                line if line.starts_with("GET /api/v1/settings/public") => {
+            // 把「方法」与「不含查询串的路径」拆开：分页参数会让 `starts_with` 判断失准
+            let mut parts = first_line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_string();
+            let path = parts
+                .next()
+                .unwrap_or_default()
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+
+            match (method.as_str(), path.as_str()) {
+                ("GET", "/api/v1/settings/public") => {
                     respond(
                         &mut stream,
                         "200 OK",
@@ -137,7 +148,7 @@ fn spawn_fake_sub2api() -> FakeSite {
                         })),
                     );
                 }
-                line if line.starts_with("POST /api/v1/auth/login/2fa") => {
+                ("POST", "/api/v1/auth/login/2fa") => {
                     let value: serde_json::Value =
                         serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
                     let token_ok =
@@ -162,7 +173,7 @@ fn spawn_fake_sub2api() -> FakeSite {
                         );
                     }
                 }
-                line if line.starts_with("POST /api/v1/auth/login") => {
+                ("POST", "/api/v1/auth/login") => {
                     let value: serde_json::Value =
                         serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
                     // 字段名必须是 email（不是 username）
@@ -187,8 +198,7 @@ fn spawn_fake_sub2api() -> FakeSite {
                         );
                     }
                 }
-                // 注意：必须带尾随空格，否则会把 `GET /api/v1/keys/{id}` 也匹配进来
-                line if line.starts_with("GET /api/v1/keys ") => {
+                ("GET", "/api/v1/keys") => {
                     if !authed {
                         respond(
                             &mut stream,
@@ -207,9 +217,22 @@ fn spawn_fake_sub2api() -> FakeSite {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    respond(&mut stream, "200 OK", &ok(serde_json::Value::Array(list)));
+                    // **真实形态**：`response.Paginated` → `data = {items, total, ...}`
+                    // （复审 P1-1：早先这里返回裸数组，与契约测试同源错误，抓不到真问题）
+                    let total = list.len() as i64;
+                    respond(
+                        &mut stream,
+                        "200 OK",
+                        &ok(serde_json::json!({
+                            "items": list,
+                            "total": total,
+                            "page": 1,
+                            "page_size": 100,
+                            "pages": 1
+                        })),
+                    );
                 }
-                line if line.starts_with("POST /api/v1/keys ") => {
+                ("POST", "/api/v1/keys") => {
                     if !authed {
                         respond(
                             &mut stream,
@@ -239,7 +262,7 @@ fn spawn_fake_sub2api() -> FakeSite {
                         &ok(key_json(id, &name, CREATED_SECRET)),
                     );
                 }
-                line if line.starts_with("DELETE /api/v1/keys/") => {
+                ("DELETE", p) if p.starts_with("/api/v1/keys/") => {
                     if !authed {
                         respond(
                             &mut stream,
@@ -249,10 +272,9 @@ fn spawn_fake_sub2api() -> FakeSite {
                         );
                         continue;
                     }
-                    let id: i64 = first_line
-                        .split_whitespace()
-                        .nth(1)
-                        .and_then(|p| p.rsplit('/').next())
+                    let id: i64 = path
+                        .rsplit('/')
+                        .next()
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(-1);
                     if let Ok(mut s) = site_state.lock() {
@@ -260,7 +282,7 @@ fn spawn_fake_sub2api() -> FakeSite {
                     }
                     respond(&mut stream, "200 OK", &ok(serde_json::Value::Null));
                 }
-                line if line.starts_with("GET /api/v1/keys/") => {
+                ("GET", p) if p.starts_with("/api/v1/keys/") => {
                     if !authed {
                         respond(
                             &mut stream,
@@ -270,10 +292,9 @@ fn spawn_fake_sub2api() -> FakeSite {
                         );
                         continue;
                     }
-                    let id: i64 = first_line
-                        .split_whitespace()
-                        .nth(1)
-                        .and_then(|p| p.rsplit('/').next())
+                    let id: i64 = path
+                        .rsplit('/')
+                        .next()
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(-1);
                     let found = site_state
@@ -291,7 +312,7 @@ fn spawn_fake_sub2api() -> FakeSite {
                         ),
                     }
                 }
-                line if line.starts_with("GET /api/v1/user/profile") => {
+                ("GET", "/api/v1/user/profile") => {
                     if !authed {
                         respond(
                             &mut stream,

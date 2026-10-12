@@ -1,0 +1,188 @@
+//! 运行时设置：刷新间隔、余额阈值、启动时是否跑漂移检测。
+//!
+//! 存储是 `settings` 键值表；**读不到就用默认值**（老库没有这些键是正常状态，
+//! 不该因此报错）。写入前一律 `validate()`。
+
+use crate::error::{Error, Result};
+
+/// 刷新间隔上限：24 小时。再长就没有「定时」的意义了。
+pub const MAX_REFRESH_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+const KEY_REFRESH_INTERVAL: &str = "refresh_interval_secs";
+const KEY_BALANCE_THRESHOLD: &str = "balance_alert_threshold";
+const KEY_DRIFT_ON_START: &str = "drift_check_on_start";
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Settings {
+    /// 自动刷新间隔（秒）。`0` = 关闭。
+    pub refresh_interval_secs: u64,
+    /// 余额低于该值时告警（USD）。`0` = 不告警。
+    pub balance_alert_threshold: f64,
+    /// 是否在启动时跑一次漂移检测（只读本地文件）。
+    pub drift_check_on_start: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            // 默认**关闭**定时刷新：不替用户决定要不要定时联网
+            refresh_interval_secs: 0,
+            balance_alert_threshold: 0.0,
+            // 漂移检测只读本地文件，默认开
+            drift_check_on_start: true,
+        }
+    }
+}
+
+impl Settings {
+    pub fn validate(&self) -> Result<()> {
+        if self.refresh_interval_secs > MAX_REFRESH_INTERVAL_SECS {
+            return Err(Error::Store(format!(
+                "刷新间隔不能超过 {MAX_REFRESH_INTERVAL_SECS} 秒（24 小时）"
+            )));
+        }
+        if !self.balance_alert_threshold.is_finite() || self.balance_alert_threshold < 0.0 {
+            return Err(Error::Store("余额告警阈值必须是非负有限数".to_string()));
+        }
+        Ok(())
+    }
+
+    /// 是否真的需要起后台刷新任务。
+    pub fn scheduler_enabled(&self) -> bool {
+        self.refresh_interval_secs > 0
+    }
+
+    /// 从键值对还原；缺失或非法的项**各自**退回默认值，不影响其它项。
+    pub fn from_pairs<'a, I>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let mut settings = Self::default();
+        for (key, value) in pairs {
+            match key {
+                KEY_REFRESH_INTERVAL => {
+                    if let Ok(secs) = value.parse::<u64>() {
+                        if secs <= MAX_REFRESH_INTERVAL_SECS {
+                            settings.refresh_interval_secs = secs;
+                        }
+                    }
+                }
+                KEY_BALANCE_THRESHOLD => {
+                    if let Ok(threshold) = value.parse::<f64>() {
+                        if threshold.is_finite() && threshold >= 0.0 {
+                            settings.balance_alert_threshold = threshold;
+                        }
+                    }
+                }
+                KEY_DRIFT_ON_START => {
+                    if let Ok(flag) = value.parse::<bool>() {
+                        settings.drift_check_on_start = flag;
+                    }
+                }
+                _ => {}
+            }
+        }
+        settings
+    }
+
+    /// 序列化成待落库的键值对。
+    pub fn to_pairs(&self) -> Vec<(&'static str, String)> {
+        vec![
+            (KEY_REFRESH_INTERVAL, self.refresh_interval_secs.to_string()),
+            (
+                KEY_BALANCE_THRESHOLD,
+                format!("{}", self.balance_alert_threshold),
+            ),
+            (KEY_DRIFT_ON_START, self.drift_check_on_start.to_string()),
+        ]
+    }
+
+    pub const KEYS: [&'static str; 3] = [
+        KEY_REFRESH_INTERVAL,
+        KEY_BALANCE_THRESHOLD,
+        KEY_DRIFT_ON_START,
+    ];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_conservative() {
+        let s = Settings::default();
+        assert_eq!(s.refresh_interval_secs, 0, "定时刷新必须默认关闭");
+        assert!(!s.scheduler_enabled());
+        assert_eq!(s.balance_alert_threshold, 0.0);
+        assert!(s.drift_check_on_start, "漂移检测只读本地，默认开");
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_bad_values() {
+        let bad_interval = Settings {
+            refresh_interval_secs: MAX_REFRESH_INTERVAL_SECS + 1,
+            ..Settings::default()
+        };
+        assert!(matches!(bad_interval.validate(), Err(Error::Store(_))));
+
+        for threshold in [-1.0, f64::NAN, f64::INFINITY] {
+            let bad = Settings {
+                balance_alert_threshold: threshold,
+                ..Settings::default()
+            };
+            assert!(
+                matches!(bad.validate(), Err(Error::Store(_))),
+                "{threshold} 应被拒绝"
+            );
+        }
+
+        // 上限本身是合法的
+        let at_limit = Settings {
+            refresh_interval_secs: MAX_REFRESH_INTERVAL_SECS,
+            ..Settings::default()
+        };
+        assert!(at_limit.validate().is_ok());
+    }
+
+    #[test]
+    fn pairs_round_trip() {
+        let s = Settings {
+            refresh_interval_secs: 900,
+            balance_alert_threshold: 3.5,
+            drift_check_on_start: false,
+        };
+        let pairs = s.to_pairs();
+        let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(Settings::from_pairs(borrowed), s);
+    }
+
+    #[test]
+    fn missing_or_invalid_values_fall_back_per_key() {
+        // 完全空 → 全默认
+        assert_eq!(
+            Settings::from_pairs(std::iter::empty()),
+            Settings::default()
+        );
+
+        // 只有一项非法 → 该项默认，其余保留
+        let s = Settings::from_pairs(vec![
+            (KEY_REFRESH_INTERVAL, "not-a-number"),
+            (KEY_BALANCE_THRESHOLD, "2.5"),
+        ]);
+        assert_eq!(s.refresh_interval_secs, 0);
+        assert_eq!(s.balance_alert_threshold, 2.5);
+
+        // 超出上限的间隔也回退
+        let s = Settings::from_pairs(vec![(KEY_REFRESH_INTERVAL, "99999999")]);
+        assert_eq!(s.refresh_interval_secs, 0);
+
+        // 负数阈值回退
+        let s = Settings::from_pairs(vec![(KEY_BALANCE_THRESHOLD, "-3")]);
+        assert_eq!(s.balance_alert_threshold, 0.0);
+
+        // 未知键忽略
+        let s = Settings::from_pairs(vec![("unknown", "1")]);
+        assert_eq!(s, Settings::default());
+    }
+}

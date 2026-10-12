@@ -62,6 +62,11 @@ impl DeliveryChannel {
             DeliveryChannel::ShellBlock => "shell",
         }
     }
+
+    /// [`Self::agent_id`] 的逆映射（漂移报告要把 `bindings.agent_id` 还原成通道名）。
+    pub fn from_agent_id(agent_id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.agent_id() == agent_id)
+    }
 }
 
 /// 预览里的一个字段。两个字段都是「可以给用户看」的值。
@@ -283,7 +288,13 @@ mod tests {
         for channel in DeliveryChannel::ALL {
             assert_eq!(DeliveryChannel::parse(channel.as_str()).unwrap(), channel);
             assert!(!channel.agent_id().is_empty());
+            assert_eq!(
+                DeliveryChannel::from_agent_id(channel.agent_id()),
+                Some(channel),
+                "agent_id 的逆映射必须自洽"
+            );
         }
+        assert_eq!(DeliveryChannel::from_agent_id("nope"), None);
         assert!(matches!(
             DeliveryChannel::parse("nope"),
             Err(Error::NotFound(_))
