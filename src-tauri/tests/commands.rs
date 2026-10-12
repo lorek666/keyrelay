@@ -11,6 +11,10 @@
 //!
 //! 说明：mock runtime 仍不等于真实 wry 窗口，M1-S3 首次 `pnpm tauri dev` 联调时需再复核一次。
 
+// 测试与 lib 各展开一次 `generate_context!()`，链接期会产生
+// `ld: duplicate symbol '__EMBED_INFO_PLIST'` 噪音（复审 P2-6）。功能无影响，此处抑制。
+#![allow(linker_messages)]
+
 use serde_json::{json, Value};
 use tauri::ipc::{CallbackFn, InvokeBody};
 use tauri::test::{get_ipc_response, mock_builder, INVOKE_KEY};
@@ -74,4 +78,37 @@ fn unknown_command_is_rejected() {
         message.contains("no_such_command"),
         "错误信息应指明命令名: {message}"
     );
+}
+
+/// 守护测试（复审 P2-4）：命令清单、build.rs 登记、capabilities 引用三者必须一致。
+///
+/// 漏登记的后果是运行期被 ACL 拒绝且无编译期提示，所以逐个命令实调一次。
+#[test]
+fn every_declared_command_is_registered_and_allowed() {
+    for cmd in keyrelay_lib::commands_list::COMMANDS {
+        if let Err(err) = invoke(cmd) {
+            let message = err.to_string();
+            assert!(
+                !message.contains("not allowed"),
+                "命令 {cmd} 未通过 ACL（检查 build.rs 登记与 capabilities 引用）: {message}"
+            );
+            assert!(
+                !message.to_lowercase().contains("not found"),
+                "命令 {cmd} 未注册到 generate_handler!: {message}"
+            );
+            panic!("命令 {cmd} 调用失败: {message}");
+        }
+    }
+}
+
+#[test]
+fn capabilities_reference_every_declared_command() {
+    let capabilities = include_str!("../capabilities/default.json");
+    for cmd in keyrelay_lib::commands_list::COMMANDS {
+        let permission = format!("allow-{}", cmd.replace('_', "-"));
+        assert!(
+            capabilities.contains(&permission),
+            "capabilities/default.json 缺少 {permission}"
+        );
+    }
 }

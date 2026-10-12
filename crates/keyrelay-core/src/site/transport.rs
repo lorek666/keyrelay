@@ -204,3 +204,60 @@ impl HttpTransport for MockTransport {
             .unwrap_or_else(|| Err(Error::Transport("mock 响应队列已空".into())))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(n: usize) -> HttpRequest {
+        HttpRequest::new(Method::Get, format!("https://x.example.com/{n}"))
+    }
+
+    #[tokio::test]
+    async fn queue_preserves_order_of_responses_and_errors() {
+        let mock = MockTransport::new(vec![]);
+        mock.push_error(Error::Transport("E1".into()));
+        mock.push(HttpResponse::new(200, "R2".as_bytes().to_vec()));
+        mock.push_error(Error::QuotaExhausted);
+
+        assert_eq!(
+            mock.request(req(0)).await.unwrap_err(),
+            Error::Transport("E1".into())
+        );
+        assert_eq!(mock.request(req(1)).await.unwrap().status, 200);
+        assert_eq!(
+            mock.request(req(2)).await.unwrap_err(),
+            Error::QuotaExhausted
+        );
+    }
+
+    #[tokio::test]
+    async fn clone_shares_queue_and_request_log() {
+        let mock = MockTransport::new(vec![]);
+        let clone = mock.clone();
+        clone.push(HttpResponse::new(204, Vec::new()));
+
+        // 通过原句柄消费克隆句柄压入的响应
+        assert_eq!(mock.request(req(0)).await.unwrap().status, 204);
+        // 记录跨句柄可见
+        assert_eq!(clone.request_count(), 1);
+        assert_eq!(clone.nth_request(0).unwrap().url, "https://x.example.com/0");
+    }
+
+    #[tokio::test]
+    async fn empty_queue_reports_transport_error() {
+        let mock = MockTransport::new(vec![]);
+        assert!(matches!(
+            mock.request(req(0)).await.unwrap_err(),
+            Error::Transport(_)
+        ));
+    }
+
+    #[test]
+    fn json_constructor_is_infallible_for_valid_values() {
+        // 事实核对：`Value` 总能序列化（NaN 在 `Value::from` 阶段就退化为 Null），
+        // 所以返回 `Result` 属**防御性**设计——把「序列化失败」显式化，而不是静默产出空 body。
+        let response = HttpResponse::json(200, Value::from(f64::NAN)).expect("构造成功");
+        assert_eq!(response.text_lossy(), "null");
+    }
+}

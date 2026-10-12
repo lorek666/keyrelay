@@ -60,6 +60,17 @@ impl std::fmt::Debug for ReqwestTransport {
     }
 }
 
+/// 只保留 scheme 与 host，去掉 `user:pass@` 等用户信息（复审 P2-1）。
+fn mask_proxy(raw: &str) -> String {
+    match raw.split_once("://") {
+        Some((scheme, rest)) => {
+            let host = rest.rsplit('@').next().unwrap_or(rest);
+            format!("{scheme}://{host}")
+        }
+        None => "<非法代理串>".to_string(),
+    }
+}
+
 impl ReqwestTransport {
     pub fn new(config: TransportConfig) -> Result<Self> {
         let mut headers = HeaderMap::new();
@@ -67,16 +78,28 @@ impl ReqwestTransport {
             .map_err(|e| Error::Transport(format!("User-Agent 非法: {e}")))?;
         headers.insert(USER_AGENT, user_agent);
 
+        // reqwest 0.13 的 `Policy::limited(0)` 会在**首个** 3xx 就报 TooManyRedirects，
+        // 让适配器看不到 3xx（无法识别会话失效/域名迁移），且该错误会被重试层当作可重试错误。
+        // 因此 0 必须用 `Policy::none()`：不跟随、把 30x 原样透传。
+        let redirect_policy = if config.follow_redirects == 0 {
+            redirect::Policy::none()
+        } else {
+            redirect::Policy::limited(config.follow_redirects)
+        };
+
         let mut builder = reqwest::Client::builder()
             .timeout(config.timeout)
             .connect_timeout(config.connect_timeout)
-            .redirect(redirect::Policy::limited(config.follow_redirects))
+            .redirect(redirect_policy)
             .default_headers(headers)
             .gzip(true);
 
         if let Some(proxy_url) = config.proxy.as_deref() {
             let proxy = Proxy::all(proxy_url.to_string()).map_err(|e| {
-                Error::Transport(format!("代理配置无效（{proxy_url}），拒绝静默直连: {e}"))
+                Error::Transport(format!(
+                    "代理配置无效（{}），拒绝静默直连: {e}",
+                    mask_proxy(proxy_url)
+                ))
             })?;
             builder = builder.proxy(proxy);
         }
@@ -187,5 +210,52 @@ mod tests {
             ..TransportConfig::default()
         };
         assert!(ReqwestTransport::new(config).is_ok());
+    }
+
+    #[test]
+    fn mask_proxy_drops_userinfo() {
+        assert_eq!(
+            mask_proxy("http://alice:s3cr3t@127.0.0.1:7897"),
+            "http://127.0.0.1:7897"
+        );
+        assert_eq!(
+            mask_proxy("socks5://127.0.0.1:1080"),
+            "socks5://127.0.0.1:1080"
+        );
+        assert_eq!(mask_proxy("这不是一个 URL"), "<非法代理串>");
+    }
+
+    #[test]
+    fn proxy_credentials_never_reach_error_message() {
+        // 复审 P2-1：错误串里不得出现 user:pass
+        let config = TransportConfig {
+            proxy: Some("http://alice:s3cr3t-token@".to_string()),
+            ..TransportConfig::default()
+        };
+        let err = ReqwestTransport::new(config).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            !message.contains("s3cr3t-token"),
+            "错误串泄漏代理凭据: {message}"
+        );
+        assert!(
+            !message.contains("alice"),
+            "错误串泄漏代理用户名: {message}"
+        );
+    }
+
+    #[test]
+    fn debug_output_masks_proxy() {
+        let transport = ReqwestTransport::new(TransportConfig {
+            proxy: Some("http://alice:s3cr3t-token@127.0.0.1:7897".to_string()),
+            ..TransportConfig::default()
+        })
+        .expect("合法代理应可构造");
+        let debug = format!("{transport:?}");
+        assert!(
+            !debug.contains("s3cr3t-token"),
+            "Debug 泄漏代理凭据: {debug}"
+        );
+        assert!(!debug.contains("alice"), "Debug 泄漏代理用户名: {debug}");
     }
 }

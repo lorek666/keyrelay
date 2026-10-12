@@ -52,16 +52,21 @@ impl<T: HttpTransport + Clone + 'static> SiteRegistry<T> {
             }
         }
 
-        if reasons.is_empty() {
-            return Err(Error::FingerprintMismatch(format!(
-                "没有可用适配器能识别 {base_url}"
-            )));
-        }
-        Err(Error::FingerprintMismatch(format!(
-            "{base_url} 未被识别（{}）",
-            reasons.join("; ")
-        )))
+        detection_failure(base_url, reasons)
     }
+}
+
+/// 组装「探测全失败」的错误：无原因（全是占位适配器）与多原因两种形态。
+fn detection_failure(base_url: &str, reasons: Vec<String>) -> Result<SiteFingerprint> {
+    if reasons.is_empty() {
+        return Err(Error::FingerprintMismatch(format!(
+            "没有可用适配器能识别 {base_url}"
+        )));
+    }
+    Err(Error::FingerprintMismatch(format!(
+        "{base_url} 未被识别（{}）",
+        reasons.join("; ")
+    )))
 }
 
 #[cfg(test)]
@@ -116,6 +121,45 @@ mod tests {
             message.contains("newapi"),
             "错误信息应包含 newapi 分支原因: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn detect_with_only_unimplemented_adapters_reports_no_adapter() {
+        // 全部适配器都是占位实现时，不能把 Unimplemented 当成「站点不匹配」
+        let mock = MockTransport::new(vec![]);
+        let registry = SiteRegistry::new(mock.clone()).with_probe_order(vec![SiteKind::Sub2Api]);
+
+        let err = registry
+            .detect("https://sub.example.com")
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("没有可用适配器"),
+            "应给出「没有可用适配器」而不是分支原因: {message}"
+        );
+        assert_eq!(mock.request_count(), 0);
+    }
+
+    #[test]
+    fn detection_failure_aggregates_reasons() {
+        // 多分支汇总（复审 P2-5）：错误串包含每条原因并以 "; " 连接
+        let err = detection_failure(
+            "https://x.example.com",
+            vec!["newapi: 指纹不匹配".into(), "sub2api: 连接超时".into()],
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("newapi: 指纹不匹配"), "{message}");
+        assert!(message.contains("sub2api: 连接超时"), "{message}");
+        assert!(
+            message.contains("; "),
+            "多条原因应以 \"; \" 连接: {message}"
+        );
+
+        // 无原因分支
+        let err = detection_failure("https://y.example.com", vec![]).unwrap_err();
+        assert!(err.to_string().contains("没有可用适配器能识别"));
     }
 
     #[tokio::test]

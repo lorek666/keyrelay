@@ -113,19 +113,35 @@ impl<T: HttpTransport> RetryingTransport<T> {
     }
 }
 
+/// 传输层可重试的状态码。
+///
+/// 只放 429：限流意味着**服务端未处理**该请求，重试安全。
+/// 5xx **不重试**——`create_key` 这类 POST 非幂等，服务端可能已处理却返回 5xx，
+/// 重试会凭空多出一把令牌。
+pub fn is_retryable_status(status: u16) -> bool {
+    status == 429
+}
+
 #[async_trait]
 impl<T: HttpTransport> HttpTransport for RetryingTransport<T> {
     async fn request(&self, req: HttpRequest) -> Result<HttpResponse> {
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
+            let can_retry = attempt < self.policy.max_attempts;
+
             match self.inner.request(req.clone()).await {
+                // 传输层把 429 当正常响应返回（状态码→错误的映射在适配器层，位于本装饰器**之上**），
+                // 所以这里必须自己识别状态码，否则「429 等待后重试」在真实装配下永不发生。
+                Ok(response) if can_retry && is_retryable_status(response.status) => {
+                    let delay = response
+                        .retry_after_secs()
+                        .map(|secs| Duration::from_secs(secs).min(self.policy.max_delay))
+                        .unwrap_or_else(|| self.policy.delay_for(attempt));
+                    self.sleeper.sleep(delay).await;
+                }
                 Ok(response) => return Ok(response),
-                Err(err) => {
-                    let can_retry = err.is_retryable() && attempt < self.policy.max_attempts;
-                    if !can_retry {
-                        return Err(err);
-                    }
+                Err(err) if can_retry && err.is_retryable() => {
                     let delay = match err {
                         Error::RateLimited { retry_after_secs } => {
                             Duration::from_secs(retry_after_secs).min(self.policy.max_delay)
@@ -134,6 +150,7 @@ impl<T: HttpTransport> HttpTransport for RetryingTransport<T> {
                     };
                     self.sleeper.sleep(delay).await;
                 }
+                Err(err) => return Err(err),
             }
         }
     }
@@ -263,5 +280,79 @@ mod tests {
         };
         let seq: Vec<u128> = (1..=5).map(|a| policy.delay_for(a).as_millis()).collect();
         assert_eq!(seq, vec![100, 200, 400, 700, 700]);
+    }
+
+    #[tokio::test]
+    async fn retries_429_response_not_only_rate_limited_error() {
+        // 真实传输层把 429 作为 Ok 响应返回（状态码→错误的映射在适配器层），
+        // 重试层必须自己识别状态码——复审 P1-1 的回归测试。
+        let mock = MockTransport::new(vec![
+            HttpResponse::new(429, "{}".as_bytes().to_vec()).with_header("Retry-After", "2"),
+            HttpResponse::new(200, "ok".as_bytes().to_vec()),
+        ]);
+
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let transport =
+            RetryingTransport::with_sleeper(mock.clone(), RetryPolicy::default(), sleeper.clone());
+
+        let response = transport.request(request()).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(mock.request_count(), 2, "429 必须触发重试");
+        assert_eq!(sleeper.calls(), vec![Duration::from_secs(2)]);
+    }
+
+    #[tokio::test]
+    async fn exhausted_429_is_returned_as_response_not_error() {
+        // 尝试次数用尽后保持「传输层返回响应」的契约，由适配器层映射为 RateLimited
+        let mock = MockTransport::new(vec![]);
+        for _ in 0..5 {
+            mock.push(
+                HttpResponse::new(429, "{}".as_bytes().to_vec()).with_header("Retry-After", "1"),
+            );
+        }
+
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let transport =
+            RetryingTransport::with_sleeper(mock.clone(), RetryPolicy::default(), sleeper.clone());
+
+        let response = transport.request(request()).await.unwrap();
+        assert_eq!(response.status, 429);
+        assert_eq!(response.retry_after_secs(), Some(1));
+        assert_eq!(mock.request_count(), 3);
+        assert_eq!(sleeper.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_5xx_because_posts_are_not_idempotent() {
+        let mock = MockTransport::new(vec![
+            HttpResponse::new(500, "boom".as_bytes().to_vec()),
+            HttpResponse::new(200, "ok".as_bytes().to_vec()),
+        ]);
+
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let transport =
+            RetryingTransport::with_sleeper(mock.clone(), RetryPolicy::default(), sleeper.clone());
+
+        let response = transport.request(request()).await.unwrap();
+        assert_eq!(response.status, 500);
+        assert_eq!(mock.request_count(), 1, "5xx 不得重试（非幂等 POST 风险）");
+        assert!(sleeper.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_retryable_status_passes_through_immediately() {
+        for status in [200u16, 302, 401, 403, 404] {
+            let mock = MockTransport::new(vec![
+                HttpResponse::new(status, "x".as_bytes().to_vec()),
+                HttpResponse::new(200, "should-not-be-used".as_bytes().to_vec()),
+            ]);
+            let transport = RetryingTransport::with_sleeper(
+                mock.clone(),
+                RetryPolicy::default(),
+                Arc::new(RecordingSleeper::default()),
+            );
+            assert_eq!(transport.request(request()).await.unwrap().status, status);
+            assert_eq!(mock.request_count(), 1, "{status} 不应重试");
+        }
     }
 }
