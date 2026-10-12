@@ -22,6 +22,10 @@
     "allow-apply-delivery",
     "allow-rollback-delivery",
     "allow-list-stored-keys",
-    "allow-recent-events"
+    "allow-recent-events",
+    "allow-drift-report",
+    "allow-get-settings",
+    "allow-update-settings",
+    "allow-refresh-all"
   ]
 }

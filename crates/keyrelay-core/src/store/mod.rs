@@ -89,6 +89,12 @@ CREATE TABLE IF NOT EXISTS consents(
 );
 CREATE INDEX IF NOT EXISTS idx_consents_agent ON consents(agent_id, channel);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
+-- 运行时设置（M3-S1）。键值都是文本，读不到就用默认值。
+CREATE TABLE IF NOT EXISTS settings(
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bindings_target ON bindings(target_path);
 "#;
 
 fn now_secs() -> i64 {
@@ -136,6 +142,16 @@ pub struct EventRow {
     pub source: String,
     pub message: String,
     pub payload: Option<String>,
+}
+
+/// 一次投递的漂移检测输入：绑定 + 投递时记录的哈希。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingDriftRow {
+    pub agent_id: String,
+    pub target_path: String,
+    pub journal_id: String,
+    /// 投递时该文件的 sha256；老库可能没有
+    pub expected_sha256: Option<String>,
 }
 
 /// 投递授权行。`fields` 是 JSON 数组，**只有键名**。
@@ -531,6 +547,65 @@ impl Store {
             .map_err(|e| Error::Store(format!("列举投递授权失败: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Store(format!("读取投递授权行失败: {e}")))
+    }
+
+    // ======================================================== 设置与绑定（M3-S1）
+
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT value FROM settings WHERE key = ?1")
+            .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
+        let mut rows = stmt
+            .query_map(params![key], |row| row.get::<_, String>(0))
+            .map_err(|e| Error::Store(format!("查询设置失败: {e}")))?;
+        match rows.next() {
+            Some(row) => Ok(Some(
+                row.map_err(|e| Error::Store(format!("读取设置失败: {e}")))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .map_err(|e| Error::Store(format!("写入设置失败: {e}")))?;
+        Ok(())
+    }
+
+    /// 每个投递目标只取**最近一次**投递的绑定，并 LEFT JOIN 出当时的 `after_sha256`。
+    ///
+    /// 用 LEFT JOIN 而不是 INNER JOIN：老库里可能没有对应的 journal 行，
+    /// 那种情况要能被识别成「无法判定」而不是从报告里消失。
+    pub fn binding_drift_rows(&self) -> Result<Vec<BindingDriftRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT b.agent_id, b.target_path, b.journal_id, j.after_sha256
+                 FROM bindings b
+                 JOIN (SELECT target_path, MAX(id) AS mid FROM bindings GROUP BY target_path) latest
+                   ON b.id = latest.mid
+                 LEFT JOIN journals j ON j.id = b.journal_id || ':' || b.target_path
+                 ORDER BY b.target_path",
+            )
+            .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(BindingDriftRow {
+                    agent_id: row.get(0)?,
+                    target_path: row.get(1)?,
+                    journal_id: row.get(2)?,
+                    expected_sha256: row.get(3)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("查询投递绑定失败: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("读取投递绑定行失败: {e}")))
     }
 
     // ============================================================ 事件（M1-S3）

@@ -129,6 +129,43 @@ pub struct EventDto {
     payload: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriftReportDto {
+    target_path: String,
+    agent_id: String,
+    channel: String,
+    /// `"intact"` | `"modified"` | `"missing"` | `"unknown"`
+    state: String,
+    journal_id: String,
+    current_sha256: Option<String>,
+    expected_sha256: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsDto {
+    refresh_interval_secs: u64,
+    balance_alert_threshold: f64,
+    drift_check_on_start: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshSummaryDto {
+    sites_total: usize,
+    sites_ok: usize,
+    sites_failed: usize,
+    keys_total: usize,
+    balance_alerts: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSettingsArgs {
+    settings: SettingsDto,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeliveryArgs {
@@ -447,6 +484,84 @@ pub fn recent_events(
                     payload: row.payload,
                 })
                 .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+// ============================================ 漂移 / 设置 / 刷新（M3-S1）
+
+fn settings_from_dto(dto: &SettingsDto) -> keyrelay_core::settings::Settings {
+    keyrelay_core::settings::Settings {
+        refresh_interval_secs: dto.refresh_interval_secs,
+        balance_alert_threshold: dto.balance_alert_threshold,
+        drift_check_on_start: dto.drift_check_on_start,
+    }
+}
+
+fn settings_to_dto(settings: &keyrelay_core::settings::Settings) -> SettingsDto {
+    SettingsDto {
+        refresh_interval_secs: settings.refresh_interval_secs,
+        balance_alert_threshold: settings.balance_alert_threshold,
+        drift_check_on_start: settings.drift_check_on_start,
+    }
+}
+
+#[tauri::command]
+pub fn drift_report(state: State<'_, AppState>) -> Result<Vec<DriftReportDto>, String> {
+    state
+        .service
+        .drift_report()
+        .map(|reports| {
+            reports
+                .into_iter()
+                .map(|r| DriftReportDto {
+                    target_path: r.target_path.display().to_string(),
+                    agent_id: r.agent_id,
+                    channel: r.channel,
+                    state: r.state.as_str().to_string(),
+                    journal_id: r.journal_id,
+                    current_sha256: r.current_sha256,
+                    expected_sha256: r.expected_sha256,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_settings(state: State<'_, AppState>) -> Result<SettingsDto, String> {
+    state
+        .service
+        .settings()
+        .map(|s| settings_to_dto(&s))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn update_settings(
+    state: State<'_, AppState>,
+    args: UpdateSettingsArgs,
+) -> Result<SettingsDto, String> {
+    let settings = settings_from_dto(&args.settings);
+    state
+        .service
+        .update_settings(&settings)
+        .map_err(|e| e.to_string())?;
+    Ok(settings_to_dto(&settings))
+}
+
+#[tauri::command]
+pub async fn refresh_all(state: State<'_, AppState>) -> Result<RefreshSummaryDto, String> {
+    state
+        .service
+        .refresh_all()
+        .await
+        .map(|s| RefreshSummaryDto {
+            sites_total: s.sites_total,
+            sites_ok: s.sites_ok,
+            sites_failed: s.sites_failed,
+            keys_total: s.keys_total,
+            balance_alerts: s.balance_alerts,
         })
         .map_err(|e| e.to_string())
 }

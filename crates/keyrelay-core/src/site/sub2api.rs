@@ -11,7 +11,7 @@
 //! 3. **列表接口直接返回明文 `key`** —— 适配器必须在边界处剥掉，
 //!    否则明文会顺着 `KeyMeta` 流进 DTO 与事件表（红线）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -185,21 +185,99 @@ fn map_status(value: Option<&Value>) -> KeyStatus {
     }
 }
 
-/// `created_at` / `last_used_at` 是 RFC 3339 字符串。这里只做粗解析（取 epoch 秒），
-/// 解析不出来就返回 `None`——`KeyMeta` 的时间字段是可选的，不值得为它引入时间库。
+/// `created_at` / `last_used_at` 是 RFC 3339 字符串。手写解析，**不引入时间库**。
+///
+/// 严格校验每一段的取值范围，并处理时区偏移：
+/// 早先的版本不校验范围也不看偏移，于是 `2026-13-45T25:61:61Z` 与
+/// `+08:00` 都会**静默返回一个错的** epoch（后者差 8 小时）——比返回 `None` 更糟
+/// （M2-S1 复审 P2）。现在任何无法确定的值一律 `None`。
 fn parse_rfc3339_secs(value: Option<&Value>) -> Option<i64> {
     let raw = value.and_then(|v| v.as_str())?;
     let (date, rest) = raw.split_once('T')?;
+
     let mut date_parts = date.split('-');
     let year: i64 = date_parts.next()?.parse().ok()?;
     let month: i64 = date_parts.next()?.parse().ok()?;
     let day: i64 = date_parts.next()?.parse().ok()?;
-    let time = rest.trim_end_matches('Z');
-    let mut time_parts = time.split(':');
+    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    // 时区：`Z` / `+HH:MM` / `-HH:MM` / 无
+    let (time_part, offset_secs) = split_timezone(rest)?;
+
+    let mut time_parts = time_part.split(':');
     let hour: i64 = time_parts.next()?.parse().ok()?;
     let minute: i64 = time_parts.next()?.parse().ok()?;
     let second: i64 = time_parts.next()?.split('.').next()?.parse().ok()?;
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
+    if time_parts.next().is_some()
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+
+    Some(
+        days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second
+            - offset_secs,
+    )
+}
+
+/// 切出「时间部分」与「时区偏移秒数」。无法确定时返回 `None`。
+fn split_timezone(rest: &str) -> Option<(&str, i64)> {
+    if let Some(time) = rest.strip_suffix('Z') {
+        return Some((time, 0));
+    }
+    if let Some(time) = rest.strip_suffix('z') {
+        return Some((time, 0));
+    }
+    // 找最后一个 `+` / `-`（时间部分里不会有这两种符号）
+    let pos = rest.rfind(['+', '-'])?;
+    let (time, offset) = rest.split_at(pos);
+    let sign = if offset.starts_with('+') { 1 } else { -1 };
+    let mut parts = offset[1..].split(':');
+    let hours: i64 = parts.next()?.parse().ok()?;
+    let minutes: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some((time, sign * (hours * 3600 + minutes * 60)))
+}
+
+/// 从 `data` 里取出密钥数组与总数。
+///
+/// 真实站点走的是 `response.Paginated` → `data = {items, total, page, page_size, pages}`
+/// （`internal/pkg/response/response.go` 的 `PaginatedData`）。
+/// 只认数组的实现会让**真实站点的列表恒为空**（M2-S1 复审 P1-1）。
+/// 为了兼容老版本/异常部署，裸数组形态也接受，但**认不出的形态必须报错**，
+/// 绝不能静默返回空列表。
+fn extract_keys_page(data: &Value) -> Result<(Vec<Value>, Option<i64>)> {
+    if let Some(items) = data.as_array() {
+        return Ok((items.clone(), None));
+    }
+    if let Some(items) = data.get("items").and_then(|v| v.as_array()) {
+        let total = data
+            .get("total")
+            .and_then(|v| v.as_i64())
+            .filter(|t| *t >= 0);
+        return Ok((items.clone(), total));
+    }
+    Err(Error::Transport(
+        "列举密钥的响应形态无法识别（既不是数组，也没有 items 字段）".into(),
+    ))
+}
+
+/// 每次创建请求一个唯一的幂等键。不是秘密，用时间戳 + 自增序号即可。
+fn new_idempotency_key() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("keyrelay-{nanos:x}-{seq:x}")
 }
 
 /// Howard Hinnant 的 `days_from_civil`（公历 → Unix 天数）。避免为一个时间戳引入 chrono。
@@ -345,22 +423,77 @@ impl<T: HttpTransport + 'static> SiteAdapter for Sub2Api<T> {
 
     async fn list_keys(&self, base_url: &str, session: &Session) -> Result<Vec<KeyMeta>> {
         let base = normalize_base_url(base_url);
-        let url = format!("{base}/api/v1/keys");
-        let resp = self
-            .transport
-            .request(Self::request(Method::Get, url, session))
-            .await?;
-        if resp.status != 200 {
-            return Err(map_http_error(
-                resp.status,
-                &resp.body,
-                resp.retry_after_secs(),
-            ));
+        let mut collected: Vec<KeyMeta> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut page: u32 = 1;
+        // 源码里 `ParsePagination` 的默认每页 20，上限 1000
+        const PAGE_SIZE: u32 = 100;
+        const MAX_PAGES: u32 = 100;
+
+        loop {
+            let url = format!("{base}/api/v1/keys?page={page}&page_size={PAGE_SIZE}");
+            let resp = self
+                .transport
+                .request(Self::request(Method::Get, url, session))
+                .await?;
+            if resp.status != 200 {
+                return Err(map_http_error(
+                    resp.status,
+                    &resp.body,
+                    resp.retry_after_secs(),
+                ));
+            }
+            let data = Self::unwrap_data(&resp, "列举密钥")?;
+            let (items, total) = extract_keys_page(&data)?;
+            let page_len = items.len();
+
+            // 逐项**只挑白名单字段**：响应里带明文 `key`，整体克隆会把密钥带出来
+            let parsed: Vec<KeyMeta> = items.iter().filter_map(key_meta_from).collect();
+            if page_len > 0 && parsed.is_empty() {
+                return Err(Error::Transport(format!(
+                    "第 {page} 页有 {page_len} 条密钥但都缺少可用的 id，无法安全分页"
+                )));
+            }
+
+            let mut added = 0usize;
+            for meta in parsed {
+                if seen.insert(meta.remote_id.clone()) {
+                    collected.push(meta);
+                    added += 1;
+                }
+            }
+
+            // 站点声明了总数 → 以它为准
+            if let Some(total) = total {
+                if (collected.len() as i64) >= total {
+                    return Ok(collected);
+                }
+            }
+            if page_len == 0 {
+                return match total {
+                    Some(total) if (total as usize) > collected.len() => {
+                        Err(Error::Transport(format!(
+                            "站点声明共有 {total} 条密钥，但第 {page} 页返回空列表，无法确认列表完整性"
+                        )))
+                    }
+                    _ => Ok(collected),
+                };
+            }
+            if added == 0 {
+                // 本页全是重复 id → 站点忽略了分页参数
+                return Ok(collected);
+            }
+            if page >= MAX_PAGES {
+                return Err(Error::Transport(format!(
+                    "已取满 {MAX_PAGES} 页仍未取全（已取 {} 条{}）；为避免交付不完整列表已中止",
+                    collected.len(),
+                    total
+                        .map(|t| format!("，站点声明共 {t} 条"))
+                        .unwrap_or_default()
+                )));
+            }
+            page += 1;
         }
-        let data = Self::unwrap_data(&resp, "列举密钥")?;
-        let items = data.as_array().cloned().unwrap_or_default();
-        // 逐项**只挑白名单字段**：响应里带明文 `key`，整体克隆会把密钥带出来
-        Ok(items.iter().filter_map(key_meta_from).collect())
     }
 
     async fn create_key(
@@ -383,8 +516,13 @@ impl<T: HttpTransport + 'static> SiteAdapter for Sub2Api<T> {
             body["quota"] = json!(quota);
         }
 
-        let req =
+        let mut req =
             Self::request(Method::Post, format!("{base}/api/v1/keys"), session).json_body(&body)?;
+        // 服务端在 `idempotency.observe_only=false` 的部署下会**强制**要求这个头，
+        // 缺失直接 400（`internal/service/idempotency.go:222`）。默认配置是观察期所以不报错，
+        // 但我们不该依赖那个默认值——始终带一个唯一的键即可。
+        req.headers
+            .push(("Idempotency-Key".to_string(), new_idempotency_key()));
         let resp = self.transport.request(req).await?;
         if resp.status != 200 && resp.status != 201 {
             return Err(map_http_error(

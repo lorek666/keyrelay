@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::delivery::{self, ConsentState, DeliveryChannel, DeliveryOutcome, DeliveryPlan};
+use crate::drift::{self, DriftReport};
 use crate::error::{Error, Result};
 use crate::inject;
 use crate::observability::{self, Event, Level};
+use crate::settings::Settings;
 use crate::site::registry::SiteRegistry;
 use crate::site::transport::HttpTransport;
 use crate::site::{Balance, Credentials, KeyMaterial, KeyMeta, KeySpec, Session, SiteKind};
@@ -146,6 +148,17 @@ impl std::fmt::Debug for StoredKey {
             .field("masked", &self.masked)
             .finish()
     }
+}
+
+/// 一轮刷新的结果。不含任何密钥。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RefreshSummary {
+    pub sites_total: usize,
+    pub sites_ok: usize,
+    pub sites_failed: usize,
+    pub keys_total: usize,
+    /// 触发余额告警的站点 id
+    pub balance_alerts: Vec<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -550,6 +563,145 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             serde_json::json!({ "journal_id": journal_id }),
         ));
         Ok(())
+    }
+
+    // ============================================ 漂移检测 / 设置 / 刷新（M3-S1）
+
+    /// 检查每个投递目标是否被外部改动过。**只读**，不做任何自动修复。
+    ///
+    /// 需要用户注意的项会写一条 `warn` 事件（同一轮里每个目标只写一条）。
+    pub fn drift_report(&self) -> Result<Vec<DriftReport>> {
+        let rows = self.store.binding_drift_rows()?;
+        let reports: Vec<DriftReport> = rows.iter().map(drift::report_for).collect();
+
+        for report in reports.iter().filter(|r| r.state.needs_attention()) {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "delivery",
+                format!(
+                    "投递目标已被外部改动（{}）: {}",
+                    report.state.as_str(),
+                    report.target_path.display()
+                ),
+                serde_json::json!({
+                    "agent_id": report.agent_id,
+                    "channel": report.channel,
+                    "journal_id": report.journal_id,
+                    "expected": report.expected_sha256.as_deref().map(|h| &h[..8.min(h.len())]),
+                    "current": report.current_sha256.as_deref().map(|h| &h[..8.min(h.len())]),
+                }),
+            ));
+        }
+        Ok(reports)
+    }
+
+    pub fn settings(&self) -> Result<Settings> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for key in Settings::KEYS {
+            if let Some(value) = self.store.get_setting(key)? {
+                pairs.push((key.to_string(), value));
+            }
+        }
+        let borrowed: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        Ok(Settings::from_pairs(borrowed))
+    }
+
+    pub fn update_settings(&self, settings: &Settings) -> Result<()> {
+        settings.validate()?;
+        for (key, value) in settings.to_pairs() {
+            self.store.set_setting(key, &value)?;
+        }
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "app",
+            "设置已更新",
+            serde_json::json!({
+                "refresh_interval_secs": settings.refresh_interval_secs,
+                "balance_alert_threshold": settings.balance_alert_threshold,
+                "drift_check_on_start": settings.drift_check_on_start,
+            }),
+        ));
+        Ok(())
+    }
+
+    /// 刷新全部**已登录**站点的余额与密钥数。
+    ///
+    /// 单个站点失败**不中断**其余站点：把失败计数与原因分类写进事件，
+    /// 整体仍返回 `Ok`（否则调用方会以为整轮都废了）。
+    pub async fn refresh_all(&self) -> Result<RefreshSummary> {
+        let settings = self.settings()?;
+        let sites = self.store.list_sites()?;
+        let mut summary = RefreshSummary {
+            sites_total: sites.len(),
+            ..Default::default()
+        };
+
+        for site in sites {
+            // 没有会话的站点直接跳过：不算失败（用户可能压根没登录过它）
+            if self.sessions.get(site.id).is_none() {
+                continue;
+            }
+
+            let balance = self.balance(site.id).await;
+            let keys = self.list_keys(site.id).await;
+
+            match (&balance, &keys) {
+                (Ok(_), Ok(list)) => {
+                    summary.sites_ok += 1;
+                    summary.keys_total += list.len();
+                }
+                _ => {
+                    summary.sites_failed += 1;
+                    let reason = balance
+                        .as_ref()
+                        .err()
+                        .or_else(|| keys.as_ref().err())
+                        .map(error_kind)
+                        .unwrap_or("未知");
+                    self.log(observability::event_with_payload(
+                        Level::Warn,
+                        "site",
+                        format!("刷新站点失败: {reason}"),
+                        serde_json::json!({ "site_id": site.id, "base_url": site.base_url }),
+                    ));
+                }
+            }
+
+            if let Ok(balance) = &balance {
+                if settings.balance_alert_threshold > 0.0
+                    && balance.remaining < settings.balance_alert_threshold
+                {
+                    summary.balance_alerts.push(site.id);
+                    self.log(observability::event_with_payload(
+                        Level::Warn,
+                        "site",
+                        format!(
+                            "余额低于阈值: {} {} < {}",
+                            balance.remaining, balance.currency, settings.balance_alert_threshold
+                        ),
+                        serde_json::json!({
+                            "site_id": site.id,
+                            "base_url": site.base_url,
+                            "remaining": balance.remaining,
+                        }),
+                    ));
+                }
+            }
+        }
+
+        self.log(observability::event_with_payload(
+            Level::Debug,
+            "app",
+            format!(
+                "刷新完成: 成功 {} / 失败 {} / 密钥 {}",
+                summary.sites_ok, summary.sites_failed, summary.keys_total
+            ),
+            serde_json::json!({ "sites_total": summary.sites_total }),
+        ));
+        Ok(summary)
     }
 
     /// 读某把令牌的明文。**只有显式调用才会返回密钥本体**——列举接口一律不含明文。

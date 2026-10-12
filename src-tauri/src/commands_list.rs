@@ -25,4 +25,8 @@ pub const COMMANDS: &[&str] = &[
     "rollback_delivery",
     "recent_events",
     "list_stored_keys",
+    "drift_report",
+    "get_settings",
+    "update_settings",
+    "refresh_all",
 ];
