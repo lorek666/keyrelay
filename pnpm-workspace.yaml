@@ -1,0 +1,3 @@
+# pnpm 11 默认拦截依赖的构建脚本；esbuild 的安装脚本需要执行以校验平台二进制。
+allowBuilds:
+  esbuild: true

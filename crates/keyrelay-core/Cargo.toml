@@ -1,0 +1,21 @@
+[package]
+name = "keyrelay-core"
+description = "KeyRelay 核心：站点适配器、agent 注入器、钥匙串与本地存储（不依赖 Tauri）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+hex = "0.4.3"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha2 = "0.10.9"
+thiserror = "2.0.21"
+toml_edit = "0.25.5"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros"] }

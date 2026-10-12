@@ -1,0 +1,26 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Node
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# 本地产物与机密
+*.log
+.env
+.env.*
+!/.env.example
+.DS_Store
+
+# 备份/临时
+/backups/
+*.bak
+*.tmp
