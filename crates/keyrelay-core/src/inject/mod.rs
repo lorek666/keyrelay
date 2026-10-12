@@ -98,10 +98,34 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     let tmp = parent.join(format!(".{file_name}.keyrelay.tmp"));
 
     fs::write(&tmp, contents).map_err(|e| Error::inject(&tmp, format!("写临时文件失败: {e}")))?;
+
+    // 继承原文件权限位：临时文件按 umask 生成（常见 0644），
+    // 会把 0600 的配置放宽成同机其他用户可读，必须在 rename 前回设。
+    if let Ok(meta) = fs::metadata(path) {
+        let _ = fs::set_permissions(&tmp, meta.permissions());
+    }
+
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         Error::inject(path, format!("原子替换失败: {e}"))
     })
+}
+
+/// 写入并回读校验，返回**磁盘上实际内容**的 sha256。
+///
+/// 对应 spec §6「注入后回读失败 → 自动回滚并报错」：若落盘内容与预期不符，
+/// journal 记录的哈希就会与磁盘不一致，后续 `rollback` 会误判为「外部改动」而拒绝，
+/// 因此必须在写入当步发现并补偿。
+fn write_verified(path: &Path, contents: &str) -> Result<String> {
+    write_atomic(path, contents)?;
+    let read_back =
+        fs::read(path).map_err(|e| Error::inject(path, format!("写入后回读失败: {e}")))?;
+    let text = String::from_utf8(read_back)
+        .map_err(|_| Error::inject(path, "写入后回读不是合法 UTF-8"))?;
+    if text != contents {
+        return Err(Error::inject(path, "写入后回读内容与预期不一致"));
+    }
+    Ok(sha256_hex(text.as_bytes()))
 }
 
 fn new_journal_id() -> String {
@@ -117,18 +141,19 @@ fn new_journal_id() -> String {
     format!("j{nanos}-{seq}")
 }
 
-/// 应用补丁：备份 → 原子写 → 记账。
+/// 应用补丁：预检 → 备份 → 原子写 + 回读校验 → 记账。
+///
+/// 两处保证：
+/// 1. **先全量预检再写入**：任一目标文件的当前内容与计划的 `before` 不一致时，
+///    在动任何文件之前就失败，不会留下「改了一半」的中间态。
+/// 2. **写入失败即补偿**：若第 N 个补丁写入或回读失败，已写入的条目与当前条目
+///    会按逆序用备份还原，磁盘回到调用前状态。
 ///
 /// 备份落在 `backup_dir/<journal_id>/` 下：每次 apply 一个独立目录，
 /// 避免同一目标文件被多次注入时后一次覆盖前一次的备份（那样会导致回滚链断裂）。
 pub fn apply(patches: &[Patch], backup_dir: &Path) -> Result<Journal> {
-    let journal_id = new_journal_id();
-    let journal_backup_dir = backup_dir.join(&journal_id);
-    fs::create_dir_all(&journal_backup_dir)
-        .map_err(|e| Error::inject(&journal_backup_dir, format!("创建备份目录失败: {e}")))?;
-
-    let mut entries = Vec::with_capacity(patches.len());
-    for (index, patch) in patches.iter().enumerate() {
+    let mut current_contents = Vec::with_capacity(patches.len());
+    for patch in patches {
         let current = read_or_empty(&patch.path)?;
         if current != patch.before {
             return Err(Error::inject(
@@ -136,7 +161,16 @@ pub fn apply(patches: &[Patch], backup_dir: &Path) -> Result<Journal> {
                 "文件内容与计划不一致（可能被外部修改），请重新生成计划",
             ));
         }
+        current_contents.push(current);
+    }
 
+    let journal_id = new_journal_id();
+    let journal_backup_dir = backup_dir.join(&journal_id);
+    fs::create_dir_all(&journal_backup_dir)
+        .map_err(|e| Error::inject(&journal_backup_dir, format!("创建备份目录失败: {e}")))?;
+
+    let mut entries: Vec<JournalEntry> = Vec::with_capacity(patches.len());
+    for (index, (patch, current)) in patches.iter().zip(current_contents).enumerate() {
         let existed = !current.is_empty() || patch.path.exists();
         let backup = if existed {
             let file_name = patch
@@ -152,14 +186,41 @@ pub fn apply(patches: &[Patch], backup_dir: &Path) -> Result<Journal> {
             None
         };
 
-        write_atomic(&patch.path, &patch.after)?;
-
-        entries.push(JournalEntry {
-            path: patch.path.clone(),
-            backup,
-            before_sha256: existed.then(|| sha256_hex(current.as_bytes())),
-            after_sha256: sha256_hex(patch.after.as_bytes()),
-        });
+        match write_verified(&patch.path, &patch.after) {
+            Ok(after_sha256) => entries.push(JournalEntry {
+                path: patch.path.clone(),
+                backup,
+                before_sha256: existed.then(|| sha256_hex(current.as_bytes())),
+                after_sha256,
+            }),
+            Err(err) => {
+                // 2) 补偿：把当前文件（若已被改写）与之前所有已写入的文件还原，
+                //    保证 apply 失败后磁盘回到调用前状态。
+                //    注意：当前文件未被改写时不加入补偿列表——否则会在「目录不可写」
+                //    这类失败场景里，对一个本就无需还原的文件做无谓写入而拖垮整轮补偿。
+                let mut compensation = entries.clone();
+                let disk_now = read_or_empty(&patch.path)?;
+                if disk_now != current {
+                    compensation.push(JournalEntry {
+                        path: patch.path.clone(),
+                        backup: backup.clone(),
+                        before_sha256: existed.then(|| sha256_hex(current.as_bytes())),
+                        // 用磁盘现状计算，保证补偿回滚的校验必然通过
+                        after_sha256: sha256_hex(disk_now.as_bytes()),
+                    });
+                }
+                return match rollback(&Journal {
+                    id: journal_id.clone(),
+                    entries: compensation,
+                }) {
+                    Ok(()) => Err(err),
+                    Err(rollback_err) => Err(Error::inject(
+                        &patch.path,
+                        format!("写入失败且自动补偿失败（需人工介入）: {err} / {rollback_err}"),
+                    )),
+                };
+            }
+        }
     }
 
     Ok(Journal {
@@ -169,32 +230,55 @@ pub fn apply(patches: &[Patch], backup_dir: &Path) -> Result<Journal> {
 }
 
 /// 回滚：校验文件未被外部改动后还原（或删除原本不存在的文件）。
+///
+/// **尽力而为**：逐个条目尝试还原，单个失败（例如该文件被外部改过、或目录不可写）
+/// 不会中断其余条目的还原；只要有一条失败，整体返回 `Err` 并列出全部失败原因。
+/// 这样一次失败不会把其他文件永久留在「已注入」状态。
 pub fn rollback(journal: &Journal) -> Result<()> {
+    let mut failures: Vec<String> = Vec::new();
     for entry in journal.entries.iter().rev() {
-        if entry.path.exists() {
-            let current = fs::read(&entry.path)
-                .map_err(|e| Error::inject(&entry.path, format!("读取失败: {e}")))?;
-            if sha256_hex(&current) != entry.after_sha256 {
-                return Err(Error::inject(
-                    &entry.path,
-                    "文件已被外部修改，拒绝覆盖（请手工处理后重试）",
-                ));
-            }
+        if let Err(err) = restore_entry(entry) {
+            failures.push(err.to_string());
         }
+    }
 
-        match &entry.backup {
-            Some(backup) => {
-                let bytes = fs::read(backup)
-                    .map_err(|e| Error::inject(backup, format!("读取备份失败: {e}")))?;
-                let contents = String::from_utf8(bytes)
-                    .map_err(|_| Error::inject(backup, "备份不是合法 UTF-8"))?;
-                write_atomic(&entry.path, &contents)?;
-            }
-            None => {
-                if entry.path.exists() {
-                    fs::remove_file(&entry.path)
-                        .map_err(|e| Error::inject(&entry.path, format!("删除失败: {e}")))?;
-                }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Inject {
+        path: format!("journal {}", journal.id),
+        reason: format!(
+            "{} 个文件未能还原: {}",
+            failures.len(),
+            failures.join(" | ")
+        ),
+    })
+}
+
+fn restore_entry(entry: &JournalEntry) -> Result<()> {
+    if entry.path.exists() {
+        let current = fs::read(&entry.path)
+            .map_err(|e| Error::inject(&entry.path, format!("读取失败: {e}")))?;
+        if sha256_hex(&current) != entry.after_sha256 {
+            return Err(Error::inject(
+                &entry.path,
+                "文件已被外部修改，拒绝覆盖（请手工处理后重试）",
+            ));
+        }
+    }
+
+    match &entry.backup {
+        Some(backup) => {
+            let bytes = fs::read(backup)
+                .map_err(|e| Error::inject(backup, format!("读取备份失败: {e}")))?;
+            let contents = String::from_utf8(bytes)
+                .map_err(|_| Error::inject(backup, "备份不是合法 UTF-8"))?;
+            write_atomic(&entry.path, &contents)?;
+        }
+        None => {
+            if entry.path.exists() {
+                fs::remove_file(&entry.path)
+                    .map_err(|e| Error::inject(&entry.path, format!("删除失败: {e}")))?;
             }
         }
     }
@@ -310,6 +394,107 @@ mod tests {
         rollback(&j2).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "v1");
         rollback(&j1).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "v0");
+    }
+
+    #[test]
+    fn multi_patch_preflight_failure_touches_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.toml");
+        fs::write(&a, "A0").unwrap();
+        let b = dir.path().join("b.toml");
+        fs::write(&b, "B0").unwrap();
+
+        let patches = vec![
+            Patch {
+                path: a.clone(),
+                before: "A0".into(),
+                after: "A1".into(),
+            },
+            Patch {
+                path: b.clone(),
+                before: "与磁盘不符的前置内容".into(),
+                after: "B1".into(),
+            },
+        ];
+
+        let err = apply(&patches, &dir.path().join("backups")).unwrap_err();
+        assert!(matches!(err, Error::Inject { .. }));
+        // 预检失败必须在动任何文件之前发生
+        assert_eq!(fs::read_to_string(&a).unwrap(), "A0");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "B0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_patch_write_failure_compensates_written_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.toml");
+        fs::write(&a, "A0").unwrap();
+
+        let readonly = dir.path().join("ro");
+        fs::create_dir(&readonly).unwrap();
+        let b = readonly.join("b.toml");
+        fs::write(&b, "B0").unwrap();
+
+        // 目录只读 → 第 2 个补丁写临时文件必然失败，触发补偿路径
+        let mut perm = fs::metadata(&readonly).unwrap().permissions();
+        perm.set_mode(0o500);
+        fs::set_permissions(&readonly, perm).unwrap();
+
+        let patches = vec![
+            Patch {
+                path: a.clone(),
+                before: "A0".into(),
+                after: "A1".into(),
+            },
+            Patch {
+                path: b.clone(),
+                before: "B0".into(),
+                after: "B1".into(),
+            },
+        ];
+
+        let err = apply(&patches, &dir.path().join("backups")).unwrap_err();
+        assert!(matches!(err, Error::Inject { .. }));
+        // 已写入的第 1 个文件必须被补偿还原
+        assert_eq!(fs::read_to_string(&a).unwrap(), "A0");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "B0");
+
+        let mut perm = fs::metadata(&readonly).unwrap().permissions();
+        perm.set_mode(0o700);
+        fs::set_permissions(&readonly, perm).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_and_rollback_preserve_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        fs::write(&target, "v0").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let journal = apply(
+            &[patch_for(dir.path(), "v0", "v1")],
+            &dir.path().join("backups"),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "注入后权限位不得被放宽"
+        );
+
+        rollback(&journal).unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "回滚后权限位必须保持"
+        );
         assert_eq!(fs::read_to_string(&target).unwrap(), "v0");
     }
 

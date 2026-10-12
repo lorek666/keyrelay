@@ -272,8 +272,8 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
             "expired_time": spec.expires_at.unwrap_or(-1),
             "group": spec.group.clone().unwrap_or_default(),
         });
-        let req = HttpRequest::new(Method::Post, format!("{base}/api/token/"))
-            .header("Cookie", session.cookie_header().unwrap_or_default())
+        let req = self
+            .request(Method::Post, format!("{base}/api/token/"), session)
             .json_body(&body)?;
         let resp = self.transport.request(req).await?;
         if resp.status != 200 {

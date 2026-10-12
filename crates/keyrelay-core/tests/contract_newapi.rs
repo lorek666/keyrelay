@@ -16,6 +16,16 @@ fn session() -> Session {
     }
 }
 
+fn header_of<'a>(
+    req: &'a keyrelay_core::site::transport::HttpRequest,
+    name: &str,
+) -> Option<&'a str> {
+    req.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
 #[tokio::test]
 async fn detect_identifies_newapi_and_reads_version() {
     let transport = MockTransport::new(vec![HttpResponse::json(
@@ -190,6 +200,47 @@ async fn create_key_flow_is_create_then_list_then_reveal() {
     assert_eq!(create_body["name"], "codex/daily");
     assert_eq!(create_body["unlimited_quota"], true);
     assert_eq!(create_body["expired_time"], -1);
+
+    // 认证头必须与其它动作一致（复审 P1-2：曾漏掉 Authorization/Accept 并发出空 Cookie）
+    for req in &requests {
+        assert_eq!(header_of(req, "Accept"), Some("application/json"));
+        assert_eq!(header_of(req, "Cookie"), Some("session=abc123"));
+        assert!(
+            !req.headers
+                .iter()
+                .any(|(k, v)| k == "Cookie" && v.is_empty()),
+            "不得发出空 Cookie 头"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_key_sends_bearer_when_session_has_access_token() {
+    let transport = MockTransport::new(vec![HttpResponse::json(
+        200,
+        json!({"success": true, "data": {"id": 5, "key": "sk-inline12345678"}}),
+    )]);
+    let adapter = NewApi::new(transport);
+    let token_session = Session {
+        cookies: vec![],
+        access_token: Some("pat-abcdefghijklmnop".into()),
+        user_id: None,
+    };
+
+    adapter
+        .create_key(BASE, &token_session, KeySpec::named("codex/daily"))
+        .await
+        .unwrap();
+
+    let req = adapter.transport().nth_request(0).unwrap();
+    assert_eq!(
+        header_of(&req, "Authorization"),
+        Some("Bearer pat-abcdefghijklmnop")
+    );
+    assert!(
+        !req.headers.iter().any(|(k, _)| k == "Cookie"),
+        "无 cookie 时不应带 Cookie 头"
+    );
 }
 
 #[tokio::test]
