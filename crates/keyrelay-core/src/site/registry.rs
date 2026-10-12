@@ -90,20 +90,56 @@ mod tests {
 
         let fingerprint = registry.detect("https://relay.example.com").await.unwrap();
         assert_eq!(fingerprint.kind, SiteKind::NewApi);
-        // 只探测一次就命中：Sub2API 分支（占位）不应被调用
+        // NewAPI 排在探测顺序第一位，一次命中
         assert_eq!(mock.request_count(), 1);
     }
 
     #[tokio::test]
-    async fn detect_skips_unimplemented_adapters() {
-        // Sub2API 目前是 Unimplemented 占位：探测顺序把它放前面，应被跳过
-        let mock = MockTransport::new(vec![newapi_status_response()]);
+    async fn detect_falls_through_to_the_second_adapter() {
+        // Sub2API 放前面：它对 NewAPI 站点会失败（404），随后 NewAPI 命中。
+        // 这条同时证明「探测顺序真的会依次尝试」而不是只试第一个。
+        let mock = MockTransport::new(vec![
+            HttpResponse::new(404, b"nope".to_vec()),
+            newapi_status_response(),
+        ]);
         let registry = SiteRegistry::new(mock.clone())
             .with_probe_order(vec![SiteKind::Sub2Api, SiteKind::NewApi]);
 
         let fingerprint = registry.detect("https://relay.example.com").await.unwrap();
         assert_eq!(fingerprint.kind, SiteKind::NewApi);
-        assert_eq!(mock.request_count(), 1, "占位适配器不发请求");
+        assert_eq!(mock.request_count(), 2, "两个适配器都应真的发过请求");
+    }
+
+    #[tokio::test]
+    async fn detect_identifies_sub2api_and_does_not_misjudge_newapi() {
+        // Sub2API 的公开设置（信封是 code/data，没有 success 字段）
+        let sub2api = HttpResponse::json(
+            200,
+            json!({"code": 0, "message": "success", "data": {"site_name": "示例 Sub2API", "totp_enabled": true}}),
+        )
+        .expect("构造测试响应");
+
+        // 默认顺序是 [NewAPI, Sub2API]：NewAPI 的探测会先打 `/api/status` 并失败，
+        // 再轮到 Sub2API。这里给两个响应，验证「第二个适配器被真的调用且命中」。
+        let mock = MockTransport::new(vec![HttpResponse::new(404, b"nope".to_vec()), sub2api]);
+        let registry = SiteRegistry::new(mock.clone());
+        let fingerprint = registry.detect("https://sub.example.com").await.unwrap();
+        assert_eq!(fingerprint.kind, SiteKind::Sub2Api);
+        assert_eq!(fingerprint.display_name, "示例 Sub2API");
+        assert_eq!(mock.request_count(), 2);
+
+        // 反向：把 NewAPI 的 `/api/status` 响应同时喂给两个适配器，
+        // Sub2API 必须**拒绝**它，随后 NewAPI 认领。
+        let mock = MockTransport::new(vec![newapi_status_response(), newapi_status_response()]);
+        let registry = SiteRegistry::new(mock.clone())
+            .with_probe_order(vec![SiteKind::Sub2Api, SiteKind::NewApi]);
+        let fingerprint = registry.detect("https://relay.example.com").await.unwrap();
+        assert_eq!(
+            fingerprint.kind,
+            SiteKind::NewApi,
+            "NewAPI 的响应被 Sub2API 误判了"
+        );
+        assert_eq!(mock.request_count(), 2, "两个适配器各发一次");
     }
 
     #[tokio::test]
@@ -124,21 +160,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_with_only_unimplemented_adapters_reports_no_adapter() {
-        // 全部适配器都是占位实现时，不能把 Unimplemented 当成「站点不匹配」
-        let mock = MockTransport::new(vec![]);
-        let registry = SiteRegistry::new(mock.clone()).with_probe_order(vec![SiteKind::Sub2Api]);
+    async fn detect_aggregates_every_adapter_reason() {
+        // 两个适配器都失败时，错误串要同时给出两条原因（便于判断是网络问题还是站点改版）
+        let mock = MockTransport::new(vec![
+            HttpResponse::new(404, b"nope".to_vec()),
+            HttpResponse::new(404, b"nope".to_vec()),
+        ]);
+        let registry = SiteRegistry::new(mock);
 
         let err = registry
-            .detect("https://sub.example.com")
+            .detect("https://unknown.example.com")
             .await
             .unwrap_err();
         let message = err.to_string();
-        assert!(
-            message.contains("没有可用适配器"),
-            "应给出「没有可用适配器」而不是分支原因: {message}"
-        );
-        assert_eq!(mock.request_count(), 0);
+        assert!(matches!(err, Error::FingerprintMismatch(_)));
+        assert!(message.contains("newapi"), "{message}");
+        assert!(message.contains("sub2api"), "{message}");
     }
 
     #[test]
