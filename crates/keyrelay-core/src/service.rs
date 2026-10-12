@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use crate::delivery::{self, ConsentState, DeliveryChannel, DeliveryOutcome, DeliveryPlan};
 use crate::error::{Error, Result};
 use crate::inject;
+use crate::observability::{self, Event, Level};
 use crate::site::registry::SiteRegistry;
 use crate::site::transport::HttpTransport;
 use crate::site::{Balance, Credentials, KeyMaterial, KeyMeta, KeySpec, Session, SiteKind};
@@ -46,6 +47,27 @@ impl ServiceConfig {
             backup_dir: home.join(".keyrelay").join("backups"),
             home,
         }
+    }
+}
+
+/// 错误分类名：只写「哪一类」，不回显站点原文（事件表里不需要原文）。
+fn error_kind(err: &Error) -> &'static str {
+    match err {
+        Error::FingerprintMismatch(_) => "指纹不匹配",
+        Error::AuthFailed(_) => "认证失败",
+        Error::CaptchaRequired => "需要人机验证",
+        Error::SecondFactorRequired { .. } => "需要二次验证",
+        Error::RateLimited { .. } => "被限流",
+        Error::QuotaExhausted => "额度不足",
+        Error::NotFound(_) => "远端资源不存在",
+        Error::Transport(_) => "网络/协议错误",
+        Error::Vault(_) => "钥匙串错误",
+        Error::VaultUnavailable(_) => "钥匙串不可用",
+        Error::ConsentRequired { .. } => "缺少用户同意",
+        Error::FileBusy(_) => "目标文件被占用",
+        Error::Store(_) => "本地存储错误",
+        Error::Inject { .. } => "写入失败",
+        Error::Unimplemented(_) => "尚未实现",
     }
 }
 
@@ -155,6 +177,20 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             base_url,
             &fingerprint.display_name,
         )?;
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "site",
+            format!(
+                "站点已识别: {} {}",
+                fingerprint.kind.as_str(),
+                fingerprint.display_name
+            ),
+            serde_json::json!({
+                "site_id": id,
+                "base_url": base_url,
+                "version": fingerprint.version,
+            }),
+        ));
         Ok(SiteSummary {
             id,
             kind: fingerprint.kind.as_str().to_string(),
@@ -167,9 +203,29 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 登录并把会话放入缓存；失败时不改变已有缓存。
     pub async fn login(&self, site_id: i64, cred: Credentials) -> Result<()> {
         let site = self.site(site_id)?;
+        // 用户名不是秘密，但仍然过一遍脱敏入口（B-36：站点原文/用户名都可能被规则命中）
+        let username = cred.username.clone();
         let adapter = self.registry.adapter(self.kind_of(&site)?);
-        let session = adapter.login(&site.base_url, cred).await?;
-        self.sessions.put(site_id, session)
+        let session = match adapter.login(&site.base_url, cred).await {
+            Ok(session) => session,
+            Err(err) => {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "site",
+                    format!("登录失败: {}", error_kind(&err)),
+                    serde_json::json!({ "site_id": site_id }),
+                ));
+                return Err(err);
+            }
+        };
+        self.sessions.put(site_id, session)?;
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "site",
+            format!("登录成功: {username}"),
+            serde_json::json!({ "site_id": site_id }),
+        ));
+        Ok(())
     }
 
     pub async fn list_keys(&self, site_id: i64) -> Result<Vec<KeyMeta>> {
@@ -177,7 +233,15 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let session = self.session(site_id)?;
         let adapter = self.registry.adapter(self.kind_of(&site)?);
         match adapter.list_keys(&site.base_url, &session).await {
-            Ok(keys) => Ok(keys),
+            Ok(keys) => {
+                self.log(observability::event_with_payload(
+                    Level::Debug,
+                    "key",
+                    format!("已列举 {} 把密钥", keys.len()),
+                    serde_json::json!({ "site_id": site_id }),
+                ));
+                Ok(keys)
+            }
             Err(err) => Err(self.on_auth_error(site_id, err)),
         }
     }
@@ -186,8 +250,17 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let site = self.site(site_id)?;
         let session = self.session(site_id)?;
         let adapter = self.registry.adapter(self.kind_of(&site)?);
+        let name = spec.name.clone();
         match adapter.create_key(&site.base_url, &session, spec).await {
-            Ok(material) => Ok(material),
+            Ok(material) => {
+                self.log(observability::event_with_payload(
+                    Level::Info,
+                    "key",
+                    format!("已获取密钥 {name}"),
+                    serde_json::json!({ "site_id": site_id, "remote_id": material.remote_id }),
+                ));
+                Ok(material)
+            }
             Err(err) => Err(self.on_auth_error(site_id, err)),
         }
     }
@@ -245,6 +318,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let patch = writer.plan(&api_key)?;
         let target_path = writer.target_path();
         let consent = self.consent_state(channel, &target_path)?;
+        self.log(observability::event_with_payload(
+            Level::Debug,
+            "delivery",
+            format!("投递预览: {} → {}", channel.as_str(), target_path.display()),
+            serde_json::json!({ "consent_granted": consent.is_granted() }),
+        ));
         Ok(DeliveryPlan {
             agent_id: channel.agent_id().to_string(),
             channel,
@@ -267,7 +346,18 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             channel.as_str(),
             &target.display().to_string(),
             &fields,
-        )
+        )?;
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "delivery",
+            "已授予投递同意",
+            serde_json::json!({
+                "agent_id": channel.agent_id(),
+                "channel": channel.as_str(),
+                "target_path": target.display().to_string(),
+            }),
+        ));
+        Ok(())
     }
 
     /// 撤销同意。**不**回滚已写入的文件（回滚是独立动作）。
@@ -278,7 +368,18 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             channel.agent_id(),
             channel.as_str(),
             &target.display().to_string(),
-        )
+        )?;
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "delivery",
+            "已撤销投递同意",
+            serde_json::json!({
+                "agent_id": channel.agent_id(),
+                "channel": channel.as_str(),
+                "target_path": target.display().to_string(),
+            }),
+        ));
+        Ok(())
     }
 
     pub fn list_consents(&self) -> Result<Vec<ConsentRow>> {
@@ -291,6 +392,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let writer = self.prepare_delivery(key_id, channel)?;
         let target = self.checked_target(channel, &writer.target_path())?;
         if !self.consent_state(channel, &target)?.is_granted() {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "delivery",
+                "投递被拒绝：缺少用户同意",
+                serde_json::json!({ "channel": channel.as_str() }),
+            ));
             return Err(Error::ConsentRequired {
                 agent_id: channel.agent_id().to_string(),
                 channel: channel.as_str().to_string(),
@@ -303,7 +410,18 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let patch = writer.plan(&api_key)?;
 
         // ③ 写入（`inject::apply` 内部完成加锁 → 预检 → 备份 → 原子写 → 回读校验 → 失败补偿）
-        let journal = inject::apply(&[patch], &self.backup_dir)?;
+        let journal = match inject::apply(&[patch], &self.backup_dir) {
+            Ok(journal) => journal,
+            Err(err) => {
+                self.log(observability::event_with_payload(
+                    Level::Error,
+                    "delivery",
+                    format!("投递失败: {}", error_kind(&err)),
+                    serde_json::json!({ "channel": channel.as_str() }),
+                ));
+                return Err(err);
+            }
+        };
 
         // ④ 记账：变更记录 + 投递绑定。两者都不含密钥。
         self.store.record_journal(&journal)?;
@@ -313,6 +431,16 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             &target.display().to_string(),
             &journal.id,
         )?;
+
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "delivery",
+            format!("投递完成: {}", channel.as_str()),
+            serde_json::json!({
+                "journal_id": journal.id,
+                "target_path": target.display().to_string(),
+            }),
+        ));
 
         Ok(DeliveryOutcome {
             channel,
@@ -331,7 +459,50 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         inject::rollback(&inject::Journal {
             id: journal_id.to_string(),
             entries,
-        })
+        })?;
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "delivery",
+            "已回滚变更",
+            serde_json::json!({ "journal_id": journal_id }),
+        ));
+        Ok(())
+    }
+
+    /// 最近事件（UI「诊断」用）。
+    pub fn recent_events(&self, limit: usize) -> Result<Vec<crate::store::EventRow>> {
+        self.store.list_events(limit.min(1000))
+    }
+
+    /// 诊断导出：事件表 → JSON 文本。**导出前再过一遍 `scrub`**（纵深防御）。
+    pub fn export_diagnostics(&self, limit: usize) -> Result<String> {
+        let events = self.recent_events(limit)?;
+        let rows: Vec<serde_json::Value> = events
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.id,
+                    "ts": row.ts,
+                    "level": row.level,
+                    "source": row.source,
+                    "message": crate::redact::scrub(&row.message),
+                    "payload": row.payload.as_deref().map(crate::redact::scrub),
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&serde_json::json!({
+            "vault_backend": self.vault.backend_name(),
+            "home": self.home.display().to_string(),
+            "events": rows,
+        }))
+        .map_err(|e| Error::Store(format!("导出诊断失败: {e}")))
+    }
+
+    /// 写事件。**故意不向上传播失败**：可观测性坏掉不该让业务操作失败。
+    fn log(&self, event: Event) {
+        if let Err(err) = self.store.insert_event(&event) {
+            eprintln!("[keyrelay] 写入事件失败: {err}");
+        }
     }
 
     /// 解析通道写入器 + 校验 `key_id` 存在。**不读钥匙串**（同意检查必须在读密钥之前）。
