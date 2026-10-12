@@ -186,12 +186,36 @@ fn json_kind(value: &Value) -> &'static str {
 }
 
 /// 令牌 id 归一化：数字与字符串统一成无引号字符串（复审 P2-3：`data.id` 为
-/// `"99"` 时曾产出 `"\"99\""`，会污染 DTO 与后续落库定位）
-fn normalize_id(value: Option<&Value>) -> Option<String> {
+/// `"99"` 时曾产出 `"\"99\""`，会污染 DTO 与后续落库定位）。
+///
+/// BACKLOG B-35：**JSON number 形态必须是真正的整数且为正**——
+/// - 非整数（`1.5`）会被 `to_string()` 成 `"1.5"` 塞进 DTO 与请求路径，而
+///   `numeric_id()` 解析失败会退化为 0，让「同名取 id 最大者」在平局时选错令牌；
+/// - `0`（与负数）在 `pick_newest_token` 里和「解析失败」不可区分，同样会选错。
+///
+/// 两种形态一律返回 `Err`（文案含「令牌 id」），由调用方决定整页失败还是中止操作。
+///
+/// 与 `parse_total` 的宽松口径**故意不对称**：`total` 只是个终止提示，多探一页也不会错；
+/// 而 id 决定「读/吊销哪一把令牌」，只能严格。因此 `2.0` 这类整数值浮点在这里也被拒绝
+/// （它 `to_string()` 成 `"2.0"`，同样会让 `numeric_id()` 退化）。
+///
+/// 返回 `Ok(None)` 表示站点**没给**可用 id（缺失 / `null` / 非标量）：
+/// 沿用既有的「都缺少可用的 id」判定，不是本步要收紧的对象。
+fn normalize_id(value: Option<&Value>) -> Result<Option<String>> {
     match value {
-        Some(Value::Number(n)) => Some(n.to_string()),
-        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(id) if id > 0 => Ok(Some(id.to_string())),
+            Some(id) => Err(Error::Transport(format!(
+                "站点返回的令牌 id 不是正整数（{id}），已拒绝用它定位令牌"
+            ))),
+            None => Err(Error::Transport(format!(
+                "站点返回的令牌 id 不是整数（{n}），已拒绝用它定位令牌"
+            ))),
+        },
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        _ => Ok(None),
     }
 }
 
@@ -322,13 +346,17 @@ fn extract_items(value: &Value) -> Vec<Value> {
     }
 }
 
-fn parse_key_meta(item: &Value) -> Option<KeyMeta> {
-    let remote_id = normalize_id(item.get("id"))?;
+fn parse_key_meta(item: &Value) -> Result<Option<KeyMeta>> {
+    // B-35：id 非法（非整数 / 0 / 负数）→ 整页失败，绝不静默跳过这一条
+    // （静默跳过等于交付一份被悄悄截断的令牌列表）。
+    let Some(remote_id) = normalize_id(item.get("id"))? else {
+        return Ok(None);
+    };
     let name = json_str(item, "/name").unwrap_or_default().to_string();
     let group = json_str(item, "/group")
         .filter(|g| !g.is_empty())
         .map(|g| g.to_string());
-    Some(KeyMeta {
+    Ok(Some(KeyMeta {
         remote_id,
         name,
         group,
@@ -341,7 +369,7 @@ fn parse_key_meta(item: &Value) -> Option<KeyMeta> {
             .get("accessed_time")
             .or_else(|| item.get("last_used_at"))
             .and_then(|v| v.as_i64()),
-    })
+    }))
 }
 
 #[async_trait]
@@ -449,7 +477,14 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
             let total = value.pointer("/data/total").and_then(parse_total);
             let page_len = items.len();
 
-            let parsed: Vec<KeyMeta> = items.iter().filter_map(parse_key_meta).collect();
+            let mut parsed: Vec<KeyMeta> = Vec::with_capacity(items.len());
+            for item in &items {
+                // B-35：非法 id（非整数 / 0 / 负数）会让整页失败，只有「站点没给 id」
+                // 才跳过——静默跳过非法 id 等于交付一份被悄悄截断的令牌列表。
+                if let Some(meta) = parse_key_meta(item)? {
+                    parsed.push(meta);
+                }
+            }
             // 有条目却一条都解析不出 id：这是解析异常，不是「站点忽略分页」。
             // 若在这里当成「翻到底了」收工，会静默丢掉后面的页（第二轮复核 N-3 回归）。
             if page_len > 0 && parsed.is_empty() {
@@ -543,7 +578,8 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
 
         // 少数版本直接在响应里回明文
         if let Some(key) = json_str(&value, "/data/key") {
-            let remote_id = normalize_id(value.pointer("/data/id")).unwrap_or_default();
+            // B-35：id 非法时不再退回空 `remote_id`（那样产出的令牌既定位不了也吊销不了）
+            let remote_id = normalize_id(value.pointer("/data/id"))?.unwrap_or_default();
             return Ok(KeyMaterial::new(remote_id, key));
         }
 

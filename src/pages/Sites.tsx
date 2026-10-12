@@ -142,6 +142,7 @@ export default function Sites() {
                 <th>名称</th>
                 <th>类型</th>
                 <th>地址</th>
+                <th>状态</th>
                 <th>余额</th>
                 <th />
               </tr>
@@ -215,6 +216,31 @@ export default function Sites() {
   );
 }
 
+/** 会话状态 → 显示文案。取值由服务层维护（`store::set_site_health`）。 */
+function healthLabel(health: string): string {
+  switch (health) {
+    case "ok":
+      return "已登录";
+    case "needs_login":
+      return "需要重新登录";
+    default:
+      // `unknown` 或将来新增的取值：不谎报「已登录」
+      return "未登录";
+  }
+}
+
+/** 会话状态 → CSS 类名。未知取值落到 `unknown` 的样式，不伪装成正常。 */
+function healthClass(health: string): string {
+  switch (health) {
+    case "ok":
+      return "enabled";
+    case "needs_login":
+      return "needs-login";
+    default:
+      return "unknown";
+  }
+}
+
 function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) {
   const balance = useQuery({
     queryKey: ["balance", site.id],
@@ -228,6 +254,13 @@ function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) 
       <td className="mono">{site.kind}</td>
       <td className="mono ellipsis" title={site.baseUrl}>
         {site.baseUrl}
+      </td>
+      <td>
+        {/* 会话状态由服务层维护（B-61）：needs_login 表示「这个站需要重新登录」，
+            它在刷新汇总里既不算成功也不算失败，所以必须在这里单独可见。 */}
+        <span className={`health-${healthClass(site.health)}`}>
+          {healthLabel(site.health)}
+        </span>
       </td>
       <td className="mono">
         {balance.isLoading

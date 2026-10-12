@@ -92,6 +92,15 @@ fn error_kind(err: &Error) -> &'static str {
     }
 }
 
+/// 是不是「认证类失败」——即 `error_kind` 判为「认证失败」的那一类（M5-S0 章程 §4.1 规则 2）。
+///
+/// 只认 [`Error::AuthFailed`]：`CaptchaRequired` / `SecondFactorRequired` 的会话**未必**失效
+/// （站点只是要人再过一道验证），把它们也标成 `needs_login` 会让用户看到一条假的
+/// 「请重新登录」。
+fn is_auth_failure(err: &Error) -> bool {
+    matches!(err, Error::AuthFailed(_))
+}
+
 /// 进程内会话缓存（按站点隔离）。持久化属 M1-S2。
 #[derive(Default)]
 pub struct SessionCache {
@@ -154,6 +163,14 @@ impl std::fmt::Debug for StoredKey {
     }
 }
 
+/// `sites.health` 的取值（与 [`Store::set_site_health`] 的约定一致，见 M5-S0 章程 §4.1）。
+///
+/// 取 `pub` 是因为 `SiteSummary.health` 本来就是对外的字符串，调用方应当对着常量比，
+/// 而不是在 `src-tauri` 与前端里到处写裸字面量。
+pub const HEALTH_UNKNOWN: &str = "unknown";
+pub const HEALTH_OK: &str = "ok";
+pub const HEALTH_NEEDS_LOGIN: &str = "needs_login";
+
 /// 一轮刷新的结果。不含任何密钥。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RefreshSummary {
@@ -163,6 +180,8 @@ pub struct RefreshSummary {
     pub keys_total: usize,
     /// 触发余额告警的站点 id
     pub balance_alerts: Vec<i64>,
+    /// 本轮**需要重新登录**的站点 id。升序、去重、不含密钥（M5-S0 章程 §4.1）。
+    pub needs_login: Vec<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +203,20 @@ impl From<SiteRow> for SiteSummary {
             health: row.health,
         }
     }
+}
+
+/// 一次落盘导出的结果。**不含文件内容**。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportOutcome {
+    pub path: std::path::PathBuf,
+    pub encrypted: bool,
+    pub bytes: usize,
+    /// 是否成功登记进「已知导出物」表（M5-S5 / B-60）。
+    ///
+    /// `false` 表示文件**确实写成了**，但审计从此看不到它 ——
+    /// 「自我证明零明文」这条链路上多了一个洞。不回滚、不谎报失败，
+    /// 但必须让调用方（与 UI）知道（M5-S2 复审 P2-4）。
+    pub registered: bool,
 }
 
 pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
@@ -254,6 +287,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     }
 
     /// 登录并把会话放入缓存；失败时不改变已有缓存。
+    ///
+    /// 顺序：**先落健康状态、再放会话缓存**（B-61）。若先缓存会话再写库而写库失败，
+    /// 调用方拿到的是 `Err`、本地却已经「登录上了」，且 `sites.health` 会永远停在
+    /// `needs_login`——那条「请重新登录」的提示再也消不掉。
     pub async fn login(&self, site_id: i64, cred: Credentials) -> Result<()> {
         let site = self.site(site_id)?;
         // 用户名不是秘密，但仍然过一遍脱敏入口（B-36：站点原文/用户名都可能被规则命中）
@@ -271,6 +308,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 return Err(err);
             }
         };
+        self.store.set_site_health(site_id, HEALTH_OK)?;
         self.sessions.put(site_id, session)?;
         self.log(observability::event_with_payload(
             Level::Info,
@@ -338,12 +376,32 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         }
     }
 
-    /// 会话失效时清缓存，让上层能提示「请重新登录」而不是反复失败。
+    /// 会话失效时清缓存 + 把「需要重新登录」**落库**（B-61）。
+    ///
+    /// 落库是必要的：会话缓存只在进程内，重启即空。状态不落库的话，用户下次开应用时
+    /// 这个站点会重新变成「从没登录过」，那条提示就再也找不回来了。
+    ///
+    /// 写入点是**共用**的：定时刷新与用户手动操作（看余额、读明文、删密钥）撞上失效会话
+    /// 都会走到这里。这是有意的——会话死了就是死了，不该只在刷新轮才可见。
     fn on_auth_error(&self, site_id: i64, err: Error) -> Error {
-        if matches!(err, Error::AuthFailed(_)) {
+        if is_auth_failure(&err) {
             self.sessions.invalidate(site_id);
+            self.mark_needs_login(site_id);
         }
         err
+    }
+
+    /// 把站点标成「需要重新登录」。**best-effort**：写库失败只留一条 warn 事件，
+    /// 不改写调用方看到的原始错误——调用方要的是「为什么失败」，不是「状态没存上」。
+    fn mark_needs_login(&self, site_id: i64) {
+        if let Err(err) = self.store.set_site_health(site_id, HEALTH_NEEDS_LOGIN) {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "store",
+                format!("站点状态落库失败: {err}"),
+                serde_json::json!({ "site_id": site_id, "health": HEALTH_NEEDS_LOGIN }),
+            ));
+        }
     }
 
     /// 删除站点记录，**同时清掉该 id 的会话缓存**。
@@ -635,6 +693,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     ///
     /// 单个站点失败**不中断**其余站点：把失败计数与原因分类写进事件，
     /// 整体仍返回 `Ok`（否则调用方会以为整轮都废了）。
+    ///
+    /// 会话失效的站点（无会话 + `health == "needs_login"`）不联网、不计成功也不计失败，
+    /// 但每轮都会出现在 [`RefreshSummary::needs_login`] 里——否则用户在界面上永远
+    /// 看不到「这个站需要重新登录」（B-61）。
     pub async fn refresh_all(&self) -> Result<RefreshSummary> {
         let settings = self.settings()?;
         let sites = self.store.list_sites()?;
@@ -644,8 +706,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         };
 
         for site in sites {
-            // 没有会话的站点直接跳过：不算失败（用户可能压根没登录过它）
+            // 没有会话：要么用户从没登录过它（跳过），要么上一轮已判过「需要重新登录」
+            // ——后者必须每轮都带出来，且不发任何请求（纯本地判定）。
             if self.sessions.get(site.id).is_none() {
+                if site.health == HEALTH_NEEDS_LOGIN {
+                    summary.needs_login.push(site.id);
+                }
                 continue;
             }
 
@@ -659,12 +725,13 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 }
                 _ => {
                     summary.sites_failed += 1;
-                    let reason = balance
-                        .as_ref()
-                        .err()
-                        .or_else(|| keys.as_ref().err())
-                        .map(error_kind)
-                        .unwrap_or("未知");
+                    let failure = balance.as_ref().err().or_else(|| keys.as_ref().err());
+                    let reason = failure.map(error_kind).unwrap_or("未知");
+                    // 认证失败 = 会话已失效：`on_auth_error` 已经把它落库，
+                    // 这里再带进本轮汇总，用户当场就能看到。
+                    if failure.is_some_and(is_auth_failure) {
+                        summary.needs_login.push(site.id);
+                    }
                     self.log(observability::event_with_payload(
                         Level::Warn,
                         "site",
@@ -696,6 +763,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             }
         }
 
+        // `list_sites` 已按 id 升序，这里的排序是让「升序去重」成为实现自身的性质，
+        // 而不是依赖存储层的排序（章程 §4.1 规则 5）。
+        summary.needs_login.sort_unstable();
+        summary.needs_login.dedup();
+
         self.log(observability::event_with_payload(
             Level::Debug,
             "app",
@@ -703,7 +775,13 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 "刷新完成: 成功 {} / 失败 {} / 密钥 {}",
                 summary.sites_ok, summary.sites_failed, summary.keys_total
             ),
-            serde_json::json!({ "sites_total": summary.sites_total }),
+            serde_json::json!({
+                "sites_total": summary.sites_total,
+                "sites_ok": summary.sites_ok,
+                "sites_failed": summary.sites_failed,
+                "keys_total": summary.keys_total,
+                "needs_login": &summary.needs_login,
+            }),
         ));
         Ok(summary)
     }
@@ -846,7 +924,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .map(|row| ExportSite {
                 id: row.id,
                 kind: row.kind,
-                base_url: row.base_url,
+                // 纵深防御（M5-S5 接线 / B-63）：序列化咽喉点 `export::to_json` 已经会剥一次，
+                // 这里在**组装处**再剥一次 —— 内存里的 `ExportBundle` 也不该带着
+                // `https://user:pass@host` 这种内嵌凭证到处传。
+                base_url: crate::redact::strip_url_userinfo(&row.base_url),
                 display_name: row.display_name,
             })
             .collect();
@@ -883,8 +964,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 ts: row.ts,
                 level: row.level,
                 source: row.source,
-                message: crate::redact::scrub(&row.message),
-                payload: row.payload.as_deref().map(crate::redact::scrub),
+                // 装配处也走**共享出口**，而且必须是**结构化优先**的那种
+                // （M5-S1 复审 P2-1）：这里原先对 payload 调的是文本级 `scrub`，
+                // 会把 34 位数字打成 `***`，让 payload 变成非法 JSON，
+                // 于是下游的结构化脱敏只能走兜底分支 —— 与诊断导出分叉。
+                message: crate::redact::scrub_event_message(&row.message),
+                payload: crate::redact::scrub_event_payload(row.payload.as_deref()),
             })
             .collect();
 
@@ -910,13 +995,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     }
 
     /// 导出并落盘。`password` 为空/`None` 时输出明文 JSON。
-    ///
-    /// 返回 `(路径, 是否加密, 字节数)`。
     pub fn export_to_file(
         &self,
         path: &std::path::Path,
         password: Option<&str>,
-    ) -> Result<(std::path::PathBuf, bool, usize)> {
+    ) -> Result<ExportOutcome> {
         let bundle = self.export_bundle()?;
         let (text, encrypted) = export::export(&bundle, password)?;
         if let Some(parent) = path.parent() {
@@ -924,6 +1007,22 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 .map_err(|e| Error::Store(format!("创建导出目录失败: {e}")))?;
         }
         std::fs::write(path, &text).map_err(|e| Error::Store(format!("写入导出文件失败: {e}")))?;
+
+        // 登记导出物（M5-S5 接线 / 关闭 B-60 的另一半）：审计靠这张表覆盖「用户自选导出路径」。
+        // 登记失败**不回滚文件**（文件确实写成了，谎报失败更糟），但必须留痕 ——
+        // 而且要把 `registered=false` 一路带回 UI：只写事件的话，用户看到的仍是
+        // 「导出成功」，而审计从此看不到这个文件（M5-S2 复审 P2-4）。
+        let registered = match self.store.record_export(path, encrypted, text.len()) {
+            Ok(()) => true,
+            Err(e) => {
+                self.log(observability::event(
+                    Level::Error,
+                    "app",
+                    format!("登记导出物失败（审计将看不到这个文件）: {e}"),
+                ));
+                false
+            }
+        };
 
         self.log(observability::event_with_payload(
             Level::Info,
@@ -933,9 +1032,15 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 "path": path.display().to_string(),
                 "bytes": text.len(),
                 "encrypted": encrypted,
+                "registered": registered,
             }),
         ));
-        Ok((path.to_path_buf(), encrypted, text.len()))
+        Ok(ExportOutcome {
+            path: path.to_path_buf(),
+            encrypted,
+            bytes: text.len(),
+            registered,
+        })
     }
 
     /// 脱敏审计：扫描本产品**全部落盘产物**里的明文凭证。
@@ -944,6 +1049,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 只扫自己的产物，不做全盘扫描。
     pub fn audit_redaction(&self) -> Result<AuditReport> {
         let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        // 覆盖面缺口要进**报告**，不能只进日志：B-60 修的正是「自称干净、其实没扫全」
+        let mut coverage_gaps: Vec<String> = Vec::new();
         if let Some(db) = self.store.path() {
             paths.push(db.to_path_buf());
             for suffix in ["-wal", "-shm"] {
@@ -963,7 +1070,22 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             paths.push(app_data.join("exports"));
         }
 
+        // 用户自选导出路径（M5-S5 接线 / 关闭 B-60 的另一半）：登记表里的每个路径都进扫描集合。
+        // 读不到登记表**不让整条审计失败** —— db / backups / 事件表三条守护明明还能跑，
+        // `?` 直接返回等于覆盖面反而更差；但也不能静默跳过，所以记一条 `Unreadable` 进报告
+        // （它不是 `is_plaintext()`，不会把干净误判成有明文）。
+        match self.store.list_exports() {
+            Ok(records) => audit::merge_export_registry(&mut paths, &records),
+            Err(e) => coverage_gaps.push(format!("读取导出登记表失败: {e}")),
+        }
+
         let mut report = audit::scan_paths(&paths);
+        for reason in coverage_gaps {
+            report.findings.push(AuditFinding::Unreadable {
+                path: std::path::PathBuf::from("<导出登记表>"),
+                reason,
+            });
+        }
 
         let event_hits = self.store.count_events_with_secrets()?;
         if event_hits > 0 {
@@ -1069,8 +1191,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                     "ts": row.ts,
                     "level": row.level,
                     "source": row.source,
-                    "message": crate::redact::scrub(&row.message),
-                    "payload": row.payload.as_deref().map(crate::redact::scrub),
+                    // 与配置导出走**同一段代码**（M5-S1 复审 P2-1）：
+                    // 手抄组合会让两条出口悄悄分叉，实测已经分叉过一次。
+                    "message": crate::redact::scrub_event_message(&row.message),
+                    "payload": crate::redact::scrub_event_payload(row.payload.as_deref()),
                 })
             })
             .collect();

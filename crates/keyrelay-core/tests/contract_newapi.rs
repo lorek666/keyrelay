@@ -818,7 +818,9 @@ async fn list_keys_stops_when_site_ignores_pagination() {
 #[tokio::test]
 async fn list_keys_reports_truncation_instead_of_silently_capping() {
     // 复核 N-3：命中页数上限且可能还有更多 → 显式报错，不交付被截断的列表
-    let full_page: Vec<serde_json::Value> = (0..100)
+    // M5-S3（差异登记 D-3）：id 从 1 起。旧夹具用 `(0..100)`，首条 id 为 0——
+    // B-35 之后 0 不再是合法主键（本测试关心的是「页数上限」，不是 id 语义）。
+    let full_page: Vec<serde_json::Value> = (1..=100)
         .map(|i| json!({"id": i, "name": format!("bulk-{i}"), "status": 1}))
         .collect();
     // 第 101 页仍有新数据 → 上限保护才应触发（第 100 页之后允许一次探测）
@@ -943,4 +945,183 @@ async fn revoke_key_rejects_remote_id_that_escapes_the_path_segment() {
         "{err:?}"
     );
     assert!(adapter.transport().requests().is_empty());
+}
+
+// ================================================================ M5-S3：B-35 令牌 id 收紧
+
+#[tokio::test]
+async fn list_keys_rejects_a_fractional_token_id() {
+    // BACKLOG B-35：`id: 1.5` 曾被归一成 `"1.5"` 塞进 DTO，
+    // 而 `numeric_id()` 解析失败退化为 0，会让「同名取 id 最大者」选错令牌。
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"items": [
+            {"id": 12, "name": "ok", "status": 1},
+            {"id": 1.5, "name": "float-id", "status": 1}
+        ], "total": 2}}),
+    )]);
+    let adapter = NewApi::new(transport);
+
+    let err = adapter.list_keys(BASE, &session()).await.unwrap_err();
+    assert!(matches!(err, Error::Transport(_)), "{err:?}");
+    let message = err.to_string();
+    assert!(message.contains("令牌 id"), "{message}");
+    assert!(message.contains("1.5"), "应能看出站点给了什么: {message}");
+}
+
+#[tokio::test]
+async fn list_keys_rejects_zero_or_negative_token_id() {
+    // BACKLOG B-35：`id: 0` 与「解析失败」在 `pick_newest_token` 里不可区分
+    for bad in [json!(0), json!(-1), json!(2.0)] {
+        let transport = MockTransport::new(vec![json_resp(
+            200,
+            json!({"success": true, "data": {"items": [
+                {"id": bad, "name": "bad-id", "status": 1}
+            ], "total": 1}}),
+        )]);
+        let adapter = NewApi::new(transport);
+
+        let err = adapter.list_keys(BASE, &session()).await.unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "id={bad} → {err:?}");
+        assert!(err.to_string().contains("令牌 id"), "id={bad} → {err}",);
+    }
+}
+
+#[tokio::test]
+async fn list_keys_keeps_integer_and_integer_string_token_ids() {
+    // 反例保护：整数与整数字符串照常，`null` 仍按「站点没给 id」跳过
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"items": [
+            {"id": 12, "name": "int", "status": 1},
+            {"id": null, "name": "null-id", "status": 1},
+            {"id": "99", "name": "str", "status": 1}
+        ], "total": 2}}),
+    )]);
+    let adapter = NewApi::new(transport);
+
+    let keys = adapter.list_keys(BASE, &session()).await.unwrap();
+    assert_eq!(keys.len(), 2, "null id 的条目应被跳过");
+    assert_eq!(keys[0].remote_id, "12");
+    assert_eq!(keys[1].remote_id, "99");
+}
+
+#[tokio::test]
+async fn create_key_rejects_an_invalid_id_in_the_inline_key_response() {
+    // 内联明文路径下 id 非法 → 报错，而不是产出既定位不了也吊销不了的空 remote_id
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"id": 0, "key": "sk-inline12345678"}}),
+    )]);
+    let adapter = NewApi::new(transport);
+
+    let err = adapter
+        .create_key(BASE, &session(), KeySpec::named("inline"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Transport(_)), "{err:?}");
+    assert!(err.to_string().contains("令牌 id"), "{err}");
+    assert_eq!(
+        adapter.transport().request_count(),
+        1,
+        "不得退回「创建 → 列表定位」路径"
+    );
+}
+
+// ================================================================ M5-S3：B-41 total 宽松解析
+
+#[tokio::test]
+async fn list_keys_uses_a_string_total_to_stop_without_an_extra_probe() {
+    // BACKLOG B-41：`total: "2"` 若被当成「缺失」，结果仍然对，但会白白多探一页。
+    // 请求数停在 1 次才能证明字符串 total 真的被采纳。
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"items": [
+            {"id": 1, "name": "a", "status": 1},
+            {"id": 2, "name": "b", "status": 1}
+        ], "total": "2"}}),
+    )]);
+    let adapter = NewApi::new(transport);
+
+    let keys = adapter.list_keys(BASE, &session()).await.unwrap();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(
+        adapter.transport().requests().len(),
+        1,
+        "字符串 total 必须被采纳"
+    );
+}
+
+#[tokio::test]
+async fn list_keys_uses_an_integral_float_total() {
+    // 浮点 `2.0` 与字符串同理：整数值必须被采纳，不该多探一页
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"items": [
+            {"id": 1, "name": "a", "status": 1},
+            {"id": 2, "name": "b", "status": 1}
+        ], "total": 2.0}}),
+    )]);
+    let adapter = NewApi::new(transport);
+
+    let keys = adapter.list_keys(BASE, &session()).await.unwrap();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(
+        adapter.transport().requests().len(),
+        1,
+        "整数值浮点 total 必须被采纳"
+    );
+}
+
+#[tokio::test]
+async fn list_keys_treats_a_boolean_total_as_missing() {
+    // 布尔不是总数 → 视为「站点没给总数」，靠空页终止（必须发第 2 次请求）
+    let transport = MockTransport::new(vec![
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": [
+                {"id": 1, "name": "a", "status": 1}
+            ], "total": true}}),
+        ),
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": [], "total": true}}),
+        ),
+    ]);
+    let adapter = NewApi::new(transport);
+
+    let keys = adapter.list_keys(BASE, &session()).await.unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(
+        adapter.transport().requests().len(),
+        2,
+        "布尔 total 必须被当作缺失，靠空页收尾"
+    );
+}
+
+#[tokio::test]
+async fn list_keys_does_not_truncate_on_a_fractional_total() {
+    // 反例保护：`total: 2.5` 不得被当成 2（否则会在第二页还没取时就静默收工）
+    let transport = MockTransport::new(vec![
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": [
+                {"id": 1, "name": "a", "status": 1},
+                {"id": 2, "name": "b", "status": 1}
+            ], "total": 2.5}}),
+        ),
+        json_resp(
+            200,
+            json!({"success": true, "data": {"items": [], "total": 2.5}}),
+        ),
+    ]);
+    let adapter = NewApi::new(transport);
+
+    let keys = adapter.list_keys(BASE, &session()).await.unwrap();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(
+        adapter.transport().requests().len(),
+        2,
+        "小数 total 不得被截断成整数"
+    );
 }

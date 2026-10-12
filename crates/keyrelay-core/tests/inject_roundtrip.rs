@@ -129,3 +129,42 @@ fn refuses_rollback_after_external_edit() {
     assert!(matches!(err, Error::Inject { .. }));
     assert_eq!(fs::read_to_string(&config).unwrap(), "手工改坏了");
 }
+
+// ================================================================ M5-S3：B-46 同批次重复路径
+
+#[test]
+fn apply_rejects_duplicate_target_path_in_one_batch() {
+    // BACKLOG B-46：同一个文件在一次注入里被计划了两次。旧实现在 `before` 相同时
+    // 静默「后者胜」（备份链只留一条），在 `before` 串联时报出误导性的
+    // 「文件内容与计划不一致（可能被外部修改）」。现在必须前置拒绝。
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    fs::write(&config, FIXTURE).unwrap();
+
+    let injector = CodexInjector::new(&config);
+    let mut batch = injector.plan(&binding()).unwrap();
+    let second = injector.plan(&binding()).unwrap();
+    batch.extend(second);
+    assert_eq!(batch.len(), 2, "两条补丁指向同一个文件");
+    assert_eq!(batch[0].path, batch[1].path);
+
+    let backup_dir = dir.path().join("backups");
+    let err = apply(&batch, &backup_dir).unwrap_err();
+
+    assert!(matches!(err, Error::Inject { .. }), "{err:?}");
+    let message = err.to_string();
+    assert!(message.contains("同一批次"), "{message}");
+    assert!(message.contains("重复"), "{message}");
+    assert!(
+        message.contains("config.toml"),
+        "文案必须带路径原文: {message}"
+    );
+    assert!(
+        !message.contains("可能被外部修改"),
+        "不得再落到误导性的外部改动文案: {message}"
+    );
+
+    // 前置校验：文件一个字节没动，且连备份目录都没建
+    assert_eq!(fs::read_to_string(&config).unwrap(), FIXTURE);
+    assert!(!backup_dir.exists(), "校验必须先于任何落盘动作");
+}

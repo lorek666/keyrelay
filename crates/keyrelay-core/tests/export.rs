@@ -15,6 +15,7 @@ const SECRET: &str = "sk-export-0123456789abcdefSECRET";
 struct Fixture {
     _dir: tempfile::TempDir,
     backup_dir: std::path::PathBuf,
+    db_path: std::path::PathBuf,
     service: KeyRelayService<MockTransport>,
     key_id: i64,
 }
@@ -24,8 +25,9 @@ fn setup() -> Fixture {
     let home = dir.path().join("home");
     fs::create_dir_all(&home).expect("home");
     let backup_dir = dir.path().join("backups");
+    let db_path = dir.path().join("keyrelay.db");
 
-    let store = Store::open(&dir.path().join("keyrelay.db")).expect("文件库");
+    let store = Store::open(&db_path).expect("文件库");
     let site_id = store
         .upsert_site("newapi", "https://relay.example.com", "测试站")
         .expect("写站点");
@@ -50,9 +52,27 @@ fn setup() -> Fixture {
     Fixture {
         _dir: dir,
         backup_dir,
+        db_path,
         service,
         key_id,
     }
+}
+
+/// 手工往事件表塞一条事件（绕过 `observability` 的脱敏入口）。
+///
+/// 模拟「将来某条路径把敏感文本写进了事件表」：导出物是最后一道防线，
+/// 这里要能兜住 —— 否则 B-62 就只是注释而不是防线。
+fn insert_raw_event(db_path: &std::path::Path, message: &str, payload: Option<&str>) {
+    Store::open(db_path)
+        .expect("重开文件库")
+        .insert_event(&keyrelay_core::observability::Event {
+            ts: 0,
+            level: keyrelay_core::observability::Level::Info,
+            source: "app".to_string(),
+            message: message.to_string(),
+            payload: payload.map(str::to_string),
+        })
+        .expect("写事件");
 }
 
 #[test]
@@ -82,10 +102,11 @@ fn export_file_round_trips_through_disk() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("out.json");
 
-    let (written, encrypted, bytes) = f.service.export_to_file(&path, None).unwrap();
-    assert_eq!(written, path);
-    assert!(!encrypted);
-    assert!(bytes > 0);
+    let outcome = f.service.export_to_file(&path, None).unwrap();
+    assert_eq!(outcome.path, path);
+    assert!(!outcome.encrypted);
+    assert!(outcome.bytes > 0);
+    assert!(outcome.registered, "正常导出必须登记进已知导出物表");
     assert!(path.exists());
 
     let text = fs::read_to_string(&path).unwrap();
@@ -99,11 +120,11 @@ fn encrypted_export_round_trips_and_hides_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("out.json");
 
-    let (_, encrypted, _) = f
+    let outcome = f
         .service
         .export_to_file(&path, Some("correct horse battery staple"))
         .unwrap();
-    assert!(encrypted);
+    assert!(outcome.encrypted);
 
     let text = fs::read_to_string(&path).unwrap();
     assert!(
@@ -309,4 +330,103 @@ fn full_delivery_then_export_then_prune_stays_clean() {
     // 清理之后审计仍然干净
     let report = f.service.audit_redaction().unwrap();
     assert!(report.is_clean(), "{}", report.summary());
+}
+
+#[test]
+fn export_strips_embedded_credentials_from_the_site_url() {
+    // B-63：`https://user:pass@relay.example.com` 形态的站点地址以前会原样进导出文件。
+    // 明文与加密两条路径都必须经过同一个咽喉点（`export::to_json`）。
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let store = Store::open(&dir.path().join("keyrelay.db")).unwrap();
+    store
+        .upsert_site(
+            "newapi",
+            "https://user:pass@relay.example.com",
+            "带凭证的站",
+        )
+        .unwrap();
+    let service = KeyRelayService::new(
+        store,
+        MockTransport::new(vec![]),
+        ServiceConfig {
+            vault: Arc::new(MemoryVault::new()),
+            home,
+            backup_dir: dir.path().join("backups"),
+        },
+    );
+
+    // ① 明文路径
+    let plain_path = dir.path().join("plain.json");
+    service.export_to_file(&plain_path, None).unwrap();
+    let plain = fs::read_to_string(&plain_path).unwrap();
+    assert!(
+        !plain.contains("user:pass"),
+        "明文导出仍带内嵌凭证:\n{plain}"
+    );
+    assert!(!plain.contains("pass@"), "明文导出仍带内嵌凭证:\n{plain}");
+    assert!(
+        plain.contains("https://relay.example.com"),
+        "只该剥掉 userinfo，主机名要留着:\n{plain}"
+    );
+
+    // ② 加密路径（`encrypt` 内部同样走 `to_json`）
+    let password = "correct horse battery staple";
+    let enc_path = dir.path().join("enc.json");
+    service.export_to_file(&enc_path, Some(password)).unwrap();
+    let envelope = fs::read_to_string(&enc_path).unwrap();
+    assert!(!envelope.contains("user:pass"), "密文信封里不该有明文凭证");
+    let bundle = export::decrypt(&envelope, password).unwrap();
+    assert_eq!(bundle.sites[0].base_url, "https://relay.example.com");
+}
+
+#[test]
+fn export_scrubs_keychain_references_and_sensitive_payload_keys() {
+    // B-62：`scrub` 只认 3 个前缀 + ≥32 位 hex，钥匙串引用与 cookie 值会原样带出。
+    let f = setup();
+    insert_raw_event(
+        &f.db_path,
+        "取密钥失败：kr/key/1/secret 不在钥匙串里",
+        Some(r#"{"password":"hunter2","cookie":"session=abc","key_id":1,"path":"/tmp/x.json"}"#),
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.json");
+    f.service.export_to_file(&path, None).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+
+    // 原始文本级断言：引用与敏感值都不能出现在导出文件里
+    assert!(
+        !text.contains("kr/key/1/secret"),
+        "导出物带出钥匙串引用:\n{text}"
+    );
+    assert!(!text.contains("hunter2"), "导出物带出 password 值:\n{text}");
+    assert!(
+        !text.contains("session=abc"),
+        "导出物带出 cookie 值:\n{text}"
+    );
+
+    // 结构化断言：payload 在导出物里是**字符串**（JSON 被转义了），要解两层才看得清
+    let bundle = export::from_json(&text).unwrap();
+    let event = bundle
+        .events
+        .iter()
+        .find(|event| event.message.contains("kr/"))
+        .expect("手工事件应在导出物里");
+    assert_eq!(
+        event.message, "取密钥失败：kr/*** 不在钥匙串里",
+        "message 里的引用形态必须被掩"
+    );
+
+    let payload = event.payload.as_deref().expect("payload 应保留");
+    let parsed: serde_json::Value = serde_json::from_str(payload).expect("payload 仍是合法 JSON");
+    assert_eq!(parsed["password"], "***", "命中键必须被掩: {payload}");
+    assert_eq!(parsed["cookie"], "***", "命中键必须被掩: {payload}");
+    assert_eq!(parsed["key_id"], 1, "「不得命中」的键不能被误伤: {payload}");
+    assert_eq!(
+        parsed["path"], "/tmp/x.json",
+        "「不得命中」的键不能被误伤: {payload}"
+    );
 }

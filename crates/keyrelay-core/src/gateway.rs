@@ -11,6 +11,10 @@
 //! 5. 请求体/响应体**不写日志**；
 //! 6. **只转发 `/v1/*`，且路径里不许有「向上跳」的段**（见 [`path_is_safe`]）；
 //! 7. 响应**流式回传**，且有大小上限（见 [`MAX_RESPONSE_BYTES`]）。
+//!
+//! 启停时序（B-64）：优雅停机是**异步**的，`shutdown()` 只是发信号。需要「停旧 → 立刻绑新」
+//! 的调用方必须用 [`GatewayHandle::shutdown_and_wait`]；`start()` 另外对 bind 的
+//! `AddrInUse` 做有界退避重试（见 [`BIND_RETRY_ATTEMPTS`] / [`BIND_RETRY_DELAY`]）。
 
 use std::net::SocketAddr;
 
@@ -31,6 +35,20 @@ use crate::error::{Error, Result};
 /// 中转站可以一直吐字节，把这个桌面进程撑爆（M4-S2 复审 P1-2）。
 /// 64 MiB 远大于任何正常的 completions 响应，又不至于吃掉整台机器。
 pub const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// bind 失败时的重试次数上限（**只在 `AddrInUse` 时重试**，其余错误一次返回）。
+///
+/// 为什么需要它（B-64 / M4-S2 复审 P2-7）：`gateway_start` 是「先停旧、再绑新」，
+/// 而优雅停机是异步的——监听套接字要等服务任务被调度到、drop 掉 listener 才释放
+/// （实测 ≈1.3ms）。窗口内 bind 就会 `AddrInUse`，旧实现直接报「端口可能被占用」，
+/// 而**旧网关其实已经被停掉了**，用户被引向错误的方向。
+///
+/// 20 × 50ms = 1000ms 的预算足够覆盖那个毫秒级窗口，又不会让「端口真被别的程序占用」
+/// 的情况等太久。
+pub const BIND_RETRY_ATTEMPTS: u32 = 20;
+
+/// 两次 bind 尝试之间的间隔（配合 [`BIND_RETRY_ATTEMPTS`]，最坏 ≈1000ms）。
+pub const BIND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// 请求体上限（与之前一致，只是抽成常量）。
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
@@ -213,6 +231,9 @@ pub struct GatewayHandle {
     pub token: String,
     pub site_display_name: String,
     shutdown: oneshot::Sender<()>,
+    /// 服务任务。`shutdown_and_wait` 等它结束；`shutdown()` 只是把它丢掉
+    /// （drop 一个 `JoinHandle` 是 **detach**，不会 abort 任务——既有调用点的行为因此不变）。
+    finished: tokio::task::JoinHandle<()>,
 }
 
 impl std::fmt::Debug for GatewayHandle {
@@ -232,6 +253,74 @@ impl GatewayHandle {
     /// 停止网关并释放端口。幂等。
     pub fn shutdown(self) {
         let _ = self.shutdown.send(());
+    }
+
+    /// 停止网关并**等待监听套接字真正释放**。幂等。
+    ///
+    /// 「已释放」的判据是服务任务结束：axum 收到停止信号后先 break accept 循环、
+    /// 立刻 `drop(listener)`，**然后**才等在途连接收尾（axum 0.8.9 `serve/mod.rs`）。
+    /// 所以「任务结束」是「监听套接字已 drop」的充分条件（严格更强）。
+    /// 这里**没有 sleep、没有轮询**——等的是任务本身。
+    ///
+    /// 幂等：服务已停时 oneshot 发送失败被忽略，已结束的 `JoinHandle` 立即返回；
+    /// 任务 panic 时 `JoinError` 也被忽略。调用方不需要处理任何错误。
+    ///
+    /// 注意：在途连接会拖住这个 `await`（axum 先放掉端口、再等连接），但端口在
+    /// 信号之后就已经能重新绑定了。
+    pub async fn shutdown_and_wait(self) {
+        let GatewayHandle {
+            shutdown, finished, ..
+        } = self;
+        let _ = shutdown.send(());
+        let _ = finished.await;
+    }
+}
+
+/// 绑定 `127.0.0.1:port`，**只对 `AddrInUse` 退避重试**。
+///
+/// 首次尝试之外最多 [`BIND_RETRY_ATTEMPTS`] 次重试、每次间隔 [`BIND_RETRY_DELAY`]；
+/// 其余错误（权限、地址不可用……）**一次**返回，不 sleep、不重试。
+/// 重试耗尽后返回**最后一次**的错误（kind 仍是 `AddrInUse`），由调用方决定文案。
+async fn bind_listener_with<F, Fut>(
+    port: u16,
+    mut bind: F,
+) -> std::io::Result<tokio::net::TcpListener>
+where
+    F: FnMut(u16) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<tokio::net::TcpListener>>,
+{
+    let mut retries_left = BIND_RETRY_ATTEMPTS;
+    loop {
+        match bind(port).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && retries_left > 0 => {
+                retries_left -= 1;
+                tokio::time::sleep(BIND_RETRY_DELAY).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// 生产路径的绑定：**只绑 `127.0.0.1`**（地址写死，不接受任何参数）。
+async fn bind_loopback(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(("127.0.0.1", port)).await
+}
+
+/// bind 失败的错误文案。
+///
+/// `AddrInUse` 单独一条：既要说清「端口 + 占用 + 实际端口号」，也要点明
+/// 「可能是上一次网关还没释放」——旧文案写「端口可能被占用」，在 B-64 那个场景里
+/// （旧实例其实已经被停掉）会把用户引向别的程序。
+fn bind_error_message(port: u16, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::AddrInUse {
+        format!(
+            "无法在 127.0.0.1:{port} 上启动网关：端口 {port} 被占用（可能是上一次网关尚未释放；\
+             已重试 {BIND_RETRY_ATTEMPTS} 次、每次 {}ms 仍失败）: {e}",
+            BIND_RETRY_DELAY.as_millis()
+        )
+    } else {
+        format!("无法在 127.0.0.1:{port} 上启动网关: {e}")
     }
 }
 
@@ -257,15 +346,12 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
         .fallback(any(proxy))
         .with_state(state);
 
-    // 只绑回环：这里写死，不接受任何参数
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", config.port))
+    // 只绑回环：这里写死，不接受任何参数。
+    // bind 失败**只对 AddrInUse 退避重试**：调用方是「先停旧、再绑新」，而优雅停机是
+    // 异步的，旧监听套接字可能还没被 drop（B-64 / M4-S2 复审 P2-7）。
+    let listener = bind_listener_with(config.port, bind_loopback)
         .await
-        .map_err(|e| {
-            Error::Store(format!(
-                "无法在 127.0.0.1:{} 上启动网关（端口可能被占用）: {e}",
-                config.port
-            ))
-        })?;
+        .map_err(|e| Error::Store(bind_error_message(config.port, &e)))?;
     let addr = listener
         .local_addr()
         .map_err(|e| Error::Store(format!("读取网关地址失败: {e}")))?;
@@ -276,7 +362,7 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
     }
 
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move {
+    let finished = tokio::spawn(async move {
         let _ = axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = rx.await;
@@ -289,6 +375,7 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
         token: config.token,
         site_display_name: config.site_display_name,
         shutdown: tx,
+        finished,
     })
 }
 
@@ -651,5 +738,214 @@ mod tests {
         })
         .await
         .is_err());
+    }
+
+    // ---- M5-S4：网关启停竞态（B-64）----
+
+    /// 本组测试用的最小配置：不发任何请求，`base_url` 只要求非空。
+    fn test_config(port: u16) -> GatewayConfig {
+        GatewayConfig {
+            port,
+            token: "kr-gw-unit-test-token".into(),
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: "sk-unit-test".into(),
+            site_display_name: "单测站点".into(),
+        }
+    }
+
+    /// 「真的等到监听套接字释放」的**确定性**证据。
+    ///
+    /// `#[tokio::test]` 默认是 `current_thread` 运行时：`shutdown_and_wait` 返回之后，
+    /// 本测试里**没有任何 await**，所以服务任务只可能在 `shutdown_and_wait` 内部被推进。
+    /// 若它只是「发个信号就返回」，服务任务在单线程运行时里根本没机会被调度、监听套接字
+    /// 还开着，下面两条断言必红。
+    #[tokio::test]
+    async fn shutdown_and_wait_releases_the_port_before_returning() {
+        let handle = start(test_config(0)).await.expect("网关应能启动");
+        let port = handle.addr.port();
+        assert_ne!(port, 0, "内核应分配一个真实端口");
+
+        handle.shutdown_and_wait().await;
+
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "shutdown_and_wait 返回后不该还有人在 {port} 上 accept"
+        );
+        let probe = std::net::TcpListener::bind(("127.0.0.1", port))
+            .unwrap_or_else(|e| panic!("shutdown_and_wait 返回后端口 {port} 必须已可绑定: {e}"));
+        drop(probe);
+    }
+
+    /// 对照组（同时也是「`shutdown()` 语义不变」的钉子）：在 `current_thread` 运行时里
+    /// `shutdown()` 发完信号就返回，**此刻监听套接字还没释放**——这正是 B-64 的竞态窗口，
+    /// 也正是 `shutdown_and_wait` 存在的理由。
+    ///
+    /// 与 `shutdown_and_wait_releases_the_port_before_returning` 合起来构成
+    /// 「不等 vs 等」的确定性对照：两者只差一个 `await`，端口状态却相反。
+    #[tokio::test]
+    async fn shutdown_without_waiting_leaves_the_socket_bound_for_a_moment() {
+        let handle = start(test_config(0)).await.expect("网关应能启动");
+        let port = handle.addr.port();
+
+        handle.shutdown(); // 只发信号，立即返回
+
+        // 中间没有 await：单线程运行时里服务任务还没被调度到，端口仍被占着
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "shutdown() 返回时端口还没释放——这正是 B-64 的竞态窗口"
+        );
+
+        // 给服务任务机会跑完：端口最终必须释放（既有行为不变）
+        let mut freed = false;
+        for _ in 0..100 {
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(freed, "shutdown() 之后端口 {port} 最终必须释放");
+    }
+
+    /// 幂等：服务已经停了（oneshot 接收端没了、任务已结束）时，
+    /// `shutdown_and_wait` 必须立即返回，不 panic、不挂。
+    #[tokio::test]
+    async fn shutdown_and_wait_on_an_already_stopped_server_returns() {
+        let (tx, rx) = oneshot::channel::<()>();
+        drop(rx); // 接收端已消失：send 会失败，若实现里 unwrap 就会炸
+        let finished = tokio::spawn(async {});
+        let handle = GatewayHandle {
+            addr: "127.0.0.1:0".parse().expect("地址可解析"),
+            token: "t".into(),
+            site_display_name: "已停的站点".into(),
+            shutdown: tx,
+            finished,
+        };
+        handle.shutdown_and_wait().await;
+    }
+
+    /// 退避预算：首次 + `BIND_RETRY_ATTEMPTS` 次尝试，耗尽后返回**最后一次**的
+    /// `AddrInUse` 错误，且实打实等满 `BIND_RETRY_ATTEMPTS × BIND_RETRY_DELAY`。
+    #[tokio::test]
+    async fn bind_retry_gives_up_after_the_budget_and_returns_the_last_error() {
+        let mut calls = 0u32;
+        let started = std::time::Instant::now();
+        let err = bind_listener_with(12345, |_port| {
+            calls += 1;
+            async move {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    "Address already in use（单测注入）",
+                ))
+            }
+        })
+        .await
+        .expect_err("一直 AddrInUse 时必须报错");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            calls,
+            1 + BIND_RETRY_ATTEMPTS,
+            "首次尝试 + {BIND_RETRY_ATTEMPTS} 次重试"
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(
+            elapsed >= BIND_RETRY_ATTEMPTS * BIND_RETRY_DELAY,
+            "必须等满退避窗口（{BIND_RETRY_ATTEMPTS}×{BIND_RETRY_DELAY:?}，实测 {elapsed:?}）"
+        );
+    }
+
+    /// 非 `AddrInUse`（这里是权限）：**一次**返回，不 sleep、不重试。
+    ///
+    /// 注入式闭包不会真的去绑 80 端口，所以这条测试与运行身份无关（root 下也成立）。
+    #[tokio::test]
+    async fn bind_retry_does_not_retry_a_non_addr_in_use_error() {
+        let mut calls = 0u32;
+        let started = std::time::Instant::now();
+        let err = bind_listener_with(80, |_port| {
+            calls += 1;
+            async move {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "权限不足（单测注入）",
+                ))
+            }
+        })
+        .await
+        .expect_err("非 AddrInUse 必须报错");
+        let elapsed = started.elapsed();
+
+        assert_eq!(calls, 1, "非 AddrInUse 不许重试");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            elapsed < BIND_RETRY_DELAY,
+            "非 AddrInUse 不许 sleep（实测 {elapsed:?}）"
+        );
+    }
+
+    /// 端口一释放就成功：失败两次 → 第三次拿到 listener，中间各退避一次。
+    #[tokio::test]
+    async fn bind_retry_succeeds_once_the_port_is_free() {
+        let mut calls = 0u32;
+        let started = std::time::Instant::now();
+        let listener = bind_listener_with(0, |port| {
+            calls += 1;
+            let attempt = calls;
+            async move {
+                if attempt < 3 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        "还没释放（单测注入）",
+                    ))
+                } else {
+                    tokio::net::TcpListener::bind(("127.0.0.1", port)).await
+                }
+            }
+        })
+        .await
+        .expect("第三次必须成功");
+        let elapsed = started.elapsed();
+
+        assert_eq!(calls, 3, "前两次失败、第三次成功");
+        assert!(listener.local_addr().expect("读到地址").ip().is_loopback());
+        assert!(
+            elapsed >= 2 * BIND_RETRY_DELAY,
+            "两次失败之间各退避一次（实测 {elapsed:?}）"
+        );
+    }
+
+    /// 文案：`AddrInUse` 要说清「端口 + 占用 + 实际端口号」并指出真实原因；
+    /// **非** `AddrInUse` 不许再出现「占用」——旧实现那句「（端口可能被占用）」正是
+    /// B-64 里误导用户的地方（旧实例其实已经停了）。
+    #[test]
+    fn bind_error_message_distinguishes_a_busy_port_from_other_failures() {
+        let busy = std::io::Error::new(std::io::ErrorKind::AddrInUse, "Address already in use");
+        let text = bind_error_message(8787, &busy);
+        assert!(text.contains("端口"), "{text}");
+        assert!(text.contains("占用"), "{text}");
+        assert!(text.contains("8787"), "必须带实际端口号: {text}");
+        assert!(
+            text.contains("上一次网关"),
+            "要指出真实原因（旧实例尚未释放），不能只说「可能被占用」: {text}"
+        );
+
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Permission denied");
+        let text = bind_error_message(80, &denied);
+        assert!(text.contains("80"), "非 AddrInUse 也要带端口号: {text}");
+        assert!(
+            !text.contains("占用"),
+            "非 AddrInUse 不许说「被占用」（B-64 的误导文案就是它）: {text}"
+        );
+    }
+
+    /// 类型级检查：命令层（M5-S5）要在 `#[tauri::command] async fn` 里 await 它，
+    /// 不是 `Send` 就编译不过。本测试不做任何运行期断言。
+    #[test]
+    fn shutdown_and_wait_future_is_send() {
+        fn require_send<T: Send>(_: T) {}
+        fn check(handle: GatewayHandle) {
+            require_send(handle.shutdown_and_wait());
+        }
+        let _ = check as fn(GatewayHandle);
     }
 }

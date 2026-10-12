@@ -236,6 +236,208 @@ pub fn fingerprint(secret: &str) -> String {
     hex::encode(digest)[..8].to_string()
 }
 
+/// 剥掉 URL 的 userinfo：`https://user:pass@relay.example.com/x` → `https://relay.example.com/x`。
+///
+/// 语义（M5-S0 章程 §4.3 冻结）：
+/// - 没有 `://` → **逐字节不变**（不猜、不补 scheme，含 `user:pass@host` 这种形态）；
+/// - 有 `://` 但 authority 段里没有 `@` → **逐字节不变**；
+/// - authority 段 = `://` 之后到第一个 `/` / `?` / `#` 之前，因此 query/fragment 里的 `@`
+///   不算 userinfo（`https://host/p?q=a@b` 原样返回）；
+/// - authority 里有多个 `@` 时删到**最后一个** `@`：`https://a@b:pw@host/` 若按第一个 `@` 切，
+///   留下的是 `b:pw@host/` —— 密码仍在串里。宁可多删。
+///
+/// 用途：站点 `base_url` 可能带内嵌凭证（B-63），导出物里不能原样带出去。
+pub fn strip_url_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + "://".len();
+    let rest = &url[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let Some(at) = authority.rfind('@') else {
+        return url.to_string();
+    };
+
+    let mut out = String::with_capacity(url.len());
+    out.push_str(&url[..authority_start]);
+    out.push_str(&authority[at + 1..]);
+    out.push_str(&rest[authority_end..]);
+    out
+}
+
+/// 钥匙串引用的段字符集：`kr/<scope>/<id>/<field>` 的 scope / id / field 只可能是这些字符。
+///
+/// **刻意收窄**：若把 `"` `,` `}` 也算进段，JSON 文本里的 `"kr/key/1/secret"` 会把结尾的
+/// 引号一起吃进匹配，替换后 JSON 结构就坏了（`{"ref":"kr/***,"x":1}` —— 第一版就是这么写的，
+/// 被 `scrub_reference_tokens_keeps_json_parseable` 抓出来的）。
+fn is_ref_segment_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
+}
+
+/// 掩掉钥匙串引用形态：`kr/<scope>/<id>/<field>` → `kr/***`（B-62 的「引用形态」那一半）。
+///
+/// 只认「`kr/` + 至少 3 段、每段非空且由 [`is_ref_segment_char`] 组成」的形态：
+/// - 段数不足（`kr/key/1`）或含空段（`kr//1/secret`）→ 原样保留：那不是合法引用
+///   （`vault::is_valid_secret_ref` 要求恰好 4 段），当普通文本处理更安全；
+/// - 段数多于 4（`kr/key/1/secret/extra`）→ 一并吃掉，不留半截引用；
+/// - 幂等：`kr/***` 里的 `*` 不是段字符，再跑一遍不变。
+///
+/// 代价（明确记录）：这是**文本级**替换，不校验引用合法性，因此 `xxkr/key/1/secret`
+/// 也会被掩成 `xxkr/***`。方向是「宁可多掩」。
+pub fn scrub_reference_tokens(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let looks_like_ref = chars[i] == 'k'
+            && i + 3 < chars.len()
+            && chars[i + 1] == 'r'
+            && chars[i + 2] == '/'
+            && is_ref_segment_char(chars[i + 3]);
+        if looks_like_ref {
+            let mut j = i + 3;
+            let mut segments = 0usize;
+            loop {
+                let segment_start = j;
+                while j < chars.len() && is_ref_segment_char(chars[j]) {
+                    j += 1;
+                }
+                if j == segment_start {
+                    break;
+                }
+                segments += 1;
+                // 只有「斜杠后面还跟着一个段」才继续吃，避免把结尾的 `/` 吃进匹配
+                if j < chars.len()
+                    && chars[j] == '/'
+                    && j + 1 < chars.len()
+                    && is_ref_segment_char(chars[j + 1])
+                {
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+            if segments >= 3 {
+                out.push_str("kr/");
+                out.push_str(MASK);
+                i = j;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
+/// 命中集合（章程 §4.3，**精确匹配**：键名先小写、再去掉 `_` 与 `-`）。
+///
+/// 清单**不得外扩**：章程把这份集合冻结了，悄悄加一个键名等于悄悄改宽契约。
+/// 已知未覆盖的复合键名（如 `session_token` → `sessiontoken`、`x_api_key` → `xapikey`）
+/// 记录在 M5-S1 spec §9，不在这里补。
+const SENSITIVE_KEYS: [&str; 16] = [
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "clientsecret",
+    "token",
+    "accesstoken",
+    "refreshtoken",
+    "apikey",
+    "authorization",
+    "cookie",
+    "setcookie",
+    "session",
+    "credential",
+    "credentials",
+    "privatekey",
+];
+
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|c| !matches!(*c, '_' | '-'))
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    SENSITIVE_KEYS.contains(&normalized.as_str())
+}
+
+/// 递归脱敏一个 JSON 值：对象按键名判命中，数组逐元素递归，字符串值过 [`scrub`]。
+fn scrub_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                let sensitive = is_sensitive_key(key);
+                match child {
+                    // 值是容器 → 递归进去（契约：不是整块打码）
+                    serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                        scrub_json_value(child);
+                    }
+                    // 命中键的标量值整体换成 MASK（含 null / 数字 / 布尔：不保留类型）
+                    _ if sensitive => *child = serde_json::Value::String(MASK.to_string()),
+                    serde_json::Value::String(text) => *text = scrub(text.as_str()),
+                    _ => {}
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                scrub_json_value(item);
+            }
+        }
+        serde_json::Value::String(text) => *text = scrub(text.as_str()),
+        _ => {}
+    }
+}
+
+/// 事件 payload 的结构化脱敏（M5-S0 章程 §4.3）。
+///
+/// - `None` → `None`；
+/// - JSON 解析成功 → 按键名脱敏（命中集合见 [`SENSITIVE_KEYS`]），未命中的字符串值仍过 [`scrub`]；
+/// - JSON 解析失败（含「payload 只是一段裸文本」）→ 退化为 [`scrub`] 整串；
+/// - 键顺序保持原样（本 crate 启用了 `serde_json` 的 `preserve_order`）。
+///
+/// 注意它**不**负责引用形态：`kr/<scope>/<id>/<field>` 由 [`scrub_reference_tokens`] 处理，
+/// 调用方两个都要串（见 `export::sanitize_bundle`）。
+pub fn scrub_payload(payload: Option<&str>) -> Option<String> {
+    let raw = payload?;
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Some(scrub(raw));
+    };
+    scrub_json_value(&mut value);
+    match serde_json::to_string(&value) {
+        Ok(text) => Some(text),
+        // 理论上不可达（`Value` 一定能序列化）。真出问题也绝不能返回原串。
+        Err(_) => Some(scrub(raw)),
+    }
+}
+
+/// **事件文本的统一出口**：`scrub` + 钥匙串引用脱敏。
+///
+/// 存在的理由（M5-S1 复审 P2-1）：配置导出（`export::sanitize_bundle`）与
+/// 诊断导出（`service::export_diagnostics`）原来是**各自手抄**同一串组合的。
+/// 手抄出来的「同源」只是注释承诺，实测已经分叉 —— 而且分叉方式很隐蔽：
+/// 配置侧在**装配处**先做了一次**文本级** `scrub`，一个 34 位数字会被
+/// 「≥32 位 hex」规则打成 `***`，于是 `{"remaining":123…}` 变成 `{"remaining":***}`
+/// ——**已经不是合法 JSON**；结构化的 `scrub_payload` 再拿到它只能走「解析失败」
+/// 的兜底分支，而诊断侧拿到的是原始串、能正常解析。同一份事件，两条出口输出不同。
+///
+/// 所以：**先结构化、再文本**，而且只有这一个实现。
+pub fn scrub_event_message(message: &str) -> String {
+    scrub_reference_tokens(&scrub(message))
+}
+
+/// **事件 payload 的统一出口**。见 [`scrub_event_message`] 的说明。
+///
+/// 幂等：第一遍产出的是 serde 重新序列化的**合法 JSON**，第二遍能正常解析。
+pub fn scrub_event_payload(payload: Option<&str>) -> Option<String> {
+    scrub_payload(payload).map(|text| scrub_reference_tokens(&text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +626,214 @@ mod tests {
         assert_eq!(a.len(), 8);
         assert!(!a.contains("sk-"));
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ---------- M5-S1：strip_url_userinfo ----------
+
+    #[test]
+    fn strip_url_userinfo_removes_embedded_credentials() {
+        assert_eq!(
+            strip_url_userinfo("https://user:pass@relay.example.com/v1"),
+            "https://relay.example.com/v1"
+        );
+        assert_eq!(
+            strip_url_userinfo("http://user:pass@relay.example.com:8080"),
+            "http://relay.example.com:8080"
+        );
+        assert_eq!(strip_url_userinfo("https://token@host"), "https://host");
+        assert_eq!(strip_url_userinfo("https://@host/"), "https://host/");
+    }
+
+    #[test]
+    fn strip_url_userinfo_leaves_clean_inputs_byte_identical() {
+        for clean in [
+            "https://relay.example.com",
+            "https://relay.example.com/v1/chat?x=1#frag",
+            "relay.example.com",
+            "",
+            // `@` 在 query / fragment 里，不是 userinfo
+            "https://host/p?q=a@b",
+            "https://host#a@b",
+            // 没有 `://` → 冻结语义要求逐字节不变
+            "user:pass@host",
+            "mailto:someone@example.com",
+        ] {
+            assert_eq!(strip_url_userinfo(clean), clean, "「{clean}」不该被改动");
+        }
+    }
+
+    #[test]
+    fn strip_url_userinfo_drops_up_to_the_last_at_of_the_authority() {
+        // 按第一个 `@` 切会留下 `b:pw@host/` —— 密码仍在串里
+        assert_eq!(strip_url_userinfo("https://a@b:pw@host/"), "https://host/");
+        assert_eq!(
+            strip_url_userinfo("https://u:p@w@relay.example.com"),
+            "https://relay.example.com"
+        );
+    }
+
+    #[test]
+    fn strip_url_userinfo_is_idempotent() {
+        let once = strip_url_userinfo("https://user:pass@relay.example.com/x");
+        assert_eq!(strip_url_userinfo(&once), once);
+    }
+
+    // ---------- M5-S1：scrub_reference_tokens ----------
+
+    #[test]
+    fn scrub_reference_tokens_masks_all_three_real_scopes() {
+        assert_eq!(
+            scrub_reference_tokens("secret_ref=kr/key/17/secret"),
+            "secret_ref=kr/***"
+        );
+        assert_eq!(scrub_reference_tokens("kr/site/3/password"), "kr/***");
+        assert_eq!(
+            scrub_reference_tokens("kr/account/5/session 已失效"),
+            "kr/*** 已失效"
+        );
+    }
+
+    #[test]
+    fn scrub_reference_tokens_keeps_json_parseable() {
+        // 第一版把段字符集放宽到「任何非 `/` 字符」，结果把 JSON 的结尾引号也吃掉了。
+        let text = r#"{"ref":"kr/key/1/secret","x":1}"#;
+        let scrubbed = scrub_reference_tokens(text);
+        assert_eq!(scrubbed, r#"{"ref":"kr/***","x":1}"#);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&scrubbed).expect("替换后必须仍是合法 JSON");
+        assert_eq!(parsed["x"], 1);
+    }
+
+    #[test]
+    fn scrub_reference_tokens_leaves_non_references_alone() {
+        for text in [
+            "",
+            "kr/",
+            "kr/key/1",     // 段数不足（合法引用恰好 4 段）
+            "kr//1/secret", // 空段
+            "kr/***",       // 已脱敏形态：必须幂等
+            "普通文本 kr 与 key",
+        ] {
+            assert_eq!(scrub_reference_tokens(text), text, "「{text}」不该被改动");
+        }
+    }
+
+    #[test]
+    fn scrub_reference_tokens_swallows_extra_segments_and_is_idempotent() {
+        assert_eq!(scrub_reference_tokens("kr/key/1/secret/extra"), "kr/***");
+        let once = scrub_reference_tokens("看 kr/key/1/secret 这条");
+        assert_eq!(once, "看 kr/*** 这条");
+        assert_eq!(scrub_reference_tokens(&once), once);
+    }
+
+    // ---------- M5-S1：scrub_payload ----------
+
+    #[test]
+    fn scrub_payload_masks_every_sensitive_key_name() {
+        // 16 个命中键名，含大小写与 `_` / `-` 变体（归一化后再精确匹配）
+        for key in [
+            "password",
+            "passwd",
+            "pwd",
+            "secret",
+            "clientSecret",
+            "token",
+            "access_token",
+            "refresh-token",
+            "apiKey",
+            "Authorization",
+            "Cookie",
+            "Set-Cookie",
+            "session",
+            "credential",
+            "credentials",
+            "privateKey",
+        ] {
+            let payload = format!(r#"{{"{key}":"hunter2"}}"#);
+            assert_eq!(
+                scrub_payload(Some(&payload)).unwrap(),
+                format!(r#"{{"{key}":"***"}}"#),
+                "键「{key}」应被掩"
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_payload_leaves_the_do_not_touch_keys_alone() {
+        // 章程 §4.3 的「不得命中」清单：9 个键必须逐字原样保留（连类型都不变）
+        let payload = r#"{"key_id":7,"keyId":"k-1","keys_total":3,"site_id":1,"remote_id":"9","remaining":1.5,"bytes":12,"path":"/tmp/x.json","idempotency_key":"abc"}"#;
+        assert_eq!(
+            scrub_payload(Some(payload)).unwrap(),
+            payload,
+            "「不得命中」清单被误伤了"
+        );
+    }
+
+    #[test]
+    fn scrub_payload_recurses_into_containers_and_scrubs_other_strings() {
+        // 命中键的值是对象 → 递归进去（不是整块打码）
+        assert_eq!(
+            scrub_payload(Some(r#"{"credential":{"password":"p","name":"n"}}"#)).unwrap(),
+            r#"{"credential":{"password":"***","name":"n"}}"#
+        );
+        // 数组 → 逐元素递归
+        assert_eq!(
+            scrub_payload(Some(r#"{"tokens":["sk-abcdefgh12345678","plain"]}"#)).unwrap(),
+            r#"{"tokens":["sk-***","plain"]}"#
+        );
+        // 未命中的字符串值仍过 scrub
+        assert_eq!(
+            scrub_payload(Some(r#"{"note":"sk-abcdefgh12345678"}"#)).unwrap(),
+            r#"{"note":"sk-***"}"#
+        );
+        // 嵌套结构里也要命中
+        assert_eq!(
+            scrub_payload(Some(r#"{"a":[{"token":"x"},{"keep":1}]}"#)).unwrap(),
+            r#"{"a":[{"token":"***"},{"keep":1}]}"#
+        );
+    }
+
+    #[test]
+    fn scrub_payload_replaces_scalars_of_sensitive_keys_regardless_of_type() {
+        assert_eq!(
+            scrub_payload(Some(r#"{"token":123}"#)).unwrap(),
+            r#"{"token":"***"}"#
+        );
+        assert_eq!(
+            scrub_payload(Some(r#"{"token":true}"#)).unwrap(),
+            r#"{"token":"***"}"#
+        );
+        assert_eq!(
+            scrub_payload(Some(r#"{"token":null}"#)).unwrap(),
+            r#"{"token":"***"}"#
+        );
+    }
+
+    #[test]
+    fn scrub_payload_falls_back_to_text_scrubbing_and_handles_none() {
+        assert_eq!(scrub_payload(None), None);
+        assert_eq!(
+            scrub_payload(Some("裸文本 sk-abcdefgh12345678")),
+            Some("裸文本 sk-***".to_string())
+        );
+        // 合法 JSON 但只是个标量：原样返回
+        assert_eq!(scrub_payload(Some("42")), Some("42".to_string()));
+    }
+
+    /// 把「已知未覆盖的复合键名」钉住（M5-S1 spec §9 风险 3）。
+    ///
+    /// 这条测试**断言的是漏报**，看起来像写反了 —— 它在给冻结契约的边界记账：
+    /// 哪天有人扩了 [`SENSITIVE_KEYS`]，这里会红，逼着他回来同步 spec 的清单，
+    /// 而不是让覆盖范围悄悄变宽（章程 §10 明确要查「签名有没有被悄悄改宽」）。
+    #[test]
+    fn scrub_payload_gap_list_is_pinned() {
+        for key in ["session_token", "x_api_key", "client_id"] {
+            let payload = format!(r#"{{"{key}":"hunter2"}}"#);
+            assert_eq!(
+                scrub_payload(Some(&payload)).unwrap(),
+                payload,
+                "「{key}」不在章程 §4.3 的命中集合里，当前不该被掩（已知代价）"
+            );
+        }
     }
 }

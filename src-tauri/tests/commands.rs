@@ -530,3 +530,192 @@ fn prune_backups_reports_zero_when_there_is_nothing_to_prune() {
         invoke_impl("prune_backups", json!({"args": {"keep": 5}})).expect("prune_backups 应成功");
     assert_eq!(value["removed"], 0);
 }
+
+// ============================================ M5-S5：会话失效可见性 + 网关启停串行化
+
+#[test]
+fn refresh_all_reports_sites_that_need_a_login() {
+    use tauri::Manager;
+
+    let (_app, webview) = build_app();
+    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let store = state.service.store();
+
+    let site = store
+        .upsert_site("newapi", "https://relay.example.com", "需要重登的站")
+        .expect("写站点");
+    // 造出「上一轮已经失效」的持久形态：无会话 + health=needs_login。
+    // 这正是 B-61 里会被静默跳过的组合——既不算成功也不算失败，
+    // 于是用户在汇总里永远看不到「这个站需要重新登录」。
+    store
+        .set_site_health(site, "needs_login")
+        .expect("落库会话状态");
+
+    let value = invoke_on(&webview, "refresh_all", json!({})).expect("refresh_all 应成功");
+
+    assert_eq!(value["sitesTotal"], 1);
+    assert_eq!(value["sitesOk"], 0);
+    assert_eq!(value["sitesFailed"], 0, "被跳过的站点不算失败");
+    assert_eq!(
+        value["needsLogin"],
+        json!([site]),
+        "会话失效的站点必须出现在 needsLogin 里: {value}"
+    );
+}
+
+#[test]
+fn gateway_stop_then_start_on_the_same_port_succeeds() {
+    use tauri::Manager;
+
+    let (_app, webview) = build_app();
+    // 拿一个空闲端口：绑 0 再放掉。窗口期内被抢的概率极低，
+    // 而且真被抢了会明确报「端口被占用」，不会假绿。
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("探端口");
+        probe.local_addr().expect("读端口").port()
+    };
+
+    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let site = state
+        .service
+        .store()
+        .upsert_site("newapi", "https://relay.example.com", "网关测试站")
+        .expect("写站点");
+    let key_id = state
+        .service
+        .store_key_material(
+            site,
+            "codex/daily",
+            Some("12"),
+            "sk-gateway-0123456789abcdef",
+        )
+        .expect("写密钥")
+        .id;
+
+    invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": {
+            "refreshIntervalSecs": 0,
+            "balanceAlertThreshold": 0.0,
+            "driftCheckOnStart": true,
+            "gatewayEnabled": true,
+            "gatewayPort": port
+        }}}),
+    )
+    .expect("打开网关总开关");
+
+    let args = json!({"args": {"siteId": site, "keyId": key_id}});
+    let first = invoke_on(&webview, "gateway_start", args.clone()).expect("第一次启动");
+    assert_eq!(first["running"], true, "{first}");
+    assert_eq!(first["url"], format!("http://127.0.0.1:{port}"));
+
+    let stopped = invoke_on(&webview, "gateway_stop", json!({})).expect("停止");
+    assert_eq!(stopped["running"], false);
+
+    // 关键断言：停完**立刻**用同一个端口再起。
+    // 命令层若不等待端口真正释放（只发 shutdown 信号），这里会撞上还没释放的
+    // 监听套接字并报「端口可能被占用」——就是 B-64 的现象。
+    let second =
+        invoke_on(&webview, "gateway_start", args).expect("停完立刻用同一端口重启必须成功");
+    assert_eq!(second["running"], true, "{second}");
+    assert_eq!(second["url"], format!("http://127.0.0.1:{port}"));
+
+    invoke_on(&webview, "gateway_stop", json!({})).expect("收尾停止");
+}
+
+#[test]
+fn gateway_stop_is_bounded_even_with_an_in_flight_request() {
+    // 处置 M5-S4 复审 P2-1：`shutdown_and_wait()` 没有上界 ——
+    // 上游卡住且仍有客户端在等时，它要等在途连接收尾才返回，而命令层
+    // 正握着 `gateway_op` 操作锁，会把后续 start/stop 一起挂死。
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+    use tauri::Manager;
+
+    // 上游：接受连接、读掉请求、**永不响应**（让网关侧的请求一直"在途"）
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("绑上游");
+    let upstream_addr = upstream.local_addr().expect("上游地址");
+    std::thread::spawn(move || {
+        for stream in upstream.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            // 不写响应、不关连接
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    });
+
+    let (_app, webview) = build_app();
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("探端口");
+        probe.local_addr().expect("读端口").port()
+    };
+
+    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let site = state
+        .service
+        .store()
+        .upsert_site("newapi", &format!("http://{upstream_addr}"), "慢上游")
+        .expect("写站点");
+    let key_id = state
+        .service
+        .store_key_material(site, "codex/daily", Some("12"), "sk-slow-0123456789abcdef")
+        .expect("写密钥")
+        .id;
+
+    invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": {
+            "refreshIntervalSecs": 0,
+            "balanceAlertThreshold": 0.0,
+            "driftCheckOnStart": true,
+            "gatewayEnabled": true,
+            "gatewayPort": port
+        }}}),
+    )
+    .expect("打开网关总开关");
+
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    let token = started["token"].as_str().expect("令牌").to_string();
+
+    // 打一个会一直"在途"的请求：不读响应，3 秒后主动断开。
+    // 客户端在 3 秒断开，是为了让**去掉上界**的变异体也能结束（只是会晚到 ~3s），
+    // 而不是把整个测试套件挂死。
+    let mut client = TcpStream::connect(("127.0.0.1", port)).expect("连网关");
+    let request = format!(
+        "GET /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Authorization: Bearer {token}\r\n\r\n"
+    );
+    client.write_all(request.as_bytes()).expect("发请求");
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(3));
+        drop(client);
+    });
+
+    // 给网关一点时间把请求转出去
+    std::thread::sleep(Duration::from_millis(300));
+
+    let t0 = Instant::now();
+    let stopped = invoke_on(&webview, "gateway_stop", json!({})).expect("停止");
+    let elapsed = t0.elapsed();
+
+    assert_eq!(stopped["running"], false);
+    // 前提：在途请求**确实**拖住了 shutdown —— 否则下面那条断言是空跑
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "在途请求没有拖住 shutdown，这条测试失去意义: {elapsed:?}"
+    );
+    // 结论：上界生效。不设上界时这里要等到客户端 3 秒后断开（≈3s）
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "shutdown 没有被上界截住: {elapsed:?}"
+    );
+}

@@ -14,6 +14,10 @@ export type SiteRow = {
   kind: string;
   baseUrl: string;
   displayName: string;
+  /**
+   * 站点健康状态，服务层自动维护，界面只读。
+   * `"unknown"`（从没登录过）| `"ok"`（登录过且会话有效）| `"needs_login"`（会话已失效，需要重新登录）
+   */
   health: string;
 };
 
@@ -154,6 +158,13 @@ export type RefreshSummary = {
   sitesFailed: number;
   keysTotal: number;
   balanceAlerts: number[];
+  /**
+   * 需要重新登录的站点 id（升序去重）。
+   *
+   * 当轮认证失败的站点**同时**出现在 `sitesFailed` 与这里；
+   * 上一轮就已失效、本轮被跳过的站点**只在这里**——那正是这个字段存在的理由。
+   */
+  needsLogin: number[];
 };
 
 export type AuditFinding = {
@@ -183,6 +194,11 @@ export type ExportResult = {
   path: string;
   encrypted: boolean;
   bytes: number;
+  /**
+   * 是否登记进「已知导出物」表（审计据此扫描用户自选路径）。
+   * `false` = 文件写成了，但**审计看不到它** —— 界面必须说出来。
+   */
+  registered: boolean;
 };
 
 export type PruneResult = { removed: number };
@@ -459,6 +475,7 @@ export async function exportBundle(
       path: "/Users/you/.keyrelay/exports/keyrelay-export-mock.json",
       encrypted: Boolean(password),
       bytes: 2048,
+      registered: true,
     });
   }
   return invokeCommand<ExportResult>("export_bundle", {
@@ -527,6 +544,7 @@ export async function refreshAll(): Promise<RefreshSummary> {
       sitesFailed: 0,
       keysTotal: 1,
       balanceAlerts: [],
+      needsLogin: [],
     });
   }
   return invokeCommand<RefreshSummary>("refresh_all");

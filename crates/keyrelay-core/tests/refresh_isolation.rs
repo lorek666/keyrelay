@@ -9,7 +9,11 @@
 //! 本文件把复审探针 P7 / P7b 的场景钉成正式用例，覆盖三件事：
 //! 1. 中间站点的传输层失败**不得**中断整轮（后面两个站点照常刷新）；
 //! 2. 失败事件的原因分类正确，且只记一次；
-//! 3. 认证失败会清掉会话缓存，下一轮该站点按「未登录」静默跳过。
+//! 3. 认证失败会清掉会话缓存，下一轮该站点不再被请求——但**不再静默消失**：
+//!    它会进 `needs_login`（M5-S2 / B-61），既不算成功也不算失败。
+//!
+//! 第 3 条的「下一轮不再请求、不算成功也不算失败」自 M3-S1 起就没变过；
+//! M5-S2 加的是**可见性**（那条状态会落库并出现在每轮汇总里），断言见文末。
 
 use keyrelay_core::error::Error;
 use keyrelay_core::service::{KeyRelayService, ServiceConfig};
@@ -145,6 +149,11 @@ async fn a_failing_site_in_the_middle_does_not_abort_the_others() {
     assert_eq!(summary.sites_failed, 1);
     assert_eq!(summary.keys_total, 0);
     assert_eq!(summary.balance_alerts, vec![a], "只有甲的余额低于阈值");
+    assert_eq!(
+        summary.needs_login,
+        Vec::<i64>::new(),
+        "乙是传输层失败（会话没死），不该被要求重新登录"
+    );
 
     // 隔离的**直接**证据：乙失败之后，丙的两个请求照样发出去了
     assert_eq!(
@@ -210,6 +219,11 @@ async fn an_auth_failure_is_classified_and_invalidates_the_session() {
         (2, 1, 1)
     );
     assert_eq!(
+        first.needs_login,
+        vec![a],
+        "认证失败当轮就该被标成「需要重新登录」（B-61）"
+    );
+    assert_eq!(
         messages_containing(&service, "刷新站点失败"),
         vec!["刷新站点失败: 认证失败"],
         "401 必须分类成认证失败，而不是网络/协议错误"
@@ -217,7 +231,7 @@ async fn an_auth_failure_is_classified_and_invalidates_the_session() {
 
     let requests_after_round_one = mock.request_count();
 
-    // 第二轮：甲已无会话 → 静默跳过（不算失败，也不再打站点）
+    // 第二轮：甲已无会话 → 不发请求、不算失败，但**仍要看得见**（这正是原先静默消失的那条）
     mock.push(balance_ok(2_000_000));
     mock.push(keys_ok());
 
@@ -226,6 +240,16 @@ async fn an_auth_failure_is_classified_and_invalidates_the_session() {
         (second.sites_total, second.sites_ok, second.sites_failed),
         (2, 1, 0),
         "会话被清掉的站点在下一轮按「未登录」跳过，不该继续算失败"
+    );
+    assert_eq!(
+        second.needs_login,
+        vec![a],
+        "第二轮仍要带出「甲需要重新登录」，否则用户永远看不到这条（B-61）"
+    );
+    assert_eq!(
+        service.store().get_site(a).unwrap().unwrap().health,
+        "needs_login",
+        "状态必须落库，而不是只活在内存里"
     );
     assert_eq!(
         messages_containing(&service, "刷新站点失败").len(),

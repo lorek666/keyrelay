@@ -94,6 +94,42 @@ fn mask_proxy(raw: &str) -> String {
     format!("{scheme}://{host}")
 }
 
+/// authority 之后的部分（path/query/fragment）。没有 `://` 时返回 `""`。
+fn proxy_tail(raw: &str) -> &str {
+    let Some((_, rest)) = raw.split_once("://") else {
+        return "";
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    &rest[end..]
+}
+
+/// 非法后缀的**形态描述**：只报种类与字符数，**绝不回显内容**。
+///
+/// `http://u:p@host/x?token=SECRET` 里的 path / query 同样是秘密——
+/// 复核 N-1 已经把 `mask_proxy` 改成剥掉它们，这里不能再把正文放回错误串。
+fn describe_illegal_proxy_tail(tail: &str) -> String {
+    let (path, after_path) = match tail.find(['?', '#']) {
+        Some(index) => (&tail[..index], &tail[index..]),
+        None => (tail, ""),
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    if !path.is_empty() && path != "/" {
+        parts.push(format!("path(长度 {})", path.chars().count()));
+    }
+    if after_path.starts_with('?') {
+        parts.push("query".to_string());
+    }
+    if after_path.contains('#') {
+        parts.push("fragment".to_string());
+    }
+    if parts.is_empty() {
+        // 调用方只对非空、非 "/" 的后缀调用本函数；保底文案避免产出空括号。
+        parts.push("非空后缀".to_string());
+    }
+    parts.join(" / ")
+}
+
 impl ReqwestTransport {
     pub fn new(config: TransportConfig) -> Result<Self> {
         let mut headers = HeaderMap::new();
@@ -131,6 +167,21 @@ impl ReqwestTransport {
                     "代理配置无效（{}）：scheme 必须是 {} 之一，拒绝静默直连",
                     mask_proxy(proxy_url),
                     ALLOWED.join(" / ")
+                )));
+            }
+
+            // BACKLOG B-42：`Proxy::all` 会接受 `socks5://127.0.0.1:1080/pac?query`，
+            // 而 reqwest 实际只用 scheme/host/port —— 用户以为配了 PAC 路径，实际是
+            // 普通代理，与模块文档「配置非法时构造即失败，绝不静默直连」不符。
+            // 这里要求 authority 之后为空（允许单个尾斜杠这种等价写法）。
+            let tail = proxy_tail(proxy_url);
+            if !matches!(tail, "" | "/") {
+                return Err(Error::Transport(format!(
+                    "代理配置无效（{}）：代理地址只能是 scheme://host[:port]（可带 userinfo），\
+                     检测到非法片段（{}，共 {} 个字符），拒绝静默直连",
+                    mask_proxy(proxy_url),
+                    describe_illegal_proxy_tail(tail),
+                    tail.chars().count()
                 )));
             }
 
@@ -335,6 +386,95 @@ mod tests {
             };
             assert!(ReqwestTransport::new(config).is_ok(), "{good} 应被接受");
         }
+    }
+
+    #[test]
+    fn proxy_with_path_query_or_fragment_is_rejected() {
+        // BACKLOG B-42：`Proxy::all` 会接受这些串，但 reqwest 只用 scheme/host/port，
+        // 用户配的 path/query 被静默丢弃 → 与「配置非法时构造即失败」不符。
+        for bad in [
+            "socks5://127.0.0.1:1080/pac",
+            "http://127.0.0.1:7897/pac?token=SECRET-VALUE",
+            "http://127.0.0.1:7897#frag",
+            "socks5://alice:pw@127.0.0.1:1080/pac?token=SECRET-VALUE#f",
+        ] {
+            let config = TransportConfig {
+                proxy: Some(bad.to_string()),
+                ..TransportConfig::default()
+            };
+            let err = ReqwestTransport::new(config)
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} 应被拒绝"));
+            assert!(matches!(err, Error::Transport(_)), "{bad:?} → {err:?}");
+            let message = err.to_string();
+            assert!(message.contains("代理"), "{bad:?} → {message}");
+            assert!(message.contains("非法片段"), "{bad:?} → {message}");
+            // path/query 正文（可能含凭据）不得回显
+            assert!(!message.contains("SECRET-VALUE"), "{message}");
+            assert!(!message.contains("pac"), "{message}");
+        }
+    }
+
+    #[test]
+    fn proxy_authority_only_forms_are_accepted() {
+        // 反例保护：正常形态不得被新校验拦死。
+        // `scheme://host:port/` 是绝对 URL 的规范写法，path 实际为空，reqwest 处理一致。
+        for good in [
+            "http://127.0.0.1:7897",
+            "http://127.0.0.1:7897/",
+            "https://proxy.example.com:8443",
+            "socks5://127.0.0.1:1080",
+            "socks5h://user:pw@127.0.0.1:1080",
+        ] {
+            let config = TransportConfig {
+                proxy: Some(good.to_string()),
+                ..TransportConfig::default()
+            };
+            assert!(ReqwestTransport::new(config).is_ok(), "{good} 应被接受");
+        }
+    }
+
+    #[test]
+    fn illegal_proxy_tail_never_echoes_secrets() {
+        // 复核 N-1 的延伸：错误串里连 path/query 正文都不能出现
+        let config = TransportConfig {
+            proxy: Some(
+                "http://alice:s3cr3t-token@127.0.0.1:7897/x?token=s3cr3t-token#f".to_string(),
+            ),
+            ..TransportConfig::default()
+        };
+        let err = ReqwestTransport::new(config).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("非法片段"), "{message}");
+        assert!(
+            message.contains("127.0.0.1:7897"),
+            "应保留可诊断的主机: {message}"
+        );
+        assert!(!message.contains("s3cr3t-token"), "泄漏了凭据: {message}");
+        assert!(!message.contains("alice"), "泄漏了用户名: {message}");
+    }
+
+    #[test]
+    fn describe_illegal_proxy_tail_names_the_parts() {
+        let path_only = describe_illegal_proxy_tail("/pac");
+        assert!(path_only.contains("path"), "{path_only}");
+        assert!(path_only.contains('4'), "{path_only}");
+
+        let query_only = describe_illegal_proxy_tail("?token=x");
+        assert_eq!(query_only, "query", "{query_only}");
+
+        let all = describe_illegal_proxy_tail("/x?y#z");
+        assert!(all.contains("path"), "{all}");
+        assert!(all.contains("query"), "{all}");
+        assert!(all.contains("fragment"), "{all}");
+
+        // 调用方不会对 "/" 调用本函数，但保底文案不能是空串
+        assert!(!describe_illegal_proxy_tail("/").is_empty());
+
+        assert_eq!(proxy_tail("http://127.0.0.1:7897"), "");
+        assert_eq!(proxy_tail("http://127.0.0.1:7897/"), "/");
+        assert_eq!(proxy_tail("http://u:p@h:1/x?y#z"), "/x?y#z");
+        assert_eq!(proxy_tail("没有 scheme"), "");
     }
 
     #[test]
