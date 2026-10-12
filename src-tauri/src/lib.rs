@@ -141,7 +141,8 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::list_consents,
             commands::apply_delivery,
             commands::rollback_delivery,
-            commands::recent_events
+            commands::recent_events,
+            commands::list_stored_keys
         ])
 }
 

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-stored-keys"
+description = "Enables the list_stored_keys command without any pre-configured scope."
+commands.allow = ["list_stored_keys"]
+
+[[permission]]
+identifier = "deny-list-stored-keys"
+description = "Denies the list_stored_keys command without any pre-configured scope."
+commands.deny = ["list_stored_keys"]

@@ -18,18 +18,29 @@ fn in_process_registry() -> &'static Mutex<HashSet<PathBuf>> {
     REGISTRY.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// 把目标路径归一成稳定 key：相对路径按当前工作目录补全，其余原样。
+/// 把目标路径归一成稳定 key。
 ///
-/// **刻意不做 `canonicalize`**：目标文件常常还不存在（`canonicalize` 会失败），
-/// 而且按是否存在切换算法会让同一个文件在不同时刻算出不同 key。
-/// 调用方负责传入规范化后的绝对路径（本产品的调用方一律由 `home_dir()` 拼出）。
-fn normalize(target: &Path) -> PathBuf {
-    if target.is_absolute() {
-        return target.to_path_buf();
-    }
-    match std::env::current_dir() {
-        Ok(cwd) => cwd.join(target),
-        Err(_) => target.to_path_buf(),
+/// 先补全为绝对路径，再**解析父目录的符号链接**（父目录一定存在，`canonicalize` 可用），
+/// 最后拼回文件名。这样 `/tmp/link-to-dir/auth.json` 与 `/tmp/real-dir/auth.json`
+/// 会算出同一个锁，堵住「用软链别名绕过互斥」的路子（M1-S2 复审 P2）。
+///
+/// 不直接 `canonicalize(target)`：目标文件本身常常还不存在。
+pub(crate) fn normalize_target(target: &Path) -> PathBuf {
+    let absolute = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(target),
+            Err(_) => target.to_path_buf(),
+        }
+    };
+
+    match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => match parent.canonicalize() {
+            Ok(real_parent) => real_parent.join(name),
+            Err(_) => absolute,
+        },
+        _ => absolute,
     }
 }
 
@@ -44,13 +55,13 @@ impl FileLock {
     ///
     /// 用哈希而不是文件名，避免把用户目录结构暴露在锁目录里，也避免路径里的分隔符出问题。
     pub fn lock_path(target: &Path, lock_dir: &Path) -> PathBuf {
-        let digest = super::sha256_hex(normalize(target).to_string_lossy().as_bytes());
+        let digest = super::sha256_hex(normalize_target(target).to_string_lossy().as_bytes());
         lock_dir.join(format!("{}.lock", &digest[..16]))
     }
 
     /// 非阻塞获取。已被其它线程/进程占用 → [`Error::FileBusy`]。
     pub fn acquire(target: &Path, lock_dir: &Path) -> Result<Self> {
-        let target = normalize(target);
+        let target = normalize_target(target);
 
         // 第一道：进程内登记
         {
@@ -134,6 +145,15 @@ impl Drop for FileLock {
 mod tests {
     use super::*;
 
+    /// 测试里复现 `normalize` 的语义（父目录解析符号链接 + 拼回文件名）。
+    fn normalized(target: &Path) -> PathBuf {
+        let parent = target.parent().expect("有父目录");
+        parent
+            .canonicalize()
+            .expect("父目录存在")
+            .join(target.file_name().expect("有文件名"))
+    }
+
     #[test]
     fn second_acquire_in_same_process_is_busy() {
         let dir = tempfile::tempdir().unwrap();
@@ -146,9 +166,10 @@ mod tests {
         assert!(matches!(err, Error::FileBusy(_)), "{err:?}");
 
         drop(first);
-        // 释放后可再次获取
+        // 释放后可再次获取。`target()` 返回的是**归一化后**的路径
+        // （父目录已解析符号链接），因此与原始 `target` 比较时要按同一规则算。
         let again = FileLock::acquire(&target, &lock_dir).unwrap();
-        assert_eq!(again.target(), target);
+        assert_eq!(again.target(), normalized(&target));
     }
 
     #[test]
@@ -199,6 +220,6 @@ mod tests {
         let _lock = FileLock::acquire(&target, &lock_dir).unwrap();
 
         let written = fs::read_to_string(FileLock::lock_path(&target, &lock_dir)).unwrap();
-        assert_eq!(written, target.to_string_lossy());
+        assert_eq!(written, normalized(&target).to_string_lossy());
     }
 }

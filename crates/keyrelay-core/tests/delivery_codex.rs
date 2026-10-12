@@ -68,7 +68,9 @@ fn setup() -> Fixture {
     let home = dir.path().join("home");
     fs::create_dir_all(&home).expect("home");
 
-    let db_path = dir.path().join("keyrelay.db");
+    let db_dir = dir.path().join("db");
+    fs::create_dir_all(&db_dir).expect("db dir");
+    let db_path = db_dir.join("keyrelay.db");
     let store = Store::open(&db_path).expect("文件库");
     let site_id = store
         .upsert_site("newapi", "https://relay.example.com", "测试站")
@@ -468,4 +470,83 @@ fn full_flow_leaves_no_secret_on_disk_or_in_logs() {
 
     // ⑤ 目标文件里**必须**有密钥（这是投递的目的）
     assert!(fs::read_to_string(&f.target).unwrap().contains(SECRET));
+}
+
+// ================================================================ M1-S2 复审 P1 回归
+
+#[test]
+fn consent_check_precedes_lock_acquisition() {
+    // 复审 P1-2 相关：没同意时必须报 ConsentRequired，而**不是** FileBusy——
+    // 证明同意检查发生在取锁之前（否则用户会看到一个与真实原因无关的错误）。
+    let f = setup();
+    let lock_dir = keyrelay_core::inject::default_lock_dir();
+    let _held =
+        keyrelay_core::inject::lock::FileLock::acquire(&f.target, &lock_dir).expect("手工占锁");
+
+    let err = f
+        .service
+        .apply_delivery(f.key_id, DeliveryChannel::CodexAuthJson)
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::ConsentRequired { .. }),
+        "无同意时应先报 ConsentRequired，实际: {err:?}"
+    );
+    assert!(!f.target.exists());
+}
+
+#[test]
+fn accounting_failure_rolls_the_file_back() {
+    // 复审 P1-4：文件写成功但记账失败时，用户拿不到 journal_id 就永远回滚不了。
+    // 制造方式：直接 DROP 掉 journals 表，让 `record_journal` 必然失败。
+    let f = setup();
+    f.service
+        .grant_consent(f.key_id, DeliveryChannel::CodexAuthJson)
+        .unwrap();
+
+    // 先正常投递一次，确认路径是通的，并留下一个「投递前」的内容
+    f.service
+        .apply_delivery(f.key_id, DeliveryChannel::CodexAuthJson)
+        .unwrap();
+    let before = fs::read_to_string(&f.target).unwrap();
+
+    // 换一把密钥，保证这一次投递**真的会改动文件内容**——
+    // 否则「内容没变」可能只是因为两次写入的内容本来就一样（空断言）。
+    f.vault
+        .put(&secret_ref("key", 1, "secret"), "sk-rotated-999999999999")
+        .unwrap();
+
+    let conn = rusqlite::Connection::open(&f.db_path).expect("直连库");
+    conn.execute_batch("DROP TABLE journals;").expect("删表");
+
+    let err = f
+        .service
+        .apply_delivery(f.key_id, DeliveryChannel::CodexAuthJson)
+        .unwrap_err();
+    assert!(matches!(err, Error::Store(_)), "{err:?}");
+    assert_eq!(
+        fs::read_to_string(&f.target).unwrap(),
+        before,
+        "记账失败必须自动回滚：文件内容要回到投递前的样子"
+    );
+}
+
+#[test]
+fn apply_uses_a_lock_dir_independent_of_backup_dir() {
+    // 复审 P1-3：换个 backup_dir 不得换锁文件。这里用服务层验证：
+    // 手工按 `default_lock_dir()` 占锁后，投递必须报 FileBusy 而不是照写。
+    let f = setup();
+    f.service
+        .grant_consent(f.key_id, DeliveryChannel::CodexAuthJson)
+        .unwrap();
+
+    let lock_dir = keyrelay_core::inject::default_lock_dir();
+    let _held =
+        keyrelay_core::inject::lock::FileLock::acquire(&f.target, &lock_dir).expect("手工占锁");
+
+    let err = f
+        .service
+        .apply_delivery(f.key_id, DeliveryChannel::CodexAuthJson)
+        .unwrap_err();
+    assert!(matches!(err, Error::FileBusy(_)), "{err:?}");
+    assert!(!f.target.exists(), "被锁住时不得写入");
 }
