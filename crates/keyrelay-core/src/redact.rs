@@ -76,6 +76,132 @@ pub fn contains_secret(input: &str) -> bool {
     scrub(input) != input
 }
 
+/// 与 [`contains_secret`] 相同，但**忽略恰好 64 位的十六进制串**。
+///
+/// 给「扫自己落盘产物」的审计用（`audit.rs`）。理由：本产品自己的数据库里
+/// 合法地存着 **sha256 十六进制哈希**（`journals` 表的 `before_sha256` / `after_sha256`），
+/// 它们恰好是 64 位 hex，会被 [`contains_secret`] 的「≥32 位 hex」规则误报。
+/// 审计若天天报假警，就等于没有审计。
+///
+/// **代价（明确记录）**：一条恰好 64 位的十六进制凭证不会被审计发现。
+/// 本产品支持的两类中转站（NewAPI / Sub2API）签发的密钥都是 `sk-` 前缀，
+/// 不是裸 hex，因此这个代价可接受。事件表那条守护仍然用严格的
+/// [`contains_secret`]（那里不该出现哈希）。
+pub fn contains_secret_outside_hashes(input: &str) -> bool {
+    scrub_ignoring_sha256(input) != input
+}
+
+/// 只按**前缀型规则**（`sk-` / `nap-` / `Bearer `）判断，忽略「≥32 位 hex」那条。
+///
+/// 给**二进制**产物用（数据库 / WAL / SHM）。理由：在字节层面无法区分
+/// 「一个 64 位 sha256 哈希」与「哈希后面紧跟一个恰好也是 hex 的字节」——
+/// 后者会拼成 65/66 位的 run，任何基于长度的规则都会误报
+/// （M4-S1 实测：`journals.after_sha256` 紧邻下一列的 serial-type 字节，run 变成 65/66）。
+///
+/// **代价**：一条裸 hex 的凭证写在二进制文件里不会被发现。
+/// 本产品支持的两类中转站（NewAPI / Sub2API）签发的密钥都是 `sk-` 前缀，
+/// 因此这个代价可接受；**文本**产物（备份、导出）仍然用完整的
+/// [`contains_secret_outside_hashes`]。
+pub fn contains_secret_prefix_only(input: &str) -> bool {
+    scrub_prefixes_only(input) != input
+}
+
+fn scrub_prefixes_only(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let mut matched = false;
+        for p in PREFIXES {
+            let plen = p.chars().count();
+            if i + plen <= chars.len() {
+                let candidate: String = chars[i..i + plen].iter().collect();
+                if candidate.eq_ignore_ascii_case(p) {
+                    let mut j = i + plen;
+                    while j < chars.len() && is_token_char(chars[j]) {
+                        j += 1;
+                    }
+                    if j - (i + plen) >= 8 {
+                        out.push_str(p);
+                        out.push_str(MASK);
+                        i = j;
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if matched {
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// 与 [`scrub`] 同样的规则，唯一的区别是**恰好 64 位 hex 的片段原样保留**。
+///
+/// 刻意写成独立的一遍扫描，而不是「先把 64 位 hex 保护起来、最后再调 `scrub`」——
+/// 那样最后的 `scrub` 会把刚保护好的哈希又按「≥32 位 hex」规则掩掉
+/// （第一版就是这么写的，被 `tests/audit.rs` 的 WAL 扫描抓出来了）。
+fn scrub_ignoring_sha256(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        // 1) 前缀型凭证（sk- / nap- / Bearer），规则与 `scrub` 完全一致
+        let mut matched_prefix = false;
+        for p in PREFIXES {
+            let plen = p.chars().count();
+            if i + plen <= chars.len() {
+                let candidate: String = chars[i..i + plen].iter().collect();
+                if candidate.eq_ignore_ascii_case(p) {
+                    let mut j = i + plen;
+                    while j < chars.len() && is_token_char(chars[j]) {
+                        j += 1;
+                    }
+                    if j - (i + plen) >= 8 {
+                        out.push_str(p);
+                        out.push_str(MASK);
+                        i = j;
+                        matched_prefix = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if matched_prefix {
+            continue;
+        }
+
+        // 2) 十六进制串：64 位视为哈希（保留），32..63 位视为疑似凭证（掩掉）
+        if chars[i].is_ascii_hexdigit() {
+            let mut j = i;
+            while j < chars.len() && chars[j].is_ascii_hexdigit() {
+                j += 1;
+            }
+            let run_len = j - i;
+            if run_len == 64 {
+                out.extend(&chars[i..j]);
+            } else if run_len >= 32 {
+                out.push_str(MASK);
+            } else {
+                out.extend(&chars[i..j]);
+            }
+            i = j;
+            continue;
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
 /// 展示用掩码：只保留末 4 个字符，前缀一律用 `…` 代替。
 ///
 /// 按 `char` 截取（不按 byte），因此不会切断多字节字符。
@@ -172,6 +298,70 @@ mod tests {
         // 4 字节 emoji 也必须整字符截取：8 个 emoji → 保留末 4 个
         assert_eq!(mask_secret("😀😀😀😀😀😀😀😀"), "…😀😀😀😀");
         assert_eq!(mask_secret("abcdefghij😀😀"), "…ij😀😀");
+    }
+
+    #[test]
+    fn sha256_length_hex_is_ignored_only_by_the_audit_variant() {
+        // 64 位 hex 是 sha256 的形态，本产品自己的 journals 表里合法存在
+        let hash = "a".repeat(64);
+        assert!(
+            contains_secret(&hash),
+            "严格判定仍然把 64 位 hex 当成疑似凭证（事件表守护用）"
+        );
+        assert!(
+            !contains_secret_outside_hashes(&hash),
+            "审计变体必须放过 64 位 hex，否则数据库里的哈希会天天误报"
+        );
+    }
+
+    #[test]
+    fn audit_variant_preserves_a_hash_even_next_to_other_text() {
+        // 第一版把「保护 64 位 hex」与「最后再 scrub 一遍」拼在一起，
+        // 结果最后的 scrub 又把哈希掩掉了。这条测试钉住「哈希必须原样保留」。
+        let hash = "0162a23f41168cb4ca6083c8aac019a5a07ad7a8b1c2d3e4f5061728394a5b6c";
+        assert_eq!(hash.len(), 64);
+        let line = format!("/home/me/.codex/auth.json{hash}");
+        assert_eq!(
+            scrub_ignoring_sha256(&line),
+            line,
+            "64 位哈希必须原样保留（哪怕是紧跟在文件路径后面）"
+        );
+        assert!(!contains_secret_outside_hashes(&line));
+    }
+
+    #[test]
+    fn prefix_only_variant_ignores_hashes_entirely() {
+        // 二进制产物里哈希与相邻字节会拼成长 run，任何长度规则都会误报
+        let hash_with_neighbour = format!("{}7", "a".repeat(64));
+        assert!(!contains_secret_prefix_only(&hash_with_neighbour));
+        assert!(!contains_secret_prefix_only(&"a".repeat(32)));
+        // 但真实密钥仍然要抓
+        assert!(contains_secret_prefix_only("sk-abcdefgh12345678"));
+        assert!(contains_secret_prefix_only("Bearer eyJhbGciOiJ"));
+        assert!(!contains_secret_prefix_only("普通文本 12.5 USD"));
+    }
+
+    #[test]
+    fn audit_variant_still_catches_real_secrets() {
+        assert!(contains_secret_outside_hashes(
+            "OPENAI_API_KEY=sk-abcdefgh12345678"
+        ));
+        assert!(contains_secret_outside_hashes(
+            "X-App-Secret: nap-0123456789abcdef"
+        ));
+        assert!(contains_secret_outside_hashes(
+            "Authorization: Bearer eyJhbGciOiJ"
+        ));
+        // 32..63 位 hex 仍然算（那是 PAT 的长度区间）
+        assert!(contains_secret_outside_hashes(&"b".repeat(32)));
+        assert!(contains_secret_outside_hashes(&"b".repeat(40)));
+        // 正常文本不误伤
+        assert!(!contains_secret_outside_hashes(
+            "站点 example 余额 12.5 USD"
+        ));
+        // 哈希与密钥混在一行时仍要抓出来
+        let mixed = format!("{} sk-abcdefgh12345678", "c".repeat(64));
+        assert!(contains_secret_outside_hashes(&mixed));
     }
 
     #[test]

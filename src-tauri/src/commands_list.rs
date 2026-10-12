@@ -29,4 +29,5 @@ pub const COMMANDS: &[&str] = &[
     "get_settings",
     "update_settings",
     "refresh_all",
+    "audit_redaction",
 ];

@@ -167,6 +167,8 @@ pub struct ConsentRow {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// 文件库的路径；内存库为 `None`。审计要用它定位 `*.db` / `-wal` / `-shm`。
+    path: Option<std::path::PathBuf>,
 }
 
 impl Store {
@@ -180,7 +182,12 @@ impl Store {
         // 文件库必须真的跑在 WAL 上（并发读+写）。内存库不支持 WAL，只在 open_in_memory 分支跳过。
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| Error::Store(format!("切换 WAL 模式失败: {e}")))?;
-        Self::from_conn(conn)
+        let store = Self::from_conn(conn)?;
+        // 记下路径（`from_conn` 不关心路径）
+        Ok(Self {
+            conn: store.conn,
+            path: Some(path.to_path_buf()),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -194,6 +201,7 @@ impl Store {
             .map_err(|e| Error::Store(format!("开启外键失败: {e}")))?;
         let store = Self {
             conn: Mutex::new(conn),
+            path: None,
         };
         store.migrate()?;
         Ok(store)
@@ -227,6 +235,11 @@ impl Store {
                 .map_err(|e| Error::Store(format!("写入 schema 版本失败: {e}")))?;
         }
         Ok(())
+    }
+
+    /// 文件库的路径；内存库返回 `None`。
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
     }
 
     pub fn schema_version(&self) -> Result<i64> {

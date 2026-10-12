@@ -25,10 +25,14 @@ impl CodexInjector {
         }
     }
 
-    /// `$HOME/.codex/config.toml`
-    pub fn default_path() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".codex").join("config.toml")
+    /// `<主目录>/.codex/config.toml`
+    ///
+    /// 走 [`crate::platform::home_dir`]：解析不出来就**报错**，
+    /// 而不是像早先那样 `unwrap_or(".")` 把配置写到当前工作目录（BACKLOG B-14）。
+    pub fn default_path() -> Result<PathBuf> {
+        Ok(crate::platform::home_dir()?
+            .join(".codex")
+            .join("config.toml"))
     }
 
     /// 环境变量名规则：`KEYRELAY_<PROVIDER_ID>_KEY`（大写、非字母数字转下划线）

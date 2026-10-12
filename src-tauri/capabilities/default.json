@@ -26,6 +26,7 @@
     "allow-drift-report",
     "allow-get-settings",
     "allow-update-settings",
-    "allow-refresh-all"
+    "allow-refresh-all",
+    "allow-audit-redaction"
   ]
 }

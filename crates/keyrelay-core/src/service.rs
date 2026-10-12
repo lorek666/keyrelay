@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::audit::{self, AuditFinding, AuditReport};
 use crate::delivery::{self, ConsentState, DeliveryChannel, DeliveryOutcome, DeliveryPlan};
 use crate::drift::{self, DriftReport};
 use crate::error::{Error, Result};
@@ -746,6 +747,49 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             }
             Err(err) => Err(self.on_auth_error(site_id, err)),
         }
+    }
+
+    /// 脱敏审计：扫描本产品**全部落盘产物**里的明文凭证。
+    ///
+    /// 覆盖：数据库文件（含 `-wal` / `-shm`）、备份目录、以及事件表。
+    /// 只扫自己的产物，不做全盘扫描。
+    pub fn audit_redaction(&self) -> Result<AuditReport> {
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(db) = self.store.path() {
+            paths.push(db.to_path_buf());
+            for suffix in ["-wal", "-shm"] {
+                paths.push(std::path::PathBuf::from(format!(
+                    "{}{suffix}",
+                    db.display()
+                )));
+            }
+        }
+        paths.push(self.backup_dir.clone());
+
+        let mut report = audit::scan_paths(&paths);
+
+        let event_hits = self.store.count_events_with_secrets()?;
+        if event_hits > 0 {
+            report
+                .findings
+                .push(AuditFinding::PlaintextInEvents { rows: event_hits });
+        }
+
+        self.log(observability::event_with_payload(
+            if report.is_clean() {
+                Level::Info
+            } else {
+                Level::Error
+            },
+            "app",
+            format!("脱敏审计: {}", report.summary()),
+            serde_json::json!({
+                "files_scanned": report.files_scanned,
+                "bytes_scanned": report.bytes_scanned,
+                "plaintext_findings": report.plaintext_findings(),
+            }),
+        ));
+        Ok(report)
     }
 
     /// 底层存储的只读借用（诊断与测试用；业务逻辑请走本层的具名方法）。
