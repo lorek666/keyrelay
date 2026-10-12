@@ -199,7 +199,7 @@ fn normalize_id(value: Option<&Value>) -> Option<String> {
 ///
 /// 返回 `None` 表示「站点没给可用的总数」——此时靠「空页 / 全重复页」判定到底。
 fn parse_total(value: &Value) -> Option<i64> {
-    match value {
+    let parsed = match value {
         Value::Number(n) => n.as_i64().or_else(|| {
             // 25.0 这类浮点：只在小数部分为 0 时接受，避免把 25.5 当成 25
             let f = n.as_f64()?;
@@ -207,7 +207,11 @@ fn parse_total(value: &Value) -> Option<i64> {
         }),
         Value::String(s) => s.trim().parse::<i64>().ok(),
         _ => None,
-    }
+    };
+    // 负数是无意义的声明。若照单全收，`collected.len() >= total` 会在第一页就成立，
+    // 于是静默交付被截断的列表（M1-S3/S4 复审 P2-1 实测 `total:-5` 只发 1 次请求）。
+    // 视为「站点没给可用总数」，退回「空页 / 全重复页」的终止判定。
+    parsed.filter(|t| *t >= 0)
 }
 
 /// 从同名候选中挑出「最新」的一把：优先按 `created_at`，缺失或平局时按数值 id 最大者。

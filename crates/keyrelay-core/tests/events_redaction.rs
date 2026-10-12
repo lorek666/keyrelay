@@ -113,6 +113,31 @@ fn full_delivery_flow_leaves_no_plaintext_in_events() {
     // 诊断导出同样不得带出密钥
     let exported = f.service.export_diagnostics(200).unwrap();
     assert!(!exported.contains(SECRET), "{exported}");
+
+    // **哨兵**：业务路径本身不会把密钥塞进事件文本，所以只靠上面的扫描，
+    // 「把 `event()` 里的 scrub 去掉」这种变异**不会**让本测试失败（复审 P2-5 实测空跑）。
+    // 这里直投一条含密钥的事件，把「脱敏入口本身有效」钉进同一条用例。
+    let sentinel = observability::event(
+        Level::Warn,
+        "delivery",
+        format!("哨兵：站点回显了 {SECRET}"),
+    );
+    assert!(
+        !sentinel.message.contains(SECRET),
+        "脱敏入口失效：{}",
+        sentinel.message
+    );
+    f.service.log_event_for_test(&sentinel);
+    let after = f.service.recent_events(500).unwrap();
+    assert!(
+        after.iter().any(|row| row.message.contains("哨兵")),
+        "哨兵事件没有落库"
+    );
+    assert_eq!(
+        secret_hits(&f.db_path),
+        0,
+        "哨兵事件落库后出现了未脱敏行 → 脱敏入口失效"
+    );
 }
 
 #[test]

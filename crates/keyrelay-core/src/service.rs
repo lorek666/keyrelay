@@ -605,6 +605,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         }
     }
 
+    /// 仅测试用：把一条事件写进事件表，用于验证脱敏入口与扫描门禁的有效性。
+    #[doc(hidden)]
+    pub fn log_event_for_test(&self, event: &Event) {
+        self.log(event.clone());
+    }
+
     /// 最近事件（UI「诊断」用）。
     pub fn recent_events(&self, limit: usize) -> Result<Vec<crate::store::EventRow>> {
         self.store.list_events(limit.min(1000))

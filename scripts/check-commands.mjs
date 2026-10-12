@@ -44,16 +44,26 @@ function parseRustCommands() {
   );
 }
 
-/** 从 `export const INVOKED_COMMANDS: string[] = [ "a", "b" ];` 里取出字符串字面量 */
+/**
+ * 从 `src/lib/api.ts` 里取出**真实被调用的**命令名。
+ *
+ * 解析的是 `invokeCommand<...>("cmd"` 这个调用点，而**不是**某个手工维护的镜像数组——
+ * 镜像数组是假守护：把真实调用注释掉、数组不动，检查依然全绿
+ * （M1-S3/S4 复审 P1 实测）。
+ */
 function parseTsCommands() {
-  const source = readFileSync(join(root, "src/lib/api.ts"), "utf8");
-  const block = source.match(
-    /export const INVOKED_COMMANDS[^=]*=\s*\[([\s\S]*?)\];/,
+  const source = stripLineComments(
+    readFileSync(join(root, "src/lib/api.ts"), "utf8"),
   );
-  if (!block) throw new Error("在 api.ts 里找不到 INVOKED_COMMANDS 数组");
-  return [...stripLineComments(block[1]).matchAll(/"([^"]+)"/g)].map(
-    (m) => m[1],
-  );
+  const calls = [
+    ...source.matchAll(/invokeCommand(?:<[^>]*>)?\(\s*"([a-z_]+)"/g),
+  ].map((m) => m[1]);
+  if (calls.length === 0) {
+    throw new Error(
+      "在 api.ts 里没解析到任何 invokeCommand(\"…\") 调用——解析器坏了，不能当成通过",
+    );
+  }
+  return [...new Set(calls)];
 }
 
 function parseCapabilities() {
