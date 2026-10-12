@@ -458,10 +458,15 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
                 return Ok(collected);
             }
 
-            // 终止条件三：跑飞保护。宁可显式报错，也不交付被截断的列表。
-            if page >= MAX_PAGES {
+            // 终止条件三：跑飞保护。
+            //
+            // 判定用 `page > MAX_PAGES` 而不是 `>=`：第 `MAX_PAGES` 页**已取到的数据是有效的**，
+            // 我们只是还需要**一次**探测请求才能确认到底（空页或全重复页）。若在这里就报错，
+            // 「站点忽略 `page_size`（默认 10 条/页）+ 恰好 1000 把令牌 + 响应无 `total`」
+            // 这个真实可达的形态会被误报为「取不全」（第三轮复核 P2-2）。
+            if page > MAX_PAGES {
                 return Err(Error::Transport(format!(
-                    "已翻 {MAX_PAGES} 页仍未取全（已取 {} 条{}）；为避免交付不完整列表已中止，请先在站点端清理",
+                    "已取满 {MAX_PAGES} 页仍未取全（已取 {} 条{}）；为避免交付不完整列表已中止，请先在站点端清理",
                     collected.len(),
                     total
                         .map(|t| format!("，站点声明共 {t} 条"))
