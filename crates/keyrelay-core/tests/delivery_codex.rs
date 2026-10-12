@@ -399,16 +399,46 @@ fn unknown_key_id_is_not_found() {
 }
 
 #[test]
-fn unimplemented_channels_fail_explicitly() {
+fn every_channel_produces_a_plan() {
+    // M2-S2 之后三条通道都实现了：逐个生成计划，确认目标路径落在 home 内、
+    // 预览不含密钥、且都没同意时投递会被拒。
     let f = setup();
-    for channel in [
-        DeliveryChannel::ClaudeCodeSettings,
-        DeliveryChannel::ShellBlock,
-    ] {
-        assert!(matches!(
-            f.service.delivery_plan(f.key_id, channel),
-            Err(Error::Unimplemented(_))
-        ));
+    for channel in DeliveryChannel::ALL {
+        let plan = f
+            .service
+            .delivery_plan(f.key_id, channel)
+            .unwrap_or_else(|e| panic!("{} 应能生成计划: {e}", channel.as_str()));
+
+        assert_eq!(plan.channel, channel);
+        assert!(
+            plan.target_path.starts_with(&f.home),
+            "{} 的目标越出 home: {}",
+            channel.as_str(),
+            plan.target_path.display()
+        );
+        assert!(
+            !plan.preview.contains(SECRET),
+            "{} 的预览泄漏密钥",
+            channel.as_str()
+        );
+        assert!(
+            !plan.fields.is_empty(),
+            "{} 应至少声明一个字段",
+            channel.as_str()
+        );
+        assert_eq!(
+            plan.consent,
+            ConsentState::Missing,
+            "{} 初始应为未同意",
+            channel.as_str()
+        );
+
+        let err = f.service.apply_delivery(f.key_id, channel).unwrap_err();
+        assert!(
+            matches!(err, Error::ConsentRequired { .. }),
+            "{} 未同意时必须拒绝: {err:?}",
+            channel.as_str()
+        );
     }
 }
 
