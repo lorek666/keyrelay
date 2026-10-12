@@ -5,15 +5,19 @@
 //! - **不落明文密钥**：本库任何类型都不得把 `sk-` / `nap-` / PAT 明文写入磁盘、日志或错误信息。
 
 pub mod audit;
+pub mod autostart;
 pub mod delivery;
 pub mod drift;
 pub mod error;
 pub mod export;
 pub mod gateway;
 pub mod inject;
+pub mod notify;
 pub mod observability;
 pub mod platform;
+pub mod platform_env;
 pub mod redact;
+pub mod rotation;
 pub mod service;
 pub mod settings;
 pub mod site;

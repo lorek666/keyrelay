@@ -4,13 +4,22 @@ import { AlertTriangle, Save } from "lucide-react";
 import { ShieldCheck } from "lucide-react";
 import {
   auditRedaction,
+  autostartStatus,
   exportBundle,
   getSettings,
   pruneBackups,
+  setAutostart,
   updateSettings,
   type Settings,
 } from "../lib/api";
 import GatewayCard from "../components/GatewayCard";
+
+/** 「系统里的实际状态」的显示文案。`unknown` 是「读不出来」，不是「没开」——两者不能混。 */
+const AUTOSTART_LABELS: Record<string, string> = {
+  enabled: "已安装并生效",
+  disabled: "未安装",
+  unknown: "无法判定（读不到自启项，可能是权限或路径问题）",
+};
 
 const PRESETS = [
   { label: "关闭", value: 0 },
@@ -141,6 +150,12 @@ function AuditCard() {
 export default function SettingsPage() {
   const qc = useQueryClient();
   const current = useQuery({ queryKey: ["settings"], queryFn: getSettings });
+  // 系统里自启的**实际**状态（不是设置里那个意愿）。见下方 AUTOSTART_LABELS 处的说明。
+  const autostart = useQuery({
+    queryKey: ["autostart-status"],
+    queryFn: autostartStatus,
+    retry: false,
+  });
   const [draft, setDraft] = useState<Settings | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -149,13 +164,45 @@ export default function SettingsPage() {
     if (current.data && draft === null) setDraft(current.data);
   }, [current.data, draft]);
 
+  /**
+   * 开关与系统实际状态不一致时的说明。`null` = 一致、或读不到、或用户还没动过草稿。
+   *
+   * 只在**两者都能确定**时才报：「unknown」是「读不出来」，把它当不一致会制造假警报。
+   */
+  const autostartMismatch = (() => {
+    if (!autostart.data || !draft) return null;
+    if (autostart.data.state === "unknown") return null;
+    const wanted = draft.autostartEnabled ? "enabled" : "disabled";
+    if (autostart.data.state === wanted) return null;
+    return autostart.data.state === "enabled"
+      ? "系统里已经装了自启项，但开关是关的（关掉开关并保存即可移除）"
+      : "系统里没有生效的自启项，但开关是开的（打开开关并保存即可写入）";
+  })();
+
   const save = useMutation({
-    mutationFn: (settings: Settings) => updateSettings(settings),
-    onSuccess: async (saved) => {
+    mutationFn: async (settings: Settings) => {
+      const saved = await updateSettings(settings);
+      // 自启不是「存一个布尔值」就完事的：它要在磁盘上真写 / 真删一个 LaunchAgent，
+      // 或者在 Windows 上动注册表。所以保存设置之后立刻把它同步成实际状态，
+      // 并把实际状态带回来——否则界面显示「已开启」而系统里什么都没有。
+      const autostart = await setAutostart(saved.autostartEnabled);
+      return { saved, autostart };
+    },
+    onSuccess: async ({ saved, autostart }) => {
       setError(null);
-      setNotice("已保存。定时刷新间隔的变更在**下次启动**生效。");
+      const wanted = saved.autostartEnabled ? "enabled" : "disabled";
+      if (autostart.state !== wanted && autostart.state !== "unknown") {
+        // 真实状态与用户意愿不一致时**必须说出来**，不能只显示「已保存」。
+        setNotice(
+          `设置已保存，但登录自启的实际状态是「${autostart.state}」，与设置不一致。`,
+        );
+      } else {
+        setNotice("已保存。定时刷新间隔的变更在**下次启动**生效。");
+      }
       setDraft(saved);
       await qc.invalidateQueries({ queryKey: ["settings"] });
+      // 重读系统里的实际状态，让上面那句「系统里的实际状态」立刻跟上
+      await qc.invalidateQueries({ queryKey: ["autostart-status"] });
     },
     onError: (err: Error) => {
       setNotice(null);
@@ -244,6 +291,228 @@ export default function SettingsPage() {
               />
               <span>
                 启动时检查投递目标是否被外部改动（只读本地文件，不联网）
+              </span>
+            </label>
+          </div>
+
+          <div className="card">
+            <h3>界面</h3>
+            <label className="field">
+              <span>主题</span>
+              <select
+                className="input"
+                value={draft.theme}
+                onChange={(e) => setDraft({ ...draft, theme: e.target.value })}
+              >
+                <option value="system">跟随系统</option>
+                <option value="light">浅色</option>
+                <option value="dark">深色</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>语言</span>
+              <select
+                className="input"
+                value={draft.language}
+                onChange={(e) => setDraft({ ...draft, language: e.target.value })}
+              >
+                <option value="zh-CN">简体中文</option>
+                <option value="en-US">English</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>代理（HTTP / SOCKS5，留空 = 直连）</span>
+              <input
+                className="input"
+                type="text"
+                placeholder="socks5://127.0.0.1:1080"
+                value={draft.proxyUrl}
+                onChange={(e) => setDraft({ ...draft, proxyUrl: e.target.value })}
+              />
+            </label>
+            <p className="muted">
+              代理串的合法性在真正发起请求时校验：写法不合法会直接报错，不会静默降级成直连。
+            </p>
+          </div>
+
+          <div className="card">
+            <h3>通知</h3>
+            <p className="muted">
+              余额低于阈值、会话失效、密钥到期与配置漂移会走这里的渠道。通知正文不含密钥，
+              也不含站点返回的原始文案。
+            </p>
+            <label className="checkline">
+              <input
+                type="checkbox"
+                checked={draft.notifySystemEnabled}
+                onChange={(e) =>
+                  setDraft({ ...draft, notifySystemEnabled: e.target.checked })
+                }
+              />
+              <span>系统通知（macOS 通知中心 / Windows Toast）</span>
+            </label>
+            <label className="field">
+              <span>Webhook 地址（留空 = 不启用）</span>
+              <input
+                className="input"
+                type="text"
+                placeholder="https://hooks.example.com/keyrelay"
+                value={draft.notifyWebhookUrl}
+                onChange={(e) =>
+                  setDraft({ ...draft, notifyWebhookUrl: e.target.value })
+                }
+              />
+            </label>
+            <label className="field">
+              <span>Webhook 超时（秒，上限 60）</span>
+              <input
+                className="input"
+                type="number"
+                min={1}
+                max={60}
+                value={draft.notifyTimeoutSecs}
+                onChange={(e) =>
+                  setDraft({
+                    ...draft,
+                    notifyTimeoutSecs: Number(e.target.value),
+                  })
+                }
+              />
+            </label>
+            <p className="muted">
+              地址里如果内嵌了凭证（<code>https://user:pass@…</code>），
+              写进事件表与导出包之前会被剥掉。
+            </p>
+          </div>
+
+          <div className="card">
+            <h3>密钥轮换</h3>
+            <p className="muted">
+              到期前提醒你换一把新的。轮换是一次三连操作：新建 key → 全量重注入 → 回收旧 key；
+              中间任何一步失败都会停下，不会留下「旧 key 已回收但新 key 没注入」的状态。
+            </p>
+            <label className="field">
+              <span>轮换周期（天，0 = 关闭提醒）</span>
+              <input
+                className="input"
+                type="number"
+                min={0}
+                value={draft.rotationMaxAgeDays}
+                onChange={(e) =>
+                  setDraft({
+                    ...draft,
+                    rotationMaxAgeDays: Number(e.target.value),
+                  })
+                }
+              />
+            </label>
+            <label className="field">
+              <span>提前提醒（天）</span>
+              <input
+                className="input"
+                type="number"
+                min={0}
+                value={draft.rotationWarnBeforeDays}
+                onChange={(e) =>
+                  setDraft({
+                    ...draft,
+                    rotationWarnBeforeDays: Number(e.target.value),
+                  })
+                }
+              />
+            </label>
+            {draft.rotationMaxAgeDays > 0 &&
+            draft.rotationWarnBeforeDays > draft.rotationMaxAgeDays ? (
+              <p className="error" role="alert">
+                <AlertTriangle size={14} aria-hidden /> 提前提醒天数不能大于轮换周期。
+              </p>
+            ) : null}
+          </div>
+
+          <div className="card">
+            <h3>常驻与自启</h3>
+            <label className="checkline">
+              <input
+                type="checkbox"
+                checked={draft.closeToTray}
+                onChange={(e) =>
+                  setDraft({ ...draft, closeToTray: e.target.checked })
+                }
+              />
+              <span>关窗时隐藏到托盘而不是退出（关掉后关窗即退出，后台刷新也随之停止）</span>
+            </label>
+            <label className="checkline">
+              <input
+                type="checkbox"
+                checked={draft.startHidden}
+                onChange={(e) =>
+                  setDraft({ ...draft, startHidden: e.target.checked })
+                }
+              />
+              <span>启动时不显示主窗口（等价于命令行加 --hidden）</span>
+            </label>
+            <label className="checkline">
+              <input
+                type="checkbox"
+                checked={draft.autostartEnabled}
+                onChange={(e) =>
+                  setDraft({ ...draft, autostartEnabled: e.target.checked })
+                }
+              />
+              <span>
+                登录时自动启动（macOS 写入 LaunchAgent，Windows 写入用户级启动项）。
+                点「保存」时才会真正写盘；自启启动时一律带 <code>--hidden</code>
+                ——自启的用途是后台刷新，弹窗会破坏它。托盘不可用时窗口仍会显示，
+                否则你没有任何入口能把它调回来。
+              </span>
+            </label>
+            {/*
+              开关只是一个「意愿」，磁盘上的自启项才是事实（M6-S7 审计 §4-3）。
+              只写不读会让界面长期显示一个已经不成立的结论——用户手工删掉 plist、
+              系统清理了自启项、或写在别的用户目录下，界面都看不出来。
+            */}
+            <p className="muted">
+              系统里的实际状态：
+              {autostart.isLoading
+                ? " 读取中…"
+                : autostart.isError
+                  ? ` 读不到（${(autostart.error as Error).message}）`
+                  : ` ${AUTOSTART_LABELS[autostart.data!.state]}`}
+            </p>
+            {autostartMismatch ? (
+              <p className="warnline" role="alert">
+                <AlertTriangle size={14} aria-hidden />
+                与上面的开关不一致：{autostartMismatch}。
+                点一次「保存」会按开关重写系统里的自启项。
+              </p>
+            ) : null}
+          </div>
+
+          <div className="card">
+            <h3>隐私</h3>
+            <label className="checkline">
+              <input
+                type="checkbox"
+                checked={draft.telemetryEnabled}
+                onChange={(e) =>
+                  setDraft({ ...draft, telemetryEnabled: e.target.checked })
+                }
+              />
+              <span>
+                匿名遥测（默认关）。**当前版本只记录这个开关，不发送任何数据**——
+                没有服务端，也没有埋点代码。
+              </span>
+            </label>
+            <label className="checkline">
+              <input
+                type="checkbox"
+                checked={draft.autoUpdateEnabled}
+                onChange={(e) =>
+                  setDraft({ ...draft, autoUpdateEnabled: e.target.checked })
+                }
+              />
+              <span>
+                自动更新（默认关）。**当前版本只记录这个开关**，尚未接入更新服务器。
               </span>
             </label>
           </div>

@@ -79,6 +79,24 @@ fn invoke(cmd: &str) -> Result<Value, Value> {
     invoke_impl(cmd, json!({}))
 }
 
+/// 打开网关总开关并指定端口。
+///
+/// 用「读 → 改 → 写」而不是手写一个只含 5 个字段的字面量：`SettingsDto` 要求**全部**
+/// 字段，M6-S5 加了 13 个新字段之后，任何部分字面量都会在反序列化时空字段失败
+/// （`invalid args … missing field 'theme'`）。这个写法对以后再加字段是免疫的，
+/// 而且它走的是前端真实的调用序列。
+fn enable_gateway(webview: &tauri::WebviewWindow<tauri::test::MockRuntime>, port: u16) {
+    let mut payload = invoke_on(webview, "get_settings", json!({})).expect("读设置");
+    payload["gatewayEnabled"] = json!(true);
+    payload["gatewayPort"] = json!(port);
+    invoke_on(
+        webview,
+        "update_settings",
+        json!({"args": {"settings": payload}}),
+    )
+    .expect("打开网关总开关");
+}
+
 /// 断言错误不是「命令未注册 / 未授权」这类装配问题（业务错误可以接受）
 fn assert_not_acl_rejection(cmd: &str, err: &Value) {
     let message = err.to_string();
@@ -355,18 +373,30 @@ fn get_settings_returns_defaults() {
 
 #[test]
 fn update_settings_round_trips_and_rejects_bad_values() {
-    // 跨调用保持状态：同一个应用实例里「写 → 读」
+    // 跨调用保持状态：同一个应用实例里「写 → 读」。
+    //
+    // 载荷按**前端的真实流程**构造：先 `get_settings` 拿到完整对象，改几个字段，再整体写回。
+    // 早先这里手写了一个只含 5 个字段的字面量——M6-S5 给 `Settings` 加了 13 个字段之后，
+    // 那个写法会因为 `SettingsDto` 要求全部字段而直接反序列化失败。
+    // 改成「读→改→写」之后，以后再加字段这个测试不需要再改，而且它验的是真实路径。
     let (_app, webview) = build_app();
+    let mut payload = invoke_on(&webview, "get_settings", json!({})).expect("get_settings");
+    payload["refreshIntervalSecs"] = json!(600);
+    payload["balanceAlertThreshold"] = json!(3.5);
+    payload["driftCheckOnStart"] = json!(false);
+    payload["gatewayEnabled"] = json!(true);
+    payload["gatewayPort"] = json!(9999);
+    // M6-S5 新增字段也走一遍：确认它们真的过得了 IPC 与校验
+    payload["theme"] = json!("dark");
+    payload["language"] = json!("en-US");
+    payload["notifyWebhookUrl"] = json!("https://hooks.example.com/kr");
+    payload["rotationMaxAgeDays"] = json!(45);
+    payload["rotationWarnBeforeDays"] = json!(10);
+
     let updated = invoke_on(
         &webview,
         "update_settings",
-        json!({"args": {"settings": {
-            "refreshIntervalSecs": 600,
-            "balanceAlertThreshold": 3.5,
-            "driftCheckOnStart": false,
-            "gatewayEnabled": true,
-            "gatewayPort": 9999
-        }}}),
+        json!({"args": {"settings": payload}}),
     )
     .expect("update_settings 应成功");
     assert_eq!(updated["refreshIntervalSecs"], 600);
@@ -374,27 +404,48 @@ fn update_settings_round_trips_and_rejects_bad_values() {
     assert_eq!(updated["driftCheckOnStart"], false);
     assert_eq!(updated["gatewayEnabled"], true);
     assert_eq!(updated["gatewayPort"], 9999);
+    assert_eq!(updated["theme"], "dark");
+    assert_eq!(updated["language"], "en-US");
+    assert_eq!(updated["notifyWebhookUrl"], "https://hooks.example.com/kr");
+    assert_eq!(updated["rotationMaxAgeDays"], 45);
+    assert_eq!(updated["rotationWarnBeforeDays"], 10);
 
     let read = invoke_on(&webview, "get_settings", json!({})).expect("get_settings");
     assert_eq!(read, updated, "同一实例内写后读必须一致");
 
-    // 非法值被拒
-    let err = invoke_impl(
-        "update_settings",
-        json!({"args": {"settings": {
-            "refreshIntervalSecs": 99999999,
-            "balanceAlertThreshold": 0.0,
-            "driftCheckOnStart": true,
-            "gatewayEnabled": false,
-            "gatewayPort": 8787
-        }}}),
-    )
-    .expect_err("超上限的间隔应被拒绝");
+    // 非法值被拒。同样走「读→改→写」，只把要验的那一项改坏。
+    let mut bad = read.clone();
+    bad["refreshIntervalSecs"] = json!(99999999);
+    let err = invoke_impl("update_settings", json!({"args": {"settings": bad}}))
+        .expect_err("超上限的间隔应被拒绝");
     assert_not_acl_rejection("update_settings", &err);
     assert!(
         err.as_str().unwrap_or_default().contains("刷新间隔"),
         "{err}"
     );
+
+    // M6-S5 新增的两条校验也要在 IPC 层被验到（不能只在 core 的单测里成立）
+    let mut bad_theme = read.clone();
+    bad_theme["theme"] = json!("neon");
+    let err = invoke_impl("update_settings", json!({"args": {"settings": bad_theme}}))
+        .expect_err("未知主题应被拒绝");
+    assert_not_acl_rejection("update_settings", &err);
+    assert!(err.as_str().unwrap_or_default().contains("主题"), "{err}");
+
+    let mut bad_window = read.clone();
+    bad_window["rotationMaxAgeDays"] = json!(30);
+    bad_window["rotationWarnBeforeDays"] = json!(31);
+    let err = invoke_impl("update_settings", json!({"args": {"settings": bad_window}}))
+        .expect_err("提醒窗口宽于轮换周期应被拒绝");
+    assert_not_acl_rejection("update_settings", &err);
+    assert!(
+        err.as_str().unwrap_or_default().contains("提前提醒"),
+        "{err}"
+    );
+
+    // 被拒之后库里仍是上一次成功写入的值（校验发生在落库之前）
+    let after = invoke_on(&webview, "get_settings", json!({})).expect("get_settings");
+    assert_eq!(after, updated, "被拒的写入不得改动已保存的设置");
 }
 
 #[test]
@@ -465,18 +516,7 @@ fn gateway_start_is_refused_while_the_master_switch_is_off() {
 fn gateway_start_on_an_unknown_key_reports_a_business_error() {
     // 先打开总开关，否则会先撞上 P2-8 那道门，测不到「未知密钥」这条业务错误
     let (_app, webview) = build_app();
-    invoke_on(
-        &webview,
-        "update_settings",
-        json!({"args": {"settings": {
-            "refreshIntervalSecs": 0,
-            "balanceAlertThreshold": 0.0,
-            "driftCheckOnStart": true,
-            "gatewayEnabled": true,
-            "gatewayPort": 8787
-        }}}),
-    )
-    .expect("打开网关总开关");
+    enable_gateway(&webview, 8787);
 
     let err = invoke_on(
         &webview,
@@ -592,18 +632,7 @@ fn gateway_stop_then_start_on_the_same_port_succeeds() {
         .expect("写密钥")
         .id;
 
-    invoke_on(
-        &webview,
-        "update_settings",
-        json!({"args": {"settings": {
-            "refreshIntervalSecs": 0,
-            "balanceAlertThreshold": 0.0,
-            "driftCheckOnStart": true,
-            "gatewayEnabled": true,
-            "gatewayPort": port
-        }}}),
-    )
-    .expect("打开网关总开关");
+    enable_gateway(&webview, port);
 
     let args = json!({"args": {"siteId": site, "keyId": key_id}});
     let first = invoke_on(&webview, "gateway_start", args.clone()).expect("第一次启动");
@@ -665,18 +694,7 @@ fn gateway_stop_is_bounded_even_with_an_in_flight_request() {
         .expect("写密钥")
         .id;
 
-    invoke_on(
-        &webview,
-        "update_settings",
-        json!({"args": {"settings": {
-            "refreshIntervalSecs": 0,
-            "balanceAlertThreshold": 0.0,
-            "driftCheckOnStart": true,
-            "gatewayEnabled": true,
-            "gatewayPort": port
-        }}}),
-    )
-    .expect("打开网关总开关");
+    enable_gateway(&webview, port);
 
     let started = invoke_on(
         &webview,
@@ -718,4 +736,143 @@ fn gateway_stop_is_bounded_even_with_an_in_flight_request() {
         elapsed < Duration::from_millis(2500),
         "shutdown 没有被上界截住: {elapsed:?}"
     );
+}
+
+// ==================================================== M6-S5：FR-2 / FR-7 接线
+
+#[test]
+fn rotation_due_is_a_local_noop_on_an_empty_installation() {
+    // 空安装（没有任何站点/密钥）时必须是「空列表」而不是报错：
+    // 它是纯本地判定，不联网、不读密钥。
+    let value = invoke("rotation_due").expect("rotation_due 应成功");
+    assert_eq!(value, json!([]));
+}
+
+#[test]
+fn available_groups_on_an_unknown_site_reports_a_business_error() {
+    let err =
+        invoke_impl("available_groups", json!({"siteId": 999})).expect_err("不存在的站点应报错");
+    assert_not_acl_rejection("available_groups", &err);
+}
+
+#[test]
+fn sync_site_keys_on_an_unknown_site_reports_a_business_error() {
+    let err =
+        invoke_impl("sync_site_keys", json!({"siteId": 999})).expect_err("不存在的站点应报错");
+    assert_not_acl_rejection("sync_site_keys", &err);
+}
+
+#[test]
+fn autostart_round_trips_through_enable_then_disable() {
+    // 注意：这条跑在 mock runtime 上，`std::env::current_exe()` 指向测试二进制本身。
+    // 我们断言的是**状态机与产物**，不是「登录时真的会启动它」——后者需要真实登录会话，
+    // 本机无法验证（见 spec §3.4 的未验证边界）。
+    let before = invoke("autostart_status").expect("autostart_status 应成功");
+    assert_not_acl_rejection("autostart_status", &before);
+    assert!(
+        ["enabled", "disabled", "unknown"].contains(&before["state"].as_str().unwrap_or("")),
+        "state 必须是三态之一: {before}"
+    );
+
+    let enabled = invoke_impl("autostart_set", json!({"enabled": true}))
+        .expect("开启自启应成功（写的是内存测试 home 下的 plist）");
+    assert_not_acl_rejection("autostart_set", &enabled);
+    // 计划摘要只含路径与键名，**不含任何 env 值**
+    assert!(enabled["plan"].is_string(), "{enabled}");
+
+    let disabled = invoke_impl("autostart_set", json!({"enabled": false})).expect("关闭自启应成功");
+    assert_not_acl_rejection("autostart_set", &disabled);
+    assert!(disabled["plan"].is_string(), "{disabled}");
+}
+
+#[test]
+fn autostart_set_rejects_a_missing_argument() {
+    // 反例保护：缺参数应是**参数错误**而不是静默当作 false 成功。
+    let err = invoke_impl("autostart_set", json!({})).expect_err("缺 enabled 参数应被拒");
+    assert_not_acl_rejection("autostart_set", &err);
+}
+
+#[test]
+fn rotation_plan_is_local_and_lists_the_fixed_three_steps() {
+    use tauri::Manager;
+    let (_app, webview) = build_app();
+    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let site = state
+        .service
+        .store()
+        .upsert_site("newapi", "https://relay.example.com", "轮换站")
+        .expect("写站点");
+    let key_id = state
+        .service
+        .store_key_material(site, "codex/daily", Some("12"), "sk-rotation-0123456789ab")
+        .expect("写密钥")
+        .id;
+
+    let value = invoke_on(&webview, "rotation_plan", json!({"keyId": key_id}))
+        .expect("rotation_plan 应成功");
+    assert_not_acl_rejection("rotation_plan", &value);
+
+    assert_eq!(value["keyId"], key_id);
+    assert_eq!(
+        value["steps"],
+        json!(["create_new", "reinject_all", "revoke_old"]),
+        "顺序是冻结的，界面展示的就是实际执行的顺序"
+    );
+    assert_eq!(
+        value["channels"],
+        json!([]),
+        "还没投递过，没有要重注入的目标"
+    );
+    assert_eq!(value["unmappedTargets"], json!([]));
+    assert_eq!(value["oldRemoteId"], "12");
+    assert_eq!(value["keyName"], "codex/daily");
+    // 预览不得带出明文（命令层至今没有任何一条命令返回过密钥明文）
+    assert!(
+        !value.to_string().contains("sk-rotation"),
+        "预览不得含密钥明文: {value}"
+    );
+}
+
+#[test]
+fn rotate_key_reaches_the_business_path_without_a_session() {
+    use tauri::Manager;
+    // 断言的是**可达性**：命令已注册、ACL 通过、参数能反序列化、本地前置检查能跑完，
+    // 最后停在「没有会话」这条业务错误上。真正的网络路径由 core 层的
+    // `tests/rotation_run.rs` 用假传输层覆盖。
+    let (_app, webview) = build_app();
+    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let site = state
+        .service
+        .store()
+        .upsert_site("newapi", "https://relay.example.com", "轮换站")
+        .expect("写站点");
+    let key_id = state
+        .service
+        .store_key_material(site, "codex/daily", Some("12"), "sk-rotation-0123456789ab")
+        .expect("写密钥")
+        .id;
+
+    let err = invoke_on(
+        &webview,
+        "rotate_key",
+        json!({"keyId": key_id, "name": "codex/rotated"}),
+    )
+    .expect_err("没有会话时必须失败");
+    assert_not_acl_rejection("rotate_key", &err);
+    let message = err.to_string();
+    assert!(
+        message.contains("登录"),
+        "没有会话时应报「先登录」这类业务错误，而不是装配错误: {message}"
+    );
+    assert!(
+        !message.contains("sk-rotation"),
+        "错误文案不得含密钥明文: {message}"
+    );
+}
+
+#[test]
+fn rotate_key_rejects_a_missing_argument() {
+    // 反例保护：缺参数应是**参数错误**，不能当成 `keyId = 0` 去查库。
+    let err = invoke_impl("rotate_key", json!({})).expect_err("缺参数应被拒");
+    assert_not_acl_rejection("rotate_key", &err);
 }

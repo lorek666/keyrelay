@@ -139,6 +139,9 @@ pub struct KeyRow {
     pub group_name: Option<String>,
     pub secret_ref: String,
     pub status: String,
+    /// 本地记账的创建时间（unix 秒）。M6-S5 起用于密钥轮换判定
+    /// （`rotation::due_keys`）；列一直是 `NOT NULL`，只是先前没进 `SELECT`。
+    pub created_at: i64,
 }
 
 /// 事件行。`message` / `payload` 在写入时已脱敏。
@@ -153,6 +156,11 @@ pub struct EventRow {
 }
 
 /// 一次投递的漂移检测输入：绑定 + 投递时记录的哈希。
+///
+/// M6-S5（W-1）新增 `site_id`：漂移本身是**投递目标**的属性，但通知快照
+/// （章程 §4.3 的 `SiteSnapshot`）是按站点装配的，装配时必须知道归属。
+/// 归属取自 `bindings.key_id → keys.site_id`（`keys.id` 有 `ON DELETE CASCADE`，
+/// 所以不存在「绑定还在、密钥已删」的悬挂行，用 INNER JOIN 不会丢行）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BindingDriftRow {
     pub agent_id: String,
@@ -160,6 +168,10 @@ pub struct BindingDriftRow {
     pub journal_id: String,
     /// 投递时该文件的 sha256；老库可能没有
     pub expected_sha256: Option<String>,
+    /// 该绑定所用密钥所属的站点（用于把漂移事实归到站点快照上）
+    pub site_id: i64,
+    /// 该绑定所用的密钥 id（用于「这把 key 现在服务哪些投递目标」）
+    pub key_id: i64,
 }
 
 /// 投递授权行。`fields` 是 JSON 数组，**只有键名**。
@@ -362,7 +374,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, site_id, remote_id, name, group_name, secret_ref, status
+                "SELECT id, site_id, remote_id, name, group_name, secret_ref, status, created_at
                  FROM keys WHERE id = ?1",
             )
             .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
@@ -376,6 +388,7 @@ impl Store {
                     group_name: row.get(4)?,
                     secret_ref: row.get(5)?,
                     status: row.get(6)?,
+                    created_at: row.get(7)?,
                 })
             })
             .map_err(|e| Error::Store(format!("查询密钥失败: {e}")))?;
@@ -440,7 +453,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, site_id, remote_id, name, group_name, secret_ref, status
+                "SELECT id, site_id, remote_id, name, group_name, secret_ref, status, created_at
                  FROM keys ORDER BY id",
             )
             .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
@@ -454,6 +467,7 @@ impl Store {
                     group_name: row.get(4)?,
                     secret_ref: row.get(5)?,
                     status: row.get(6)?,
+                    created_at: row.get(7)?,
                 })
             })
             .map_err(|e| Error::Store(format!("查询密钥失败: {e}")))?;
@@ -610,16 +624,28 @@ impl Store {
 
     /// 每个投递目标只取**最近一次**投递的绑定，并 LEFT JOIN 出当时的 `after_sha256`。
     ///
-    /// 用 LEFT JOIN 而不是 INNER JOIN：老库里可能没有对应的 journal 行，
+    /// 用 LEFT JOIN（journals）而不是 INNER JOIN：老库里可能没有对应的 journal 行，
     /// 那种情况要能被识别成「无法判定」而不是从报告里消失。
+    /// `keys` 那一跳反过来必须是 INNER JOIN：那一跳是「这行属于哪个站点」，
+    /// 少了它这行就成了无法归组的孤儿数据（而 `keys` 的删除会级联带走 `bindings`，
+    /// 所以 INNER JOIN 不会把正常行丢掉）。
+    ///
+    /// `journal_id` 过 `COALESCE`：列在 schema 里可空（`journal_id TEXT`），而 Rust 侧是
+    /// `String`——一行 NULL 会让 `row.get::<String>` 报「Invalid column type Null」，
+    /// 于是**整张表**读不出来（一次手工写的/迁移来的绑定行就能让漂移报告与轮换预览
+    /// 一起变成 `Err`）。空串的语义与 NULL 在下面那个 `j.id = …` 拼接里完全一致
+    /// （都匹配不到 journal 行 → `expected_sha256` 为 NULL → `Unknown`），
+    /// 所以这里不需要改类型、也不会把「无法判定」说成「完好」。
     pub fn binding_drift_rows(&self) -> Result<Vec<BindingDriftRow>> {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT b.agent_id, b.target_path, b.journal_id, j.after_sha256
+                "SELECT b.agent_id, b.target_path, COALESCE(b.journal_id, '') AS journal_id,
+                        j.after_sha256, k.site_id, b.key_id
                  FROM bindings b
                  JOIN (SELECT target_path, MAX(id) AS mid FROM bindings GROUP BY target_path) latest
                    ON b.id = latest.mid
+                 JOIN keys k ON k.id = b.key_id
                  LEFT JOIN journals j ON j.id = b.journal_id || ':' || b.target_path
                  ORDER BY b.target_path",
             )
@@ -631,6 +657,8 @@ impl Store {
                     target_path: row.get(1)?,
                     journal_id: row.get(2)?,
                     expected_sha256: row.get(3)?,
+                    site_id: row.get(4)?,
+                    key_id: row.get(5)?,
                 })
             })
             .map_err(|e| Error::Store(format!("查询投递绑定失败: {e}")))?;

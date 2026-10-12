@@ -16,12 +16,13 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Value};
 
 use super::transport::{HttpRequest, HttpTransport, Method};
 use super::{
-    json_str, map_http_error, normalize_base_url, Balance, Credentials, KeyMaterial, KeyMeta,
-    KeySpec, KeyStatus, Session, SiteAdapter, SiteFingerprint, SiteKind,
+    json_str, map_http_error, normalize_base_url, scrub_error, Balance, Credentials, GroupInfo,
+    KeyMaterial, KeyMeta, KeySpec, KeyStatus, Session, SiteAdapter, SiteFingerprint, SiteKind,
 };
 use crate::error::{Error, Result, SecondFactorKind};
 
@@ -31,6 +32,12 @@ const TWO_FA_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// TOTP 码长度（源码 `binding:"required,len=6"`）。
 const TOTP_LEN: usize = 6;
+
+/// 批量读明文时的并发上限（章程 §4.4 冻结值）。
+///
+/// Sub2API **没有**批量端点，只能逐个 `GET /api/v1/keys/{id}`。用 `buffered(N)` 把同时在飞
+/// 的请求数限制在 N，同时保持**返回顺序 = 入参顺序**（与完成先后无关）。
+pub const SUB2API_REVEAL_CONCURRENCY: usize = 4;
 
 /// 一次登录尝试的中间态：需要 2FA 时暂存 `temp_token`。
 struct PendingTwoFa {
@@ -289,6 +296,83 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+/// `GET /api/v1/groups/available` 的中间形态。
+///
+/// `id` 只用于和 `/groups/rates` 的键合并，**不进** `GroupInfo`（`GroupInfo` 没有 id 字段）。
+struct RawGroup {
+    id: Option<i64>,
+    name: String,
+    description: Option<String>,
+}
+
+/// 解析 `GET /api/v1/groups/available` 的 `data`（M6-S4 / PRD FR-2）。
+///
+/// **真实形态**（本机 Sub2API 源码实测，见 M6-S4 spec §5.2）：`data` 是数组，
+/// 元素为 `dto.Group`：`{"id":1,"name":"vip","description":"…","rate_multiplier":1.0, …}`。
+/// 兼容形态 `data = {items: [...]}`（与既有 `extract_keys_page` 同口径；真实站点未观察到）。
+///
+/// 逐条跳过取不出名字的条目；**数组非空却一条都取不出**时报错——静默返回空列表等于
+/// 告诉用户「站点没有可选分组」。
+fn parse_available_groups(data: &Value) -> Result<Vec<RawGroup>> {
+    let items = if let Some(items) = data.as_array() {
+        items.clone()
+    } else if let Some(items) = data.get("items").and_then(|v| v.as_array()) {
+        items.clone()
+    } else {
+        return Err(Error::Transport(
+            "分组响应的形态无法识别（既不是数组，也没有 items 字段）".into(),
+        ));
+    };
+
+    let mut out: Vec<RawGroup> = Vec::with_capacity(items.len());
+    for item in &items {
+        let Some(name) = json_str(item, "/name").filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        out.push(RawGroup {
+            id: item.get("id").and_then(|v| v.as_i64()),
+            name: name.to_string(),
+            description: json_str(item, "/description")
+                .filter(|d| !d.is_empty())
+                .map(|d| d.to_string()),
+        });
+    }
+    if !items.is_empty() && out.is_empty() {
+        return Err(Error::Transport(format!(
+            "分组响应有 {} 条，但都取不出可用的分组名",
+            items.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// 解析 `GET /api/v1/groups/rates` 的 `data`。
+///
+/// **真实形态**：对象 `{"<group_id>": <倍率>}`（Go 的 `map[int64]float64`）。
+/// 仓库未接线时源码直接 `return nil, nil` → `data: null` → `Ok(None)`，调用方把该轮
+/// 全部 `rate` 置 `None`（章程 §4.4：「`rates` 缺失时 `rate = None`」）。
+///
+/// 既不是对象也不是 `null` 的形态 → 报错：静默当作「没有倍率」会把站点改版伪装成正常结果。
+fn parse_group_rates(data: &Value) -> Result<Option<HashMap<i64, f64>>> {
+    if data.is_null() {
+        return Ok(None);
+    }
+    let Some(map) = data.as_object() else {
+        return Err(Error::Transport(
+            "分组倍率响应的形态无法识别（既不是对象，也不是 null）".into(),
+        ));
+    };
+    let mut rates: HashMap<i64, f64> = HashMap::with_capacity(map.len());
+    for (key, value) in map {
+        // 解析不出分组 id / 值不是数字的条目直接忽略：它们永远匹配不上任何分组。
+        let (Ok(id), Some(rate)) = (key.parse::<i64>(), value.as_f64()) else {
+            continue;
+        };
+        rates.insert(id, rate);
+    }
+    Ok(Some(rates))
 }
 
 /// 从 `APIKey` 对象构造 `KeyMeta`。
@@ -622,6 +706,99 @@ impl<T: HttpTransport + 'static> SiteAdapter for Sub2Api<T> {
             raw_quota: None,
             quota_per_unit: None,
         })
+    }
+
+    /// M6-S4 / PRD FR-2：`GET /api/v1/groups/available` + `GET /api/v1/groups/rates` 两次调用合并。
+    ///
+    /// - 顺序固定：先 `available`（决定分组集合与顺序），再 `rates`（决定倍率）；
+    /// - `rates` 的 `data` 为 `null`（源码里仓库未接线）→ 全部 `rate = None`；
+    /// - `rates` 里没有该分组 → 该分组 `rate = None`（**不**回落到 `available` 里的
+    ///   `rate_multiplier`：那是分组基准倍率，不是该用户的专属覆盖倍率，见 spec D-3）；
+    /// - `rates` 调用本身失败（非 2xx / 信封失败）→ **传播错误**，不降级为全 `None`
+    ///   （否则会话失效会被伪装成「倍率未知」，违反 M5-S2 的会话失效可见性）。
+    async fn available_groups(&self, base_url: &str, session: &Session) -> Result<Vec<GroupInfo>> {
+        let base = normalize_base_url(base_url);
+
+        let resp = self
+            .transport
+            .request(Self::request(
+                Method::Get,
+                format!("{base}/api/v1/groups/available"),
+                session,
+            ))
+            .await?;
+        if resp.status != 200 {
+            return Err(scrub_error(map_http_error(
+                resp.status,
+                &resp.body,
+                resp.retry_after_secs(),
+            )));
+        }
+        let groups = parse_available_groups(&Self::unwrap_data(&resp, "拉取分组")?)?;
+
+        let resp = self
+            .transport
+            .request(Self::request(
+                Method::Get,
+                format!("{base}/api/v1/groups/rates"),
+                session,
+            ))
+            .await?;
+        if resp.status != 200 {
+            return Err(scrub_error(map_http_error(
+                resp.status,
+                &resp.body,
+                resp.retry_after_secs(),
+            )));
+        }
+        let rates = parse_group_rates(&Self::unwrap_data(&resp, "拉取分组倍率")?)?;
+
+        Ok(groups
+            .into_iter()
+            .map(|group| GroupInfo {
+                rate: group
+                    .id
+                    .and_then(|id| rates.as_ref().and_then(|map| map.get(&id).copied())),
+                name: group.name,
+                description: group.description,
+            })
+            .collect())
+    }
+
+    /// M6-S4 / PRD FR-2：无批量端点 → **有界并发**逐个 `GET /api/v1/keys/{id}`。
+    ///
+    /// - 空入参 → 空 `Vec`，**0 请求**；
+    /// - 返回顺序与入参**逐位一致**（`buffered` 按流的顺序产出，与完成先后无关）；
+    /// - 同时在飞 ≤ [`SUB2API_REVEAL_CONCURRENCY`]；
+    /// - 按入参顺序的**首个**失败立即返回：流被丢弃 → 在飞请求取消，不再发新请求；
+    /// - 单条的路径段校验 / 错误映射 / 脱敏沿用既有 [`SiteAdapter::reveal_key`]。
+    async fn reveal_keys(
+        &self,
+        base_url: &str,
+        session: &Session,
+        remote_ids: &[String],
+    ) -> Result<Vec<(String, KeyMaterial)>> {
+        if remote_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let base = normalize_base_url(base_url);
+
+        // 先把每个 id 的 future 建出来（`async fn` 是惰性的：建出来不等于发请求），
+        // 再交给 `buffered(N)` 驱动 —— 它同时保证「在飞 ≤ N」与「产出顺序 = 入参顺序」。
+        let mut pending = Vec::with_capacity(remote_ids.len());
+        for id in remote_ids {
+            pending.push(self.reveal_key(&base, session, id));
+        }
+        let mut stream = Box::pin(stream::iter(pending).buffered(SUB2API_REVEAL_CONCURRENCY));
+        let mut out: Vec<(String, KeyMaterial)> = Vec::with_capacity(remote_ids.len());
+        while let Some(result) = stream.next().await {
+            // 单条路径的错误文案来自 `map_http_error`，可能回显站点原文（含密钥）。
+            // 既有 `reveal_key` 的行为不动（章程 §3），因此在**本方法**的边界上再脱一次敏
+            // ——章程 §4.4 要求新增方法不得把密钥写进任何 `Error` 文案。
+            let material = result.map_err(scrub_error)?;
+            out.push((material.remote_id.clone(), material));
+        }
+        Ok(out)
     }
 }
 

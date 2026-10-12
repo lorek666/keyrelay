@@ -151,6 +151,28 @@ h2 {
   gap: 6px;
 }
 
+/* 投递预览的提示项（BACKLOG B-76）：不是错误，但用户该知道。
+   用告警色而不是错误色——投递照常可以做。 */
+.warnbox {
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 10px 0;
+}
+
+.warnline {
+  color: var(--warn);
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.warnline + .warnline {
+  margin-top: 6px;
+}
+
 .health-enabled {
   color: #7ee787;
 }

@@ -11,17 +11,24 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::password_crypto::{encrypt_password, PasswordEncryptionKey};
 use super::transport::{HttpRequest, HttpTransport, Method};
 use super::{
-    json_str, map_http_error, normalize_base_url, Balance, Credentials, KeyMaterial, KeyMeta,
-    KeySpec, KeyStatus, Session, SiteAdapter, SiteFingerprint, SiteKind,
+    json_str, map_http_error, normalize_base_url, scrub_error, Balance, Credentials, GroupInfo,
+    KeyMaterial, KeyMeta, KeySpec, KeyStatus, Session, SiteAdapter, SiteFingerprint, SiteKind,
 };
 use crate::error::{Error, Result, SecondFactorKind};
 
 pub const DEFAULT_QUOTA_PER_UNIT: i64 = 500_000;
+
+/// `POST /api/token/batch/keys` 单次可提交的 id 数上限（站点硬上限）。
+///
+/// 证据：`controller/token.go` 的 `GetTokenKeysBatch` 在 `len(ids) > 100` 时直接返回
+/// `MsgBatchTooMany`（`Max: 100`）。超限时适配器**顺序**分块，不并发——该路由挂了
+/// `middleware.CriticalRateLimit()`。
+pub const NEWAPI_BATCH_KEYS_MAX_IDS: usize = 100;
 
 pub struct NewApi<T: HttpTransport> {
     transport: T,
@@ -346,6 +353,59 @@ fn extract_items(value: &Value) -> Vec<Value> {
     }
 }
 
+/// 解析 `GET /api/token/auto-groups` 的 `data`（M6-S4 / PRD FR-2）。
+///
+/// **真实形态**（本机 NewAPI 源码实测，见 M6-S4 spec §5.1）：
+/// `data = {"groups": ["default", "vip"], "max_count": 3}` —— 元素是**分组名字符串**，
+/// 站点不给倍率，因此 `rate = None`（章程 §4.4：「`rate` 取站点字段，缺省 `None`」）。
+///
+/// **兼容形态**（真实站点未观察到，登记为 spec D-6）：元素为对象
+/// `{"name": …, "rate"|"ratio": …, "description": …}`。只有对象形态才可能出现倍率字段，
+/// 故保留该分支并测试。
+///
+/// 形态判据与既有列表解析同口径：逐条跳过取不出名字的条目，但**数组非空却一条都取不出**
+/// 时报错——静默返回空列表等于告诉用户「站点没有可选分组」。
+fn parse_auto_groups(data: &Value) -> Result<Vec<GroupInfo>> {
+    let items = data
+        .get("groups")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| Error::Transport("分组响应缺少 data.groups 数组".into()))?;
+
+    let mut out: Vec<GroupInfo> = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Value::String(name) if !name.is_empty() => out.push(GroupInfo {
+                name: name.clone(),
+                rate: None,
+                description: None,
+            }),
+            Value::Object(_) => {
+                let Some(name) = json_str(item, "/name").filter(|n| !n.is_empty()) else {
+                    continue;
+                };
+                out.push(GroupInfo {
+                    name: name.to_string(),
+                    rate: item
+                        .get("rate")
+                        .or_else(|| item.get("ratio"))
+                        .and_then(|v| v.as_f64()),
+                    description: json_str(item, "/description")
+                        .filter(|d| !d.is_empty())
+                        .map(|d| d.to_string()),
+                });
+            }
+            _ => {}
+        }
+    }
+    if !items.is_empty() && out.is_empty() {
+        return Err(Error::Transport(format!(
+            "分组响应有 {} 条，但都取不出可用的分组名",
+            items.len()
+        )));
+    }
+    Ok(out)
+}
+
 fn parse_key_meta(item: &Value) -> Result<Option<KeyMeta>> {
     // B-35：id 非法（非整数 / 0 / 负数）→ 整页失败，绝不静默跳过这一条
     // （静默跳过等于交付一份被悄悄截断的令牌列表）。
@@ -370,6 +430,53 @@ fn parse_key_meta(item: &Value) -> Result<Option<KeyMeta>> {
             .or_else(|| item.get("last_used_at"))
             .and_then(|v| v.as_i64()),
     }))
+}
+
+impl<T: HttpTransport> NewApi<T> {
+    /// 一次 `POST /api/token/batch/keys`，返回 `令牌 id → 明文` 的映射。
+    ///
+    /// 站点契约（M6-S4 spec §5.1）：请求体 `{"ids":[<int>, …]}`，
+    /// 响应 `{"success":true,"data":{"keys":{"<id>":"<key>", …}}}`。
+    /// 未命中的 id（已删除 / 不属于当前账号）**不会**出现在 `keys` 里，由调用方发现。
+    async fn batch_keys_once(
+        &self,
+        base: &str,
+        session: &Session,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, String>> {
+        let body = json!({ "ids": ids });
+        let req = self
+            .request(
+                Method::Post,
+                format!("{base}/api/token/batch/keys"),
+                session,
+            )
+            .json_body(&body)?;
+        let resp = self.transport.request(req).await?;
+        if resp.status != 200 {
+            return Err(scrub_error(map_http_error(
+                resp.status,
+                &resp.body,
+                resp.retry_after_secs(),
+            )));
+        }
+        let value = Self::unwrap_success(&resp, "批量读取令牌明文")?;
+        let keys = value
+            .pointer("/data/keys")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| Error::Transport("批量读明文响应缺少 data.keys 对象".into()))?;
+
+        let mut out: HashMap<i64, String> = HashMap::with_capacity(keys.len());
+        for (key, value) in keys {
+            // JSON 对象键一定是字符串。解析不出 id / 值不是字符串的条目直接忽略：
+            // 调用方只按自己请求的 id 取值，多余的键不影响结果。
+            let (Ok(id), Some(secret)) = (key.parse::<i64>(), value.as_str()) else {
+                continue;
+            };
+            out.insert(id, secret.to_string());
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait]
@@ -673,5 +780,79 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
             raw_quota,
             quota_per_unit: Some(unit),
         })
+    }
+
+    /// M6-S4 / PRD FR-2：`GET /api/token/auto-groups`。
+    async fn available_groups(&self, base_url: &str, session: &Session) -> Result<Vec<GroupInfo>> {
+        let url = format!("{}/api/token/auto-groups", normalize_base_url(base_url));
+        let resp = self
+            .transport
+            .request(self.request(Method::Get, url, session))
+            .await?;
+        if resp.status != 200 {
+            return Err(scrub_error(map_http_error(
+                resp.status,
+                &resp.body,
+                resp.retry_after_secs(),
+            )));
+        }
+        let value = Self::unwrap_success(&resp, "拉取分组")?;
+        parse_auto_groups(value.get("data").unwrap_or(&Value::Null))
+    }
+
+    /// M6-S4 / PRD FR-2：`POST /api/token/batch/keys` 批量读明文。
+    ///
+    /// - 空入参 → 空 `Vec`，**0 请求**；
+    /// - `n ≤ NEWAPI_BATCH_KEYS_MAX_IDS` → **恰好 1 次**请求（验收标准）；
+    /// - `n > 100` → 顺序分块（站点硬上限，spec D-4）；
+    /// - 返回顺序与入参**逐位一致**；站点少回任何一个 id → `NotFound`，不交付部分结果。
+    async fn reveal_keys(
+        &self,
+        base_url: &str,
+        session: &Session,
+        remote_ids: &[String],
+    ) -> Result<Vec<(String, KeyMaterial)>> {
+        if remote_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let base = normalize_base_url(base_url);
+
+        // 站点契约是 `ids: []int`：非正整数 id 在本地拦下，一个请求都不发。
+        // 错误文案里的 id 过 scrub —— 调用方若误把密钥当 id 传进来，也不会被回显。
+        let mut numeric: Vec<i64> = Vec::with_capacity(remote_ids.len());
+        for id in remote_ids {
+            let parsed = id.parse::<i64>().ok().filter(|v| *v > 0).ok_or_else(|| {
+                Error::Transport(format!(
+                    "NewAPI 批量读明文只接受正整数令牌 id（站点契约 ids: []int），收到 {}",
+                    crate::redact::scrub(id)
+                ))
+            })?;
+            numeric.push(parsed);
+        }
+
+        let mut secrets: HashMap<i64, String> = HashMap::with_capacity(numeric.len());
+        for chunk in numeric.chunks(NEWAPI_BATCH_KEYS_MAX_IDS) {
+            for (id, secret) in self.batch_keys_once(&base, session, chunk).await? {
+                secrets.entry(id).or_insert(secret);
+            }
+        }
+
+        let mut out: Vec<(String, KeyMaterial)> = Vec::with_capacity(remote_ids.len());
+        let mut missing: Vec<&str> = Vec::new();
+        for (raw, id) in remote_ids.iter().zip(&numeric) {
+            match secrets.get(id) {
+                Some(secret) => out.push((raw.clone(), KeyMaterial::new(raw.clone(), secret))),
+                None => missing.push(raw),
+            }
+        }
+        if !missing.is_empty() {
+            // 站点对未命中的 id 静默丢弃（`GetTokenKeysByIds` 只回命中行）：
+            // 必须由适配器发现，绝不交付「短一截」的结果。
+            return Err(Error::NotFound(format!(
+                "站点未返回以下令牌的明文（可能已被删除或不属于当前账号）：{}",
+                crate::redact::scrub(&missing.join(", "))
+            )));
+        }
+        Ok(out)
     }
 }

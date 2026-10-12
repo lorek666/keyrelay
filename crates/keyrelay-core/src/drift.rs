@@ -185,6 +185,8 @@ mod tests {
             target_path: path.display().to_string(),
             journal_id: "j1".into(),
             expected_sha256: Some(expected.clone()),
+            site_id: 7,
+            key_id: 11,
         };
         let report = report_for(&row);
         assert_eq!(report.state, DriftState::Intact);
@@ -211,6 +213,8 @@ mod tests {
             target_path: path.display().to_string(),
             journal_id: "j1".into(),
             expected_sha256: Some(hash_bytes(b"content")),
+            site_id: 7,
+            key_id: 11,
         };
 
         // 用「路径变成了目录」来稳定制造「存在但读不到」，不依赖 chmod（在 root 下会失效）
@@ -233,6 +237,8 @@ mod tests {
             target_path: path.display().to_string(),
             journal_id: "j1".into(),
             expected_sha256: None,
+            site_id: 7,
+            key_id: 11,
         };
         assert_eq!(report_for(&row).state, DriftState::Unknown);
     }
@@ -249,6 +255,8 @@ mod tests {
             target_path: path.display().to_string(),
             journal_id: "j1".into(),
             expected_sha256: None,
+            site_id: 7,
+            key_id: 11,
         };
         assert_eq!(report_for(&row).state, DriftState::Unknown);
     }

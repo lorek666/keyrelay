@@ -118,6 +118,7 @@ async fn local_operations_are_unaffected_by_the_network() {
         drift_check_on_start: true,
         gateway_enabled: false,
         gateway_port: 8787,
+        ..Settings::default()
     };
     f.service.update_settings(&settings).unwrap();
     assert_eq!(f.service.settings().unwrap(), settings);

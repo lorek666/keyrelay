@@ -94,6 +94,9 @@ pub struct DeliveryPlanDto {
     consent: String,
     consent_granted_at: Option<i64>,
     consent_revoked_at: Option<i64>,
+    /// 提示项（**不是错误**）。当前只有一条来源：同目录下存在「同主名、不同扩展名」
+    /// 的兄弟文件，可能被 agent 优先读取，从而让本次投递静默不生效（BACKLOG B-76）。
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -150,6 +153,22 @@ pub struct SettingsDto {
     drift_check_on_start: bool,
     gateway_enabled: bool,
     gateway_port: u16,
+    // ---- M6-S5：FR-9 界面与隐私 ----
+    theme: String,
+    language: String,
+    proxy_url: String,
+    telemetry_enabled: bool,
+    auto_update_enabled: bool,
+    // ---- M6-S5：FR-3 通知 ----
+    notify_system_enabled: bool,
+    notify_webhook_url: String,
+    notify_timeout_secs: u64,
+    // ---- M6-S5：FR-7 轮换与常驻 ----
+    rotation_max_age_days: u32,
+    rotation_warn_before_days: u32,
+    autostart_enabled: bool,
+    close_to_tray: bool,
+    start_hidden: bool,
 }
 
 #[derive(Serialize)]
@@ -422,6 +441,11 @@ pub fn delivery_plan(
                 ConsentState::Granted { granted_at } => ("granted", Some(granted_at), None),
                 ConsentState::Revoked { revoked_at } => ("revoked", None, Some(revoked_at)),
             };
+            // BACKLOG B-76：有些 agent 会优先读**另一个扩展名**的同名文件
+            // （本机实测 `~/.config/opencode/` 下 `.json` 与 `.jsonc` 并存）。
+            // 写进 A 而 agent 读 B 时投递会**静默不生效**——用户看到「已投递成功」，
+            // agent 却拿不到 key，且没有任何报错。这里只提示，不阻断。
+            let warnings = delivery_warnings(&plan.target_path);
             DeliveryPlanDto {
                 agent_id: plan.agent_id,
                 channel: plan.channel.as_str().to_string(),
@@ -439,9 +463,30 @@ pub fn delivery_plan(
                 consent: consent.to_string(),
                 consent_granted_at: granted_at,
                 consent_revoked_at: revoked_at,
+                warnings,
             }
         })
         .map_err(|e| e.to_string())
+}
+
+/// 投递预览的提示项。**不是错误**：投递照常可以做，只是用户该知道这件事。
+///
+/// 只对普通文件给提示（目录不算）。文案里带**文件名**而不是全路径——
+/// 全路径在 UI 上已经显示过了，这里补的是「还有哪个兄弟文件」。
+fn delivery_warnings(target: &std::path::Path) -> Vec<String> {
+    let siblings = keyrelay_core::service::sibling_config_files(target);
+    if siblings.is_empty() {
+        return Vec::new();
+    }
+    let names: Vec<String> = siblings
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect();
+    vec![format!(
+        "同目录下还有 {}。如果这个 agent 优先读它，本次投递会被静默忽略——\
+         请确认 agent 实际读的是哪个文件",
+        names.join("、")
+    )]
 }
 
 #[tauri::command]
@@ -572,6 +617,19 @@ fn settings_from_dto(dto: &SettingsDto) -> keyrelay_core::settings::Settings {
         drift_check_on_start: dto.drift_check_on_start,
         gateway_enabled: dto.gateway_enabled,
         gateway_port: dto.gateway_port,
+        theme: dto.theme.clone(),
+        language: dto.language.clone(),
+        proxy_url: dto.proxy_url.clone(),
+        telemetry_enabled: dto.telemetry_enabled,
+        auto_update_enabled: dto.auto_update_enabled,
+        notify_system_enabled: dto.notify_system_enabled,
+        notify_webhook_url: dto.notify_webhook_url.clone(),
+        notify_timeout_secs: dto.notify_timeout_secs,
+        rotation_max_age_days: dto.rotation_max_age_days,
+        rotation_warn_before_days: dto.rotation_warn_before_days,
+        autostart_enabled: dto.autostart_enabled,
+        close_to_tray: dto.close_to_tray,
+        start_hidden: dto.start_hidden,
     }
 }
 
@@ -582,6 +640,19 @@ fn settings_to_dto(settings: &keyrelay_core::settings::Settings) -> SettingsDto 
         drift_check_on_start: settings.drift_check_on_start,
         gateway_enabled: settings.gateway_enabled,
         gateway_port: settings.gateway_port,
+        theme: settings.theme.clone(),
+        language: settings.language.clone(),
+        proxy_url: settings.proxy_url.clone(),
+        telemetry_enabled: settings.telemetry_enabled,
+        auto_update_enabled: settings.auto_update_enabled,
+        notify_system_enabled: settings.notify_system_enabled,
+        notify_webhook_url: settings.notify_webhook_url.clone(),
+        notify_timeout_secs: settings.notify_timeout_secs,
+        rotation_max_age_days: settings.rotation_max_age_days,
+        rotation_warn_before_days: settings.rotation_warn_before_days,
+        autostart_enabled: settings.autostart_enabled,
+        close_to_tray: settings.close_to_tray,
+        start_hidden: settings.start_hidden,
     }
 }
 
@@ -853,6 +924,300 @@ pub async fn refresh_all(state: State<'_, AppState>) -> Result<RefreshSummaryDto
         .map_err(|e| e.to_string())
 }
 
+// ==================================================== M6-S5：FR-2 / FR-7 接线
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupDto {
+    name: String,
+    /// 分组倍率。`None` = 站点没给（**不是 0**，0 表示免费分组）。
+    rate: Option<f64>,
+    description: Option<String>,
+}
+
+#[tauri::command]
+pub async fn available_groups(
+    state: State<'_, AppState>,
+    site_id: i64,
+) -> Result<Vec<GroupDto>, String> {
+    state
+        .service
+        .available_groups(site_id)
+        .await
+        .map(|groups| {
+            groups
+                .into_iter()
+                .map(|g| GroupDto {
+                    name: g.name,
+                    rate: g.rate,
+                    description: g.description,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeySyncDto {
+    site_id: i64,
+    site_total: usize,
+    already_local: usize,
+    imported: usize,
+    /// 站点没给明文的 `remote_id`。界面据此引导「新建一把」而不是以为对齐成功了。
+    unreadable: Vec<String>,
+}
+
+/// 把站点侧已有密钥的明文一次性对齐到本地钥匙串（FR-2）。
+///
+/// **不返回任何明文**——理由见 `KeyRelayService::sync_site_keys` 的文档。
+#[tauri::command]
+pub async fn sync_site_keys(
+    state: State<'_, AppState>,
+    site_id: i64,
+) -> Result<KeySyncDto, String> {
+    state
+        .service
+        .sync_site_keys(site_id)
+        .await
+        .map(|s| KeySyncDto {
+            site_id: s.site_id,
+            site_total: s.site_total,
+            already_local: s.already_local,
+            imported: s.imported,
+            unreadable: s.unreadable,
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotationDueDto {
+    key_id: i64,
+    site_id: i64,
+    name: String,
+    created_at: i64,
+    due_at: i64,
+}
+
+/// 该轮换的密钥（FR-7）。纯本地判定，不联网、不读密钥。
+#[tauri::command]
+pub fn rotation_due(state: State<'_, AppState>) -> Result<Vec<RotationDueDto>, String> {
+    state
+        .service
+        .rotation_due()
+        .map(|due| {
+            due.into_iter()
+                .map(|d| RotationDueDto {
+                    key_id: d.key_id,
+                    site_id: d.site_id,
+                    name: d.name,
+                    created_at: d.created_at,
+                    due_at: d.due_at,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotationPlanDto {
+    key_id: i64,
+    site_id: i64,
+    key_name: String,
+    /// 固定三步的稳定标识（`create_new` / `reinject_all` / `revoke_old`）
+    steps: Vec<String>,
+    /// 会被重注入的通道
+    channels: Vec<String>,
+    /// 认不出通道的目标；**非空 = 界面必须禁用「开始轮换」**
+    unmapped_targets: Vec<String>,
+    old_remote_id: Option<String>,
+}
+
+/// 轮换预览（FR-7）。只读，一个请求都不发。
+#[tauri::command]
+pub fn rotation_plan(state: State<'_, AppState>, key_id: i64) -> Result<RotationPlanDto, String> {
+    state
+        .service
+        .rotation_plan(key_id)
+        .map(|plan| RotationPlanDto {
+            key_id: plan.key_id,
+            site_id: plan.site_id,
+            key_name: plan.key_name,
+            steps: plan
+                .steps
+                .iter()
+                .map(|step| step.as_str().to_string())
+                .collect(),
+            channels: plan.channels,
+            unmapped_targets: plan.unmapped_targets,
+            old_remote_id: plan.old_remote_id,
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotationRunDto {
+    /// 新密钥的**掩码**形态（明文只在钥匙串里，绝不过 IPC）
+    new_key_id: i64,
+    new_key_masked: String,
+    reinjected: Vec<String>,
+    /// `"revoked"` | `"skippedNoRemoteId"` | `"notAttempted"` | `"failed"`
+    revoke: String,
+    revoke_reason: Option<String>,
+    /// `"create_new"` | `"reinject_all"` | `"revoke_old"`；`None` = 没中途失败
+    stopped_at: Option<String>,
+    stop_reason: Option<String>,
+    /// 三步是否都没中途失败。**界面不得只看它**——`skippedNoRemoteId` 也算完成，
+    /// 但那是「本来就没得回收」，必须单独说明。
+    completed: bool,
+}
+
+/// 执行轮换（FR-7，PRD §176 的「一键三连」）。
+///
+/// 破坏性操作：界面必须先调 `rotation_plan` 出预览并做二次确认（PRD §7）。
+/// 中途失败**不**返回 `Err`——那种情况下「停在哪一步」本身就是用户必须看到的信息，
+/// 压成一条错误字符串会被读成「什么都没发生」。
+#[tauri::command]
+pub async fn rotate_key(
+    state: State<'_, AppState>,
+    key_id: i64,
+    name: String,
+) -> Result<RotationRunDto, String> {
+    let run = state
+        .service
+        .rotate_key(key_id, keyrelay_core::site::KeySpec::named(name))
+        .await
+        .map_err(|e| e.to_string())?;
+    let (revoke, revoke_reason) = match &run.revoke {
+        keyrelay_core::service::RevokeOutcome::Revoked => ("revoked".to_string(), None),
+        keyrelay_core::service::RevokeOutcome::SkippedNoRemoteId => {
+            ("skippedNoRemoteId".to_string(), None)
+        }
+        keyrelay_core::service::RevokeOutcome::NotAttempted => ("notAttempted".to_string(), None),
+        keyrelay_core::service::RevokeOutcome::Failed(reason) => {
+            ("failed".to_string(), Some(reason.clone()))
+        }
+    };
+    Ok(RotationRunDto {
+        new_key_id: run.new_key.id,
+        new_key_masked: run.new_key.masked.clone(),
+        reinjected: run.reinjected.clone(),
+        revoke,
+        revoke_reason,
+        stopped_at: run.stopped_at.map(|step| step.as_str().to_string()),
+        stop_reason: run.stop_reason.clone(),
+        completed: run.completed(),
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutostartDto {
+    /// `"enabled"` | `"disabled"` | `"unknown"`
+    state: String,
+    /// 计划的人类可读摘要（**不含任何值**，见 `EnvPlan::describe`）。
+    ///
+    /// 仅 `autostart_set` 返回时有内容；`autostart_status` 为 `None`。
+    plan: Option<String>,
+    /// 是否需要用户在系统设置里手动放行（本产品不做提权）。
+    manual_action: Option<String>,
+}
+
+fn autostart_dto(state: keyrelay_core::autostart::AutostartState) -> AutostartDto {
+    use keyrelay_core::autostart::AutostartState;
+    AutostartDto {
+        state: match state {
+            AutostartState::Enabled => "enabled",
+            AutostartState::Disabled => "disabled",
+            AutostartState::Unknown => "unknown",
+        }
+        .to_string(),
+        plan: None,
+        manual_action: None,
+    }
+}
+
+#[tauri::command]
+pub fn autostart_status(state: State<'_, AppState>) -> Result<AutostartDto, String> {
+    state
+        .service
+        .autostart_state()
+        .map(autostart_dto)
+        .map_err(|e| e.to_string())
+}
+
+/// 开启 / 关闭登录自启（FR-7）。
+///
+/// `hidden` 固定为 `true`（见 `KeyRelayService::autostart_plan`）：自启的用途就是后台刷新，
+/// 弹窗会破坏它。`--hidden` 在托盘不可用时会被壳层降级成显示窗口，所以不会出现
+/// 「启动了但没有任何入口」。
+#[tauri::command]
+pub fn autostart_set(state: State<'_, AppState>, enabled: bool) -> Result<AutostartDto, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("拿不到当前可执行文件路径，无法写入自启项: {e}"))?;
+    let plan = state
+        .service
+        .autostart_plan(enabled, &exe)
+        .map_err(|e| e.to_string())?;
+    let describe = plan.describe();
+    apply_env_plan(&state, &plan)?;
+    let mut dto = autostart_dto(state.service.autostart_state().map_err(|e| e.to_string())?);
+    dto.plan = Some(describe);
+    Ok(dto)
+}
+
+/// 落盘一份环境/自启计划。
+///
+/// Windows 形态（`EnvPlan::Registry`）走 `reg.exe`，**不经 shell**——值里的空格、
+/// 引号、`%` 原样到达（`RegOp::to_argv` 已单测）。本机（macOS）上这条分支不可达：
+/// `autostart_plan` 只会产出 macOS 的 plist。
+fn apply_env_plan(
+    state: &State<'_, AppState>,
+    plan: &keyrelay_core::platform_env::EnvPlan,
+) -> Result<(), String> {
+    use keyrelay_core::platform_env::EnvPlan;
+    match plan {
+        EnvPlan::Files(_) => state
+            .service
+            .apply_env_plan(plan)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        EnvPlan::Registry(ops) => {
+            for op in ops {
+                run_reg_op(op)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_reg_op(op: &keyrelay_core::platform_env::RegOp) -> Result<(), String> {
+    use keyrelay_core::platform_env::REG_EXE;
+    let output = std::process::Command::new(REG_EXE)
+        .args(op.to_argv())
+        .output()
+        .map_err(|e| format!("执行 {REG_EXE} 失败: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{REG_EXE} 返回失败（{}）: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+#[cfg(not(windows))]
+fn run_reg_op(_op: &keyrelay_core::platform_env::RegOp) -> Result<(), String> {
+    // 非 Windows 上不该走到这里：`autostart_plan` 按平台选落点，macOS 产出 plist。
+    // 真走到了说明有人把 `EnvScope::WindowsUserEnv` 硬编码进了调用链。
+    Err("注册表操作只在 Windows 上可执行（当前平台不支持）".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -969,6 +1334,9 @@ mod tests {
             consent: "missing".into(),
             consent_granted_at: None,
             consent_revoked_at: None,
+            // M6-S5：同目录有「同主名、不同扩展名」的兄弟文件时的提示（BACKLOG B-76）。
+            // 这里塞一条真的，顺带断言它确实到了线上字段名 `warnings` 上。
+            warnings: vec!["同目录下还有 auth.jsonc。".into()],
         };
         let value = to_value(&plan);
         assert_eq!(value["agentId"], "codex");
@@ -978,6 +1346,7 @@ mod tests {
         assert_eq!(value["fields"][1]["masked"], "…cdef");
         assert_eq!(value["consent"], "missing");
         assert_eq!(value["consentGrantedAt"], Value::Null);
+        assert_eq!(value["warnings"][0], "同目录下还有 auth.jsonc。");
         assert!(value.get("target_path").is_none(), "不得出现 snake_case");
 
         let outcome = DeliveryOutcomeDto {
