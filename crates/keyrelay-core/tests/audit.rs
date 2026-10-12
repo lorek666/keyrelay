@@ -209,11 +209,11 @@ fn audit_covers_the_export_directory() {
 
     // ① 加密导出：不误报，但确实被扫到了
     let encrypted_path = exports_dir.join("encrypted.json");
-    let (_, encrypted, _) = f
+    let outcome = f
         .service
         .export_to_file(&encrypted_path, Some("correct horse battery staple"))
         .unwrap();
-    assert!(encrypted);
+    assert!(outcome.encrypted);
 
     let with_export = f.service.audit_redaction().unwrap();
     assert!(
@@ -283,4 +283,105 @@ fn audit_scans_wal_and_shm_when_present() {
     assert!(report.is_clean(), "{}", report.summary());
     // 至少扫到 db 本身；WAL/SHM 存在时也应被扫到
     assert!(report.files_scanned >= 1);
+}
+
+/// `merge_export_registry` 的并集语义（M5-S1 / B-60 的扫描集合那一半）。
+#[test]
+fn merge_export_registry_dedupes_and_keeps_order() {
+    let mut paths = vec![PathBuf::from("/already/scanned.db")];
+    let record = |path: &str, bytes: i64| keyrelay_core::store::ExportRecord {
+        path: path.to_string(),
+        encrypted: false,
+        bytes,
+        exported_at: 0,
+    };
+    let records = vec![
+        record("/already/scanned.db", 1), // 与已有项重复
+        record("/user/chosen/a.json", 2),
+        record("/user/chosen/a.json", 3), // 登记表内部重复
+        record("/user/chosen/b.json", 4),
+    ];
+
+    keyrelay_core::audit::merge_export_registry(&mut paths, &records);
+    assert_eq!(
+        paths,
+        vec![
+            PathBuf::from("/already/scanned.db"),
+            PathBuf::from("/user/chosen/a.json"),
+            PathBuf::from("/user/chosen/b.json"),
+        ],
+        "并集去重：已有项不动、新项按登记顺序追加"
+    );
+
+    let before = paths.clone();
+    keyrelay_core::audit::merge_export_registry(&mut paths, &[]);
+    assert_eq!(paths, before, "空登记表不该改动集合");
+}
+
+/// B-60：用户自选的导出路径不在任何固定目录里，只能靠登记表找回来。
+///
+/// 这里构造一个**默认导出目录之外**的明文文件并登记它，断言它真的进了扫描集合 ——
+/// 只断言「审计报了」是不够的，还要断言它指向的是那个文件。
+/// （`audit_redaction` 里那两行接线由 Lead 在 M5-S5 落地；本测试钉的是原语行为。）
+#[test]
+fn audit_registry_paths_enter_the_scan_set_outside_the_default_export_dir() {
+    let f = setup();
+    let chosen_dir = tempfile::tempdir().unwrap(); // 模拟用户自选的目录
+    let chosen = chosen_dir.path().join("my-export.json");
+    fs::write(&chosen, format!("{{\"leaked\":\"{SECRET}\"}}")).unwrap();
+
+    let store = Store::open(&f.db_path).unwrap();
+    store.record_export(&chosen, false, 64).unwrap();
+
+    // 与 `audit_redaction` 的组装顺序一致：固定路径 + 登记表
+    let mut paths = vec![f.db_path.clone(), f.backup_dir.clone()];
+    let records = store.list_exports().unwrap();
+    assert_eq!(records.len(), 1, "登记表应有一条: {records:?}");
+    keyrelay_core::audit::merge_export_registry(&mut paths, &records);
+
+    let report = keyrelay_core::audit::scan_paths(&paths);
+    assert!(
+        !report.is_clean(),
+        "登记表里的导出路径必须进扫描集合: {report:?}"
+    );
+    assert!(
+        report.findings.iter().any(|finding| matches!(
+            finding,
+            keyrelay_core::audit::AuditFinding::PlaintextInFile { path, .. } if path == &chosen
+        )),
+        "发现项必须指向用户自选路径那个文件: {:?}",
+        report.findings
+    );
+}
+
+/// 登记表里的路径**可能已被用户删掉**：审计不得因此报错、误报或 panic。
+#[test]
+fn registry_paths_that_no_longer_exist_are_skipped_without_error() {
+    let f = setup();
+    let store = Store::open(&f.db_path).unwrap();
+
+    let gone_dir = tempfile::tempdir().unwrap();
+    let gone = gone_dir.path().join("deleted-after-export.json");
+    store.record_export(&gone, true, 128).unwrap();
+    // 极端输入：空路径也要扛住（不算 Unreadable、不 panic）
+    store
+        .record_export(std::path::Path::new(""), false, 0)
+        .unwrap();
+    drop(gone_dir); // 目录连同文件一起消失，模拟「用户删掉了导出物」
+
+    let mut paths = vec![f.db_path.clone(), f.backup_dir.clone()];
+    let baseline = keyrelay_core::audit::scan_paths(&paths);
+    keyrelay_core::audit::merge_export_registry(&mut paths, &store.list_exports().unwrap());
+    let after = keyrelay_core::audit::scan_paths(&paths);
+
+    assert_eq!(
+        after.files_scanned, baseline.files_scanned,
+        "不存在的登记路径不该增加扫描计数"
+    );
+    assert!(after.is_clean(), "{}", after.summary());
+    assert!(
+        after.findings.is_empty(),
+        "不存在的路径不该产生任何发现（含 Unreadable）: {:?}",
+        after.findings
+    );
 }

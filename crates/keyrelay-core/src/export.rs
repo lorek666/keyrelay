@@ -104,9 +104,42 @@ pub struct KdfParams {
     pub salt: String,
 }
 
-/// 明文导出。
+/// 明文导出。**序列化之前先过 [`sanitize_bundle`]**（见该函数的说明）。
 pub fn to_json(bundle: &ExportBundle) -> Result<String> {
-    serde_json::to_string_pretty(bundle).map_err(|e| Error::Store(format!("序列化导出包失败: {e}")))
+    let sanitized = sanitize_bundle(bundle);
+    serde_json::to_string_pretty(&sanitized)
+        .map_err(|e| Error::Store(format!("序列化导出包失败: {e}")))
+}
+
+/// 导出前的纵深脱敏（M5-S1 / 关闭 B-62、B-63）。**幂等**；对本来干净的导出包是恒等变换。
+///
+/// 为什么钉在 `to_json` 而不是 `service::export_bundle`：
+/// `to_json` 是明文导出与加密导出**共同的唯一出口**（`encrypt` 内部也调它），
+/// 钉在这里等于「默认安全」—— 任何调用方都绕不过去，将来新增导出入口也不会忘记脱敏。
+///
+/// 三处（对应 BACKLOG 的三条）：
+/// - `sites[].base_url`：剥掉 userinfo（`https://user:pass@host` → `https://host`，B-63）；
+/// - `events[].message`：`scrub` + 钥匙串引用脱敏（B-62）；
+/// - `events[].payload`：按键名结构化脱敏 + 引用脱敏（B-62）。
+///
+/// `service::export_bundle` 已经在拼装时对 message/payload 调过一次 `scrub`，
+/// 这里**再调一次是刻意的**：`scrub` 幂等，代价是一次多余扫描，换来的是
+/// 「脱敏不依赖调用方记性」。
+pub fn sanitize_bundle(bundle: &ExportBundle) -> ExportBundle {
+    let mut sanitized = bundle.clone();
+
+    for site in &mut sanitized.sites {
+        site.base_url = crate::redact::strip_url_userinfo(&site.base_url);
+    }
+
+    for event in &mut sanitized.events {
+        // 用共享出口，不手抄组合（M5-S1 复审 P2-1）：两条导出路径必须走同一段代码，
+        // 否则「同源」只是注释承诺，迟早分叉。
+        event.message = crate::redact::scrub_event_message(&event.message);
+        event.payload = crate::redact::scrub_event_payload(event.payload.as_deref());
+    }
+
+    sanitized
 }
 
 /// 从明文 JSON 解析。
@@ -370,5 +403,44 @@ mod tests {
         assert!(!text.contains("secret_ref"), "{text}");
         assert!(!text.contains("\"key\""), "{text}");
         assert!(!text.contains("sk-"), "{text}");
+    }
+
+    #[test]
+    fn sanitize_is_a_no_op_for_a_clean_bundle() {
+        // 咽喉点不能改坏本来就干净的导出包（既有 `json_round_trip` 的上游保证）
+        let bundle = sample();
+        assert_eq!(sanitize_bundle(&bundle), bundle);
+        assert_eq!(
+            to_json(&bundle).unwrap(),
+            serde_json::to_string_pretty(&bundle).unwrap()
+        );
+    }
+
+    #[test]
+    fn sanitize_is_idempotent_and_covers_the_encrypted_path() {
+        let mut bundle = sample();
+        bundle.sites[0].base_url = "https://user:pass@relay.example.com".into();
+        bundle.events.push(ExportEvent {
+            ts: 1,
+            level: "info".into(),
+            source: "app".into(),
+            message: "取密钥失败 kr/key/1/secret".into(),
+            payload: Some(r#"{"password":"hunter2","key_id":1}"#.into()),
+        });
+
+        let once = sanitize_bundle(&bundle);
+        assert_eq!(sanitize_bundle(&once), once, "脱敏必须幂等");
+        assert_eq!(once.sites[0].base_url, "https://relay.example.com");
+        assert_eq!(once.events[0].message, "取密钥失败 kr/***");
+        assert_eq!(
+            once.events[0].payload.as_deref(),
+            Some(r#"{"password":"***","key_id":1}"#),
+            "命中键被掩、不得命中的键原样保留"
+        );
+
+        // 加密路径与明文路径共用 `to_json`：解出来必须是脱敏后的内容，密文里也不能有凭证
+        let envelope = encrypt(&bundle, "pw").unwrap();
+        assert!(!envelope.contains("user:pass"), "{envelope}");
+        assert_eq!(decrypt(&envelope, "pw").unwrap(), once);
     }
 }

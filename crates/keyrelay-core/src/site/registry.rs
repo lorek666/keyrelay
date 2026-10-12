@@ -60,13 +60,22 @@ impl<T: HttpTransport + Clone + 'static> SiteRegistry<T> {
     ///
     /// `Unimplemented` 的适配器（占位实现）直接跳过；其余失败原因会被汇总进最终错误，
     /// 便于用户判断「是站点类型不支持，还是网络/站点改版」。
+    ///
+    /// 适配器**只能认领自己的类型**（BACKLOG B-20）：返回的 `fingerprint.kind` 与请求的
+    /// `kind` 不一致时，该结果被视为不匹配并继续探测下一个适配器——否则一个写错 `kind`
+    /// 的适配器会把「别的站点类型」的指纹交给调用方，后续按类型分发的逻辑全部错位。
     pub async fn detect(&self, base_url: &str) -> Result<SiteFingerprint> {
         let mut reasons: Vec<String> = Vec::new();
 
         for kind in self.probe_order.clone() {
             let adapter = self.adapter(kind);
             match adapter.detect(base_url).await {
-                Ok(fingerprint) => return Ok(fingerprint),
+                Ok(fingerprint) if fingerprint.kind == kind => return Ok(fingerprint),
+                Ok(fingerprint) => reasons.push(format!(
+                    "{}: 适配器返回的指纹类型 {} 与请求的类型不一致，已忽略该结果",
+                    kind.as_str(),
+                    fingerprint.kind.as_str()
+                )),
                 Err(Error::Unimplemented(_)) => continue,
                 Err(err) => reasons.push(format!("{}: {err}", kind.as_str())),
             }
@@ -93,7 +102,81 @@ fn detection_failure(base_url: &str, reasons: Vec<String>) -> Result<SiteFingerp
 mod tests {
     use super::*;
     use crate::site::transport::{HttpResponse, MockTransport};
+    use crate::site::{Balance, Credentials, KeyMaterial, KeyMeta, KeySpec, Session};
     use serde_json::json;
+
+    /// 可控指纹类型的最小适配器（B-20 探针）：`claimed` 与 `kind` 故意可以不一致。
+    struct StubAdapter {
+        kind: SiteKind,
+        claimed: SiteKind,
+    }
+
+    #[async_trait::async_trait]
+    impl SiteAdapter for StubAdapter {
+        fn kind(&self) -> SiteKind {
+            self.kind
+        }
+
+        async fn detect(&self, _base_url: &str) -> Result<SiteFingerprint> {
+            Ok(SiteFingerprint {
+                kind: self.claimed,
+                display_name: "桩适配器".to_string(),
+                version: None,
+            })
+        }
+
+        async fn login(&self, _base_url: &str, _cred: Credentials) -> Result<Session> {
+            Err(Error::Unimplemented("测试桩".into()))
+        }
+
+        async fn list_keys(&self, _base_url: &str, _session: &Session) -> Result<Vec<KeyMeta>> {
+            Err(Error::Unimplemented("测试桩".into()))
+        }
+
+        async fn create_key(
+            &self,
+            _base_url: &str,
+            _session: &Session,
+            _spec: KeySpec,
+        ) -> Result<KeyMaterial> {
+            Err(Error::Unimplemented("测试桩".into()))
+        }
+
+        async fn reveal_key(
+            &self,
+            _base_url: &str,
+            _session: &Session,
+            _remote_id: &str,
+        ) -> Result<KeyMaterial> {
+            Err(Error::Unimplemented("测试桩".into()))
+        }
+
+        async fn revoke_key(
+            &self,
+            _base_url: &str,
+            _session: &Session,
+            _remote_id: &str,
+        ) -> Result<()> {
+            Err(Error::Unimplemented("测试桩".into()))
+        }
+
+        async fn balance(&self, _base_url: &str, _session: &Session) -> Result<Balance> {
+            Err(Error::Unimplemented("测试桩".into()))
+        }
+    }
+
+    fn stub(kind: SiteKind, claimed: SiteKind) -> Arc<dyn SiteAdapter> {
+        Arc::new(StubAdapter { kind, claimed })
+    }
+
+    /// 把一个冒名适配器塞进 registry 的实例缓存，覆盖真实适配器。
+    fn install_liar(registry: &SiteRegistry<MockTransport>, kind: SiteKind, claimed: SiteKind) {
+        registry
+            .cache
+            .lock()
+            .expect("缓存锁")
+            .insert(kind, stub(kind, claimed));
+    }
 
     fn newapi_status_response() -> HttpResponse {
         HttpResponse::json(
@@ -228,5 +311,54 @@ mod tests {
             registry.adapter(SiteKind::Sub2Api).kind(),
             SiteKind::Sub2Api
         );
+    }
+
+    // ==================================================== M5-S3：B-20 指纹类型自洽
+
+    #[tokio::test]
+    async fn detect_ignores_a_fingerprint_with_a_mismatched_kind() {
+        // 冒名的 NewApi 适配器自称返回 Sub2Api 指纹。旧实现会直接采用它
+        // （`display_name` 来自冒名者）；新实现必须忽略，继续让真正的 Sub2Api 认领。
+        let sub2api = HttpResponse::json(
+            200,
+            json!({"code": 0, "message": "success", "data": {"site_name": "真正的 Sub2API"}}),
+        )
+        .expect("构造测试响应");
+        let mock = MockTransport::new(vec![sub2api]);
+        let registry = SiteRegistry::new(mock.clone());
+        install_liar(&registry, SiteKind::NewApi, SiteKind::Sub2Api);
+
+        let fingerprint = registry.detect("https://x.example.com").await.unwrap();
+        assert_eq!(fingerprint.kind, SiteKind::Sub2Api);
+        assert_eq!(
+            fingerprint.display_name, "真正的 Sub2API",
+            "冒名适配器的指纹不得被采用"
+        );
+        assert_eq!(mock.request_count(), 1, "只有真适配器发过请求");
+    }
+
+    #[tokio::test]
+    async fn detect_reports_kind_mismatch_when_no_adapter_matches() {
+        // 唯一候选返回别的类型 → 视为不匹配，错误里要能看出「谁在冒名」
+        let registry = SiteRegistry::new(MockTransport::new(vec![]));
+        install_liar(&registry, SiteKind::NewApi, SiteKind::Sub2Api);
+
+        let err = registry.detect("https://x.example.com").await.unwrap_err();
+        assert!(matches!(err, Error::FingerprintMismatch(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("newapi"), "{message}");
+        assert!(message.contains("sub2api"), "{message}");
+        assert!(message.contains("与请求的类型不一致"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn detect_accepts_a_fingerprint_with_a_matching_kind() {
+        // 反例保护：类型一致时不得被新校验拦下
+        let registry = SiteRegistry::new(MockTransport::new(vec![]));
+        install_liar(&registry, SiteKind::NewApi, SiteKind::NewApi);
+
+        let fingerprint = registry.detect("https://x.example.com").await.unwrap();
+        assert_eq!(fingerprint.kind, SiteKind::NewApi);
+        assert_eq!(fingerprint.display_name, "桩适配器");
     }
 }

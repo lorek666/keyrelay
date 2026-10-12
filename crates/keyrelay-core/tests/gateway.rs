@@ -8,7 +8,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use keyrelay_core::gateway::{generate_token, start, GatewayConfig};
+use keyrelay_core::gateway::{
+    generate_token, start, GatewayConfig, GatewayHandle, BIND_RETRY_ATTEMPTS, BIND_RETRY_DELAY,
+};
 
 const SITE_KEY: &str = "sk-upstream-0123456789abcdef";
 
@@ -217,6 +219,21 @@ async fn start_gateway(upstream: &FakeUpstream) -> (keyrelay_core::gateway::Gate
     .await
     .expect("网关应能启动");
     (handle, token)
+}
+
+/// 在**指定端口**上起网关（`port = 0` 时由内核分配）。M5-S4 的重启用例要能指定端口。
+async fn start_gateway_on(
+    upstream: &FakeUpstream,
+    port: u16,
+) -> keyrelay_core::Result<GatewayHandle> {
+    start(GatewayConfig {
+        port,
+        token: generate_token(),
+        base_url: upstream.base_url.clone(),
+        api_key: SITE_KEY.to_string(),
+        site_display_name: "假站点".to_string(),
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -505,4 +522,84 @@ async fn a_busy_port_is_reported_clearly() {
     .await
     .expect_err("端口被占用时必须报错");
     assert!(err.to_string().contains("端口"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restarting_on_the_same_port_after_shutdown_and_wait_succeeds() {
+    // B-64 的正面用例：`shutdown_and_wait().await` 返回时监听套接字必须已经释放，
+    // 于是「停旧 → 立刻绑新同一端口」必然成功（旧实现要碰运气）。
+    // 端口用 0 拿内核分配的实际端口，避免与 CI / 队友的固定端口冲突；跑 3 轮提高敏感度。
+    let upstream = spawn_fake_upstream();
+
+    for round in 0..3 {
+        let first = start_gateway_on(&upstream, 0).await.expect("网关应能启动");
+        let port = first.addr.port();
+        assert_ne!(port, 0, "内核应分配真实端口");
+
+        first.shutdown_and_wait().await;
+
+        // ① 立刻（中间没有 sleep）连一下：不该还有人在 accept
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "第 {round} 轮：shutdown_and_wait 返回后 {port} 上不该还有监听者"
+        );
+
+        // ② 立刻用 OS 层直接 bind：端口必须已经可绑定
+        let probe = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| {
+            panic!("第 {round} 轮：shutdown_and_wait 返回后端口 {port} 必须已可绑定: {e}")
+        });
+        drop(probe);
+
+        // ③ 立刻 start 同端口：必须成功，端口号一致。
+        //    这条耗时断言只是**粗界**（重启不该烧掉退避预算）；「有没有真的等」由单测
+        //    `shutdown_and_wait_releases_the_port_before_returning` 确定性钉住。
+        let started = std::time::Instant::now();
+        let second = start_gateway_on(&upstream, port)
+            .await
+            .unwrap_or_else(|e| panic!("第 {round} 轮：同端口立刻重启必须成功: {e}"));
+        let elapsed = started.elapsed();
+        assert_eq!(second.addr.port(), port);
+        assert!(
+            elapsed < BIND_RETRY_ATTEMPTS * BIND_RETRY_DELAY / 2,
+            "第 {round} 轮：重启不该烧掉退避预算（实测 {elapsed:?}）"
+        );
+
+        second.shutdown_and_wait().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_start_without_shutdown_fails_after_the_full_retry_budget() {
+    // B-64 的负面用例：旧网关**不**关，第二个网关绑同一端口必须明确报错。
+    // 有了退避重试之后，报错会先等满 20 × 50ms 的预算——把这段耗时也断言进去：
+    // 既钉住「确实重试过」，也钉住「没有无限重试」。
+    let upstream = spawn_fake_upstream();
+    let first = start_gateway_on(&upstream, 0).await.expect("网关应能启动");
+    let port = first.addr.port();
+
+    let started = std::time::Instant::now();
+    let err = start_gateway_on(&upstream, port)
+        .await
+        .expect_err("同一端口上的第二个网关必须报错");
+    let elapsed = started.elapsed();
+    let text = err.to_string();
+
+    assert!(text.contains("端口"), "文案要提端口: {text}");
+    assert!(text.contains("占用"), "文案要说清是被占用: {text}");
+    assert!(
+        text.contains(&port.to_string()),
+        "文案要带实际端口号 {port}: {text}"
+    );
+    assert!(
+        elapsed >= BIND_RETRY_ATTEMPTS * BIND_RETRY_DELAY,
+        "必须等满退避预算 {}×{:?}（实测 {elapsed:?}）",
+        BIND_RETRY_ATTEMPTS,
+        BIND_RETRY_DELAY
+    );
+    assert!(
+        elapsed < BIND_RETRY_ATTEMPTS * BIND_RETRY_DELAY * 5,
+        "不许无界重试（实测 {elapsed:?}）"
+    );
+
+    first.shutdown_and_wait().await;
 }

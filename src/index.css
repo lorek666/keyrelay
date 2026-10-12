@@ -159,6 +159,11 @@ h2 {
   color: var(--muted);
 }
 
+/* 会话已失效，需要用户重新登录（B-61）。用告警色，因为它需要人动手。 */
+.health-needs-login {
+  color: var(--warn);
+}
+
 button.ghost {
   display: inline-flex;
   align-items: center;

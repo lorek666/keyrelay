@@ -29,7 +29,10 @@ function ExportCard() {
     onSuccess: (r) => {
       setError(null);
       setResult(
-        `已导出到 ${r.path}（${r.encrypted ? "已加密" : "明文"}，${r.bytes} 字节）`,
+        `已导出到 ${r.path}（${r.encrypted ? "已加密" : "明文"}，${r.bytes} 字节）` +
+          (r.registered
+            ? ""
+            : "。注意：这个文件没能登记进「已知导出物」表，脱敏审计不会扫描它——请自行确认它里面没有明文凭证。"),
       );
     },
     onError: (err: Error) => {

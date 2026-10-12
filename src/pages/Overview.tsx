@@ -38,6 +38,10 @@ export default function Overview() {
   );
   const hasUnreadable = drifted.some((r) => r.state === "unreadable");
 
+  // 会话已失效、需要重新登录的站点（B-61）。从站点表读，而不是只看上一轮刷新结果：
+  // 一轮刷新只反映那一刻，而这个状态是**持久**的——用户不重新登录就一直存在。
+  const needsLogin = (sites.data ?? []).filter((s) => s.health === "needs_login");
+
   const warnings = (events.data ?? []).filter(
     (e) => e.level === "warn" || e.level === "error",
   );
@@ -106,6 +110,9 @@ export default function Overview() {
             {refresh.data.balanceAlerts.length
               ? ` / 余额告警 ${refresh.data.balanceAlerts.length} 个站点`
               : ""}
+            {refresh.data.needsLogin.length
+              ? ` / 需要重新登录 ${refresh.data.needsLogin.length} 个站点`
+              : ""}
           </p>
         ) : null}
 
@@ -123,6 +130,28 @@ export default function Overview() {
           </p>
         ) : null}
       </div>
+
+      {needsLogin.length ? (
+        <div className="card">
+          <h3>
+            <AlertTriangle size={15} aria-hidden /> 需要重新登录（{needsLogin.length}）
+          </h3>
+          <ul className="list">
+            {needsLogin.map((s) => (
+              <li key={s.id}>
+                <span className="badge badge-warn">needs_login</span>{" "}
+                <span className="mono ellipsis" title={s.baseUrl}>
+                  {s.displayName || s.baseUrl}
+                </span>
+              </li>
+            ))}
+          </ul>
+          <p className="muted">
+            这些站点的会话已经失效，刷新时会被跳过——既不算成功也不算失败，
+            所以不会出现在上面的「失败」计数里。请到「站点」页重新登录。
+          </p>
+        </div>
+      ) : null}
 
       {drifted.length ? (
         <div className="card">

@@ -310,18 +310,50 @@ pub fn default_lock_dir() -> PathBuf {
 /// 备份落在 `backup_dir/<journal_id>/` 下：每次 apply 一个独立目录，
 /// 避免同一目标文件被多次注入时后一次覆盖前一次的备份（那样会导致回滚链断裂）。
 pub fn apply(patches: &[Patch], backup_dir: &Path) -> Result<Journal> {
-    // 同一个目标文件在 patches 里出现两次时只取一把锁，否则自己和自己互斥。
+    // BACKLOG B-46：同批次重复路径在**取锁之前**就拒绝。
+    // 放到这里而不是只放进 `apply_holding_lock`，是为了让「等价但字面不同」的路径
+    // （`a/config.toml` 与 `./a/config.toml`）也拿到「同一批次重复」的专用文案，
+    // 而不是先撞出 `FileBusy`（同一个归一化目标取第二把锁必然失败）。
+    reject_duplicate_targets(patches)?;
+
+    // 每个目标路径到这里都是唯一的，因此一条补丁一把锁即可（无需去重）。
     let lock_dir = default_lock_dir();
-    let mut locks: Vec<lock::FileLock> = Vec::new();
-    let mut locked: Vec<PathBuf> = Vec::new();
+    let mut locks: Vec<lock::FileLock> = Vec::with_capacity(patches.len());
     for patch in patches {
-        if locked.contains(&patch.path) {
-            continue;
-        }
         locks.push(lock::FileLock::acquire(&patch.path, &lock_dir)?);
-        locked.push(patch.path.clone());
     }
     apply_holding_lock(patches, backup_dir, &locks)
+}
+
+/// 同批次里同一个目标文件出现两次 → 直接拒绝（BACKLOG B-46）。
+///
+/// 为什么必须前置拒绝，而不是让预检去报错：
+/// - 两条补丁的 `before` 串联（`v0→v1`、`v1→v2`）时，第二条预检读到的是 `v0`，
+///   于是报出「文件内容与计划不一致（可能被外部修改）」——把调用方的**计划错误**
+///   说成外部改动，用户会去找一个根本不存在的外部修改者；
+/// - 两条补丁的 `before` 相同（`v0→v1`、`v0→v2`）时更糟：静默「后者胜」，
+///   调用方以为两次改写都生效了，而备份链只留了一条 `v0`。
+///
+/// 比较用 `lock::normalize_target`（补全绝对路径 + 解析父目录符号链接 + 拼回文件名），
+/// 因此 `a/config.toml` 与 `./a/config.toml`、软链目录别名都算同一个目标。
+fn reject_duplicate_targets(patches: &[Patch]) -> Result<()> {
+    let mut seen: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(patches.len());
+    for patch in patches {
+        let key = lock::normalize_target(&patch.path);
+        if let Some((_, first)) = seen.iter().find(|(seen_key, _)| *seen_key == key) {
+            return Err(Error::inject(
+                &patch.path,
+                format!(
+                    "同一批次里有重复的目标路径（重复出现：{}，首次出现：{}）；\
+                     同一个文件在一次注入中只能出现一条补丁，请合并后重试",
+                    patch.path.display(),
+                    first.display()
+                ),
+            ));
+        }
+        seen.push((key, patch.path.clone()));
+    }
+    Ok(())
 }
 
 /// 调用方**已经持有** `patches` 里全部目标路径的锁时使用。
@@ -336,6 +368,9 @@ pub(crate) fn apply_holding_lock(
     backup_dir: &Path,
     held: &[lock::FileLock],
 ) -> Result<Journal> {
+    // 服务层会直接调本函数（已自持锁），因此重复路径校验必须在这里也做一遍（B-46）。
+    reject_duplicate_targets(patches)?;
+
     debug_assert!(
         patches.iter().all(|p| {
             let normalized = lock::normalize_target(&p.path);
@@ -850,29 +885,86 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_paths_in_one_batch_do_not_self_deadlock() {
+    fn duplicate_paths_in_one_batch_are_rejected() {
+        // BACKLOG B-46（改写自 `duplicate_paths_in_one_batch_do_not_self_deadlock`，
+        // 差异登记见 `docs/specs/M5-S3-适配器与注入加固.md` §11 D-1）。
+        //
+        // 旧行为：重复路径被静默接受（后者胜、回滚链串起来）或报出
+        // 「文件内容与计划不一致（可能被外部修改）」——两种都把调用方的计划错误
+        // 说成外部改动。新行为：预检之前直接拒绝。
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("config.toml");
         fs::write(&target, "v0").unwrap();
 
-        // 同一路径出现两次：只能取一把锁，否则会自己和自己互斥。
-        // 实测行为是「后者胜」且回滚链仍然正确（备份按写入顺序串联）。
-        let journal = apply(
+        let err = apply(
             &[
                 Patch::new(&target, "v0", "v1"),
-                Patch::new(&target, "v0", "v2"),
+                // 第二条的 before 与第一条的 after 串联：这正是旧实现报「可能被外部修改」的形态
+                Patch::new(&target, "v1", "v2"),
             ],
             &dir.path().join("backups"),
         )
-        .expect("同批次同路径不得因自锁而失败");
-        assert_eq!(fs::read_to_string(&target).unwrap(), "v2");
+        .unwrap_err();
 
-        rollback(&journal).unwrap();
-        assert_eq!(
-            fs::read_to_string(&target).unwrap(),
-            "v0",
-            "重复路径的回滚链必须一路还原到最初内容"
+        assert!(matches!(err, Error::Inject { .. }), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("同一批次"), "{message}");
+        assert!(message.contains("重复"), "{message}");
+        assert!(
+            message.contains("config.toml"),
+            "文案必须带路径原文: {message}"
         );
+        assert!(
+            !message.contains("可能被外部修改"),
+            "不得再落到误导性的外部改动文案: {message}"
+        );
+        // 前置校验：磁盘一个字节都没动
+        assert_eq!(fs::read_to_string(&target).unwrap(), "v0");
+    }
+
+    #[test]
+    fn duplicate_paths_are_rejected_before_any_read() {
+        // 同一个目标用两种字面写法（相对 + 归一化后相同），并且磁盘内容与 before 不符：
+        // 必须拿到「同一批次重复」而不是「可能被外部修改」——证明校验发生在预检之前。
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        fs::write(&target, "实际内容").unwrap();
+
+        let aliased = dir.path().join(".").join("config.toml");
+        let err = apply(
+            &[
+                Patch::new(&target, "与磁盘不符", "a"),
+                Patch::new(&aliased, "与磁盘不符", "b"),
+            ],
+            &dir.path().join("backups"),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("同一批次"), "{message}");
+        assert!(message.contains("重复"), "{message}");
+        assert!(!message.contains("可能被外部修改"), "{message}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "实际内容");
+    }
+
+    #[test]
+    fn distinct_paths_in_one_batch_still_apply() {
+        // 反例保护：不同路径的多条补丁不得被重复校验误伤
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        fs::write(&a, "A0").unwrap();
+        fs::write(&b, "B0").unwrap();
+
+        let journal = apply(
+            &[Patch::new(&a, "A0", "A1"), Patch::new(&b, "B0", "B1")],
+            &dir.path().join("backups"),
+        )
+        .unwrap();
+
+        assert_eq!(journal.entries.len(), 2);
+        assert_eq!(fs::read_to_string(&a).unwrap(), "A1");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "B1");
     }
 
     #[cfg(unix)]

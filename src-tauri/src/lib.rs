@@ -28,6 +28,12 @@ pub struct AppState {
     pub db_error: Option<String>,
     /// 正在运行的本地网关（同一时刻只允许一个）。
     pub gateway: std::sync::Mutex<Option<keyrelay_core::gateway::GatewayHandle>>,
+    /// 把「停旧 → 绑新」整个序列串起来（M5-S5 / 关闭 B-64 的命令层那一半）。
+    ///
+    /// 必须是**异步**锁：`gateway_start` 里要 `await` `shutdown_and_wait()`，
+    /// 而 `std::sync::MutexGuard` 不能跨 `await`（不是 `Send`）。
+    /// 用 std 锁只在取 `Option` 时上锁，等于没修 —— 两个并发启动仍会各自 bind。
+    pub gateway_op: tokio::sync::Mutex<()>,
 }
 
 /// 用户主目录。解析逻辑在 `keyrelay_core::platform`（按平台处理 `KEYRELAY_HOME` /
@@ -97,6 +103,7 @@ fn state_with_config(
         db_path,
         db_error,
         gateway: std::sync::Mutex::new(None),
+        gateway_op: tokio::sync::Mutex::new(()),
     }
 }
 

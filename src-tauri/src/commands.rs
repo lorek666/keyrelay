@@ -160,6 +160,11 @@ pub struct RefreshSummaryDto {
     sites_failed: usize,
     keys_total: usize,
     balance_alerts: Vec<i64>,
+    /// 需要重新登录的站点 id（M5-S5 接线 / B-61）。升序去重。
+    ///
+    /// 与 `sites_failed` 的关系：当轮认证失败的站点**两边都有**（它确实失败了，
+    /// 也确实需要重新登录）；上一轮就已经失效、本轮被跳过的站点**只在这里**。
+    needs_login: Vec<i64>,
 }
 
 #[derive(Serialize)]
@@ -210,6 +215,9 @@ pub struct ExportResultDto {
     path: String,
     encrypted: bool,
     bytes: usize,
+    /// 是否登记进「已知导出物」表。`false` = 文件写成了，但**审计看不到它**。
+    /// 界面必须把这件事说出来，不能让用户以为「审计会兜住」。
+    registered: bool,
 }
 
 #[derive(Deserialize)]
@@ -649,6 +657,32 @@ pub fn gateway_status(state: State<'_, AppState>) -> Result<GatewayStatusDto, St
     Ok(gateway_status_of(&state))
 }
 
+/// 等待网关真正停止的**上界**（M5-S5 接线 / 处置 M5-S4 复审 P2-1）。
+///
+/// `GatewayHandle::shutdown_and_wait()` 本身没有上界：上游卡住且仍有客户端在等时，
+/// 它要等在途连接收尾才返回。命令层不能因此把 `gateway_op` 操作锁一直占着 ——
+/// 那会把后续的 `gateway_start` / `gateway_stop` 一起挂死。
+///
+/// **为什么超时是安全的**：`shutdown_and_wait` 先发停止信号**再** await，
+/// 而 axum 收到信号后先 `drop(listener)`、然后才等在途连接 ——
+/// 端口在信号之后就已经能重新绑定（M5-S4 复审探针实测 2.6ms）。
+/// 超时只是放弃「等在途连接收尾」，不影响端口释放，所以照样可以接着 bind。
+const GATEWAY_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 停止一个网关句柄，最多等 `GATEWAY_SHUTDOWN_TIMEOUT`。
+///
+/// 超时只留一行 stderr，不向上报错：调用方接下来要做的（释放句柄槽、重新 bind）
+/// 都不依赖「在途连接是否收尾完成」。
+async fn stop_gateway(handle: keyrelay_core::gateway::GatewayHandle) {
+    match tokio::time::timeout(GATEWAY_SHUTDOWN_TIMEOUT, handle.shutdown_and_wait()).await {
+        Ok(()) => {}
+        Err(_) => eprintln!(
+            "[keyrelay] 等待网关停止超过 {GATEWAY_SHUTDOWN_TIMEOUT:?}（在途连接未收尾）；\
+             监听端口在此之前已释放，继续。"
+        ),
+    }
+}
+
 /// 启动本地网关。同一时刻只允许一个：启动前会先停掉旧的。
 #[tauri::command]
 pub async fn gateway_start(
@@ -665,10 +699,21 @@ pub async fn gateway_start(
         );
     }
 
-    if let Ok(mut guard) = state.gateway.lock() {
-        if let Some(old) = guard.take() {
-            old.shutdown();
-        }
+    // 整个「停旧 → 绑新」序列串行化（M5-S5 / 关闭 B-64 的命令层那一半）。
+    //
+    // 不串行的话，两次并发启动会各自走到 bind：第二次撞 `AddrInUse`，
+    // 用户看到「端口可能被占用」——那是并发假象，不是真有人占着端口。
+    // 注意是**异步**锁（`std::sync::MutexGuard` 不能跨 `await`，不是 `Send`）。
+    let _op = state.gateway_op.lock().await;
+
+    // 先停旧的，并**等端口真正释放**：`shutdown()` 只发信号就返回，
+    // 立刻 bind 会撞上还没释放的监听套接字 —— 这正是 B-64 的现象。
+    let previous = match state.gateway.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => None,
+    };
+    if let Some(previous) = previous {
+        stop_gateway(previous).await;
     }
 
     let port = settings.gateway_port;
@@ -692,12 +737,18 @@ pub async fn gateway_start(
     Ok(status)
 }
 
+/// 停止网关。与 `gateway_start` 共用同一把操作锁，避免「停」与「启」交错。
 #[tauri::command]
-pub fn gateway_stop(state: State<'_, AppState>) -> Result<GatewayStatusDto, String> {
-    if let Ok(mut guard) = state.gateway.lock() {
-        if let Some(handle) = guard.take() {
-            handle.shutdown();
-        }
+pub async fn gateway_stop(state: State<'_, AppState>) -> Result<GatewayStatusDto, String> {
+    let _op = state.gateway_op.lock().await;
+
+    let running = match state.gateway.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => None,
+    };
+    if let Some(handle) = running {
+        // 等端口真正释放再返回：否则调用方紧接着 start 会撞 AddrInUse
+        stop_gateway(handle).await;
     }
     Ok(gateway_status_of(&state))
 }
@@ -723,10 +774,11 @@ pub fn export_bundle(
     state
         .service
         .export_to_file(&path, args.password.as_deref())
-        .map(|(path, encrypted, bytes)| ExportResultDto {
-            path: path.display().to_string(),
-            encrypted,
-            bytes,
+        .map(|outcome| ExportResultDto {
+            path: outcome.path.display().to_string(),
+            encrypted: outcome.encrypted,
+            bytes: outcome.bytes,
+            registered: outcome.registered,
         })
         .map_err(|e| e.to_string())
 }
@@ -796,6 +848,7 @@ pub async fn refresh_all(state: State<'_, AppState>) -> Result<RefreshSummaryDto
             sites_failed: s.sites_failed,
             keys_total: s.keys_total,
             balance_alerts: s.balance_alerts,
+            needs_login: s.needs_login,
         })
         .map_err(|e| e.to_string())
 }

@@ -11,7 +11,7 @@ use rusqlite::{params, Connection};
 use crate::error::{Error, Result};
 use crate::inject::Journal;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -94,6 +94,14 @@ CREATE TABLE IF NOT EXISTS settings(
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- 已知导出物（M5-S1 / 关闭 B-60）。审计按这张表扫，用户自选路径才算进了覆盖范围。
+-- 只记路径与统计，不记内容。
+CREATE TABLE IF NOT EXISTS exports(
+  path        TEXT PRIMARY KEY,
+  encrypted   INTEGER NOT NULL,
+  bytes       INTEGER NOT NULL,
+  exported_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_bindings_target ON bindings(target_path);
 "#;
 
@@ -163,6 +171,15 @@ pub struct ConsentRow {
     pub fields: String,
     pub granted_at: i64,
     pub revoked_at: Option<i64>,
+}
+
+/// 一次导出的登记行（M5-S1 / 关闭 B-60）。**不含文件内容**。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportRecord {
+    pub path: String,
+    pub encrypted: bool,
+    pub bytes: i64,
+    pub exported_at: i64,
 }
 
 pub struct Store {
@@ -703,6 +720,69 @@ impl Store {
             .count();
         Ok(hits as i64)
     }
+
+    /// 更新站点的健康状态。取值由调用方约定：`"unknown"` / `"ok"` / `"needs_login"`。
+    ///
+    /// 站点不存在时**报错**而不是静默成功：静默成功会让调用方以为状态已落库，
+    /// 而 `needs_login` 正是「用户看不到就永远修不好」的那类状态（B-61）。
+    pub fn set_site_health(&self, site_id: i64, health: &str) -> Result<()> {
+        let conn = self.lock()?;
+        let affected = conn
+            .execute(
+                "UPDATE sites SET health = ?2 WHERE id = ?1",
+                params![site_id, health],
+            )
+            .map_err(|e| Error::Store(format!("更新站点状态失败: {e}")))?;
+        if affected == 0 {
+            return Err(Error::Store(format!("站点不存在: {site_id}")));
+        }
+        Ok(())
+    }
+
+    /// 登记一次导出（同一路径重复导出则覆盖）。**只记路径与统计，不记内容。**
+    pub fn record_export(&self, path: &Path, encrypted: bool, bytes: usize) -> Result<()> {
+        let bytes = i64::try_from(bytes)
+            .map_err(|_| Error::Store(format!("导出字节数超出范围: {bytes}")))?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO exports(path, encrypted, bytes, exported_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET
+               encrypted   = excluded.encrypted,
+               bytes       = excluded.bytes,
+               exported_at = excluded.exported_at",
+            params![
+                path.to_string_lossy(),
+                i64::from(encrypted),
+                bytes,
+                now_secs(),
+            ],
+        )
+        .map_err(|e| Error::Store(format!("登记导出失败: {e}")))?;
+        Ok(())
+    }
+
+    /// 列出已知导出物，最新的在前。同 `exported_at` 时按路径升序，保证顺序确定。
+    pub fn list_exports(&self) -> Result<Vec<ExportRecord>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, encrypted, bytes, exported_at FROM exports
+                 ORDER BY exported_at DESC, path ASC",
+            )
+            .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ExportRecord {
+                    path: row.get(0)?,
+                    encrypted: row.get::<_, i64>(1)? != 0,
+                    bytes: row.get(2)?,
+                    exported_at: row.get(3)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("查询导出记录失败: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("读取导出行失败: {e}")))
+    }
 }
 
 #[cfg(test)]
@@ -763,6 +843,79 @@ mod tests {
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         store.migrate().unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn exports_table_is_added_to_an_existing_database() {
+        // 与 `migrate_adds_new_tables_to_an_existing_database` 同一条回归：
+        // M5-S1 新增了 `exports` 表并把 SCHEMA_VERSION 提到 2，
+        // 老库（版本号 1、没有 exports）打开后必须补建，否则 `record_export` 直接 no such table。
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("keyrelay.db");
+
+        {
+            let conn = rusqlite::Connection::open(&path).expect("直连库");
+            conn.execute_batch(
+                "CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .expect("造一个最小旧库");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("写成旧版本号");
+        }
+
+        let store = Store::open(&path).expect("打开旧库");
+        assert_eq!(
+            store.schema_version().unwrap(),
+            SCHEMA_VERSION,
+            "版本号必须被抬到当前值"
+        );
+        store
+            .record_export(Path::new("/tmp/old-db-export.json"), false, 12)
+            .expect("旧库补建 exports 表后必须能登记");
+        assert_eq!(store.list_exports().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_export_upserts_by_path_and_lists_newest_first() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_export(Path::new("/tmp/a.json"), false, 10)
+            .unwrap();
+        store
+            .record_export(Path::new("/tmp/b.krbackup"), false, 20)
+            .unwrap();
+        // 同一路径再导出一次：覆盖，不新增行
+        store
+            .record_export(Path::new("/tmp/a.json"), true, 33)
+            .unwrap();
+
+        let rows = store.list_exports().unwrap();
+        assert_eq!(rows.len(), 2, "同一路径必须覆盖而不是追加");
+        // 覆盖后的 a.json 更新，排最前
+        assert_eq!(rows[0].path, "/tmp/a.json");
+        assert!(rows[0].encrypted);
+        assert_eq!(rows[0].bytes, 33);
+        assert_eq!(rows[1].path, "/tmp/b.krbackup");
+        assert!(!rows[1].encrypted);
+    }
+
+    #[test]
+    fn set_site_health_persists_and_rejects_an_unknown_site() {
+        let store = Store::open_in_memory().unwrap();
+        let site = store
+            .upsert_site("newapi", "https://h.example.com", "H")
+            .unwrap();
+        assert_eq!(store.get_site(site).unwrap().unwrap().health, "unknown");
+
+        store.set_site_health(site, "needs_login").unwrap();
+        assert_eq!(store.get_site(site).unwrap().unwrap().health, "needs_login");
+
+        let err = store.set_site_health(9999, "ok").unwrap_err();
+        assert!(
+            err.to_string().contains("站点不存在"),
+            "未知站点必须报错而不是静默成功：{}",
+            err
+        );
     }
 
     #[test]

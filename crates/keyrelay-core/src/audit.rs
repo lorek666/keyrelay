@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::redact::{contains_secret_outside_hashes, contains_secret_prefix_only};
+use crate::store::ExportRecord;
 
 /// 一条审计发现。
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -64,11 +65,34 @@ impl AuditReport {
         self.findings.iter().filter(|f| f.is_plaintext()).count()
     }
 
+    /// 一段人话结论。
+    ///
+    /// **覆盖面缺口必须出现在这里**（M5-S2 复审 P2-3）：`Unreadable` 不是
+    /// 「有明文」，所以它不影响 [`is_clean`]；但「自称干净、其实没扫全」正是
+    /// B-60 要修的那类谎言。缺口只在 `findings` 里时，主文案仍然写
+    /// 「未发现明文凭证」，用户读到的就是过度承诺。这里把它追加在结论**后面**，
+    /// 既让缺口可见，又不改变「有没有明文」这个判断本身。
     pub fn summary(&self) -> String {
+        let gaps: Vec<String> = self
+            .findings
+            .iter()
+            .filter(|f| !f.is_plaintext())
+            .map(AuditFinding::describe)
+            .collect();
+        let gap_note = if gaps.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "；注意：覆盖面不完整（{} 处）：{}",
+                gaps.len(),
+                gaps.join("；")
+            )
+        };
+
         if self.is_clean() {
             format!(
-                "已扫描 {} 个文件 / {} 字节，未发现明文凭证",
-                self.files_scanned, self.bytes_scanned
+                "已扫描 {} 个文件 / {} 字节，未发现明文凭证{}",
+                self.files_scanned, self.bytes_scanned, gap_note
             )
         } else {
             let detail: Vec<String> = self
@@ -78,11 +102,12 @@ impl AuditReport {
                 .map(AuditFinding::describe)
                 .collect();
             format!(
-                "已扫描 {} 个文件 / {} 字节，发现 {} 处问题：{}",
+                "已扫描 {} 个文件 / {} 字节，发现 {} 处问题：{}{}",
                 self.files_scanned,
                 self.bytes_scanned,
                 self.plaintext_findings(),
-                detail.join("；")
+                detail.join("；"),
+                gap_note
             )
         }
     }
@@ -95,6 +120,27 @@ pub fn scan_paths(paths: &[PathBuf]) -> AuditReport {
         scan_one(path, &mut report, 0);
     }
     report
+}
+
+/// 把「已知导出物」登记表（`Store::list_exports()`）里的路径**逐个**并入扫描集合（M5-S1 / 关闭 B-60）。
+///
+/// 背景：用户自选的导出路径不在任何固定目录里，审计原本看不到它们 ——
+/// 而「自我证明落盘产物零明文」恰恰是审计存在的理由。
+///
+/// 语义：
+/// - **并集去重**：与已有路径重复时不重复添加。否则同一文件被扫两遍，`files_scanned`
+///   会虚高 —— 那是审计报告里唯一的「覆盖面」证据，不能被注水。
+/// - **不做存在性检查**：用户随时可能删掉导出文件。`scan_paths` 对 `NotFound` 本来就静默跳过
+///   （不计 `files_scanned`、不产生 `Unreadable`），在这里先 `exists()` 只会引入 TOCTOU
+///   与「文件被删了就不再扫」的假绿。
+/// - 空路径字符串也照收：`scan_paths` 会把它当 `NotFound` 跳过，不会 panic。
+pub fn merge_export_registry(paths: &mut Vec<PathBuf>, records: &[ExportRecord]) {
+    for record in records {
+        let path = PathBuf::from(record.path.as_str());
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
 }
 
 /// 递归深度上限：本产品的产物只有两三层，加个上限防止误传根目录时炸栈。
