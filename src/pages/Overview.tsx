@@ -1,65 +1,110 @@
 import { useQuery } from "@tanstack/react-query";
-import { AlertCircle, Globe, KeyRound, RefreshCw } from "lucide-react";
-import { listSites, runtimeMode, type SiteRow } from "../lib/api";
-
-function SiteCard({ site }: { site: SiteRow }) {
-  return (
-    <article className="card">
-      <header className="card-head">
-        <Globe size={16} aria-hidden />
-        <span className="card-title">{site.displayName || site.baseUrl}</span>
-        <span className={`badge badge-${site.kind}`}>{site.kind}</span>
-      </header>
-      <p className="muted mono">{site.baseUrl}</p>
-      <p className="muted">
-        登录态：<span className={`health health-${site.health}`}>{site.health}</span>
-      </p>
-      <button className="ghost" disabled title="M1 接入后可用">
-        <KeyRound size={14} aria-hidden /> 获取密钥（M1）
-      </button>
-    </article>
-  );
-}
+import { AlertTriangle, KeyRound, Server, ShieldCheck } from "lucide-react";
+import {
+  appInfo,
+  listConsents,
+  listSites,
+  listStoredKeys,
+  recentEvents,
+  runtimeMode,
+} from "../lib/api";
 
 export default function Overview() {
-  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
-    queryKey: ["sites"],
-    queryFn: listSites,
-  });
+  const info = useQuery({ queryKey: ["app-info"], queryFn: appInfo });
+  const sites = useQuery({ queryKey: ["sites"], queryFn: listSites });
+  const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
+  const consents = useQuery({ queryKey: ["consents"], queryFn: listConsents });
+  const events = useQuery({ queryKey: ["events"], queryFn: () => recentEvents(20) });
+
+  const warnings = (events.data ?? []).filter(
+    (e) => e.level === "warn" || e.level === "error",
+  );
 
   return (
     <section>
-      <div className="row-between">
-        <h2>站点</h2>
-        <button className="ghost" onClick={() => void refetch()} disabled={isFetching}>
-          <RefreshCw size={14} aria-hidden /> 刷新
-        </button>
+      <div className="cards">
+        <Stat
+          icon={<Server size={16} aria-hidden />}
+          label="站点"
+          value={sites.data?.length ?? "—"}
+        />
+        <Stat
+          icon={<KeyRound size={16} aria-hidden />}
+          label="本地密钥"
+          value={keys.data?.length ?? "—"}
+        />
+        <Stat
+          icon={<ShieldCheck size={16} aria-hidden />}
+          label="有效同意"
+          value={consents.data?.filter((c) => !c.revokedAt).length ?? "—"}
+        />
+        <Stat
+          icon={<AlertTriangle size={16} aria-hidden />}
+          label="告警事件"
+          value={warnings.length}
+        />
       </div>
 
-      {isLoading && <p className="muted">正在读取本地站点…</p>}
+      <div className="card">
+        <h3>运行状态</h3>
+        <dl className="kv">
+          <dt>运行模式</dt>
+          <dd className="mono">
+            {runtimeMode === "tauri" ? "Tauri（已连接后端）" : "浏览器预览（未连接后端）"}
+          </dd>
+          <dt>本地数据库</dt>
+          <dd className="mono ellipsis" title={info.data?.dbPath}>
+            {info.data?.dbPath ?? "…"}
+          </dd>
+          <dt>版本</dt>
+          <dd className="mono">
+            {info.data ? `${info.data.name} ${info.data.version}` : "…"}
+          </dd>
+        </dl>
 
-      {isError && (
-        <p className="error">
-          <AlertCircle size={14} aria-hidden /> 读取失败：{String(error)}
-        </p>
-      )}
-
-      {data && data.length === 0 && (
-        <p className="muted">
-          还没有站点。M1 起可在「新增站点」里填入中转站地址并登录（当前为骨架版本）。
-        </p>
-      )}
-
-      <div className="grid">
-        {data?.map((site) => (
-          <SiteCard key={site.id} site={site} />
-        ))}
+        {runtimeMode === "browser" ? (
+          <p className="warn" role="status">
+            当前是浏览器预览模式：所有数据都是示例，写操作不会生效。
+            要连真实后端请用 <span className="mono">pnpm tauri dev</span>。
+          </p>
+        ) : null}
       </div>
 
-      <p className="muted footnote">
-        运行模式：<span className="mono">{runtimeMode}</span>
-        {runtimeMode === "browser" && "（浏览器预览使用示例数据）"}
-      </p>
+      {warnings.length ? (
+        <div className="card">
+          <h3>最近告警</h3>
+          <ul className="list">
+            {warnings.slice(0, 5).map((row) => (
+              <li key={row.id}>
+                <span className={`badge badge-${row.level === "error" ? "danger" : "warn"}`}>
+                  {row.level}
+                </span>{" "}
+                <span className="mono">{row.source}</span> {row.message}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
     </section>
+  );
+}
+
+function Stat({
+  icon,
+  label,
+  value,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: number | string;
+}) {
+  return (
+    <div className="stat">
+      <div className="stat-label">
+        {icon}
+        <span>{label}</span>
+      </div>
+      <div className="stat-value">{value}</div>
+    </div>
   );
 }

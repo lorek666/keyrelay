@@ -6,7 +6,7 @@ import {
   deliveryPlan,
   grantConsent,
   listConsents,
-  listKeys,
+  listStoredKeys,
   listSites,
   revokeConsent,
   rollbackDelivery,
@@ -28,12 +28,8 @@ export default function Agents() {
   const [siteId, setSiteId] = useState<number | null>(null);
   const activeSite = siteId ?? sites.data?.[0]?.id ?? null;
 
-  const keys = useQuery({
-    queryKey: ["keys", activeSite],
-    queryFn: () => listKeys(activeSite!),
-    enabled: activeSite !== null,
-    retry: false,
-  });
+  // 投递需要**本地 key id**，所以用 stored keys 而不是站点侧列表
+  const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
 
   const [keyId, setKeyId] = useState<number | null>(null);
   const activeKey = keyId ?? null;
@@ -160,8 +156,8 @@ export default function Agents() {
             >
               <option value="">（选择一把）</option>
               {(keys.data ?? []).map((k) => (
-                <option key={k.id ?? k.remoteId} value={k.id ?? 0}>
-                  {k.name}
+                <option key={k.id} value={k.id}>
+                  {k.name}（#{k.id}）
                 </option>
               ))}
             </select>
