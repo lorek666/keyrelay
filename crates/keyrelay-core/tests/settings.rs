@@ -34,6 +34,8 @@ fn settings_survive_a_reopen() {
         refresh_interval_secs: 900,
         balance_alert_threshold: 5.5,
         drift_check_on_start: false,
+        gateway_enabled: true,
+        gateway_port: 9999,
     };
     service_on(&path).update_settings(&wanted).unwrap();
 

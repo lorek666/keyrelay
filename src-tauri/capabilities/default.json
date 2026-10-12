@@ -27,6 +27,11 @@
     "allow-get-settings",
     "allow-update-settings",
     "allow-refresh-all",
-    "allow-audit-redaction"
+    "allow-audit-redaction",
+    "allow-gateway-status",
+    "allow-gateway-start",
+    "allow-gateway-stop",
+    "allow-export-bundle",
+    "allow-prune-backups"
   ]
 }

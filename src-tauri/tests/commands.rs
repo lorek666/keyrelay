@@ -345,6 +345,8 @@ fn get_settings_returns_defaults() {
     assert_eq!(value["refreshIntervalSecs"], 0, "定时刷新必须默认关闭");
     assert_eq!(value["balanceAlertThreshold"], 0.0);
     assert_eq!(value["driftCheckOnStart"], true);
+    assert_eq!(value["gatewayEnabled"], false, "网关必须默认关闭");
+    assert_eq!(value["gatewayPort"], 8787);
     assert!(
         value.get("refresh_interval_secs").is_none(),
         "不得出现 snake_case: {value}"
@@ -361,13 +363,17 @@ fn update_settings_round_trips_and_rejects_bad_values() {
         json!({"args": {"settings": {
             "refreshIntervalSecs": 600,
             "balanceAlertThreshold": 3.5,
-            "driftCheckOnStart": false
+            "driftCheckOnStart": false,
+            "gatewayEnabled": true,
+            "gatewayPort": 9999
         }}}),
     )
     .expect("update_settings 应成功");
     assert_eq!(updated["refreshIntervalSecs"], 600);
     assert_eq!(updated["balanceAlertThreshold"], 3.5);
     assert_eq!(updated["driftCheckOnStart"], false);
+    assert_eq!(updated["gatewayEnabled"], true);
+    assert_eq!(updated["gatewayPort"], 9999);
 
     let read = invoke_on(&webview, "get_settings", json!({})).expect("get_settings");
     assert_eq!(read, updated, "同一实例内写后读必须一致");
@@ -378,7 +384,9 @@ fn update_settings_round_trips_and_rejects_bad_values() {
         json!({"args": {"settings": {
             "refreshIntervalSecs": 99999999,
             "balanceAlertThreshold": 0.0,
-            "driftCheckOnStart": true
+            "driftCheckOnStart": true,
+            "gatewayEnabled": false,
+            "gatewayPort": 8787
         }}}),
     )
     .expect_err("超上限的间隔应被拒绝");
@@ -418,4 +426,76 @@ fn audit_redaction_reports_clean_on_a_fresh_install() {
         value.get("files_scanned").is_none(),
         "不得出现 snake_case: {value}"
     );
+}
+
+// ============================================ 网关 / 导出 / 备份清理（M4-S2）
+
+#[test]
+fn gateway_status_is_stopped_on_a_fresh_install() {
+    let value = invoke("gateway_status").expect("gateway_status 应成功");
+    assert_eq!(value["running"], false);
+    assert_eq!(value["url"], Value::Null);
+    assert_eq!(value["token"], Value::Null);
+}
+
+#[test]
+fn gateway_stop_is_idempotent() {
+    let value = invoke("gateway_stop").expect("未运行时停止也应成功");
+    assert_eq!(value["running"], false);
+    let again = invoke("gateway_stop").expect("重复停止仍应成功");
+    assert_eq!(again["running"], false);
+}
+
+#[test]
+fn gateway_start_on_an_unknown_key_reports_a_business_error() {
+    let err = invoke_impl(
+        "gateway_start",
+        json!({"args": {"siteId": 999, "keyId": 999}}),
+    )
+    .expect_err("未知站点/密钥必须报错");
+    assert_not_acl_rejection("gateway_start", &err);
+    assert!(err.as_str().unwrap_or_default().contains("999"), "{err}");
+}
+
+#[test]
+fn export_bundle_writes_a_file_without_key_material() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let path = dir.path().join("export.json");
+    let value = invoke_impl(
+        "export_bundle",
+        json!({"args": {"path": path.display().to_string()}}),
+    )
+    .expect("export_bundle 应成功");
+
+    assert_eq!(value["encrypted"], false);
+    assert!(value["bytes"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(value["path"], path.display().to_string());
+
+    let text = std::fs::read_to_string(&path).expect("读导出文件");
+    assert!(text.contains("\"version\""), "{text}");
+    assert!(!text.contains("sk-"), "导出物出现密钥形态: {text}");
+    assert!(!text.contains("secret_ref"), "{text}");
+}
+
+#[test]
+fn export_bundle_with_a_password_is_encrypted() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let path = dir.path().join("export-enc.json");
+    let value = invoke_impl(
+        "export_bundle",
+        json!({"args": {"password": "pw-123456", "path": path.display().to_string()}}),
+    )
+    .expect("加密导出应成功");
+    assert_eq!(value["encrypted"], true);
+
+    let text = std::fs::read_to_string(&path).expect("读导出文件");
+    assert!(text.contains("keyrelay-export-v1"), "{text}");
+    assert!(!text.contains("\"sites\""), "密文里不该有明文结构");
+}
+
+#[test]
+fn prune_backups_reports_zero_when_there_is_nothing_to_prune() {
+    let value =
+        invoke_impl("prune_backups", json!({"args": {"keep": 5}})).expect("prune_backups 应成功");
+    assert_eq!(value["removed"], 0);
 }

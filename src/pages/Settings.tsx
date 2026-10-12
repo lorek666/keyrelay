@@ -4,10 +4,13 @@ import { AlertTriangle, Save } from "lucide-react";
 import { ShieldCheck } from "lucide-react";
 import {
   auditRedaction,
+  exportBundle,
   getSettings,
+  pruneBackups,
   updateSettings,
   type Settings,
 } from "../lib/api";
+import GatewayCard from "../components/GatewayCard";
 
 const PRESETS = [
   { label: "关闭", value: 0 },
@@ -15,6 +18,73 @@ const PRESETS = [
   { label: "15 分钟", value: 900 },
   { label: "1 小时", value: 3600 },
 ];
+
+function ExportCard() {
+  const [password, setPassword] = useState("");
+  const [result, setResult] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const run = useMutation({
+    mutationFn: () => exportBundle(password || undefined),
+    onSuccess: (r) => {
+      setError(null);
+      setResult(
+        `已导出到 ${r.path}（${r.encrypted ? "已加密" : "明文"}，${r.bytes} 字节）`,
+      );
+    },
+    onError: (err: Error) => {
+      setResult(null);
+      setError(err.message);
+    },
+  });
+
+  const prune = useMutation({
+    mutationFn: () => pruneBackups(10),
+    onSuccess: (r) => setResult(`已清理 ${r.removed} 个历史备份（保留最近 10 个）`),
+    onError: (err: Error) => setError(err.message),
+  });
+
+  return (
+    <div className="card">
+      <h3>导出与备份</h3>
+      <p className="muted">
+        导出的是站点、密钥**元数据**、同意记录与设置。
+        <strong>密钥本体不在导出物里</strong>——它只存在于系统钥匙串。
+        因此加密保护的是元数据（站点地址、密钥名称），不是密钥。
+      </p>
+      <label className="field">
+        <span>导出密码（留空 = 明文导出）</span>
+        <input
+          className="input"
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          autoComplete="off"
+        />
+      </label>
+      <div className="row">
+        <button
+          type="button"
+          className="btn btn-primary"
+          disabled={run.isPending}
+          onClick={() => run.mutate()}
+        >
+          {run.isPending ? "导出中…" : "导出配置"}
+        </button>
+        <button
+          type="button"
+          className="btn"
+          disabled={prune.isPending}
+          onClick={() => prune.mutate()}
+        >
+          {prune.isPending ? "清理中…" : "清理历史备份（保留最近 10 个）"}
+        </button>
+      </div>
+      {result ? <p className="ok" role="status">{result}</p> : null}
+      {error ? <p className="error" role="alert">{error}</p> : null}
+    </div>
+  );
+}
 
 function AuditCard() {
   const report = useQuery({
@@ -186,6 +256,16 @@ export default function SettingsPage() {
             </button>
             {dirty ? <span className="muted">有未保存的修改</span> : null}
           </div>
+
+          <GatewayCard
+            enabled={draft.gatewayEnabled}
+            port={draft.gatewayPort}
+            onToggle={(enabled) => setDraft({ ...draft, gatewayEnabled: enabled })}
+            onPortChange={(port) => setDraft({ ...draft, gatewayPort: port })}
+            settingsDirty={dirty}
+          />
+
+          <ExportCard />
 
           <AuditCard />
         </>

@@ -116,6 +116,8 @@ async fn local_operations_are_unaffected_by_the_network() {
         refresh_interval_secs: 300,
         balance_alert_threshold: 1.0,
         drift_check_on_start: true,
+        gateway_enabled: false,
+        gateway_port: 8787,
     };
     f.service.update_settings(&settings).unwrap();
     assert_eq!(f.service.settings().unwrap(), settings);

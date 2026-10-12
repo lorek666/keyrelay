@@ -11,6 +11,9 @@ use crate::audit::{self, AuditFinding, AuditReport};
 use crate::delivery::{self, ConsentState, DeliveryChannel, DeliveryOutcome, DeliveryPlan};
 use crate::drift::{self, DriftReport};
 use crate::error::{Error, Result};
+use crate::export::{
+    self, ExportBundle, ExportConsent, ExportEvent, ExportKey, ExportSettings, ExportSite,
+};
 use crate::inject;
 use crate::observability::{self, Event, Level};
 use crate::settings::Settings;
@@ -747,6 +750,192 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             }
             Err(err) => Err(self.on_auth_error(site_id, err)),
         }
+    }
+
+    /// 组装网关配置（含站点密钥）。调用方负责真正启动网关。
+    ///
+    /// `GatewayConfig` 的 `Debug` 已手写脱敏，不会打印令牌与密钥。
+    pub fn gateway_config(
+        &self,
+        site_id: i64,
+        key_id: i64,
+        port: u16,
+    ) -> Result<crate::gateway::GatewayConfig> {
+        let site = self.site(site_id)?;
+        let row = self
+            .store
+            .get_key(key_id)?
+            .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
+        if row.site_id != site_id {
+            return Err(Error::Store(format!(
+                "密钥 #{key_id} 不属于站点 #{site_id}"
+            )));
+        }
+        let api_key = self.vault.get(&row.secret_ref)?.ok_or_else(|| {
+            Error::Vault(format!(
+                "钥匙串中没有该密钥（{}）；请先重新取一次钥匙",
+                row.secret_ref
+            ))
+        })?;
+
+        Ok(crate::gateway::GatewayConfig {
+            port,
+            token: crate::gateway::generate_token(),
+            base_url: site.base_url,
+            api_key,
+            site_display_name: site.display_name,
+        })
+    }
+
+    /// 只保留最近 `keep` 次投递的备份目录，删除更早的。返回删除的目录数。
+    ///
+    /// `keep == 0` 表示全部删除——这是危险操作，UI 必须二次确认。
+    /// 只动 `backup_dir` 下**看起来像 journal 目录**（名字以 `j` 开头）的子目录，
+    /// 不碰别的文件，也不递归到 `backup_dir` 之外。
+    pub fn prune_backups(&self, keep: usize) -> Result<usize> {
+        if !self.backup_dir.exists() {
+            return Ok(0);
+        }
+        let entries = std::fs::read_dir(&self.backup_dir)
+            .map_err(|e| Error::Store(format!("读取备份目录失败: {e}")))?;
+
+        let mut journals: Vec<std::path::PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_journal = entry.file_name().to_string_lossy().starts_with('j');
+            if path.is_dir() && is_journal {
+                journals.push(path);
+            }
+        }
+        // journal id 是 `j<纳秒>-<序号>`，按名字排序 ≈ 按时间排序
+        journals.sort();
+
+        let remove_count = journals.len().saturating_sub(keep);
+        let mut removed = 0usize;
+        for path in journals.into_iter().take(remove_count) {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => removed += 1,
+                // 单个目录删不掉不中断其余清理
+                Err(e) => {
+                    self.log(observability::event_with_payload(
+                        Level::Warn,
+                        "store",
+                        "删除备份目录失败",
+                        serde_json::json!({ "path": path.display().to_string(), "error": e.to_string() }),
+                    ));
+                }
+            }
+        }
+
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "store",
+            format!("已清理 {removed} 个历史备份（保留最近 {keep} 个）"),
+            serde_json::json!({ "removed": removed, "keep": keep }),
+        ));
+        Ok(removed)
+    }
+
+    /// 组装导出包。**不含任何密钥本体**（只有元数据）。
+    pub fn export_bundle(&self) -> Result<ExportBundle> {
+        let settings = self.settings()?;
+        let sites = self
+            .store
+            .list_sites()?
+            .into_iter()
+            .map(|row| ExportSite {
+                id: row.id,
+                kind: row.kind,
+                base_url: row.base_url,
+                display_name: row.display_name,
+            })
+            .collect();
+        let keys = self
+            .store
+            .list_keys()?
+            .into_iter()
+            .map(|row| ExportKey {
+                id: row.id,
+                site_id: row.site_id,
+                remote_id: row.remote_id,
+                name: row.name,
+                group: row.group_name,
+                status: row.status,
+            })
+            .collect();
+        let consents = self
+            .store
+            .list_consents()?
+            .into_iter()
+            .map(|row| ExportConsent {
+                agent_id: row.agent_id,
+                channel: row.channel,
+                target_path: row.target_path,
+                fields: row.fields,
+                granted_at: row.granted_at,
+                revoked_at: row.revoked_at,
+            })
+            .collect();
+        let events = self
+            .recent_events(1000)?
+            .into_iter()
+            .map(|row| ExportEvent {
+                ts: row.ts,
+                level: row.level,
+                source: row.source,
+                message: crate::redact::scrub(&row.message),
+                payload: row.payload.as_deref().map(crate::redact::scrub),
+            })
+            .collect();
+
+        Ok(ExportBundle {
+            version: export::EXPORT_VERSION,
+            exported_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            sites,
+            keys,
+            consents,
+            settings: ExportSettings {
+                refresh_interval_secs: settings.refresh_interval_secs,
+                balance_alert_threshold: settings.balance_alert_threshold,
+                drift_check_on_start: settings.drift_check_on_start,
+                gateway_enabled: settings.gateway_enabled,
+                gateway_port: settings.gateway_port,
+            },
+            events,
+        })
+    }
+
+    /// 导出并落盘。`password` 为空/`None` 时输出明文 JSON。
+    ///
+    /// 返回 `(路径, 是否加密, 字节数)`。
+    pub fn export_to_file(
+        &self,
+        path: &std::path::Path,
+        password: Option<&str>,
+    ) -> Result<(std::path::PathBuf, bool, usize)> {
+        let bundle = self.export_bundle()?;
+        let (text, encrypted) = export::export(&bundle, password)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Store(format!("创建导出目录失败: {e}")))?;
+        }
+        std::fs::write(path, &text).map_err(|e| Error::Store(format!("写入导出文件失败: {e}")))?;
+
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "app",
+            format!("已导出配置（{}）", if encrypted { "加密" } else { "明文" }),
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "bytes": text.len(),
+                "encrypted": encrypted,
+            }),
+        ));
+        Ok((path.to_path_buf(), encrypted, text.len()))
     }
 
     /// 脱敏审计：扫描本产品**全部落盘产物**里的明文凭证。

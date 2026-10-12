@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gateway-start"
+description = "Enables the gateway_start command without any pre-configured scope."
+commands.allow = ["gateway_start"]
+
+[[permission]]
+identifier = "deny-gateway-start"
+description = "Denies the gateway_start command without any pre-configured scope."
+commands.deny = ["gateway_start"]

@@ -11,6 +11,8 @@ pub const MAX_REFRESH_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const KEY_REFRESH_INTERVAL: &str = "refresh_interval_secs";
 const KEY_BALANCE_THRESHOLD: &str = "balance_alert_threshold";
 const KEY_DRIFT_ON_START: &str = "drift_check_on_start";
+const KEY_GATEWAY_ENABLED: &str = "gateway_enabled";
+const KEY_GATEWAY_PORT: &str = "gateway_port";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -20,6 +22,10 @@ pub struct Settings {
     pub balance_alert_threshold: f64,
     /// 是否在启动时跑一次漂移检测（只读本地文件）。
     pub drift_check_on_start: bool,
+    /// 本地网关开关。默认关闭。
+    pub gateway_enabled: bool,
+    /// 网关端口。只绑 `127.0.0.1`。
+    pub gateway_port: u16,
 }
 
 impl Default for Settings {
@@ -30,6 +36,9 @@ impl Default for Settings {
             balance_alert_threshold: 0.0,
             // 漂移检测只读本地文件，默认开
             drift_check_on_start: true,
+            // 网关会监听端口，默认关闭
+            gateway_enabled: false,
+            gateway_port: 8787,
         }
     }
 }
@@ -43,6 +52,12 @@ impl Settings {
         }
         if !self.balance_alert_threshold.is_finite() || self.balance_alert_threshold < 0.0 {
             return Err(Error::Store("余额告警阈值必须是非负有限数".to_string()));
+        }
+        // 1024 以下是特权端口，普通用户绑不上；0 也不是合法端口
+        if self.gateway_port < 1024 {
+            return Err(Error::Store(
+                "网关端口必须在 1024..=65535 之间（1024 以下需要管理员权限）".to_string(),
+            ));
         }
         Ok(())
     }
@@ -79,6 +94,18 @@ impl Settings {
                         settings.drift_check_on_start = flag;
                     }
                 }
+                KEY_GATEWAY_ENABLED => {
+                    if let Ok(flag) = value.parse::<bool>() {
+                        settings.gateway_enabled = flag;
+                    }
+                }
+                KEY_GATEWAY_PORT => {
+                    if let Ok(port) = value.parse::<u16>() {
+                        if port >= 1024 {
+                            settings.gateway_port = port;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -94,13 +121,17 @@ impl Settings {
                 format!("{}", self.balance_alert_threshold),
             ),
             (KEY_DRIFT_ON_START, self.drift_check_on_start.to_string()),
+            (KEY_GATEWAY_ENABLED, self.gateway_enabled.to_string()),
+            (KEY_GATEWAY_PORT, self.gateway_port.to_string()),
         ]
     }
 
-    pub const KEYS: [&'static str; 3] = [
+    pub const KEYS: [&'static str; 5] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
+        KEY_GATEWAY_ENABLED,
+        KEY_GATEWAY_PORT,
     ];
 }
 
@@ -115,6 +146,8 @@ mod tests {
         assert!(!s.scheduler_enabled());
         assert_eq!(s.balance_alert_threshold, 0.0);
         assert!(s.drift_check_on_start, "漂移检测只读本地，默认开");
+        assert!(!s.gateway_enabled, "网关会监听端口，必须默认关闭");
+        assert_eq!(s.gateway_port, 8787);
         assert!(s.validate().is_ok());
     }
 
@@ -143,6 +176,20 @@ mod tests {
             ..Settings::default()
         };
         assert!(at_limit.validate().is_ok());
+
+        // 特权端口被拒
+        for port in [0u16, 80, 1023] {
+            let bad = Settings {
+                gateway_port: port,
+                ..Settings::default()
+            };
+            assert!(bad.validate().is_err(), "端口 {port} 应被拒绝");
+        }
+        let ok_port = Settings {
+            gateway_port: 1024,
+            ..Settings::default()
+        };
+        assert!(ok_port.validate().is_ok());
     }
 
     #[test]
@@ -151,6 +198,8 @@ mod tests {
             refresh_interval_secs: 900,
             balance_alert_threshold: 3.5,
             drift_check_on_start: false,
+            gateway_enabled: true,
+            gateway_port: 9999,
         };
         let pairs = s.to_pairs();
         let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();

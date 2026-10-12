@@ -8,6 +8,8 @@ pub mod audit;
 pub mod delivery;
 pub mod drift;
 pub mod error;
+pub mod export;
+pub mod gateway;
 pub mod inject;
 pub mod observability;
 pub mod platform;

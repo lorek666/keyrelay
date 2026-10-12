@@ -30,4 +30,9 @@ pub const COMMANDS: &[&str] = &[
     "update_settings",
     "refresh_all",
     "audit_redaction",
+    "gateway_status",
+    "gateway_start",
+    "gateway_stop",
+    "export_bundle",
+    "prune_backups",
 ];
