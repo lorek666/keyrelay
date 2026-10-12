@@ -26,9 +26,14 @@ fn header_of<'a>(
         .map(|(_, v)| v.as_str())
 }
 
+/// 测试用响应构造器：`HttpResponse::json` 现在返回 `Result`（不再静默降级为空 body）
+fn json_resp(status: u16, value: serde_json::Value) -> HttpResponse {
+    HttpResponse::json(status, value).expect("测试响应构造失败")
+}
+
 #[tokio::test]
 async fn detect_identifies_newapi_and_reads_version() {
-    let transport = MockTransport::new(vec![HttpResponse::json(
+    let transport = MockTransport::new(vec![json_resp(
         200,
         json!({"success": true, "data": {"version": "v0.9.1", "quota_per_unit": 500000, "system_name": "中转站"}}),
     )]);
@@ -46,7 +51,7 @@ async fn detect_identifies_newapi_and_reads_version() {
 
 #[tokio::test]
 async fn detect_rejects_non_newapi_site() {
-    let transport = MockTransport::new(vec![HttpResponse::json(200, json!({"hello": "world"}))]);
+    let transport = MockTransport::new(vec![json_resp(200, json!({"hello": "world"}))]);
     let adapter = NewApi::new(transport);
     let err = adapter.detect(BASE).await.unwrap_err();
     assert!(matches!(err, Error::FingerprintMismatch(_)));
@@ -54,7 +59,7 @@ async fn detect_rejects_non_newapi_site() {
 
 #[tokio::test]
 async fn login_captures_session_cookie_and_user_id() {
-    let transport = MockTransport::new(vec![HttpResponse::json(
+    let transport = MockTransport::new(vec![json_resp(
         200,
         json!({"success": true, "message": "", "data": {"id": 42, "username": "me"}}),
     )
@@ -82,7 +87,7 @@ async fn login_captures_session_cookie_and_user_id() {
 
 #[tokio::test]
 async fn login_maps_turnstile_to_captcha_required() {
-    let transport = MockTransport::new(vec![HttpResponse::json(
+    let transport = MockTransport::new(vec![json_resp(
         200,
         json!({"success": false, "message": "Turnstile 验证失败，请重试"}),
     )]);
@@ -96,7 +101,7 @@ async fn login_maps_turnstile_to_captcha_required() {
 
 #[tokio::test]
 async fn login_maps_2fa_message_to_second_factor() {
-    let transport = MockTransport::new(vec![HttpResponse::json(
+    let transport = MockTransport::new(vec![json_resp(
         200,
         json!({"success": false, "message": "需要二次验证"}),
     )]);
@@ -128,7 +133,7 @@ async fn login_maps_rate_limit_with_retry_after() {
 
 #[tokio::test]
 async fn list_keys_parses_paginated_shape() {
-    let transport = MockTransport::new(vec![HttpResponse::json(
+    let transport = MockTransport::new(vec![json_resp(
         200,
         json!({"success": true, "data": {"items": [
             {"id": 12, "name": "codex/daily", "group": "default", "status": 1, "created_time": 1700000000, "accessed_time": 1700000100},
@@ -161,9 +166,9 @@ async fn list_keys_parses_paginated_shape() {
 async fn create_key_flow_is_create_then_list_then_reveal() {
     let transport = MockTransport::new(vec![
         // 1) 创建
-        HttpResponse::json(200, json!({"success": true, "message": ""})),
+        json_resp(200, json!({"success": true, "message": ""})),
         // 2) 列表定位
-        HttpResponse::json(
+        json_resp(
             200,
             json!({"success": true, "data": {"items": [
                 {"id": 11, "name": "codex/daily", "status": 1, "created_time": 1},
@@ -171,7 +176,7 @@ async fn create_key_flow_is_create_then_list_then_reveal() {
             ]}}),
         ),
         // 3) 读明文
-        HttpResponse::json(
+        json_resp(
             200,
             json!({"success": true, "data": {"key": "sk-abcdefgh12345678"}}),
         ),
@@ -216,7 +221,7 @@ async fn create_key_flow_is_create_then_list_then_reveal() {
 
 #[tokio::test]
 async fn create_key_sends_bearer_when_session_has_access_token() {
-    let transport = MockTransport::new(vec![HttpResponse::json(
+    let transport = MockTransport::new(vec![json_resp(
         200,
         json!({"success": true, "data": {"id": 5, "key": "sk-inline12345678"}}),
     )]);
@@ -245,7 +250,7 @@ async fn create_key_sends_bearer_when_session_has_access_token() {
 
 #[tokio::test]
 async fn create_key_uses_key_from_create_response_when_present() {
-    let transport = MockTransport::new(vec![HttpResponse::json(
+    let transport = MockTransport::new(vec![json_resp(
         200,
         json!({"success": true, "data": {"id": 99, "key": "sk-inline12345678"}}),
     )]);
@@ -261,7 +266,7 @@ async fn create_key_uses_key_from_create_response_when_present() {
 
 #[tokio::test]
 async fn balance_converts_quota_to_usd() {
-    let transport = MockTransport::new(vec![HttpResponse::json(
+    let transport = MockTransport::new(vec![json_resp(
         200,
         json!({"success": true, "data": {"quota": 1234567, "used_quota": 500000, "quota_per_unit": 500000}}),
     )]);
@@ -276,7 +281,7 @@ async fn balance_converts_quota_to_usd() {
 
 #[tokio::test]
 async fn quota_error_is_mapped_on_key_operations() {
-    let transport = MockTransport::new(vec![HttpResponse::json(
+    let transport = MockTransport::new(vec![json_resp(
         403,
         json!({"error": {"code": "insufficient_user_quota", "message": "额度不足"}}),
     )]);
@@ -287,7 +292,7 @@ async fn quota_error_is_mapped_on_key_operations() {
 
 #[tokio::test]
 async fn revoke_key_hits_delete_endpoint() {
-    let transport = MockTransport::new(vec![HttpResponse::json(200, json!({"success": true}))]);
+    let transport = MockTransport::new(vec![json_resp(200, json!({"success": true}))]);
     let adapter = NewApi::new(transport);
     adapter.revoke_key(BASE, &session(), "12").await.unwrap();
 

@@ -4,7 +4,7 @@
 //! 生产实现（`reqwest`，含代理支持）在 M1-S1 接入。
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -86,12 +86,18 @@ impl HttpResponse {
         }
     }
 
-    pub fn json(status: u16, value: Value) -> Self {
-        Self {
+    /// 构造 JSON 响应。
+    ///
+    /// 序列化失败（例如 `Value` 里含 NaN/Infinity）返回错误，**不再静默降级为空 body**
+    /// （BACKLOG B-13）。
+    pub fn json(status: u16, value: Value) -> Result<Self> {
+        let body = serde_json::to_vec(&value)
+            .map_err(|e| Error::Transport(format!("响应体序列化失败: {e}")))?;
+        Ok(Self {
             status,
             headers: vec![("Content-Type".into(), "application/json".into())],
-            body: serde_json::to_vec(&value).unwrap_or_default(),
-        }
+            body,
+        })
     }
 
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
@@ -140,24 +146,34 @@ pub trait HttpTransport: Send + Sync {
     async fn request(&self, req: HttpRequest) -> Result<HttpResponse>;
 }
 
-/// 测试用传输层：按队列顺序返回预置响应，并记录收到的请求。
-#[derive(Default)]
+/// 测试用传输层：按队列顺序返回预置响应或预置错误，并记录收到的请求。
+///
+/// 内部用 `Arc` 包裹，`clone()` 后共享同一队列与记录（契约测试里 `mock.clone()` 交给
+/// 被测适配器、原句柄用来断言请求，是常见用法）。
+#[derive(Default, Clone)]
 pub struct MockTransport {
-    queue: Mutex<VecDeque<HttpResponse>>,
-    seen: Mutex<Vec<HttpRequest>>,
+    queue: Arc<Mutex<VecDeque<Result<HttpResponse>>>>,
+    seen: Arc<Mutex<Vec<HttpRequest>>>,
 }
 
 impl MockTransport {
     pub fn new(responses: Vec<HttpResponse>) -> Self {
         Self {
-            queue: Mutex::new(responses.into()),
-            seen: Mutex::new(Vec::new()),
+            queue: Arc::new(Mutex::new(responses.into_iter().map(Ok).collect())),
+            seen: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub fn push(&self, response: HttpResponse) {
         if let Ok(mut q) = self.queue.lock() {
-            q.push_back(response);
+            q.push_back(Ok(response));
+        }
+    }
+
+    /// 注入一个传输层错误（用于测试重试与错误路径）
+    pub fn push_error(&self, error: Error) {
+        if let Ok(mut q) = self.queue.lock() {
+            q.push_back(Err(error));
         }
     }
 
@@ -185,6 +201,6 @@ impl HttpTransport for MockTransport {
             .lock()
             .map_err(|_| Error::Transport("mock 响应队列锁已中毒".into()))?
             .pop_front()
-            .ok_or_else(|| Error::Transport("mock 响应队列已空".into()))
+            .unwrap_or_else(|| Err(Error::Transport("mock 响应队列已空".into())))
     }
 }
