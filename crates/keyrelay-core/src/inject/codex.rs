@@ -90,11 +90,11 @@ impl Injector for CodexInjector {
         provider.insert("env_key", value(Self::env_key_name(&binding.provider_id)));
         providers.insert(&binding.provider_id, Item::Table(provider));
 
-        Ok(vec![Patch {
-            path: self.config_path.clone(),
+        Ok(vec![Patch::new(
+            self.config_path.clone(),
             before,
-            after: doc.to_string(),
-        }])
+            doc.to_string(),
+        )])
     }
 }
 

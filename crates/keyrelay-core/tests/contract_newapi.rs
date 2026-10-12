@@ -327,7 +327,10 @@ async fn create_key_flow_is_create_then_list_then_reveal() {
     assert!(requests[1]
         .url
         .starts_with("https://relay.example.com/api/token/?"));
-    assert_eq!(requests[2].url, "https://relay.example.com/api/token/?p=2&page_size=100");
+    assert_eq!(
+        requests[2].url,
+        "https://relay.example.com/api/token/?p=2&page_size=100"
+    );
     assert_eq!(
         requests[3].url,
         "https://relay.example.com/api/token/12/key"
@@ -653,11 +656,7 @@ async fn list_keys_does_not_assume_the_server_honors_page_size() {
             json!({"success": true, "data": {"items": items, "total": 25}}),
         )
     };
-    let transport = MockTransport::new(vec![
-        page(0, 10),
-        page(10, 10),
-        page(20, 5),
-    ]);
+    let transport = MockTransport::new(vec![page(0, 10), page(10, 10), page(20, 5)]);
     let adapter = NewApi::new(transport);
 
     let keys = adapter.list_keys(BASE, &session()).await.unwrap();
@@ -750,14 +749,22 @@ async fn list_keys_accepts_empty_account_with_zero_total() {
         json!({"success": true, "data": {"items": [], "total": 0}}),
     )]);
     let adapter = NewApi::new(transport);
-    assert!(adapter.list_keys(BASE, &session()).await.unwrap().is_empty());
+    assert!(adapter
+        .list_keys(BASE, &session())
+        .await
+        .unwrap()
+        .is_empty());
 
     let transport = MockTransport::new(vec![json_resp(
         200,
         json!({"success": true, "data": {"items": []}}),
     )]);
     let adapter = NewApi::new(transport);
-    assert!(adapter.list_keys(BASE, &session()).await.unwrap().is_empty());
+    assert!(adapter
+        .list_keys(BASE, &session())
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

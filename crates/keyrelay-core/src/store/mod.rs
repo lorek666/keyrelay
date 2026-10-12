@@ -76,6 +76,18 @@ CREATE TABLE IF NOT EXISTS events(
   message TEXT NOT NULL,
   payload_redacted_json TEXT
 );
+-- 密钥投递的用户授权（M1-S2）。**只存键名**，任何情况下不得出现密钥明文或掩码值。
+CREATE TABLE IF NOT EXISTS consents(
+  id INTEGER PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  target_path TEXT NOT NULL,
+  fields TEXT NOT NULL,
+  granted_at INTEGER NOT NULL,
+  revoked_at INTEGER,
+  UNIQUE(agent_id, channel, target_path)
+);
+CREATE INDEX IF NOT EXISTS idx_consents_agent ON consents(agent_id, channel);
 "#;
 
 fn now_secs() -> i64 {
@@ -112,6 +124,17 @@ pub struct KeyRow {
     pub group_name: Option<String>,
     pub secret_ref: String,
     pub status: String,
+}
+
+/// 投递授权行。`fields` 是 JSON 数组，**只有键名**。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsentRow {
+    pub agent_id: String,
+    pub channel: String,
+    pub target_path: String,
+    pub fields: String,
+    pub granted_at: i64,
+    pub revoked_at: Option<i64>,
 }
 
 pub struct Store {
@@ -266,6 +289,85 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// 按 id 取单条密钥记录（投递时用它拿 `secret_ref`）。
+    pub fn get_key(&self, id: i64) -> Result<Option<KeyRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, site_id, remote_id, name, group_name, secret_ref, status
+                 FROM keys WHERE id = ?1",
+            )
+            .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
+        let mut rows = stmt
+            .query_map(params![id], |row| {
+                Ok(KeyRow {
+                    id: row.get(0)?,
+                    site_id: row.get(1)?,
+                    remote_id: row.get(2)?,
+                    name: row.get(3)?,
+                    group_name: row.get(4)?,
+                    secret_ref: row.get(5)?,
+                    status: row.get(6)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("查询密钥失败: {e}")))?;
+        match rows.next() {
+            Some(row) => {
+                Ok(Some(row.map_err(|e| {
+                    Error::Store(format!("读取密钥行失败: {e}"))
+                })?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 记录一次投递绑定（agent ← key → 目标文件）。
+    pub fn record_binding(
+        &self,
+        agent_id: &str,
+        key_id: i64,
+        target_path: &str,
+        journal_id: &str,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO bindings(agent_id, key_id, target_path, applied_at, journal_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![agent_id, key_id, target_path, now_secs(), journal_id],
+        )
+        .map_err(|e| Error::Store(format!("写入投递绑定失败: {e}")))?;
+        Ok(())
+    }
+
+    /// 还原一个 journal 的条目，供 `rollback_delivery` 重建 `Journal`。
+    ///
+    /// 用 `instr(...) = 1` 做前缀匹配而不是 `LIKE`：`LIKE` 的通配符会让
+    /// 含 `%` / `_` 的 id 匹配到别的 journal。
+    pub fn journal_entries(&self, journal_id: &str) -> Result<Vec<crate::inject::JournalEntry>> {
+        use crate::inject::JournalEntry;
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT target_path, backup_path, before_sha256, after_sha256
+                 FROM journals WHERE instr(id, ?1 || ':') = 1 ORDER BY rowid",
+            )
+            .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
+        let rows = stmt
+            .query_map(params![journal_id], |row| {
+                Ok(JournalEntry {
+                    path: std::path::PathBuf::from(row.get::<_, String>(0)?),
+                    backup: row
+                        .get::<_, Option<String>>(1)?
+                        .map(std::path::PathBuf::from),
+                    before_sha256: row.get(2)?,
+                    after_sha256: row.get(3)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("查询变更记录失败: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("读取变更记录行失败: {e}")))
+    }
+
     pub fn list_keys(&self) -> Result<Vec<KeyRow>> {
         let conn = self.lock()?;
         let mut stmt = conn
@@ -316,6 +418,97 @@ impl Store {
         let conn = self.lock()?;
         conn.query_row("SELECT COUNT(*) FROM journals", [], |row| row.get(0))
             .map_err(|e| Error::Store(format!("统计变更记录失败: {e}")))
+    }
+
+    // ======================================================== 投递授权（M1-S2）
+
+    /// 授予/刷新同意。同一 `(agent_id, channel, target_path)` 幂等：
+    /// 重复同意只刷新 `granted_at` 并清空 `revoked_at`。
+    pub fn grant_consent(
+        &self,
+        agent_id: &str,
+        channel: &str,
+        target_path: &str,
+        fields: &[String],
+    ) -> Result<()> {
+        let fields_json = serde_json::to_string(fields)
+            .map_err(|e| Error::Store(format!("序列化字段名失败: {e}")))?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO consents(agent_id, channel, target_path, fields, granted_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)
+             ON CONFLICT(agent_id, channel, target_path)
+             DO UPDATE SET fields = excluded.fields,
+                           granted_at = excluded.granted_at,
+                           revoked_at = NULL",
+            params![agent_id, channel, target_path, fields_json, now_secs()],
+        )
+        .map_err(|e| Error::Store(format!("写入投递授权失败: {e}")))?;
+        Ok(())
+    }
+
+    /// 撤销同意。**不**回滚已写入的文件（回滚是独立动作）。
+    pub fn revoke_consent(&self, agent_id: &str, channel: &str, target_path: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE consents SET revoked_at = ?4
+             WHERE agent_id = ?1 AND channel = ?2 AND target_path = ?3 AND revoked_at IS NULL",
+            params![agent_id, channel, target_path, now_secs()],
+        )
+        .map_err(|e| Error::Store(format!("撤销投递授权失败: {e}")))?;
+        Ok(())
+    }
+
+    /// 查有效同意（`revoked_at IS NULL`）。返回 `granted_at`。
+    pub fn active_consent(
+        &self,
+        agent_id: &str,
+        channel: &str,
+        target_path: &str,
+    ) -> Result<Option<i64>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT granted_at FROM consents
+                 WHERE agent_id = ?1 AND channel = ?2 AND target_path = ?3 AND revoked_at IS NULL",
+            )
+            .map_err(|e| Error::Store(format!("查询投递授权失败: {e}")))?;
+        let mut rows = stmt
+            .query_map(params![agent_id, channel, target_path], |row| row.get(0))
+            .map_err(|e| Error::Store(format!("查询投递授权失败: {e}")))?;
+        match rows.next() {
+            Some(row) => {
+                Ok(Some(row.map_err(|e| {
+                    Error::Store(format!("读取投递授权失败: {e}"))
+                })?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 列出全部同意记录（含已撤销），供 UI 展示。
+    pub fn list_consents(&self) -> Result<Vec<ConsentRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_id, channel, target_path, fields, granted_at, revoked_at
+                 FROM consents ORDER BY agent_id, channel, target_path",
+            )
+            .map_err(|e| Error::Store(format!("列举投递授权失败: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ConsentRow {
+                    agent_id: row.get(0)?,
+                    channel: row.get(1)?,
+                    target_path: row.get(2)?,
+                    fields: row.get(3)?,
+                    granted_at: row.get(4)?,
+                    revoked_at: row.get(5)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("列举投递授权失败: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("读取投递授权行失败: {e}")))
     }
 }
 
