@@ -221,3 +221,66 @@ async fn timeout_maps_to_transport_error() {
         other => panic!("期望 Transport 错误，实际: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn redirect_is_passed_through_not_followed() {
+    // 复审 P2-2：默认必须把 3xx 原样交给适配器（用于识别会话失效/域名迁移），
+    // 而不是变成 TooManyRedirects 错误。
+    let server = spawn_server(vec![
+        "HTTP/1.1 302 Found\r\nLocation: https://login.example.com/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+    ]);
+    let transport = transport(Duration::from_secs(5));
+
+    let response = transport
+        .request(HttpRequest::new(
+            Method::Get,
+            format!("{}/api/status", server.base_url),
+        ))
+        .await
+        .expect("3xx 不应变成传输错误");
+
+    assert_eq!(response.status, 302);
+    assert_eq!(
+        response.header("Location"),
+        Some("https://login.example.com/")
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 1, "不得跟随重定向");
+}
+
+#[tokio::test]
+async fn real_stack_retries_429_with_retry_after() {
+    // 复审 P1-1 的**真实栈**回归测试：ReqwestTransport（429 作为 Ok 返回）
+    // 叠加重试装饰器后必须真的重试，而不是一次即返。
+    use keyrelay_core::site::retry::{RecordingSleeper, RetryPolicy, RetryingTransport};
+    use std::sync::Arc;
+
+    let server = spawn_server(vec![
+        http_response("429 Too Many Requests", "application/json", "{}")
+            .replace("Connection: close", "Connection: close\r\nRetry-After: 2"),
+        http_response("200 OK", "application/json", r#"{"success":true}"#),
+    ]);
+
+    let inner = transport(Duration::from_secs(5));
+    let sleeper = Arc::new(RecordingSleeper::default());
+    let retrying = RetryingTransport::with_sleeper(inner, RetryPolicy::default(), sleeper.clone());
+
+    let response = retrying
+        .request(HttpRequest::new(
+            Method::Get,
+            format!("{}/api/status", server.base_url),
+        ))
+        .await
+        .expect("请求成功");
+
+    assert_eq!(response.status, 200, "重试后应拿到 200");
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        2,
+        "服务端应收到两次请求（429 后重试一次）"
+    );
+    assert_eq!(
+        sleeper.calls(),
+        vec![Duration::from_secs(2)],
+        "等待时长应取 Retry-After"
+    );
+}

@@ -6,6 +6,7 @@
 //! （`tests/commands.rs`）能用 Tauri 官方 mock runtime 复用同一套命令注册。
 
 mod commands;
+pub mod commands_list;
 
 use std::path::PathBuf;
 
