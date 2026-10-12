@@ -1,16 +1,53 @@
-//! 应用服务层：把「站点适配器 + 注册表 + 会话缓存 + 本地存储」组合成可直接被 UI 调用的用例。
+//! 应用服务层：把「站点适配器 + 注册表 + 会话缓存 + 本地存储 + 钥匙串」组合成可直接被 UI 调用的用例。
 //!
 //! 分层约定：本层**不碰 HTTP 细节**（交给适配器）、**不碰 SQL**（交给 `Store`）、
-//! **不碰密钥落盘**（M1-S2 的钥匙串）。Tauri 命令层只做 DTO 转换。
+//! **不读环境变量**（路径由壳层显式传入）。Tauri 命令层只做 DTO 转换。
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use crate::delivery::{self, ConsentState, DeliveryChannel, DeliveryOutcome, DeliveryPlan};
 use crate::error::{Error, Result};
+use crate::inject;
 use crate::site::registry::SiteRegistry;
 use crate::site::transport::HttpTransport;
 use crate::site::{Balance, Credentials, KeyMaterial, KeyMeta, KeySpec, Session, SiteKind};
-use crate::store::{SiteRow, Store};
+use crate::store::{ConsentRow, SiteRow, Store};
+use crate::vault::{KeychainVault, Vault};
+
+/// 服务装配参数。核心层**不读环境变量**，`home` 与 `backup_dir` 一律由壳层传入，
+/// 这样测试可以把它们指向临时目录。
+pub struct ServiceConfig {
+    pub vault: Arc<dyn Vault>,
+    pub home: PathBuf,
+    pub backup_dir: PathBuf,
+}
+
+impl ServiceConfig {
+    /// 生产装配：钥匙串用系统实现（`KeychainVault`），路径按 `home` 推导。
+    ///
+    /// 注意：这里**只**会构造系统钥匙串；不可用时由 `Vault::probe()`/各方法返回
+    /// [`Error::VaultUnavailable`]，绝不静默换成 `MemoryVault`。
+    pub fn production(home: impl Into<PathBuf>) -> Self {
+        let home = home.into();
+        Self {
+            vault: Arc::new(KeychainVault::new()),
+            backup_dir: home.join(".keyrelay").join("backups"),
+            home,
+        }
+    }
+
+    /// 测试装配：内存钥匙串 + 显式临时目录。
+    pub fn in_memory(home: impl Into<PathBuf>) -> Self {
+        let home = home.into();
+        Self {
+            vault: Arc::new(crate::vault::MemoryVault::new()),
+            backup_dir: home.join(".keyrelay").join("backups"),
+            home,
+        }
+    }
+}
 
 /// 进程内会话缓存（按站点隔离）。持久化属 M1-S2。
 #[derive(Default)]
@@ -78,15 +115,26 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     registry: SiteRegistry<T>,
     store: Store,
     sessions: SessionCache,
+    vault: Arc<dyn Vault>,
+    home: PathBuf,
+    backup_dir: PathBuf,
 }
 
 impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
-    pub fn new(store: Store, transport: T) -> Self {
+    pub fn new(store: Store, transport: T, config: ServiceConfig) -> Self {
         Self {
             registry: SiteRegistry::new(transport),
             store,
             sessions: SessionCache::new(),
+            vault: config.vault,
+            home: config.home,
+            backup_dir: config.backup_dir,
         }
+    }
+
+    /// 钥匙串后端标识（诊断用；`"memory"` 出现在生产装配里即为缺陷）。
+    pub fn vault_backend(&self) -> &'static str {
+        self.vault.backend_name()
     }
 
     pub fn sites(&self) -> Result<Vec<SiteSummary>> {
@@ -187,6 +235,168 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             Error::AuthFailed("尚未登录该站点（或会话已失效），请先登录".to_string())
         })
     }
+
+    // ============================================================== 密钥投递（M1-S2）
+
+    /// 生成投递预览。**不含密钥明文**；不落盘、不写库。
+    pub fn delivery_plan(&self, key_id: i64, channel: DeliveryChannel) -> Result<DeliveryPlan> {
+        let writer = self.prepare_delivery(key_id, channel)?;
+        let api_key = self.key_secret(key_id)?;
+        let patch = writer.plan(&api_key)?;
+        let target_path = writer.target_path();
+        let consent = self.consent_state(channel, &target_path)?;
+        Ok(DeliveryPlan {
+            agent_id: channel.agent_id().to_string(),
+            channel,
+            target_exists: target_path.exists(),
+            fields: writer.fields(&api_key),
+            preview: delivery::diff_preview(&patch.before, &patch.after, &api_key),
+            consent,
+            target_path,
+        })
+    }
+
+    /// 记录用户同意（幂等：重复同意刷新时间戳并解除撤销）。
+    pub fn grant_consent(&self, key_id: i64, channel: DeliveryChannel) -> Result<()> {
+        let writer = self.prepare_delivery(key_id, channel)?;
+        let target = self.checked_target(channel, &writer.target_path())?;
+        // 记录同意**不需要**读钥匙串：用户此刻同意的是「写哪些键」，不是「密钥是否存在」。
+        let fields = writer.field_names();
+        self.store.grant_consent(
+            channel.agent_id(),
+            channel.as_str(),
+            &target.display().to_string(),
+            &fields,
+        )
+    }
+
+    /// 撤销同意。**不**回滚已写入的文件（回滚是独立动作）。
+    pub fn revoke_consent(&self, key_id: i64, channel: DeliveryChannel) -> Result<()> {
+        let writer = self.prepare_delivery(key_id, channel)?;
+        let target = self.checked_target(channel, &writer.target_path())?;
+        self.store.revoke_consent(
+            channel.agent_id(),
+            channel.as_str(),
+            &target.display().to_string(),
+        )
+    }
+
+    pub fn list_consents(&self) -> Result<Vec<ConsentRow>> {
+        self.store.list_consents()
+    }
+
+    /// 真正把密钥写进目标文件。步骤与顺序见 spec §6.1，**同意是第一步**。
+    pub fn apply_delivery(&self, key_id: i64, channel: DeliveryChannel) -> Result<DeliveryOutcome> {
+        // ① 同意（未同意时**不读钥匙串、不落盘**）
+        let writer = self.prepare_delivery(key_id, channel)?;
+        let target = self.checked_target(channel, &writer.target_path())?;
+        if !self.consent_state(channel, &target)?.is_granted() {
+            return Err(Error::ConsentRequired {
+                agent_id: channel.agent_id().to_string(),
+                channel: channel.as_str().to_string(),
+                target_path: target.display().to_string(),
+            });
+        }
+
+        // ② 取密钥并生成计划
+        let api_key = self.key_secret(key_id)?;
+        let patch = writer.plan(&api_key)?;
+
+        // ③ 写入（`inject::apply` 内部完成加锁 → 预检 → 备份 → 原子写 → 回读校验 → 失败补偿）
+        let journal = inject::apply(&[patch], &self.backup_dir)?;
+
+        // ④ 记账：变更记录 + 投递绑定。两者都不含密钥。
+        self.store.record_journal(&journal)?;
+        self.store.record_binding(
+            channel.agent_id(),
+            key_id,
+            &target.display().to_string(),
+            &journal.id,
+        )?;
+
+        Ok(DeliveryOutcome {
+            channel,
+            target_path: target,
+            backup_path: journal.entries.first().and_then(|e| e.backup.clone()),
+            journal_id: journal.id,
+        })
+    }
+
+    /// 按 journal 回滚（校验文件未被外部改动）。
+    pub fn rollback_delivery(&self, journal_id: &str) -> Result<()> {
+        let entries = self.store.journal_entries(journal_id)?;
+        if entries.is_empty() {
+            return Err(Error::NotFound(format!("变更记录 {journal_id} 不存在")));
+        }
+        inject::rollback(&inject::Journal {
+            id: journal_id.to_string(),
+            entries,
+        })
+    }
+
+    /// 解析通道写入器 + 校验 `key_id` 存在。**不读钥匙串**（同意检查必须在读密钥之前）。
+    fn prepare_delivery(
+        &self,
+        key_id: i64,
+        channel: DeliveryChannel,
+    ) -> Result<Box<dyn delivery::DeliveryWriter>> {
+        // key_id 存在性先校验：不存在时连通道都不必解析
+        if self.store.get_key(key_id)?.is_none() {
+            return Err(Error::NotFound(format!("密钥记录 #{key_id} 不存在")));
+        }
+        delivery::resolve(channel, &self.home)
+    }
+
+    /// 从钥匙串取密钥明文。调用方必须立刻用掉，不得记录。
+    fn key_secret(&self, key_id: i64) -> Result<String> {
+        let row = self
+            .store
+            .get_key(key_id)?
+            .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
+        self.vault.get(&row.secret_ref)?.ok_or_else(|| {
+            Error::Vault(format!(
+                "钥匙串中没有该密钥（{}）；请先在该站点重新取一次钥匙",
+                row.secret_ref
+            ))
+        })
+    }
+
+    /// 目标路径必须落在 `home` 之内。写入器目前是固定相对路径拼出来的，
+    /// 这一层是**纵深防御**：将来新增写入器时挡住越界路径。
+    fn checked_target(&self, channel: DeliveryChannel, target: &Path) -> Result<PathBuf> {
+        if !target.starts_with(&self.home) {
+            return Err(Error::Inject {
+                path: target.display().to_string(),
+                reason: format!(
+                    "投递目标越出用户目录（home={}），拒绝写入",
+                    self.home.display()
+                ),
+            });
+        }
+        let _ = channel;
+        Ok(target.to_path_buf())
+    }
+
+    fn consent_state(&self, channel: DeliveryChannel, target: &Path) -> Result<ConsentState> {
+        let target = target.display().to_string();
+        if let Some(granted_at) =
+            self.store
+                .active_consent(channel.agent_id(), channel.as_str(), &target)?
+        {
+            return Ok(ConsentState::Granted { granted_at });
+        }
+        // 没有有效同意时，区分「从未同意」与「同意后被撤销」——UI 文案不同。
+        let revoked = self.store.list_consents()?.into_iter().find(|row| {
+            row.agent_id == channel.agent_id()
+                && row.channel == channel.as_str()
+                && row.target_path == target
+                && row.revoked_at.is_some()
+        });
+        Ok(match revoked.and_then(|r| r.revoked_at) {
+            Some(revoked_at) => ConsentState::Revoked { revoked_at },
+            None => ConsentState::Missing,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -225,7 +435,14 @@ mod tests {
 
     async fn service_with(responses: Vec<HttpResponse>) -> KeyRelayService<MockTransport> {
         let store = Store::open_in_memory().expect("内存库");
-        KeyRelayService::new(store, MockTransport::new(responses))
+        KeyRelayService::new(store, MockTransport::new(responses), test_config())
+    }
+
+    /// 测试装配：内存钥匙串 + 一次性临时目录（绝不碰真实 `~/.keyrelay`）。
+    fn test_config() -> ServiceConfig {
+        let dir = tempfile::tempdir().expect("临时目录");
+        // 目录句柄随进程存活：测试进程结束即由系统回收
+        ServiceConfig::in_memory(dir.keep())
     }
 
     #[tokio::test]
@@ -267,7 +484,7 @@ mod tests {
         ];
         let store = Store::open_in_memory().unwrap();
         let mock = MockTransport::new(transport_responses);
-        let service = KeyRelayService::new(store, mock.clone());
+        let service = KeyRelayService::new(store, mock.clone(), test_config());
 
         let site = service.add_site("https://relay.example.com").await.unwrap();
         service
@@ -309,7 +526,11 @@ mod tests {
                 .expect("构造响应"),
         ];
         let store = Store::open_in_memory().unwrap();
-        let service = KeyRelayService::new(store, MockTransport::new(transport_responses));
+        let service = KeyRelayService::new(
+            store,
+            MockTransport::new(transport_responses),
+            test_config(),
+        );
 
         let site = service.add_site("https://relay.example.com").await.unwrap();
         service
@@ -341,7 +562,11 @@ mod tests {
             login_response(),
         ];
         let store = Store::open_in_memory().unwrap();
-        let service = KeyRelayService::new(store, MockTransport::new(transport_responses));
+        let service = KeyRelayService::new(
+            store,
+            MockTransport::new(transport_responses),
+            test_config(),
+        );
 
         let site = service.add_site("https://relay.example.com").await.unwrap();
         service

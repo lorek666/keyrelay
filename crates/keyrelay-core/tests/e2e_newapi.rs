@@ -11,6 +11,7 @@ use std::thread;
 
 use base64::Engine as _;
 use keyrelay_core::service::KeyRelayService;
+use keyrelay_core::service::ServiceConfig;
 use keyrelay_core::site::retry::{RetryPolicy, RetryingTransport};
 use keyrelay_core::site::transport::HttpTransport;
 use keyrelay_core::site::transport_reqwest::{ReqwestTransport, TransportConfig};
@@ -217,6 +218,11 @@ fn spawn_fake_newapi(private: RsaPrivateKey, public_pem: String) -> FakeSite {
     }
 }
 
+/// 测试装配：内存钥匙串 + 一次性临时目录（绝不碰真实 `~/.keyrelay`）。
+fn test_config() -> ServiceConfig {
+    ServiceConfig::in_memory(std::env::temp_dir().join("keyrelay-e2e-home"))
+}
+
 #[tokio::test]
 async fn full_flow_against_fake_newapi_site() {
     let private = RsaPrivateKey::new(&mut OsRng, 2048).expect("生成站点密钥");
@@ -234,7 +240,7 @@ async fn full_flow_against_fake_newapi_site() {
         ReqwestTransport::new(TransportConfig::default()).expect("构造真实传输层"),
         RetryPolicy::default(),
     );
-    let service = KeyRelayService::new(store, transport);
+    let service = KeyRelayService::new(store, transport, test_config());
 
     // ① 指纹识别 + 落库
     let summary = service.add_site(&site.base_url).await.expect("识别站点");
@@ -341,7 +347,7 @@ async fn wrong_password_is_rejected_by_fake_site() {
         ReqwestTransport::new(TransportConfig::default()).expect("构造真实传输层"),
         RetryPolicy::default(),
     );
-    let service = KeyRelayService::new(store, transport);
+    let service = KeyRelayService::new(store, transport, test_config());
 
     let summary = service.add_site(&site.base_url).await.expect("识别站点");
     let err = service

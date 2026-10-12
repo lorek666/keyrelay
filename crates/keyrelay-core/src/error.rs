@@ -49,6 +49,22 @@ pub enum Error {
     #[error("钥匙串错误: {0}")]
     Vault(String),
 
+    /// 系统钥匙串不可用（无后端 / 未授权 / 平台不支持）。禁止降级为内存实现。
+    #[error("系统钥匙串不可用: {0}")]
+    VaultUnavailable(String),
+
+    /// 需要用户先在界面上明确同意
+    #[error("需要用户同意后才能写入：{agent_id} 的 {channel} 通道将写入 {target_path}")]
+    ConsentRequired {
+        agent_id: String,
+        channel: String,
+        target_path: String,
+    },
+
+    /// 目标文件正被另一个 KeyRelay 实例（或线程）占用
+    #[error("目标文件正被占用，请稍后重试: {0}")]
+    FileBusy(String),
+
     /// 本地存储失败
     #[error("存储错误: {0}")]
     Store(String),

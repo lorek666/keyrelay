@@ -10,7 +10,7 @@ pub mod commands_list;
 
 use std::path::PathBuf;
 
-use keyrelay_core::service::KeyRelayService;
+use keyrelay_core::service::{KeyRelayService, ServiceConfig};
 use keyrelay_core::site::registry::SiteRegistry;
 use keyrelay_core::site::retry::{RetryPolicy, RetryingTransport};
 use keyrelay_core::site::transport_reqwest::{ReqwestTransport, TransportConfig};
@@ -28,10 +28,17 @@ pub struct AppState {
     pub db_error: Option<String>,
 }
 
+/// 用户主目录。Windows 上 `HOME` 可能缺失（BACKLOG B-14，M4-S1 换 `platform::home_dir()`）。
+pub fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
 /// `~/.keyrelay/keyrelay.db`
 pub fn default_db_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".keyrelay").join("keyrelay.db")
+    home_dir().join(".keyrelay").join("keyrelay.db")
 }
 
 fn build_transport() -> AppTransport {
@@ -51,8 +58,33 @@ pub async fn detect_only(base_url: &str) -> Result<SiteFingerprint> {
 }
 
 fn state_from_store(store: Store, db_path: PathBuf, db_error: Option<String>) -> AppState {
+    state_with_config(
+        store,
+        db_path,
+        db_error,
+        ServiceConfig::production(home_dir()),
+    )
+}
+
+/// 测试用：内存钥匙串，绝不触碰用户真实钥匙串与 `~/.keyrelay`。
+fn state_in_memory(store: Store, db_path: PathBuf) -> AppState {
+    let tmp = std::env::temp_dir().join(format!("keyrelay-test-{}", std::process::id()));
+    state_with_config(store, db_path, None, ServiceConfig::in_memory(tmp))
+}
+
+fn state_with_config(
+    store: Store,
+    db_path: PathBuf,
+    db_error: Option<String>,
+    config: ServiceConfig,
+) -> AppState {
+    // 钥匙串可用性只在启动时探测一次并明确告警；不可用时投递相关能力会各自失败，
+    // **不会**静默换成内存实现（ADR-0002）。
+    if let Err(err) = config.vault.probe() {
+        eprintln!("[keyrelay] 系统钥匙串不可用，密钥投递将被禁用: {err}");
+    }
     AppState {
-        service: KeyRelayService::new(store, build_transport()),
+        service: KeyRelayService::new(store, build_transport(), config),
         db_path,
         db_error,
     }
@@ -79,7 +111,7 @@ pub fn init_state() -> AppState {
 /// 测试用：纯内存状态，不触碰用户 `~/.keyrelay`。
 pub fn init_state_in_memory() -> AppState {
     match Store::open_in_memory() {
-        Ok(store) => state_from_store(store, PathBuf::from(":memory:"), None),
+        Ok(store) => state_in_memory(store, PathBuf::from(":memory:")),
         Err(fatal) => {
             eprintln!("[keyrelay] 内存库不可用: {fatal}");
             std::process::exit(1);

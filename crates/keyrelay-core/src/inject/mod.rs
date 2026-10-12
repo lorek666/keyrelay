@@ -8,6 +8,7 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod lock;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,11 +19,62 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 
 /// 一次文件改写：`before` / `after` 用于生成 diff 与校验
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Patch {
     pub path: PathBuf,
     pub before: String,
     pub after: String,
+    /// 新建文件时使用的权限位（Unix）。`None` = 0644。
+    /// 已存在的文件**一律保留原权限**（沿用 M0 的行为）。
+    pub new_file_mode: Option<u32>,
+}
+
+impl Patch {
+    /// 常规配置补丁（不含密钥；新建时 0644）。
+    pub fn new(
+        path: impl Into<PathBuf>,
+        before: impl Into<String>,
+        after: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            before: before.into(),
+            after: after.into(),
+            new_file_mode: None,
+        }
+    }
+
+    /// 含密钥的文件（新建时 0600）。
+    pub fn secret_bearing(
+        path: impl Into<PathBuf>,
+        before: impl Into<String>,
+        after: impl Into<String>,
+    ) -> Self {
+        Self {
+            new_file_mode: Some(0o600),
+            ..Self::new(path, before, after)
+        }
+    }
+}
+
+/// 手写 `Debug`：只打印路径、长度与内容摘要，**绝不打印 `before` / `after` 正文**。
+///
+/// BACKLOG B-12：`Patch::after` 会包含密钥本体（投递场景），
+/// 而用户的 `config.toml` 里也可能本就有明文密钥。任何 `{:?}` 都不得把它们写进日志。
+impl std::fmt::Debug for Patch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Patch")
+            .field("path", &self.path)
+            .field("before_len", &self.before.len())
+            .field("after_len", &self.after.len())
+            .field("before_sha8", &&sha256_hex(self.before.as_bytes())[..8])
+            .field("after_sha8", &&sha256_hex(self.after.as_bytes())[..8])
+            .field(
+                "new_file_mode",
+                &self.new_file_mode.map(|m| format!("{m:o}")),
+            )
+            .finish()
+    }
 }
 
 /// 回滚凭据。`backup` 为 `None` 表示该文件在应用前不存在（回滚时应删除）。
@@ -85,7 +137,12 @@ fn read_or_empty(path: &Path) -> Result<String> {
     }
 }
 
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+fn write_atomic(
+    path: &Path,
+    contents: &str,
+    new_file_mode: Option<u32>,
+    mode_from: Option<&Path>,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::inject(path, "路径没有父目录"))?;
@@ -99,10 +156,37 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
 
     fs::write(&tmp, contents).map_err(|e| Error::inject(&tmp, format!("写临时文件失败: {e}")))?;
 
-    // 继承原文件权限位：临时文件按 umask 生成（常见 0644），
-    // 会把 0600 的配置放宽成同机其他用户可读，必须在 rename 前回设。
-    if let Ok(meta) = fs::metadata(path) {
-        let _ = fs::set_permissions(&tmp, meta.permissions());
+    // 权限必须在 rename **之前**设好（先 rename 再 chmod 会留下宽权限窗口）。
+    // 优先级：① 目标文件现存权限 → ② `mode_from` 模板文件（回滚时的备份文件，
+    // `fs::copy` 会带上原权限位）→ ③ 调用方指定值（含密钥的文件必须 0600）→ ④ 0644。
+    let template = fs::metadata(path)
+        .ok()
+        .map(|m| m.permissions())
+        .or_else(|| {
+            mode_from
+                .and_then(|p| fs::metadata(p).ok())
+                .map(|m| m.permissions())
+        });
+
+    match template {
+        Some(permissions) => {
+            let _ = fs::set_permissions(&tmp, permissions);
+        }
+        None => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = new_file_mode.unwrap_or(0o644);
+                fs::set_permissions(&tmp, fs::Permissions::from_mode(mode)).map_err(|e| {
+                    let _ = fs::remove_file(&tmp);
+                    Error::inject(&tmp, format!("设置文件权限失败: {e}"))
+                })?;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = new_file_mode;
+            }
+        }
     }
 
     fs::rename(&tmp, path).map_err(|e| {
@@ -116,8 +200,8 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
 /// 对应 spec §6「注入后回读失败 → 自动回滚并报错」：若落盘内容与预期不符，
 /// journal 记录的哈希就会与磁盘不一致，后续 `rollback` 会误判为「外部改动」而拒绝，
 /// 因此必须在写入当步发现并补偿。
-fn write_verified(path: &Path, contents: &str) -> Result<String> {
-    write_atomic(path, contents)?;
+fn write_verified(path: &Path, contents: &str, new_file_mode: Option<u32>) -> Result<String> {
+    write_atomic(path, contents, new_file_mode, None)?;
     let read_back =
         fs::read(path).map_err(|e| Error::inject(path, format!("写入后回读失败: {e}")))?;
     let text = String::from_utf8(read_back)
@@ -141,17 +225,44 @@ fn new_journal_id() -> String {
     format!("j{nanos}-{seq}")
 }
 
-/// 应用补丁：预检 → 备份 → 原子写 + 回读校验 → 记账。
+/// 锁目录 = `backup_dir` 的兄弟目录 `locks/`。
 ///
-/// 两处保证：
-/// 1. **先全量预检再写入**：任一目标文件的当前内容与计划的 `before` 不一致时，
+/// 例：`~/.keyrelay/backups` → `~/.keyrelay/locks`。
+/// 这样派生而不是新增参数，是为了让**每一条** `apply` 路径（包括不含密钥的
+/// `config.toml` 注入）都自动获得互斥保护，而不只是投递路径（BACKLOG B-16）。
+fn lock_dir_for(backup_dir: &Path) -> PathBuf {
+    match backup_dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join("locks"),
+        // `backup_dir` 只有一段（如 `"backups"`）时 parent 是空串：取同级 `locks`。
+        _ => PathBuf::from("locks"),
+    }
+}
+
+/// 应用补丁：加锁 → 预检 → 备份 → 原子写 + 回读校验 → 记账。
+///
+/// 三处保证：
+/// 1. **先加锁**：所有目标文件在预检之前就取到排他锁（进程内 + 跨进程），
+///    封住「读 → 校验 → 写」之间被其它实例插入改写的窗口（BACKLOG B-16）。
+/// 2. **先全量预检再写入**：任一目标文件的当前内容与计划的 `before` 不一致时，
 ///    在动任何文件之前就失败，不会留下「改了一半」的中间态。
-/// 2. **写入失败即补偿**：若第 N 个补丁写入或回读失败，已写入的条目与当前条目
+/// 3. **写入失败即补偿**：若第 N 个补丁写入或回读失败，已写入的条目与当前条目
 ///    会按逆序用备份还原，磁盘回到调用前状态。
 ///
 /// 备份落在 `backup_dir/<journal_id>/` 下：每次 apply 一个独立目录，
 /// 避免同一目标文件被多次注入时后一次覆盖前一次的备份（那样会导致回滚链断裂）。
 pub fn apply(patches: &[Patch], backup_dir: &Path) -> Result<Journal> {
+    // 同一个目标文件在 patches 里出现两次时只取一把锁，否则自己和自己互斥。
+    let lock_dir = lock_dir_for(backup_dir);
+    let mut locks: Vec<lock::FileLock> = Vec::new();
+    let mut locked: Vec<PathBuf> = Vec::new();
+    for patch in patches {
+        if locked.contains(&patch.path) {
+            continue;
+        }
+        locks.push(lock::FileLock::acquire(&patch.path, &lock_dir)?);
+        locked.push(patch.path.clone());
+    }
+
     let mut current_contents = Vec::with_capacity(patches.len());
     for patch in patches {
         let current = read_or_empty(&patch.path)?;
@@ -186,7 +297,7 @@ pub fn apply(patches: &[Patch], backup_dir: &Path) -> Result<Journal> {
             None
         };
 
-        match write_verified(&patch.path, &patch.after) {
+        match write_verified(&patch.path, &patch.after, patch.new_file_mode) {
             Ok(after_sha256) => entries.push(JournalEntry {
                 path: patch.path.clone(),
                 backup,
@@ -273,7 +384,7 @@ fn restore_entry(entry: &JournalEntry) -> Result<()> {
                 .map_err(|e| Error::inject(backup, format!("读取备份失败: {e}")))?;
             let contents = String::from_utf8(bytes)
                 .map_err(|_| Error::inject(backup, "备份不是合法 UTF-8"))?;
-            write_atomic(&entry.path, &contents)?;
+            write_atomic(&entry.path, &contents, None, Some(backup))?;
         }
         None => {
             if entry.path.exists() {
@@ -291,11 +402,7 @@ mod tests {
     use std::fs;
 
     fn patch_for(dir: &Path, before: &str, after: &str) -> Patch {
-        Patch {
-            path: dir.join("config.toml"),
-            before: before.to_string(),
-            after: after.to_string(),
-        }
+        Patch::new(dir.join("config.toml"), before, after)
     }
 
     #[test]
@@ -354,11 +461,7 @@ mod tests {
     fn rollback_deletes_file_that_did_not_exist() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("brand-new.toml");
-        let patch = Patch {
-            path: target.clone(),
-            before: String::new(),
-            after: "created".to_string(),
-        };
+        let patch = Patch::new(target.clone(), String::new(), "created".to_string());
         let journal = apply(&[patch], &dir.path().join("backups")).unwrap();
         assert!(target.exists());
         assert!(journal.entries[0].backup.is_none());
@@ -406,16 +509,8 @@ mod tests {
         fs::write(&b, "B0").unwrap();
 
         let patches = vec![
-            Patch {
-                path: a.clone(),
-                before: "A0".into(),
-                after: "A1".into(),
-            },
-            Patch {
-                path: b.clone(),
-                before: "与磁盘不符的前置内容".into(),
-                after: "B1".into(),
-            },
+            Patch::new(a.clone(), "A0", "A1"),
+            Patch::new(b.clone(), "与磁盘不符的前置内容", "B1"),
         ];
 
         let err = apply(&patches, &dir.path().join("backups")).unwrap_err();
@@ -445,16 +540,8 @@ mod tests {
         fs::set_permissions(&readonly, perm).unwrap();
 
         let patches = vec![
-            Patch {
-                path: a.clone(),
-                before: "A0".into(),
-                after: "A1".into(),
-            },
-            Patch {
-                path: b.clone(),
-                before: "B0".into(),
-                after: "B1".into(),
-            },
+            Patch::new(a.clone(), "A0", "A1"),
+            Patch::new(b.clone(), "B0", "B1"),
         ];
 
         let err = apply(&patches, &dir.path().join("backups")).unwrap_err();
@@ -513,5 +600,159 @@ mod tests {
             .filter(|n| n.contains(".keyrelay.tmp"))
             .collect();
         assert!(leftovers.is_empty(), "临时文件未清理: {leftovers:?}");
+    }
+
+    // ==================================================== M1-S2：B-12 / 0600 / 文件锁
+
+    #[test]
+    fn patch_debug_never_prints_contents() {
+        // BACKLOG B-12：投递场景下 `after` 含密钥本体，用户 config.toml 里也可能有明文密钥
+        let patch = Patch::secret_bearing(
+            "/home/u/.codex/auth.json",
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-OLD-LEAKY-VALUE"}"#,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-NEW-LEAKY-VALUE"}"#,
+        );
+        let text = format!("{patch:?}");
+
+        assert!(!text.contains("LEAKY"), "{text}");
+        assert!(!text.contains("sk-"), "{text}");
+        assert!(!text.contains("OPENAI_API_KEY"), "{text}");
+        // 有用的诊断信息仍要在
+        assert!(text.contains("auth.json"), "{text}");
+        assert!(text.contains("after_len"), "{text}");
+        assert!(text.contains("after_sha8"), "{text}");
+    }
+
+    #[test]
+    fn journal_debug_never_prints_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        fs::write(&target, "{}").unwrap();
+        let patch = Patch::secret_bearing(&target, "{}", r#"{"OPENAI_API_KEY":"sk-LEAKY"}"#);
+        let journal = apply(&[patch], &dir.path().join("backups")).unwrap();
+
+        let text = format!("{journal:?}");
+        assert!(!text.contains("LEAKY"), "{text}");
+        assert!(!text.contains("sk-"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_bearing_new_file_is_created_with_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        assert!(!target.exists());
+
+        let patch = Patch::secret_bearing(&target, "", r#"{"OPENAI_API_KEY":"sk-x"}"#);
+        apply(&[patch], &dir.path().join("backups")).unwrap();
+
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "含密钥的新文件必须是 0600，不能是 umask 决定的 0644"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plain_patch_new_file_still_uses_0644() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+
+        let patch = Patch::new(&target, "", "model = \"gpt\"\n");
+        apply(&[patch], &dir.path().join("backups")).unwrap();
+
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_restores_0600_when_file_was_deleted_in_between() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        fs::write(&target, "{}").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let patch = Patch::secret_bearing(&target, "{}", r#"{"OPENAI_API_KEY":"sk-x"}"#);
+        let journal = apply(&[patch], &dir.path().join("backups")).unwrap();
+
+        // 模拟「注入后目标被外部删除」，回滚时必须从备份重建而不是留下 0644
+        fs::remove_file(&target).unwrap();
+        rollback(&journal).unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "{}");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "回滚重建的文件必须继承备份的权限位"
+        );
+    }
+
+    #[test]
+    fn apply_takes_the_lock_so_a_second_apply_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        fs::write(&target, "v0").unwrap();
+        let backup_dir = dir.path().join("backups");
+
+        // 手工持有锁 → apply 必须报 FileBusy 而不是继续写
+        let lock_dir = lock_dir_for(&backup_dir);
+        let held = lock::FileLock::acquire(&target, &lock_dir).unwrap();
+
+        let err = apply(&[Patch::new(&target, "v0", "v1")], &backup_dir).unwrap_err();
+        assert!(matches!(err, Error::FileBusy(_)), "{err:?}");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "v0",
+            "被锁住时不得写入"
+        );
+
+        drop(held);
+        apply(&[Patch::new(&target, "v0", "v1")], &backup_dir).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "v1");
+    }
+
+    #[test]
+    fn duplicate_paths_in_one_batch_do_not_self_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        fs::write(&target, "v0").unwrap();
+
+        // 同一路径出现两次：只能取一把锁，否则会自己和自己互斥。
+        // 实测行为是「后者胜」且回滚链仍然正确（备份按写入顺序串联）。
+        let journal = apply(
+            &[
+                Patch::new(&target, "v0", "v1"),
+                Patch::new(&target, "v0", "v2"),
+            ],
+            &dir.path().join("backups"),
+        )
+        .expect("同批次同路径不得因自锁而失败");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "v2");
+
+        rollback(&journal).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "v0",
+            "重复路径的回滚链必须一路还原到最初内容"
+        );
+    }
+
+    #[test]
+    fn lock_dir_is_sibling_of_backup_dir() {
+        assert_eq!(
+            lock_dir_for(Path::new("/home/u/.keyrelay/backups")),
+            PathBuf::from("/home/u/.keyrelay/locks")
+        );
+        assert_eq!(lock_dir_for(Path::new("backups")), PathBuf::from("locks"));
     }
 }

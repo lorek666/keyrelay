@@ -109,28 +109,27 @@ impl<T: HttpTransport> NewApi<T> {
         };
 
         let enabled_field = value.pointer("/data/enabled");
-        let enabled =
-            match enabled_field {
-                Some(Value::Bool(flag)) => *flag,
-                // 端点存在、返回了 JSON 信封，却没有 `enabled` 字段 → 无法判定，fail-closed。
-                // 与 `enabled: null` 同策略：把「读不懂」和「明确关闭」区分开（复核 N-2）。
-                //
-                // 站点常见的失败信封是 `{"success":false,"message":"Database error…"}`（HTTP 200）。
-                // 方向（拒绝退回明文）是对的，但**必须把站点原文带出来**，否则用户无法排障（复核 P2）。
-                None => {
-                    let site_message = json_str(&value, "/message").unwrap_or("(无 message)");
-                    return Err(Error::Transport(format!(
-                        "登录加密探测响应缺少 enabled 字段，无法确认站点是否要求加密登录；站点返回: {}",
-                        crate::redact::scrub(site_message)
-                    )));
-                }
-                Some(other) => {
-                    return Err(Error::Transport(format!(
-                        "登录加密探测响应异常：enabled 字段类型不可识别（{}）",
-                        json_kind(other)
-                    )))
-                }
-            };
+        let enabled = match enabled_field {
+            Some(Value::Bool(flag)) => *flag,
+            // 端点存在、返回了 JSON 信封，却没有 `enabled` 字段 → 无法判定，fail-closed。
+            // 与 `enabled: null` 同策略：把「读不懂」和「明确关闭」区分开（复核 N-2）。
+            //
+            // 站点常见的失败信封是 `{"success":false,"message":"Database error…"}`（HTTP 200）。
+            // 方向（拒绝退回明文）是对的，但**必须把站点原文带出来**，否则用户无法排障（复核 P2）。
+            None => {
+                let site_message = json_str(&value, "/message").unwrap_or("(无 message)");
+                return Err(Error::Transport(format!(
+                    "登录加密探测响应缺少 enabled 字段，无法确认站点是否要求加密登录；站点返回: {}",
+                    crate::redact::scrub(site_message)
+                )));
+            }
+            Some(other) => {
+                return Err(Error::Transport(format!(
+                    "登录加密探测响应异常：enabled 字段类型不可识别（{}）",
+                    json_kind(other)
+                )))
+            }
+        };
         if !enabled {
             return Ok(None);
         }

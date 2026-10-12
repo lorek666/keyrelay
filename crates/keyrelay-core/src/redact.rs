@@ -6,6 +6,8 @@
 //! - 站点 PAT / access_token：32 位以上十六进制串
 //! - HTTP 头：`Authorization: Bearer <token>`、`X-App-Secret: <token>`
 
+use sha2::{Digest, Sha256};
+
 pub const MASK: &str = "***";
 
 const PREFIXES: [&str; 3] = ["sk-", "nap-", "Bearer "];
@@ -74,6 +76,27 @@ pub fn contains_secret(input: &str) -> bool {
     scrub(input) != input
 }
 
+/// 展示用掩码：只保留末 4 个字符，前缀一律用 `…` 代替。
+///
+/// 按 `char` 截取（不按 byte），因此不会切断多字节字符。
+/// 长度不足 8 个 `char` 时只返回 `…`——短密钥的末 4 位已经占了一半以上，不能再给。
+pub fn mask_secret(secret: &str) -> String {
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() < 8 {
+        return "…".to_string();
+    }
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("…{tail}")
+}
+
+/// 比对用指纹：`sha256(secret)` 的前 8 个 hex 字符。
+///
+/// 用于回答「这两把钥匙是不是同一把」而不暴露明文；不可逆，也不能用来恢复密钥。
+pub fn fingerprint(secret: &str) -> String {
+    let digest = Sha256::digest(secret.as_bytes());
+    hex::encode(digest)[..8].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +145,42 @@ mod tests {
     fn short_hex_not_masked() {
         // 16 位 hex 是常见的 id，不应误伤
         assert_eq!(scrub("id=deadbeefdeadbeef"), "id=deadbeefdeadbeef");
+    }
+
+    #[test]
+    fn mask_secret_boundaries() {
+        assert_eq!(mask_secret("sk-0123456789abcdef"), "…cdef");
+        assert_eq!(mask_secret("abcdefg"), "…"); // 7 char
+        assert_eq!(mask_secret("abcdefgh"), "…efgh"); // 8 char
+        assert_eq!(mask_secret(""), "…");
+        assert_eq!(mask_secret("密钥abcd"), "…"); // 6 char，不足 8
+        assert_eq!(mask_secret("密钥abcdefgh"), "…efgh"); // 10 char
+    }
+
+    #[test]
+    fn mask_secret_never_leaks_more_than_four_chars() {
+        let secret = "sk-0123456789abcdef";
+        let masked = mask_secret(secret);
+        // 掩码里最多出现原文末 4 位；前缀、中段一律不得出现
+        assert!(!masked.contains("sk-"));
+        assert!(!masked.contains("0123456789"));
+        assert_eq!(masked.chars().count(), 5);
+    }
+
+    #[test]
+    fn mask_secret_does_not_split_utf8() {
+        // 4 字节 emoji 也必须整字符截取：8 个 emoji → 保留末 4 个
+        assert_eq!(mask_secret("😀😀😀😀😀😀😀😀"), "…😀😀😀😀");
+        assert_eq!(mask_secret("abcdefghij😀😀"), "…ij😀😀");
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_hides_plaintext() {
+        let a = fingerprint("sk-0123456789abcdef");
+        assert_eq!(a, fingerprint("sk-0123456789abcdef"));
+        assert_ne!(a, fingerprint("sk-0123456789abcde0"));
+        assert_eq!(a.len(), 8);
+        assert!(!a.contains("sk-"));
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
