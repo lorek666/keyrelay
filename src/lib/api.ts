@@ -42,9 +42,21 @@ export type KeyRow = {
 };
 
 /** 新建密钥的返回值。`secret` 是**明文**，只允许一次性透传给投递流程，不渲染、不落任何存储。 */
-export type KeyMaterial = {
+export type StoredKey = {
+  id: number;
   remoteId: string;
-  secret: string;
+  name: string;
+  /** 掩码后的密钥（`…末4位`）。**明文永远不从后端返回给前端。** */
+  masked: string;
+};
+
+export type StoredKeyRow = {
+  id: number;
+  siteId: number;
+  remoteId?: string | null;
+  name: string;
+  group?: string | null;
+  status: string;
 };
 
 export type Balance = {
@@ -255,11 +267,28 @@ export async function listKeys(siteId: number): Promise<KeyRow[]> {
   return invokeCommand<KeyRow[]>("list_keys", { siteId });
 }
 
-export async function createKey(args: CreateKeyArgs): Promise<KeyMaterial> {
+export async function createKey(args: CreateKeyArgs): Promise<StoredKey> {
   if (!hasTauri) {
-    return mock({ remoteId: "13", secret: "sk-mock-0000000000000000" });
+    return mock({ id: 2, remoteId: "13", name: args.name, masked: "…cdef" });
   }
-  return invokeCommand<KeyMaterial>("create_key", { args });
+  return invokeCommand<StoredKey>("create_key", { args });
+}
+
+/** 本地已存的密钥（**不含密钥本体**）。投递需要的是这里的 `id`。 */
+export async function listStoredKeys(): Promise<StoredKeyRow[]> {
+  if (!hasTauri) {
+    return mock([
+      {
+        id: 1,
+        siteId: 1,
+        remoteId: "12",
+        name: "codex/daily",
+        group: "default",
+        status: "enabled",
+      },
+    ]);
+  }
+  return invokeCommand<StoredKeyRow[]>("list_stored_keys");
 }
 
 export async function siteBalance(siteId: number): Promise<Balance> {
@@ -336,4 +365,5 @@ export const INVOKED_COMMANDS: string[] = [
   "apply_delivery",
   "rollback_delivery",
   "recent_events",
+  "list_stored_keys",
 ];

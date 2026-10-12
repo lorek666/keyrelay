@@ -1,10 +1,34 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { KeyRound } from "lucide-react";
+import {
+  AlertTriangle,
+  History as HistoryIcon,
+  KeyRound,
+  LayoutDashboard,
+  Plug,
+  Server,
+} from "lucide-react";
 import Overview from "./pages/Overview";
-import { appInfo } from "./lib/api";
+import Sites from "./pages/Sites";
+import Keys from "./pages/Keys";
+import Agents from "./pages/Agents";
+import History from "./pages/History";
+import { appInfo, runtimeMode } from "./lib/api";
+
+const PAGES = [
+  { id: "overview", label: "总览", icon: LayoutDashboard, render: () => <Overview /> },
+  { id: "sites", label: "站点", icon: Server, render: () => <Sites /> },
+  { id: "keys", label: "密钥", icon: KeyRound, render: () => <Keys /> },
+  { id: "agents", label: "Agent 投递", icon: Plug, render: () => <Agents /> },
+  { id: "history", label: "变更历史", icon: HistoryIcon, render: () => <History /> },
+] as const;
+
+type PageId = (typeof PAGES)[number]["id"];
 
 export default function App() {
+  const [page, setPage] = useState<PageId>("overview");
   const { data: info } = useQuery({ queryKey: ["app-info"], queryFn: appInfo });
+  const current = PAGES.find((p) => p.id === page) ?? PAGES[0];
 
   return (
     <div className="app">
@@ -14,29 +38,42 @@ export default function App() {
           <span>KeyRelay</span>
         </div>
         <nav>
-          <a className="nav-item active" href="#overview">
-            总览
-          </a>
-          <span className="nav-item disabled">密钥（M1）</span>
-          <span className="nav-item disabled">Agent（M1）</span>
-          <span className="nav-item disabled">变更历史（M2）</span>
-          <span className="nav-item disabled">设置（M1）</span>
+          {PAGES.map((item) => {
+            const Icon = item.icon;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                className={item.id === page ? "nav-item active" : "nav-item"}
+                onClick={() => setPage(item.id)}
+              >
+                <Icon size={15} aria-hidden />
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
         </nav>
+        {runtimeMode === "browser" ? (
+          <p className="sidebar-note">浏览器预览模式（示例数据）</p>
+        ) : null}
       </aside>
 
       <main className="content">
         <header className="topbar">
-          <h1>总览</h1>
+          <h1>{current.label}</h1>
           <span className="muted mono">
             {info ? `${info.name} ${info.version}` : ""}
           </span>
         </header>
+
         {info?.dbError ? (
           <p className="error" role="alert">
-            本地数据库降级：{info.dbError}（当前数据仅存内存，重启即丢失）
+            <AlertTriangle size={14} aria-hidden /> 本地数据库降级：{info.dbError}
+            （当前数据仅存内存，重启即丢失）
           </p>
         ) : null}
-        <Overview />
+
+        {current.render()}
       </main>
     </div>
   );

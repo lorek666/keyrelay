@@ -194,9 +194,19 @@ impl Store {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| Error::Store(format!("读取 schema 版本失败: {e}")))?;
+
+        // **每次都跑 DDL**，而不是只在版本变化时跑。
+        //
+        // DDL 里全是 `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`，天然幂等。
+        // 只在 `version < SCHEMA_VERSION` 时跑会有一个隐蔽后果：往 DDL 里**新增**表
+        // 却不改版本号时，已经存在的库永远建不出那张新表——
+        // 实测：加了 `consents` 之后，跑过旧版的 `~/.keyrelay/keyrelay.db` 里依然没有该表，
+        // `grant_consent` 会直接报 `no such table`（M1-S4 真实启动时发现）。
+        conn.execute_batch(DDL)
+            .map_err(|e| Error::Store(format!("建表失败: {e}")))?;
+
+        // 版本号仍然只在升级时写，保留它作为「将来需要非幂等迁移」的锚点。
         if version < SCHEMA_VERSION {
-            conn.execute_batch(DDL)
-                .map_err(|e| Error::Store(format!("建表失败: {e}")))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|e| Error::Store(format!("写入 schema 版本失败: {e}")))?;
         }
@@ -595,6 +605,52 @@ mod tests {
     use super::*;
     use crate::inject::JournalEntry;
     use std::path::PathBuf;
+
+    #[test]
+    fn migrate_adds_new_tables_to_an_existing_database() {
+        // M1-S4 实测回归：往 DDL 里新增表后，**已经存在的库**也必须补建。
+        // 旧实现只在 `user_version < SCHEMA_VERSION` 时跑 DDL，
+        // 于是「加了 consents 却不改版本号」会让旧库永远缺这张表。
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("keyrelay.db");
+
+        {
+            let store = Store::open(&path).expect("首次建库");
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        }
+
+        // 模拟「旧版库」：把新表与新索引删掉，版本号保持不变
+        {
+            let conn = rusqlite::Connection::open(&path).expect("直连库");
+            conn.execute_batch("DROP TABLE consents; DROP INDEX idx_events_ts;")
+                .expect("删表");
+        }
+
+        let store = Store::open(&path).expect("重新打开");
+        let conn = rusqlite::Connection::open(&path).expect("直连库");
+        let consents: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='consents'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("查表");
+        let index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_events_ts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("查索引");
+        assert_eq!(consents, 1, "已存在的库必须补建 consents 表");
+        assert_eq!(index, 1, "已存在的库必须补建 idx_events_ts 索引");
+
+        // 补建后功能可用（不是只有表壳）
+        store
+            .grant_consent("codex", "codex-auth-json", "/tmp/auth.json", &["k".into()])
+            .expect("写入同意");
+        assert_eq!(store.list_consents().unwrap().len(), 1);
+    }
 
     #[test]
     fn migrate_is_idempotent() {

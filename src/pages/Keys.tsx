@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Plus, RefreshCw } from "lucide-react";
-import { createKey, listKeys, listSites, type KeyRow } from "../lib/api";
+import { createKey, listKeys, listSites, listStoredKeys } from "../lib/api";
 import ConfirmDialog from "../components/ConfirmDialog";
 
 export default function Keys() {
@@ -16,8 +16,10 @@ export default function Keys() {
 
   const activeSite = siteId ?? sites.data?.[0]?.id ?? null;
 
-  const keys = useQuery({
-    queryKey: ["keys", activeSite],
+  // 主表用**本地已存密钥**（投递需要它的本地 id）；站点侧列表只作对照
+  const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
+  const remote = useQuery({
+    queryKey: ["remote-keys", activeSite],
     queryFn: () => listKeys(activeSite!),
     enabled: activeSite !== null,
     retry: false,
@@ -35,7 +37,8 @@ export default function Keys() {
       // 只显示掩码，明文从不出现在界面上
       setNotice(`已创建 ${key.name}（${key.masked}），密钥已存入系统钥匙串`);
       setCreating(false);
-      await qc.invalidateQueries({ queryKey: ["keys", activeSite] });
+      await qc.invalidateQueries({ queryKey: ["stored-keys"] });
+      await qc.invalidateQueries({ queryKey: ["remote-keys", activeSite] });
     },
     onError: (err: Error) => {
       setError(err.message);
@@ -71,7 +74,7 @@ export default function Keys() {
               type="button"
               className="btn btn-ghost"
               onClick={() => keys.refetch()}
-              disabled={activeSite === null || keys.isFetching}
+              disabled={keys.isFetching}
             >
               <RefreshCw size={14} aria-hidden /> 刷新
             </button>
@@ -98,10 +101,57 @@ export default function Keys() {
           <p className="muted">读取失败：{(keys.error as Error).message}</p>
         ) : null}
         {keys.data?.length === 0 ? (
-          <p className="muted">该站点下还没有密钥。点「新建密钥」开始。</p>
+          <p className="muted">
+            KeyRelay 本地还没有密钥。点「新建密钥」——新建成功后密钥会直接进系统钥匙串。
+          </p>
         ) : null}
 
         {keys.data?.length ? (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>本地 id</th>
+                <th>名称</th>
+                <th>分组</th>
+                <th>远端 id</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {keys.data.map((key) => (
+                <tr key={key.id}>
+                  <td className="mono">{key.id}</td>
+                  <td>
+                    <KeyRound size={13} aria-hidden /> {key.name}
+                  </td>
+                  <td className="mono">{key.group ?? "—"}</td>
+                  <td className="mono">{key.remoteId ?? "—"}</td>
+                  <td>
+                    <span className={`badge badge-${statusTone(key.status)}`}>
+                      {key.status}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : null}
+
+        <p className="muted">
+          密钥明文只存在于系统钥匙串里；后端**从不**把明文返回给界面。
+          投递时用的是上表的「本地 id」。
+        </p>
+      </div>
+
+      <div className="card">
+        <h3>站点上的令牌（只读对照）</h3>
+        {remote.isLoading ? <p className="muted">加载中…</p> : null}
+        {remote.isError ? (
+          <p className="muted">
+            读取失败（可能需要先登录）：{(remote.error as Error).message}
+          </p>
+        ) : null}
+        {remote.data?.length ? (
           <table className="table">
             <thead>
               <tr>
@@ -113,11 +163,9 @@ export default function Keys() {
               </tr>
             </thead>
             <tbody>
-              {keys.data.map((key) => (
+              {remote.data.map((key) => (
                 <tr key={key.remoteId}>
-                  <td>
-                    <KeyRound size={13} aria-hidden /> {key.name}
-                  </td>
+                  <td>{key.name}</td>
                   <td className="mono">{key.group ?? "—"}</td>
                   <td className="mono">{key.remoteId}</td>
                   <td>
@@ -131,10 +179,6 @@ export default function Keys() {
             </tbody>
           </table>
         ) : null}
-
-        <p className="muted">
-          密钥明文只存在于系统钥匙串里；本页只显示名称与远端 id。
-        </p>
       </div>
 
       <ConfirmDialog

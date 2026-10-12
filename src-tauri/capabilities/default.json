@@ -21,7 +21,7 @@
     "allow-list-consents",
     "allow-apply-delivery",
     "allow-rollback-delivery",
-    "allow-recent-events",
-    "allow-list-stored-keys"
+    "allow-list-stored-keys",
+    "allow-recent-events"
   ]
 }
