@@ -3,6 +3,9 @@
 //! 新增一个站点适配器只需要：实现 [`SiteAdapter`] → 在 [`SiteRegistry::adapter`] 加一个分支
 //! → 在 [`SiteRegistry::new`] 的探测顺序里插入。核心逻辑不用动。
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use super::newapi::NewApi;
 use super::sub2api::Sub2Api;
 use super::transport::HttpTransport;
@@ -13,6 +16,12 @@ use crate::error::{Error, Result};
 pub struct SiteRegistry<T: HttpTransport + Clone + 'static> {
     transport: T,
     probe_order: Vec<SiteKind>,
+    /// **适配器实例缓存**。
+    ///
+    /// 不能每次调用都新建：Sub2API 的适配器内部持有「等待二次验证的 temp_token」，
+    /// 每次新建会让那份状态在两次 `login` 之间丢失，导致每次都要多发一次密码登录请求
+    /// （M2-S2 的 e2e 实测到 3 次登录请求而不是 2 次）。
+    cache: Arc<Mutex<HashMap<SiteKind, Arc<dyn SiteAdapter>>>>,
 }
 
 impl<T: HttpTransport + Clone + 'static> SiteRegistry<T> {
@@ -20,6 +29,7 @@ impl<T: HttpTransport + Clone + 'static> SiteRegistry<T> {
         Self {
             transport,
             probe_order: vec![SiteKind::NewApi, SiteKind::Sub2Api],
+            cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -29,11 +39,21 @@ impl<T: HttpTransport + Clone + 'static> SiteRegistry<T> {
         self
     }
 
-    pub fn adapter(&self, kind: SiteKind) -> Box<dyn SiteAdapter> {
-        match kind {
-            SiteKind::NewApi => Box::new(NewApi::new(self.transport.clone())),
-            SiteKind::Sub2Api => Box::new(Sub2Api::new(self.transport.clone())),
+    /// 取该类型的适配器实例（同一个 registry 内复用）。
+    pub fn adapter(&self, kind: SiteKind) -> Arc<dyn SiteAdapter> {
+        if let Ok(cache) = self.cache.lock() {
+            if let Some(existing) = cache.get(&kind) {
+                return Arc::clone(existing);
+            }
         }
+        let created: Arc<dyn SiteAdapter> = match kind {
+            SiteKind::NewApi => Arc::new(NewApi::new(self.transport.clone())),
+            SiteKind::Sub2Api => Arc::new(Sub2Api::new(self.transport.clone())),
+        };
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(kind, Arc::clone(&created));
+        }
+        created
     }
 
     /// 依次探测，返回第一个匹配的指纹。

@@ -144,15 +144,32 @@ fn read_or_empty(path: &Path) -> Result<String> {
 #[cfg(unix)]
 fn resolve_mode(path: &Path, new_file_mode: Option<u32>, mode_from: Option<&Path>) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = fs::metadata(path) {
-        return meta.permissions().mode() & 0o7777;
-    }
+    // `mode_from`（回滚时的备份文件）优先：回滚的语义是「还原到投递之前」，
+    // 包括权限位。若让它排在目标文件之后，就会把 apply 阶段收紧过的 0600
+    // 当成「原权限」再写回去，0644 永远还原不了。
     if let Some(template) = mode_from {
         if let Ok(meta) = fs::metadata(template) {
             return meta.permissions().mode() & 0o7777;
         }
     }
+    if let Ok(meta) = fs::metadata(path) {
+        return clamp_secret_mode(meta.permissions().mode() & 0o7777, new_file_mode);
+    }
     new_file_mode.unwrap_or(0o644)
+}
+
+/// 含密钥的文件**不允许比 0600 更宽**。
+///
+/// 只「保留原权限」是不够的：用户（或某个 CLI 的历史版本）把 `~/.codex/auth.json`
+/// 留成 0644 时，我们往里写密钥会让同机其它用户直接读到它。
+/// 这里只收紧、不放宽：`0o644 → 0o600`、`0o400 → 0o400`、`0o777 → 0o600`。
+#[cfg(unix)]
+fn clamp_secret_mode(existing: u32, new_file_mode: Option<u32>) -> u32 {
+    if new_file_mode == Some(0o600) {
+        existing & 0o600
+    } else {
+        existing
+    }
 }
 
 /// 临时文件名：随机后缀 + `create_new`，同时解决两个问题：
@@ -702,6 +719,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn secret_patch_tightens_a_world_readable_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        fs::write(&target, "{}").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let patch = Patch::secret_bearing(&target, "{}", r#"{"OPENAI_API_KEY":"sk-x"}"#);
+        let journal = apply(&[patch], &dir.path().join("backups")).unwrap();
+
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "含密钥的文件不得保持 0644"
+        );
+
+        // 回滚要按**原始**权限还原（0644），而不是把收紧后的 0600 也带回去
+        rollback(&journal).unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "回滚必须还原原始权限位"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_patch_never_widens_a_stricter_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        fs::write(&target, "{}").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let patch = Patch::secret_bearing(&target, "{}", r#"{"OPENAI_API_KEY":"sk-x"}"#);
+        apply(&[patch], &dir.path().join("backups")).unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o400,
+            "不得把只读文件放宽成 0600"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn plain_patch_new_file_still_uses_0644() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -828,7 +892,7 @@ mod tests {
         };
 
         // 内容足够大，让写入过程持续可观测
-        let big = "x".repeat(4 * 1024 * 1024);
+        let big = "x".repeat(16 * 1024 * 1024);
         let patch = Patch::secret_bearing(&target, "", big.clone());
         apply(&[patch], &dir.path().join("backups")).unwrap();
 

@@ -8,7 +8,10 @@
 //! - 投递结果（[`DeliveryOutcome`]）同样不含密钥。
 //! - 生成的 [`Patch`] 含密钥，其 `Debug` 已手写脱敏（BACKLOG B-12）。
 
+pub mod claude_code;
 pub mod codex_auth;
+pub mod json_text;
+pub mod shell_block;
 
 use std::path::{Path, PathBuf};
 
@@ -149,11 +152,26 @@ pub trait DeliveryWriter: Send + Sync {
 
 /// 按通道解析出写入器。`home` 显式传入以便测试重定向（不读环境变量）。
 pub fn resolve(channel: DeliveryChannel, home: &Path) -> Result<Box<dyn DeliveryWriter>> {
+    resolve_for(channel, home, "")
+}
+
+/// 带站点 `base_url` 的解析。三条通道都走这里。
+///
+/// `base_url` 为空表示「只投递密钥，不动 endpoint」——两个会写 base_url 的通道
+/// （Claude Code / shell 块）据此少写一行。
+pub fn resolve_for(
+    channel: DeliveryChannel,
+    home: &Path,
+    base_url: &str,
+) -> Result<Box<dyn DeliveryWriter>> {
     match channel {
         DeliveryChannel::CodexAuthJson => Ok(Box::new(codex_auth::CodexAuthWriter::new(home))),
-        DeliveryChannel::ClaudeCodeSettings | DeliveryChannel::ShellBlock => Err(
-            Error::Unimplemented(format!("投递通道 {} 将在 M1-S3 实现", channel.as_str())),
-        ),
+        DeliveryChannel::ClaudeCodeSettings => {
+            Ok(Box::new(claude_code::ClaudeCodeWriter::new(home, base_url)))
+        }
+        DeliveryChannel::ShellBlock => {
+            Ok(Box::new(shell_block::ShellBlockWriter::new(home, base_url)))
+        }
     }
 }
 
@@ -273,18 +291,26 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_channels_are_explicit() {
+    fn every_channel_resolves() {
         let home = Path::new("/tmp/nobody");
-        for channel in [
-            DeliveryChannel::ClaudeCodeSettings,
-            DeliveryChannel::ShellBlock,
-        ] {
-            assert!(matches!(
-                resolve(channel, home),
-                Err(Error::Unimplemented(_))
-            ));
+        for channel in DeliveryChannel::ALL {
+            let writer = resolve_for(channel, home, "https://relay.example.com")
+                .unwrap_or_else(|e| panic!("{} 应可解析: {e}", channel.as_str()));
+            assert_eq!(writer.channel(), channel);
+            assert!(
+                writer.target_path().starts_with(home),
+                "{} 的目标应落在 home 内",
+                channel.as_str()
+            );
         }
-        assert!(resolve(DeliveryChannel::CodexAuthJson, home).is_ok());
+    }
+
+    #[test]
+    fn shell_block_target_is_platform_specific() {
+        let home = Path::new("/tmp/nobody");
+        let writer = resolve_for(DeliveryChannel::ShellBlock, home, "https://x").unwrap();
+        let expected = shell_block::ShellSyntax::for_current_platform().default_rc_relative_path();
+        assert_eq!(writer.target_path(), home.join(expected));
     }
 
     #[test]

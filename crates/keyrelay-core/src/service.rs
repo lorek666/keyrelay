@@ -13,7 +13,7 @@ use crate::inject;
 use crate::observability::{self, Event, Level};
 use crate::site::registry::SiteRegistry;
 use crate::site::transport::HttpTransport;
-use crate::site::{Balance, Credentials, KeyMeta, KeySpec, Session, SiteKind};
+use crate::site::{Balance, Credentials, KeyMaterial, KeyMeta, KeySpec, Session, SiteKind};
 use crate::store::{ConsentRow, SiteRow, Store};
 use crate::vault::{KeychainVault, Vault};
 
@@ -552,6 +552,50 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         Ok(())
     }
 
+    /// 读某把令牌的明文。**只有显式调用才会返回密钥本体**——列举接口一律不含明文。
+    pub async fn reveal_key(&self, site_id: i64, remote_id: &str) -> Result<KeyMaterial> {
+        let site = self.site(site_id)?;
+        let session = self.session(site_id)?;
+        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        match adapter
+            .reveal_key(&site.base_url, &session, remote_id)
+            .await
+        {
+            Ok(material) => {
+                self.log(observability::event_with_payload(
+                    Level::Debug,
+                    "key",
+                    "已读取密钥明文",
+                    serde_json::json!({ "site_id": site_id, "remote_id": remote_id }),
+                ));
+                Ok(material)
+            }
+            Err(err) => Err(self.on_auth_error(site_id, err)),
+        }
+    }
+
+    /// 删除站点上的某把令牌。
+    pub async fn revoke_key(&self, site_id: i64, remote_id: &str) -> Result<()> {
+        let site = self.site(site_id)?;
+        let session = self.session(site_id)?;
+        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        match adapter
+            .revoke_key(&site.base_url, &session, remote_id)
+            .await
+        {
+            Ok(()) => {
+                self.log(observability::event_with_payload(
+                    Level::Info,
+                    "key",
+                    "已删除站点上的密钥",
+                    serde_json::json!({ "site_id": site_id, "remote_id": remote_id }),
+                ));
+                Ok(())
+            }
+            Err(err) => Err(self.on_auth_error(site_id, err)),
+        }
+    }
+
     /// 本地已存的密钥（**不含密钥本体**）。UI 的「密钥」页用这个，而不是站点侧列表——
     /// 因为投递需要的是**本地 key_id**，站点返回的 `remote_id` 不能当本地主键用。
     pub fn stored_keys(&self) -> Result<Vec<crate::store::KeyRow>> {
@@ -654,10 +698,13 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         channel: DeliveryChannel,
     ) -> Result<Box<dyn delivery::DeliveryWriter>> {
         // key_id 存在性先校验：不存在时连通道都不必解析
-        if self.store.get_key(key_id)?.is_none() {
-            return Err(Error::NotFound(format!("密钥记录 #{key_id} 不存在")));
-        }
-        delivery::resolve(channel, &self.home)
+        let row = self
+            .store
+            .get_key(key_id)?
+            .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
+        // Claude Code / shell 块两个通道要写 endpoint，需要该密钥所属站点的 base_url
+        let site = self.site(row.site_id)?;
+        delivery::resolve_for(channel, &self.home, &site.base_url)
     }
 
     /// 从钥匙串取密钥明文。调用方必须立刻用掉，不得记录。
@@ -680,15 +727,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 新增通道时必须在这里登记期望路径，否则一律拒绝——这样「通道写错文件」不可能悄悄发生。
     fn checked_target(&self, channel: DeliveryChannel, target: &Path) -> Result<PathBuf> {
         let expected_rel = match channel {
-            DeliveryChannel::CodexAuthJson => Path::new(".codex").join("auth.json"),
-            // 以下通道尚未实现（`delivery::resolve` 会先返回 Unimplemented）；
-            // 这里刻意不给期望路径，将来实现时必须显式登记。
-            DeliveryChannel::ClaudeCodeSettings | DeliveryChannel::ShellBlock => {
-                return Err(Error::Unimplemented(format!(
-                    "通道 {} 的目标路径尚未登记，拒绝写入",
-                    channel.as_str()
-                )))
-            }
+            DeliveryChannel::CodexAuthJson => PathBuf::from(".codex").join("auth.json"),
+            DeliveryChannel::ClaudeCodeSettings => PathBuf::from(".claude").join("settings.json"),
+            DeliveryChannel::ShellBlock => PathBuf::from(
+                delivery::shell_block::ShellSyntax::for_current_platform()
+                    .default_rc_relative_path(),
+            ),
         };
 
         let expected = self.home.join(&expected_rel);
