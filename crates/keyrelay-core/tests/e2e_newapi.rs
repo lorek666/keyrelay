@@ -225,7 +225,11 @@ async fn full_flow_against_fake_newapi_site() {
         .expect("导出 PEM");
     let site = spawn_fake_newapi(private, public_pem);
 
-    let store = Store::open_in_memory().expect("内存库");
+    // 用**文件库**而不是内存库：这样测试结束后可以扫描落盘文件，验证密钥/密码不入库
+    // （对应验收标准 §8.6；复审 P2-5 指出原实现只用了内存库、无法真正验证）
+    let dir = tempfile::tempdir().expect("临时目录");
+    let db_path = dir.path().join("e2e.db");
+    let store = Store::open(&db_path).expect("文件库");
     let transport = RetryingTransport::new(
         ReqwestTransport::new(TransportConfig::default()).expect("构造真实传输层"),
         RetryPolicy::default(),
@@ -302,6 +306,26 @@ async fn full_flow_against_fake_newapi_site() {
             .contains("cookie: session=e2e-cookie"),
         "列表请求缺少会话 cookie: {list_raw}"
     );
+
+    // ⑧ 落盘泄漏扫描（验收标准 §8.6）：库文件与 WAL 里都不得出现密码或密钥明文。
+    // 复审 P2-5 指出原实现只用了内存库，无法真正验证这一点。
+    for suffix in ["", "-wal", "-shm"] {
+        let path = std::path::PathBuf::from(format!("{}{suffix}", db_path.display()));
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains(PASSWORD),
+            "数据库文件 {} 含明文密码",
+            path.display()
+        );
+        assert!(
+            !text.contains("sk-e2e-abcdefgh12345678"),
+            "数据库文件 {} 含密钥明文",
+            path.display()
+        );
+    }
 }
 
 #[tokio::test]
