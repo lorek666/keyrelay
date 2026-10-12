@@ -51,10 +51,13 @@ pub struct KeyMetaDto {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct KeyMaterialDto {
+pub struct StoredKeyDto {
+    id: i64,
     remote_id: String,
-    /// 明文密钥：仅在创建成功时返回一次，前端展示后由 M1-S2 收进钥匙串
-    secret: String,
+    name: String,
+    /// 掩码后的密钥（`…末4位`）。**明文永远不返回给前端**——
+    /// 密钥在创建时就直接进了系统钥匙串，前端只负责说「是哪一把」。
+    masked: String,
 }
 
 #[derive(Serialize)]
@@ -251,16 +254,18 @@ pub async fn list_keys(
 pub async fn create_key(
     state: State<'_, AppState>,
     args: CreateKeyArgs,
-) -> Result<KeyMaterialDto, String> {
+) -> Result<StoredKeyDto, String> {
     let mut spec = keyrelay_core::site::KeySpec::named(args.name);
     spec.group = args.group;
     state
         .service
         .create_key(args.site_id, spec)
         .await
-        .map(|material| KeyMaterialDto {
-            remote_id: material.remote_id,
-            secret: material.secret,
+        .map(|key| StoredKeyDto {
+            id: key.id,
+            remote_id: key.remote_id,
+            name: key.name,
+            masked: key.masked,
         })
         .map_err(|e| e.to_string())
 }
@@ -388,6 +393,38 @@ pub fn rollback_delivery(state: State<'_, AppState>, journal_id: String) -> Resu
         .map_err(|e| e.to_string())
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredKeyRowDto {
+    id: i64,
+    site_id: i64,
+    remote_id: Option<String>,
+    name: String,
+    group: Option<String>,
+    status: String,
+}
+
+/// 本地已存密钥（不含密钥本体）。
+#[tauri::command]
+pub fn list_stored_keys(state: State<'_, AppState>) -> Result<Vec<StoredKeyRowDto>, String> {
+    state
+        .service
+        .stored_keys()
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredKeyRowDto {
+                    id: row.id,
+                    site_id: row.site_id,
+                    remote_id: row.remote_id,
+                    name: row.name,
+                    group: row.group_name,
+                    status: row.status,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn recent_events(
     state: State<'_, AppState>,
@@ -451,13 +488,20 @@ mod tests {
         assert_eq!(value["displayName"], "测试站");
         assert_eq!(value["version"], "v0.9.1");
 
-        let material = KeyMaterialDto {
+        let stored = StoredKeyDto {
+            id: 3,
             remote_id: "12".into(),
-            secret: "sk-dto-shape-test".into(),
+            name: "codex/daily".into(),
+            masked: "…cdef".into(),
         };
-        let value = to_value(&material);
+        let value = to_value(&stored);
+        assert_eq!(value["id"], 3);
         assert_eq!(value["remoteId"], "12");
-        assert_eq!(value["secret"], "sk-dto-shape-test");
+        assert_eq!(value["masked"], "…cdef");
+        assert!(
+            value.get("secret").is_none(),
+            "密钥明文永远不得出现在 DTO 里: {value}"
+        );
 
         let meta = KeyMetaDto {
             remote_id: "12".into(),

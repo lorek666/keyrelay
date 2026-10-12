@@ -137,6 +137,39 @@ fn read_or_empty(path: &Path) -> Result<String> {
     }
 }
 
+/// 决定临时文件应当使用的权限位（Unix）。
+///
+/// 优先级：① 目标文件现存权限 → ② `mode_from` 模板文件（回滚时的备份文件，
+/// `fs::copy` 会带上原权限位）→ ③ 调用方指定值（含密钥的文件必须 0600）→ ④ 0644。
+#[cfg(unix)]
+fn resolve_mode(path: &Path, new_file_mode: Option<u32>, mode_from: Option<&Path>) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(path) {
+        return meta.permissions().mode() & 0o7777;
+    }
+    if let Some(template) = mode_from {
+        if let Ok(meta) = fs::metadata(template) {
+            return meta.permissions().mode() & 0o7777;
+        }
+    }
+    new_file_mode.unwrap_or(0o644)
+}
+
+/// 临时文件名：随机后缀 + `create_new`，同时解决两个问题：
+/// - **可预测路径**：固定名字（`.<name>.keyrelay.tmp`）可以被预先放一个符号链接劫持，
+///   让密钥写到攻击者指定的文件上（复核 P2）；
+/// - **并发覆盖**：同目录两次写入若用同一个临时名会互相踩。
+fn temp_path(parent: &Path, file_name: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!(".{file_name}.keyrelay.{:x}{:x}.tmp", nanos, seq))
+}
+
 fn write_atomic(
     path: &Path,
     contents: &str,
@@ -152,42 +185,34 @@ fn write_atomic(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "config".to_string());
-    let tmp = parent.join(format!(".{file_name}.keyrelay.tmp"));
+    let tmp = temp_path(parent, &file_name);
 
-    fs::write(&tmp, contents).map_err(|e| Error::inject(&tmp, format!("写临时文件失败: {e}")))?;
+    // **权限必须在创建时就正确**：先用 `fs::write`（umask 022 → 0644）创建再 chmod，
+    // 会在磁盘上留下一个「内容是密钥、权限却是 0644」的窗口（M1-S2 复审 P1-1，实测
+    // 权限序列 [0644, 0600]）。这里用 `OpenOptions::mode()` 一次到位，
+    // 并加 `create_new` 防止跟随已存在的符号链接。
+    #[cfg(unix)]
+    let write_result = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mode = resolve_mode(path, new_file_mode, mode_from);
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, contents.as_bytes()))
+    };
 
-    // 权限必须在 rename **之前**设好（先 rename 再 chmod 会留下宽权限窗口）。
-    // 优先级：① 目标文件现存权限 → ② `mode_from` 模板文件（回滚时的备份文件，
-    // `fs::copy` 会带上原权限位）→ ③ 调用方指定值（含密钥的文件必须 0600）→ ④ 0644。
-    let template = fs::metadata(path)
-        .ok()
-        .map(|m| m.permissions())
-        .or_else(|| {
-            mode_from
-                .and_then(|p| fs::metadata(p).ok())
-                .map(|m| m.permissions())
-        });
+    #[cfg(not(unix))]
+    let write_result = {
+        let _ = (new_file_mode, mode_from);
+        fs::write(&tmp, contents)
+    };
 
-    match template {
-        Some(permissions) => {
-            let _ = fs::set_permissions(&tmp, permissions);
-        }
-        None => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = new_file_mode.unwrap_or(0o644);
-                fs::set_permissions(&tmp, fs::Permissions::from_mode(mode)).map_err(|e| {
-                    let _ = fs::remove_file(&tmp);
-                    Error::inject(&tmp, format!("设置文件权限失败: {e}"))
-                })?;
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = new_file_mode;
-            }
-        }
-    }
+    write_result.map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        Error::inject(&tmp, format!("写临时文件失败: {e}"))
+    })?;
 
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
@@ -225,17 +250,15 @@ fn new_journal_id() -> String {
     format!("j{nanos}-{seq}")
 }
 
-/// 锁目录 = `backup_dir` 的兄弟目录 `locks/`。
+/// 锁目录：**与调用方参数无关**的进程级常量。
 ///
-/// 例：`~/.keyrelay/backups` → `~/.keyrelay/locks`。
-/// 这样派生而不是新增参数，是为了让**每一条** `apply` 路径（包括不含密钥的
-/// `config.toml` 注入）都自动获得互斥保护，而不只是投递路径（BACKLOG B-16）。
-fn lock_dir_for(backup_dir: &Path) -> PathBuf {
-    match backup_dir.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join("locks"),
-        // `backup_dir` 只有一段（如 `"backups"`）时 parent 是空串：取同级 `locks`。
-        _ => PathBuf::from("locks"),
-    }
+/// 早先的版本从 `backup_dir` 参数派生锁目录，结果是「换个 `backup_dir` 就换一个锁文件」，
+/// 互斥形同虚设（M1-S2 复审 P1-3，真子进程实测可绕过）。
+/// 现在固定用 `<系统临时目录>/keyrelay-locks`：
+/// - 同一用户的任意进程都算出同一个目录 → 跨进程互斥成立；
+/// - 不依赖任何入参，调用方无法「不小心」绕开。
+pub fn default_lock_dir() -> PathBuf {
+    std::env::temp_dir().join("keyrelay-locks")
 }
 
 /// 应用补丁：加锁 → 预检 → 备份 → 原子写 + 回读校验 → 记账。
@@ -252,7 +275,7 @@ fn lock_dir_for(backup_dir: &Path) -> PathBuf {
 /// 避免同一目标文件被多次注入时后一次覆盖前一次的备份（那样会导致回滚链断裂）。
 pub fn apply(patches: &[Patch], backup_dir: &Path) -> Result<Journal> {
     // 同一个目标文件在 patches 里出现两次时只取一把锁，否则自己和自己互斥。
-    let lock_dir = lock_dir_for(backup_dir);
+    let lock_dir = default_lock_dir();
     let mut locks: Vec<lock::FileLock> = Vec::new();
     let mut locked: Vec<PathBuf> = Vec::new();
     for patch in patches {
@@ -262,6 +285,28 @@ pub fn apply(patches: &[Patch], backup_dir: &Path) -> Result<Journal> {
         locks.push(lock::FileLock::acquire(&patch.path, &lock_dir)?);
         locked.push(patch.path.clone());
     }
+    apply_holding_lock(patches, backup_dir, &locks)
+}
+
+/// 调用方**已经持有** `patches` 里全部目标路径的锁时使用。
+///
+/// 存在这个入口的原因：服务层需要在「取锁 → 重新确认用户同意 → 写入」之间保持互斥。
+/// 如果先查同意再进 `apply` 取锁，用户完全可能在我们等锁的时候撤销同意，
+/// 结果「撤销后仍然写入」（M1-S2 复审 P1-2）。
+///
+/// `held` 是调用方持有的锁的借用凭证；本函数**不会**自己加锁。
+pub(crate) fn apply_holding_lock(
+    patches: &[Patch],
+    backup_dir: &Path,
+    held: &[lock::FileLock],
+) -> Result<Journal> {
+    debug_assert!(
+        patches.iter().all(|p| {
+            let normalized = lock::normalize_target(&p.path);
+            held.iter().any(|l| l.target() == normalized)
+        }),
+        "apply_holding_lock 要求调用方已锁住所有目标路径"
+    );
 
     let mut current_contents = Vec::with_capacity(patches.len());
     for patch in patches {
@@ -705,7 +750,7 @@ mod tests {
         let backup_dir = dir.path().join("backups");
 
         // 手工持有锁 → apply 必须报 FileBusy 而不是继续写
-        let lock_dir = lock_dir_for(&backup_dir);
+        let lock_dir = default_lock_dir();
         let held = lock::FileLock::acquire(&target, &lock_dir).unwrap();
 
         let err = apply(&[Patch::new(&target, "v0", "v1")], &backup_dir).unwrap_err();
@@ -747,12 +792,102 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn lock_dir_is_sibling_of_backup_dir() {
-        assert_eq!(
-            lock_dir_for(Path::new("/home/u/.keyrelay/backups")),
-            PathBuf::from("/home/u/.keyrelay/locks")
+    fn temp_file_never_exists_with_a_wider_mode_than_the_target() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // 复审 P1-1 的回归：旧实现用 `fs::write`（umask 022 → 0644）建临时文件、
+        // 写入密钥正文、**再** chmod 0600，留下一个「内容是密钥、权限 0644」的窗口。
+        // 这里用一个观察线程在整个写入过程中轮询临时文件的权限位。
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let watcher = {
+            let dir = dir.path().to_path_buf();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut observed: Vec<u32> = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(entries) = fs::read_dir(&dir) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name.ends_with(".tmp") {
+                                if let Ok(meta) = entry.metadata() {
+                                    observed.push(meta.permissions().mode() & 0o777);
+                                }
+                            }
+                        }
+                    }
+                }
+                observed
+            })
+        };
+
+        // 内容足够大，让写入过程持续可观测
+        let big = "x".repeat(4 * 1024 * 1024);
+        let patch = Patch::secret_bearing(&target, "", big.clone());
+        apply(&[patch], &dir.path().join("backups")).unwrap();
+
+        stop.store(true, Ordering::Relaxed);
+        let observed = watcher.join().expect("观察线程");
+
+        assert!(
+            !observed.is_empty(),
+            "观察线程一个样本都没采到 → 该门禁是空跑"
         );
-        assert_eq!(lock_dir_for(Path::new("backups")), PathBuf::from("locks"));
+        assert!(
+            observed.iter().all(|m| *m == 0o600),
+            "临时文件出现过非 0600 的权限位: {observed:?}"
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn apply_uses_a_lock_dir_independent_of_backup_dir() {
+        // 复审 P1-3 的回归：换个 backup_dir 不得换锁文件
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth.json");
+        fs::write(&target, "v0").unwrap();
+
+        let held = lock::FileLock::acquire(&target, &default_lock_dir()).unwrap();
+
+        // 故意用一个与持锁者完全无关的 backup_dir
+        let err = apply(
+            &[Patch::new(&target, "v0", "v1")],
+            &dir.path().join("totally/other/backups"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::FileBusy(_)), "{err:?}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "v0");
+        drop(held);
+    }
+
+    #[test]
+    fn lock_dir_does_not_depend_on_caller_arguments() {
+        // 复审 P1-3 的回归：换 backup_dir 不得换锁文件
+        let a = Patch::new("/tmp/x/auth.json", "", "a");
+        let b = Patch::new("/tmp/x/auth.json", "", "a");
+        assert_eq!(
+            lock::FileLock::lock_path(&a.path, &default_lock_dir()),
+            lock::FileLock::lock_path(&b.path, &default_lock_dir())
+        );
+        assert!(default_lock_dir().is_absolute(), "锁目录必须是绝对路径");
+    }
+
+    #[test]
+    fn temp_path_is_unpredictable_and_unique() {
+        let dir = Path::new("/tmp/x");
+        let a = temp_path(dir, "auth.json");
+        let b = temp_path(dir, "auth.json");
+        assert_ne!(a, b, "两次写入不得用同一个临时名");
+        assert!(a.to_string_lossy().ends_with(".tmp"));
+        assert!(a.to_string_lossy().contains("auth.json"));
     }
 }

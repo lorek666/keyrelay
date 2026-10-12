@@ -260,13 +260,14 @@ async fn full_flow_against_fake_newapi_site() {
         .expect("列令牌")
         .is_empty());
 
-    // ④ 建令牌 → 读明文
-    let material = service
+    // ④ 建令牌 → 读明文 → **立刻进钥匙串 + 落库**（服务层不再把明文返回给上层）
+    let stored = service
         .create_key(summary.id, KeySpec::named("codex/daily"))
         .await
         .expect("创建令牌");
-    assert_eq!(material.remote_id, "1");
-    assert_eq!(material.secret, "sk-e2e-abcdefgh12345678");
+    assert_eq!(stored.remote_id, "1");
+    assert_eq!(stored.name, "codex/daily");
+    assert_eq!(stored.masked, "…5678", "只暴露末 4 位");
 
     // ⑤ 再次列令牌应能看到它
     let keys = service.list_keys(summary.id).await.expect("再列令牌");

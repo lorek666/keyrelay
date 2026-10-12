@@ -13,7 +13,7 @@ use crate::inject;
 use crate::observability::{self, Event, Level};
 use crate::site::registry::SiteRegistry;
 use crate::site::transport::HttpTransport;
-use crate::site::{Balance, Credentials, KeyMaterial, KeyMeta, KeySpec, Session, SiteKind};
+use crate::site::{Balance, Credentials, KeyMeta, KeySpec, Session, SiteKind};
 use crate::store::{ConsentRow, SiteRow, Store};
 use crate::vault::{KeychainVault, Vault};
 
@@ -48,6 +48,21 @@ impl ServiceConfig {
             home,
         }
     }
+}
+
+/// 钥匙串条目的引用 id：时间戳 + 进程内自增序号 + 进程号。
+///
+/// 不用站点返回的 `remote_id`：不同站点可以有同一个 `remote_id`，
+/// 而钥匙串的引用必须全局唯一（否则两把不同的钥匙会互相覆盖）。
+fn new_ref_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}{seq:x}{:x}", std::process::id())
 }
 
 /// 错误分类名：只写「哪一类」，不回显站点原文（事件表里不需要原文）。
@@ -109,6 +124,27 @@ impl SessionCache {
         self.inner
             .lock()
             .map_err(|_| Error::Store("会话缓存锁已中毒".into()))
+    }
+}
+
+/// 已落库的密钥记录。**不含密钥本体**，可以直接给前端。
+#[derive(Clone, PartialEq, Eq)]
+pub struct StoredKey {
+    pub id: i64,
+    pub remote_id: String,
+    pub name: String,
+    /// 掩码后的密钥（`…末4位`），用于让用户确认「是哪一把」
+    pub masked: String,
+}
+
+impl std::fmt::Debug for StoredKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredKey")
+            .field("id", &self.id)
+            .field("remote_id", &self.remote_id)
+            .field("name", &self.name)
+            .field("masked", &self.masked)
+            .finish()
     }
 }
 
@@ -246,20 +282,30 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         }
     }
 
-    pub async fn create_key(&self, site_id: i64, spec: KeySpec) -> Result<KeyMaterial> {
+    pub async fn create_key(&self, site_id: i64, spec: KeySpec) -> Result<StoredKey> {
         let site = self.site(site_id)?;
         let session = self.session(site_id)?;
         let adapter = self.registry.adapter(self.kind_of(&site)?);
         let name = spec.name.clone();
         match adapter.create_key(&site.base_url, &session, spec).await {
             Ok(material) => {
+                // 站点上已经建好了。此刻若本地保存失败，必须如实告诉用户
+                // 「站点上已创建、本地没存上」，而不是含糊地报一个失败让人重试建键。
+                let stored = self
+                    .store_key_material(site_id, &name, Some(&material.remote_id), &material.secret)
+                    .map_err(|err| {
+                        Error::Vault(format!(
+                            "站点上已创建成功（id={}），但本地保存失败：{err}",
+                            material.remote_id
+                        ))
+                    })?;
                 self.log(observability::event_with_payload(
                     Level::Info,
                     "key",
                     format!("已获取密钥 {name}"),
-                    serde_json::json!({ "site_id": site_id, "remote_id": material.remote_id }),
+                    serde_json::json!({ "site_id": site_id, "key_id": stored.id }),
                 ));
-                Ok(material)
+                Ok(stored)
             }
             Err(err) => Err(self.on_auth_error(site_id, err)),
         }
@@ -405,12 +451,36 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             });
         }
 
-        // ② 取密钥并生成计划
+        // ② 取锁。**必须在确认同意之前**：否则用户可以在我们等锁的时候撤销同意，
+        //    而我们醒来后照写不误（M1-S2 复审 P1-2）。
+        let lock_dir = inject::default_lock_dir();
+        let guard = inject::lock::FileLock::acquire(&target, &lock_dir)?;
+
+        // ③ 在锁内**重新**确认同意（第一次检查在取锁之前，那一次是为了避免无谓取锁）
+        if !self.consent_state(channel, &target)?.is_granted() {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "delivery",
+                "投递被拒绝：取锁期间同意被撤销",
+                serde_json::json!({ "channel": channel.as_str() }),
+            ));
+            return Err(Error::ConsentRequired {
+                agent_id: channel.agent_id().to_string(),
+                channel: channel.as_str().to_string(),
+                target_path: target.display().to_string(),
+            });
+        }
+
+        // ④ 取密钥并生成计划
         let api_key = self.key_secret(key_id)?;
         let patch = writer.plan(&api_key)?;
 
-        // ③ 写入（`inject::apply` 内部完成加锁 → 预检 → 备份 → 原子写 → 回读校验 → 失败补偿）
-        let journal = match inject::apply(&[patch], &self.backup_dir) {
+        // ⑤ 写入（加锁已在上面完成；预检 → 备份 → 原子写 → 回读校验 → 失败补偿在 apply 内部）
+        let journal = match inject::apply_holding_lock(
+            &[patch],
+            &self.backup_dir,
+            std::slice::from_ref(&guard),
+        ) {
             Ok(journal) => journal,
             Err(err) => {
                 self.log(observability::event_with_payload(
@@ -423,14 +493,27 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             }
         };
 
-        // ④ 记账：变更记录 + 投递绑定。两者都不含密钥。
-        self.store.record_journal(&journal)?;
-        self.store.record_binding(
-            channel.agent_id(),
-            key_id,
-            &target.display().to_string(),
-            &journal.id,
-        )?;
+        // ⑥ 记账：变更记录 + 投递绑定。两者都不含密钥。
+        //
+        // 记账失败必须**补偿回滚**：文件已经改了，但用户拿不到 `journal_id`
+        // 就永远回滚不了——那等于留下一个无法撤销的改动（M1-S2 复审 P1-4）。
+        if let Err(err) = self.store.record_journal(&journal).and_then(|()| {
+            self.store.record_binding(
+                channel.agent_id(),
+                key_id,
+                &target.display().to_string(),
+                &journal.id,
+            )
+        }) {
+            return match inject::rollback(&journal) {
+                Ok(()) => Err(Error::Store(format!(
+                    "记账失败，已自动回滚（文件内容未改动）: {err}"
+                ))),
+                Err(rollback_err) => Err(Error::Store(format!(
+                    "记账失败且自动回滚也失败，需要人工处理: {err} / {rollback_err}"
+                ))),
+            };
+        }
 
         self.log(observability::event_with_payload(
             Level::Info,
@@ -467,6 +550,59 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             serde_json::json!({ "journal_id": journal_id }),
         ));
         Ok(())
+    }
+
+    /// 本地已存的密钥（**不含密钥本体**）。UI 的「密钥」页用这个，而不是站点侧列表——
+    /// 因为投递需要的是**本地 key_id**，站点返回的 `remote_id` 不能当本地主键用。
+    pub fn stored_keys(&self) -> Result<Vec<crate::store::KeyRow>> {
+        self.store.list_keys()
+    }
+
+    /// 把一把密钥存进钥匙串 + 本地库，返回新记录 id。
+    ///
+    /// 顺序不可换：**先写钥匙串，再写库**。
+    /// - 先写库再写钥匙串：钥匙串失败会留下一条指向不存在条目的悬空记录。
+    /// - 先写钥匙串再写库：写库失败时删掉刚写的钥匙串条目即可完全补偿。
+    pub fn store_key_material(
+        &self,
+        site_id: i64,
+        name: &str,
+        remote_id: Option<&str>,
+        secret: &str,
+    ) -> Result<StoredKey> {
+        if secret.trim().is_empty() {
+            return Err(Error::Vault("密钥为空，拒绝保存".into()));
+        }
+        let ref_id = new_ref_id();
+        let secret_ref = crate::vault::secret_ref("key", &ref_id, "secret");
+        self.vault.put(&secret_ref, secret)?;
+
+        match self.store.insert_key(site_id, name, &secret_ref, remote_id) {
+            Ok(id) => {
+                let stored = StoredKey {
+                    id,
+                    remote_id: remote_id.unwrap_or_default().to_string(),
+                    name: name.to_string(),
+                    masked: crate::redact::mask_secret(secret),
+                };
+                self.log(observability::event_with_payload(
+                    Level::Info,
+                    "vault",
+                    format!("密钥已存入钥匙串: {name}"),
+                    serde_json::json!({
+                        "site_id": site_id,
+                        "key_id": id,
+                        "fingerprint": crate::redact::fingerprint(secret),
+                    }),
+                ));
+                Ok(stored)
+            }
+            Err(err) => {
+                // 补偿：库没写进去，钥匙串里那条也不能留
+                let _ = self.vault.delete(&secret_ref);
+                Err(err)
+            }
+        }
     }
 
     /// 最近事件（UI「诊断」用）。
@@ -532,9 +668,34 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         })
     }
 
-    /// 目标路径必须落在 `home` 之内。写入器目前是固定相对路径拼出来的，
-    /// 这一层是**纵深防御**：将来新增写入器时挡住越界路径。
+    /// 目标路径白名单：既要落在 `home` 之内，也要与**该通道声明的相对路径**逐字相等。
+    ///
+    /// 只做 `starts_with(home)` 是不够的：任何落在 home 下的路径都会放行（复核 P2）。
+    /// 新增通道时必须在这里登记期望路径，否则一律拒绝——这样「通道写错文件」不可能悄悄发生。
     fn checked_target(&self, channel: DeliveryChannel, target: &Path) -> Result<PathBuf> {
+        let expected_rel = match channel {
+            DeliveryChannel::CodexAuthJson => Path::new(".codex").join("auth.json"),
+            // 以下通道尚未实现（`delivery::resolve` 会先返回 Unimplemented）；
+            // 这里刻意不给期望路径，将来实现时必须显式登记。
+            DeliveryChannel::ClaudeCodeSettings | DeliveryChannel::ShellBlock => {
+                return Err(Error::Unimplemented(format!(
+                    "通道 {} 的目标路径尚未登记，拒绝写入",
+                    channel.as_str()
+                )))
+            }
+        };
+
+        let expected = self.home.join(&expected_rel);
+        if target != expected {
+            return Err(Error::Inject {
+                path: target.display().to_string(),
+                reason: format!(
+                    "投递目标与通道 {} 声明的路径不符（期望 {}），拒绝写入",
+                    channel.as_str(),
+                    expected.display()
+                ),
+            });
+        }
         if !target.starts_with(&self.home) {
             return Err(Error::Inject {
                 path: target.display().to_string(),
@@ -544,7 +705,6 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 ),
             });
         }
-        let _ = channel;
         Ok(target.to_path_buf())
     }
 

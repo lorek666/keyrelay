@@ -24,4 +24,5 @@ pub const COMMANDS: &[&str] = &[
     "apply_delivery",
     "rollback_delivery",
     "recent_events",
+    "list_stored_keys",
 ];
