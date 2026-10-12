@@ -31,6 +31,11 @@ fn json_resp(status: u16, value: serde_json::Value) -> HttpResponse {
     HttpResponse::json(status, value).expect("测试响应构造失败")
 }
 
+/// 站点未启用登录加密（登录前会先探一次该端点）
+fn encryption_disabled() -> HttpResponse {
+    json_resp(200, json!({"success": true, "data": {"enabled": false}}))
+}
+
 #[tokio::test]
 async fn detect_identifies_newapi_and_reads_version() {
     let transport = MockTransport::new(vec![json_resp(
@@ -59,11 +64,15 @@ async fn detect_rejects_non_newapi_site() {
 
 #[tokio::test]
 async fn login_captures_session_cookie_and_user_id() {
-    let transport = MockTransport::new(vec![json_resp(
-        200,
-        json!({"success": true, "message": "", "data": {"id": 42, "username": "me"}}),
-    )
-    .with_header("Set-Cookie", "session=s3cr3t; Path=/; HttpOnly")]);
+    // 请求序列：① 加密键探测 ② 登录
+    let transport = MockTransport::new(vec![
+        encryption_disabled(),
+        json_resp(
+            200,
+            json!({"success": true, "message": "", "data": {"id": 42, "username": "me"}}),
+        )
+        .with_header("Set-Cookie", "session=s3cr3t; Path=/; HttpOnly"),
+    ]);
     let adapter = NewApi::new(transport);
 
     let session = adapter
@@ -77,7 +86,13 @@ async fn login_captures_session_cookie_and_user_id() {
     );
     assert_eq!(session.cookie_header().as_deref(), Some("session=s3cr3t"));
 
-    let req = adapter.transport().nth_request(0).unwrap();
+    let probe = adapter.transport().nth_request(0).unwrap();
+    assert_eq!(
+        probe.url,
+        "https://relay.example.com/api/user/login/encryption-key"
+    );
+
+    let req = adapter.transport().nth_request(1).unwrap();
     assert_eq!(req.method.as_str(), "POST");
     assert_eq!(req.url, "https://relay.example.com/api/user/login");
     let body: serde_json::Value = serde_json::from_slice(req.body.as_ref().unwrap()).unwrap();
@@ -87,10 +102,13 @@ async fn login_captures_session_cookie_and_user_id() {
 
 #[tokio::test]
 async fn login_maps_turnstile_to_captcha_required() {
-    let transport = MockTransport::new(vec![json_resp(
-        200,
-        json!({"success": false, "message": "Turnstile 验证失败，请重试"}),
-    )]);
+    let transport = MockTransport::new(vec![
+        encryption_disabled(),
+        json_resp(
+            200,
+            json!({"success": false, "message": "Turnstile 验证失败，请重试"}),
+        ),
+    ]);
     let adapter = NewApi::new(transport);
     let err = adapter
         .login(BASE, Credentials::new("me", "pw"))
@@ -101,10 +119,10 @@ async fn login_maps_turnstile_to_captcha_required() {
 
 #[tokio::test]
 async fn login_maps_2fa_message_to_second_factor() {
-    let transport = MockTransport::new(vec![json_resp(
-        200,
-        json!({"success": false, "message": "需要二次验证"}),
-    )]);
+    let transport = MockTransport::new(vec![
+        encryption_disabled(),
+        json_resp(200, json!({"success": false, "message": "需要二次验证"})),
+    ]);
     let adapter = NewApi::new(transport);
     let err = adapter
         .login(BASE, Credentials::new("me", "pw"))
@@ -116,7 +134,8 @@ async fn login_maps_2fa_message_to_second_factor() {
 #[tokio::test]
 async fn login_maps_rate_limit_with_retry_after() {
     let transport = MockTransport::new(vec![
-        HttpResponse::new(429, b"{}".to_vec()).with_header("Retry-After", "30")
+        encryption_disabled(),
+        HttpResponse::new(429, b"{}".to_vec()).with_header("Retry-After", "30"),
     ]);
     let adapter = NewApi::new(transport);
     let err = adapter
@@ -128,6 +147,108 @@ async fn login_maps_rate_limit_with_retry_after() {
         Error::RateLimited {
             retry_after_secs: 30
         }
+    );
+}
+
+#[tokio::test]
+async fn login_encrypts_password_when_site_requires_it() {
+    use base64::Engine as _;
+    use rsa::pkcs8::{EncodePublicKey, LineEnding};
+    use rsa::rand_core::OsRng;
+    use rsa::sha2::Sha256;
+    use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
+
+    let private = RsaPrivateKey::new(&mut OsRng, 2048).expect("生成测试密钥");
+    let public_pem = RsaPublicKey::from(&private)
+        .to_public_key_pem(LineEnding::LF)
+        .expect("导出 PEM");
+
+    let transport = MockTransport::new(vec![
+        json_resp(
+            200,
+            json!({"success": true, "data": {"enabled": true, "kid": "kid-1", "public_key": public_pem}}),
+        ),
+        json_resp(200, json!({"success": true, "data": {"id": 42}})),
+    ]);
+    let adapter = NewApi::new(transport);
+
+    adapter
+        .login(BASE, Credentials::new("me", "hunter2"))
+        .await
+        .unwrap();
+
+    let req = adapter.transport().nth_request(1).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(req.body.as_ref().unwrap()).unwrap();
+
+    // 启用加密时绝不出现明文字段
+    assert!(body.get("password").is_none(), "不得发送明文密码: {body}");
+    assert_eq!(body["encryption_key_id"], "kid-1");
+    assert_eq!(body["username"], "me");
+
+    // 密文必须能被站点私钥按 RSA-OAEP(SHA-256) 解回原文
+    let ciphertext = base64::engine::general_purpose::STANDARD
+        .decode(body["password_encrypted"].as_str().unwrap())
+        .expect("base64 解码");
+    let plaintext = private
+        .decrypt(Oaep::new::<Sha256>(), &ciphertext)
+        .expect("私钥解密");
+    assert_eq!(plaintext, b"hunter2");
+}
+
+#[tokio::test]
+async fn login_falls_back_to_plaintext_when_encryption_endpoint_missing() {
+    // 旧版本 NewAPI 没有该端点 → 404 → 按未启用处理
+    let transport = MockTransport::new(vec![
+        HttpResponse::new(404, b"404 page not found".to_vec()),
+        json_resp(200, json!({"success": true, "data": {"id": 42}})),
+    ]);
+    let adapter = NewApi::new(transport);
+
+    adapter
+        .login(BASE, Credentials::new("me", "pw"))
+        .await
+        .unwrap();
+
+    let body: serde_json::Value = serde_json::from_slice(
+        adapter
+            .transport()
+            .nth_request(1)
+            .unwrap()
+            .body
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["password"], "pw");
+    assert!(body.get("password_encrypted").is_none());
+}
+
+#[tokio::test]
+async fn login_rejects_overlong_password_instead_of_sending_plaintext() {
+    use rsa::pkcs8::{EncodePublicKey, LineEnding};
+    use rsa::rand_core::OsRng;
+    use rsa::{RsaPrivateKey, RsaPublicKey};
+
+    let private = RsaPrivateKey::new(&mut OsRng, 2048).expect("生成测试密钥");
+    let public_pem = RsaPublicKey::from(&private)
+        .to_public_key_pem(LineEnding::LF)
+        .expect("导出 PEM");
+
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"enabled": true, "kid": "kid-1", "public_key": public_pem}}),
+    )]);
+    let adapter = NewApi::new(transport);
+
+    let err = adapter
+        .login(BASE, Credentials::new("me", "a".repeat(200)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::AuthFailed(_)), "实际: {err:?}");
+    assert_eq!(
+        adapter.transport().request_count(),
+        1,
+        "超长密码不得再发登录请求（更不得降级明文）"
     );
 }
 

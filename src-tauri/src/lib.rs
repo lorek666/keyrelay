@@ -10,10 +10,19 @@ pub mod commands_list;
 
 use std::path::PathBuf;
 
+use keyrelay_core::service::KeyRelayService;
+use keyrelay_core::site::registry::SiteRegistry;
+use keyrelay_core::site::retry::{RetryPolicy, RetryingTransport};
+use keyrelay_core::site::transport_reqwest::{ReqwestTransport, TransportConfig};
+use keyrelay_core::site::SiteFingerprint;
 use keyrelay_core::store::Store;
+use keyrelay_core::Result;
+
+/// 生产装配：真实 reqwest + 重试装饰器
+pub type AppTransport = RetryingTransport<ReqwestTransport>;
 
 pub struct AppState {
-    pub store: Store,
+    pub service: KeyRelayService<AppTransport>,
     pub db_path: PathBuf,
     /// 数据库打开失败时的原因（用于在 UI 上明确提示，而不是静默降级）
     pub db_error: Option<String>,
@@ -25,9 +34,25 @@ pub fn default_db_path() -> PathBuf {
     PathBuf::from(home).join(".keyrelay").join("keyrelay.db")
 }
 
+fn build_transport() -> AppTransport {
+    match ReqwestTransport::new(TransportConfig::default()) {
+        Ok(inner) => RetryingTransport::new(inner, RetryPolicy::default()),
+        Err(err) => {
+            // 默认配置理论上不会失败；真失败说明构建环境异常，明确退出而不是静默降级
+            eprintln!("[keyrelay] 构造 HTTP 传输层失败: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 仅做指纹识别（不落库），供前端「测试连接」按钮使用。
+pub async fn detect_only(base_url: &str) -> Result<SiteFingerprint> {
+    SiteRegistry::new(build_transport()).detect(base_url).await
+}
+
 fn state_from_store(store: Store, db_path: PathBuf, db_error: Option<String>) -> AppState {
     AppState {
-        store,
+        service: KeyRelayService::new(store, build_transport()),
         db_path,
         db_error,
     }
@@ -71,7 +96,13 @@ pub fn configure_with_state<R: tauri::Runtime>(
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::list_sites,
-            commands::app_info
+            commands::app_info,
+            commands::detect_site,
+            commands::add_site,
+            commands::login_site,
+            commands::list_keys,
+            commands::create_key,
+            commands::site_balance
         ])
 }
 

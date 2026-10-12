@@ -1,6 +1,7 @@
 //! 站点适配器契约与共享类型。
 
 pub mod newapi;
+pub mod password_crypto;
 pub mod registry;
 pub mod retry;
 pub mod sub2api;

@@ -12,6 +12,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use super::password_crypto::{encrypt_password, PasswordEncryptionKey};
 use super::transport::{HttpRequest, HttpTransport, Method};
 use super::{
     json_str, map_http_error, normalize_base_url, Balance, Credentials, KeyMaterial, KeyMeta,
@@ -77,6 +78,62 @@ impl<T: HttpTransport> NewApi<T> {
             return Err(classify_login_message(&message));
         }
         Ok(value)
+    }
+
+    /// 取站点密码加密公钥。站点未启用、端点不存在或响应不可解析时返回 `None`
+    /// （按「未启用加密」处理，兼容旧版本 NewAPI）。
+    async fn fetch_encryption_key(&self, base: &str) -> Result<Option<PasswordEncryptionKey>> {
+        let url = format!("{base}/api/user/login/encryption-key");
+        let resp = self
+            .transport
+            .request(HttpRequest::new(Method::Get, url))
+            .await?;
+
+        if resp.status != 200 {
+            return Ok(None);
+        }
+        let Ok(value) = resp.json_value() else {
+            return Ok(None);
+        };
+        let enabled = value
+            .pointer("/data/enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !enabled {
+            return Ok(None);
+        }
+
+        let kid = json_str(&value, "/data/kid")
+            .unwrap_or_default()
+            .to_string();
+        let public_key_pem = json_str(&value, "/data/public_key")
+            .unwrap_or_default()
+            .to_string();
+        if kid.is_empty() || public_key_pem.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PasswordEncryptionKey {
+            kid,
+            public_key_pem,
+        }))
+    }
+
+    /// 组装登录请求体：站点启用加密时发送密文（**不含明文 `password` 字段**），否则发送明文。
+    async fn login_body(&self, base: &str, cred: &Credentials) -> Result<Value> {
+        match self.fetch_encryption_key(base).await? {
+            Some(key) => {
+                let password_encrypted = encrypt_password(&cred.password, &key)?;
+                Ok(json!({
+                    "username": cred.username,
+                    "password_encrypted": password_encrypted,
+                    "encryption_key_id": key.kid,
+                }))
+            }
+            None => Ok(json!({
+                "username": cred.username,
+                "password": cred.password,
+            })),
+        }
     }
 }
 
@@ -210,12 +267,10 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
     }
 
     async fn login(&self, base_url: &str, cred: Credentials) -> Result<Session> {
-        let url = format!("{}/api/user/login", normalize_base_url(base_url));
-        let body = json!({
-            "username": cred.username,
-            "password": cred.password,
-        });
-        let req = HttpRequest::new(Method::Post, url).json_body(&body)?;
+        let base = normalize_base_url(base_url);
+        let body = self.login_body(&base, &cred).await?;
+        let req =
+            HttpRequest::new(Method::Post, format!("{base}/api/user/login")).json_body(&body)?;
         let resp = self.transport.request(req).await?;
 
         match resp.status {
