@@ -25,7 +25,17 @@ pub fn home_dir() -> Result<PathBuf> {
 /// 4. `HOME`（macOS / Linux）
 pub fn home_dir_with(get: impl Fn(&str) -> Option<String>) -> Result<PathBuf> {
     if let Some(value) = non_empty(get(HOME_OVERRIDE_ENV)) {
-        return Ok(PathBuf::from(value));
+        // 覆盖值必须是**绝对路径**（复审 P2-3）：相对路径会随进程 CWD 漂移，
+        // 「密钥到底写到了哪儿」就变成不可预测的事——而这正是本产品最不能含糊的地方。
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err(Error::Store(format!(
+                "{HOME_OVERRIDE_ENV} 必须是绝对路径，收到的是「{}」。\
+                 相对路径会随进程工作目录变化，拒绝使用。",
+                path.display()
+            )));
+        }
+        return Ok(path);
     }
 
     if let Some(value) = non_empty(get("USERPROFILE")) {
@@ -48,8 +58,14 @@ pub fn home_dir_with(get: impl Fn(&str) -> Option<String>) -> Result<PathBuf> {
     )))
 }
 
+/// 空串与**纯空白**都算「没有设置」；取值本身要 `trim`。
+///
+/// 不 trim 会让 `KEYRELAY_HOME="  /tmp/x  "` 造出一个名字带空格的目录（复审 P2-2）。
+/// 其余三个变量是操作系统给的、形状固定，trim 对它们无害。
 fn non_empty(value: Option<String>) -> Option<String> {
-    value.filter(|v| !v.trim().is_empty())
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// 本产品的应用数据目录：`<home>/.keyrelay`。
@@ -124,6 +140,29 @@ mod tests {
     #[test]
     fn all_empty_strings_are_also_an_error() {
         let get = env_of(&[("HOME", ""), ("USERPROFILE", " "), ("HOMEDRIVE", "")]);
+        assert!(home_dir_with(get).is_err());
+    }
+
+    #[test]
+    fn override_is_trimmed() {
+        // 复审 P2-2：`"  /tmp/padded  "` 以前会原样变成名字带空格的目录
+        let get = env_of(&[(HOME_OVERRIDE_ENV, "  /tmp/padded  ")]);
+        assert_eq!(home_dir_with(get).unwrap(), PathBuf::from("/tmp/padded"));
+    }
+
+    #[test]
+    fn a_relative_override_is_refused() {
+        // 复审 P2-3：相对路径随 CWD 漂移，密钥写到哪儿就不可预测了
+        let get = env_of(&[(HOME_OVERRIDE_ENV, "relative/dir"), ("HOME", "/home/me")]);
+        let err = home_dir_with(get).unwrap_err().to_string();
+        assert!(err.contains("绝对路径"), "{err}");
+        assert!(err.contains("relative/dir"), "错误里要回显收到的值: {err}");
+    }
+
+    #[test]
+    fn a_relative_override_does_not_silently_fall_back() {
+        // 拒绝，而不是「忽略覆盖值、悄悄用 HOME」——后者会让用户以为覆盖生效了
+        let get = env_of(&[(HOME_OVERRIDE_ENV, "./x"), ("HOME", "/home/me")]);
         assert!(home_dir_with(get).is_err());
     }
 }

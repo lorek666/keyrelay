@@ -90,12 +90,12 @@ impl Settings {
                     }
                 }
                 KEY_DRIFT_ON_START => {
-                    if let Ok(flag) = value.parse::<bool>() {
+                    if let Some(flag) = parse_bool(value) {
                         settings.drift_check_on_start = flag;
                     }
                 }
                 KEY_GATEWAY_ENABLED => {
-                    if let Ok(flag) = value.parse::<bool>() {
+                    if let Some(flag) = parse_bool(value) {
                         settings.gateway_enabled = flag;
                     }
                 }
@@ -133,6 +133,19 @@ impl Settings {
         KEY_GATEWAY_ENABLED,
         KEY_GATEWAY_PORT,
     ];
+}
+
+/// 宽松解析布尔值：大小写不敏感，并接受 `1` / `0`。
+///
+/// 为什么不用 `str::parse::<bool>()`（复审 P2-9）：它只认小写 `true` / `false`。
+/// 用户手工把库里的值改成 `"False"` 时，解析失败会**静默退回默认值**，
+/// 而 `drift_check_on_start` 的默认是 `true` —— 结果与用户写的正好相反。
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -233,5 +246,48 @@ mod tests {
         // 未知键忽略
         let s = Settings::from_pairs(vec![("unknown", "1")]);
         assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn booleans_are_parsed_case_insensitively() {
+        // 复审 P2-9：`"False"` 以前解析失败 → 静默退回默认 `true`，与用户写的**正好相反**
+        for text in ["false", "False", "FALSE", " false ", "0", "no", "off"] {
+            let s = Settings::from_pairs(vec![
+                (KEY_DRIFT_ON_START, text),
+                (KEY_GATEWAY_ENABLED, text),
+            ]);
+            assert!(!s.drift_check_on_start, "「{text}」应解析成 false");
+            assert!(!s.gateway_enabled, "「{text}」应解析成 false");
+        }
+
+        for text in ["true", "True", "TRUE", " true ", "1", "yes", "on"] {
+            let s = Settings::from_pairs(vec![
+                (KEY_DRIFT_ON_START, text),
+                (KEY_GATEWAY_ENABLED, text),
+            ]);
+            assert!(s.drift_check_on_start, "「{text}」应解析成 true");
+            assert!(s.gateway_enabled, "「{text}」应解析成 true");
+        }
+    }
+
+    #[test]
+    fn an_unparseable_boolean_falls_back_to_the_default_not_to_the_opposite() {
+        // 认不出来的值仍然退回默认（`drift_check_on_start` 默认 true）——
+        // 但至少「认不出来的值」不会伪装成用户显式写下的相反值
+        let s = Settings::from_pairs(vec![(KEY_DRIFT_ON_START, "maybe")]);
+        assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn false_survives_a_round_trip() {
+        // 端到端：写进库的 `false` 读回来必须还是 `false`
+        let wanted = Settings {
+            drift_check_on_start: false,
+            gateway_enabled: false,
+            ..Settings::default()
+        };
+        let pairs = wanted.to_pairs();
+        let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(Settings::from_pairs(borrowed), wanted);
     }
 }

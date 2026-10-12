@@ -645,6 +645,23 @@ impl Store {
     }
 
     pub fn list_events(&self, limit: usize) -> Result<Vec<EventRow>> {
+        let limit = i64::try_from(limit)
+            .map_err(|_| Error::Store(format!("事件条数上限超出范围: {limit}")))?;
+        self.query_events(limit)
+    }
+
+    /// 读**全部**事件，不限条数（事件表守护用）。
+    ///
+    /// 单独一个方法，而不是 `list_events(usize::MAX)`（复审 P2-13）：后者能「不限制」
+    /// 纯粹是因为 `usize::MAX as i64 == -1`，而 SQLite 恰好把负 `LIMIT` 解释成不限制。
+    /// 一旦有人给 `list_events` 加上限（`recent_events` 就有 `min(1000)`），
+    /// 事件表守护会**静默只扫最近 N 条**，红线守护变成空跑。
+    pub fn list_all_events(&self) -> Result<Vec<EventRow>> {
+        // `LIMIT -1` 是 SQLite 明文的「不限制」，不是巧合
+        self.query_events(-1)
+    }
+
+    fn query_events(&self, limit: i64) -> Result<Vec<EventRow>> {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
@@ -653,7 +670,7 @@ impl Store {
             )
             .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
         let rows = stmt
-            .query_map(params![limit as i64], |row| {
+            .query_map(params![limit], |row| {
                 Ok(EventRow {
                     id: row.get(0)?,
                     ts: row.get(1)?,
@@ -673,7 +690,7 @@ impl Store {
     /// 用 `redact::scrub` 做判定，而不是硬编码正则：脱敏规则只有一处定义，
     /// 规则升级后本方法自动跟随。
     pub fn count_events_with_secrets(&self) -> Result<i64> {
-        let events = self.list_events(usize::MAX)?;
+        let events = self.list_all_events()?;
         let hits = events
             .iter()
             .filter(|row| {

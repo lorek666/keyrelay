@@ -135,7 +135,7 @@ pub struct DriftReportDto {
     target_path: String,
     agent_id: String,
     channel: String,
-    /// `"intact"` | `"modified"` | `"missing"` | `"unknown"`
+    /// `"intact"` | `"modified"` | `"missing"` | `"unreadable"` | `"unknown"`
     state: String,
     journal_id: String,
     current_sha256: Option<String>,
@@ -655,17 +655,23 @@ pub async fn gateway_start(
     state: State<'_, AppState>,
     args: GatewayStartArgs,
 ) -> Result<GatewayStatusDto, String> {
+    // 总开关在**后端**也要拦一道（M4-S2 复审 P2-8）：之前只有 UI 把按钮置灰，
+    // 直接调 IPC 就能绕过设置把端口打开。
+    let settings = state.service.settings().map_err(|e| e.to_string())?;
+    if !settings.gateway_enabled {
+        return Err(
+            "本地网关总开关是关的。请到「设置」页勾选「允许启动本地网关」并保存后再启动。"
+                .to_string(),
+        );
+    }
+
     if let Ok(mut guard) = state.gateway.lock() {
         if let Some(old) = guard.take() {
             old.shutdown();
         }
     }
 
-    let port = state
-        .service
-        .settings()
-        .map_err(|e| e.to_string())?
-        .gateway_port;
+    let port = settings.gateway_port;
     let config = state
         .service
         .gateway_config(args.site_id, args.key_id, port)
