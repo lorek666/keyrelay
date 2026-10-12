@@ -1,8 +1,11 @@
 //! 站点适配器契约与共享类型。
 
 pub mod newapi;
+pub mod registry;
+pub mod retry;
 pub mod sub2api;
 pub mod transport;
+pub mod transport_reqwest;
 
 use async_trait::async_trait;
 use serde_json::Value;
