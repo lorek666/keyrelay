@@ -27,16 +27,24 @@ pub struct SiteRegistry<T: HttpTransport + Clone + 'static> {
 
 impl<T: HttpTransport + Clone + 'static> SiteRegistry<T> {
     pub fn new(transport: T) -> Self {
+        // 基础顺序从 `SiteKind::ALL` 派生（M8-S6 / B-119）——不再手写第二份变体清单：
+        // 手写的那份会在新增适配器时静默过期，而 `ALL` 的长度由编译期守着。
+        //
+        // 只做一条重排：`CustomOpenAiCompatible` **必须排在最后**
+        // （M7-S2 / 章程 v1.1 裁决 O-1）——它只靠 `/v1/models` 认领，判据最宽；
+        // 放前面会把已有两类的站点抢过来（NewAPI 的 `/v1/models` 挂在 TokenAuth 之后，
+        // 但别的兼容层未必如此）。
+        //
+        // `sort_by_key` 是**稳定**排序 ⇒ `NewApi` / `Sub2Api` 的相对顺序仍是 `ALL` 里的
+        // 顺序，与改前逐字相同（`default_probe_order_puts_the_wildcard_last` 钉着）。
+        let mut probe_order = SiteKind::ALL.to_vec();
+        probe_order.sort_by_key(|kind| match kind {
+            SiteKind::CustomOpenAiCompatible => 1u8,
+            _ => 0u8,
+        });
         Self {
             transport,
-            // `CustomOpenAiCompatible` **必须排在最后**（M7-S2 / 章程 v1.1 裁决 O-1）：
-            // 它只靠 `/v1/models` 认领，判据最宽；放前面会把已有两类的站点抢过来
-            // （NewAPI 的 `/v1/models` 挂在 TokenAuth 之后，但别的兼容层未必如此）。
-            probe_order: vec![
-                SiteKind::NewApi,
-                SiteKind::Sub2Api,
-                SiteKind::CustomOpenAiCompatible,
-            ],
+            probe_order,
             cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -117,6 +125,33 @@ mod tests {
     use crate::site::transport::{HttpResponse, MockTransport};
     use crate::site::{Balance, Credentials, KeyMaterial, KeyMeta, KeySpec, Session};
     use serde_json::json;
+
+    #[test]
+    fn default_probe_order_puts_the_wildcard_last() {
+        // M8-S6 / B-119：探测顺序现在从 `SiteKind::ALL` 派生，这条钉住**生产路径**。
+        //
+        // 为什么直接读 `registry.probe_order` 而不是抄一份排序逻辑来断言
+        // （M8-S6 独立复审 P2-1）：抄一份的话，`new()` 里的排序被删掉/改坏时
+        // 这条照样绿——它断言的是副本，不是生产。测试模块是本模块的子模块，
+        // 读私有字段没有障碍（同文件里 B-20 的几条测试就是这么读私有 `cache` 的）。
+        let registry = SiteRegistry::new(MockTransport::new(vec![]));
+        let order = registry.probe_order.clone();
+        // ① 判据最宽的必须排最后（章程 v1.1 裁决 O-1）——否则它会把已有两类抢过来
+        assert_eq!(
+            order.last().copied(),
+            Some(SiteKind::CustomOpenAiCompatible),
+            "CustomOpenAiCompatible 必须排最后"
+        );
+        // ② 一个不丢、一个不重（派生逻辑写错会同时丢掉或重复某个变体）
+        assert_eq!(order.len(), SiteKind::ALL.len());
+        for kind in SiteKind::ALL {
+            assert_eq!(
+                order.iter().filter(|k| **k == kind).count(),
+                1,
+                "{kind:?} 在探测顺序里必须恰好出现一次"
+            );
+        }
+    }
 
     /// 可控指纹类型的最小适配器（B-20 探针）：`claimed` 与 `kind` 故意可以不一致。
     struct StubAdapter {

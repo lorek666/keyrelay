@@ -26,6 +26,21 @@ pub enum SiteKind {
 }
 
 impl SiteKind {
+    /// 全部变体（B-119 / M8-S6）。
+    ///
+    /// **新增变体时必须加进来**：`SiteKind::ALL` 的长度写在类型 `[SiteKind; N]` 里，
+    /// 而 `site::tests::site_kind_all_covers_every_variant` 手列了一份变体清单并与
+    /// `ALL.len()` 对账 ⇒ 漏加则那条测试**编译失败**（不是运行失败），失败信息直接说清
+    /// 「该改哪」。这与 `DeliveryChannel::ALL`（M6-S0 §9.1）是同一个手法。
+    ///
+    /// 顺序即 `SiteRegistry` 的默认探测顺序的**基础顺序**（`registry.rs` 在它之上只做
+    /// 「`CustomOpenAiCompatible` 排最后」这一条重排）。
+    pub const ALL: [SiteKind; 3] = [
+        SiteKind::NewApi,
+        SiteKind::Sub2Api,
+        SiteKind::CustomOpenAiCompatible,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             SiteKind::NewApi => "newapi",
@@ -489,6 +504,51 @@ pub(crate) fn json_str<'a>(v: &'a Value, path: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn site_kind_all_covers_every_variant() {
+        // B-119 / M8-S6：把「每个变体都在 ALL 里」变成**编译期**失败。
+        //
+        // 为什么用穷举 match 而不是「数组字面量 + assert_eq!(len)」：后者只在
+        // **改了 ALL 的长度**时才红；新增一个变体却忘了把它加进 ALL 时，
+        // `variants.len() == 3 == ALL.len()` 照过——M8-S6 独立复审 P1-1 实测复现过
+        // （加了变体、补全编译器强制的 match 臂、唯独不动 ALL ⇒ 这条测试**通过**）。
+        // 而 `probe_order` 是从 ALL 派生的 ⇒ 那个新适配器会**永远不被探测**，
+        // 且没有任何东西会红。
+        //
+        // 穷举 match（**没有 `_` 臂**）强制的是另一件事：新增变体时这个 match 编不过，
+        // 人就被迫回来——而回来就要面对「ALL 要不要加它」这个问题。
+        // 每个臂返回 `true` 表示「这个变体已确认在 ALL 里」。
+        let in_all = |kind: SiteKind| -> bool {
+            match kind {
+                SiteKind::NewApi => SiteKind::ALL.contains(&SiteKind::NewApi),
+                SiteKind::Sub2Api => SiteKind::ALL.contains(&SiteKind::Sub2Api),
+                SiteKind::CustomOpenAiCompatible => {
+                    SiteKind::ALL.contains(&SiteKind::CustomOpenAiCompatible)
+                }
+            }
+        };
+        // 上面的 match 无 `_` 臂 ⇒ 新增变体时编译失败。下面这几条是**运行期**兜底：
+        // 防的是「ALL 里出现重复项」与「as_str 撞名」这两种不靠编译期能发现的退化。
+        assert_eq!(
+            SiteKind::ALL.len(),
+            3,
+            "SiteKind::ALL 的长度变了：新增变体时必须同步改这条测试的穷举 match（B-119）"
+        );
+        for kind in SiteKind::ALL {
+            assert!(in_all(kind), "{kind:?} 不在 ALL 里（穷举 match 没覆盖它）");
+        }
+        // `as_str` 逐个不同：ALL 里有两个变体撞名会让 `sites.kind` 列无法区分
+        let mut names: Vec<&str> = SiteKind::ALL.iter().map(|k| k.as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            before,
+            "SiteKind::ALL 里有重名的 as_str: {names:?}"
+        );
+    }
 
     #[test]
     fn session_debug_hides_secrets() {

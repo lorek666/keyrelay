@@ -149,18 +149,42 @@ fn messages(service: &KeyRelayService<MockTransport>, needle: &str) -> Vec<Strin
 /// 补了才能被这条断言覆盖到。
 #[test]
 fn fixture_replay_covers_every_adapter() {
-    // 适配器 ⇒ 它的构造函数形态（`site/registry.rs::adapter()` 里 `Arc::new(X::new(...))`）
+    // 适配器 ⇒ 它的构造函数形态（`site/registry.rs::adapter()` 里 `Arc::new(X::new(...))`）。
+    //
+    // 构造函数形态**不能从 `SiteKind` 安全派生**（第三个不叫 `CustomOpenAiCompatible::new`，
+    // 命名没有统一规律），所以仍要这张表。但长度与 `SiteKind::ALL` 对账（B-119 / M8-S6）：
+    // 新增变体时下面那个 `assert_eq!` 会红，逼人回来补一行——漏测从静默变成显式。
+    //
+    // 另外一层强制在 `site::tests::site_kind_all_covers_every_variant`：那边手列变体清单，
+    // 新增变体时**编译失败**。两道合起来 = 编译期 + 运行期各一道。
+    // 长度不写死在类型里：交给下面那条 `assert_eq!` 与 `SiteKind::ALL.len()` 对账，
+    // 报错信息比「数组类型不匹配」清楚（M8-S6 独立复审 P3-1）。
     let adapters = [
         (SiteKind::NewApi, "NewApi::new("),
         (SiteKind::Sub2Api, "Sub2Api::new("),
         (SiteKind::CustomOpenAiCompatible, "CustomOpenAi::new("),
     ];
+    assert_eq!(
+        adapters.len(),
+        SiteKind::ALL.len(),
+        "适配器表与 SiteKind::ALL 长度不一致：新增站点类型必须同时补这张表（B-119）"
+    );
     let tests_dir = workspace_root().join("crates/keyrelay-core/tests");
+    // **排除本文件自己**（M8-S6 实测抓到的缺陷）：这条守护是「扫描 tests/ 目录里的文件」，
+    // 而它自己就在那个目录里 ⇒ 判据字符串（`NewApi::new(` 等）写在它自己源码中，
+    // 于是**任何**字符串都能自我匹配、判据永远成立——实测把构造函数形态改成一个
+    // 完全不可能存在的串，`covering` 仍是 1（匹配到它自己）。守护自己的源码不能算证据。
+    let this_file = std::path::Path::new(file!())
+        .file_name()
+        .expect("有文件名")
+        .to_string_lossy()
+        .to_string();
     let sources: Vec<(String, String)> = fs::read_dir(&tests_dir)
         .expect("读 tests 目录")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .filter(|path| path.file_name().expect("有文件名").to_string_lossy() != this_file)
         .filter_map(|path| {
             fs::read_to_string(&path)
                 .ok()
