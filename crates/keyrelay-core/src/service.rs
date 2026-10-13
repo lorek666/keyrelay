@@ -247,6 +247,12 @@ pub struct KeySyncSummary {
     pub site_total: usize,
     /// 其中本地已经有了多少条
     pub already_local: usize,
+    /// 本次**恢复**了多少条：本地行还在、但钥匙串条目被清过（`purge_keychain`），
+    /// 于是把明文重新取回**原来那一行**（DEBUG 报告 §1.9）。
+    ///
+    /// 与 `imported` 分开报：用户的动作不一样——「恢复」说明他清过钥匙串，
+    /// 现在按提示取回来了；「新导入」说明这是本机第一次看到这把 key。
+    pub restored: usize,
     /// 本次新导入本地钥匙串多少条
     pub imported: usize,
     /// 站点没给明文（或写入钥匙串失败）的 `remote_id`。
@@ -1693,54 +1699,127 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let adapter = self.registry.adapter(kind);
         let metas = adapter.list_keys(&site.base_url, &session).await?;
 
-        // 本地已有的（按 remote_id 判重）。**只在同一个站点内判重**：
-        // 不同站点的 remote_id 会撞（NewAPI 与 Sub2API 都从 1 开始编号）。
-        let existing: Vec<Option<String>> = self
+        // 本地「真的可用」的：有行 **且** 钥匙串条目还在（DEBUG 报告 §1.9）。
+        //
+        // 只看 `remote_id` 是错的：`purge_keychain` 删掉秘密但**保留行**（那是刻意的，
+        // `bindings` 与漂移追溯靠它存活），于是这里报「本地已有 1 / 新导入 0」，
+        // 而用户按界面提示「重新取一次密钥即可恢复」**取不回来**——投递与网关随后全失败。
+        let local: Vec<crate::store::KeyRow> = self
             .store
             .list_keys()?
             .into_iter()
             .filter(|row| row.site_id == site_id)
-            .map(|row| row.remote_id)
             .collect();
 
-        let missing: Vec<String> = metas
-            .iter()
-            .filter(|meta| {
-                !existing
-                    .iter()
-                    .any(|known| known.as_deref() == Some(meta.remote_id.as_str()))
-            })
-            .map(|meta| meta.remote_id.clone())
-            .collect();
+        // remote_id → 本地行。**只在同一个站点内判重**：不同站点的 remote_id 会撞
+        // （NewAPI 与 Sub2API 都从 1 开始编号）。
+        let mut by_remote: std::collections::HashMap<&str, &crate::store::KeyRow> =
+            std::collections::HashMap::new();
+        for row in &local {
+            if let Some(remote) = row.remote_id.as_deref() {
+                by_remote.insert(remote, row);
+            }
+        }
 
-        if missing.is_empty() {
+        // 站点侧的每一条，落在三种状态之一：
+        //   already_local —— 行在、秘密也在（什么都不用做）
+        //   restorable    —— 行在、秘密没了（**恢复进原来那一行**，不新建）
+        //   missing       —— 连行都没有（新建）
+        let mut restorable: Vec<(String, String)> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        let mut already_local = 0usize;
+        let mut unreadable: Vec<String> = Vec::new();
+        for meta in &metas {
+            let Some(row) = by_remote.get(meta.remote_id.as_str()) else {
+                missing.push(meta.remote_id.clone());
+                continue;
+            };
+            match self.vault.get(&row.secret_ref) {
+                Ok(Some(_)) => already_local += 1,
+                Ok(None) => restorable.push((meta.remote_id.clone(), row.secret_ref.clone())),
+                Err(err) => {
+                    // 钥匙串**读失败**（例如被锁）不能当成「没有」：当成没有就会去新建一行，
+                    // 而那一行与现有行是同一个 `remote_id`，`keys` 表上**没有唯一约束**
+                    // ——留下两条重复记录，之后每一处按 `remote_id` 判重的地方都会分叉。
+                    // 读不出来就如实报成「不可读」，下一轮再试。
+                    self.log(observability::event_with_payload(
+                        Level::Warn,
+                        "key",
+                        format!("读钥匙串失败，本轮跳过这一条: {err}"),
+                        serde_json::json!({ "site_id": site_id, "key_id": row.id }),
+                    ));
+                    unreadable.push(meta.remote_id.clone());
+                }
+            }
+        }
+
+        let mut to_fetch: Vec<String> = restorable.iter().map(|(id, _)| id.clone()).collect();
+        to_fetch.extend(missing.iter().cloned());
+
+        if to_fetch.is_empty() {
             return Ok(KeySyncSummary {
                 site_id,
                 site_total: metas.len(),
-                already_local: metas.len(),
+                already_local,
+                restored: 0,
                 imported: 0,
-                unreadable: Vec::new(),
+                unreadable,
             });
         }
 
         let materials = adapter
-            .reveal_keys(&site.base_url, &session, &missing)
+            .reveal_keys(&site.base_url, &session, &to_fetch)
             .await?;
 
+        let restore_into: std::collections::HashMap<&str, &str> = restorable
+            .iter()
+            .map(|(remote, secret_ref)| (remote.as_str(), secret_ref.as_str()))
+            .collect();
+
         let mut imported = 0usize;
-        let mut unreadable: Vec<String> = Vec::new();
+        let mut restored = 0usize;
         for (remote_id, material) in materials {
-            let name = metas
-                .iter()
-                .find(|meta| meta.remote_id == remote_id)
-                .map(|meta| meta.name.clone())
-                .unwrap_or_else(|| remote_id.clone());
             if material.secret.trim().is_empty() {
                 // 站点给了条目但没给明文（「不提供密钥明文回读」，PRD §10 风险表）。
                 // 不静默跳过：把它列出来，UI 才能引导用户新建。
                 unreadable.push(remote_id);
                 continue;
             }
+
+            if let Some(secret_ref) = restore_into.get(remote_id.as_str()) {
+                // 恢复：**复用原来那一行**。新建一行会让同一个 remote_id 出现两条记录。
+                match self.vault.put(secret_ref, &material.secret) {
+                    Ok(()) => {
+                        restored += 1;
+                        self.log(observability::event_with_payload(
+                            Level::Info,
+                            "vault",
+                            "已把密钥重新取回钥匙串",
+                            serde_json::json!({
+                                "site_id": site_id,
+                                "remote_id": remote_id,
+                                "fingerprint": crate::redact::fingerprint(&material.secret),
+                            }),
+                        ));
+                    }
+                    Err(err) => {
+                        self.log(observability::event_with_payload(
+                            Level::Warn,
+                            "key",
+                            format!("恢复密钥失败: {err}"),
+                            serde_json::json!({ "site_id": site_id, "remote_id": remote_id }),
+                        ));
+                        unreadable.push(remote_id);
+                    }
+                }
+                continue;
+            }
+
+            let name = metas
+                .iter()
+                .find(|meta| meta.remote_id == remote_id)
+                .map(|meta| meta.name.clone())
+                .unwrap_or_else(|| remote_id.clone());
             match self.store_key_material(site_id, &name, Some(&remote_id), &material.secret) {
                 Ok(_) => imported += 1,
                 Err(err) => {
@@ -1759,7 +1838,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let summary = KeySyncSummary {
             site_id,
             site_total: metas.len(),
-            already_local: metas.len() - missing.len(),
+            already_local,
+            restored,
             imported,
             unreadable,
         };
@@ -1767,9 +1847,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             Level::Info,
             "key",
             format!(
-                "密钥对齐完成: 站点 {} 条 / 已有 {} / 新导入 {} / 不可读 {}",
+                "密钥对齐完成: 站点 {} 条 / 已有 {} / 恢复 {} / 新导入 {} / 不可读 {}",
                 summary.site_total,
                 summary.already_local,
+                summary.restored,
                 summary.imported,
                 summary.unreadable.len()
             ),
@@ -1778,6 +1859,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 "site_id": summary.site_id,
                 "site_total": summary.site_total,
                 "already_local": summary.already_local,
+                "restored": summary.restored,
                 "imported": summary.imported,
                 "unreadable_count": summary.unreadable.len(),
             }),

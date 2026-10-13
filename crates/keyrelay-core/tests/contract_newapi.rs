@@ -400,6 +400,48 @@ async fn create_key_uses_key_from_create_response_when_present() {
 }
 
 #[tokio::test]
+async fn balance_without_a_quota_field_is_unknown_not_zero() {
+    // DEBUG 报告 §1.7：字段缺失时 `unwrap_or(0)` + 硬写 `known: true`，
+    // 于是 `notify/rules.rs` 的 BalanceLow 会拿 0 去比阈值，产出一条假告警。
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"used_quota": 500000, "quota_per_unit": 500000}}),
+    )]);
+    let adapter = NewApi::new(transport);
+    let balance = adapter.balance(BASE, &session()).await.unwrap();
+
+    assert!(!balance.known, "缺 quota ⇒ 不可观测，不是 0");
+    assert_eq!(balance.raw_quota, None);
+    assert_eq!(balance.quota_per_unit, None);
+    assert_eq!(balance.remaining, 0.0, "占位值，判据是 known");
+}
+
+#[tokio::test]
+async fn a_float_quota_is_unknown_not_truncated_to_zero() {
+    // 浮点 quota：`as_i64()` 拿不到。修复前这里显示 0.00。
+    // 没有证据说站点会这么返回，所以**不猜**——「解析不出来」如实报成不可观测。
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"quota": 1.5, "used_quota": 0}}),
+    )]);
+    let adapter = NewApi::new(transport);
+    let balance = adapter.balance(BASE, &session()).await.unwrap();
+    assert!(!balance.known, "浮点 quota ⇒ 不可观测");
+}
+
+#[tokio::test]
+async fn a_missing_used_quota_is_unknown_too() {
+    // 同一响应体里读到一半 = 没读到。给 `used` 编一个 0.0 是同一个错误换了个字段。
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"quota": 1234567}}),
+    )]);
+    let adapter = NewApi::new(transport);
+    let balance = adapter.balance(BASE, &session()).await.unwrap();
+    assert!(!balance.known, "缺 used_quota ⇒ 同样不可观测");
+}
+
+#[tokio::test]
 async fn balance_converts_quota_to_usd() {
     let transport = MockTransport::new(vec![json_resp(
         200,
