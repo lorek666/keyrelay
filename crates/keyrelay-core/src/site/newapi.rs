@@ -765,11 +765,24 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
             ));
         }
         let value = Self::unwrap_success(&resp, "查询余额")?;
-        let raw_quota = value.pointer("/data/quota").and_then(|v| v.as_i64());
-        let used_quota = value
-            .pointer("/data/used_quota")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        // 「不知道」不得被当成「余额 0」（DEBUG 报告 §1.7 / M7-S2 复审 S-2 的口径）。
+        //
+        // 修复前的形态是 `raw_quota.unwrap_or(0)` + 硬写 `known: true`：字段缺失或是浮点时
+        // 余额被编成 0，而 `notify/rules.rs` 的 BalanceLow 照常触发——用户收到一条
+        // 「余额不足」，去充值页却看到一个正常数字，**下一次他就不再相信这条告警了**。
+        // 假告警的代价不是多一条通知，是整条通知链路失去信用。
+        //
+        // 判据只看 `quota`：它定义「这个站点的余额能不能观测」。
+        // `used_quota` 缺失也走未知态——它与 `quota` 来自同一个响应体，读到一半就是没读到；
+        // 而给它编一个 `0.0` 正是同一个「把不知道当成 0」的错误，只是换了个字段。
+        let Some(raw_quota) = value.pointer("/data/quota").and_then(|v| v.as_i64()) else {
+            return Ok(Balance::unknown("USD"));
+        };
+        let Some(used_quota) = value.pointer("/data/used_quota").and_then(|v| v.as_i64()) else {
+            return Ok(Balance::unknown("USD"));
+        };
+        // `quota_per_unit` 缺失**不影响**可观测性：那是单位换算，不是余额本身。
+        // 换算单位缺失时用适配器自己的常量兜底——那是已知的本地值，不是编造。
         let unit = value
             .pointer("/data/quota_per_unit")
             .and_then(|v| v.as_i64())
@@ -778,11 +791,11 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
 
         Ok(Balance {
             currency: "USD".to_string(),
-            remaining: raw_quota.unwrap_or(0) as f64 / unit as f64,
+            remaining: raw_quota as f64 / unit as f64,
             used: used_quota as f64 / unit as f64,
-            raw_quota,
+            raw_quota: Some(raw_quota),
             quota_per_unit: Some(unit),
-            // NewAPI 有余额端点：读到了就是可观测（M7-S2）。
+            // NewAPI 有余额端点，且这一次真的读到了：可观测。
             known: true,
         })
     }
