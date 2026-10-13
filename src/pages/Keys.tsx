@@ -143,9 +143,17 @@ export default function Keys() {
       // 只显示掩码，明文从不出现在界面上
       setNotice(`已创建 ${key.name}（${key.masked}），密钥已存入系统钥匙串`);
       setCreating(false);
+      // 名字用完就还回去：否则下一次「新建密钥」会**沿用上一把的名字**，
+      // 站点侧就出现两把同名 key——那恰好废掉了命名规范存在的理由
+      // （「在站点侧一眼看出这把 key 给谁用」）。`nameEdited` 也要一起清，
+      // 否则用户改过一次名之后，后续每次新建都会重新填回他那个旧名字。
+      setName("");
+      setNameEdited(false);
       await qc.invalidateQueries({ queryKey: ["stored-keys"] });
       await qc.invalidateQueries({ queryKey: ["remote-keys", activeSite] });
     },
+    // 失败时**不**清名字：用户要拿着这个名字去改（例如站点说重名），
+    // 清掉等于让他重打一遍
     onError: (err: Error) => {
       setError(err.message);
     },
