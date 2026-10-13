@@ -448,3 +448,87 @@ async fn groups_errors_never_carry_site_echoed_secret() {
     assert!(!text.contains("LEAK0000"), "错误文案残留密钥片段: {text}");
     assert!(text.contains("sk-***"), "应留下脱敏痕迹: {text}");
 }
+
+// ============================================================ M7-S2 D-1：倍率统一走 parse_rate
+
+/// D-1 订正：NewAPI 的倍率**不再**直接 `as_f64()`，而是走 `parse_rate`（B-91 的语义定稿）。
+///
+/// 关键三格：`0` **保留**（免费分组）、负数 **丢弃**（`None`，不报错）、字符串数字按边界表处理。
+#[tokio::test]
+async fn newapi_available_groups_rates_follow_parse_rate_semantics() {
+    let transport = MockTransport::new(vec![newapi_ok(json!({
+        "groups": [
+            {"name": "free", "rate": 0},
+            {"name": "neg", "rate": -1},
+            {"name": "str", "rate": "2"},
+            {"name": "bad", "rate": "abc"},
+            {"name": "nul", "rate": null},
+            {"name": "ratio", "ratio": 0.5},
+            {"name": "inf", "rate": "inf"},
+        ],
+        "max_count": 9,
+    }))]);
+    let adapter = NewApi::new(transport);
+
+    let groups = adapter
+        .available_groups(NEWAPI_BASE, &cookie_session())
+        .await
+        .expect("倍率不可用不是传输错误，不得整条失败");
+
+    assert_eq!(
+        groups,
+        vec![
+            group("free", Some(0.0), None), // 0 = 免费分组，必须保留
+            group("neg", None, None),       // 负数 ⇒ None（B-91）
+            group("str", Some(2.0), None),  // 字符串数字按边界表
+            group("bad", None, None),       // 非数字 ⇒ None
+            group("nul", None, None),       // null ⇒ None
+            group("ratio", Some(0.5), None),
+            group("inf", None, None), // ±inf / NaN 形态 ⇒ None
+        ]
+    );
+}
+
+/// D-1 订正：Sub2API 的 `/groups/rates` 映射同样走 `parse_rate`。
+///
+/// 语义差异（与 NewAPI 的差别是**结构性的**）：这里的倍率是 `map<group_id, f64>` 的一项，
+/// 解析不出 ⇒ **忽略该条目** ⇒ 该分组回落成 `rate = None`（而不是报错）。
+#[tokio::test]
+async fn sub2api_available_groups_rates_follow_parse_rate_semantics() {
+    let transport = MockTransport::new(vec![
+        sub2api_ok(json!([
+            {"id": 1, "name": "free", "description": ""},
+            {"id": 2, "name": "neg", "description": ""},
+            {"id": 3, "name": "str", "description": ""},
+            {"id": 4, "name": "bad", "description": ""},
+            {"id": 5, "name": "ok", "description": ""},
+            {"id": 6, "name": "missing", "description": ""},
+        ])),
+        sub2api_ok(json!({
+            "1": 0,
+            "2": -1,
+            "3": "2",
+            "4": "abc",
+            "5": 1.5,
+            "not-an-id": 1.0,
+        })),
+    ]);
+    let adapter = Sub2Api::new(transport);
+
+    let groups = adapter
+        .available_groups(SUB2API_BASE, &bearer_session())
+        .await
+        .expect("倍率不可用不是传输错误，不得整条失败");
+
+    assert_eq!(
+        groups,
+        vec![
+            group("free", Some(0.0), None), // 0 = 免费分组，必须保留（不能丢条目）
+            group("neg", None, None),       // 负数 ⇒ 条目被忽略 ⇒ 回落 None
+            group("str", Some(2.0), None),  // 字符串数字按边界表
+            group("bad", None, None),       // 非数字 ⇒ 忽略
+            group("ok", Some(1.5), None),
+            group("missing", None, None), // rates 里没有 ⇒ None（既有口径）
+        ]
+    );
+}

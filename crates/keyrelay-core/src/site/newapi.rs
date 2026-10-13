@@ -16,8 +16,9 @@ use std::collections::{HashMap, HashSet};
 use super::password_crypto::{encrypt_password, PasswordEncryptionKey};
 use super::transport::{HttpRequest, HttpTransport, Method};
 use super::{
-    json_str, map_http_error, normalize_base_url, scrub_error, Balance, Credentials, GroupInfo,
-    KeyMaterial, KeyMeta, KeySpec, KeyStatus, Session, SiteAdapter, SiteFingerprint, SiteKind,
+    json_str, map_http_error, normalize_base_url, parse_rate, scrub_error, Balance, Credentials,
+    GroupInfo, KeyMaterial, KeyMeta, KeySpec, KeyStatus, Session, SiteAdapter, SiteFingerprint,
+    SiteKind,
 };
 use crate::error::{Error, Result, SecondFactorKind};
 
@@ -385,10 +386,12 @@ fn parse_auto_groups(data: &Value) -> Result<Vec<GroupInfo>> {
                 };
                 out.push(GroupInfo {
                     name: name.to_string(),
+                    // 倍率统一走 `parse_rate`（B-91）：负数 / NaN / ±inf / 非数字 ⇒ `None`，
+                    // `0` ⇒ `Some(0.0)`（免费分组必须保留）。字符串形态（`"2"`）也按同一张边界表。
                     rate: item
                         .get("rate")
                         .or_else(|| item.get("ratio"))
-                        .and_then(|v| v.as_f64()),
+                        .and_then(parse_rate),
                     description: json_str(item, "/description")
                         .filter(|d| !d.is_empty())
                         .map(|d| d.to_string()),
