@@ -12,6 +12,7 @@ import {
   rotateKey,
   rotationDue,
   rotationPlan,
+  suggestKeyName,
   syncSiteKeys,
   type RotationPlan,
   type RotationRun,
@@ -21,12 +22,28 @@ import {
 import ConfirmDialog from "../components/ConfirmDialog";
 import CapButton from "../components/CapButton";
 
+/**
+ * 新建密钥时默认名里的 `agent-id` 段。
+ *
+ * 密钥页**没有** agent 上下文（agent 是在「Agent 投递」页选的），所以这里用一个
+ * **中性值**，而不是猜一个具体 agent：写死 `codex` 会让每个站点、每个用户的密钥名
+ * 都冒充 codex —— B-87 的根因正是这个「看着像规范、其实是占位」的默认名。
+ * 名字只是给人看的标签，用户可以在输入框里改成真正的 agent。
+ */
+const DEFAULT_AGENT_SEGMENT = "unassigned";
+
 export default function Keys() {
   const qc = useQueryClient();
   const sites = useQuery({ queryKey: ["sites"], queryFn: listSites });
   const [siteId, setSiteId] = useState<number | null>(null);
   const [creating, setCreating] = useState(false);
-  const [name, setName] = useState("codex/daily");
+  // 默认名**不硬编码**：打开对话框时按 FR-2 的规范现算（`suggestKeyName`，日期用本地日期）。
+  // 拿不到建议名时留空，绝不回退到写死的名字——那正是 B-87 要消灭的占位符。
+  const [name, setName] = useState("");
+  /** 用户是否手输过名字。手输过就**不再**用建议名覆盖他（见 `openCreateDialog`）。 */
+  const [nameEdited, setNameEdited] = useState(false);
+  /** 建议名正在路上：这期间不让提交，否则会创建出一个空名字的密钥。 */
+  const [suggesting, setSuggesting] = useState(false);
   const [group, setGroup] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -134,6 +151,40 @@ export default function Keys() {
     },
   });
 
+  /**
+   * 打开「新建密钥」对话框，并按 FR-2 的命名规范预填一个默认名。
+   *
+   * 三条纪律（B-87 / M7-S5 D-5）：
+   * 1. **日期由界面给**：Rust 侧不读时钟也不做时区，用户看到的「今天」必须是他本地的今天
+   *    （`getMonth()` 从 0 开始，所以要 `+1`）；
+   * 2. 返回 `null`（入参不合法）⇒ **留空**，绝不回退到硬编码默认名；
+   * 3. 用户已经手输过名字 ⇒ **不覆盖**。
+   */
+  async function openCreateDialog() {
+    setError(null);
+    setNotice(null);
+    setCreating(true);
+    if (nameEdited) return;
+
+    const today = new Date();
+    setSuggesting(true);
+    try {
+      const suggested = await suggestKeyName(DEFAULT_AGENT_SEGMENT, {
+        year: today.getFullYear(),
+        month: today.getMonth() + 1,
+        day: today.getDate(),
+      });
+      // 等待期间用户可能已经自己敲了名字：再确认一次，别把他的输入盖掉
+      if (!nameEdited) setName(suggested ?? "");
+    } catch (err) {
+      // 生成建议名失败不是致命错误，但也不能静默填一个假名字——留空让他自己写
+      if (!nameEdited) setName("");
+      setError(`没能生成默认名（${(err as Error).message}），请手动填写。`);
+    } finally {
+      setSuggesting(false);
+    }
+  }
+
   return (
     <section>
       <h2>密钥</h2>
@@ -172,11 +223,7 @@ export default function Keys() {
             allowed={caps?.createKey ?? false}
             reason={capReason(caps, "该站点类型不支持在站点侧建密钥")}
             className="btn btn-primary"
-            onClick={() => {
-              setError(null);
-              setNotice(null);
-              setCreating(true);
-            }}
+            onClick={openCreateDialog}
           >
             <Plus size={14} aria-hidden /> 新建密钥
           </CapButton>
@@ -405,7 +452,8 @@ export default function Keys() {
         open={creating}
         title="新建密钥"
         confirmLabel={create.isPending ? "创建中…" : "创建"}
-        confirmDisabled={!name || create.isPending}
+        // `suggesting` 期间也禁用：否则可能在建议名到达之前就提交一个空名字
+        confirmDisabled={!name || suggesting || create.isPending}
         onCancel={() => setCreating(false)}
         onConfirm={() => create.mutate()}
       >
@@ -417,10 +465,19 @@ export default function Keys() {
           <input
             className="input"
             value={name}
-            onChange={(e) => setName(e.target.value)}
+            onChange={(e) => {
+              setName(e.target.value);
+              // 用户动过这个名字之后，就再也不用建议名覆盖他
+              setNameEdited(true);
+            }}
+            placeholder={suggesting ? "正在生成默认名…" : "keyrelay/agent/yyyymmdd"}
             spellCheck={false}
           />
         </label>
+        <p className="muted">
+          默认名按 <span className="mono">app-id/agent-id/yyyymmdd</span> 生成，
+          日期用你本机的今天。它只是标签：可以改成任何你认得出的名字。
+        </p>
         <label className="field">
           <span>分组（可选）</span>
           <select
