@@ -931,6 +931,48 @@ fn purge_keychain_requires_confirmation_and_reports_counts() {
 }
 
 #[test]
+fn the_frontend_channel_list_matches_the_backend_channels_exactly() {
+    // B-101：前端的 `CHANNELS` 与后端的 `DeliveryChannel::ALL` 是**两份清单**。
+    // `check-commands.mjs` 只守护**命令**集合，不覆盖**通道**名——于是新增一条通道时
+    // 两边可能不同步，而症状是「界面里选不到那个通道」（不报错，只是少一个选项）。
+    //
+    // 这里用**扫源码**的方式把两份清单钉在一起：后端是权威（`ALL` 是编译期数组），
+    // 前端从 `src/pages/Agents.tsx` 里抽 `id:`。任一边增删而另一边没跟，这条直接红。
+    const AGENTS_TSX: &str = include_str!("../../src/pages/Agents.tsx");
+
+    // 只取 `const CHANNELS = [ … ];` 这一段，免得把文件里别的 `id:` 也算进来。
+    let start = AGENTS_TSX
+        .find("const CHANNELS = [")
+        .expect("Agents.tsx 里应当有 CHANNELS 常量");
+    let rest = &AGENTS_TSX[start..];
+    let end = rest.find("];").expect("CHANNELS 数组应当有结束括号");
+    let block = &rest[..end];
+
+    let mut frontend: Vec<String> = Vec::new();
+    for line in block.lines() {
+        let Some(at) = line.find("id: \"") else {
+            continue;
+        };
+        let tail = &line[at + 5..];
+        let Some(close) = tail.find('"') else { continue };
+        frontend.push(tail[..close].to_string());
+    }
+    frontend.sort();
+
+    let mut backend: Vec<String> = keyrelay_core::delivery::DeliveryChannel::ALL
+        .iter()
+        .map(|channel| channel.as_str().to_string())
+        .collect();
+    backend.sort();
+
+    assert_eq!(
+        frontend, backend,
+        "前端 CHANNELS 的 id 集合与后端 DeliveryChannel::ALL 的 as_str() 集合不一致。\n\
+         后端是权威：新增/删除通道时请同步 src/pages/Agents.tsx 的 CHANNELS。"
+    );
+}
+
+#[test]
 fn gateway_stop_drains_buffered_failures_into_the_event_log() {
     // M7-S5 复审 P2-1：缓冲里的失败原本只在 `refresh_all` 落库，
     // 于是「网关刚报失败、用户随即关掉应用」会让那条失败永远进不了事件表——
