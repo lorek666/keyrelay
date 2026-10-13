@@ -1131,6 +1131,9 @@ pub struct KeySyncDto {
     site_id: i64,
     site_total: usize,
     already_local: usize,
+    /// 本次**恢复**了多少条：本地行还在、钥匙串被清过，于是把明文取回**原来那一行**。
+    /// 与 `imported` 分开报：用户的动作不一样（恢复 = 他清过钥匙串；导入 = 本机第一次见到）。
+    restored: usize,
     imported: usize,
     /// 站点没给明文的 `remote_id`。界面据此引导「新建一把」而不是以为对齐成功了。
     unreadable: Vec<String>,
@@ -1152,6 +1155,7 @@ pub async fn sync_site_keys(
             site_id: s.site_id,
             site_total: s.site_total,
             already_local: s.already_local,
+            restored: s.restored,
             imported: s.imported,
             unreadable: s.unreadable,
         })
