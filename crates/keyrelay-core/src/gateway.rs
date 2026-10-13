@@ -237,8 +237,15 @@ pub struct GatewayConfig {
 /// 一次「因可切换状态而放弃当前上游」的元数据。
 ///
 /// **恰好这三个字段**——这是结构上的白名单：装不下 prompt 正文、响应正文、
-/// 密钥或本地令牌（FR-5:161 + FR-8 红线）。`model` 是调用方自由文本，
-/// 写事件前必须过 `redact::scrub`（由 S5 的出口负责，本结构不替它决定）。
+/// 密钥或本地令牌（FR-5:161 + FR-8 红线）。
+///
+/// `model` 是调用方自由文本，**脱敏在值被创造的地方完成**：即 [`report_failure`] 里
+/// 先过一遍 [`crate::redact::scrub`]，再交给出口（M7-S1 复审 P1-1）。
+///
+/// 为什么不能把这个义务推给下游：出口是 `store.insert_event`，而它**原样入库**
+/// （`store/mod.rs:706-721` 直接 `params![event.payload]`，不做任何脱敏）。
+/// 「由出口负责」这个假设会让密钥形状的自由文本进事件表、再随导出与审计外流——
+/// 与 B-75 是同一类咽喉。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewayFailure {
     pub site_id: i64,
@@ -765,7 +772,14 @@ fn report_failure(state: &AppState, site_id: i64, status: u16, model: &str, now:
         sink(GatewayFailure {
             site_id,
             status,
-            model: model.to_string(),
+            // **在值被创造的地方脱敏**（M7-S1 复审 P1-1）：`model` 是调用方自由文本，
+            // 可以是任何字符串——包括一把 `sk-…`。出口 `store.insert_event` 原样入库，
+            // 所以脱敏不能推给下游。
+            //
+            // 边界：模型名**整体**就是一把密钥时（`sk-…`），`scrub` 会把整条打掉，
+            // 事件里只剩 `sk-…`——那是对的取舍（密钥绝不能外流；而那种情况下
+            // 「这是哪个模型」本来也没有可用信息）。正常的模型名（`gpt-5.6`）原样通过。
+            model: crate::redact::scrub(model),
         });
     }
 }
@@ -801,6 +815,13 @@ fn rewrite_model(body: &[u8], model: &str, route: &RouteTable) -> bytes::Bytes {
 ///
 /// 只认顶层：嵌套对象里的 `model`（例如某个工具的参数 schema）不是我们要改的那个。
 /// 键名不做转义解码——`"\u006dodel"` 这种写法不会被识别，但真实客户端不会那么写。
+///
+/// **重复键不保证**（M7-S1 复审 P2-2）：本函数取**第一个** `"model"`，而
+/// [`model_from_body`] 走 serde、serde 对重复键**最后一个胜出**。于是
+/// `{"model":"a","model":"b"}` 这种畸形 body 会出现「按 `b` 选路、却把第一个 `a` 改写」
+/// 的不一致。**不改行为**：重复顶层键的 body 不是任何真实客户端会发出的东西，
+/// 而为它引入一套「重复键感知」的改写逻辑，复杂度远大于收益。
+/// 已知后果仅限「别名静默失效」（不改写、不损坏、不泄漏）。
 fn top_level_model_span(body: &[u8]) -> Option<(usize, usize)> {
     let mut depth = 0i32;
     let mut i = 0usize;

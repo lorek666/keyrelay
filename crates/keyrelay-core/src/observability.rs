@@ -12,7 +12,14 @@ use crate::error::{Error, Result};
 use crate::redact::scrub;
 
 /// `source` 的约定取值（同时用于 UI 过滤）。
-pub const SOURCES: [&str; 6] = ["app", "site", "key", "delivery", "vault", "store"];
+///
+/// `"gateway"` 是 M7-S5 加的：网关的失败事件（FR-5:160）此前**无处可去**——
+/// `normalize_source` 会把认不出的来源归一到 `"app"`，于是「网关为什么切换了上游」
+/// 会混在应用事件里，按来源过滤就找不到它。加进白名单而不是改用 `"app"`，
+/// 是因为这条事件需要能**单独被筛出来**：它是「请求失败」而不是「应用做了什么」。
+pub const SOURCES: [&str; 7] = [
+    "app", "site", "key", "delivery", "vault", "store", "gateway",
+];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {

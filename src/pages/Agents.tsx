@@ -4,6 +4,7 @@ import { AlertTriangle, RotateCcw, Send, ShieldCheck, Undo2 } from "lucide-react
 import {
   applyDelivery,
   deliveryPlan,
+  detectUnmanagedTargets,
   grantConsent,
   listConsents,
   listStoredKeys,
@@ -12,17 +13,39 @@ import {
   rollbackDelivery,
   type DeliveryOutcome,
   type DeliveryPlan,
+  type RestartHint,
 } from "../lib/api";
 import ConfirmDialog from "../components/ConfirmDialog";
 
-/** 五条投递通道（M6-S1 把 OpenCode 与 Gemini CLI 补齐，现在全部有实现）。 */
+/**
+ * 七条投递通道（M7-S3 补上 OpenCode `.jsonc` 与 Continue）。
+ *
+ * 这里的 `label` 是**给人看的落点提示**；能力判断不在这里——投递能不能做、
+ * 改完要不要重启，一律由后端给（`plan.restartHint`），本文件不得按通道硬编码判断。
+ */
 const CHANNELS = [
   { id: "codex-auth-json", label: "Codex CLI（~/.codex/auth.json）", agent: "codex" },
   { id: "claude-code-settings", label: "Claude Code（~/.claude/settings.json）", agent: "claude-code" },
   { id: "shell-block", label: "Shell 标记块", agent: "shell" },
   { id: "opencode", label: "OpenCode（~/.config/opencode/opencode.json）", agent: "opencode" },
+  { id: "opencode-jsonc", label: "OpenCode JSONC（~/.config/opencode/opencode.jsonc）", agent: "opencode-jsonc" },
   { id: "gemini-cli", label: "Gemini CLI（~/.gemini/.env）", agent: "gemini-cli" },
+  { id: "continue", label: "Continue（~/.continue/config.yaml）", agent: "continue" },
 ];
+
+/**
+ * 生效策略文案（PRD FR-4:137 / M7-S3 的 `restart_hint`）。
+ *
+ * **从取值派生，不按通道硬编码**：新增一条通道时，后端那张表会给出新取值，
+ * 界面这里照显；反过来，如果按通道写判断，新增通道必然漏一处，
+ * 而漏掉的那处会给用户一个错的生效预期（以为改完就生效，其实要重启）。
+ */
+const RESTART_HINTS: Record<RestartHint, string> = {
+  notNeeded: "改完即生效：该 agent 每次运行都会重新读这个文件。",
+  needed: "需要重启该 agent 才能读到新配置——它只在启动时读一次。",
+  dependsOnNewSession:
+    "只对新开的会话生效：已经在跑的窗口读到的还是旧配置（例如 shell rc 文件）。",
+};
 
 export default function Agents() {
   const qc = useQueryClient();
@@ -46,6 +69,13 @@ export default function Agents() {
   const [lastOutcome, setLastOutcome] = useState<DeliveryOutcome | null>(null);
 
   const consents = useQuery({ queryKey: ["consents"], queryFn: listConsents });
+
+  // 未托管落点（Cline / Roo Code）：只读探测，永远不写盘
+  const unmanaged = useQuery({
+    queryKey: ["unmanaged-targets"],
+    queryFn: detectUnmanagedTargets,
+    retry: false,
+  });
 
   const plan = useQuery({
     queryKey: ["plan", activeKey, channel],
@@ -71,8 +101,10 @@ export default function Agents() {
     onSuccess: async (outcome) => {
       setError(null);
       setLastOutcome(outcome);
+      // 生效策略必须跟着结果一起说：用户最容易在这里以为「已经生效了」
+      const hint = plan.data ? RESTART_HINTS[plan.data.restartHint] : "";
       setNotice(
-        `已投递到 ${outcome.targetPath}（变更 ${outcome.journalId}）`,
+        `已投递到 ${outcome.targetPath}（变更 ${outcome.journalId}）。${hint}`,
       );
       setConfirming(false);
       await qc.invalidateQueries({ queryKey: ["plan", activeKey, channel] });
@@ -228,6 +260,48 @@ export default function Agents() {
         </div>
       ) : null}
 
+      {/*
+        未托管落点（M7-S3 / 章程 R-7）：只读探测。
+        存在的理由是**不静默**——用户在 Cline / Roo Code 里配了中转站，本产品既不能
+        帮他注入，也不该假装没这回事。`note` 是后端给的原文（为什么不写），
+        界面**不得**改写它（改写等于替后端撒谎）。
+      */}
+      <div className="card">
+        <h3>不托管的落点（只读探测）</h3>
+        <p className="muted">
+          这些 agent 的配置落点本版本<strong>不写</strong>：往一个 agent 不会读的文件里
+          写密钥，比不写更糟——你会以为投递成功了。下面是本机实际探测结果
+          （只读：不创建目录、不写盘）。
+        </p>
+        {unmanaged.isLoading ? <p className="muted">探测中…</p> : null}
+        {unmanaged.isError ? (
+          <p className="muted">
+            探测失败：{(unmanaged.error as Error).message}
+          </p>
+        ) : null}
+        {unmanaged.data?.length ? (
+          <ul className="list">
+            {unmanaged.data.map((target) => (
+              <li key={`${target.label}-${target.path}`}>
+                <span
+                  className={`badge badge-${target.exists ? "warn" : "muted"}`}
+                >
+                  {target.exists ? "检测到" : "未检测到"}
+                </span>{" "}
+                <strong>{target.label}</strong>{" "}
+                <span className="mono ellipsis" title={target.path}>
+                  {target.path}
+                </span>
+                <div className="muted">{target.note}</div>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+        {unmanaged.data?.length === 0 ? (
+          <p className="muted">本版本没有已知的不托管落点。</p>
+        ) : null}
+      </div>
+
       <div className="card">
         <h3>已记录的同意（{consents.data?.length ?? 0}）</h3>
         {consents.data?.length ? (
@@ -375,6 +449,13 @@ function PlanView({
               {f.key} = {f.masked}
             </span>
           ))}
+        </dd>
+        {/* 生效策略：文案从 `restartHint` 取值派生，**不按通道硬编码**。
+            认不出的取值原样显示（不静默留空——那会让用户以为「不需要重启」）。 */}
+        <dt>生效方式</dt>
+        <dd>
+          {RESTART_HINTS[plan.restartHint] ??
+            `未知的生效策略：${plan.restartHint}`}
         </dd>
       </dl>
 

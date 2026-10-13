@@ -9,6 +9,40 @@
  * - 本文件不缓存、不持久化任何密钥；后端返回的 `secret` 只做一次性透传。
  */
 
+/**
+ * 站点类型的**设计能力**（M7-S2 的 `site/capability.rs`，IPC 上是 `SiteSummary.capabilities`）。
+ *
+ * 界面用它灰显按钮，**不得**按 `kind` 硬编码判断：新增站点类型时，硬编码的页面会给出一个
+ * 「点了才报错」的按钮，而报的错还是别的原因（例如「未登录」）。认不出的站点类型
+ * ⇒ 后端给**全部 `false`**（fail-closed）。
+ *
+ * 灰显 = `disabled` + `title` 写明原因，**不是**隐藏——用户要能看见「这个功能存在，
+ * 但这个站点类型不支持」，否则会以为是产品缺陷（M7-S2 spec §3.3）。
+ */
+export type SiteCapabilities = {
+  /** 有会话/登录端点（需要账号密码换会话） */
+  login: boolean;
+  /** 能列出站点侧已有的令牌 */
+  listKeys: boolean;
+  /** 能在站点侧新建令牌 */
+  createKey: boolean;
+  /** 能读回令牌明文 */
+  revealKey: boolean;
+  /** 能回收（删除）站点侧令牌 */
+  revokeKey: boolean;
+  /** 能查询余额 */
+  balance: boolean;
+  /** 能拉取可用分组（含倍率） */
+  groups: boolean;
+  /**
+   * 能取到**每把** key 的用量。
+   *
+   * 定义是「本产品**今天**能不能取到」而不是「站点端有没有该字段」：当前三行全 `false`
+   * （`keys.quota_used` 没有写入器），所以界面**不显示**用量列（M7-S0 §3.2 裁决 / B-96）。
+   */
+  keyUsage: boolean;
+};
+
 export type SiteRow = {
   id: number;
   kind: string;
@@ -19,6 +53,8 @@ export type SiteRow = {
    * `"unknown"`（从没登录过）| `"ok"`（登录过且会话有效）| `"needs_login"`（会话已失效，需要重新登录）
    */
   health: string;
+  /** 该站点类型支持什么（唯一出处，页面不得自己判断 `kind`） */
+  capabilities: SiteCapabilities;
 };
 
 export type AppInfo = {
@@ -62,13 +98,34 @@ export type StoredKeyRow = {
   remoteId?: string | null;
   name: string;
   group?: string | null;
+  /**
+   * 生命周期状态。**两个来源、两套词表**，界面上必须能区分：
+   *
+   * - 站点侧（`site::KeyStatus`）：`"enabled"` / `"disabled"`（站点把它禁了）/ `"exhausted"` / `"unknown"`；
+   * - 本地侧（`store::KEY_STATUS_REVOKED`）：`"revoked"` —— **我**在站点上回收了它（B-82）。
+   *
+   * `"revoked"` 是本地生命周期标记：本地行**保留**（`bindings` 与漂移追溯靠 `keys.id` 存活），
+   * 站点侧那把 key 已经没了。用 `disabled` 冒充会让界面分不清「站点禁的」与「我回收的」。
+   */
   status: string;
 };
 
+/**
+ * 站点余额。
+ *
+ * **`known === false` ⇒ `remaining` / `used` 是 `null`** —— 这是**结构性**保证：
+ * 后端在未知态下不给出任何可渲染的数字，界面也就不可能把「不知道」渲染成 `0.00`。
+ * 这两件事必须能分开：余额为零是一个事实，余额不可观测是另一个事实
+ * （`custom-openai-compatible` 站点拿不到余额）。阈值告警同理，见 M7-S2 §6.5 硬要求 (b)。
+ */
 export type Balance = {
   currency: string;
-  remaining: number;
-  used: number;
+  /** 该站点的余额是否可观测。`false` ⇒ 下面两个数值字段为 `null`。 */
+  known: boolean;
+  /** 未知时为 `null`。**未知绝不当成 0。** */
+  remaining: number | null;
+  /** 未知时为 `null`。 */
+  used: number | null;
   rawQuota?: number | null;
   quotaPerUnit?: number | null;
 };
@@ -80,6 +137,14 @@ export type DeliveryField = {
 };
 
 export type ConsentState = "missing" | "granted" | "revoked";
+
+/**
+ * 投递后该 agent 是否需要重启才读到新配置（PRD FR-4:137 / M7-S3）。
+ *
+ * 取值**只能**来自后端 `delivery::restart_hint(channel)`——界面**不得**按通道硬编码判断，
+ * 否则新增一条通道时又会漏一处，而漏掉的那处会给出一个错的生效预期。
+ */
+export type RestartHint = "notNeeded" | "needed" | "dependsOnNewSession";
 
 export type DeliveryPlan = {
   agentId: string;
@@ -100,6 +165,8 @@ export type DeliveryPlan = {
    * 于是本次投递**静默不生效**（BACKLOG B-76）。
    */
   warnings: string[];
+  /** 生效策略。文案由这个取值派生，**不得**在页面里按通道判断。 */
+  restartHint: RestartHint;
 };
 
 export type ConsentRow = {
@@ -284,6 +351,23 @@ async function invokeCommand<T>(
 
 // ============================================================ mock（浏览器预览）
 
+/** mock 用的能力集：与 `site/capability.rs` 的两行**逐格一致**（NewAPI/Sub2Api 同表）。 */
+const MOCK_CAPS_NEWAPI: SiteCapabilities = {
+  login: true,
+  listKeys: true,
+  createKey: true,
+  revealKey: true,
+  revokeKey: true,
+  balance: true,
+  groups: true,
+  keyUsage: false,
+};
+
+/**
+ * mock 里放**两个**站点是有意的：第二个 `custom-openai-compatible` 站点全能力为 `false`，
+ * 于是浏览器预览（`pnpm dev`）里能直接看到「灰显 + 不可观测」长什么样——
+ * 本机没有 GUI 会话，预览是唯一能肉眼核 W2/W5 的路径。
+ */
 const MOCK_SITES: SiteRow[] = [
   {
     id: 1,
@@ -291,6 +375,24 @@ const MOCK_SITES: SiteRow[] = [
     baseUrl: "https://relay.example.com",
     displayName: "示例中转站（mock）",
     health: "unknown",
+    capabilities: MOCK_CAPS_NEWAPI,
+  },
+  {
+    id: 2,
+    kind: "custom-openai-compatible",
+    baseUrl: "https://compatible.example.com",
+    displayName: "只读兼容端点（mock·无令牌管理）",
+    health: "unknown",
+    capabilities: {
+      login: false,
+      listKeys: false,
+      createKey: false,
+      revealKey: false,
+      revokeKey: false,
+      balance: false,
+      groups: false,
+      keyUsage: false,
+    },
   },
 ];
 
@@ -328,6 +430,8 @@ const MOCK_PLAN: DeliveryPlan = {
   consentGrantedAt: null,
   consentRevokedAt: null,
   warnings: [],
+  // codex 只在进程启动时读 auth.json（M7-S3 的 `restart_hint` 表）
+  restartHint: "needed",
 };
 
 const MOCK_EVENTS: EventRow[] = [
@@ -419,8 +523,22 @@ export async function listStoredKeys(): Promise<StoredKeyRow[]> {
 
 export async function siteBalance(siteId: number): Promise<Balance> {
   if (!hasTauri) {
+    // 站点 2 是 `custom-openai-compatible`：余额**不可观测**。mock 必须照着真实契约返回
+    // `known: false` + `null`，否则预览里看不到「不可观测」那条路径。
+    const site = MOCK_SITES.find((s) => s.id === siteId);
+    if (site && !site.capabilities.balance) {
+      return mock({
+        currency: "USD",
+        known: false,
+        remaining: null,
+        used: null,
+        rawQuota: null,
+        quotaPerUnit: null,
+      });
+    }
     return mock({
       currency: "USD",
+      known: true,
       remaining: 12.5,
       used: 3.25,
       rawQuota: 6_250_000,
@@ -763,6 +881,61 @@ export type KeychainPurgeReport = {
 export async function purgeKeychain(confirm: boolean): Promise<KeychainPurgeReport> {
   if (!hasTauri) return mock({ attempted: 3, removed: 3, failed: 0, firstError: null });
   return invokeCommand<KeychainPurgeReport>("purge_keychain", { confirm });
+}
+
+/**
+ * 探测「已知但本版本**不托管**」的 agent 落点（Cline / Roo Code）。
+ *
+ * 只读：核心层永不创建目录、永不写盘。它存在的理由是**不静默**——用户在 Cline / Roo Code
+ * 里配了中转站，本产品既不能帮他注入，也不该假装没这回事。
+ *
+ * `note` 是给用户看的原文（为什么不写），界面**不得**改写它。
+ */
+export type UnmanagedTarget = {
+  label: string;
+  path: string;
+  exists: boolean;
+  note: string;
+};
+
+export async function detectUnmanagedTargets(): Promise<UnmanagedTarget[]> {
+  if (!hasTauri) {
+    return mock([
+      {
+        label: "Cline",
+        path: "/Users/u/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev",
+        exists: false,
+        note: "本版本不向 Cline 写入：它的配置落点尚未核实，写错文件会让你以为投递成功。",
+      },
+    ]);
+  }
+  return invokeCommand<UnmanagedTarget[]>("detect_unmanaged_targets");
+}
+
+/**
+ * 按 FR-2:113 的命名规范给一个默认名：`<app-id>/<agent-id>/<yyyymmdd>`。
+ *
+ * **日期由界面给**（M7-S5 决策 D-5）：Rust 侧不读时钟、不做时区——用户看到的「今天」
+ * 应当是他所在时区的今天。调用方用本地日期算 `(year, month, day)` 传进去
+ * （注意 `getMonth()` 从 0 开始，要 `+1`）。
+ *
+ * 返回 `null` 表示入参不合法。**此时不要回退到硬编码的名字**——那正是这条规范要消灭的
+ * 东西（这里原本写死的 `"codex/daily"` 看着像规范、其实是个占位）。
+ */
+export async function suggestKeyName(
+  agentId: string,
+  date: { year: number; month: number; day: number },
+): Promise<string | null> {
+  if (!hasTauri) {
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `keyrelay/${agentId}/${date.year}${pad(date.month)}${pad(date.day)}`;
+  }
+  return invokeCommand<string | null>("suggest_key_name", {
+    agentId,
+    year: date.year,
+    month: date.month,
+    day: date.day,
+  });
 }
 
 /**

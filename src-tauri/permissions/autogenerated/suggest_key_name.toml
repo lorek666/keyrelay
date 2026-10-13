@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-suggest-key-name"
+description = "Enables the suggest_key_name command without any pre-configured scope."
+commands.allow = ["suggest_key_name"]
+
+[[permission]]
+identifier = "deny-suggest-key-name"
+description = "Denies the suggest_key_name command without any pre-configured scope."
+commands.deny = ["suggest_key_name"]

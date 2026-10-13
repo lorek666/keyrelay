@@ -459,6 +459,37 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     /// 存活，而 `evaluate` 的「边沿型」规则（用量跳变 / 登录态失效 / 额度耗尽 / 漂移）
     /// 必须拿上一轮做基线，否则每一轮都会被当成「新事件」重复通知。
     notify: Option<NotifyState>,
+    /// 网关侧「因可切换状态而放弃当前上游」的失败（M7-S5 / FR-5:160）。
+    ///
+    /// **为什么是一个内存缓冲而不是让网关直接写库**：`gateway.rs` 不该为了记一条事件
+    /// 拿到整个存储层（M7-S1 的注入出口设计），而 `Store` 也不是 `Clone`——它是
+    /// `Mutex<Connection>`，再开一条连接又会在没有 `busy_timeout` 的前提下引入
+    /// `SQLITE_BUSY` 风险。所以走「回调入内存 → 服务层落库」这一条路：
+    /// 网关只 push 一个**恰好三个字段**的结构体，写事件的那一步留在这里（有 store 的地方）。
+    ///
+    /// 代价：事件落库发生在**下一次 `refresh_all`**。网关失败是低频事件，
+    /// 而 `refresh_all` 是前台 60s / 后台 30min 的固定节拍，可接受。
+    /// 缓冲有上限（见 [`MAX_BUFFERED_GATEWAY_FAILURES`]），满了丢**最旧**的一条——
+    /// 宁可丢历史，也不让一个坏掉的上游把内存吃光。
+    gateway_failures:
+        Arc<std::sync::Mutex<std::collections::VecDeque<crate::gateway::GatewayFailure>>>,
+}
+
+/// 网关失败的内存缓冲上限。见 [`KeyRelayService::gateway_failures`] 的说明。
+pub const MAX_BUFFERED_GATEWAY_FAILURES: usize = 256;
+
+/// 往缓冲里放一条，满了丢**最旧**的一条。
+///
+/// 抽成函数是为了让**生产路径（网关回调）与测试路径（`record_gateway_failure_for_test`）
+/// 走同一段逻辑**——否则「上限」这条纪律只在一边生效，而测试会证明一个产品里不存在的性质。
+fn push_bounded(
+    buffer: &mut std::collections::VecDeque<crate::gateway::GatewayFailure>,
+    failure: crate::gateway::GatewayFailure,
+) {
+    if buffer.len() >= MAX_BUFFERED_GATEWAY_FAILURES {
+        buffer.pop_front();
+    }
+    buffer.push_back(failure);
 }
 
 /// 通知的运行时状态。`config` 是冻结的装配参数，`last` 是上一轮快照。
@@ -478,11 +509,19 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             backup_dir: config.backup_dir,
             // 默认**不通知**：通知会弹窗并发网络请求，测试与纯核心用例不该意外触发。
             notify: None,
+            gateway_failures: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         }
     }
 
-    /// 打开通知（M6-S5 / FR-3）。不调用 = 完全不通知。
+    /// 用户目录（注入落点、探测候选路径都相对于它）。
     ///
+    /// 只读访问器：M7-S3 的 `detect_unmanaged_targets(home)` 需要它，
+    /// 而命令层不该为了拿一个路径去翻私有字段。
+    pub fn home(&self) -> &std::path::Path {
+        &self.home
+    }
+
+    /// 打开通知（M6-S5 / FR-3）。不调用 = 完全不通知。    ///
     /// 做成构造器方法而不是 [`ServiceConfig`] 的字段，是为了让既有调用方零改动
     /// （理由见 `ServiceConfig` 的文档）。
     pub fn with_notify(mut self, config: crate::notify::NotifyConfig) -> Self {
@@ -546,9 +585,19 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// `needs_login`——那条「请重新登录」的提示再也消不掉。
     pub async fn login(&self, site_id: i64, cred: Credentials) -> Result<()> {
         let site = self.site(site_id)?;
+        let kind = self.kind_of(&site)?;
+        // `custom-openai-compatible` 没有登录流程（只填 base_url 就能用），
+        // 所以「登录」这个动作在它身上是**设计上不支持**，不是「还没登录」。
+        // 不加这条门的话，UI 上一个没被灰显的登录按钮会让用户走进一个不存在的流程，
+        // 而且会把一个**空会话**写进会话缓存（M7-S2 复审 S-2 指出的可达路径）。
+        capability_gate(
+            kind,
+            crate::site::capability::capabilities(kind).login,
+            "登录",
+        )?;
         // 用户名不是秘密，但仍然过一遍脱敏入口（B-36：站点原文/用户名都可能被规则命中）
         let username = cred.username.clone();
-        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        let adapter = self.registry.adapter(kind);
         let session = match adapter.login(&site.base_url, cred).await {
             Ok(session) => session,
             Err(err) => {
@@ -631,10 +680,25 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         }
     }
 
+    /// 站点余额。**可观测性不足时返回未知态，不返回错误**。
+    ///
+    /// # 为什么这里不是「能力门」
+    ///
+    /// 另外五个入口在能力为 false 时返回 [`Error::Unsupported`]（那是「这个操作不做」）。
+    /// 余额不一样：它**有**答案——答案是「不可观测」（[`Balance::unknown`]）。
+    /// 所以这里在 `session()` **之前**短路成 `Ok(unknown)`。
+    ///
+    /// 短路的位置是硬要求（M7-S2 复审 S-1 实测）：`custom-openai-compatible` 站点
+    /// **没有登录流程**（`login: false`），会话永远拿不到——若先要会话，
+    /// 用户会看到「请先登录」，被引向一个根本不存在的登录流程。
     pub async fn balance(&self, site_id: i64) -> Result<Balance> {
         let site = self.site(site_id)?;
+        let kind = self.kind_of(&site)?;
+        if !crate::site::capability::capabilities(kind).balance {
+            return Ok(Balance::unknown("USD"));
+        }
         let session = self.session(site_id)?;
-        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        let adapter = self.registry.adapter(kind);
         match adapter.balance(&site.base_url, &session).await {
             Ok(balance) => Ok(balance),
             Err(err) => Err(self.on_auth_error(site_id, err)),
@@ -970,6 +1034,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 但每轮都会出现在 [`RefreshSummary::needs_login`] 里——否则用户在界面上永远
     /// 看不到「这个站需要重新登录」（B-61）。
     pub async fn refresh_all(&self) -> Result<RefreshSummary> {
+        // 先把网关攒下的失败落库（FR-5:160）。放在最前面：它们是**已经发生过**的事实，
+        // 而下面的刷新要跑网络；先落库能让「网关为什么切换了上游」在事件面板里
+        // 早于本轮的余额/漂移事件出现，读起来是因果顺序。
+        self.drain_gateway_failures();
         let settings = self.settings()?;
         let sites = self.store.list_sites()?;
         let mut summary = RefreshSummary {
@@ -1073,6 +1141,17 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 balance: balance
                     .as_ref()
                     .ok()
+                    // 硬要求 (b)（M7-S2 复审 S-2）：**未知余额不进快照**。
+                    //
+                    // `BalanceSnapshot` 只有 `remaining: f64`，装不下「不知道」；
+                    // 若把未知态照传，`balance_low` 会把 0.0 拿去和阈值比，
+                    // 阈值 > 0 时就会产出一条**假的**「余额不足」——用户会去查一个
+                    // 根本没问题的站点。假告警比不告警更糟：它会消耗掉用户对告警的信任。
+                    //
+                    // 传 `None` 与「这个站点没有余额信息」同义，而 `balance_low`
+                    // 对 `None` 是直接不评估（`rules.rs:151` 的 `?`，
+                    // 有测试 `balance_low_without_balance_never_fires` 钉着）。
+                    .filter(|b| b.known)
                     .map(|b| crate::notify::BalanceSnapshot {
                         remaining: b.remaining,
                         used: b.used,
@@ -1759,9 +1838,30 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         {
             Ok(()) => {
                 let key_id = self.local_key_id_for_remote(site_id, remote_id)?;
+                // 本地记账失败**不让命令失败**（M7-S4 复审 P2-1 的建议，Lead 采纳）。
+                //
+                // 理由：站点侧那一把**已经删了**，这个动作不可逆。若因为本地写状态失败就返回
+                // `Err`，用户会看到「回收失败」并去重试——而重试**必然失败**（站点上已经没有它了），
+                // 更糟的是他会以为密钥还活着。把一次不可逆的成功报成失败，是比记账缺失更坏的结果。
+                //
+                // 代价是记账确实没写上，所以这里**必须留痕**：Warn 级事件带上原因（脱敏后），
+                // 用户能在事件面板看到；下一次 `sync_site_keys` 对账也会把它标出来。
                 if let Some(key_id) = key_id {
-                    self.store
-                        .set_key_status(key_id, crate::store::KEY_STATUS_REVOKED)?;
+                    if let Err(err) = self
+                        .store
+                        .set_key_status(key_id, crate::store::KEY_STATUS_REVOKED)
+                    {
+                        self.log(observability::event_with_payload(
+                            Level::Warn,
+                            "key",
+                            "站点侧已回收，但本地状态没写上",
+                            serde_json::json!({
+                                "site_id": site_id,
+                                "key_id": key_id,
+                                "reason": crate::redact::scrub(&err.to_string()),
+                            }),
+                        ));
+                    }
                 }
                 // payload 只记 id 与状态：这里经手的是「哪一把」，不是「那一把的值」。
                 self.log(observability::event_with_payload(
@@ -1889,13 +1989,61 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             ))
         })?;
 
-        Ok(crate::gateway::GatewayConfig::single_upstream(
+        let mut config = crate::gateway::GatewayConfig::single_upstream(
             port,
             crate::gateway::generate_token(),
             site.base_url,
             api_key,
             site.display_name,
-        ))
+        );
+        // 失败事件出口（FR-5:160）。回调只做一次 `push`：它跑在网关的请求任务里，
+        // 不该在那里做 IO，也不该 panic（`Mutex` 中毒时静默丢弃——观测性坏掉
+        // 不该让业务请求失败，这是本文件既有的一条口径，见 `log()`）。
+        let sink = Arc::clone(&self.gateway_failures);
+        config.on_failure = Some(Arc::new(move |failure: crate::gateway::GatewayFailure| {
+            if let Ok(mut buffer) = sink.lock() {
+                push_bounded(&mut buffer, failure);
+            }
+        }));
+        Ok(config)
+    }
+
+    /// 把网关侧攒下的失败写进事件表（在 [`Self::refresh_all`] 里调用）。    ///
+    /// 只记元数据：`site_id` / `status` / `model`。`model` 是调用方自由文本，
+    /// **在网关侧就已经过 `redact::scrub`**（M7-S1 复审 P1-1）——这里不重复脱敏：
+    /// 两条出口各抄一段掩码逻辑，迟早会分叉（M5-S1 已经踩过一次）。
+    ///
+    /// 返回写出的条数（测试用）。
+    pub fn drain_gateway_failures(&self) -> usize {
+        let drained: Vec<crate::gateway::GatewayFailure> = match self.gateway_failures.lock() {
+            Ok(mut buffer) => buffer.drain(..).collect(),
+            Err(_) => return 0,
+        };
+        for failure in &drained {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "gateway",
+                format!("网关放弃上游（HTTP {}）", failure.status),
+                serde_json::json!({
+                    "site_id": failure.site_id,
+                    "status": failure.status,
+                    "model": failure.model,
+                }),
+            ));
+        }
+        drained.len()
+    }
+
+    /// 仅测试用：把一条网关失败放进缓冲，等价于网关回调触发了一次。
+    ///
+    /// 与 `log_event_for_test` 同一手法（`#[doc(hidden)]`）：真实的失败要起一个网关 +
+    /// 一个会 503 的假上游才造得出来，而那属于 `tests/gateway_failover.rs` 的覆盖范围；
+    /// 这里要验的是**下游那一段**——缓冲里的东西有没有、以什么形状落到事件表里。
+    #[doc(hidden)]
+    pub fn record_gateway_failure_for_test(&self, failure: crate::gateway::GatewayFailure) {
+        if let Ok(mut buffer) = self.gateway_failures.lock() {
+            push_bounded(&mut buffer, failure);
+        }
     }
 
     /// 只保留最近 `keep` 次投递的备份目录，删除更早的。返回删除的目录数。

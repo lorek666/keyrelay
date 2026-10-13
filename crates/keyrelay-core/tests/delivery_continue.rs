@@ -126,6 +126,50 @@ fn model_line_appears_only_when_provided() {
 
 // ============================================================ 插入 / 替换
 
+/// `models:` 之后的所有 `- ` 列表项必须**同一缩进**——这是 YAML 块序列的硬要求，
+/// 也是「产物仍然可解析」的无依赖判据（PyYAML 实测见 `docs/reviews/M7-S3-复审-探针留档.md`）。
+fn assert_uniform_sequence_indent(text: &str) {
+    let indents: Vec<&str> = text
+        .lines()
+        .filter(|line| line.trim_start().starts_with("- "))
+        .map(|line| &line[..line.len() - line.trim_start().len()])
+        .collect();
+    assert!(indents.len() >= 2, "夹具应有多个列表项: {indents:?}");
+    assert!(
+        indents.iter().all(|i| *i == indents[0]),
+        "同一个序列里出现了两种缩进（非法 YAML）: {indents:?}"
+    );
+}
+
+#[test]
+fn zero_indent_list_keeps_zero_indent_and_a_uniform_sequence() {
+    // **M7-S3 复审 P1-1 的回归**：YAML 允许块序列项与父键**同缩进**（`models:` 下一行直接是 `- x`）。
+    // 旧实现要求「缩进 > 0」才沿用，于是给这种文件塞了 2 空格的条目 ⇒ 序列内两种缩进 ⇒
+    // 原文 `safe_load` 通过、投递之后 `ParserError: expected <block end>, but found '-'`。
+    let dir = tmp();
+    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+    let before = "name: cfg\nmodels:\n- name: \"mine\"\n- name: \"second\"\n";
+    fs::write(&path, before).unwrap();
+
+    let patch = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
+
+    // 块内行首缩进为**空**（与既有条目同缩进）；字段相对条目再缩进两格
+    let expected = format!(
+        "name: cfg\nmodels:\n{BLOCK_BEGIN}\n# 由 KeyRelay 管理；手工修改会在下次投递时被覆盖\n\
+         - name: \"keyrelay\"\n  provider: \"openai\"\n  apiBase: \"{BASE}\"\n  apiKey: \"{SECRET}\"\n{BLOCK_END}\n\
+         - name: \"mine\"\n- name: \"second\"\n"
+    );
+    assert_eq!(patch.after, expected, "0 缩进的产物必须逐字如此");
+
+    assert_uniform_sequence_indent(&patch.after);
+    assert_insertion_preserved("0 缩进插入", before, &patch.after);
+
+    // 幂等：二次投递不得产生额外改动
+    fs::write(&path, &patch.after).unwrap();
+    let second = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
+    assert_eq!(second.after, patch.after);
+}
+
 #[test]
 fn inserts_after_the_existing_models_key() {
     let dir = tmp();

@@ -8,11 +8,14 @@ import {
   exportBundle,
   getSettings,
   pruneBackups,
+  purgeKeychain,
   setAutostart,
   updateSettings,
+  type KeychainPurgeReport,
   type Settings,
 } from "../lib/api";
 import GatewayCard from "../components/GatewayCard";
+import ConfirmDialog from "../components/ConfirmDialog";
 
 /** 「系统里的实际状态」的显示文案。`unknown` 是「读不出来」，不是「没开」——两者不能混。 */
 const AUTOSTART_LABELS: Record<string, string> = {
@@ -94,6 +97,126 @@ function ExportCard() {
       </div>
       {result ? <p className="ok" role="status">{result}</p> : null}
       {error ? <p className="error" role="alert">{error}</p> : null}
+    </div>
+  );
+}
+
+/**
+ * 钥匙串条目一键清理（FR-8:191）。
+ *
+ * 清理的是**系统钥匙串里的秘密**：删了就没了（站点侧那把 key 还在，但本地再也取不回明文）。
+ * 本地 SQLite 记录**保留**——清理的是秘密，不是历史（`bindings` / 漂移追溯靠它存活）。
+ *
+ * `confirm=true` 只能来自下面的**明确勾选**：默认 false，不勾就点不动。
+ * 后端同样会拒绝 `confirm=false`，两处都不提供「无参数即全删」的形态。
+ */
+function KeychainCard() {
+  const [confirming, setConfirming] = useState(false);
+  const [agreed, setAgreed] = useState(false);
+  const [report, setReport] = useState<KeychainPurgeReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const purge = useMutation({
+    mutationFn: () => purgeKeychain(true),
+    onSuccess: (r) => {
+      setError(null);
+      setReport(r);
+      setAgreed(false);
+      setConfirming(false);
+    },
+    onError: (err: Error) => {
+      setReport(null);
+      setError(err.message);
+      setAgreed(false);
+      setConfirming(false);
+    },
+  });
+
+  return (
+    <div className="card">
+      <h3>钥匙串条目清理</h3>
+      <p className="muted">
+        删除本产品写进<strong>系统钥匙串</strong>的全部条目（按本地数据库里的引用逐条删，
+        不去枚举钥匙串——macOS 上枚举会弹授权）。秘密删掉之后<strong>取不回来</strong>：
+        站点侧那把 key 还在，但本地再也没有它的明文。
+      </p>
+      <p className="muted">
+        <strong>本地记录不会被删</strong>：站点、密钥元数据、同意记录与变更历史都保留，
+        只是它们指向的钥匙串条目不存在了（重新取一次密钥即可恢复）。
+      </p>
+      <button
+        type="button"
+        className="btn btn-danger"
+        disabled={purge.isPending}
+        onClick={() => {
+          setError(null);
+          setAgreed(false);
+          setConfirming(true);
+        }}
+      >
+        {purge.isPending ? "清理中…" : "清理钥匙串条目"}
+      </button>
+
+      {report ? (
+        <>
+          <p
+            className={report.failed > 0 ? "error" : "ok"}
+            role="status"
+          >
+            清理完成：尝试 {report.attempted} 条 / 删除 {report.removed} 条 /
+            失败 {report.failed} 条。
+          </p>
+          {report.firstError ? (
+            <p className="muted">第一条失败：{report.firstError}</p>
+          ) : null}
+          {report.failed > 0 ? (
+            <p className="muted">
+              失败的条目仍然留在钥匙串里（单条失败不会中断其余清理）。可以再点一次重试；
+              反复失败通常意味着系统钥匙串的访问权限被拒绝了。
+            </p>
+          ) : null}
+        </>
+      ) : null}
+      {error ? (
+        <p className="error" role="alert">
+          <AlertTriangle size={14} aria-hidden /> {error}
+        </p>
+      ) : null}
+
+      <p className="muted">
+        卸载说明：macOS <strong>没有</strong>卸载钩子，所以顺序是「先在这里跑一次清理，
+        再删掉 App」——本产品<strong>不会</strong>（也无法）在你删除 App 时自动清理。
+      </p>
+
+      <ConfirmDialog
+        open={confirming}
+        title="清理钥匙串条目"
+        danger
+        confirmLabel={purge.isPending ? "清理中…" : "确认清理"}
+        confirmDisabled={!agreed || purge.isPending}
+        onCancel={() => {
+          setAgreed(false);
+          setConfirming(false);
+        }}
+        onConfirm={() => purge.mutate()}
+      >
+        <p>
+          会逐条删除本产品在系统钥匙串里的条目。<strong>不可逆</strong>：删掉之后本地再也取不回
+          那些密钥的明文，已投递到 agent 配置里的旧值不受影响（它们还在文件里，
+          需要你自己重新投递覆盖）。
+        </p>
+        <p className="muted">本地数据库记录不会被删除。</p>
+        <label className="checkline">
+          <input
+            type="checkbox"
+            checked={agreed}
+            onChange={(e) => setAgreed(e.target.checked)}
+          />
+          <span>
+            我确认要删除钥匙串里的密钥条目，并明白它们<strong>不可恢复</strong>
+          </span>
+        </label>
+      </ConfirmDialog>
     </div>
   );
 }
@@ -538,6 +661,8 @@ export default function SettingsPage() {
           />
 
           <ExportCard />
+
+          <KeychainCard />
 
           <AuditCard />
         </>

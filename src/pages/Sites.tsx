@@ -7,9 +7,11 @@ import {
   listSites,
   loginSite,
   siteBalance,
+  type Balance,
   type SiteRow,
 } from "../lib/api";
 import ConfirmDialog from "../components/ConfirmDialog";
+import CapButton from "../components/CapButton";
 
 export default function Sites() {
   const qc = useQueryClient();
@@ -242,11 +244,24 @@ function healthClass(health: string): string {
 }
 
 function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) {
+  // 能力集为 false 的站点**连请求都不发**：后端也会提前拒绝（`Error::Unsupported`），
+  // 但先发一次注定失败的请求只会让余额列闪一下「（需登录）」这种错的原因。
   const balance = useQuery({
     queryKey: ["balance", site.id],
     queryFn: () => siteBalance(site.id),
+    enabled: site.capabilities.balance,
     retry: false,
   });
+
+  const balanceText = !site.capabilities.balance
+    ? "不可观测"
+    : balance.isLoading
+      ? "…"
+      : balance.isError
+        ? "（需登录）"
+        : balance.data
+          ? formatBalance(balance.data)
+          : "—";
 
   return (
     <tr>
@@ -262,18 +277,40 @@ function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) 
           {healthLabel(site.health)}
         </span>
       </td>
-      <td className="mono">
-        {balance.isLoading
-          ? "…"
-          : balance.isError
-            ? "（需登录）"
-            : `${balance.data?.remaining.toFixed(2)} ${balance.data?.currency}`}
+      <td className="mono" title={balanceReason(site, balance.data)}>
+        {balanceText}
       </td>
       <td>
-        <button type="button" className="btn btn-ghost" onClick={onLogin}>
+        {/* 能力驱动的灰显（W5）：站点类型不支持登录时，这个按钮点了只会报
+            「不需要登录」之类的别的原因。文案与判断都来自 `capabilities`。 */}
+        <CapButton
+          allowed={site.capabilities.login}
+          reason="该站点类型不需要登录"
+          className="btn btn-ghost"
+          onClick={onLogin}
+        >
           登录
-        </button>
+        </CapButton>
       </td>
     </tr>
   );
+}
+
+/**
+ * 余额单元格的文案（W2）。
+ *
+ * **`known === false` 或后端给了 `null` ⇒ 「不可观测」，绝不 `toFixed(2)`。**
+ * 「余额为零」与「余额不可观测」是两个不同的事实，后者渲染成 `0.00` 会让用户
+ * 以为这个站没钱了，也会让阈值告警看起来「已经触发过」（M7-S2 §6.5 硬要求 (a)）。
+ */
+function formatBalance(balance: Balance): string {
+  if (!balance.known || balance.remaining === null) return "不可观测";
+  return `${balance.remaining.toFixed(2)} ${balance.currency}`;
+}
+
+/** 余额列为什么显示成这样——挂在 `title` 上，避免「不可观测」被当成一个 bug。 */
+function balanceReason(site: SiteRow, balance?: Balance): string | undefined {
+  if (!site.capabilities.balance) return "该站点类型不提供余额";
+  if (balance && !balance.known) return "站点这次没有返回可用的余额";
+  return undefined;
 }
