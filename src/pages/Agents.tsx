@@ -240,7 +240,12 @@ export default function Agents() {
             <select
               className="input"
               value={activeKey ?? ""}
-              onChange={(e) => setKeyId(Number(e.target.value))}
+              onChange={(e) =>
+                // 空选择是 `null`，**不是 0**（M8-S5B §6.7）：
+                // `Number("")` 恰好是 0，而 0 是一个看似合法的 key id，
+                // 下游会拿它去查一把不存在的 key，报「key 不存在」而不是「还没选」。
+                setKeyId(e.target.value === "" ? null : Number(e.target.value))
+              }
             >
               <option value="">（选择一把）</option>
               {(keys.data ?? []).map((k) => (
@@ -523,6 +528,7 @@ export default function Agents() {
         title="回滚这次投递"
         danger
         confirmLabel={rollback.isPending ? "回滚中…" : "回滚"}
+        confirmDisabled={rollback.isPending}
         onCancel={() => setConfirmingRollback(false)}
         onConfirm={() => rollback.mutate()}
       >
@@ -538,6 +544,7 @@ export default function Agents() {
         title="撤销投递同意"
         danger
         confirmLabel="撤销"
+        confirmDisabled={revoke.isPending}
         onCancel={() => setRevoking(false)}
         onConfirm={() => revoke.mutate()}
       >
@@ -552,6 +559,7 @@ export default function Agents() {
         title={`解绑 ${activeAgent}`}
         danger
         confirmLabel={unbind.isPending ? "处理中…" : "解绑"}
+        confirmDisabled={unbind.isPending}
         onCancel={() => setUnbinding(false)}
         onConfirm={() => unbind.mutate()}
       >

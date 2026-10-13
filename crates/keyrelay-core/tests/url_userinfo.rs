@@ -176,7 +176,7 @@ async fn transport_error_text_carrying_the_url_is_masked_in_the_rotation_stop_re
     let site_id = store.upsert_site("newapi", &url, "测试站").unwrap();
     let reference = secret_ref("key", 1, "secret");
     let key_id = store
-        .insert_key(site_id, "old", &reference, Some("1"))
+        .insert_key(site_id, "old", &reference, Some("1"), None)
         .unwrap();
     f.mock.push(
         HttpResponse::json(200, json!({"success": true, "data": {"enabled": false}})).unwrap(),

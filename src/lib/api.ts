@@ -602,6 +602,22 @@ export function isCaptchaRequired(err: unknown): boolean {
   return err instanceof Error && err.message.includes("需要人工完成验证码");
 }
 
+/**
+ * 「这个错误是不是认证失败」——界面据此把原因说成「（需登录）」（M8-S5B §6.9）。
+ *
+ * 为什么需要它：余额查询失败有**很多种**原因（超时 / 5xx / 断网 / 认证失效），
+ * 此前一律显示「（需登录）」，用户会去重新登录一个根本不需要登录的站点。
+ * 这里只认两种「确实是凭证问题」的形态，其余一律按普通查询失败显示真实原因。
+ *
+ * 匹配的是后端 Display 原文（`invokeCommand` 已把错误转成 `Error(message)`）：
+ * - `Error::AuthFailed` ⇒ `"认证失败: …"`；
+ * - `Error::CaptchaRequired` ⇒ `"需要人工完成验证码"`。
+ */
+export function isAuthError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return err.message.includes("认证失败") || isCaptchaRequired(err);
+}
+
 export async function listKeys(siteId: number): Promise<KeyRow[]> {
   if (!hasTauri) return mock(MOCK_KEYS);
   return invokeCommand<KeyRow[]>("list_keys", { siteId });
@@ -1145,8 +1161,17 @@ export async function suggestKeyName(
   date: { year: number; month: number; day: number },
 ): Promise<string | null> {
   if (!hasTauri) {
+    // 浏览器预览用的 mock（M8-S5B §7.4 / B-102）。
+    //
+    // **形态与权威实现同形，但不复刻其校验**：年份补足 4 位、月日各 2 位，
+    // 与 `crates/keyrelay-core/src/naming.rs` 的 `{year:04}{month:02}{day:02}` 一致
+    // （此前这里写 `date.year` 不补零，与后端差一位——B-102 报的就是这个）。
+    //
+    // 段规则（非空 / `[A-Za-z0-9._-]` / ≤64 字节）**不在这里校验**：前端不编译 Rust，
+    // 复刻一份校验规则只会多一个漂移源。要校验就走 IPC（`hasTauri` 为真时正是如此）。
     const pad = (n: number) => String(n).padStart(2, "0");
-    return `keyrelay/${agentId}/${date.year}${pad(date.month)}${pad(date.day)}`;
+    const year = String(date.year).padStart(4, "0");
+    return `keyrelay/${agentId}/${year}${pad(date.month)}${pad(date.day)}`;
   }
   return invokeCommand<string | null>("suggest_key_name", {
     agentId,

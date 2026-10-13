@@ -878,6 +878,76 @@ mod tests {
         assert_eq!(strip_url_userinfo(&once), once);
     }
 
+    // ---------- 规则顺序的差分守护（M8-S5B §7.3） ----------
+
+    /// 顺序敏感语料：每一串都同时踩到「前缀型凭证」与「URL userinfo」两条规则，
+    /// 且两条规则的边界互相影响（`sk-` 的 token 字符含 `/`，会把外层路径连同内层
+    /// URL 的 scheme 一起吞掉——M5-S1 复核 R-1 抓到的正是这一类）。
+    const ORDER_CORPUS: &[&str] = &[
+        "连接 https://alice:s3cretPW@relay.example.com/v1 失败",
+        // 密钥紧跟在 URL 后面：前缀规则会一路吃到 `/`
+        "https://relay.example.com/sk-abcdefgh12345678/x",
+        // URL 里嵌密钥形态
+        "https://relay.example.com/?token=sk-abcdefgh12345678",
+        // Bearer + 长 hex
+        "Authorization: Bearer 0123456789abcdef0123456789abcdef",
+        // 嵌套 URL（外层 userinfo 里有内层 URL）
+        "https://a:p@host/https://b:q@inner.example.com/x",
+        // 两个 URL 连在一起
+        "https://alice:pw@a.example.com/x https://bob:pw@b.example.com/y",
+        // 掩过一次的串（幂等语料）
+        "https://***@relay.example.com/v1",
+    ];
+
+    /// 语料里**必须被掩掉**的秘密字面量。
+    ///
+    /// 显式列出来而不是从输出反推：反推要写通用解析，而这里要的只是
+    /// 「这些具体的秘密不允许以明文出现在新输出里」。
+    const ORDER_SECRETS: &[&str] = &[
+        "s3cretPW",
+        "alice",
+        "bob",
+        "sk-abcdefgh12345678",
+        "0123456789abcdef0123456789abcdef",
+        // 嵌套 / 相邻两条语料里的 userinfo（没有这两个，那两行就是死重）
+        "a:p",
+        "b:q",
+    ];
+
+    /// 顺序差分守护（M8-S5B §7.3）。
+    ///
+    /// 断言是**无条件正向**的：语料里出现过的每个秘密，都不得在新口径的输出里以明文出现。
+    ///
+    /// 为什么不是「与旧口径差分」（第一版的写法，被独立复审 P2-2 抓出空转）：
+    /// 旧口径 `scrub_prefixes_only` **只跑前缀规则、永不掩 URL userinfo**，
+    /// 于是 `alice` / `bob` / `s3cretPW` 这些 URL 秘密在差分里必然被跳过——
+    /// 7 条语料 × 5 个秘密 = 35 对组合里 32 对是死重，恰好漏掉它声称要守的
+    /// 「两条规则边界互相影响」。改成无条件正向后，那 4 条纯 URL 语料
+    /// （嵌套 URL / 相邻 URL / 掩过的串）才真的被断言。
+    ///
+    /// **边际价值有限，如实记录**：定稿时试过四种变异（去掉开头的 URL 遍、去掉收尾的
+    /// URL 遍、换掉 `PREFIXES` 里的 `Bearer`、收窄 authority 终止符集），**每一种都被
+    /// 更专门的既有用例抓到**（`scrub_is_idempotent_across_rule_interactions` /
+    /// `scrub_masks_userinfo_of_a_url_nested_behind_a_prefix_lookalike_host` /
+    /// `masks_nap_and_bearer` / `scrub_stops_the_authority_at_a_json_quote`）。
+    /// 保留它的理由：它把「这些秘密不许露」写成**可增长的语料点**——将来往
+    /// `ORDER_CORPUS` 加新形态时，不用再为每个形态手写一条专用用例。
+    #[test]
+    fn scrub_never_masks_less_than_the_prefix_only_pass() {
+        for input in ORDER_CORPUS {
+            let new = scrub(input);
+            for secret in ORDER_SECRETS {
+                if !input.contains(secret) {
+                    continue;
+                }
+                assert!(
+                    !new.contains(secret),
+                    "{secret:?} 在新口径里是明文：\n  输入: {input}\n  输出: {new}"
+                );
+            }
+        }
+    }
+
     // ---------- mask_url_userinfo_in_json：结构化层（M8-S3 独立复审 P1-3） ----------
 
     /// 把字符串包成 JSON 值过一遍结构化层，取出结果。

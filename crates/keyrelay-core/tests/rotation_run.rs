@@ -44,7 +44,7 @@ async fn setup(remote_id: Option<&str>) -> Fixture {
     let site_id = store.upsert_site("newapi", BASE, "测试站").expect("写站点");
     let reference = secret_ref("key", 1, "secret");
     let key_id = store
-        .insert_key(site_id, "codex/daily", &reference, remote_id)
+        .insert_key(site_id, "codex/daily", &reference, remote_id, None)
         .expect("写密钥记录");
 
     let vault = Arc::new(MemoryVault::new());

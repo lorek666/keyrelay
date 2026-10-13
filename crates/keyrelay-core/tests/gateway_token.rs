@@ -49,7 +49,7 @@ async fn setup() -> Fixture {
     let site_id = store.upsert_site("newapi", BASE, "测试站").unwrap();
     let reference = secret_ref("key", 1, "secret");
     let key_id = store
-        .insert_key(site_id, "codex/daily", &reference, Some("1"))
+        .insert_key(site_id, "codex/daily", &reference, Some("1"), None)
         .unwrap();
     let vault = Arc::new(MemoryVault::new());
     vault.put(&reference, SECRET).unwrap();
@@ -127,7 +127,7 @@ async fn a_missing_vault_degrades_to_a_temporary_token_and_says_so() {
     let site_id = store.upsert_site("newapi", BASE, "测试站").unwrap();
     let reference = secret_ref("key", 1, "secret");
     let key_id = store
-        .insert_key(site_id, "codex/daily", &reference, Some("1"))
+        .insert_key(site_id, "codex/daily", &reference, Some("1"), None)
         .unwrap();
     // 只读钥匙串：站点密钥读得到（否则连 `gateway_config` 都走不到令牌那一步），
     // 但 `put` 必然失败（模拟「钥匙串不可用 / ACL 拒绝」）。

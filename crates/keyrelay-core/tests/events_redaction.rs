@@ -35,7 +35,7 @@ fn setup() -> Fixture {
         .expect("写站点");
     let secret_ref = secret_ref("key", 1, "secret");
     let key_id = store
-        .insert_key(site_id, "codex/daily", &secret_ref, Some("1"))
+        .insert_key(site_id, "codex/daily", &secret_ref, Some("1"), None)
         .expect("写密钥记录");
 
     let vault = Arc::new(MemoryVault::new());
@@ -227,4 +227,106 @@ fn diagnostic_export_includes_vault_backend_for_support() {
     let parsed: serde_json::Value = serde_json::from_str(&exported).expect("导出应是 JSON");
     assert_eq!(parsed["vault_backend"], "memory");
     assert!(parsed["home"].is_string());
+}
+
+// ================================================================ 老行清洗（M8-S5B §7.2）
+
+/// **一次性数据修复**，不是门禁（spec §7.2：不自动执行、不进 CI）。
+///
+/// 为什么需要它：`observability::event_with_payload` 是**后来**才加上结构化脱敏的
+/// （M5-S0），在那之前写进行表的 `message` / `payload` 可能带着密钥明文。
+/// 事件表会被导出与审计 ⇒ 那些老行是真实的泄漏面。
+///
+/// 为什么不给一段 `sqlite3` 的 `UPDATE`：脱敏规则在 Rust 侧
+/// （`redact::scrub` / `scrub_event_message` / `scrub_event_payload`）。
+/// 用 SQL 复刻一遍只会多一个漂移源，而且 SQL 版**必然漏**（它猜不出 authority 边界、
+/// 也不知道哪些 payload 键是敏感键）⇒ 这里用真规则逐行改写。
+///
+/// 用法一（自检，改的是临时库）：
+/// ```console
+/// $ cargo test -p keyrelay-core --test events_redaction scrub_legacy_event_rows -- --ignored --nocapture
+/// ```
+///
+/// 用法二（修**真实库**，M8-S5B 独立复审 P2-3：不改成这样就得改源码才能指过去）：
+/// ```console
+/// $ cp ~/.keyrelay/keyrelay.db{,.bak} && cp ~/.keyrelay/keyrelay.db-wal{,.bak} 2>/dev/null; \
+///   cp ~/.keyrelay/keyrelay.db-shm{,.bak} 2>/dev/null; true
+/// $ KEYRELAY_DB=~/.keyrelay/keyrelay.db \
+///   cargo test -p keyrelay-core --test events_redaction scrub_legacy_event_rows -- --ignored --nocapture
+/// $ sqlite3 ~/.keyrelay/keyrelay.db "SELECT count(*) FROM events;"
+/// ```
+/// `KEYRELAY_DB` 指向哪个库就改哪个库；**缺省仍是临时目录**（自检形态不变）。
+/// **跑之前一定先备份** `<db>` 与 `<db>-wal` / `<db>-shm`（WAL 模式下缺一个都不完整）。
+#[tokio::test]
+#[ignore = "一次性数据修复：跑之前先备份数据库；它逐行改写 message / payload"]
+async fn scrub_legacy_event_rows() {
+    use keyrelay_core::observability::{Event, Level};
+    use keyrelay_core::store::Store;
+
+    // `KEYRELAY_DB` 指向真实库时就地修（P2-3）；否则用临时库自检。
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (db, _keep) = match std::env::var("KEYRELAY_DB") {
+        Ok(path) if !path.trim().is_empty() => {
+            let path = std::path::PathBuf::from(path);
+            println!("目标库（真实）: {}", path.display());
+            println!("  （若还没备份，现在 Ctrl-C：要连 <db>-wal / <db>-shm 一起备份）");
+            (path, dir)
+        }
+        _ => {
+            let path = dir.path().join("legacy.db");
+            println!("目标库（临时自检）: {}", path.display());
+            (path, dir)
+        }
+    };
+    let store = Store::open(&db).expect("文件库");
+
+    // 造两行「老形态」。`Event` 的字段是 pub，所以可以直接拼一个**未脱敏**的行，
+    // 绕过构造侧脱敏——这正是修复前的历史数据长什么样。
+    // （不往 `Store` 上加「写原始行」的公开 API：那种 API 留在生产里本身就是隐患。）
+    let legacy = Event {
+        ts: 1_700_000_000,
+        level: Level::Warn,
+        source: "site".to_string(),
+        message: format!("取密钥失败 {SECRET}"),
+        payload: Some(format!(r#"{{"note":"{SECRET}","key_id":1}}"#)),
+    };
+    store.insert_event(&legacy).expect("写老行");
+    let before = store.count_events_with_secrets().expect("扫描");
+    println!("修复前：{before} 行仍含密钥形态");
+    assert_eq!(before, 1, "夹具必须真的造出一行含密钥的老数据");
+
+    let repaired = store.scrub_legacy_events().expect("逐行改写");
+    println!("修复：改写了 {repaired} 行");
+    assert_eq!(repaired, 1, "只有那一行老数据该被改写");
+
+    let after = store.count_events_with_secrets().expect("复扫");
+    println!("修复后：{after} 行仍含密钥形态");
+    assert_eq!(after, 0, "修复后不得再有含密钥形态的行");
+
+    // 复核（spec §7.2 要求给）：直接看改完的文本，掩码要落在该落的地方
+    let row = store
+        .list_all_events()
+        .expect("读全部事件")
+        .into_iter()
+        .next()
+        .expect("有那一行");
+    assert!(
+        !row.message.contains(SECRET),
+        "message 仍是明文: {}",
+        row.message
+    );
+    assert!(
+        row.message.contains("sk-***"),
+        "message 应被掩: {}",
+        row.message
+    );
+    let payload = row.payload.expect("payload 还在");
+    assert!(!payload.contains(SECRET), "payload 仍是明文: {payload}");
+    assert!(payload.contains("sk-***"), "payload 应被掩: {payload}");
+    // 键名与其它字段不被牵连（结构化脱敏的既有契约）
+    assert!(
+        payload.contains(r#""key_id":1"#),
+        "其它字段该原样: {payload}"
+    );
+    println!("复核通过：message / payload 均已掩码，其它字段原样");
 }

@@ -56,7 +56,7 @@ async fn setup() -> Fixture {
     let site_id = store.upsert_site("newapi", BASE, "测试站").unwrap();
     let reference = secret_ref("key", 1, "secret");
     let key_id = store
-        .insert_key(site_id, "codex/daily", &reference, Some("1"))
+        .insert_key(site_id, "codex/daily", &reference, Some("1"), None)
         .unwrap();
     let vault = Arc::new(MemoryVault::new());
     vault.put(&reference, SECRET).unwrap();
@@ -230,7 +230,7 @@ async fn a_binding_without_a_remote_id_is_skipped_with_a_note() {
     let reference = secret_ref("key", 1, "secret");
     // `remote_id = None`：老库 / 手工导入的形态（站点侧没有记录）。
     let key_id = store
-        .insert_key(site_id, "codex/daily", &reference, None)
+        .insert_key(site_id, "codex/daily", &reference, None, None)
         .unwrap();
     let vault = Arc::new(MemoryVault::new());
     vault.put(&reference, SECRET).unwrap();
