@@ -777,6 +777,12 @@ export type KeySyncSummary = {
   siteId: number;
   siteTotal: number;
   alreadyLocal: number;
+  /**
+   * 本次**恢复**了多少条：本地记录还在、但钥匙串条目被清过（「清理钥匙串条目」），
+   * 于是把明文取回**原来那一行**。与 `imported` 分开：恢复 = 你清过钥匙串，
+   * 现在按提示取回来了；导入 = 本机第一次见到这把 key。
+   */
+  restored: number;
   imported: number;
   /** 站点没给明文的 key。界面据此引导「新建一把」而不是以为对齐成功了。 */
   unreadable: string[];
@@ -794,6 +800,7 @@ export async function syncSiteKeys(siteId: number): Promise<KeySyncSummary> {
       siteId,
       siteTotal: 2,
       alreadyLocal: 1,
+      restored: 0,
       imported: 1,
       unreadable: [],
     });
