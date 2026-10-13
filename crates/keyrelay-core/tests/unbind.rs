@@ -17,7 +17,7 @@ fn store_with_one_binding() -> (tempfile::TempDir, Store, i64, i64) {
         .upsert_site("newapi", "https://relay.example.com", "测试站")
         .unwrap();
     let key = store
-        .insert_key(site, "codex/daily", "kr/key/1/secret", Some("1"))
+        .insert_key(site, "codex/daily", "kr/key/1/secret", Some("1"), None)
         .unwrap();
     store
         .record_binding("codex", key, "/home/u/.codex/auth.json", "j1")

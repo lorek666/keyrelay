@@ -25,6 +25,26 @@ const AUTOSTART_LABELS: Record<string, string> = {
   unknown: "无法判定（读不到自启项，可能是权限或路径问题）",
 };
 
+/**
+ * 数值字段的提交前校验（M8-S5B §6.6）。
+ *
+ * 为什么必须在前端拦：这些字段最终落进 Rust 的 `u32` / `u16`。`type="number"` 的
+ * `min` / `max` 只是 HTML 属性——用户可以键入越界值，也可以提交（属性不阻止提交），
+ * 于是后端反序列化失败，用户看到一句难懂的序列化错误，而界面刚刚还显示他填的值。
+ *
+ * 返回 `null` = 不合法；调用方据此**不发请求**并给出中文文案。
+ */
+function intInRange(raw: number, min: number, max: number): number | null {
+  if (!Number.isInteger(raw) || raw < min || raw > max) return null;
+  return raw;
+}
+
+/** 允许小数的字段（目前只有余额阈值）：有限数 + 落在区间内 + 非负。 */
+function finiteNonNegative(raw: number, max: number): number | null {
+  if (!Number.isFinite(raw) || raw < 0 || raw > max) return null;
+  return raw;
+}
+
 const PRESETS = [
   { label: "关闭", value: 0 },
   { label: "5 分钟", value: 300 },
@@ -335,23 +355,70 @@ export default function SettingsPage() {
       : "系统里没有生效的自启项，但开关是开的（打开开关并保存即可写入）";
   })();
 
+  /**
+   * 提交前的数值校验（M8-S5B §6.6）。
+   *
+   * 逐字段给出「不合法时说什么」。区间取的是**业务界，比后端类型更严**
+   * （独立复审 P3-2：`refresh_interval_secs` / `notify_timeout_secs` 在 Rust 侧是
+   * `u64`，这里限 0..86400 / 1..60；`rotation_*_days` 是 `u32`，这里限 0..36500）。
+   * 方向是安全的：更严只会挡住越界值，不会漏放——`u32` / `u16` 反序列化失败那条
+   * 风险已经闭合。
+   *
+   * **已知副作用**：若某个字段的存量值超出这些业务界（例如手工改过配置文件），
+   * 用户会被挡住**任何**保存，直到把它改回界内。这是有意的——真放过去也是后端报错。
+   * 任一字段不合法 ⇒ 直接 return，**不发请求**。
+   */
+  function validateDraft(draft: Settings): string | null {
+    const refresh = intInRange(draft.refreshIntervalSecs, 0, 86_400);
+    if (refresh === null) return "定时刷新间隔必须是 0 到 86400 之间的整数秒（0 = 关闭）。";
+    const threshold = finiteNonNegative(draft.balanceAlertThreshold, 1_000_000);
+    if (threshold === null) return "余额告警阈值必须是不超过 1000000 的非负数（0 = 不告警）。";
+    const port = intInRange(draft.gatewayPort, 1, 65_535);
+    if (port === null) return "网关端口必须是 1 到 65535 之间的整数。";
+    const timeout = intInRange(draft.notifyTimeoutSecs, 1, 60);
+    if (timeout === null) return "Webhook 超时必须是 1 到 60 之间的整数秒。";
+    const maxAge = intInRange(draft.rotationMaxAgeDays, 0, 36_500);
+    if (maxAge === null) return "轮换周期必须是 0 到 36500 之间的整数天（0 = 关闭提醒）。";
+    const warn = intInRange(draft.rotationWarnBeforeDays, 0, 36_500);
+    if (warn === null) return "提前提醒天数必须是 0 到 36500 之间的整数。";
+    if (warn > maxAge && maxAge !== 0) {
+      return "提前提醒天数不能大于轮换周期（要提醒的事得先在那个周期内发生）。";
+    }
+    return null;
+  }
+
   const save = useMutation({
     mutationFn: async (settings: Settings) => {
       const saved = await updateSettings(settings);
       // 自启不是「存一个布尔值」就完事的：它要在磁盘上真写 / 真删一个 LaunchAgent，
       // 或者在 Windows 上动注册表。所以保存设置之后立刻把它同步成实际状态，
       // 并把实际状态带回来——否则界面显示「已开启」而系统里什么都没有。
-      const autostart = await setAutostart(saved.autostartEnabled);
-      return { saved, autostart };
+      //
+      // 自启失败**不**让整笔保存算失败（M8-S5B §6.10）：设置已经存进去了，
+      // 把两件事的结果分别带回，界面分开说——否则用户以为设置没存，会重复保存。
+      try {
+        const autostart = await setAutostart(saved.autostartEnabled);
+        return { saved, autostart, autostartError: null as string | null };
+      } catch (err) {
+        return { saved, autostart: null, autostartError: (err as Error).message };
+      }
     },
-    onSuccess: async ({ saved, autostart }) => {
+    onSuccess: async ({ saved, autostart, autostartError }) => {
       setError(null);
-      const wanted = saved.autostartEnabled ? "enabled" : "disabled";
-      if (autostart.state !== wanted && autostart.state !== "unknown") {
-        // 真实状态与用户意愿不一致时**必须说出来**，不能只显示「已保存」。
-        setNotice(
-          `设置已保存，但登录自启的实际状态是「${autostart.state}」，与设置不一致。`,
-        );
+      // 两件事分开说（M8-S5B §6.10）：设置**已保存**（这是事实，先讲清楚），
+      // 自启的同步结果是另一件事——失败或状态不一致都单独说一句。
+      if (autostartError !== null) {
+        setNotice(`设置已保存，但登录自启没能同步：${autostartError}`);
+      } else if (autostart) {
+        const wanted = saved.autostartEnabled ? "enabled" : "disabled";
+        if (autostart.state !== wanted && autostart.state !== "unknown") {
+          // 真实状态与用户意愿不一致时**必须说出来**，不能只显示「已保存」。
+          setNotice(
+            `设置已保存，但登录自启的实际状态是「${autostart.state}」，与设置不一致。`,
+          );
+        } else {
+          setNotice("已保存。定时刷新间隔的变更在**下次启动**生效。");
+        }
       } else {
         setNotice("已保存。定时刷新间隔的变更在**下次启动**生效。");
       }
@@ -678,7 +745,18 @@ export default function SettingsPage() {
               type="button"
               className="btn btn-primary"
               disabled={!dirty || save.isPending}
-              onClick={() => save.mutate(draft)}
+              onClick={() => {
+                if (!draft) return;
+                // 提交前校验（M8-S5B §6.6）：不合法就不发请求，并说清是哪一字段
+                const problem = validateDraft(draft);
+                if (problem !== null) {
+                  setNotice(null);
+                  setError(problem);
+                  return;
+                }
+                setError(null);
+                save.mutate(draft);
+              }}
             >
               <Save size={14} aria-hidden /> 保存
             </button>

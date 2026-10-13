@@ -190,8 +190,15 @@ fn spawn_fake_newapi(private: RsaPrivateKey, public_pem: String) -> FakeSite {
                     None,
                 );
             } else if first_line.starts_with("POST /api/token/") {
+                // 名字从请求体里取（M8-S5B §6.5）：假站点不能只认一个硬编码的名字，
+                // 否则「建第二把带分组的 key」这条路径根本走不到。
+                // 解析失败时退回流名，绝不静默丢请求。
+                let name = serde_json::from_str::<serde_json::Value>(body.as_str())
+                    .ok()
+                    .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                    .unwrap_or_else(|| "codex/daily".to_string());
                 if let Ok(mut s) = site_state.lock() {
-                    s.tokens.push("codex/daily".to_string());
+                    s.tokens.push(name);
                 }
                 respond(
                     &mut stream,
@@ -273,6 +280,42 @@ async fn full_flow_against_fake_newapi_site() {
     let keys = service.list_keys(summary.id).await.expect("再列令牌");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].name, "codex/daily");
+
+    // ④-b 分组名必须落库（M8-S5B §6.5）：用户刚填的 `KeySpec.group` 是权威值，
+    // 此前 `insert_key` 根本不写 `group_name` ⇒ 本地行这一列恒为 NULL，
+    // 界面显示空、按分组筛选失真。上面那把没填分组 ⇒ NULL；这里补一把填了分组的。
+    let grouped = service
+        .create_key(
+            summary.id,
+            KeySpec {
+                group: Some("vip".to_string()),
+                ..KeySpec::named("codex/grouped")
+            },
+        )
+        .await
+        .expect("创建带分组的令牌");
+    let row = service
+        .store()
+        .get_key(grouped.id)
+        .expect("读本地行")
+        .expect("行在");
+    assert_eq!(
+        row.group_name.as_deref(),
+        Some("vip"),
+        "分组名必须原样落库（不猜、不改写）"
+    );
+    // 没填分组的那把必须是 NULL，而不是空串——「不知道」与「空分组」是两件事
+    let plain = service
+        .store()
+        .get_key(stored.id)
+        .expect("读本地行")
+        .expect("行在");
+    assert_eq!(plain.group_name, None, "没填分组 ⇒ NULL");
+    // `status` 仍然不写：它是本地词表，`unknown` 的含义是「本产品没对它做过任何事」
+    assert_eq!(
+        row.status, "unknown",
+        "新建时不写站点侧状态（本地词表语义）"
+    );
 
     // ⑥ 余额（quota / quota_per_unit）
     let balance = service.balance(summary.id).await.expect("查余额");

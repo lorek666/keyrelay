@@ -35,7 +35,7 @@ fn build_app_with_key() -> (
         .expect("建站");
     let key = state
         .service
-        .store_key_material(site_id, "ipc/continue", Some("1"), SECRET)
+        .store_key_material(site_id, "ipc/continue", Some("1"), None, SECRET)
         .expect("存 key");
     let home = state.service.home().to_path_buf();
     let app = keyrelay_lib::configure_with_state(mock_builder(), state)

@@ -28,9 +28,18 @@ function ok(message) {
   console.log(`✓ ${message}`);
 }
 
-/** 去掉行注释，避免把被注释掉的命令也算进来（否则「删一条命令」抓不到） */
-function stripLineComments(text) {
-  return text.replace(/\/\/[^\n]*/g, "");
+/**
+ * 去掉注释，避免把被注释掉的命令/通道也算进来（否则「删一条命令」抓不到）。
+ *
+ * **块注释也必须去**（M8-S5B 独立复审 P2-1）：只去行注释时，把一条 `CHANNELS`
+ * 条目用 `/* … *\/` 包起来就能让前端清单少一项而脚本照旧绿——
+ * 独立复审在沙箱里复现过这个「静默通过」。顺序也有讲究：**先去块注释**，
+ * 否则块注释里出现的 `//` 会先把块注释切成两半，剩下的 `*\/` 变成普通文本。
+ */
+function stripComments(text) {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
 }
 
 /** 从 `pub const COMMANDS: &[&str] = &[ "a", "b" ];` 里取出字符串字面量 */
@@ -41,7 +50,7 @@ function parseRustCommands() {
   );
   const block = source.match(/pub const COMMANDS[^=]*=\s*&\[([\s\S]*?)\];/);
   if (!block) throw new Error("在 commands_list.rs 里找不到 COMMANDS 数组");
-  return [...stripLineComments(block[1]).matchAll(/"([^"]+)"/g)].map(
+  return [...stripComments(block[1]).matchAll(/"([^"]+)"/g)].map(
     (m) => m[1],
   );
 }
@@ -54,7 +63,7 @@ function parseRustCommands() {
  * （M1-S3/S4 复审 P1 实测）。
  */
 function parseTsCommands() {
-  const source = stripLineComments(
+  const source = stripComments(
     readFileSync(join(root, "src/lib/api.ts"), "utf8"),
   );
   const calls = [
@@ -66,6 +75,63 @@ function parseTsCommands() {
     );
   }
   return [...new Set(calls)];
+}
+
+/**
+ * 从 `DeliveryChannel::as_str()` 的穷尽 match 里取出通道名字面量（B-101）。
+ *
+ * 为什么这是**可证伪**的读法：`as_str` 是穷尽 `match`，新增一个 `DeliveryChannel`
+ * 变体而忘了加臂，rustc 直接报错 ⇒ 抽出来的臂数与 `ALL` 数组长度必然相等。
+ * 反过来，若哪天有人把 `as_str` 改成 `#[derive]` 自动生成，这里的正则会匹配不到
+ * 臂 ⇒ **宁可红，也不静默跳过**（解析器失效时报错，不当成通过）。
+ */
+function parseRustChannels() {
+  const source = stripComments(
+    readFileSync(join(root, "crates/keyrelay-core/src/delivery/mod.rs"), "utf8"),
+  );
+  // 只取 `as_str()` **函数体内**的臂：同一个文件里 `agent_id()` 也是同形态的 match，
+  // 不限定函数就会把两份都抓进来（实测 14 条臂 vs ALL 的 7 个元素）。
+  const fn = source.match(/pub fn as_str\(self\)[\s\S]*?\n    \}/);
+  if (!fn) throw new Error("在 delivery/mod.rs 里找不到 as_str() 函数");
+  const arms = [
+    ...fn[0].matchAll(/DeliveryChannel::(\w+)\s*=>\s*"([a-z0-9-]+)"/g),
+  ].map((m) => m[2]);
+  if (arms.length === 0) {
+    throw new Error(
+      "在 delivery/mod.rs 里没解析到任何 DeliveryChannel 的 as_str 臂——解析器坏了，不能当成通过",
+    );
+  }
+  // `ALL` 数组：与臂数对账，防「as_str 加了臂但 ALL 没加」这种半边改动
+  const all = source.match(/pub const ALL[^=]*=\s*\[([\s\S]*?)\]/);
+  if (!all) throw new Error("在 delivery/mod.rs 里找不到 DeliveryChannel::ALL");
+  const allCount = [...all[1].matchAll(/DeliveryChannel::\w+/g)].length;
+  if (allCount !== arms.length) {
+    throw new Error(
+      `DeliveryChannel::ALL 有 ${allCount} 个元素，但 as_str 有 ${arms.length} 条臂——两边不同步`,
+    );
+  }
+  return arms;
+}
+
+/**
+ * 从 `src/pages/Agents.tsx` 的 `CHANNELS` 数组里取出 id 字面量。
+ *
+ * 前端那份是**手工维护**的（界面要拿它渲染下拉），所以必须与后端对账：
+ * 少了 ⇒ 用户选不到新通道；多了 ⇒ 选到一个后端不认识的通道。
+ */
+function parseTsChannels() {
+  const source = stripComments(
+    readFileSync(join(root, "src/pages/Agents.tsx"), "utf8"),
+  );
+  const block = source.match(/const CHANNELS\s*=\s*\[([\s\S]*?)\];/);
+  if (!block) throw new Error("在 Agents.tsx 里找不到 CHANNELS 数组");
+  const ids = [...block[1].matchAll(/id:\s*"([a-z0-9-]+)"/g)].map((m) => m[1]);
+  if (ids.length === 0) {
+    throw new Error(
+      "在 Agents.tsx 的 CHANNELS 里没解析到任何 id——解析器坏了，不能当成通过",
+    );
+  }
+  return ids;
 }
 
 function parseCapabilities() {
@@ -205,6 +271,29 @@ if (!ghostFiles.length && !missingFiles.length) {
   ok(
     `权限生成物与命令集合一致（${actualPermissionFiles.length} 个文件 == ${rust.length} 条命令）`,
   );
+}
+
+// ---------------------------------------------------------------- 5. 通道名对账（B-101）
+// 前端 `CHANNELS` 的 id 集合必须与后端 `DeliveryChannel::ALL` 的 `as_str()` 集合相同。
+// 少一个 ⇒ 用户选不到新通道；多一个 ⇒ 选到一个后端不认识的通道。
+const rustChannels = parseRustChannels();
+const tsChannels = parseTsChannels();
+const onlyBackend = rustChannels.filter((c) => !tsChannels.includes(c));
+const onlyFrontend = tsChannels.filter((c) => !rustChannels.includes(c));
+if (onlyBackend.length || onlyFrontend.length) {
+  fail(
+    `投递通道名两边不一致（B-101）：\n` +
+      (onlyBackend.length
+        ? `  只有后端有: ${onlyBackend.join(", ")}\n`
+        : "") +
+      (onlyFrontend.length
+        ? `  只有前端有: ${onlyFrontend.join(", ")}（后端不认识的通道，用户选到了也发不出去）\n`
+        : "") +
+      `  后端清单来自 delivery/mod.rs 的 as_str()（${rustChannels.length} 条），` +
+      `前端清单来自 Agents.tsx 的 CHANNELS（${tsChannels.length} 条）`,
+  );
+} else {
+  ok(`投递通道名两边一致（${rustChannels.length} 条）`);
 }
 
 if (process.exitCode) {

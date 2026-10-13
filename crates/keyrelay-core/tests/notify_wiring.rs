@@ -59,7 +59,7 @@ fn setup() -> Fixture {
         .expect("写站点");
     let reference = secret_ref("key", 1, "secret");
     let key_id = store
-        .insert_key(site_id, "codex/daily", &reference, Some("1"))
+        .insert_key(site_id, "codex/daily", &reference, Some("1"), None)
         .expect("写密钥记录");
 
     let vault = Arc::new(MemoryVault::new());
@@ -318,6 +318,7 @@ async fn a_newly_added_site_reports_its_drift_on_the_very_round_it_appears() {
             second,
             "gemini/second",
             Some("9"),
+            None,
             "sk-second-0123456789abcdef",
         )
         .expect("写第二把密钥")

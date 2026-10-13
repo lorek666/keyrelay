@@ -33,6 +33,7 @@ fn setup() -> Fixture {
             "keyrelay/codex/20261013",
             &secret_ref("key", 1, "secret"),
             Some("42"),
+            None,
         )
         .expect("写密钥记录");
     Fixture {

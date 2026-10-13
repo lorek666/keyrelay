@@ -247,7 +247,12 @@ export default function GatewayCard({
               <select
                 className="input"
                 value={activeKey ?? ""}
-                onChange={(e) => setKeyId(Number(e.target.value))}
+                onChange={(e) =>
+                  // 空选择是 `null`，**不是 0**（M8-S5B §6.7）：
+                  // `Number("")` 恰好是 0，而 0 是一个看似合法的 key id，
+                  // 下游会拿它去查一把不存在的 key，报「key 不存在」而不是「还没选」。
+                  setKeyId(e.target.value === "" ? null : Number(e.target.value))
+                }
               >
                 <option value="">（选择一把）</option>
                 {siteKeys.map((k) => (

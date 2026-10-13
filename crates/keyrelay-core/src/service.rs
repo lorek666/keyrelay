@@ -957,12 +957,21 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let session = self.session(site_id)?;
         let adapter = self.registry.adapter(kind);
         let name = spec.name.clone();
+        // 分组名在 `spec` 被 move 进适配器**之前**取出来：它是用户刚填的权威值，
+        // 适配器不回传它（`KeyMaterial` 只有 remote_id + secret）。
+        let group_name = spec.group.clone();
         match adapter.create_key(&site.base_url, &session, spec).await {
             Ok(material) => {
                 // 站点上已经建好了。此刻若本地保存失败，必须如实告诉用户
                 // 「站点上已创建、本地没存上」，而不是含糊地报一个失败让人重试建键。
                 let stored = self
-                    .store_key_material(site_id, &name, Some(&material.remote_id), &material.secret)
+                    .store_key_material(
+                        site_id,
+                        &name,
+                        Some(&material.remote_id),
+                        group_name.as_deref(),
+                        &material.secret,
+                    )
                     .map_err(|err| {
                         Error::Vault(format!(
                             "站点上已创建成功（id={}），但本地保存失败：{err}",
@@ -2277,7 +2286,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 .find(|meta| meta.remote_id == remote_id)
                 .map(|meta| meta.name.clone())
                 .unwrap_or_else(|| remote_id.clone());
-            match self.store_key_material(site_id, &name, Some(&remote_id), &material.secret) {
+            // 分组名传 `None`：这条路径的名字都是从 `KeyMeta` 反查的，分组同样没有
+            // 权威来源 ⇒ 落 `NULL` 让界面显示空，不猜（M8-S5B §6.5）。
+            match self.store_key_material(site_id, &name, Some(&remote_id), None, &material.secret)
+            {
                 Ok(_) => imported += 1,
                 Err(err) => {
                     // 单条失败不中断整批：对齐是尽力而为的，失败的那条下一轮还能再来。
@@ -3332,6 +3344,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         site_id: i64,
         name: &str,
         remote_id: Option<&str>,
+        // 分组名：`None` = 「不知道」⇒ 落 `NULL`，**绝不猜**（M8-S5B §6.5）。
+        group_name: Option<&str>,
         secret: &str,
     ) -> Result<StoredKey> {
         if secret.trim().is_empty() {
@@ -3341,7 +3355,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let secret_ref = crate::vault::secret_ref("key", &ref_id, "secret");
         self.vault.put(&secret_ref, secret)?;
 
-        match self.store.insert_key(site_id, name, &secret_ref, remote_id) {
+        match self
+            .store
+            .insert_key(site_id, name, &secret_ref, remote_id, group_name)
+        {
             Ok(id) => {
                 let stored = StoredKey {
                     id,

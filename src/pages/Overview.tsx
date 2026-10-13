@@ -115,6 +115,14 @@ export default function Overview() {
               : ""}
           </p>
         ) : null}
+        {/* 刷新失败必须说出来（M8-S5B §6.8）：`refresh_all` 出错时整个 mutation 走
+            onError，而这里原本只渲染 `refresh.data`（成功分支）⇒ 界面上「成功」与
+            「失败」看不出差别，用户会以为刷新成功了。 */}
+        {refresh.isError ? (
+          <p className="error" role="alert">
+            <AlertTriangle size={14} aria-hidden /> 刷新失败：{refresh.error.message}
+          </p>
+        ) : null}
 
         {info.data?.vaultBackend === "memory" ? (
           <p className="error" role="alert">

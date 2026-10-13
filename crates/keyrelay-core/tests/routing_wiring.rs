@@ -204,10 +204,10 @@ mod production_wiring {
         let ref_a = secret_ref("key", 1, "secret");
         let ref_b = secret_ref("key", 2, "secret");
         let key_a = store
-            .insert_key(a, "codex/daily", &ref_a, Some("1"))
+            .insert_key(a, "codex/daily", &ref_a, Some("1"), None)
             .unwrap();
         store
-            .insert_key(b, "codex/daily", &ref_b, Some("2"))
+            .insert_key(b, "codex/daily", &ref_b, Some("2"), None)
             .unwrap();
 
         let vault = Arc::new(MemoryVault::new());

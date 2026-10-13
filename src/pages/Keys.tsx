@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, KeyRound, Plus, RefreshCw, RotateCw, Trash2 } from "lucide-react";
 import {
@@ -41,7 +41,17 @@ export default function Keys() {
   // 拿不到建议名时留空，绝不回退到写死的名字——那正是 B-87 要消灭的占位符。
   const [name, setName] = useState("");
   /** 用户是否手输过名字。手输过就**不再**用建议名覆盖他（见 `openCreateDialog`）。 */
-  const [nameEdited, setNameEdited] = useState(false);
+  /**
+   * 「用户是否手输过名字」（M8-S5B §6.4）。
+   *
+   * 为什么是 ref 而不是 state：`openCreateDialog` 在 `await suggestKeyName(...)`
+   * **之后**才判断这件事。闭包捕获的是 `await` 之前的旧值，于是用户在建议名还在
+   * 路上时敲的名字会被建议名覆盖。ref 读的是当前值，跨 await 也准确。
+   *
+   * 第一版在这里同时留了 state 与 ref，`tsc --noEmit` 直接报 TS6133「state 只写不读」
+   * ——那就是答案：渲染根本不需要它，留着的那个必然在某天与 ref 漂移。
+   */
+  const nameEditedRef = useRef(false);
   /** 建议名正在路上：这期间不让提交，否则会创建出一个空名字的密钥。 */
   const [suggesting, setSuggesting] = useState(false);
   const [group, setGroup] = useState("");
@@ -51,6 +61,14 @@ export default function Keys() {
   // 轮换：先出预览（`rotating`），用户确认后才真的动手（PRD §7 危险操作二次确认）
   const [rotating, setRotating] = useState<RotationPlan | null>(null);
   const [rotationName, setRotationName] = useState("");
+  /**
+   * 轮换的建议名还在路上（M8-S5B 独立复审 P3-1）。
+   *
+   * 与创建路径的 `suggesting` 同一用途：对话框一打开就显示**上一次用过的名字**，
+   * 而建议名要等一个 IPC 往返才回来。这期间不挡住确认，用户就可能用一个旧名字
+   * 建出新 key。窗口是毫秒级，但创建路径正是为这个才有 `suggesting` 的。
+   */
+  const [rotationSuggesting, setRotationSuggesting] = useState(false);
   const [rotationResult, setRotationResult] = useState<RotationRun | null>(null);
   // 回收站点侧密钥（B-82）：先出二次确认，确认里还要**明确勾选**才会带 `confirm=true`
   const [revoking, setRevoking] = useState<StoredKeyRow | null>(null);
@@ -60,6 +78,27 @@ export default function Keys() {
   const activeSiteRow = (sites.data ?? []).find((s) => s.id === activeSite);
   /** 能力集：`undefined`（站点还没读出来）按「全不支持」处理，绝不乐观放行。 */
   const caps = activeSiteRow?.capabilities;
+
+  /**
+   * 按**指定站点**取能力集（M8-S5B §6.2）。
+   *
+   * 轮换列表里每一行是 `RotationDue`，它带自己的 `siteId`；用「当前选中站点」的
+   * 能力去判另一把 key 的操作，会出现「按钮可点但后端拒绝」。语义与 `caps` 一致：
+   * 取不到 ⇒ `undefined` ⇒ 按全不支持处理。
+   */
+  function capsFor(siteId: number): SiteRow["capabilities"] | undefined {
+    return (sites.data ?? []).find((s) => s.id === siteId)?.capabilities;
+  }
+
+  /**
+   * 切换站点时作废已选分组（M8-S5B §6.3）。
+   *
+   * 分组名是**站点侧**的概念：A 站选了「vip」后切到 B 站，B 站未必有同名分组，
+   * 留着它只会让新建密钥带着一个来历不明的分组（建键失败，或建到错误分组）。
+   */
+  useEffect(() => {
+    setGroup("");
+  }, [activeSite]);
 
   // 该轮换的密钥（FR-7）。纯本地判定：不联网、不读密钥。
   const rotation = useQuery({ queryKey: ["rotation-due"], queryFn: rotationDue });
@@ -113,12 +152,33 @@ export default function Keys() {
 
   const rotationPreview = useMutation({
     mutationFn: (keyId: number) => rotationPlan(keyId),
-    onSuccess: (data) => {
+    onSuccess: async (data) => {
       setError(null);
       setNotice(null);
       setRotationResult(null);
-      setRotationName(`${data.keyName}-rotated`);
       setRotating(data);
+      // 先清空再取建议名（P3-1）：否则建议名回来前显示的是上一次轮换用过的名字
+      setRotationName("");
+      setRotationSuggesting(true);
+      // 新 key 的默认名走**与新建同一条路径**（M8-S5B §6.12）：按 FR-2 的命名规范现算，
+      // 不再 `${data.keyName}-rotated` 硬拼——二次轮换会拼出 `xxx-rotated-rotated`，
+      // 而命名规范（`naming.rs`）在轮换路径上就被绕过去了。
+      // 兜底用 `data.keyName`（原名）：拿不到建议名时**不**留空（空名会被确认按钮挡住），
+      // 也**不**回退到写死的 `-rotated` 后缀（那正是要消灭的占位符）。
+      const today = new Date();
+      try {
+        const suggested = await suggestKeyName(DEFAULT_AGENT_SEGMENT, {
+          year: today.getFullYear(),
+          month: today.getMonth() + 1,
+          day: today.getDate(),
+        });
+        setRotationName(suggested ?? data.keyName);
+      } catch {
+        setRotationName(data.keyName);
+      } finally {
+        // 无论成功失败都要收尾：失败时用 `data.keyName` 兜底，名字仍然有效
+        setRotationSuggesting(false);
+      }
     },
     onError: (err: Error) => setError(err.message),
   });
@@ -152,10 +212,10 @@ export default function Keys() {
       setCreating(false);
       // 名字用完就还回去：否则下一次「新建密钥」会**沿用上一把的名字**，
       // 站点侧就出现两把同名 key——那恰好废掉了命名规范存在的理由
-      // （「在站点侧一眼看出这把 key 给谁用」）。`nameEdited` 也要一起清，
+      // （「在站点侧一眼看出这把 key 给谁用」）。手输标记也要一起清，
       // 否则用户改过一次名之后，后续每次新建都会重新填回他那个旧名字。
       setName("");
-      setNameEdited(false);
+      nameEditedRef.current = false;
       await qc.invalidateQueries({ queryKey: ["stored-keys"] });
       await qc.invalidateQueries({ queryKey: ["remote-keys", activeSite] });
     },
@@ -179,7 +239,7 @@ export default function Keys() {
     setError(null);
     setNotice(null);
     setCreating(true);
-    if (nameEdited) return;
+    if (nameEditedRef.current) return;
 
     const today = new Date();
     setSuggesting(true);
@@ -189,11 +249,12 @@ export default function Keys() {
         month: today.getMonth() + 1,
         day: today.getDate(),
       });
-      // 等待期间用户可能已经自己敲了名字：再确认一次，别把他的输入盖掉
-      if (!nameEdited) setName(suggested ?? "");
+      // 等待期间用户可能已经自己敲了名字：再确认一次，别把他的输入盖掉。
+      // 读 **ref** 而不是闭包里的 `nameEdited`——后者还是 `await` 之前的旧值（M8-S5B §6.4）
+      if (!nameEditedRef.current) setName(suggested ?? "");
     } catch (err) {
       // 生成建议名失败不是致命错误，但也不能静默填一个假名字——留空让他自己写
-      if (!nameEdited) setName("");
+      if (!nameEditedRef.current) setName("");
       setError(`没能生成默认名（${(err as Error).message}），请手动填写。`);
     } finally {
       setSuggesting(false);
@@ -271,9 +332,9 @@ export default function Keys() {
                     <td>
                       {/* 轮换是「建 / 读 / 回收」三连，缺一不可（M7-S2 §3.3） */}
                       <CapButton
-                        allowed={rotationAllowed(caps)}
+                        allowed={rotationAllowed(capsFor(due.siteId))}
                         reason={capReason(
-                          caps,
+                          capsFor(due.siteId),
                           "轮换需要建 / 读 / 回收三连，该类型缺其中一步",
                         )}
                         busy={rotationPreview.isPending || rotationExecute.isPending}
@@ -482,8 +543,8 @@ export default function Keys() {
             value={name}
             onChange={(e) => {
               setName(e.target.value);
-              // 用户动过这个名字之后，就再也不用建议名覆盖他
-              setNameEdited(true);
+              // 用户动过这个名字之后，就再也不用建议名覆盖他（§6.4）
+              nameEditedRef.current = true;
             }}
             placeholder={suggesting ? "正在生成默认名…" : "keyrelay/agent/yyyymmdd"}
             spellCheck={false}
@@ -534,7 +595,12 @@ export default function Keys() {
         open={rotating !== null}
         title="轮换密钥"
         confirmLabel={rotationExecute.isPending ? "轮换中…" : "开始轮换"}
-        confirmDisabled={rotationExecute.isPending || !rotationName || (rotating?.unmappedTargets.length ?? 0) > 0}
+        confirmDisabled={
+          rotationExecute.isPending ||
+          rotationSuggesting ||
+          !rotationName ||
+          (rotating?.unmappedTargets.length ?? 0) > 0
+        }
         onCancel={() => setRotating(null)}
         onConfirm={() => rotationExecute.mutate()}
       >

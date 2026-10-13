@@ -699,6 +699,7 @@ fn gateway_stop_then_start_on_the_same_port_succeeds() {
             site,
             "codex/daily",
             Some("12"),
+            None,
             "sk-gateway-0123456789abcdef",
         )
         .expect("写密钥")
@@ -762,7 +763,13 @@ fn gateway_stop_is_bounded_even_with_an_in_flight_request() {
         .expect("写站点");
     let key_id = state
         .service
-        .store_key_material(site, "codex/daily", Some("12"), "sk-slow-0123456789abcdef")
+        .store_key_material(
+            site,
+            "codex/daily",
+            Some("12"),
+            None,
+            "sk-slow-0123456789abcdef",
+        )
         .expect("写密钥")
         .id;
 
@@ -876,7 +883,13 @@ fn rotation_plan_is_local_and_lists_the_fixed_three_steps() {
         .expect("写站点");
     let key_id = state
         .service
-        .store_key_material(site, "codex/daily", Some("12"), "sk-rotation-0123456789ab")
+        .store_key_material(
+            site,
+            "codex/daily",
+            Some("12"),
+            None,
+            "sk-rotation-0123456789ab",
+        )
         .expect("写密钥")
         .id;
 
@@ -920,7 +933,13 @@ fn rotate_key_reaches_the_business_path_without_a_session() {
         .expect("写站点");
     let key_id = state
         .service
-        .store_key_material(site, "codex/daily", Some("12"), "sk-rotation-0123456789ab")
+        .store_key_material(
+            site,
+            "codex/daily",
+            Some("12"),
+            None,
+            "sk-rotation-0123456789ab",
+        )
         .expect("写密钥")
         .id;
 

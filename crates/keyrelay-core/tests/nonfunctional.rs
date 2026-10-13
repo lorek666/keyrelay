@@ -232,7 +232,7 @@ fn injection_latency_p95() {
         .expect("写站点");
     let secret_ref = keyrelay_core::vault::secret_ref("key", 1, "secret");
     let key_id = store
-        .insert_key(site_id, "codex/daily", &secret_ref, Some("1"))
+        .insert_key(site_id, "codex/daily", &secret_ref, Some("1"), None)
         .expect("写密钥记录");
     let vault = Arc::new(MemoryVault::new());
     vault

@@ -476,12 +476,22 @@ impl Store {
     }
 
     /// `secret_ref` 必须是钥匙串引用（`kr/<scope>/<id>/<field>`），禁止传明文
+    ///
+    /// `group_name` 是**调用方给的权威值**（新建密钥时用户刚填的那个分组）。
+    /// 传 `None` 表示「不知道」⇒ 落 `NULL`，界面显示空——**绝不猜**：
+    /// `sync_site_keys` 的导入路径就传 `None`，那条路的名字都是从 `KeyMeta` 反查的，
+    /// 分组同样没有权威来源。
+    ///
+    /// `status` **刻意不写**：它是本地词表（见本模块顶部 `KEY_STATUS_REVOKED` 的说明），
+    /// `DEFAULT 'unknown'` 的正确含义是「本产品没对这把钥匙做过任何事」。
+    /// 新建时写一个站点侧状态会把两套语义混成一列（M8-S5B §6.5）。
     pub fn insert_key(
         &self,
         site_id: i64,
         name: &str,
         secret_ref: &str,
         remote_id: Option<&str>,
+        group_name: Option<&str>,
     ) -> Result<i64> {
         if !is_valid_secret_ref(secret_ref) {
             return Err(Error::Store(format!(
@@ -491,9 +501,9 @@ impl Store {
         }
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO keys(site_id, remote_id, name, secret_ref, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![site_id, remote_id, name, secret_ref, now_secs()],
+            "INSERT INTO keys(site_id, remote_id, name, secret_ref, created_at, group_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![site_id, remote_id, name, secret_ref, now_secs(), group_name],
         )
         .map_err(|e| Error::Store(format!("写入密钥记录失败: {e}")))?;
         Ok(conn.last_insert_rowid())
@@ -1026,6 +1036,50 @@ impl Store {
         Ok(hits as i64)
     }
 
+    /// **一次性数据修复**：把 `events` 表里所有老行的 `message` / `payload` 按**当前**
+    /// 脱敏规则改写一遍，返回改写的行数。
+    ///
+    /// 为什么需要（M8-S5B §7.2）：`observability::event_with_payload` 是后来才加上
+    /// 结构化脱敏的（M5-S0），在那之前写进行表的老行可能带着密钥明文，而事件表会被
+    /// 导出与审计 ⇒ 那些行是真实的泄漏面。
+    ///
+    /// **未接线（章程 §4 增量）**：本仓库唯一的调用点是
+    /// `tests/events_redaction.rs::scrub_legacy_event_rows`（`#[ignore]`）——
+    /// 生产代码里没有调用点，命令层也没有入口。去向：需要「在界面上修历史行」时
+    /// 再加一条命令（跑前自动备份 `<db>` / `-wal` / `<db>-shm`）；在那之前它是
+    /// **可复跑的一次性工具**，不是产品功能。
+    ///
+    /// **不进门禁、不自动执行**：它是数据修复，由人显式跑
+    /// （`cargo test -p keyrelay-core --test events_redaction scrub_legacy_event_rows -- --ignored`）。
+    /// 跑之前先备份数据库。
+    ///
+    /// 用真规则而不是 SQL：脱敏规则在 Rust 侧（`scrub_event_message` /
+    /// `scrub_event_payload`），SQL 复刻必然漏（猜不出 authority 边界、也不知道哪些
+    /// payload 键是敏感键）。
+    ///
+    /// 幂等：规则本身幂等，跑第二遍改写行数为 0。
+    pub fn scrub_legacy_events(&self) -> Result<usize> {
+        let rows = self.list_all_events()?;
+        let mut repaired = 0usize;
+        for row in &rows {
+            let new_message = crate::redact::scrub_event_message(&row.message);
+            let new_payload = crate::redact::scrub_event_payload(row.payload.as_deref());
+            let message_changed = new_message != row.message;
+            let payload_changed = new_payload.as_deref() != row.payload.as_deref();
+            if !message_changed && !payload_changed {
+                continue;
+            }
+            let conn = self.lock()?;
+            conn.execute(
+                "UPDATE events SET message = ?2, payload_redacted_json = ?3 WHERE id = ?1",
+                params![row.id, new_message, new_payload],
+            )
+            .map_err(|e| Error::Store(format!("改写事件行 {} 失败: {e}", row.id)))?;
+            repaired += 1;
+        }
+        Ok(repaired)
+    }
+
     /// 更新站点的健康状态。取值由调用方约定：`"unknown"` / `"ok"` / `"needs_login"`。
     ///
     /// 站点不存在时**报错**而不是静默成功：静默成功会让调用方以为状态已落库，
@@ -1301,7 +1355,7 @@ mod tests {
             .upsert_site("newapi", "https://b.example.com", "B")
             .unwrap();
         store
-            .insert_key(site, "codex/daily", "kr/key/1/secret", Some("12"))
+            .insert_key(site, "codex/daily", "kr/key/1/secret", Some("12"), None)
             .unwrap();
         assert_eq!(store.list_keys().unwrap().len(), 1);
 
@@ -1316,7 +1370,7 @@ mod tests {
             .upsert_site("newapi", "https://c.example.com", "C")
             .unwrap();
         let err = store
-            .insert_key(site, "bad", "sk-abcdefgh12345678", None)
+            .insert_key(site, "bad", "sk-abcdefgh12345678", None, None)
             .unwrap_err();
         assert!(matches!(err, Error::Store(_)));
     }
@@ -1330,17 +1384,17 @@ mod tests {
 
         // 32 位 hex 明文（复审 P2-4 探针形状）：黑名单时代会被放过
         assert!(matches!(
-            store.insert_key(site, "hex", "9f3c1a7b2e5d8046c1b9f4a7d2e83b15", None),
+            store.insert_key(site, "hex", "9f3c1a7b2e5d8046c1b9f4a7d2e83b15", None, None),
             Err(Error::Store(_))
         ));
         // 段数不对的引用
         assert!(matches!(
-            store.insert_key(site, "short", "kr/key/1", None),
+            store.insert_key(site, "short", "kr/key/1", None, None),
             Err(Error::Store(_))
         ));
         // 合法引用
         assert!(store
-            .insert_key(site, "ok", "kr/key/9/secret", None)
+            .insert_key(site, "ok", "kr/key/9/secret", None, None)
             .is_ok());
     }
 

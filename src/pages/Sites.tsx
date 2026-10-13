@@ -7,6 +7,7 @@ import {
   captchaCancel,
   captchaComplete,
   detectSite,
+  isAuthError,
   isCaptchaRequired,
   listSites,
   loginSite,
@@ -357,7 +358,11 @@ function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) 
     : balance.isLoading
       ? "…"
       : balance.isError
-        ? "（需登录）"
+        ? // 只有**确实是凭证问题**才说「（需登录）」（M8-S5B §6.9）。
+          // 超时 / 5xx / 断网都说成「需登录」，用户会去重新登录一个根本不需要登录的站点。
+          isAuthError(balance.error)
+          ? "（需登录）"
+          : "（查询失败）"
         : balance.data
           ? formatBalance(balance.data)
           : "—";
@@ -376,7 +381,10 @@ function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) 
           {healthLabel(site.health)}
         </span>
       </td>
-      <td className="mono" title={balanceReason(site, balance.data)}>
+      <td
+        className="mono"
+        title={balanceReason(site, balance.data, balance.error)}
+      >
         {balanceText}
       </td>
       <td>
@@ -408,8 +416,15 @@ function formatBalance(balance: Balance): string {
 }
 
 /** 余额列为什么显示成这样——挂在 `title` 上，避免「不可观测」被当成一个 bug。 */
-function balanceReason(site: SiteRow, balance?: Balance): string | undefined {
+function balanceReason(
+  site: SiteRow,
+  balance?: Balance,
+  error?: unknown,
+): string | undefined {
   if (!site.capabilities.balance) return "该站点类型不提供余额";
   if (balance && !balance.known) return "站点这次没有返回可用的余额";
+  // 查询失败时把**真实原因**放进 title（M8-S5B §6.9）：此前这里不处理错误，
+  // 于是用户既看到错的文案（「需登录」），也看不到真正的原因。
+  if (error instanceof Error) return error.message;
   return undefined;
 }
