@@ -1618,8 +1618,17 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// **不外流明文**的对齐操作：取回 → 写钥匙串 → 记 `secret_ref` → 只回计数。
     pub async fn sync_site_keys(&self, site_id: i64) -> Result<KeySyncSummary> {
         let site = self.site(site_id)?;
+        let kind = self.kind_of(&site)?;
+        // M7-S5 复审 P1-1：这一处**曾经漏了门**。它调的是 `adapter.list_keys`，
+        // 所以判据必须与 `list_keys()` 一致——否则同一个站点上，一个入口说
+        // 「这个站点类型不支持」、另一个说「请先登录」，而后者指向一个不存在的流程。
+        capability_gate(
+            kind,
+            crate::site::capability::capabilities(kind).list_keys,
+            "列举令牌",
+        )?;
         let session = self.session(site_id)?;
-        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        let adapter = self.registry.adapter(kind);
         let metas = adapter.list_keys(&site.base_url, &session).await?;
 
         // 本地已有的（按 remote_id 判重）。**只在同一个站点内判重**：
@@ -1724,8 +1733,15 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         remote_ids: &[String],
     ) -> Result<Vec<(String, KeyMaterial)>> {
         let site = self.site(site_id)?;
+        let kind = self.kind_of(&site)?;
+        // M7-S5 复审 P1-1：同 `sync_site_keys`——判据与 `reveal_key()` 一致。
+        capability_gate(
+            kind,
+            crate::site::capability::capabilities(kind).reveal_key,
+            "读取令牌明文",
+        )?;
         let session = self.session(site_id)?;
-        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        let adapter = self.registry.adapter(kind);
         let materials = adapter
             .reveal_keys(&site.base_url, &session, remote_ids)
             .await?;

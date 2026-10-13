@@ -877,6 +877,9 @@ pub async fn gateway_start(
     };
     if let Some(previous) = previous {
         stop_gateway(previous).await;
+        // 与 `gateway_stop` 同一条理由（M7-S5 复审 P2-1）：换网关之前先把**旧网关**的
+        // 失败落库，否则它们会被归到新会话的时间线上。
+        state.service.drain_gateway_failures();
     }
 
     let port = settings.gateway_port;
@@ -913,6 +916,16 @@ pub async fn gateway_stop(state: State<'_, AppState>) -> Result<GatewayStatusDto
         // 等端口真正释放再返回：否则调用方紧接着 start 会撞 AddrInUse
         stop_gateway(handle).await;
     }
+    // M7-S5 复审 P2-1：把网关攒下的失败**在这里落库一次**。
+    //
+    // 为什么必须在停止时落：`drain_gateway_failures` 的生产调用点原本只有 `refresh_all`，
+    // 于是「网关刚报失败、用户随即关掉应用」会让那条失败**永远进不了事件表**——
+    // 而它正是「网关为什么切换了上游」的唯一线索。
+    //
+    // 为什么在**停止**时（而不是退出时）：退出钩子拿不到 `AppState` 的可靠时机，
+    // 而 `gateway_stop` 是「这一次会话结束了」的天然边界——失败归给产生它的那次会话，
+    // 顺带解决复审指出的**归因错位**（旧会话的失败被记成当前会话的）。
+    state.service.drain_gateway_failures();
     Ok(gateway_status_of(&state))
 }
 

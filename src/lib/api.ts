@@ -408,7 +408,9 @@ const MOCK_INFO: AppInfo = {
 const MOCK_KEYS: KeyRow[] = [
   {
     remoteId: "12",
-    name: "codex/daily",
+    // 示例数据用 FR-2 的规范形态（`<app-id>/<agent-id>/<yyyymmdd>`），
+    // 免得预览里又出现一个「看着像规范、其实是占位」的旧名字（B-87）
+    name: "keyrelay/codex/20251009",
     group: "default",
     status: "enabled",
     createdAt: 1_760_000_000,
@@ -512,7 +514,7 @@ export async function listStoredKeys(): Promise<StoredKeyRow[]> {
         id: 1,
         siteId: 1,
         remoteId: "12",
-        name: "codex/daily",
+        name: "keyrelay/codex/20251009",
         group: "default",
         status: "enabled",
       },
@@ -805,7 +807,7 @@ export async function rotationPlan(keyId: number): Promise<RotationPlan> {
     return mock({
       keyId,
       siteId: 1,
-      keyName: "codex/daily",
+      keyName: "keyrelay/codex/20251009",
       steps: ["create_new", "reinject_all", "revoke_old"],
       channels: ["codex-auth-json"],
       unmappedTargets: [],

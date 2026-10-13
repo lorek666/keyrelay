@@ -931,6 +931,39 @@ fn purge_keychain_requires_confirmation_and_reports_counts() {
 }
 
 #[test]
+fn gateway_stop_drains_buffered_failures_into_the_event_log() {
+    // M7-S5 复审 P2-1：缓冲里的失败原本只在 `refresh_all` 落库，
+    // 于是「网关刚报失败、用户随即关掉应用」会让那条失败永远进不了事件表——
+    // 而它正是「网关为什么切换了上游」的唯一线索。停止网关是「这次会话结束」的
+    // 天然边界，所以在这一步 drain 一次，失败也归给产生它的那次会话。
+    let (app, webview) = build_app();
+    {
+        use tauri::Manager;
+        let state = app.state::<keyrelay_lib::AppState>();
+        state
+            .service
+            .record_gateway_failure_for_test(keyrelay_core::gateway::GatewayFailure {
+                site_id: 1,
+                status: 503,
+                model: "gpt-5.6".into(),
+            });
+    }
+
+    invoke_on(&webview, "gateway_stop", json!({})).expect("停止应成功（没在跑也要幂等）");
+
+    let events = invoke_on(&webview, "recent_events", json!({"limit": 50})).expect("读事件");
+    let drained = events
+        .as_array()
+        .expect("事件是数组")
+        .iter()
+        .any(|event| event["source"] == "gateway");
+    assert!(
+        drained,
+        "停止网关时应当把缓冲里的失败落库；实际事件：{events}"
+    );
+}
+
+#[test]
 fn site_balance_reports_unknown_without_pretending_it_is_zero() {
     // M7-S5 接线：未知余额必须**结构上**给 null，而不是 0——
     // 界面拿到 0 就会渲染成 `0.00`，而那与「不知道」是两件事。

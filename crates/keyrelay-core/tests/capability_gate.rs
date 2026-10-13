@@ -173,6 +173,64 @@ async fn unsupported_entry_points_fail_before_asking_for_a_session() {
     }
 }
 
+/// **结构守卫**：`service.rs` 里每一处 `self.session(site_id)?` 都必须在
+/// **能力门或能力短路之后**。
+///
+/// # 为什么需要这条（M7-S5 复审 P1-1 的教训）
+///
+/// 上面那条 `unsupported_entry_points_fail_before_asking_for_a_session` **手写了六个入口**，
+/// 而漏掉的 `sync_site_keys` / `reveal_keys_batch` 恰好不在那张清单里——
+/// **实现与测试共享同一个盲区**，于是它「5 passed」地看起来完全正常，
+/// 而用户点「密钥对齐」会看到「请先登录」（一个该站点类型根本没有的流程）。
+///
+/// 手写清单永远会漏。所以这条测试**扫源码**：新增入口若忘了过门，它会直接红，
+/// 而不用等下一轮复审的对抗性探针。
+#[test]
+fn every_session_use_in_service_goes_through_the_capability_gate() {
+    const SOURCE: &str = include_str!("../src/service.rs");
+
+    // 逐段切出每个函数体：按 `\n    pub ` 切、取每段到下一个同级项为止。
+    // 这不是完整的 Rust 解析器，但对「函数体在同一缩进层级里」这件事足够，
+    // 而且它**故意**保持简单——守卫的价值在于不漏，不在于精确。
+    //
+    // **必须先剥掉注释行**：本文件的说明文字里就写着 `self.session(site_id)?`
+    // 这个字样（`capability_gate` 的文档注释），不剥的话守卫会对自己误报。
+    // 这条是实测出来的——第一版没剥，守卫报了 `["fn"]`。
+    let code: String = SOURCE
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut offenders: Vec<String> = Vec::new();
+    for chunk in code.split("\n    pub ").skip(1) {
+        let Some(session_at) = chunk.find("self.session(site_id)?") else {
+            continue;
+        };
+        let head = &chunk[..session_at];
+        let name = chunk
+            .split_once("fn ")
+            .and_then(|(_, rest)| rest.split(['(', '<', ' ']).next())
+            .unwrap_or("<未知>")
+            .to_string();
+        // 允许两种形态，都必须在 `session` **之前**：
+        // ① `capability_gate(...)` —— 不支持就 `Err(Unsupported)`；
+        // ② `capabilities(kind)` —— `balance` 的短路（`Ok(unknown)`，不是错误）。
+        if !head.contains("capability_gate(") && !head.contains("capabilities(kind)") {
+            offenders.push(name);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "这些入口在拿会话之前没有过能力门（在 `custom-openai-compatible` 站点上会报\
+         「请先登录」而不是「这个站点类型不支持」）：{offenders:?}\n\
+         修法：在 `self.session(site_id)?` 之前插入 \
+         `capability_gate(kind, capabilities(kind).<能力>, \"<动作>\")?`，\
+         或者（像 `balance` 那样）短路成未知态。"
+    );
+}
+
 /// **S-2**：未知余额**不得**产生余额告警。
 ///
 /// 这是本文件最值钱的一条：阈值 30、站点余额「不可观测」。若快照里塞进
