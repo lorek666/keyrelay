@@ -68,12 +68,18 @@ impl RouteTable {
     /// → 延迟升序（`None` 排最后）→ `site_id` 升序。**同分按 `site_id` 升序**。
     ///
     /// `model` 先过 [`Self::resolve_model`]（别名映射）再与 `Upstream::models` **精确**匹配。
+    ///
+    /// **空 `models` = 未知 ⇒ 通配**（M8-S1 §4.2）：模型清单采集**默认关**，关着的时候
+    /// 每个上游的 `models` 都是空的。若把空列表解释成「谁都不服务」，路由在默认配置下
+    /// **完全不可用**（每个请求都 404）。fail-open 在这里是对的：最坏是多一次注定失败的
+    /// 尝试，由故障切换兜住；而 fail-closed 会把一个本来可用的站点从候选里摘掉。
+    /// 残差（与「该站点真的一把模型都不服务」不可区分）见 BACKLOG 与 spec 的 D-1。
     pub fn candidates(&self, model: &str) -> Vec<&Upstream> {
         let real = self.resolve_model(model);
         ordered(
             self.upstreams
                 .iter()
-                .filter(|u| u.models.iter().any(|m| m == &real)),
+                .filter(|u| u.models.is_empty() || u.models.iter().any(|m| m == &real)),
         )
     }
 
@@ -84,6 +90,75 @@ impl RouteTable {
     pub fn preferred(&self) -> Option<&Upstream> {
         ordered(self.upstreams.iter()).into_iter().next()
     }
+}
+
+/// 一个站点能服务哪些模型 + 它的成本 / 健康度（**路由表的输入**）。
+///
+/// 与 [`Upstream`] 的区别：`Upstream` 是「一次请求可用的上游」，本结构是「从站点事实推导上游」
+/// 的中间层——分开的理由是**推导要能单测**，而 `Upstream` 的构造要读钥匙串。
+///
+/// 七个字段里 `site_id` / `base_url` / `key_ref` 是**事实**（库里有），
+/// 另外四个是**观测**（`models` 来自可选的采集，`rate` / `balance_usd` / `latency_ms`
+/// 来自最近一次成功观测）。四项观测都**不落库**：重启后回到「全未知」，
+/// 排序退化成按 `site_id`（M8-S1 spec §5.1 / D-4）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct SiteFacts {
+    pub site_id: i64,
+    pub base_url: String,
+    /// 站点侧模型清单（可选采集的结果）。**空 = 未知**，语义见 [`RouteTable::candidates`]。
+    pub models: Vec<String>,
+    /// 站点倍率（`parse_rate` 的口径）。`None` = 未知，**不是** 1.0。
+    pub rate: Option<f64>,
+    /// 余额；`known == false` ⇒ `None`（**不是** `Some(0.0)`）。
+    pub balance_usd: Option<f64>,
+    /// 最近一次成功观测的延迟（到响应头为止）。`None` = 未观测。
+    pub latency_ms: Option<u64>,
+    /// 钥匙串引用。**不是**密钥明文。
+    pub key_ref: String,
+}
+
+/// 从站点事实推导路由表。**纯函数**（不读钥匙串、不联网、不读时钟）。
+///
+/// 余额未知（`None`）的站点**不得**被当成「余额为 0」而排到最后——那是把「不知道」
+/// 当成「最差」，与 `Balance.known` 的口径冲突（M7-S2 复审 S-2 花了一整条测试禁止
+/// 「未知余额被当成 0 渲染 / 告警」，路由层再犯一次就是同一件事在另一层复活）。
+///
+/// 排序**不在这里做**：`RouteTable` 只在 [`RouteTable::candidates`] / [`RouteTable::preferred`]
+/// 里排序，本函数只做映射，且**保持入参顺序**（稳定排序的性质依赖它）。
+pub fn build_route_table(facts: &[SiteFacts]) -> RouteTable {
+    RouteTable::new(
+        facts
+            .iter()
+            .map(|f| Upstream {
+                site_id: f.site_id,
+                base_url: f.base_url.clone(),
+                key_ref: f.key_ref.clone(),
+                models: f.models.clone(),
+                // **原样搬过去，不做任何 `unwrap_or` 降级**：`Option` 一路走到排序键，
+                // 由 `health_rank` 把 `None` 归进「未知」档。任何 `unwrap_or(0.0)`
+                // 都会把「不知道」变成「已耗尽」，直接改变候选顺序。
+                rate: f.rate,
+                balance_usd: f.balance_usd,
+                latency_ms: f.latency_ms,
+            })
+            .collect(),
+    )
+}
+
+/// 模型别名：agent 侧名 → 真实模型名（PRD FR-6 的「模型别名映射」）。
+///
+/// 用 `BTreeMap` 而不是 `HashMap`：遍历顺序确定（与排序的确定性同一条理由）。
+/// 重复的 alias **后者胜**（与 `BTreeMap::insert` 一致）——配置来自用户，
+/// 不该让应用因为一个重复键起不来。
+///
+/// **未接线（去向 B-110）**：别名表的**数据来源**还没有定论（用户手填？从站点模型表推导？），
+/// 所以生产上 `pairs` 恒为空。本函数已实现、已测，但**没有生产调用点**。
+pub fn alias_map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for (alias, real) in pairs {
+        map.insert((*alias).to_string(), (*real).to_string());
+    }
+    map
 }
 
 /// 候选排序：`sort_by` 是**稳定排序**，所以「连 `site_id` 都相同」的重复条目会保持入参顺序——
