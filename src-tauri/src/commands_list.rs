@@ -35,6 +35,8 @@ pub const COMMANDS: &[&str] = &[
     "gateway_stop",
     "export_bundle",
     "prune_backups",
+    // M8-S5A：FR-9:196 诊断包（此前 `service::export_diagnostics` 零生产调用点）
+    "export_diagnostics",
     // M6-S5：FR-2 / FR-7 接线
     "available_groups",
     "sync_site_keys",

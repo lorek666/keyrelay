@@ -350,6 +350,22 @@ pub struct ExportOutcome {
     pub registered: bool,
 }
 
+/// 诊断包落盘的结果（FR-9）。
+///
+/// 与 [`ExportOutcome`] 分开而不是复用：诊断包**没有加密形态**（它本来就只含脱敏后的
+/// 事件与白名单设置），`encrypted` 字段放在这里会是恒 `false` 的噪音；而 `events`
+/// 是用户在报障时唯一关心的量（「我导了几条」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticsOutcome {
+    pub path: std::path::PathBuf,
+    pub bytes: usize,
+    pub events: usize,
+    /// 是否成功登记进「已知导出物」表。语义与 [`ExportOutcome::registered`] 逐字相同：
+    /// `false` = 文件写成了，但审计从此看不到它。诊断包同样要登记——
+    /// 它落在用户磁盘上，就同样属于「本产品产物」的扫描面。
+    pub registered: bool,
+}
+
 /// 当前 unix 秒。
 ///
 /// 只给 [`KeyRelayService::dispatch_notifications`] 与 [`KeyRelayService::rotation_due`] 用：
@@ -2430,7 +2446,15 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 第一句要问的就是「你装的哪个版本、库结构是哪一版」）。设置快照走
     /// `Settings::diagnostic_snapshot()` 的白名单，**不含**代理与 webhook 的值。
     pub fn export_diagnostics(&self, limit: usize) -> Result<String> {
+        self.diagnostics_json(limit).map(|(text, _)| text)
+    }
+
+    /// 与 [`Self::export_diagnostics`] 同一份产物，但**同时给出事件条数**——
+    /// 落盘路径要把它回报给界面（`DiagnosticsOutcome::events`），
+    /// 而条数在序列化之后就数不出来了（不重新解析一遍 JSON 的前提下）。
+    fn diagnostics_json(&self, limit: usize) -> Result<(String, usize)> {
         let events = self.recent_events(limit)?;
+        let count = events.len();
         let rows: Vec<serde_json::Value> = events
             .into_iter()
             .map(|row| {
@@ -2448,7 +2472,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .collect();
         let settings = self.settings()?;
         let schema = self.store.schema_version()?;
-        serde_json::to_string_pretty(&serde_json::json!({
+        let mut value = serde_json::json!({
             "vault_backend": self.vault.backend_name(),
             "home": self.home.display().to_string(),
             "version": {
@@ -2459,8 +2483,64 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             },
             "settings": settings.diagnostic_snapshot(),
             "events": rows,
-        }))
-        .map_err(|e| Error::Store(format!("导出诊断失败: {e}")))
+        });
+        // 上面那行文档注释承诺的「再过一遍」曾经**只是注释**（DEBUG 报告 §1.6 同族的
+        // 「注释说了、代码没做」）：修 P2-1 时给配置导出加了结构化 URL 掩码，诊断包这条
+        // 出口漏在外面。`scrub_event_*` 只做文本级，抓不到**不带 scheme 的 userinfo**
+        // 形态（`custom_openai::host_of` 那一类历史数据），所以结构化这层必须补上。
+        crate::redact::mask_url_userinfo_in_json(&mut value);
+        serde_json::to_string_pretty(&value)
+            .map(|text| (text, count))
+            .map_err(|e| Error::Store(format!("导出诊断失败: {e}")))
+    }
+
+    /// 诊断包落盘（FR-9:196）。**这是 `export_diagnostics` 的第一个生产调用点**——
+    /// 在此之前它只有测试在调，`M7-收口记录` 却把它记成已交付（DEBUG 报告 §1.6）。
+    ///
+    /// 与 [`Self::export_to_file`] 同一套纪律，逐条对齐：
+    /// ① 先建父目录；② 写文件；③ 登记进「已知导出物」；④ 登记失败**不回滚文件**但留痕并把
+    /// `registered=false` 带回界面。加密形态不存在——诊断包不含密钥（设置快照走白名单）。
+    pub fn export_diagnostics_to_file(
+        &self,
+        path: &std::path::Path,
+        limit: usize,
+    ) -> Result<DiagnosticsOutcome> {
+        let (text, events) = self.diagnostics_json(limit)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Store(format!("创建导出目录失败: {e}")))?;
+        }
+        std::fs::write(path, &text).map_err(|e| Error::Store(format!("写入诊断包失败: {e}")))?;
+
+        let registered = match self.store.record_export(path, false, text.len()) {
+            Ok(()) => true,
+            Err(e) => {
+                self.log(observability::event(
+                    Level::Error,
+                    "app",
+                    format!("登记诊断包失败（审计将看不到这个文件）: {e}"),
+                ));
+                false
+            }
+        };
+
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "app",
+            "已导出诊断包（脱敏）",
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "bytes": text.len(),
+                "events": events,
+                "registered": registered,
+            }),
+        ));
+        Ok(DiagnosticsOutcome {
+            path: path.to_path_buf(),
+            bytes: text.len(),
+            events,
+            registered,
+        })
     }
 
     /// 写事件。**故意不向上传播失败**：可观测性坏掉不该让业务操作失败。

@@ -181,6 +181,8 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::gateway_stop,
             commands::export_bundle,
             commands::prune_backups,
+            // M8-S5A：FR-9:196 诊断包
+            commands::export_diagnostics,
             // M6-S5：FR-2 / FR-7 接线
             commands::available_groups,
             commands::sync_site_keys,

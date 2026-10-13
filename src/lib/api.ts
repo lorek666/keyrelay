@@ -307,6 +307,16 @@ export type ExportResult = {
 
 export type PruneResult = { removed: number };
 
+/** 诊断包落盘结果（FR-9:196）。与 `ExportResult` 分开：诊断包**没有加密形态**。 */
+export type DiagnosticsResult = {
+  path: string;
+  bytes: number;
+  /** 实际写进去的事件条数。 */
+  events: number;
+  /** 语义同 `ExportResult.registered`：`false` = 审计看不到这个文件。 */
+  registered: boolean;
+};
+
 export type LoginArgs = {
   siteId: number;
   username: string;
@@ -646,6 +656,27 @@ export async function exportBundle(
 export async function pruneBackups(keep: number): Promise<PruneResult> {
   if (!hasTauri) return mock({ removed: 0 });
   return invokeCommand<PruneResult>("prune_backups", { args: { keep } });
+}
+
+/**
+ * 导出诊断包（FR-9:196）。**脱敏后的**事件表 + 白名单设置快照 + 版本信息。
+ *
+ * 与「导出配置」的区别：配置导出是给**迁移**用的（站点与密钥元数据），
+ * 诊断包是给**报障**用的（最近发生了什么 + 你装的哪个版本）。
+ * 两者都不含密钥本体，但只有配置导出有加密形态。
+ */
+export async function exportDiagnostics(limit?: number): Promise<DiagnosticsResult> {
+  if (!hasTauri) {
+    return mock({
+      path: "/Users/you/.keyrelay/exports/keyrelay-diagnostics-mock.json",
+      bytes: 4096,
+      events: 200,
+      registered: true,
+    });
+  }
+  return invokeCommand<DiagnosticsResult>("export_diagnostics", {
+    args: { limit: limit ?? null },
+  });
 }
 
 export async function auditRedaction(): Promise<AuditReport> {

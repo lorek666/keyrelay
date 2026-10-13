@@ -33,6 +33,7 @@
     "allow-gateway-stop",
     "allow-export-bundle",
     "allow-prune-backups",
+    "allow-export-diagnostics",
     "allow-available-groups",
     "allow-sync-site-keys",
     "allow-rotation-due",

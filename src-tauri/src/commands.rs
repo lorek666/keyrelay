@@ -373,6 +373,33 @@ pub struct PruneArgs {
     keep: usize,
 }
 
+/// 诊断包默认带上多少条事件。
+///
+/// **PRD FR-9:196 逐字规定「最近 500 条事件」**——这里不是随手挑的数：
+/// 报障时用户往往是在「刷新完一圈之后」来导包的，条数少了会把出事那几轮挤出去。
+/// 上限由核心层 `recent_events` 夹到 1000。
+const DEFAULT_DIAGNOSTIC_EVENTS: usize = 500;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsResultDto {
+    path: String,
+    bytes: usize,
+    /// 实际写进去的事件条数（用户报障时第一句会问「带了多少条」）。
+    events: usize,
+    /// 是否登记进「已知导出物」表。`false` = 文件写成了，但**审计看不到它**。
+    registered: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsArgs {
+    /// 事件条数上限（缺省 500 = PRD FR-9:196 的口径）。
+    limit: Option<usize>,
+    /// 缺省写到 `~/.keyrelay/exports/keyrelay-diagnostics-<时间戳>.json`
+    path: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeliveryArgs {
@@ -939,16 +966,7 @@ pub fn export_bundle(
 ) -> Result<ExportResultDto, String> {
     let path = match args.path {
         Some(path) if !path.trim().is_empty() => std::path::PathBuf::from(path),
-        _ => {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            crate::home_dir()
-                .join(".keyrelay")
-                .join("exports")
-                .join(format!("keyrelay-export-{stamp}.json"))
-        }
+        _ => default_export_path("keyrelay-export"),
     };
     state
         .service
@@ -957,6 +975,48 @@ pub fn export_bundle(
             path: outcome.path.display().to_string(),
             encrypted: outcome.encrypted,
             bytes: outcome.bytes,
+            registered: outcome.registered,
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// `~/.keyrelay/exports/<prefix>-<unix 秒>.json`。
+///
+/// 抽出来是因为配置导出与诊断包**必须落在同一个目录**：两者都会被登记进
+/// 「已知导出物」表、都会被 `audit_redaction` 扫到，散在两个目录只会让用户
+/// 在报障时找错地方。
+fn default_export_path(prefix: &str) -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    crate::home_dir()
+        .join(".keyrelay")
+        .join("exports")
+        .join(format!("{prefix}-{stamp}.json"))
+}
+
+/// 导出诊断包（FR-9:196）。**脱敏后的**事件表 + 白名单设置快照 + 版本信息。
+///
+/// 这条命令是 DEBUG 报告 §1.6 的正面处置：`service::export_diagnostics` 当时
+/// 只有测试在调，界面与命令层都没有入口——于是「诊断包」在 PRD 里是已交付，
+/// 在用户手里不存在。
+#[tauri::command]
+pub fn export_diagnostics(
+    state: State<'_, AppState>,
+    args: DiagnosticsArgs,
+) -> Result<DiagnosticsResultDto, String> {
+    let path = match args.path {
+        Some(path) if !path.trim().is_empty() => std::path::PathBuf::from(path),
+        _ => default_export_path("keyrelay-diagnostics"),
+    };
+    state
+        .service
+        .export_diagnostics_to_file(&path, args.limit.unwrap_or(DEFAULT_DIAGNOSTIC_EVENTS))
+        .map(|outcome| DiagnosticsResultDto {
+            path: outcome.path.display().to_string(),
+            bytes: outcome.bytes,
+            events: outcome.events,
             registered: outcome.registered,
         })
         .map_err(|e| e.to_string())

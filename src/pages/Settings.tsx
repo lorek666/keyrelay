@@ -6,6 +6,7 @@ import {
   auditRedaction,
   autostartStatus,
   exportBundle,
+  exportDiagnostics,
   getSettings,
   pruneBackups,
   purgeKeychain,
@@ -59,6 +60,25 @@ function ExportCard() {
     onError: (err: Error) => setError(err.message),
   });
 
+  // FR-9:196 诊断包。在此之前 `service::export_diagnostics` 只有测试在调，
+  // 命令层与界面都没有入口——PRD 里算已交付，用户手里不存在。
+  const diagnostics = useMutation({
+    mutationFn: () => exportDiagnostics(),
+    onSuccess: (r) => {
+      setError(null);
+      setResult(
+        `已导出诊断包到 ${r.path}（${r.events} 条事件，${r.bytes} 字节）` +
+          (r.registered
+            ? ""
+            : "。注意：这个文件没能登记进「已知导出物」表，脱敏审计不会扫描它。"),
+      );
+    },
+    onError: (err: Error) => {
+      setResult(null);
+      setError(err.message);
+    },
+  });
+
   return (
     <div className="card">
       <h3>导出与备份</h3>
@@ -66,6 +86,11 @@ function ExportCard() {
         导出的是站点、密钥**元数据**、同意记录与设置。
         <strong>密钥本体不在导出物里</strong>——它只存在于系统钥匙串。
         因此加密保护的是元数据（站点地址、密钥名称），不是密钥。
+      </p>
+      <p className="muted">
+        「导出诊断包」是给<strong>报障</strong>用的另一份产物：最近的事件（已脱敏）+
+        设置快照（<strong>不含</strong>代理与 Webhook 的值，只标「配没配」）+ 版本与库结构。
+        它<strong>不含密钥本体</strong>，所以没有加密形态。
       </p>
       <label className="field">
         <span>导出密码（留空 = 明文导出）</span>
@@ -93,6 +118,14 @@ function ExportCard() {
           onClick={() => prune.mutate()}
         >
           {prune.isPending ? "清理中…" : "清理历史备份（保留最近 10 个）"}
+        </button>
+        <button
+          type="button"
+          className="btn"
+          disabled={diagnostics.isPending}
+          onClick={() => diagnostics.mutate()}
+        >
+          {diagnostics.isPending ? "导出中…" : "导出诊断包"}
         </button>
       </div>
       {result ? <p className="ok" role="status">{result}</p> : null}
