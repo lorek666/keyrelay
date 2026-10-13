@@ -173,6 +173,15 @@ h2 {
   margin-top: 6px;
 }
 
+/* 解绑结果（M8-S4 §5.4）。四态文案都在里面，所以用「结果盒子」而不是一行提示：
+   同一段里可以同时有「解开了 2 条」「回收成功 1 把」「回收失败 1 把」。 */
+.okbox {
+  border: 1px solid var(--ok, #2ea043);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 10px 0;
+}
+
 .health-enabled {
   color: #7ee787;
 }

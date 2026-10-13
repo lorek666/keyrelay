@@ -180,6 +180,9 @@ pub struct DeliveryPlanDto {
     channel: String,
     target_path: String,
     target_exists: bool,
+    /// `"site"` | `"gateway"`（M8-S4 §6.6）。网关模式下写进去的是**本地令牌**，
+    /// 而两种模式的字段名一模一样（`apiKey` / `apiBase`）⇒ 不说用户分不清。
+    mode: String,
     fields: Vec<DeliveryFieldDto>,
     /// **已脱敏**的 diff 预览
     preview: String,
@@ -332,6 +335,12 @@ pub struct GatewayStatusDto {
     /// 本地令牌：**只在这里返回给 UI 显示**，不写日志、不入库。
     token: Option<String>,
     site: Option<String>,
+    /// 令牌是否**已持久化**（M8-S4 §6.4 第 5 条）。
+    ///
+    /// `false` = 临时令牌（钥匙串不可用），**重启后会变** ⇒ 指向网关的通道需要重新投递。
+    /// 降级必须说出来：不说的话用户会以为「换站零改动」成立了，直到 agent 开始 401。
+    /// 取值是**最近一次**装配 / 轮换的结果（网关没在跑时也照报）。
+    token_persistent: bool,
 }
 
 #[derive(Deserialize)]
@@ -408,6 +417,11 @@ pub struct DeliveryArgs {
     /// 模型名（可缺）。Continue 通道必须有：Continue 的 schema 把条目的 `model` 定为必填。
     /// 只有预览与投递两条命令读它；同意的授予 / 撤销与模型名无关。
     model: Option<String>,
+    /// 投递模式（M8-S4 §6.2）：`"site"`（默认，缺省即此）或 `"gateway"`。
+    ///
+    /// 缺省 = 站点模式 ⇒ **既有调用点的行为一字不变**。认不出的取值直接拒绝，
+    /// 不静默回退（回退会把「指向网关」的请求当成站点投递）。
+    mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -553,9 +567,20 @@ pub fn delivery_plan(
     args: DeliveryArgs,
 ) -> Result<DeliveryPlanDto, String> {
     let channel = parse_channel(&args.channel)?;
+    // 模式解析与端点都在**动手之前**：`"gateway"` 但网关没在跑 ⇒ 在这里拒绝，
+    // 而不是写出一个指向空地址的配置。
+    let mode = parse_delivery_mode(args.mode.as_deref())?;
+    let endpoint = match mode {
+        keyrelay_core::delivery::DeliveryMode::Site => None,
+        keyrelay_core::delivery::DeliveryMode::LocalGateway => Some(gateway_endpoint_of(&state)?),
+    };
+    let source = match &endpoint {
+        Some(endpoint) => keyrelay_core::delivery::DeliverySource::Gateway(endpoint),
+        None => keyrelay_core::delivery::DeliverySource::Site,
+    };
     state
         .service
-        .delivery_plan_with_model(args.key_id, channel, args.model.as_deref())
+        .delivery_plan_in(args.key_id, channel, args.model.as_deref(), source)
         .map(|plan| {
             let (consent, granted_at, revoked_at) = match plan.consent {
                 ConsentState::Missing => ("missing", None, None),
@@ -572,6 +597,7 @@ pub fn delivery_plan(
                 channel: plan.channel.as_str().to_string(),
                 target_path: plan.target_path.display().to_string(),
                 target_exists: plan.target_exists,
+                mode: plan.mode.as_str().to_string(),
                 fields: plan
                     .fields
                     .into_iter()
@@ -655,9 +681,18 @@ pub fn apply_delivery(
     args: DeliveryArgs,
 ) -> Result<DeliveryOutcomeDto, String> {
     let channel = parse_channel(&args.channel)?;
+    let mode = parse_delivery_mode(args.mode.as_deref())?;
+    let endpoint = match mode {
+        keyrelay_core::delivery::DeliveryMode::Site => None,
+        keyrelay_core::delivery::DeliveryMode::LocalGateway => Some(gateway_endpoint_of(&state)?),
+    };
+    let source = match &endpoint {
+        Some(endpoint) => keyrelay_core::delivery::DeliverySource::Gateway(endpoint),
+        None => keyrelay_core::delivery::DeliverySource::Site,
+    };
     state
         .service
-        .apply_delivery_with_model(args.key_id, channel, args.model.as_deref())
+        .apply_delivery_in(args.key_id, channel, args.model.as_deref(), source)
         .map(|outcome| DeliveryOutcomeDto {
             channel: outcome.channel.as_str().to_string(),
             target_path: outcome.target_path.display().to_string(),
@@ -825,11 +860,18 @@ pub fn update_settings(
 // ============================================ 网关 / 导出 / 备份清理（M4-S2）
 
 fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
+    // 「令牌是不是持久的」两个分支都用**同一个来源**：服务上「最近一次装配 / 轮换」的结果。
+    // 网关没在跑时它不是「没意义」，而是「最近一次的结果」——冷启动时可能是 `false`
+    // （本次会话还没装配过），而界面只在 `running` 时显示这个字段，所以不会有误导。
+    // 反过来，如果这里硬编码 `false`，一次成功的「重新生成令牌」就会在停止状态下
+    // 被报成「临时令牌」——那才是真的在说假话。
+    let token_persistent = state.service.gateway_token_persistent();
     let empty = GatewayStatusDto {
         running: false,
         url: None,
         token: None,
         site: None,
+        token_persistent,
     };
     let Ok(guard) = state.gateway.lock() else {
         return empty;
@@ -840,8 +882,46 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             url: Some(handle.local_url()),
             token: Some(handle.token.clone()),
             site: Some(handle.site_display_name.clone()),
+            token_persistent,
         },
         None => empty,
+    }
+}
+
+/// 运行中网关的「指向网关」端点：`<local_url>/v1` + 本地令牌（M8-S4 §6.1）。
+///
+/// 拼 `/v1` 是硬要求：网关只服务 `/health` 与 `/v1/*`，而 `local_url()` 没有路径段。
+/// 少拼一次的表现是「投递成功、agent 404」——那是最难查的一类失败。
+///
+/// 网关没在跑 ⇒ 明确拒绝：此时**没有**可信的地址可写（端口来自设置，但网关没跑时
+/// 写下去只会让 agent 连不上）。这不是限制，是把「指向网关」的定义执行到底。
+fn gateway_endpoint_of(
+    state: &State<'_, AppState>,
+) -> Result<keyrelay_core::delivery::GatewayEndpoint, String> {
+    let guard = state
+        .gateway
+        .lock()
+        .map_err(|_| "网关状态锁失效（需要重启应用）".to_string())?;
+    let handle = guard.as_ref().ok_or_else(|| {
+        "本地网关没有在运行：请先在「网关」页启动它，再把通道改为指向网关。".to_string()
+    })?;
+    Ok(keyrelay_core::delivery::GatewayEndpoint {
+        base_url: format!("{}/v1", handle.local_url()),
+        token: handle.token.clone(),
+    })
+}
+
+/// 解析投递模式。`None` / 空 / `"site"` ⇒ 站点模式（**既有调用点的行为一字不变**）。
+///
+/// 认不出的取值 ⇒ `Err`，**不**回退成默认：静默回退会让「指向网关」的请求被当成站点投递，
+/// 而用户以为已经切过去了。
+fn parse_delivery_mode(raw: Option<&str>) -> Result<keyrelay_core::delivery::DeliveryMode, String> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("site") => Ok(keyrelay_core::delivery::DeliveryMode::Site),
+        Some("gateway") => Ok(keyrelay_core::delivery::DeliveryMode::LocalGateway),
+        Some(other) => Err(format!(
+            "未知的投递模式 {other:?}；只支持 \"site\" 与 \"gateway\""
+        )),
     }
 }
 
@@ -926,6 +1006,80 @@ pub async fn gateway_start(
         url: Some(handle.local_url()),
         token: Some(handle.token.clone()),
         site: Some(handle.site_display_name.clone()),
+        token_persistent: state.service.gateway_token_persistent(),
+    };
+    if let Ok(mut guard) = state.gateway.lock() {
+        *guard = Some(handle);
+    }
+    Ok(status)
+}
+
+/// **显式轮换**网关本地令牌（M8-S4 §6.4 第 4 条）。
+///
+/// # 为什么必须「换令牌 + 重启网关」在一个命令里
+///
+/// 令牌写在两处：钥匙串（下次启动读它）与运行中的网关（内存里那一份）。
+/// 只换钥匙串 ⇒ 运行中的网关仍用旧令牌，而 agent 配置与网关不一致；
+/// 只重启网关 ⇒ 令牌没变，等于没轮换。两件事分开做就会出现上面两种中间态，
+/// 所以合成一个命令：**先换、再停、再启**（用同一组 `site_id` / `key_id`）。
+///
+/// # 不动 agent 配置
+///
+/// 轮换后旧令牌立即失效 ⇒ 指向网关的通道**需要重新投递**（界面提示）。
+/// 这与「换站」是两件事：换站靠令牌稳定做到零改动（§6.5），轮换是用户显式
+/// 作废令牌的动作，本来就该重新投递一次。
+///
+/// 网关没在跑时只换钥匙串里的那一份（下一次启动自然用新的），不需要 `site_id` / `key_id`。
+#[tauri::command]
+pub async fn gateway_rotate_token(
+    state: State<'_, AppState>,
+    args: Option<GatewayStartArgs>,
+) -> Result<GatewayStatusDto, String> {
+    let _op = state.gateway_op.lock().await;
+
+    // ① 先换钥匙串里那一份。**失败即中止**（不重启）：否则用户以为换掉了，
+    //    而重启后会读到旧令牌（或者第三把），状态与预期不符。
+    state
+        .service
+        .rotate_gateway_token()
+        .map_err(|e| e.to_string())?;
+
+    // ② 网关没在跑 ⇒ 到此为止（下一次启动用新令牌）。
+    let running = match state.gateway.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => None,
+    };
+    let Some(handle) = running else {
+        return Ok(gateway_status_of(&state));
+    };
+
+    // ③ 重启：先停（等端口释放）→ 再按**同一组**站点/密钥启。
+    //    取不到参数就明确拒绝：把「轮换」做成「顺手把网关关掉」是最坏的结果。
+    let args = args.ok_or_else(|| {
+        "轮换令牌需要同时重启网关，请从「网关」页触发（缺少站点与密钥参数）".to_string()
+    })?;
+    stop_gateway(handle).await;
+    state.service.drain_gateway_failures();
+    state.service.end_gateway_session();
+
+    let port = state
+        .service
+        .settings()
+        .map_err(|e| e.to_string())?
+        .gateway_port;
+    let config = state
+        .service
+        .gateway_config(args.site_id, args.key_id, port)
+        .map_err(|e| e.to_string())?;
+    let handle = keyrelay_core::gateway::start(config)
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = GatewayStatusDto {
+        running: true,
+        url: Some(handle.local_url()),
+        token: Some(handle.token.clone()),
+        site: Some(handle.site_display_name.clone()),
+        token_persistent: state.service.gateway_token_persistent(),
     };
     if let Ok(mut guard) = state.gateway.lock() {
         *guard = Some(handle);
@@ -1404,7 +1558,7 @@ pub async fn revoke_key(
     site_id: i64,
     remote_id: String,
     confirm: bool,
-) -> Result<(), String> {
+) -> Result<RevokeReportDto, String> {
     if !confirm {
         return Err("回收站点侧密钥需要二次确认".to_string());
     }
@@ -1412,6 +1566,37 @@ pub async fn revoke_key(
         .service
         .revoke_key(site_id, &remote_id)
         .await
+        .map(RevokeReportDto::from)
+        .map_err(|e| e.to_string())
+}
+
+/// 解绑一个 agent 与它的密钥（FR-2:115 / M8-S4 §5.4）。
+///
+/// # 两个参数是**两件事**
+///
+/// - `also_revoke = false`（默认）：纯本地动作，**一个站点请求都不发**；
+/// - `also_revoke = true`：顺带把站点侧那把 key 也删掉（**不可逆**）⇒ 必须 `confirm = true`。
+///
+/// `confirm` 只对 `also_revoke == true` 强制：解绑本身可恢复（行保留、再投递即可），
+/// 给它加一道二次确认只会让日常操作变烦；而站点侧删除没有撤销入口。
+#[tauri::command]
+pub async fn unbind_agent(
+    state: State<'_, AppState>,
+    agent_id: String,
+    also_revoke: bool,
+    confirm: bool,
+) -> Result<UnbindOutcomeDto, String> {
+    if also_revoke && !confirm {
+        return Err(
+            "「同时回收站点侧的密钥」不可逆，需要二次确认；若只想解除本机绑定，请取消勾选。"
+                .to_string(),
+        );
+    }
+    state
+        .service
+        .unbind(&agent_id, also_revoke)
+        .await
+        .map(UnbindOutcomeDto::from)
         .map_err(|e| e.to_string())
 }
 
@@ -1447,6 +1632,57 @@ pub struct KeychainPurgeDto {
     failed: usize,
     /// 第一条失败的文案（已脱敏）。没有失败时为 `null`。
     first_error: Option<String>,
+}
+
+/// 一次**回收**（站点侧删除）的回报（B-100 / M8-S4 §7）。
+///
+/// 两个布尔值必须分开给界面：`revoked = true` + `localStatusUpdated = false` 是
+/// 「站点侧已经删了（不可逆），但本地记账没写上」——**整体仍然是成功**，
+/// 界面要说的是「已回收，但本地状态没记上」，而不是「回收失败」。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevokeReportDto {
+    site_id: i64,
+    remote_id: Option<String>,
+    revoked: bool,
+    local_status_updated: bool,
+    note: Option<String>,
+}
+
+impl From<keyrelay_core::service::RevokeReport> for RevokeReportDto {
+    fn from(report: keyrelay_core::service::RevokeReport) -> Self {
+        Self {
+            site_id: report.site_id,
+            remote_id: report.remote_id,
+            revoked: report.revoked,
+            local_status_updated: report.local_status_updated,
+            note: report.note,
+        }
+    }
+}
+
+/// 一次解绑的结果（M8-S4 §5.4 第 4 条：**四种文案**都要能说出来）。
+///
+/// `unbound` / `alreadyUnbound` / `revoked` 三者互相独立：
+/// 「这次新解开了 2 条」「本来就是解绑状态」「回收成功 1 把、失败 1 把」可以同时成立。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnbindOutcomeDto {
+    unbound: usize,
+    already_unbound: usize,
+    revoked: Vec<RevokeReportDto>,
+    note: Option<String>,
+}
+
+impl From<keyrelay_core::service::UnbindOutcome> for UnbindOutcomeDto {
+    fn from(outcome: keyrelay_core::service::UnbindOutcome) -> Self {
+        Self {
+            unbound: outcome.unbound,
+            already_unbound: outcome.already_unbound,
+            revoked: outcome.revoked.into_iter().map(Into::into).collect(),
+            note: outcome.note,
+        }
+    }
 }
 
 /// 落盘一份环境/自启计划。
@@ -1628,6 +1864,10 @@ mod tests {
             channel: "codex-auth-json".into(),
             target_path: "/home/u/.codex/auth.json".into(),
             target_exists: false,
+            // M8-S4 §6.6：模式必须到线上字段名上（界面靠它区分「写的是站点密钥还是本地令牌」）。
+            mode: keyrelay_core::delivery::DeliveryMode::Site
+                .as_str()
+                .to_string(),
             fields: vec![
                 DeliveryFieldDto {
                     key: "auth_mode".into(),
@@ -1655,6 +1895,7 @@ mod tests {
         assert_eq!(value["agentId"], "codex");
         assert_eq!(value["targetPath"], "/home/u/.codex/auth.json");
         assert_eq!(value["targetExists"], false);
+        assert_eq!(value["mode"], "site", "模式必须到线上字段名上");
         assert_eq!(value["fields"][1]["key"], "OPENAI_API_KEY");
         assert_eq!(value["fields"][1]["masked"], "…cdef");
         assert_eq!(value["consent"], "missing");

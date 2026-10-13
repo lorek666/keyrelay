@@ -50,4 +50,7 @@ pub const COMMANDS: &[&str] = &[
     "purge_keychain",
     "detect_unmanaged_targets",
     "suggest_key_name",
+    // M8-S4：解绑（FR-2:115）、网关令牌轮换（§6.4）
+    "unbind_agent",
+    "gateway_rotate_token",
 ];

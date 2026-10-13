@@ -151,6 +151,13 @@ export type DeliveryPlan = {
   channel: string;
   targetPath: string;
   targetExists: boolean;
+  /**
+   * `"site"` | `"gateway"`（M8-S4 §6.6）。
+   *
+   * 网关模式下写进去的是**本地网关令牌**，不是站点密钥——两种模式的字段名一模一样
+   * （`apiKey` / `apiBase`）⇒ 界面不把模式说出来，用户就分不清。
+   */
+  mode: DeliveryMode;
   fields: DeliveryField[];
   /** 已脱敏的 diff 预览 */
   preview: string;
@@ -168,6 +175,9 @@ export type DeliveryPlan = {
   /** 生效策略。文案由这个取值派生，**不得**在页面里按通道判断。 */
   restartHint: RestartHint;
 };
+
+/** 投递模式（M8-S4 §6.2）。缺省 = `"site"`：既有调用点的行为一字不变。 */
+export type DeliveryMode = "site" | "gateway";
 
 export type ConsentRow = {
   agentId: string;
@@ -292,6 +302,34 @@ export type GatewayStatus = {
   /** 本地令牌：只在界面上显示给用户，用于配置 agent 连本地网关 */
   token?: string | null;
   site?: string | null;
+  /**
+   * 令牌是否已持久化（M8-S4 §6.4 第 5 条）。
+   *
+   * `false` = 临时令牌（钥匙串不可用），**重启后会变** ⇒ 指向网关的通道需要重新投递。
+   * 这是**降级**，必须显示出来——不说的话用户会以为「换站零改动」成立了，直到 agent 开始 401。
+   */
+  tokenPersistent: boolean;
+};
+
+/** 一次回收（站点侧删除）的回报（B-100）。 */
+export type RevokeReport = {
+  siteId: number;
+  remoteId?: string | null;
+  /** 站点侧确认删除（不可逆） */
+  revoked: boolean;
+  /** 本地 `keys.status` 是否写上 */
+  localStatusUpdated: boolean;
+  note?: string | null;
+};
+
+/** 一次解绑的结果（M8-S4 §5.4）。三者互相独立，界面要分别说。 */
+export type UnbindOutcome = {
+  /** 本次新标记的行数（幂等：二次调用为 0） */
+  unbound: number;
+  /** 本次看到但早已解绑的行数 */
+  alreadyUnbound: number;
+  revoked: RevokeReport[];
+  note?: string | null;
 };
 
 export type ExportResult = {
@@ -335,6 +373,12 @@ export type DeliveryArgs = {
   channel: string;
   /** 模型名。Continue 通道必填（留空 = 沿用上次投递写下的）；其余通道不读它。 */
   model?: string;
+  /**
+   * 投递模式（M8-S4 §6.2）。缺省 = `"site"`（既有行为一字不变）。
+   *
+   * `"gateway"` 时后端要求网关**正在运行**：此时才有一个可信的本地地址可写。
+   */
+  mode?: DeliveryMode;
 };
 
 const hasTauri =
@@ -435,6 +479,7 @@ const MOCK_PLAN: DeliveryPlan = {
   channel: "codex-auth-json",
   targetPath: "/Users/you/.codex/auth.json",
   targetExists: true,
+  mode: "site",
   fields: [
     { key: "auth_mode", masked: "apikey" },
     { key: "OPENAI_API_KEY", masked: "…cdef" },
@@ -608,7 +653,13 @@ export async function recentEvents(limit = 100): Promise<EventRow[]> {
 
 export async function gatewayStatus(): Promise<GatewayStatus> {
   if (!hasTauri) {
-    return mock({ running: false, url: null, token: null, site: null });
+    return mock({
+      running: false,
+      url: null,
+      token: null,
+      site: null,
+      tokenPersistent: false,
+    });
   }
   return invokeCommand<GatewayStatus>("gateway_status");
 }
@@ -623,6 +674,7 @@ export async function gatewayStart(
       url: "http://127.0.0.1:8787",
       token: "kr-gw-mock0000000000000000000000000",
       site: "示例中转站（mock）",
+      tokenPersistent: true,
     });
   }
   return invokeCommand<GatewayStatus>("gateway_start", {
@@ -632,7 +684,13 @@ export async function gatewayStart(
 
 export async function gatewayStop(): Promise<GatewayStatus> {
   if (!hasTauri) {
-    return mock({ running: false, url: null, token: null, site: null });
+    return mock({
+      running: false,
+      url: null,
+      token: null,
+      site: null,
+      tokenPersistent: false,
+    });
   }
   return invokeCommand<GatewayStatus>("gateway_stop");
 }
@@ -901,9 +959,76 @@ export async function revokeKey(
   siteId: number,
   remoteId: string,
   confirm: boolean,
-): Promise<void> {
-  if (!hasTauri) return mock(undefined);
-  return invokeCommand<void>("revoke_key", { siteId, remoteId, confirm });
+): Promise<RevokeReport> {
+  if (!hasTauri) {
+    return mock({
+      siteId,
+      remoteId,
+      revoked: true,
+      localStatusUpdated: true,
+      note: null,
+    });
+  }
+  return invokeCommand<RevokeReport>("revoke_key", { siteId, remoteId, confirm });
+}
+
+/**
+ * 解绑一个 agent 与它的密钥（FR-2:115 / M8-S4 §5.4）。
+ *
+ * `alsoRevoke` 是**另一件事**：`false`（默认）纯本地、一个站点请求都不发；
+ * `true` 顺带把站点侧那把 key 删掉（不可逆）⇒ 后端强制 `confirm === true`。
+ */
+export async function unbindAgent(
+  agentId: string,
+  alsoRevoke: boolean,
+  confirm: boolean,
+): Promise<UnbindOutcome> {
+  if (!hasTauri) {
+    return mock({
+      unbound: 1,
+      alreadyUnbound: 0,
+      revoked: alsoRevoke
+        ? [
+            {
+              siteId: 1,
+              remoteId: "mock-remote-1",
+              revoked: true,
+              localStatusUpdated: true,
+              note: null,
+            },
+          ]
+        : [],
+      note: null,
+    });
+  }
+  return invokeCommand<UnbindOutcome>("unbind_agent", {
+    agentId,
+    alsoRevoke,
+    confirm,
+  });
+}
+
+/**
+ * 显式轮换网关本地令牌（M8-S4 §6.4）。
+ *
+ * 后端把「换令牌 + 重启网关」合成一个动作：只换钥匙串会让运行中的网关与 agent 配置不一致，
+ * 只重启等于没轮换。轮换后旧令牌立即失效 ⇒ **指向网关的通道需要重新投递**。
+ *
+ * 网关没在跑时只换钥匙串里那一份（`args` 可以不给）。
+ */
+export async function gatewayRotateToken(
+  args?: { siteId: number; keyId: number },
+): Promise<GatewayStatus> {
+  if (!hasTauri) {
+    return mock({
+      running: false,
+      url: null,
+      token: null,
+      site: null,
+      tokenPersistent: true,
+    });
+  }
+  return invokeCommand<GatewayStatus>("gateway_rotate_token", { args: args ?? null });
 }
 
 export type KeychainPurgeReport = {

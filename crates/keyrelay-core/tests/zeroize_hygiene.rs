@@ -199,13 +199,31 @@ fn the_vault_is_read_through_exactly_one_choke_point() {
 }
 
 #[test]
-fn the_plaintext_choke_point_is_documented_as_covered() {
-    // 「已实现但没接线的部分必须显式声明」（M8-S0 §4 增量①）：
-    // `GatewayConfig::api_key` 仍是裸 `String`（`gateway.rs` 属 M8-S1 写域），
-    // 所以网关那条路径上的一次副本没有被包住。代码里必须留着这句话。
-    let source = include_str!("../src/service.rs");
+fn the_gateway_config_copy_is_wrapped_too() {
+    // 这条守卫的**前身**断言的是「必须留着那句未接线声明」：M8-S5A 时期
+    // `GatewayConfig::api_key` 还是裸 `String`，于是 `service.rs` 里那次 `.to_string()`
+    // 产生了一个未清零的副本，代码里必须写明去向（M8-S1 章程 §3.5 第 13 行）。
+    // M8-S4 把类型换成 `Zeroizing<String>` 之后那句声明消失——守卫随之换向：
+    // 从「声明未接线」变成「**接线不许回退**」。
+    //
+    // 为什么非要有这条守卫：把类型改回裸 `String` 不会让任何**行为**测试变红
+    // （`Zeroizing` 的 `Deref` 让所有调用点照旧编译，`key_secret_returns_a_zeroizing_wrapper`
+    // 也只看返回类型），所以只有文本断言拦得住它。
+    let gateway = include_str!("../src/gateway.rs");
     assert!(
-        source.contains("去向 M8-S1"),
-        "`gateway_config` 里那条未覆盖的副本必须有显式声明与去向编号"
+        gateway.contains("pub api_key: Zeroizing<String>"),
+        "`GatewayConfig::api_key` 必须是 `Zeroizing<String>`：\
+         它每请求被 clone，裸 `String` 会留下一份永不擦除的站点密钥"
+    );
+
+    let service = include_str!("../src/service.rs");
+    let bare_copies = service
+        .lines()
+        .filter(|line| line.contains("key_secret(") && line.contains("to_string()"))
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .count();
+    assert_eq!(
+        bare_copies, 0,
+        "`key_secret` 的返回值不得被复制成裸 `String`（当前 {bare_copies} 处）"
     );
 }

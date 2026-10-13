@@ -213,7 +213,7 @@ async fn start_gateway(upstream: &FakeUpstream) -> (keyrelay_core::gateway::Gate
         0, // 让内核分配
         token.clone(),
         upstream.base_url.clone(),
-        SITE_KEY.to_string(),
+        zeroize::Zeroizing::new(SITE_KEY.to_string()),
         "假站点".to_string(),
     ))
     .await
@@ -230,7 +230,7 @@ async fn start_gateway_on(
         port,
         generate_token(),
         upstream.base_url.clone(),
-        SITE_KEY.to_string(),
+        zeroize::Zeroizing::new(SITE_KEY.to_string()),
         "假站点".to_string(),
     ))
     .await
@@ -516,7 +516,7 @@ async fn a_busy_port_is_reported_clearly() {
         port,
         generate_token(),
         upstream.base_url.clone(),
-        SITE_KEY.to_string(),
+        zeroize::Zeroizing::new(SITE_KEY.to_string()),
         "假站点".to_string(),
     ))
     .await

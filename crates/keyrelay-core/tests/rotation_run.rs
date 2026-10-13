@@ -162,51 +162,54 @@ async fn the_three_steps_run_in_order_and_the_new_key_is_what_lands() {
 // ============================================================ 失败即停（T10）
 
 #[tokio::test]
-async fn a_failed_reinject_stops_before_the_old_key_is_revoked() {
+async fn an_unwritable_target_refuses_the_rotation_before_a_key_is_created() {
+    // M8-S4 §9-8（P2-3）：**这条测试原先断言的是「建好新 key、再停在第②步」**。
+    // 那个行为本身就是 P2-3 的缺陷：每重试一次，站点上就多一把没人用的密钥。
+    // 现在 `rotate_key` 在建 key **之前**用占位密钥空跑每个通道的 `plan()`，
+    // 任何一条写不进去就整体拒绝——所以本测试断言的是「一个请求都不发」。
+    //
+    // 「不回收旧密钥」这条不变式因此变得**更强**了：连创建请求都没有，自然也没有 DELETE。
+    // 中途失败的形态仍然可能（预检与真正写入之间有时间差），但那时不会留下多余的 key。
     let f = setup(Some("1")).await;
     deliver(&f, f.key_id, DeliveryChannel::CodexAuthJson);
     let gemini = deliver(&f, f.key_id, DeliveryChannel::GeminiCli);
 
-    // 前置：这把 key 确实服务两个通道，且顺序是 codex 在前。
+    // 前置：这把 key 确实服务两个通道。
     let plan = f.service.rotation_plan(f.key_id).expect("预览");
     assert_eq!(
         plan.channels,
         vec!["codex-auth-json", "gemini-cli"],
-        "顺序是「先成功一个、再失败一个」这条测试的前提"
+        "两个通道都要在轮换范围里"
     );
 
-    // 把第二个目标弄成**目录**：`patch` 读不到它就必然失败。
+    // 把第二个目标弄成**目录**：`plan()` 读不到它就必然失败。
     // 不依赖 chmod（以 root 跑时 chmod 无效），与 `drift.rs` 造「存在但读不到」同一手法。
     fs::remove_file(&gemini).expect("删文件");
     fs::create_dir(&gemini).expect("建同名目录");
 
     let after_login = f.mock.request_count();
-    // **只摆创建响应**：如果实现走了第三步，队列耗尽会让那次请求以传输错误收场，
-    // 但请求记录里会留下一条 DELETE —— 那正是本测试要抓的形态。
-    f.mock.push(create_key_ok());
-
-    let run = f
+    let err = f
         .service
         .rotate_key(f.key_id, KeySpec::named("codex/rotated"))
         .await
-        .expect("轮换返回的是「停在哪」而不是错误");
+        .expect_err("目标写不进去时必须在建新 key 之前拒绝");
 
-    assert!(!run.completed());
-    assert_eq!(
-        run.stopped_at,
-        Some(keyrelay_core::rotation::RotationStep::ReinjectAll)
+    let text = err.to_string();
+    assert!(text.contains("gemini-cli"), "要点名是哪个通道: {text}");
+    assert!(
+        text.contains("多一把"),
+        "文案必须说清代价（否则用户只会觉得轮换坏了）: {text}"
     );
-    assert_eq!(run.reinjected, vec!["codex-auth-json"], "成功一个就记一个");
-    assert_eq!(
-        run.revoke,
-        RevokeOutcome::NotAttempted,
-        "前一步失败就绝不能回收旧密钥——否则用户会同时失去旧密钥和新密钥"
-    );
-
     assert_eq!(
         request_lines(&f.mock, after_login),
-        vec![format!("POST {BASE}/api/token/")],
-        "失败之后不得再发任何请求（尤其不得有 DELETE）"
+        Vec::<String>::new(),
+        "预检失败 ⇒ 一个请求都不发（没有 POST、更没有 DELETE）"
+    );
+
+    // 旧密钥仍然可用：站点上那把没被删，本地状态也没动
+    assert_ne!(
+        f.service.store().key_status(f.key_id).unwrap().as_deref(),
+        Some("revoked")
     );
 }
 

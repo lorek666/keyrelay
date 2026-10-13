@@ -315,6 +315,10 @@ pub struct DeliveryPlan {
     pub target_path: PathBuf,
     /// 目标文件当前是否存在（决定 UI 提示「新建」还是「改写」）
     pub target_exists: bool,
+    /// 本次是**站点模式**还是**网关模式**（M8-S4 §6.6）。
+    /// 界面必须把它显示出来：网关模式下写进去的是**本地令牌**，不是站点密钥——
+    /// 两者在预览里的字段名一模一样（`apiKey` / `apiBase`），不说就分不清。
+    pub mode: DeliveryMode,
     pub fields: Vec<DeliveryField>,
     /// 已脱敏的 diff 预览
     pub preview: String,
@@ -328,6 +332,7 @@ impl std::fmt::Debug for DeliveryPlan {
             .field("channel", &self.channel)
             .field("target_path", &self.target_path)
             .field("target_exists", &self.target_exists)
+            .field("mode", &self.mode)
             .field("fields", &self.fields)
             .field("preview_len", &self.preview.len())
             .field("consent", &self.consent)
@@ -492,6 +497,67 @@ pub fn resolve_for_gateway(
         return Err(Error::inject(target, "网关令牌为空，拒绝写入"));
     }
     resolve_for_binding(channel, home, &gateway.base_url, provider_id, model)
+}
+
+/// 投递的**取值来源**（M8-S4 §6.2 / §6.6）。
+///
+/// 用一个枚举而不是「模式 + `Option<端点>`」两个参数：那两个必须一致，
+/// 而不一致的组合（网关模式但没有端点）只能靠运行期拒绝——枚举让它**无法表达**。
+///
+/// 默认 `Site`：**任何既有调用点不传来源时的行为一字不变**。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeliverySource<'a> {
+    /// 站点模式：`base_url` = 站点 base_url、`api_key` = 站点密钥。
+    #[default]
+    Site,
+    /// 网关模式：`base_url` = `<local_url>/v1`、`api_key` = 本地令牌。
+    Gateway(&'a GatewayEndpoint),
+}
+
+/// 投递模式的名字。**只用于界面与 DTO**（`"site"` / `"gateway"`），不参与判断。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeliveryMode {
+    #[default]
+    Site,
+    LocalGateway,
+}
+
+impl DeliveryMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Site => "site",
+            Self::LocalGateway => "gateway",
+        }
+    }
+}
+
+impl DeliverySource<'_> {
+    pub fn mode(self) -> DeliveryMode {
+        match self {
+            Self::Site => DeliveryMode::Site,
+            Self::Gateway(_) => DeliveryMode::LocalGateway,
+        }
+    }
+}
+
+/// 按**来源**解析通道写入器：站点模式走 [`resolve_for_binding`]，
+/// 网关模式走 [`resolve_for_gateway`]。两者产出的类型完全相同。
+pub fn resolve_for_source(
+    source: DeliverySource<'_>,
+    channel: DeliveryChannel,
+    home: &Path,
+    site_base_url: &str,
+    provider_id: &str,
+    model: Option<&str>,
+) -> Result<Box<dyn DeliveryWriter>> {
+    match source {
+        DeliverySource::Site => {
+            resolve_for_binding(channel, home, site_base_url, provider_id, model)
+        }
+        DeliverySource::Gateway(endpoint) => {
+            resolve_for_gateway(channel, home, endpoint, provider_id, model)
+        }
+    }
 }
 
 /// 构造一个掩码字段（用于密钥值）。

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gateway-rotate-token"
+description = "Enables the gateway_rotate_token command without any pre-configured scope."
+commands.allow = ["gateway_rotate_token"]
+
+[[permission]]
+identifier = "deny-gateway-rotate-token"
+description = "Denies the gateway_rotate_token command without any pre-configured scope."
+commands.deny = ["gateway_rotate_token"]

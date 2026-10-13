@@ -585,6 +585,156 @@ fn plan_does_not_depend_on_the_process_environment() {
     );
 }
 
+// ============================================================ M8-S4 §9-10 / §9-11
+
+/// §10.3 C20：`models: []`（Continue 自己生成的**默认模板**形态）要能投进去。
+///
+/// 「块外字节不变」在这条上的精确表述（§9-10）：除那一行的 `[]` 这一个 token 被抹掉之外，
+/// **其余字节逐字节不变**——注释留在原位。下面把「差异恰好一处」用位置 + 长度逐字钉住。
+#[test]
+fn empty_flow_models_is_normalised_and_everything_else_is_untouched() {
+    let dir = tmp();
+    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+    let before = "name: mine\nversion: 1.0.0\nmodels: [] # 我的模型\n";
+    fs::write(&path, before).unwrap();
+
+    let plan = writer(dir.path(), BASE, Some(MODEL));
+    let patch = plan.plan(SECRET).unwrap();
+
+    let pos = before.find("[]").expect("夹具含 `[]`");
+    let block = plan.render_block(SECRET, "  ", "\n");
+    let tail_len = before.len() - pos - 2;
+
+    // ① `[]` 之前的字节逐字相同
+    assert_eq!(&patch.after[..pos], &before[..pos], "`[]` 之前被动过");
+    // ② `[]` 之后到文件末尾（含注释与行尾）逐字相同，整体左移 2 字节
+    assert_eq!(
+        &patch.after[pos..pos + tail_len],
+        &before[pos + 2..],
+        "`[]` 之后被动过"
+    );
+    // ③ 其后只有新插入的块 + 一个行尾
+    assert_eq!(&patch.after[pos + tail_len..], format!("{block}\n"));
+    // ④ 长度账：-2（`[]`）+ 块 + 1 个行尾
+    assert_eq!(patch.after.len(), before.len() - 2 + block.len() + 1);
+    // ⑤ 注释与 `models:` 键都还在，且没有写出第二个顶层 `models:`
+    assert!(
+        patch.after.contains("models:  # 我的模型\n"),
+        "{}",
+        patch.after
+    );
+    assert_eq!(patch.after.matches("models:").count(), 1, "{}", patch.after);
+    // ⑥ 幂等：再投一次走「原地替换块」的分支，产物逐字相同
+    fs::write(&path, &patch.after).unwrap();
+    let again = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
+    assert_eq!(again.after, patch.after, "二次投递必须幂等");
+}
+
+/// §10.3 C21：**非空** flow 序列仍然拒绝（N-4：只放开空序列这一种形态）。
+#[test]
+fn non_empty_flow_models_is_still_refused() {
+    let dir = tmp();
+    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+    for bad in ["models: [a, b]\n", "models: [\"a\"]\n", "models: []x\n"] {
+        fs::write(&path, bad).unwrap();
+        let err = writer(dir.path(), BASE, Some(MODEL))
+            .plan(SECRET)
+            .unwrap_err();
+        assert!(matches!(err, Error::Inject { .. }), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("行内值"), "{text}");
+        assert!(
+            text.contains("块序列") && text.contains("其它通道"),
+            "{text}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), bad, "拒绝时磁盘零改动");
+    }
+}
+
+/// §10.3 C22（P3-5）：只有注释（+ BOM）的文件按「**已有文件**」处理——
+/// 只追加 `models:` 与受管块，用户的注释与 BOM **一个字节不动**（绝不整份重写）。
+/// 「真正空」（0 字节 / 纯空白）才用新建模板，那条已在 `creates_the_file_with_the_documented_bytes` 钉住。
+#[test]
+fn comment_only_file_keeps_every_byte() {
+    let dir = tmp();
+    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+    for before in [
+        "# 我的 Continue 配置\n",
+        "\u{FEFF}# 我的 Continue 配置\n",
+        "   \n# 只有注释\n",
+    ] {
+        fs::write(&path, before).unwrap();
+        let patch = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
+        assert!(
+            patch.after.starts_with(before),
+            "原字节必须是产物的前缀：{:?}",
+            patch.after
+        );
+        assert!(!patch.after.contains("version:"), "已有文件不得补配置头");
+        // 原字节逐字保留（含 BOM）：sha256 两层
+        assert_eq!(
+            sha256_hex(&patch.after.as_bytes()[..before.len()]),
+            sha256_hex(before.as_bytes())
+        );
+        assert!(patch.after.contains(BLOCK_BEGIN) && patch.after.contains(BLOCK_END));
+        fs::remove_file(&path).unwrap();
+    }
+}
+
+/// §10.3 C23（P3-1）：本次不传 model ⇒ 预览要把**沿用的那个名字**念出来，
+/// 且产物里的块仍然写着那个名字（预览与产物用同一个 `block_model`，不分叉）。
+#[test]
+fn preview_shows_the_inherited_model_name() {
+    let dir = tmp();
+    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+
+    let first = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
+    fs::write(&path, &first.after).unwrap();
+
+    let inheriting = writer(dir.path(), BASE, None);
+    let fields = inheriting.fields(SECRET);
+    assert_eq!(fields.len(), 3, "{fields:?}");
+    assert_eq!(fields[2].key, "model");
+    assert_eq!(fields[2].masked, format!("沿用：{MODEL}"), "{fields:?}");
+
+    let patch = inheriting.plan(ROTATED).unwrap();
+    assert!(patch.after.contains(ROTATED), "轮换必须换密钥");
+    assert!(
+        patch.after.contains("    model: \"gpt-4o\"\n"),
+        "沿用的模型名必须写进块里：{}",
+        patch.after
+    );
+}
+
+/// §10.3 C24：没有名字可沿用 ⇒ 预览给「必须填写」，`plan()` 硬门拒绝（`MODEL_REQUIRED`）。
+#[test]
+fn missing_model_with_nothing_to_inherit_is_refused() {
+    let dir = tmp();
+    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+
+    // 空文件：预览提示必填
+    let fresh = writer(dir.path(), BASE, None);
+    let fields = fresh.fields(SECRET);
+    assert_eq!(fields[2].masked, "（首次投递必须填写）", "{fields:?}");
+    let err = fresh.plan(SECRET).unwrap_err();
+    assert!(err.to_string().contains("模型名"), "{err}");
+
+    // 有受管块、但块里没有 model（手工删掉了）⇒ 同样拒绝
+    fs::write(
+        &path,
+        format!("models:\n  {BLOCK_BEGIN}\n  - name: \"keyrelay\"\n  {BLOCK_END}\n"),
+    )
+    .unwrap();
+    let orphaned = writer(dir.path(), BASE, None);
+    assert_eq!(
+        orphaned.fields(SECRET)[2].masked,
+        "（首次投递必须填写）",
+        "块里没有 model 时不该编造一个"
+    );
+    let err = orphaned.plan(SECRET).unwrap_err();
+    assert!(err.to_string().contains("模型名"), "{err}");
+}
+
 #[test]
 fn target_path_is_the_declared_relative_target() {
     let home = Path::new("/tmp/nobody");

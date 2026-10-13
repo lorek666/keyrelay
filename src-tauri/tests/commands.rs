@@ -984,6 +984,74 @@ fn revoke_key_requires_confirmation_before_touching_anything() {
 }
 
 #[test]
+fn unbind_agent_requires_confirmation_only_when_also_revoking() {
+    // M8-S4 §5.4：`confirm` **只对** `alsoRevoke == true` 强制。
+    // 解绑本身可恢复（行保留、再投递即可），给它加一道二次确认只会让日常操作变烦；
+    // 而站点侧删除没有撤销入口。
+    let err = invoke_impl(
+        "unbind_agent",
+        json!({"agentId": "codex", "alsoRevoke": true, "confirm": false}),
+    )
+    .expect_err("回收未确认应被拒");
+    assert_not_acl_rejection("unbind_agent", &err);
+    assert!(
+        err.to_string().contains("二次确认"),
+        "应给出「需要二次确认」: {err}"
+    );
+
+    // 默认路径（不回收）**不需要** confirm：空安装上应当拿到一份零报告而不是错误。
+    let value = invoke_impl(
+        "unbind_agent",
+        json!({"agentId": "codex", "alsoRevoke": false, "confirm": false}),
+    )
+    .expect("解绑是幂等的收尾动作，零命中也是成功");
+    assert_not_acl_rejection("unbind_agent", &value);
+    assert_eq!(value["unbound"], 0);
+    assert_eq!(value["alreadyUnbound"], 0);
+    assert_eq!(value["revoked"], json!([]));
+    assert_eq!(value["note"], Value::Null);
+}
+
+#[test]
+fn gateway_rotate_token_reaches_the_business_path() {
+    // 网关没在跑：轮换只换钥匙串里那一份（下一次启动自然用新的），返回当前状态。
+    let value = invoke_impl("gateway_rotate_token", json!({})).expect("空安装应成功");
+    assert_not_acl_rejection("gateway_rotate_token", &value);
+    assert_eq!(value["running"], false);
+    assert_eq!(value["tokenPersistent"], true, "写进钥匙串了");
+}
+
+#[test]
+fn delivery_plan_rejects_an_unknown_mode_and_refuses_gateway_mode_without_a_gateway() {
+    // 模式认不出 ⇒ 明确拒绝（**不**静默回退成站点模式：那会让用户以为已经切过去了）。
+    let err = invoke_impl(
+        "delivery_plan",
+        json!({"args": {"keyId": 1, "channel": "codex-auth-json", "mode": "gateway2"}}),
+    )
+    .expect_err("未知模式应被拒");
+    assert_not_acl_rejection("delivery_plan", &err);
+    assert!(err.to_string().contains("未知的投递模式"), "{err}");
+
+    // 网关模式但网关没在跑 ⇒ 拒绝，而不是写出一个指向空地址的配置。
+    let err = invoke_impl(
+        "delivery_plan",
+        json!({"args": {"keyId": 1, "channel": "codex-auth-json", "mode": "gateway"}}),
+    )
+    .expect_err("网关没在跑应被拒");
+    assert_not_acl_rejection("delivery_plan", &err);
+    assert!(err.to_string().contains("没有在运行"), "{err}");
+
+    // 缺省模式（既有调用点的形态）：走到业务路径（key 不存在 ⇒ 业务错误）。
+    let err = invoke_impl(
+        "delivery_plan",
+        json!({"args": {"keyId": 999, "channel": "codex-auth-json"}}),
+    )
+    .expect_err("不存在的 key 应报错");
+    assert_not_acl_rejection("delivery_plan", &err);
+    assert!(err.to_string().contains("不存在"), "{err}");
+}
+
+#[test]
 fn purge_keychain_requires_confirmation_and_reports_counts() {
     let err = invoke_impl("purge_keychain", json!({"confirm": false})).expect_err("未确认应被拒");
     assert_not_acl_rejection("purge_keychain", &err);

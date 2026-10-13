@@ -372,6 +372,63 @@ pub struct DiagnosticsOutcome {
     pub registered: bool,
 }
 
+/// 网关本地令牌的钥匙串引用（M8-S4 §6.4）。
+///
+/// # 为什么是 `kr/gateway/local/token` 而不是 spec 写的 `gateway/local-token`
+///
+/// 引用格式由 ADR-0002 钉死：`kr/<scope>/<id>/<field>` 四段，`is_valid_secret_ref` 会拒绝
+/// 其它形状。spec §6.4 给的是「一把钥匙串条目」这个**意图**，形状以本仓的引用规则为准
+/// （规格差异登记 D-7）。取值只此一处：改这里就是改全部。
+pub const GATEWAY_TOKEN_REF: &str = "kr/gateway/local/token";
+
+/// 轮换预检里「写不进去」的一个目标（§9-8）。
+///
+/// 三个字段都会被原样念给用户听（错误文案 + 事件），所以不做成 `bool` 或 `String`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlockedTarget {
+    channel: String,
+    target: String,
+    /// 已脱敏的原因。
+    reason: String,
+}
+
+/// 一次**回收**（站点侧删除）的回报（B-100）。
+///
+/// 为什么要把「站点侧删掉了」与「本地状态写上了」分开报：这两个是**两个不同的世界**，
+/// 且第一个不可逆。合成一个 bool 会让「站点侧已删、本地记账失败」只能二选一，
+/// 而两种选择都错——报成功则账不平，报失败则用户会去重试一次注定失败的删除（§7）。
+///
+/// # 为什么叫 `RevokeReport` 而不是 spec §4.2 写的 `RevokeOutcome`
+///
+/// 名字**已被占用**：`RevokeOutcome` 是 M7 就有的四态枚举（`RotationRun.revoke` 的类型，
+/// 界面按四态给不同文案，见上面那条定义）。两个类型不能同名，而改掉既有那个会动到
+/// M7 的冻结接口与前端契约 ⇒ **新的这个让路**（规格差异登记 D-6，M8-S4 §13）。
+/// 命名与 `store::UnbindReport` 同形：都是「一次动作的逐条回报」。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevokeReport {
+    pub site_id: i64,
+    /// 站点侧的令牌 id。`None` = 本地没有记过它（站点网页上手工建的 key）。
+    pub remote_id: Option<String>,
+    /// 站点侧**确认删除**（适配器 `revoke_key` 返回 `Ok`）。
+    pub revoked: bool,
+    /// 本地 `keys.status` 是否写上 `revoked`。
+    pub local_status_updated: bool,
+    pub note: Option<String>,
+}
+
+/// 一次解绑的结果（M8-S4 §5）。
+///
+/// `unbound` / `already_unbound` 的语义逐条见 [`crate::store::UnbindReport`]；
+/// `revoked` 只在 `also_revoke == true` 时非空——**默认路径一个站点请求都不发**。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnbindOutcome {
+    pub unbound: usize,
+    pub already_unbound: usize,
+    /// 逐把回收的结果（单条失败不回滚解绑，也不冒泡）。
+    pub revoked: Vec<RevokeReport>,
+    pub note: Option<String>,
+}
+
 /// 当前 unix 秒。
 ///
 /// 只给 [`KeyRelayService::dispatch_notifications`] 与 [`KeyRelayService::rotation_due`] 用：
@@ -526,6 +583,12 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     /// `revoke_key` 成功后插进来，`gateway_config` 把它交给网关。
     /// 这样网关**不新开取密钥路径**，只查一个由 `ensure_not_revoked` 那条路径维护的集合。
     revoked_refs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// 最近一次 `gateway_config` 用的令牌**是不是**持久化的（M8-S4 §6.4）。
+    ///
+    /// 放在服务上而不是 `GatewayHandle` 上：`gateway.rs` 的结构白名单与
+    /// `Debug` 脱敏都已经定稿，为一个状态位去动它不划算；而状态的**生产者**本来就是这里。
+    /// 语义是「最近一次装配网关时，令牌落进钥匙串了吗」——网关没在跑时这个值没有意义。
+    gateway_token_persistent: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 缓冲里的一条：**失败发生的时刻** + 失败本身。
@@ -593,6 +656,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             gateway_session: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             site_facts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             revoked_refs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            gateway_token_persistent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -860,8 +924,23 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         channel: DeliveryChannel,
         model: Option<&str>,
     ) -> Result<DeliveryPlan> {
-        let writer = self.prepare_delivery(key_id, channel, model)?;
-        let api_key = self.key_secret(key_id)?;
+        self.delivery_plan_in(key_id, channel, model, delivery::DeliverySource::Site)
+    }
+
+    /// 按**来源**（站点 / 本地网关）生成投递预览（M8-S4 §6.6）。
+    ///
+    /// 两条路径共用同一份 `plan()` / `fields()` / 同意检查：模式只决定
+    /// 「`base_url` 与 `api_key` 取哪一对值」，落点与字段名**逐字相同**。
+    pub fn delivery_plan_in(
+        &self,
+        key_id: i64,
+        channel: DeliveryChannel,
+        model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
+    ) -> Result<DeliveryPlan> {
+        let mode = source.mode();
+        let writer = self.prepare_delivery(key_id, channel, model, source)?;
+        let api_key = self.secret_for_source(key_id, source)?;
         let patch = writer.plan(&api_key)?;
         let target_path = writer.target_path();
         let consent = self.consent_state(channel, &target_path)?;
@@ -869,12 +948,16 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             Level::Debug,
             "delivery",
             format!("投递预览: {} → {}", channel.as_str(), target_path.display()),
-            serde_json::json!({ "consent_granted": consent.is_granted() }),
+            serde_json::json!({
+                "consent_granted": consent.is_granted(),
+                "mode": mode.as_str(),
+            }),
         ));
         Ok(DeliveryPlan {
             agent_id: channel.agent_id().to_string(),
             channel,
             target_exists: target_path.exists(),
+            mode,
             fields: writer.fields(&api_key),
             preview: delivery::diff_preview(&patch.before, &patch.after, &api_key),
             consent,
@@ -884,7 +967,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
 
     /// 记录用户同意（幂等：重复同意刷新时间戳并解除撤销）。
     pub fn grant_consent(&self, key_id: i64, channel: DeliveryChannel) -> Result<()> {
-        let writer = self.prepare_delivery(key_id, channel, None)?;
+        let writer =
+            self.prepare_delivery(key_id, channel, None, delivery::DeliverySource::Site)?;
         let target = self.checked_target(channel, &writer.target_path())?;
         // 记录同意**不需要**读钥匙串：用户此刻同意的是「写哪些键」，不是「密钥是否存在」。
         let fields = writer.field_names();
@@ -909,7 +993,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
 
     /// 撤销同意。**不**回滚已写入的文件（回滚是独立动作）。
     pub fn revoke_consent(&self, key_id: i64, channel: DeliveryChannel) -> Result<()> {
-        let writer = self.prepare_delivery(key_id, channel, None)?;
+        let writer =
+            self.prepare_delivery(key_id, channel, None, delivery::DeliverySource::Site)?;
         let target = self.checked_target(channel, &writer.target_path())?;
         self.store.revoke_consent(
             channel.agent_id(),
@@ -947,8 +1032,23 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         channel: DeliveryChannel,
         model: Option<&str>,
     ) -> Result<DeliveryOutcome> {
+        self.apply_delivery_in(key_id, channel, model, delivery::DeliverySource::Site)
+    }
+
+    /// 按**来源**（站点 / 本地网关）真正落盘（M8-S4 §6.2）。
+    ///
+    /// 步骤与顺序与站点模式**逐字相同**（同意 → 取锁 → 锁内再确认同意 → 取密钥 → 写 → 记账）：
+    /// 网关模式只换「`base_url` 与 `api_key` 取哪一对值」，其余一个字节都不改。
+    /// 这很关键——同意、备份、回读校验、失败补偿这些安全动作**不因为模式而放松**。
+    pub fn apply_delivery_in(
+        &self,
+        key_id: i64,
+        channel: DeliveryChannel,
+        model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
+    ) -> Result<DeliveryOutcome> {
         // ① 同意（未同意时**不读钥匙串、不落盘**）
-        let writer = self.prepare_delivery(key_id, channel, model)?;
+        let writer = self.prepare_delivery(key_id, channel, model, source)?;
         let target = self.checked_target(channel, &writer.target_path())?;
         if !self.consent_state(channel, &target)?.is_granted() {
             self.log(observability::event_with_payload(
@@ -984,8 +1084,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             });
         }
 
-        // ④ 取密钥并生成计划
-        let api_key = self.key_secret(key_id)?;
+        // ④ 取密钥并生成计划（网关模式取的是本地令牌，见 `secret_for_source`）
+        let api_key = self.secret_for_source(key_id, source)?;
         let patch = writer.plan(&api_key)?;
 
         // ⑤ 写入（加锁已在上面完成；预检 → 备份 → 原子写 → 回读校验 → 失败补偿在 apply 内部）
@@ -1551,6 +1651,44 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         Ok((channels, unmapped))
     }
 
+    /// 轮换预检（§9-8）：逐通道用占位密钥空跑一次 `plan()`，返回**写不进去的**那些。
+    ///
+    /// 空 `Vec` = 预检通过（可以建新 key）。每条记 `(通道名, 目标路径, 原因)`——
+    /// 界面与错误文案都要能直接念出来，所以不做成 `bool`。
+    ///
+    /// 为什么是 `plan()` 而不是 `apply_delivery`：`plan()` 不落盘、不读钥匙串、不改任何状态，
+    /// 因此「预检」不会产生任何需要回滚的东西。**预检失败不建新 key** 是这条的全部意义。
+    fn rotation_precheck(&self, key_id: i64, channels: &[DeliveryChannel]) -> Vec<BlockedTarget> {
+        let mut blocked = Vec::new();
+        for channel in channels {
+            let writer =
+                match self.prepare_delivery(key_id, *channel, None, delivery::DeliverySource::Site)
+                {
+                    Ok(writer) => writer,
+                    Err(err) => {
+                        blocked.push(BlockedTarget {
+                            channel: channel.as_str().to_string(),
+                            target: self
+                                .home
+                                .join(channel.relative_target())
+                                .display()
+                                .to_string(),
+                            reason: crate::redact::scrub(&err.to_string()),
+                        });
+                        continue;
+                    }
+                };
+            if let Err(err) = writer.plan(delivery::PLACEHOLDER_KEY) {
+                blocked.push(BlockedTarget {
+                    channel: channel.as_str().to_string(),
+                    target: writer.target_path().display().to_string(),
+                    reason: crate::redact::scrub(&err.to_string()),
+                });
+            }
+        }
+        blocked
+    }
+
     /// 轮换预览（FR-7）。**只读**：两次库查询，不联网、不写盘、不含密钥明文。
     pub fn rotation_plan(&self, key_id: i64) -> Result<RotationPlan> {
         let row = self
@@ -1600,6 +1738,34 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // 通道用**解析好的枚举**迭代（而不是回头 `parse` 一遍 `plan.channels` 的字符串）：
         // 认不出通道这件事上面已经拒绝过了，循环里不该再有一个「理论上不可达」的分支。
         let (channels, _) = self.rotation_targets(key_id)?;
+
+        // ①′ 预检（§9-8 / P2-3）：**在 `create_key` 之前**证明「每个通道都写得进去」。
+        //
+        // 复现 P2-3 要看的就是这个数字：目标写不进时（M7 旧版无 `model` 的块 / 用户删了
+        // `config.yaml` / 文件被重置成 `models: []`），旧实现会**先建好新 key**、再在第②步停下，
+        // 于是**每重试一次，站点上就多一把没人用的 key**。
+        //
+        // 空跑用的是 `PLACEHOLDER_KEY`（不是任何真实密钥形态）且只调 `plan()`：
+        // `plan()` 读目标文件、生成 `Patch`，**不落盘、不读钥匙串**⇒ 对站点与本地都无副作用。
+        let blocked = self.rotation_precheck(key_id, &channels);
+        if !blocked.is_empty() {
+            return Err(Error::Inject {
+                path: blocked
+                    .iter()
+                    .map(|b| b.target.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                reason: format!(
+                    "这些通道现在写不进去，若继续会在**新密钥已建好之后**才失败——\
+                     每重试一次，站点上就多一把没人用的密钥。请先处理下列目标再轮换：{}",
+                    blocked
+                        .iter()
+                        .map(|b| format!("{} → {}: {}", b.channel, b.target, b.reason))
+                        .collect::<Vec<_>>()
+                        .join("；")
+                ),
+            });
+        }
 
         // ① 建新 key（明文只进钥匙串，本函数全程不持有它）
         let new_key = self.create_key(plan.site_id, spec).await?;
@@ -1668,7 +1834,9 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             });
         };
         match self.revoke_key(plan.site_id, &remote_id).await {
-            Ok(()) => {
+            // `Ok(_)` 里带的是 B-100 的回报；轮换这条路径只关心「站点侧确认删除了」
+            // （`Ok` 即已删除，本地状态写失败也仍是 `Ok`——理由见 `revoke_key` 的注释）。
+            Ok(_) => {
                 self.log(observability::event_with_payload(
                     Level::Info,
                     "key",
@@ -2058,7 +2226,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// `bindings.key_id` 是 `ON DELETE CASCADE`——删行会把绑定与漂移追溯一起带走，
     /// 而 `journals` 表**没有** `key_id`，溯源链的起点就是 `keys.id`（M7-S4 spec §6.1 有实测）。
     /// 所以「回收」= 改状态，不是删记录。
-    pub async fn revoke_key(&self, site_id: i64, remote_id: &str) -> Result<()> {
+    pub async fn revoke_key(&self, site_id: i64, remote_id: &str) -> Result<RevokeReport> {
         let site = self.site(site_id)?;
         let kind = self.kind_of(&site)?;
         capability_gate(
@@ -2073,6 +2241,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .await
         {
             Ok(()) => {
+                let mut local_status_updated = false;
+                let mut note: Option<String> = None;
                 // **读本地行失败也不能把整次操作报成失败**（M8-S5A §4）：
                 // 站点侧那一把已经删了，这个动作不可逆。原来的 `?` 会让「DELETE 成功、
                 // 但本地这一读失败」表现为「回收失败」——与下面 `set_key_status` 那条注释里
@@ -2080,13 +2250,15 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 let key_id = match self.local_key_id_for_remote(site_id, remote_id) {
                     Ok(id) => id,
                     Err(err) => {
+                        let reason = crate::redact::scrub(&err.to_string());
+                        note = Some(format!("站点侧已回收，但读本地记录失败：{reason}"));
                         self.log(observability::event_with_payload(
                             Level::Warn,
                             "key",
                             "站点侧已回收，但读本地记录失败（本地状态没写上）",
                             serde_json::json!({
                                 "site_id": site_id,
-                                "reason": crate::redact::scrub(&err.to_string()),
+                                "reason": reason,
                             }),
                         ));
                         None
@@ -2108,20 +2280,25 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                             set.insert(row.secret_ref);
                         }
                     }
-                    if let Err(err) = self
+                    match self
                         .store
                         .set_key_status(key_id, crate::store::KEY_STATUS_REVOKED)
                     {
-                        self.log(observability::event_with_payload(
-                            Level::Warn,
-                            "key",
-                            "站点侧已回收，但本地状态没写上",
-                            serde_json::json!({
-                                "site_id": site_id,
-                                "key_id": key_id,
-                                "reason": crate::redact::scrub(&err.to_string()),
-                            }),
-                        ));
+                        Ok(()) => local_status_updated = true,
+                        Err(err) => {
+                            let reason = crate::redact::scrub(&err.to_string());
+                            note = Some(format!("站点侧已回收，但本地状态没写上：{reason}"));
+                            self.log(observability::event_with_payload(
+                                Level::Warn,
+                                "key",
+                                "站点侧已回收，但本地状态没写上",
+                                serde_json::json!({
+                                    "site_id": site_id,
+                                    "key_id": key_id,
+                                    "reason": reason,
+                                }),
+                            ));
+                        }
                     }
                 }
                 // payload 只记 id 与状态：这里经手的是「哪一把」，不是「那一把的值」。
@@ -2133,12 +2310,102 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                         "site_id": site_id,
                         "key_id": key_id,
                         "status": crate::store::KEY_STATUS_REVOKED,
+                        "local_status_updated": local_status_updated,
                     }),
                 ));
-                Ok(())
+                Ok(RevokeReport {
+                    site_id,
+                    remote_id: Some(remote_id.to_string()),
+                    revoked: true,
+                    local_status_updated,
+                    note,
+                })
             }
             Err(err) => Err(self.on_auth_error(site_id, err)),
         }
+    }
+
+    /// 解绑一个 agent 与它的密钥（FR-2:115 / M8-S4 §5）。
+    ///
+    /// # 解绑不是删除
+    ///
+    /// `bindings` 的每一行都是「哪个 agent 曾被哪个 key 写到哪个文件」的**唯一记录**，
+    /// 删掉它等于同时丢掉漂移追溯与「这把 key 服务过哪些目标」⇒ 只写 `unbound_at` 标记，
+    /// 行保留（§5.1）。`consents` / `journals` / `events` 一概不动，`keys.status` 也不动
+    /// （解绑 ≠ 回收；站点侧那把 key 仍然有效）。
+    ///
+    /// # `also_revoke` 是**两件事**
+    ///
+    /// 解绑是本地动作，回收是远端动作。把两者绑成一个事务会让「站点挂了就解不了绑」✗
+    /// ⇒ 单条回收失败**不**回滚解绑，也不冒泡（汇总进 [`UnbindOutcome::revoked`] 的 `note`）。
+    ///
+    /// # 为什么先读后标记
+    ///
+    /// 「要回收哪几把」必须在标记**之前**读：标记之后 `bindings_of_agent` 仍然会返回这些行
+    /// （行没删），但语义上我们要的是「**这次**解绑影响到的那些」。两次调用之间没有写操作，
+    /// 所以顺序只影响可读性——先读再标记，代码说的就是它做的事。
+    pub async fn unbind(&self, agent_id: &str, also_revoke: bool) -> Result<UnbindOutcome> {
+        let affected = self.store.bindings_of_agent(agent_id)?;
+        let report = self.store.unbind_agent(agent_id)?;
+
+        let mut revoked = Vec::new();
+        let mut note = None;
+        if also_revoke {
+            // 同一把 key 可能被投到多个目标文件 ⇒ 只回收一次。
+            // 站点侧的删除本身是幂等的，但重复发请求会让「回收了几把」这个数字失去意义，
+            // 也会让第二次请求必然失败（站点上已经没有了）而写出一条误导性的失败记录。
+            let mut seen: std::collections::HashSet<(i64, String)> =
+                std::collections::HashSet::new();
+            let mut unmanaged = 0usize;
+            for row in &affected {
+                let Some(remote_id) = row.remote_id.clone() else {
+                    // 站点侧没有记录（用户在站点网页上手工建的 key）⇒ 没有可回收的 id。
+                    unmanaged += 1;
+                    continue;
+                };
+                if !seen.insert((row.site_id, remote_id.clone())) {
+                    continue;
+                }
+                match self.revoke_key(row.site_id, &remote_id).await {
+                    Ok(outcome) => revoked.push(outcome),
+                    // 单条失败不冒泡：解绑已经完成了，这里只是「顺手回收」没成功。
+                    // 失败原因照旧脱敏（站点返回体可能回显凭证）。
+                    Err(err) => revoked.push(RevokeReport {
+                        site_id: row.site_id,
+                        remote_id: Some(remote_id),
+                        revoked: false,
+                        local_status_updated: false,
+                        note: Some(crate::redact::scrub(&err.to_string())),
+                    }),
+                }
+            }
+            if unmanaged > 0 {
+                note = Some(format!(
+                    "{unmanaged} 个绑定没有站点侧 id（可能是在站点网页上手工创建的），已跳过回收"
+                ));
+            }
+        }
+
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "delivery",
+            "已解绑 agent 的密钥绑定",
+            serde_json::json!({
+                "agent_id": agent_id,
+                "unbound": report.unbound,
+                "already_unbound": report.already_unbound,
+                "also_revoke": also_revoke,
+                "revoked_ok": revoked.iter().filter(|o| o.revoked).count(),
+                "revoked_failed": revoked.iter().filter(|o| !o.revoked).count(),
+            }),
+        ));
+
+        Ok(UnbindOutcome {
+            unbound: report.unbound,
+            already_unbound: report.already_unbound,
+            revoked,
+            note,
+        })
     }
 
     /// `remote_id → 本地 key_id`（限定同一站点）。找不到 ⇒ `Ok(None)`。
@@ -2160,8 +2427,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 都必须走它——把枚举收在一处，将来新增一种凭据（例如账号会话）时，
     /// 漏删的风险集中在**一个**函数里，而不是散在若干处。
     ///
-    /// 今天只有 `keys.secret_ref` 一种：`accounts` 表有 `credential_ref` 列，
-    /// 但全仓没有写入器（M7-S4 的同类发现），所以它现在不可能有行。
+    /// 今天有两种：`keys.secret_ref`（每把站点密钥一条）与**网关本地令牌**
+    /// （[`GATEWAY_TOKEN_REF`]——它没有 `keys` 行，所以必须显式带上，
+    /// 否则「一键清理钥匙串」会把它留在系统钥匙串里，FR-8:191 的承诺就不成立）。
+    /// `accounts` 表有 `credential_ref` 列，但全仓没有写入器（M7-S4 的同类发现），
+    /// 所以它现在不可能有行。
     fn owned_secret_refs(&self) -> Result<Vec<String>> {
         let mut refs: Vec<String> = self
             .store
@@ -2169,6 +2439,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .into_iter()
             .map(|row| row.secret_ref)
             .collect();
+        // 先问「在不在」再列进去：`delete` 是幂等的，无条件列进去不会出错，
+        // 但会让「清掉了几条」这个数字永远多一条（而那是界面上的原话）。
+        // `has` 的 `Err`（读失败）**向上传播**：读失败不等于不存在，这条口径与本文件一致。
+        if self.vault.has(GATEWAY_TOKEN_REF)? {
+            refs.push(GATEWAY_TOKEN_REF.to_string());
+        }
         refs.sort();
         refs.dedup();
         Ok(refs)
@@ -2256,16 +2532,22 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // 走 `key_secret` 而不是在这里再抄一遍 `vault.get` + 回收判定（M8-S5A §2.2）：
         // 一个咽喉点比两处同义代码好，`ensure_not_revoked` 也不会再漏。
         //
-        // **未接线（去向 M8-S1 第 13 行）**：`GatewayConfig::api_key` 的类型仍是裸 `String`
-        // （单上游 legacy 字段），所以下面这一次 `.to_string()` 产生的副本**没有**被
-        // `Zeroizing` 包住。`keys_by_ref` 那条路径已经是 `Zeroizing` 了，单上游这条还不是。
-        let api_key = self.key_secret(key_id)?.to_string();
+        // M8-S4 收口了 M8-S1 章程 §3.5 第 13 行：`GatewayConfig::api_key` 的类型
+        // 从裸 `String` 换成 `Zeroizing<String>`，所以这里**不再有**一个未清零的副本
+        // （原来那一版是 `.to_string()`，把 `Zeroizing` 里的明文复制成裸 `String`）。
+        let api_key = self.key_secret(key_id)?;
 
         let (route, keys_by_ref) = self.build_gateway_route()?;
 
+        // 令牌**跨重启稳定**（M8-S4 §6.4）：不稳定的令牌会让每次 `stop → start` 都作废
+        // agent 配置里那把，而那正是 FR-5:158「换站零改动」要消灭的一步。
+        let (token, token_persistent) = self.gateway_token();
+        self.gateway_token_persistent
+            .store(token_persistent, std::sync::atomic::Ordering::SeqCst);
+
         let mut config = crate::gateway::GatewayConfig::single_upstream(
             port,
-            crate::gateway::generate_token(),
+            token,
             site.base_url,
             api_key,
             site.display_name,
@@ -2312,6 +2594,83 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             }
         }));
         Ok(config)
+    }
+
+    /// 网关本地令牌（M8-S4 §6.4）：**已持久化就用它，没有就生成一把并存起来**。
+    ///
+    /// 返回 `(令牌, 是否持久化)`。第二个值一路走到 `GatewayStatusDto.token_persistent`：
+    /// 降级**必须说出来**（§6.4 第 5 条），用户要能看见「令牌：临时（重启后需重新投递）」。
+    ///
+    /// # 三条边界
+    ///
+    /// - **不存在**（第一次启动）⇒ 生成 + `put`；这是唯一「令牌会变」的正常时机。
+    /// - **读失败**（钥匙串锁着 / ACL 拒绝）⇒ 仍然生成一把**临时**令牌让网关照常启动，
+    ///   但 `token_persistent = false` + 一条 Warn 事件。为什么不直接报错：网关是用户显式
+    ///   打开的开关，钥匙串读不了不该让整个功能不可用；而「静默生成一把新的」才是真缺陷
+    ///   ——那会让 agent 配置里那把**无声无息**地失效。所以：降级 + 留痕 + 状态里明示。
+    /// - **写失败** ⇒ 同上（临时令牌）。两次失败的原因都进事件（脱敏后）。
+    ///
+    /// 不返回 `Result`：这个方法**没有**失败态——它的失败全部表达为「临时令牌」。
+    /// 唯一的例外是 `rotate_gateway_token`（显式轮换动作），那里写失败必须报错。
+    fn gateway_token(&self) -> (String, bool) {
+        match self.vault_secret(GATEWAY_TOKEN_REF) {
+            Ok(Some(token)) if !token.trim().is_empty() => return (token.to_string(), true),
+            // 存在但是空的（手工把条目清成空串）⇒ 当作没有：空令牌会让网关拒绝所有请求
+            // （`config.token.trim().is_empty()` 那条硬门），比生成一把新的更糟。
+            Ok(_) => {}
+            Err(err) => {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "gateway",
+                    "读钥匙串里的网关令牌失败，本次用临时令牌（重启后会变）",
+                    serde_json::json!({ "reason": crate::redact::scrub(&err.to_string()) }),
+                ));
+            }
+        }
+        let token = crate::gateway::generate_token();
+        match self.vault.put(GATEWAY_TOKEN_REF, &token) {
+            Ok(()) => (token, true),
+            Err(err) => {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "gateway",
+                    "网关令牌没能存进钥匙串，本次用临时令牌（重启后会变）",
+                    serde_json::json!({ "reason": crate::redact::scrub(&err.to_string()) }),
+                ));
+                (token, false)
+            }
+        }
+    }
+
+    /// 最近一次装配网关时，令牌是否持久化（供状态 DTO 用）。
+    pub fn gateway_token_persistent(&self) -> bool {
+        self.gateway_token_persistent
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// **显式轮换**网关令牌（§6.4 第 4 条）：生成新的一把并写进钥匙串。
+    ///
+    /// 与 [`Self::gateway_token`] 的关键区别：这是用户按下去的按钮，**写失败必须报错**——
+    /// 否则用户会以为换掉了，而重启后令牌又变回去（或者变成第三把）。
+    ///
+    /// 调用方（命令层）**必须**接着重启网关：否则运行中的网关仍用旧令牌，
+    /// 而钥匙串里已经是新的 ⇒ agent 配置与网关不一致，直到下一次重启。
+    ///
+    /// 也不动 agent 配置：指向网关的通道需要**重新投递**（界面提示），
+    /// 这是「轮换」与「换站」是两件事的地方（§6.5 边界）。
+    pub fn rotate_gateway_token(&self) -> Result<()> {
+        let token = crate::gateway::generate_token();
+        self.vault.put(GATEWAY_TOKEN_REF, &token)?;
+        // 轮换后**不再**是临时令牌（写成功即持久化）。
+        self.gateway_token_persistent
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "gateway",
+            "已轮换网关本地令牌（指向网关的通道需要重新投递）",
+            serde_json::json!({ "secret_ref": GATEWAY_TOKEN_REF }),
+        ));
+        Ok(())
     }
 
     /// 从**所有可用站点**推导路由表 + 明文映射（M8-S1 §5.1 / §10）。
@@ -2911,13 +3270,15 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
 
     /// 解析通道写入器 + 校验 `key_id` 存在。**不读钥匙串**（同意检查必须在读密钥之前）。
     ///
-    /// 走 `resolve_for_binding` 而不是 `resolve_for`：后者固定 `model = None`，
-    /// 生产路径因此从来没法给 Continue 写模型名（Continue 拒绝加载缺 `model` 的配置）。
+    /// 走 `resolve_for_binding` / `resolve_for_gateway` 而不是 `resolve_for`：后者固定
+    /// `model = None`，生产路径因此从来没法给 Continue 写模型名（Continue 拒绝加载缺
+    /// `model` 的配置）。
     fn prepare_delivery(
         &self,
         key_id: i64,
         channel: DeliveryChannel,
         model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
     ) -> Result<Box<dyn delivery::DeliveryWriter>> {
         // key_id 存在性先校验：不存在时连通道都不必解析
         let row = self
@@ -2925,8 +3286,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .get_key(key_id)?
             .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
         // Claude Code / shell 块两个通道要写 endpoint，需要该密钥所属站点的 base_url
+        // （网关模式下**不**用站点 base_url——那正是「换站零改动」的全部内容，
+        //  但站点行仍然要读：`key_id` 必须属于一个存在的站点）。
         let site = self.site(row.site_id)?;
-        delivery::resolve_for_binding(
+        delivery::resolve_for_source(
+            source,
             channel,
             &self.home,
             &site.base_url,
@@ -2948,25 +3312,69 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         self.secret_for_row(&row)
     }
 
-    /// 从一行密钥记录取出明文。**这是全文件唯一读钥匙串取明文的地方。**
+    /// 本次要写进去的那一份「密钥」——**按来源二选一**（M8-S4 §6.2）。
     ///
+    /// 站点模式：读钥匙串里的站点密钥。
+    /// 网关模式：用本地令牌，**不读**站点密钥——那正是「换站零改动」的全部内容
+    /// （agent 配置里写的是网关地址与网关令牌，站点密钥由网关在转发时加上）。
+    ///
+    /// 网关模式**仍然**拒绝已回收的 key：网关的路由表是按「可用 key」建的
+    /// （[`Self::build_gateway_route`]），用一个已回收的 key 去投递，只会得到一份
+    /// 「指向一个服务不了该站点的网关」的配置。拒绝在这里，比让 agent 拿到 502 早。
+    ///
+    /// 这一条是集成测试逼出来的：`delivery_mode.rs` 的
+    /// `gateway_mode_writes_the_gateway_values_to_disk` 一开始就红了——它发现产物里
+    /// `ANTHROPIC_BASE_URL` 是网关地址、而 `ANTHROPIC_AUTH_TOKEN` 还是站点密钥。
+    /// 那种「半个开关」的配置会 401，而两边看起来都「写成功了」。
+    fn secret_for_source(
+        &self,
+        key_id: i64,
+        source: delivery::DeliverySource<'_>,
+    ) -> Result<zeroize::Zeroizing<String>> {
+        match source {
+            delivery::DeliverySource::Site => self.key_secret(key_id),
+            delivery::DeliverySource::Gateway(endpoint) => {
+                let row = self
+                    .store
+                    .get_key(key_id)?
+                    .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
+                ensure_not_revoked(&row)?;
+                // 令牌从调用方给的端点来（它来自运行中的网关句柄）。
+                // `Zeroizing`：这一份也要清零，它是本地网关的凭证。
+                Ok(zeroize::Zeroizing::new(endpoint.token.clone()))
+            }
+        }
+    }
+
+    /// 从一行密钥记录取出明文。
+    ///
+    /// **明文的唯一出口是 [`Self::vault_secret`]**：本函数只是一层「按行取」的包装。
     /// 收成一个函数不是为了好看：`tests/zeroize_hygiene.rs` 有一条结构守卫断言
     /// `vault.get(` 在 `service.rs` 里恰好出现一次——那条守卫在 M8-S1 加
     /// `build_gateway_route`（网关的明文映射）时**当场红了**，红得对：
     /// 那是第二个明文出口。处置是把它收进这里，而不是放宽断言。
+    ///
+    /// M8-S4 的网关令牌是**第二个按引用取的秘密**（它没有 `keys` 行），于是同一件事
+    /// 再发生一次：出口从 `secret_for_row` 下沉到 `vault_secret`，`vault.get(` 仍然只有一处。
     fn secret_for_row(&self, row: &crate::store::KeyRow) -> Result<zeroize::Zeroizing<String>> {
-        let secret = self.vault.get(&row.secret_ref)?.ok_or_else(|| {
+        self.vault_secret(&row.secret_ref)?.ok_or_else(|| {
             Error::Vault(format!(
                 "钥匙串中没有该密钥（{}）；请先在该站点重新取一次钥匙",
                 row.secret_ref
             ))
-        })?;
-        // M7-S5 spec §2.1 要求的 `Zeroizing` 直到 M8-S5A 才真正落地：此前它是裸 `String`，
-        // 而复审 §6-4 写的却是「核了」（DEBUG 报告 §1.10）。
-        //
-        // 返回 `Zeroizing` 而不是在调用点各自包一层：调用点会变多，咽喉点只有一个。
-        // 调用方拿到的东西类型上就不是裸 `String`，所以「某次调用忘了清零」在编译期就不成立。
-        Ok(zeroize::Zeroizing::new(secret))
+        })
+    }
+
+    /// **全文件唯一**读钥匙串取明文的地方（结构守卫守着这条不变式）。
+    ///
+    /// 返回 `Zeroizing` 而不是在调用点各自包一层：调用点会变多，咽喉点只有一个。
+    /// 调用方拿到的东西类型上就不是裸 `String`，所以「某次调用忘了清零」在编译期就不成立。
+    ///
+    /// 返回 `Ok(None)` = 条目不存在（**不是**错误）；`Err` = 读失败。
+    /// 这个区分在本仓有实际后果：`secret_for_row` 把两者都当失败（密钥缺失），
+    /// 而网关令牌把「不存在」当「第一次启动，生成一把」（M8-S4 §6.4）。
+    fn vault_secret(&self, secret_ref: &str) -> Result<Option<zeroize::Zeroizing<String>>> {
+        Ok(self.vault.get(secret_ref)?.map(zeroize::Zeroizing::new))
     }
 
     /// 仅测试用：把 `key_secret` 暴露给集成测试，用于断言**返回类型**本身。
