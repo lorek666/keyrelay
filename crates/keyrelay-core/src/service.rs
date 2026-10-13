@@ -507,8 +507,46 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     /// 而 `refresh_all` 是前台 60s / 后台 30min 的固定节拍，可接受。
     /// 缓冲有上限（见 [`MAX_BUFFERED_GATEWAY_FAILURES`]），满了丢**最旧**的一条——
     /// 宁可丢历史，也不让一个坏掉的上游把内存吃光。
-    gateway_failures:
-        Arc<std::sync::Mutex<std::collections::VecDeque<crate::gateway::GatewayFailure>>>,
+    gateway_failures: Arc<std::sync::Mutex<std::collections::VecDeque<BufferedGatewayFailure>>>,
+    /// 网关**会话**代号（M8-S1 §11.1）。每次 `gateway_config` 递增一次，
+    /// `gateway_stop` 再递增一次（= 作废当前会话）。
+    ///
+    /// sink 捕获自己那一份代号，推送前比对：**不相等 ⇒ 丢弃**。
+    /// 于是「stop 之后在途请求才产生的失败」不会被记到**下一个**会话上——
+    /// 那是主动误导（用户会去查一个没问题的会话）。
+    gateway_session: Arc<std::sync::atomic::AtomicU64>,
+    /// 站点的**观测**（M8-S1 §5.1）：模型清单 / 倍率 / 余额 / 延迟。
+    ///
+    /// 四项都是「最近一次观测」（last-value，不是滑动平均）：实现简单、可解释，
+    /// 且与 `RouteTable` 的排序语义（「按已知信息排」）一致。
+    /// **都不落库**——重启后回到「全未知」，排序退化成按 `site_id`（spec D-4）。
+    site_facts: Arc<std::sync::Mutex<std::collections::HashMap<i64, SiteObservations>>>,
+    /// 已被回收的 `secret_ref`（M8-S1 §3.5-5）。
+    ///
+    /// `revoke_key` 成功后插进来，`gateway_config` 把它交给网关。
+    /// 这样网关**不新开取密钥路径**，只查一个由 `ensure_not_revoked` 那条路径维护的集合。
+    revoked_refs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// 缓冲里的一条：**失败发生的时刻** + 失败本身。
+///
+/// 时刻放在**元素里**而不是 `GatewayFailure` 里：那个结构的「恰好三个字段」是 M7 冻结的
+/// 结构白名单（装不下 prompt / 响应正文 / 密钥），不为一个时间戳破例。
+#[derive(Clone, Debug)]
+struct BufferedGatewayFailure {
+    /// 失败发生的 **unix 秒**。
+    at: i64,
+    failure: crate::gateway::GatewayFailure,
+}
+
+/// 一个站点的四项观测（M8-S1 §5.1）。全部可缺省，缺省 = 未知。
+#[derive(Clone, Debug, Default)]
+struct SiteObservations {
+    /// 站点侧模型清单。**空 = 未知**（采集默认关）。
+    models: Vec<String>,
+    rate: Option<f64>,
+    balance_usd: Option<f64>,
+    latency_ms: Option<u64>,
 }
 
 /// 网关失败的内存缓冲上限。见 [`KeyRelayService::gateway_failures`] 的说明。
@@ -519,13 +557,19 @@ pub const MAX_BUFFERED_GATEWAY_FAILURES: usize = 256;
 /// 抽成函数是为了让**生产路径（网关回调）与测试路径（`record_gateway_failure_for_test`）
 /// 走同一段逻辑**——否则「上限」这条纪律只在一边生效，而测试会证明一个产品里不存在的性质。
 fn push_bounded(
-    buffer: &mut std::collections::VecDeque<crate::gateway::GatewayFailure>,
+    buffer: &mut std::collections::VecDeque<BufferedGatewayFailure>,
     failure: crate::gateway::GatewayFailure,
 ) {
     if buffer.len() >= MAX_BUFFERED_GATEWAY_FAILURES {
         buffer.pop_front();
     }
-    buffer.push_back(failure);
+    buffer.push_back(BufferedGatewayFailure {
+        // 时刻在**推送侧**取（网关的请求任务里），不是落库时取：
+        // 落库发生在下一次 `refresh_all`，那时取到的是「刷新时刻」——
+        // 于是「网关为什么在 14:00 切换了上游」会显示成「14:05」，因果链在时间轴上错位。
+        at: unix_now_secs(),
+        failure,
+    });
 }
 
 /// 通知的运行时状态。`config` 是冻结的装配参数，`last` 是上一轮快照。
@@ -546,6 +590,9 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             // 默认**不通知**：通知会弹窗并发网络请求，测试与纯核心用例不该意外触发。
             notify: None,
             gateway_failures: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            gateway_session: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            site_facts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            revoked_refs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -1146,6 +1193,15 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             }
 
             let balance = self.balance(site.id).await;
+            // M8-S1 §5.1：余额进**观测缓存**（供路由表排序用）。
+            // `known == false` ⇒ `None`——绝不 `unwrap_or(0.0)`：那会把「不知道」
+            // 变成「已耗尽」，直接改变候选顺序（`health_rank` 的档位就是为这件事存在的）。
+            if let Ok(b) = &balance {
+                if let Ok(mut map) = self.site_facts.lock() {
+                    map.entry(site.id).or_default().balance_usd =
+                        if b.known { Some(b.remaining) } else { None };
+                }
+            }
             let keys = self.list_keys(site.id).await;
             let mut quota_exceeded = false;
 
@@ -1669,7 +1725,15 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         )?;
         let session = self.session(site_id)?;
         let adapter = self.registry.adapter(kind);
-        adapter.available_groups(&site.base_url, &session).await
+        let groups = adapter.available_groups(&site.base_url, &session).await?;
+        // M8-S1 §5.4：倍率进观测缓存。取**第一个有倍率的分组**——`available_groups`
+        // 是用户触发的（FR-2 的下拉），观测只在用户看过分组之后才存在；未知就是未知。
+        if let Ok(mut map) = self.site_facts.lock() {
+            if let Some(rate) = groups.iter().find_map(|g| g.rate) {
+                map.entry(site_id).or_default().rate = Some(rate);
+            }
+        }
+        Ok(groups)
     }
 
     /// 把站点侧已有密钥的明文**一次性对齐到本地钥匙串**（FR-2 的批量读明文）。
@@ -2037,6 +2101,13 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 // 代价是记账确实没写上，所以这里**必须留痕**：Warn 级事件带上原因（脱敏后），
                 // 用户能在事件面板看到；下一次 `sync_site_keys` 对账也会把它标出来。
                 if let Some(key_id) = key_id {
+                    // M8-S1 §3.5-5：让**正在运行**的网关也立刻停止使用这把 key。
+                    // `ensure_not_revoked` 只拦新启动；运行中的网关只看这个集合。
+                    if let Ok(Some(row)) = self.store.get_key(key_id) {
+                        if let Ok(mut set) = self.revoked_refs.lock() {
+                            set.insert(row.secret_ref);
+                        }
+                    }
                     if let Err(err) = self
                         .store
                         .set_key_status(key_id, crate::store::KEY_STATUS_REVOKED)
@@ -2156,6 +2227,15 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 组装网关配置（含站点密钥）。调用方负责真正启动网关。
     ///
     /// `GatewayConfig` 的 `Debug` 已手写脱敏，不会打印令牌与密钥。
+    ///
+    /// # M8-S1：路由表真的被填上了
+    ///
+    /// M7 的审计 D-2/D-4 说的是同一件事：`RouteTable` 写得对、测得全，但**这个函数**一直走
+    /// `single_upstream` ⇒ `route` 恒为空表 ⇒ 排序、故障切换、失败事件在生产上全部不可达。
+    /// 现在这里做三件事：
+    /// ① 为**所有**有可用密钥的站点建 `SiteFacts`（含当前这个），推导路由表；
+    /// ② 把每个上游的明文填进 `keys_by_ref`（否则网关会静默 `continue` → 502）；
+    /// ③ 交给网关一个**已回收集合**与一个会话代号。
     pub fn gateway_config(
         &self,
         site_id: i64,
@@ -2176,11 +2256,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // 走 `key_secret` 而不是在这里再抄一遍 `vault.get` + 回收判定（M8-S5A §2.2）：
         // 一个咽喉点比两处同义代码好，`ensure_not_revoked` 也不会再漏。
         //
-        // **未接线（去向 M8-S1）**：`GatewayConfig::api_key` 的类型仍是裸 `String`
-        // （`gateway.rs` 属 M8-S1 写域），所以下面这一次 `.to_string()` 产生的副本
-        // **没有**被 `Zeroizing` 包住。`keys_by_ref` 那条路径已经是 `Zeroizing` 了，
-        // 单上游这条还不是——`M8-S0` §4 增量① 要求把这件事说出来，不能假装覆盖了。
+        // **未接线（去向 M8-S1 第 13 行）**：`GatewayConfig::api_key` 的类型仍是裸 `String`
+        // （单上游 legacy 字段），所以下面这一次 `.to_string()` 产生的副本**没有**被
+        // `Zeroizing` 包住。`keys_by_ref` 那条路径已经是 `Zeroizing` 了，单上游这条还不是。
         let api_key = self.key_secret(key_id)?.to_string();
+
+        let (route, keys_by_ref) = self.build_gateway_route()?;
 
         let mut config = crate::gateway::GatewayConfig::single_upstream(
             port,
@@ -2189,16 +2270,138 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             api_key,
             site.display_name,
         );
+        // ① 路由表：**非空**（只要至少有一个可用站点）。空表会退回 legacy 单上游路径，
+        //    那正是 M7 的 D-4——所以这里非空本身就是本包存在的意义。
+        config.route = route;
+        // ② 明文映射：`route` 里出现的每个 `key_ref` 都在这里。集合不变式由
+        //    `tests/routing_wiring.rs` 的 W3 守着（缺一个 ⇒ 网关静默 502）。
+        config.keys_by_ref = keys_by_ref;
+        // ③ 已回收集合：网关只**查**它，不新开取密钥路径。
+        config.revoked_refs = Some(Arc::clone(&self.revoked_refs));
+        // ④ 会话代号：本次会话的失败才算本次的（§11.1）。
+        let session = self
+            .gateway_session
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let current = Arc::clone(&self.gateway_session);
+
         // 失败事件出口（FR-5:160）。回调只做一次 `push`：它跑在网关的请求任务里，
         // 不该在那里做 IO，也不该 panic（`Mutex` 中毒时静默丢弃——观测性坏掉
         // 不该让业务请求失败，这是本文件既有的一条口径，见 `log()`）。
         let sink = Arc::clone(&self.gateway_failures);
         config.on_failure = Some(Arc::new(move |failure: crate::gateway::GatewayFailure| {
+            // 会话比对：**不相等就丢弃**（§11.1）。丢弃的代价写在 spec 的未验证边界里：
+            // 停止瞬间在途请求的失败不进事件表——把它记到下一个会话是主动误导，
+            // 而它本身（网关正在停）也不构成可诊断的故障。
+            if current.load(std::sync::atomic::Ordering::SeqCst) != session {
+                return;
+            }
             if let Ok(mut buffer) = sink.lock() {
                 push_bounded(&mut buffer, failure);
             }
         }));
+
+        // ⑤ 延迟观测出口（§5.3）。**只采信成功的尝试**：失败耗时没有比较意义。
+        let facts = Arc::clone(&self.site_facts);
+        config.on_observation = Some(Arc::new(move |obs: crate::gateway::UpstreamObservation| {
+            if !obs.ok {
+                return;
+            }
+            if let Ok(mut map) = facts.lock() {
+                map.entry(obs.site_id).or_default().latency_ms = Some(obs.latency_ms);
+            }
+        }));
         Ok(config)
+    }
+
+    /// 从**所有可用站点**推导路由表 + 明文映射（M8-S1 §5.1 / §10）。
+    ///
+    /// 「可用」= 有一行**未被回收**的本地记录，且钥匙串里那份明文还在。
+    /// 判据与 [`Self::key_secret`] 同源（都过 `ensure_not_revoked`）——**不新开取密钥路径**。
+    ///
+    /// 返回 `(route, keys_by_ref)`。两者的**集合不变式**：`route` 里出现的每个 `key_ref`
+    /// 都在 `keys_by_ref` 里。这条不是靠自觉：`tests/routing_wiring.rs` 的 W3 直接断言，
+    /// 因为缺一个的表现是「网关静默 502」（M7 审计 D-2）。
+    ///
+    /// **每个站点取哪一把 key**：取该站点**最新**的一条（`list_keys` 按 id 倒序无所谓，
+    /// 这里显式按 id 取最大）。多把 key 的站点应当由用户自己决定用哪把——今天没有这个界面，
+    /// 登记为限制（不是缺陷：站点的多把 key 在额度上等价，取最新那把是最不容易过期的）。
+    fn build_gateway_route(
+        &self,
+    ) -> Result<(
+        crate::routing::RouteTable,
+        std::collections::HashMap<String, zeroize::Zeroizing<String>>,
+    )> {
+        let observations = self
+            .site_facts
+            .lock()
+            .map(|map| map.clone())
+            .unwrap_or_default();
+        let revoked = self
+            .revoked_refs
+            .lock()
+            .map(|set| set.clone())
+            .unwrap_or_default();
+
+        let mut facts: Vec<crate::routing::SiteFacts> = Vec::new();
+        let mut keys: std::collections::HashMap<String, zeroize::Zeroizing<String>> =
+            std::collections::HashMap::new();
+
+        for site in self.store.list_sites()? {
+            let Some(row) = self.pick_gateway_key(site.id)? else {
+                continue;
+            };
+            if row.status == crate::store::KEY_STATUS_REVOKED {
+                continue;
+            }
+            // 走 `secret_for_row`（唯一的明文出口），**不新开取密钥路径**。
+            let Ok(secret) = self.secret_for_row(&row) else {
+                // 本地记录在、明文没了：这把 key **用不了**。
+                // 跳过这一把是对的（该站点不进路由表），跳过整个站点是错的。
+                continue;
+            };
+            let obs = observations.get(&site.id).cloned().unwrap_or_default();
+            facts.push(crate::routing::SiteFacts {
+                site_id: site.id,
+                base_url: site.base_url.clone(),
+                models: obs.models,
+                rate: obs.rate,
+                // **余额未知 ⇒ None**，绝不 `unwrap_or(0.0)`（那会把「不知道」变成「已耗尽」）。
+                balance_usd: obs.balance_usd,
+                latency_ms: obs.latency_ms,
+                key_ref: row.secret_ref.clone(),
+            });
+            if !revoked.contains(&row.secret_ref) {
+                keys.insert(row.secret_ref.clone(), secret);
+            }
+        }
+
+        Ok((crate::routing::build_route_table(&facts), keys))
+    }
+
+    /// 该站点用来出网的 key：**未回收**里 id 最大的那一条（最新的一把）。
+    fn pick_gateway_key(&self, site_id: i64) -> Result<Option<crate::store::KeyRow>> {
+        Ok(self
+            .store
+            .list_keys()?
+            .into_iter()
+            .filter(|row| row.site_id == site_id)
+            .filter(|row| row.status != crate::store::KEY_STATUS_REVOKED)
+            .max_by_key(|row| row.id))
+    }
+
+    /// 作废当前网关会话（M8-S1 §11.1）。
+    ///
+    /// `gateway_stop` 在 drain **之后**调它：stop 之前产生的失败属于**被停止的那次会话**
+    /// （已被这次 drain 收走）；stop 之后**在途**请求才产生的失败会看到代号不匹配，
+    /// 于是被丢弃——不会被记到下一个会话上。
+    ///
+    /// **代价**（写进 spec 的未验证边界）：停止瞬间在途请求的失败不进事件表。
+    /// 这是刻意的取舍：记到下一个会话是**主动误导**，而它本身（网关正在停）
+    /// 也不构成可诊断的故障。
+    pub fn end_gateway_session(&self) {
+        self.gateway_session
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 把网关侧攒下的失败写进事件表（在 [`Self::refresh_all`] 里调用）。    ///
@@ -2206,25 +2409,67 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// **在网关侧就已经过 `redact::scrub`**（M7-S1 复审 P1-1）——这里不重复脱敏：
     /// 两条出口各抄一段掩码逻辑，迟早会分叉（M5-S1 已经踩过一次）。
     ///
+    /// **事件的 `ts` 取失败发生的时刻**，不是落库时刻（M8-S1 §11.2）：
+    /// 落库发生在下一次 `refresh_all`，用落库时刻会让「网关为什么在 14:00 切换了上游」
+    /// 显示成「14:05」，因果链在时间轴上错位。
+    ///
     /// 返回写出的条数（测试用）。
     pub fn drain_gateway_failures(&self) -> usize {
-        let drained: Vec<crate::gateway::GatewayFailure> = match self.gateway_failures.lock() {
+        let drained: Vec<BufferedGatewayFailure> = match self.gateway_failures.lock() {
             Ok(mut buffer) => buffer.drain(..).collect(),
             Err(_) => return 0,
         };
-        for failure in &drained {
-            self.log(observability::event_with_payload(
+        for buffered in &drained {
+            let failure = &buffered.failure;
+            // `status == 0` 是哨兵（M8-S1 §9）：HTTP 里不存在 0，它表示
+            // 「没有任何上游返回过状态码」（候选全被熔断 / 缺明文 / 已回收）。
+            // 文案必须写明，否则读者会把 0 误读成真实状态码。
+            let message = if failure.status == 0 {
+                format!("网关没有可用的上游（site {}）", failure.site_id)
+            } else {
+                format!("网关放弃上游（HTTP {}）", failure.status)
+            };
+            // **必须走 `event_with_payload`**（而不是手搓一个 `Event`）：它里面那两件事
+            // ——`mask_url_userinfo_in_json` 与 `scrub(payload)`——是所有出口共用的咽喉。
+            // 我第一版手搓了一个，当场被 `gateway_failure_sink` 的用例抓住：
+            // 事件里的 `model` 不再被掩。**两条出口各写一份掩码逻辑迟早分叉**，
+            // 这正是 M5-S1 与 DEBUG P2-1 反复出现的模式。
+            let mut event = observability::event_with_payload(
                 Level::Warn,
                 "gateway",
-                format!("网关放弃上游（HTTP {}）", failure.status),
+                message,
                 serde_json::json!({
                     "site_id": failure.site_id,
                     "status": failure.status,
                     "model": failure.model,
                 }),
-            ));
+            );
+            // 唯一需要覆盖的是时间戳（§11.2）：取**失败发生**的时刻而不是落库时刻。
+            event.ts = buffered.at;
+            self.log(event);
         }
         drained.len()
+    }
+
+    /// 仅测试用：直接写一条站点观测（余额 / 倍率 / 延迟）。
+    ///
+    /// 真实路径是 `refresh_all` 取余额、`available_groups` 取倍率、网关观测回传延迟——
+    /// 那三条都要起站点与网关。这里要验的是**下游那一段**：观测进了缓存之后，
+    /// 路由表的排序是不是照 §6 的语义走。
+    #[doc(hidden)]
+    pub fn set_site_observation_for_test(
+        &self,
+        site_id: i64,
+        balance_usd: Option<f64>,
+        rate: Option<f64>,
+        latency_ms: Option<u64>,
+    ) {
+        if let Ok(mut map) = self.site_facts.lock() {
+            let entry = map.entry(site_id).or_default();
+            entry.balance_usd = balance_usd;
+            entry.rate = rate;
+            entry.latency_ms = latency_ms;
+        }
     }
 
     /// 仅测试用：把一条网关失败放进缓冲，等价于网关回调触发了一次。
@@ -2700,6 +2945,16 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .get_key(key_id)?
             .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
         ensure_not_revoked(&row)?;
+        self.secret_for_row(&row)
+    }
+
+    /// 从一行密钥记录取出明文。**这是全文件唯一读钥匙串取明文的地方。**
+    ///
+    /// 收成一个函数不是为了好看：`tests/zeroize_hygiene.rs` 有一条结构守卫断言
+    /// `vault.get(` 在 `service.rs` 里恰好出现一次——那条守卫在 M8-S1 加
+    /// `build_gateway_route`（网关的明文映射）时**当场红了**，红得对：
+    /// 那是第二个明文出口。处置是把它收进这里，而不是放宽断言。
+    fn secret_for_row(&self, row: &crate::store::KeyRow) -> Result<zeroize::Zeroizing<String>> {
         let secret = self.vault.get(&row.secret_ref)?.ok_or_else(|| {
             Error::Vault(format!(
                 "钥匙串中没有该密钥（{}）；请先在该站点重新取一次钥匙",

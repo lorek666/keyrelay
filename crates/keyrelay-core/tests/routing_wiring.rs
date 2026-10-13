@@ -168,3 +168,165 @@ fn build_route_table_keeps_the_input_order() {
         .collect();
     assert_eq!(order, vec![1, 9], "同分按 site_id 升序（排序键的最后一段）");
 }
+
+// ============================================================ W7：生产构造点
+
+/// **W7 是「未接线」的守卫**：M7 的 D-2/D-4 就是「实现好了但生产构造点仍走 `single_upstream`」。
+/// 这条直接对**生产构造点**（`service.rs::gateway_config`）断言，它红了就说明接线没做。
+mod production_wiring {
+    use std::fs;
+    use std::sync::Arc;
+
+    use keyrelay_core::service::{KeyRelayService, ServiceConfig};
+    use keyrelay_core::site::transport::MockTransport;
+    use keyrelay_core::store::Store;
+    use keyrelay_core::vault::{secret_ref, MemoryVault, Vault};
+
+    async fn service_with_two_sites() -> (
+        tempfile::TempDir,
+        KeyRelayService<MockTransport>,
+        i64,
+        i64,
+        String,
+        String,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let store = Store::open(&dir.path().join("keyrelay.db")).unwrap();
+
+        let a = store
+            .upsert_site("newapi", "https://a.example.com", "A 站")
+            .unwrap();
+        let b = store
+            .upsert_site("newapi", "https://b.example.com", "B 站")
+            .unwrap();
+        let ref_a = secret_ref("key", 1, "secret");
+        let ref_b = secret_ref("key", 2, "secret");
+        let key_a = store
+            .insert_key(a, "codex/daily", &ref_a, Some("1"))
+            .unwrap();
+        store
+            .insert_key(b, "codex/daily", &ref_b, Some("2"))
+            .unwrap();
+
+        let vault = Arc::new(MemoryVault::new());
+        vault.put(&ref_a, "sk-site-A-0123456789").unwrap();
+        vault.put(&ref_b, "sk-site-B-0123456789").unwrap();
+
+        let mock = MockTransport::new(vec![]);
+        let service = KeyRelayService::new(
+            store,
+            mock.clone(),
+            ServiceConfig {
+                vault: Arc::clone(&vault) as Arc<dyn Vault>,
+                home,
+                backup_dir: dir.path().join("backups"),
+            },
+        );
+        (dir, service, a, key_a, ref_a, ref_b)
+    }
+
+    #[tokio::test]
+    async fn gateway_config_carries_a_populated_route_table() {
+        // 修复前：`route` 恒为空表（`gateway_config` 只产 `single_upstream`），
+        // 于是排序、故障切换、失败事件在生产上**全部不可达**。
+        let (_dir, service, site_a, key_a, ref_a, ref_b) = service_with_two_sites().await;
+
+        let config = service
+            .gateway_config(site_a, key_a, 0)
+            .expect("组装网关配置");
+
+        assert!(
+            !config.route.is_empty(),
+            "生产构造点必须产出**非空**路由表——空表就是 M7 审计的 D-4"
+        );
+        let candidates = config.route.candidates("gpt-5.6");
+        assert_eq!(
+            candidates.len(),
+            2,
+            "两个站点各有一把可用 key ⇒ 两个候选（模型清单为空 = 未知 ⇒ 通配）"
+        );
+
+        // W3 的集合不变式：`route` 里出现的每个 `key_ref` 都必须在 `keys_by_ref` 里。
+        // 缺一个的表现是网关静默 `continue` → 502（M7 审计 D-2）。
+        for upstream in &candidates {
+            assert!(
+                config.keys_by_ref.contains_key(&upstream.key_ref),
+                "路由指向 {} 但 keys_by_ref 里没有它——网关会静默 502",
+                upstream.key_ref
+            );
+        }
+        assert!(config.keys_by_ref.contains_key(&ref_a));
+        assert!(config.keys_by_ref.contains_key(&ref_b));
+
+        // 明文确实进去了（不是空壳）。
+        assert_eq!(
+            config.keys_by_ref.get(&ref_a).map(|s| s.as_str()),
+            Some("sk-site-A-0123456789")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revoked_key_is_excluded_from_the_route_table() {
+        // §3.5-5 的另一半：**新的取密钥路径不得绕过 `ensure_not_revoked` 建立的读者**。
+        let (_dir, service, site_a, key_a, _ref_a, _ref_b) = service_with_two_sites().await;
+        service
+            .store()
+            .set_key_status(key_a, keyrelay_core::store::KEY_STATUS_REVOKED)
+            .unwrap();
+
+        let config = service.gateway_config(site_a, key_a, 0);
+        // 站点 A 唯一那把被回收了 ⇒ 它不该出现在路由表里。
+        // （`gateway_config` 本身会因为 key 被回收而拒绝——那是另一条路径，见 M8-S5A §2。）
+        assert!(
+            config.is_err(),
+            "对已回收的 key 组装网关配置必须被拒绝，而不是产出一张含它的路由表"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unobservable_balance_does_not_push_a_site_to_the_back() {
+        // 端到端把 §6 的排序语义钉在生产装配上：观测缓存里余额未知时，
+        // 该站点**不得**被排到「已耗尽」档后面。
+        let (_dir, service, site_a, key_a, _ref_a, _ref_b) = service_with_two_sites().await;
+
+        // 给 B 站一个已知余额，A 站保持未知。
+        service.set_site_observation_for_test(1, Some(50.0), None, None);
+        service.set_site_observation_for_test(2, None, None, None);
+
+        let config = service
+            .gateway_config(site_a, key_a, 0)
+            .expect("组装网关配置");
+        let order: Vec<i64> = config
+            .route
+            .candidates("gpt-5.6")
+            .iter()
+            .map(|u| u.site_id)
+            .collect();
+
+        assert_eq!(
+            order.first().copied(),
+            Some(1),
+            "有余额的站点排第一（site_id 升序是最后一段，1 < 2）"
+        );
+        assert_eq!(order.len(), 2, "两个站点都还在候选里：{order:?}");
+    }
+
+    #[test]
+    fn the_route_table_is_built_from_the_single_production_constructor() {
+        // 结构面：生产侧只应有一个 `GatewayConfig` 构造点，且它必须**不是**
+        // 一条只产单上游的路径。M7 的 D-4 就是「实现好了但构造点没换」。
+        let source = include_str!("../src/service.rs");
+        let built = source.matches("GatewayConfig::single_upstream(").count();
+        assert_eq!(built, 1, "生产侧应当只有一处构造（当前 {built} 处）");
+        assert!(
+            source.contains("config.route = route;"),
+            "构造之后必须把推导出来的路由表装上去——否则它还是空表"
+        );
+        assert!(
+            source.contains("config.keys_by_ref = keys_by_ref;"),
+            "明文映射也必须装上（缺它 = 静默 502）"
+        );
+    }
+}
