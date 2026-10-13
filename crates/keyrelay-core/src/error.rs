@@ -79,6 +79,14 @@ pub enum Error {
     /// 尚未实现的能力（占位，禁止在发布路径上出现）
     #[error("尚未实现: {0}")]
     Unimplemented(String),
+
+    /// 该站点类型**设计上**不支持此能力。
+    ///
+    /// 与 [`Error::Unimplemented`] 的区别是语义而非措辞：后者表示「还没做」（发布路径上不该出现），
+    /// 本条表示「不做」——例如 `custom-openai-compatible` 站点没有令牌管理端点，
+    /// 它永远不会有 `list_keys`。界面上因此应当**灰显**而不是提示「即将支持」。
+    #[error("站点类型不支持: {0}")]
+    Unsupported(String),
 }
 
 impl Error {

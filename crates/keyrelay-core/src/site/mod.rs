@@ -355,6 +355,8 @@ pub(crate) fn scrub_error(err: Error) -> Error {
         Error::NotFound(m) => Error::NotFound(crate::redact::scrub(&m)),
         Error::Transport(m) => Error::Transport(crate::redact::scrub(&m)),
         Error::FingerprintMismatch(m) => Error::FingerprintMismatch(crate::redact::scrub(&m)),
+        // M7-S0：`Unsupported` 的文案可能带上站点回显的原文，因此与上面四条同等对待。
+        Error::Unsupported(m) => Error::Unsupported(crate::redact::scrub(&m)),
         other => other,
     }
 }
@@ -451,6 +453,7 @@ mod tests {
             Error::NotFound(format!("没有 {secret}")),
             Error::Transport(format!("boom {secret}")),
             Error::FingerprintMismatch(format!("nope {secret}")),
+            Error::Unsupported(format!("站点回显 {secret}")),
         ] {
             let text = scrub_error(err).to_string();
             assert!(!text.contains(secret), "错误文案泄漏密钥: {text}");
