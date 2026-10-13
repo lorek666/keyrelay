@@ -226,3 +226,48 @@ async fn rotating_a_revoked_key_is_refused_before_any_site_request() {
         "对已回收的 key 发起轮换不得发出任何站点请求"
     );
 }
+
+#[tokio::test]
+async fn a_failed_local_read_after_a_successful_remote_delete_is_not_reported_as_failure() {
+    // M8-S5A §4 / DEBUG 报告 §1.8 的第二半：站点侧 DELETE **已经成功**之后，
+    // 如果读本地记录失败，原来那个 `?` 会把整次操作报成失败——而站点上那一把已经没了。
+    // 用户看到「回收失败」会去重试，重试**必然失败**（站点上已经没有它了），
+    // 更糟的是他会以为密钥还活着。同一函数里 `set_key_status` 那条注释早就写明了这条原则
+    // （「不可逆的成功不得报成失败」），只有这一处没照做。
+    let f = setup().await;
+    {
+        // 让本地读失败：把 `keys` 表拆掉（服务与夹具用的是同一个库文件）。
+        let conn = rusqlite::Connection::open(&f.db).unwrap();
+        conn.execute("DROP TABLE keys", []).unwrap();
+    }
+    f.mock.push(delete_ok());
+
+    let outcome = f.service.revoke_key(f.site_id, "1").await;
+    assert!(outcome.is_ok(), "站点侧已删成功，不得报成失败: {outcome:?}");
+
+    // 代价是记账没写上，所以**必须留痕**——否则用户没有任何线索。
+    let events = f.service.recent_events(50).unwrap();
+    assert!(
+        events.iter().any(|e| e.message.contains("读本地记录失败")),
+        "必须留痕: {:?}",
+        events.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn the_revoke_doc_does_not_promise_a_reconcile_that_does_not_exist() {
+    // DEBUG 报告 §1.8 的第一半：注释写着「下一次 `sync_site_keys` 会把它标成 `missing`」，
+    // 而 `sync_site_keys` **从不改已有行的状态**，`missing` 也不在 `set_key_status`
+    // 的合法值里。B-100 的处置一度建立在这个不存在的前提上。
+    //
+    // 这条是脆弱的文本断言，它只钉一件事：**不要把不存在的能力写进注释**。
+    const SOURCE: &str = include_str!("../src/service.rs");
+    let offenders: Vec<&str> = SOURCE
+        .lines()
+        .filter(|line| line.contains("标成 `missing`") && !line.contains("原来写的是"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "代码里又出现了「对账会把它标成 missing」这类承诺（那个能力不存在）：{offenders:?}"
+    );
+}
