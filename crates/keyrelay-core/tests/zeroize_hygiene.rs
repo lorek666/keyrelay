@@ -182,6 +182,10 @@ fn the_vault_is_read_through_exactly_one_choke_point() {
     //
     // 断言的是**源码里 `vault.get` 的出现次数为 1**——这是一条脆弱的文本断言，
     // 所以它只钉「不要长出第二个明文出口」这一件事，不试图证明更多。
+    //
+    // **实测过的教训**：加上 §5 的 `sync_site_keys` 之后这条**当场红了**（2 处）——
+    // 而那一处是「查一下在不在」不是「把明文取出来用」。处置不是放宽这条断言，
+    // 是给 `Vault` 加 `has()`（名字上分开意图），于是这条守卫的前提重新成立。
     let source = include_str!("../src/service.rs");
     let reads = source
         .lines()
