@@ -226,6 +226,31 @@ impl std::fmt::Debug for GatewayConfig {
     }
 }
 
+impl GatewayConfig {
+    /// 单一上游的构造器（M7-S0 引入）。
+    ///
+    /// 存在的理由：`service.rs` 是本文件**之外**的唯一生产构造点，而 M7-S1 会给本结构
+    /// 增加多上游字段。只要构造走这个函数，S1 改字段就不会打断 `service.rs` 的编译——
+    /// 「新增一个上游概念」不该要求改两个包的文件（同 M6-S0 §9.1 对 `relative_target` 的处置）。
+    ///
+    /// `service.rs::gateway_config` 的对外行为因此**逐字不变**：仍然是「一个站点、一把密钥」。
+    pub fn single_upstream(
+        port: u16,
+        token: String,
+        base_url: String,
+        api_key: String,
+        site_display_name: String,
+    ) -> Self {
+        Self {
+            port,
+            token,
+            base_url,
+            api_key,
+            site_display_name,
+        }
+    }
+}
+
 pub struct GatewayHandle {
     pub addr: SocketAddr,
     pub token: String,

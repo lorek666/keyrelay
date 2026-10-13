@@ -94,6 +94,8 @@ fn error_kind(err: &Error) -> &'static str {
         Error::Store(_) => "本地存储错误",
         Error::Inject { .. } => "写入失败",
         Error::Unimplemented(_) => "尚未实现",
+        // M7-S0：与 `Unimplemented` 分开记，事件表里「还没做」和「这类站点不做」是两条不同的信号。
+        Error::Unsupported(_) => "站点类型不支持",
     }
 }
 
@@ -1720,13 +1722,13 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             ))
         })?;
 
-        Ok(crate::gateway::GatewayConfig {
+        Ok(crate::gateway::GatewayConfig::single_upstream(
             port,
-            token: crate::gateway::generate_token(),
-            base_url: site.base_url,
+            crate::gateway::generate_token(),
+            site.base_url,
             api_key,
-            site_display_name: site.display_name,
-        })
+            site.display_name,
+        ))
     }
 
     /// 只保留最近 `keep` 次投递的备份目录，删除更早的。返回删除的目录数。
