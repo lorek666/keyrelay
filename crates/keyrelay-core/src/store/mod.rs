@@ -10,8 +10,39 @@ use rusqlite::{params, Connection};
 
 use crate::error::{Error, Result};
 use crate::inject::Journal;
+use crate::site::KeyStatus;
 
 const SCHEMA_VERSION: i64 = 2;
+
+/// 「已回收」——**本地**密钥生命周期状态（M7-S4 / FR-2）。
+///
+/// **这一列的词表是本地词表**：`keys.status` 今天**没有任何站点侧写入者**——
+/// `INSERT INTO keys` 不写它（`store/mod.rs:395`）、也没有把站点侧 `KeyMeta.status` 映射进来的代码，
+/// 所以它记的是**本产品对这把钥匙做过什么**，而不是站点怎么报。
+///
+/// `site::KeyStatus` 只有 `enabled` / `disabled` / `exhausted` / `unknown`，**装不下「已回收」**
+/// ——键在站点上已经不存在了，站点永远不会报这个状态。用 `"disabled"` 冒充会让界面无法区分
+/// 「站点把它禁了」与「我自己把它回收了」，而后者正是本包存在的理由（章程 §3.4 v1.1 裁决）。
+pub const KEY_STATUS_REVOKED: &str = "revoked";
+
+/// `keys.status` 的合法值 = 站点侧词表 ∪ 本地词表。
+///
+/// 站点侧四个值**从枚举派生**（不抄字面量）：章程 §3.4 的原文就是「只接受 `site::KeyStatus::as_str()`
+/// 的合法值」，派生比抄写少一个漂移源。新增站点侧变体时，`tests/key_lifecycle.rs` 里那条
+/// 穷举 `match` 会编译失败，逼人回来确认本集合。
+fn legal_key_statuses() -> [&'static str; 5] {
+    [
+        KeyStatus::Enabled.as_str(),
+        KeyStatus::Disabled.as_str(),
+        KeyStatus::Exhausted.as_str(),
+        KeyStatus::Unknown.as_str(),
+        KEY_STATUS_REVOKED,
+    ]
+}
+
+fn is_legal_key_status(status: &str) -> bool {
+    legal_key_statuses().contains(&status)
+}
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -767,6 +798,62 @@ impl Store {
         Ok(())
     }
 
+    /// 写 `keys.status`（M7-S4 / FR-2「回收站点侧 key」的落点）。
+    ///
+    /// 合法值 = [`legal_key_statuses`]（站点侧 `site::KeyStatus::as_str()` 四个值
+    /// ∪ [`KEY_STATUS_REVOKED`]）。其余值 ⇒ [`Error::Store`]，且**不执行 UPDATE**：
+    /// 先校验后写，调用方的入参 bug 不该在库里留下半成品。
+    ///
+    /// 行不存在时**报错**而不是静默成功（与 [`Store::set_site_health`] 同口径）：
+    /// 静默成功会让调用方以为状态已落库，而界面会显示一个**不存在**的 key「已回收」。
+    ///
+    /// **不删行**：回收语义只改状态。删 `keys` 行会经 `ON DELETE CASCADE` 带走该 key 的
+    /// 全部 `bindings`（漂移检测的输入），而 `journals` 没有 `key_id` 列——溯源链的起点就是
+    /// `keys.id`，删了它再也答不上「这次投递是哪把 key 造成的」（M7-S4 spec §6.1）。
+    pub fn set_key_status(&self, key_id: i64, status: &str) -> Result<()> {
+        if !is_legal_key_status(status) {
+            // 值本身也过 `scrub`：调用方可能把密钥误传进来，错误文案里不能出现它
+            return Err(Error::Store(format!(
+                "keys.status 非法值: {}（合法值: {}）",
+                crate::redact::scrub(status),
+                legal_key_statuses().join("/")
+            )));
+        }
+        let conn = self.lock()?;
+        let affected = conn
+            .execute(
+                "UPDATE keys SET status = ?2 WHERE id = ?1",
+                params![key_id, status],
+            )
+            .map_err(|e| Error::Store(format!("更新密钥状态失败: {e}")))?;
+        if affected == 0 {
+            return Err(Error::Store(format!("密钥不存在: {key_id}")));
+        }
+        Ok(())
+    }
+
+    /// 读 `keys.status`。行不存在 ⇒ `Ok(None)`。
+    ///
+    /// 读是查询语义：「没有这行」是正常状态而不是错误——与写的口径**刻意不同**
+    /// （写不存在的行是调用方的 bug，见 [`Store::set_key_status`]）。两条都有测试。
+    pub fn key_status(&self, key_id: i64) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT status FROM keys WHERE id = ?1")
+            .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
+        let mut rows = stmt
+            .query_map(params![key_id], |row| row.get::<_, String>(0))
+            .map_err(|e| Error::Store(format!("查询密钥状态失败: {e}")))?;
+        match rows.next() {
+            Some(row) => {
+                Ok(Some(row.map_err(|e| {
+                    Error::Store(format!("读取密钥状态失败: {e}"))
+                })?))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// 登记一次导出（同一路径重复导出则覆盖）。**只记路径与统计，不记内容。**
     pub fn record_export(&self, path: &Path, encrypted: bool, bytes: usize) -> Result<()> {
         let bytes = i64::try_from(bytes)
@@ -1025,5 +1112,39 @@ mod tests {
         };
         store.record_journal(&journal).unwrap();
         assert_eq!(store.journal_count().unwrap(), 1);
+    }
+
+    /// 合法值集合必须是「站点侧词表 ∪ 本地词表」，且**从枚举派生**（不是抄字面量）。
+    ///
+    /// 站点侧新增变体时，`tests/key_lifecycle.rs` 里那条穷举 `match` 会先编译失败；
+    /// 这里再钉住集合大小与派生关系，两道一起挡。
+    #[test]
+    fn legal_key_statuses_are_derived_from_the_site_enum_plus_the_local_revoked() {
+        let legal = legal_key_statuses();
+        for status in [
+            KeyStatus::Enabled,
+            KeyStatus::Disabled,
+            KeyStatus::Exhausted,
+            KeyStatus::Unknown,
+        ] {
+            assert!(
+                legal.contains(&status.as_str()),
+                "站点侧 {} 必须是合法值",
+                status.as_str()
+            );
+        }
+        assert!(
+            legal.contains(&KEY_STATUS_REVOKED),
+            "本地 revoked 必须是合法值"
+        );
+        assert_eq!(
+            legal.len(),
+            5,
+            "集合大小变了要回来确认（4 站点侧 + 1 本地）"
+        );
+
+        assert!(!is_legal_key_status("REVOKED"), "大小写敏感");
+        assert!(!is_legal_key_status(""));
+        assert!(!is_legal_key_status(" revoked"));
     }
 }

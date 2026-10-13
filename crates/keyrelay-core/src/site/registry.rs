@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use super::custom_openai::CustomOpenAi;
 use super::newapi::NewApi;
 use super::sub2api::Sub2Api;
 use super::transport::HttpTransport;
@@ -28,7 +29,14 @@ impl<T: HttpTransport + Clone + 'static> SiteRegistry<T> {
     pub fn new(transport: T) -> Self {
         Self {
             transport,
-            probe_order: vec![SiteKind::NewApi, SiteKind::Sub2Api],
+            // `CustomOpenAiCompatible` **必须排在最后**（M7-S2 / 章程 v1.1 裁决 O-1）：
+            // 它只靠 `/v1/models` 认领，判据最宽；放前面会把已有两类的站点抢过来
+            // （NewAPI 的 `/v1/models` 挂在 TokenAuth 之后，但别的兼容层未必如此）。
+            probe_order: vec![
+                SiteKind::NewApi,
+                SiteKind::Sub2Api,
+                SiteKind::CustomOpenAiCompatible,
+            ],
             cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -49,6 +57,7 @@ impl<T: HttpTransport + Clone + 'static> SiteRegistry<T> {
         let created: Arc<dyn SiteAdapter> = match kind {
             SiteKind::NewApi => Arc::new(NewApi::new(self.transport.clone())),
             SiteKind::Sub2Api => Arc::new(Sub2Api::new(self.transport.clone())),
+            SiteKind::CustomOpenAiCompatible => Arc::new(CustomOpenAi::new(self.transport.clone())),
         };
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(kind, Arc::clone(&created));

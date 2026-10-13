@@ -10,6 +10,7 @@
 
 pub mod claude_code;
 pub mod codex_auth;
+pub mod continue_yaml;
 pub mod gemini_cli;
 pub mod json_text;
 pub mod opencode;
@@ -34,15 +35,26 @@ pub enum DeliveryChannel {
     OpenCode,
     /// `~/.gemini/.env`（M6-S1）
     GeminiCli,
+    /// `~/.config/opencode/opencode.jsonc`（M7-S3 / B-76）。
+    ///
+    /// 与 [`DeliveryChannel::OpenCode`] **并存**且互不回退：用户在预览里看到两个落点、
+    /// 自己选一个（产品不猜「哪个文件优先」，那正是 B-76 的根因）。
+    /// 目标文件必须是**严格 JSON**；带注释/尾随逗号会被拒绝（见 `delivery/mod.rs::jsonc_hazard`
+    /// 与 `docs/specs/M7-S3-落点扩展与生效策略.md` §6.2 / §13.1 O-1）。
+    OpenCodeJsonc,
+    /// `~/.continue/config.yaml` 的标记块（M7-S3 / PRD FR-4:151）
+    Continue,
 }
 
 impl DeliveryChannel {
-    pub const ALL: [DeliveryChannel; 5] = [
+    pub const ALL: [DeliveryChannel; 7] = [
         DeliveryChannel::CodexAuthJson,
         DeliveryChannel::ClaudeCodeSettings,
         DeliveryChannel::ShellBlock,
         DeliveryChannel::OpenCode,
         DeliveryChannel::GeminiCli,
+        DeliveryChannel::OpenCodeJsonc,
+        DeliveryChannel::Continue,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -52,6 +64,8 @@ impl DeliveryChannel {
             DeliveryChannel::ShellBlock => "shell-block",
             DeliveryChannel::OpenCode => "opencode",
             DeliveryChannel::GeminiCli => "gemini-cli",
+            DeliveryChannel::OpenCodeJsonc => "opencode-jsonc",
+            DeliveryChannel::Continue => "continue",
         }
     }
 
@@ -62,11 +76,23 @@ impl DeliveryChannel {
             "shell-block" => Ok(DeliveryChannel::ShellBlock),
             "opencode" => Ok(DeliveryChannel::OpenCode),
             "gemini-cli" => Ok(DeliveryChannel::GeminiCli),
+            "opencode-jsonc" => Ok(DeliveryChannel::OpenCodeJsonc),
+            "continue" => Ok(DeliveryChannel::Continue),
             other => Err(Error::NotFound(format!("未知的投递通道: {other}"))),
         }
     }
 
     /// 该通道服务的 agent 标识，与 `bindings.agent_id` 对齐。
+    ///
+    /// **必须 1:1**（`from_agent_id(agent_id()) == Some(self)` 对每个通道成立）：
+    /// 它是漂移报告的**逆映射**（`bindings.agent_id` → 通道名）。两条通道共享同一个
+    /// `agent_id` 时，`.jsonc` 上的漂移会被归到 `.json` 上——**报告错的落点比不报告更糟**
+    /// （用户会去检查一个根本没被改过的文件）。`consents` 表不受影响（它按
+    /// `UNIQUE(agent_id, channel, target_path)` 存），但漂移这条路只有 `agent_id` 一个键。
+    ///
+    /// 因此 `OpenCodeJsonc` 的取值是 `"opencode-jsonc"`（与 `as_str()` 一致）：
+    /// 它服务的是同一个 agent，但在**漂移归属**上必须是两个可区分的身份。
+    /// （章程 §3.3 原本冻结成 `"opencode"`，M7-S0 v1.2 已按此理由更正。）
     pub fn agent_id(self) -> &'static str {
         match self {
             DeliveryChannel::CodexAuthJson => "codex",
@@ -74,6 +100,8 @@ impl DeliveryChannel {
             DeliveryChannel::ShellBlock => "shell",
             DeliveryChannel::OpenCode => "opencode",
             DeliveryChannel::GeminiCli => "gemini-cli",
+            DeliveryChannel::OpenCodeJsonc => "opencode-jsonc",
+            DeliveryChannel::Continue => "continue",
         }
     }
 
@@ -105,8 +133,147 @@ impl DeliveryChannel {
                 .join("opencode")
                 .join("opencode.json"),
             DeliveryChannel::GeminiCli => PathBuf::from(".gemini").join(".env"),
+            // M7-S3：两条新通道的落点同样是**常量**（见本函数文档与 M7-S3 spec §4.1）。
+            DeliveryChannel::OpenCodeJsonc => PathBuf::from(".config")
+                .join("opencode")
+                .join("opencode.jsonc"),
+            DeliveryChannel::Continue => PathBuf::from(".continue").join("config.yaml"),
         }
     }
+}
+
+/// 投递后该 agent 是否需要重启才能读到新配置（PRD FR-4:137 / 章程 R-11：**只标注，不重启**）。
+///
+/// 纯函数、无 IO。UI **必须**调用它取文案，不得在界面里硬编码判断——否则新增通道时又会漏一处。
+pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
+    match channel {
+        // rc 文件在 **shell 启动时** source：不是「重启某个 agent」能解决的，
+        // 而是「**新开的终端**才生效」——改的是会话环境，不是某个进程的配置。
+        DeliveryChannel::ShellBlock => RestartHint::DependsOnNewSession,
+        // 其余六条都是「进程启动时读配置」：已在跑的会话不会自动重读。
+        // 保守方向（M7-S3 spec §8）：多提示一次重启无害；反过来（说「改完即生效」而其实没生效）
+        // 会让用户以为投递失败。
+        DeliveryChannel::CodexAuthJson
+        | DeliveryChannel::ClaudeCodeSettings
+        | DeliveryChannel::OpenCode
+        | DeliveryChannel::GeminiCli
+        | DeliveryChannel::OpenCodeJsonc
+        | DeliveryChannel::Continue => RestartHint::Needed,
+    }
+}
+
+/// 生效策略（章程 §3.3 冻结）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartHint {
+    /// 进程每次读配置，改完即生效。
+    ///
+    /// **当前没有任何通道返回它**：本波次六条通道都是「启动时读配置」。
+    /// 它是冻结枚举的一部分，为将来「每次调用都读配置」的通道保留——
+    /// **不得**为了「用上这个变体」把某个通道硬标成 `NotNeeded`。
+    NotNeeded,
+    /// 需要重启该 agent 才能生效
+    Needed,
+    /// 无法一概而论（例如 shell rc：只对新开的终端生效）
+    DependsOnNewSession,
+}
+
+/// 一个「已知但本版本**不托管**」的落点（M7-S3 / 章程 R-7）。
+///
+/// `note` 是 `&'static str`（冻结字段类型），因此它**不能**随 `exists` 变化：
+/// UI 用 `exists` 决定「检测到 / 未检测到」前缀，用 `note` 说明为什么不写。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetectedTarget {
+    /// `"Cline"` / `"Roo Code"`
+    pub label: &'static str,
+    /// 候选落点（`home` 下的绝对路径）
+    pub path: PathBuf,
+    /// `path.is_dir()`
+    pub exists: bool,
+    /// 面向用户的一句话
+    pub note: &'static str,
+}
+
+/// Cline / Roo Code 的候选扩展目录名。
+///
+/// **是候选，不是实测事实**：本机 VS Code `globalStorage` 下没有任何 cline/roo 目录
+/// （M7-S3 spec §15-②），这两个 ID 取自公开约定 → 未验证边界 + BACKLOG B-95。
+/// 猜错**无写盘风险**：本模块永不写这些路径。
+const CLINE_EXT_ID: &str = "saoudrizwan.claude-dev";
+const ROO_EXT_ID: &str = "rooveterinaryinc.roo-cline";
+
+const CLINE_NOTE: &str =
+    "本版本不向 Cline 写入：它的配置落点尚未核实，写错文件会让你以为投递成功。";
+const ROO_NOTE: &str =
+    "本版本不向 Roo Code 写入：它的配置落点尚未核实，写错文件会让你以为投递成功。";
+
+/// 宿主平台。抽出来是为了让**三个平台**的候选路径都能被单测覆盖
+/// （macOS 上跑不了 Windows 分支，但「路径拼装」可以逐字断言）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HostOs {
+    MacOs,
+    Linux,
+    Windows,
+}
+
+pub(crate) fn current_host_os() -> HostOs {
+    if cfg!(target_os = "macos") {
+        HostOs::MacOs
+    } else if cfg!(target_os = "windows") {
+        HostOs::Windows
+    } else {
+        HostOs::Linux
+    }
+}
+
+/// VS Code 的 `globalStorage` 目录（相对 `home`）——三个平台的约定不同。
+pub(crate) fn global_storage_dir(os: HostOs) -> PathBuf {
+    match os {
+        HostOs::MacOs => PathBuf::from("Library")
+            .join("Application Support")
+            .join("Code")
+            .join("User")
+            .join("globalStorage"),
+        HostOs::Linux => PathBuf::from(".config")
+            .join("Code")
+            .join("User")
+            .join("globalStorage"),
+        HostOs::Windows => PathBuf::from("AppData")
+            .join("Roaming")
+            .join("Code")
+            .join("User")
+            .join("globalStorage"),
+    }
+}
+
+/// 候选清单（顺序固定，UI 与测试都依赖它稳定）。
+pub(crate) fn unmanaged_candidates(os: HostOs, home: &Path) -> Vec<DetectedTarget> {
+    let base = home.join(global_storage_dir(os));
+    [
+        ("Cline", CLINE_EXT_ID, CLINE_NOTE),
+        ("Roo Code", ROO_EXT_ID, ROO_NOTE),
+    ]
+    .into_iter()
+    .map(|(label, ext_id, note)| {
+        let path = base.join(ext_id);
+        // 只读判定：`is_dir()` 对不存在的路径返回 false，且**不会**创建任何东西。
+        let exists = path.is_dir();
+        DetectedTarget {
+            label,
+            path,
+            exists,
+            note,
+        }
+    })
+    .collect()
+}
+
+/// 探测**已知但本版本不托管**的落点。只读，绝不创建目录、绝不写盘（章程 R-7）。
+///
+/// 只探测**宿主平台**那一列：Windows 路径在 macOS 的 `home` 下没有意义。
+/// 探测失败（权限、不存在）一律表现为 `exists: false`——本函数**不返回 `Err`**：
+/// 探测失败不该阻断 UI。
+pub fn detect_unmanaged_targets(home: &Path) -> Vec<DetectedTarget> {
+    unmanaged_candidates(current_host_os(), home)
 }
 
 /// 预览里的一个字段。两个字段都是「可以给用户看」的值。
@@ -204,7 +371,7 @@ pub fn resolve(channel: DeliveryChannel, home: &Path) -> Result<Box<dyn Delivery
 /// 本步的作者写域不含 `service.rs`（M6-S0 章程 §3）。
 ///
 /// `base_url` 为空表示「只投递密钥，不动 endpoint」——会写 base_url 的通道
-/// （Claude Code / shell 块 / OpenCode / Gemini CLI）据此少写一行。
+/// （Claude Code / shell 块 / OpenCode / OpenCodeJsonc / Gemini CLI / Continue）据此少写一行。
 ///
 /// OpenCode 通道在这里走**默认 provider 名**
 /// （[`opencode::OpenCodeWriter::DEFAULT_PROVIDER_ID`]）且不写 `model`。
@@ -223,11 +390,13 @@ pub fn resolve_for(
     )
 }
 
-/// 完整入口：`provider_id` / `model` **只对 [`DeliveryChannel::OpenCode`] 生效**，其余通道忽略。
+/// 完整入口：`provider_id` / `model` 对 `OpenCode`、`OpenCodeJsonc`、`Continue` 三条通道生效；
+/// 其余通道忽略。
 ///
 /// `provider_id` 为空（trim 后）时**在这里就报错**，而不是等到 `plan()`：
 /// 调用方传空 provider 名是接线错误，早报比写到一个 `provider.""` 上强。
-/// `model` 为 `None` 或 trim 后为空 → 不写、也不动已有的 `model` 键。
+/// `model` 为 `None` 或 trim 后为空 → 不写、也不动已有的 `model` 键（`Continue` 同理：
+/// 不写 `model:` 行，**不编造默认模型**）。
 pub fn resolve_for_binding(
     channel: DeliveryChannel,
     home: &Path,
@@ -243,15 +412,16 @@ pub fn resolve_for_binding(
         DeliveryChannel::ShellBlock => {
             Ok(Box::new(shell_block::ShellBlockWriter::new(home, base_url)))
         }
-        DeliveryChannel::OpenCode => {
+        DeliveryChannel::OpenCode | DeliveryChannel::OpenCodeJsonc => {
             if provider_id.trim().is_empty() {
                 return Err(Error::inject(
                     home.join(channel.relative_target()),
                     "provider id 为空，拒绝写入",
                 ));
             }
-            Ok(Box::new(opencode::OpenCodeWriter::new(
-                home,
+            Ok(Box::new(opencode::OpenCodeWriter::with_path_and_channel(
+                home.join(channel.relative_target()),
+                channel,
                 provider_id,
                 base_url,
                 model,
@@ -260,6 +430,9 @@ pub fn resolve_for_binding(
         DeliveryChannel::GeminiCli => {
             Ok(Box::new(gemini_cli::GeminiCliWriter::new(home, base_url)))
         }
+        DeliveryChannel::Continue => Ok(Box::new(continue_yaml::ContinueWriter::new(
+            home, base_url, model,
+        ))),
     }
 }
 
@@ -362,13 +535,142 @@ fn split_lines(text: &str) -> Vec<&str> {
     trimmed.split('\n').collect()
 }
 
+// ==================================================== M7-S3：`.jsonc` 与标记块的文本工具
+//
+// 三个 `pub(crate)` helper，都只服务于 M7-S3 的两条新通道。它们**只做文本判定**，
+// 不做 YAML / JSONC 解析（章程 §3.3 规则 3：不引入新依赖）。
+
+/// JSONC 专有语法。
+///
+/// **只用于把错误说清楚**，不参与写入决策：任何 `serde_json` 解析失败都拒绝写入
+/// （fail-closed），因此「是不是 JSONC」只影响文案，不影响安全。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum JsoncHazard {
+    LineComment,
+    BlockComment,
+    TrailingComma,
+}
+
+/// 字符串感知的有界扫描：只在**字符串外**判定 `//`、`/*` 与尾随逗号。
+///
+/// 字符串感知是必须的：`{"url": "https://x//y"}` 里的 `//` 不是注释
+/// （M7-S3 spec §10.2 J8 钉住这一点）。
+pub(crate) fn jsonc_hazard(text: &str) -> Option<JsoncHazard> {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            match b {
+                b'\\' => i += 2, // 跳过被转义的字符（`\"` 不结束字符串）
+                b'"' => {
+                    in_string = false;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        match b {
+            b'"' => {
+                in_string = true;
+                i += 1;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => return Some(JsoncHazard::LineComment),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => return Some(JsoncHazard::BlockComment),
+            b',' => {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if matches!(bytes.get(j), Some(b'}') | Some(b']')) {
+                    return Some(JsoncHazard::TrailingComma);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// 文件的行尾形态：首个 `\n` 之前若是 `\r` ⇒ CRLF；否则 LF；没有换行 / 空文件 ⇒ LF。
+pub(crate) fn detect_line_ending(text: &str) -> &'static str {
+    match text.find('\n') {
+        Some(i) if i > 0 && text.as_bytes()[i - 1] == b'\r' => "\r\n",
+        _ => "\n",
+    }
+}
+
+/// 收集 `marker` 所在**行首**的字节偏移（含该行的前导缩进）。
+///
+/// 「行首」= 该行在 `marker` 之前**只有空白**（Continue 的块是缩进在 `models:` 之下的，
+/// 与 `shell_block` 那种顶格标记不同）；注释里/字符串里提到标记不算。
+///
+/// 返回**行首**而不是标记自身的偏移：替换块时要把旧行连同它的缩进一起换掉，
+/// 否则会留下旧缩进、与新块自己的缩进叠成两层。
+fn line_start_offsets(text: &str, marker: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(marker) {
+        let at = from + rel;
+        // 向左跳过行内缩进，落点必须是行首（或文件开头）
+        let mut head = at;
+        while head > 0 && matches!(bytes[head - 1], b' ' | b'\t') {
+            head -= 1;
+        }
+        if head == 0 || bytes[head - 1] == b'\n' {
+            out.push(head);
+        }
+        from = at + marker.len();
+    }
+    out
+}
+
+/// 探测受管块的**行区间** `[begin_line_start, end_line_end)`（含结束标记那一行的行尾）。
+///
+/// 返回 `Ok(None)` = 文件里没有块；`Err` = 块不完整或有歧义（**不修**，章程 §3.3 规则 2）。
+pub(crate) fn locate_block(text: &str, path: &Path) -> Result<Option<(usize, usize)>> {
+    let begins = line_start_offsets(text, continue_yaml::BLOCK_BEGIN);
+    let ends = line_start_offsets(text, continue_yaml::BLOCK_END);
+    if begins.is_empty() && ends.is_empty() {
+        return Ok(None);
+    }
+    if begins.len() != 1 || ends.len() != 1 {
+        return Err(Error::inject(
+            path,
+            format!(
+                "受管块不完整或有歧义（行首开始标记 {} 个、结束标记 {} 个）；\
+                 KeyRelay 不修半成品：请手工补全或删掉残留标记后重试",
+                begins.len(),
+                ends.len()
+            ),
+        ));
+    }
+    let (begin, end_marker) = (begins[0], ends[0]);
+    if end_marker <= begin {
+        return Err(Error::inject(
+            path,
+            "受管块的结束标记出现在开始标记之前；拒绝改写以免吃掉文件内容",
+        ));
+    }
+    // 结束标记那一行的行尾也算在块内（没有行尾 = 块是文件最后一行且无尾换行）
+    let end = text[end_marker..]
+        .find('\n')
+        .map(|i| end_marker + i + 1)
+        .unwrap_or(text.len());
+    Ok(Some((begin, end)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn channel_strings_are_exact() {
-        // M6-S1 章程 §4.1 冻结：两条新通道的字符串逐字如下，且 `ALL` 的顺序是稳定契约。
+        // M6-S1 章程 §4.1 / M7-S0 §3.3 冻结：通道字符串逐字如下，且 `ALL` 的顺序是稳定契约。
         let strings: Vec<&str> = DeliveryChannel::ALL.iter().map(|c| c.as_str()).collect();
         assert_eq!(
             strings,
@@ -377,11 +679,33 @@ mod tests {
                 "claude-code-settings",
                 "shell-block",
                 "opencode",
-                "gemini-cli"
+                "gemini-cli",
+                "opencode-jsonc",
+                "continue"
             ]
         );
         assert_eq!(DeliveryChannel::OpenCode.agent_id(), "opencode");
         assert_eq!(DeliveryChannel::GeminiCli.agent_id(), "gemini-cli");
+        // M7-S0 v1.2 更正：`OpenCodeJsonc` 必须与 `OpenCode` **可区分**（漂移归属靠它）
+        assert_eq!(DeliveryChannel::OpenCodeJsonc.agent_id(), "opencode-jsonc");
+        assert_eq!(DeliveryChannel::Continue.agent_id(), "continue");
+    }
+
+    #[test]
+    fn agent_id_is_injective_so_drift_cannot_misattribute() {
+        // 这条断言是 M7-S0 v1.2 那次更正的**理由**本身：`from_agent_id` 是漂移报告的逆映射，
+        // 两条通道共享 agent_id 会让 `.jsonc` 的漂移被归到 `.json` 上。
+        let mut seen: Vec<&str> = Vec::new();
+        for channel in DeliveryChannel::ALL {
+            let id = channel.agent_id();
+            assert!(
+                !seen.contains(&id),
+                "agent_id 重复: {id}（{} 与另一条通道撞了）",
+                channel.as_str()
+            );
+            seen.push(id);
+        }
+        assert_eq!(seen.len(), 7);
     }
 
     #[test]
@@ -396,6 +720,35 @@ mod tests {
             DeliveryChannel::GeminiCli.relative_target(),
             PathBuf::from(".gemini").join(".env")
         );
+        // M7-S3 两条新通道（章程 §3.3 冻结）
+        assert_eq!(
+            DeliveryChannel::OpenCodeJsonc.relative_target(),
+            PathBuf::from(".config")
+                .join("opencode")
+                .join("opencode.jsonc")
+        );
+        assert_eq!(
+            DeliveryChannel::Continue.relative_target(),
+            PathBuf::from(".continue").join("config.yaml")
+        );
+    }
+
+    #[test]
+    fn relative_targets_are_pairwise_distinct() {
+        // 安全边界：`checked_target` 用 `home.join(relative_target())` 逐字比对。
+        // 两条通道落在同一个文件上会让「同意」与「漂移」串味。
+        let mut seen: Vec<PathBuf> = Vec::new();
+        for channel in DeliveryChannel::ALL {
+            let target = channel.relative_target();
+            assert!(
+                !seen.contains(&target),
+                "{} 的落点与另一条通道重复: {}",
+                channel.as_str(),
+                target.display()
+            );
+            seen.push(target);
+        }
+        assert_eq!(seen.len(), 7);
     }
 
     #[test]
@@ -474,6 +827,7 @@ mod tests {
             DeliveryChannel::ClaudeCodeSettings,
             DeliveryChannel::ShellBlock,
             DeliveryChannel::GeminiCli,
+            DeliveryChannel::Continue,
         ] {
             assert!(
                 resolve_for_binding(channel, home, "https://x", "", None).is_ok(),
@@ -481,6 +835,191 @@ mod tests {
                 channel.as_str()
             );
         }
+        // 而 `OpenCodeJsonc` **和** `OpenCode` 一样受 provider_id 校验（同一个写入器）
+        assert!(
+            resolve_for_binding(DeliveryChannel::OpenCodeJsonc, home, "https://x", "", None)
+                .is_err()
+        );
+    }
+
+    // ==================================================== M7-S3：新增通道与生效策略
+
+    #[test]
+    fn restart_hint_table_is_verbatim() {
+        // M7-S3 spec §8：shell rc 只对新开的终端生效，其余六条按「需要重启」保守标注。
+        assert_eq!(
+            restart_hint(DeliveryChannel::ShellBlock),
+            RestartHint::DependsOnNewSession
+        );
+        for channel in DeliveryChannel::ALL {
+            let hint = restart_hint(channel);
+            if channel != DeliveryChannel::ShellBlock {
+                assert_eq!(hint, RestartHint::Needed, "{}", channel.as_str());
+            }
+        }
+        // 七个通道都有取值（穷举 match 由编译器保证；这里钉住数量）
+        assert_eq!(DeliveryChannel::ALL.len(), 7);
+    }
+
+    #[test]
+    fn restart_hint_does_not_use_not_needed_yet() {
+        // `NotNeeded` 是冻结枚举的一部分，但**当前没有通道该返回它**。
+        // 这条断言存在的意义：将来有人为了「用上这个变体」把某通道硬标成 NotNeeded 时，
+        // 会在这里被拦下来并被迫先论证「该 agent 真的每次调用都读配置」。
+        for channel in DeliveryChannel::ALL {
+            assert_ne!(
+                restart_hint(channel),
+                RestartHint::NotNeeded,
+                "{} 不该被标成「改完即生效」（本机无 agent 运行时，无法验证热加载）",
+                channel.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn unmanaged_candidates_cover_three_platforms() {
+        let home = Path::new("/home/u");
+        let mac = unmanaged_candidates(HostOs::MacOs, home);
+        assert_eq!(mac.len(), 2);
+        assert_eq!(mac[0].label, "Cline");
+        assert_eq!(mac[1].label, "Roo Code");
+        assert_eq!(
+            mac[0].path,
+            home.join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev")
+        );
+        assert_eq!(
+            mac[1].path,
+            home.join(
+                "Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline"
+            )
+        );
+
+        let linux = unmanaged_candidates(HostOs::Linux, home);
+        assert_eq!(
+            linux[0].path,
+            home.join(".config/Code/User/globalStorage/saoudrizwan.claude-dev")
+        );
+
+        let windows = unmanaged_candidates(HostOs::Windows, home);
+        assert_eq!(
+            windows[0].path,
+            home.join("AppData/Roaming/Code/User/globalStorage/saoudrizwan.claude-dev")
+        );
+    }
+
+    #[test]
+    fn unmanaged_notes_are_verbatim() {
+        let items = unmanaged_candidates(HostOs::MacOs, Path::new("/home/u"));
+        assert_eq!(
+            items[0].note,
+            "本版本不向 Cline 写入：它的配置落点尚未核实，写错文件会让你以为投递成功。"
+        );
+        assert_eq!(
+            items[1].note,
+            "本版本不向 Roo Code 写入：它的配置落点尚未核实，写错文件会让你以为投递成功。"
+        );
+    }
+
+    #[test]
+    fn detect_unmanaged_targets_never_writes() {
+        // 章程 R-7：只读。目录不存在时**不得**创建它。
+        let dir = tempfile::tempdir().expect("临时目录");
+        let missing_home = dir.path().join("home-does-not-exist");
+        let items = detect_unmanaged_targets(&missing_home);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|t| !t.exists));
+        assert!(!missing_home.exists(), "探测不得创建 home");
+
+        // 造出目录 → exists 变 true，且仍不写任何东西
+        let cline = items[0].path.clone();
+        std::fs::create_dir_all(&cline).unwrap();
+        let again = detect_unmanaged_targets(&missing_home);
+        assert!(again[0].exists);
+        assert!(!again[1].exists);
+        assert_eq!(std::fs::read_dir(&cline).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn jsonc_hazard_is_string_aware() {
+        assert_eq!(jsonc_hazard("{\"url\": \"https://x//y\"}"), None);
+        assert_eq!(jsonc_hazard("{\"a\": \"/* not a comment */\"}"), None);
+        assert_eq!(jsonc_hazard("{\"a\": \"b\"}"), None);
+        assert_eq!(
+            jsonc_hazard("{\n  // c\n  \"a\": 1\n}"),
+            Some(JsoncHazard::LineComment)
+        );
+        assert_eq!(
+            jsonc_hazard("{\n  /* c */\n  \"a\": 1\n}"),
+            Some(JsoncHazard::BlockComment)
+        );
+        assert_eq!(
+            jsonc_hazard("{\"a\": 1,}"),
+            Some(JsoncHazard::TrailingComma)
+        );
+        assert_eq!(
+            jsonc_hazard("{\"a\": [1,]}"),
+            Some(JsoncHazard::TrailingComma)
+        );
+        assert_eq!(jsonc_hazard("{\"a\": [1, 2]}"), None);
+        // 转义引号不会提前结束字符串
+        assert_eq!(jsonc_hazard("{\"a\": \"x\\\"//y\"}"), None);
+    }
+
+    #[test]
+    fn line_ending_follows_the_file() {
+        assert_eq!(detect_line_ending("a\r\nb\r\n"), "\r\n");
+        assert_eq!(detect_line_ending("a\nb\n"), "\n");
+        assert_eq!(detect_line_ending(""), "\n");
+        assert_eq!(detect_line_ending("no newline"), "\n");
+    }
+
+    #[test]
+    fn locate_block_handles_the_three_shapes() {
+        let path = Path::new("/tmp/config.yaml");
+        let ok = format!(
+            "models:\n  {}\n  - name: x\n  {}\n  - name: y\n",
+            continue_yaml::BLOCK_BEGIN,
+            continue_yaml::BLOCK_END
+        );
+        let (begin, end) = locate_block(&ok, path).unwrap().expect("应找到块");
+        assert_eq!(
+            &ok[begin..end],
+            format!(
+                "  {}\n  - name: x\n  {}\n",
+                continue_yaml::BLOCK_BEGIN,
+                continue_yaml::BLOCK_END
+            )
+        );
+
+        assert_eq!(locate_block("models:\n", path).unwrap(), None);
+
+        // 孤立 / 重复 / 顺序颠倒 → Err
+        for bad in [
+            format!("  {}\n", continue_yaml::BLOCK_BEGIN),
+            format!("  {}\n", continue_yaml::BLOCK_END),
+            format!(
+                "  {}\n  {}\n  {}\n  {}\n",
+                continue_yaml::BLOCK_BEGIN,
+                continue_yaml::BLOCK_END,
+                continue_yaml::BLOCK_BEGIN,
+                continue_yaml::BLOCK_END
+            ),
+            format!(
+                "  {}\n  {}\n",
+                continue_yaml::BLOCK_END,
+                continue_yaml::BLOCK_BEGIN
+            ),
+        ] {
+            assert!(locate_block(&bad, path).is_err(), "{bad}");
+        }
+
+        // 行内提到标记（非行首）不算块
+        let inline = format!(
+            "models: # 见 {} 与 {}\n",
+            continue_yaml::BLOCK_BEGIN,
+            continue_yaml::BLOCK_END
+        );
+        assert_eq!(locate_block(&inline, path).unwrap(), None);
     }
 
     #[test]

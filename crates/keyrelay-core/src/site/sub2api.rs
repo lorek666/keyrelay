@@ -705,6 +705,8 @@ impl<T: HttpTransport + 'static> SiteAdapter for Sub2Api<T> {
             used,
             raw_quota: None,
             quota_per_unit: None,
+            // Sub2API 有余额端点：读到了就是可观测（M7-S2）。
+            known: true,
         })
     }
 

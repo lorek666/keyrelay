@@ -1,5 +1,7 @@
 //! 站点适配器契约与共享类型。
 
+pub mod capability;
+pub mod custom_openai;
 pub mod newapi;
 pub mod password_crypto;
 pub mod registry;
@@ -17,6 +19,9 @@ use crate::error::{Error, Result};
 pub enum SiteKind {
     NewApi,
     Sub2Api,
+    /// 只读的 OpenAI 兼容端点（M7-S2 / PRD FR-1）：只有一个 `/v1/models` 可读，
+    /// 没有令牌管理端点、没有余额与分组概念。能力见 [`capability::capabilities`]。
+    CustomOpenAiCompatible,
 }
 
 impl SiteKind {
@@ -24,13 +29,20 @@ impl SiteKind {
         match self {
             SiteKind::NewApi => "newapi",
             SiteKind::Sub2Api => "sub2api",
+            SiteKind::CustomOpenAiCompatible => "custom-openai-compatible",
         }
     }
 
+    /// 解析站点类型。**宽进严出**：接受三个写法（大小写不敏感），但 [`Self::as_str`] 只输出
+    /// `"custom-openai-compatible"` 这一个规范形态——它会落进 `sites.kind` 列与事件表，
+    /// 必须是唯一的（M7-S2 spec §3.1 D-1）。
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "newapi" | "new-api" => Some(SiteKind::NewApi),
             "sub2api" | "sub2-api" => Some(SiteKind::Sub2Api),
+            "custom-openai-compatible" | "custom-openai" | "openai-compatible" => {
+                Some(SiteKind::CustomOpenAiCompatible)
+            }
             _ => None,
         }
     }
@@ -160,6 +172,33 @@ pub struct Balance {
     pub used: f64,
     pub raw_quota: Option<i64>,
     pub quota_per_unit: Option<i64>,
+    /// **该站点的余额是否可观测**（M7-S2）。
+    ///
+    /// `false` ⇒ `remaining` / `used` / `raw_quota` / `quota_per_unit` 全部**无意义**，
+    /// 任何消费者（DTO / 前端 / 通知判定 / 导出）都必须先看本字段：
+    /// 界面**绝不**把未知态渲染成 `0.00`，通知判定遇到未知余额必须**跳过**余额告警
+    /// （把「不知道」当成 0 会产出假告警，比不显示更糟）。
+    ///
+    /// 用 [`Balance::unknown`] 构造未知态，不要手写字段。
+    pub known: bool,
+}
+
+impl Balance {
+    /// `Balance` 的**未知态**（M7-S2 定稿）：站点类型没有余额端点时用它表达「不可观测」。
+    ///
+    /// 它**不是**「余额为 0」：`known == false` 是唯一判据，数值字段只是占位。
+    /// 选 `0.0` 而不是 `NaN`/`inf` 作占位：后两者会被 JSON 序列化破坏（变 `null`）
+    /// 或让比较失效，且 `inf` 会**静默关掉**余额告警——比 0 更危险。
+    pub fn unknown(currency: &str) -> Self {
+        Self {
+            currency: currency.to_string(),
+            remaining: 0.0,
+            used: 0.0,
+            raw_quota: None,
+            quota_per_unit: None,
+            known: false,
+        }
+    }
 }
 
 /// 站点的一个可选分组（M6-S4 / PRD FR-2）。
@@ -367,6 +406,34 @@ pub fn is_quota_code(code: &str) -> bool {
         code,
         "insufficient_user_quota" | "pre_consume_token_quota_failed" | "insufficient_quota"
     )
+}
+
+/// 把站点返回的**倍率原值**解析成 `Option<f64>`（M7-S2 / B-91）。
+///
+/// 规则（逐条有测试，见 `docs/specs/M7-S2-站点类型与能力集.md` §4）：
+///
+/// - 数字 / 字符串数字（先 `trim`）⇒ 取数值；其余形态（布尔 / null / 数组 / 对象 / 非数字串）⇒ `None`；
+/// - 负数 ⇒ `None`；
+/// - **`0` ⇒ `Some(0.0)`**：0 表示**免费分组**，必须保留（当成 `None` 会把它误判成「不可判定」）；
+/// - `-0.0` 归一成 `0.0`（它不是负数，且界面显示 `-0.00` 会让人以为倍率是负的）；
+/// - NaN / ±inf ⇒ `None`。JSON 无法表示 NaN/±inf（`Value::from(f64::NAN)` 会退化成 `Null`），
+///   因此这一支主要由**字符串**形态（`"NaN"` / `"inf"` / `"1e400"`）覆盖，数字分支的
+///   `is_finite()` 是纵深防御。
+///
+/// `None` 一律表示「不可用/不可判定」，**绝不**回落成 `1.0`——把「不知道倍率」显示成
+/// 「1 倍」是 M6-S4 P2-4 已裁定要避免的同一类错误。
+pub fn parse_rate(raw: &Value) -> Option<f64> {
+    let value = match raw {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }?;
+
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    // `-0.0 == 0.0` 为真 ⇒ 归一成 `0.0`
+    Some(if value == 0.0 { 0.0 } else { value })
 }
 
 /// 从 JSON 里按路径取字符串
@@ -585,6 +652,18 @@ mod tests {
         let body = format!(r#"{{"message":"{secret}"}}"#);
         let once = map_http_error(401, body.as_bytes(), None);
         assert_eq!(scrub_error(once.clone()), once);
+    }
+
+    #[test]
+    fn unsupported_error_is_scrubbed() {
+        // M7-S2 spec §7 T14：`Error::Unsupported` 是 S0 为「站点类型不支持」加的变体，
+        // `scrub_error` 必须同等对待它（它的文案也可能带上站点回显的原文）。
+        let secret = "sk-UNSUPPORTED-0123456789abcdef";
+        let err = scrub_error(Error::Unsupported(format!("站点回显 {secret}")));
+        let text = err.to_string();
+        assert!(!text.contains(secret), "错误文案泄漏密钥: {text}");
+        assert!(text.contains("sk-***"), "应留下脱敏痕迹: {text}");
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
     }
 
     /// M6-S6：**逐个真实调用点**验证 —— 从任意一个裸调用点触发，错误文案都不得含密钥。

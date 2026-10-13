@@ -39,6 +39,8 @@
     "allow-rotation-plan",
     "allow-rotate-key",
     "allow-autostart-status",
-    "allow-autostart-set"
+    "allow-autostart-set",
+    "allow-revoke-key",
+    "allow-purge-keychain"
   ]
 }

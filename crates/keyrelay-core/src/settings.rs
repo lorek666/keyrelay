@@ -204,6 +204,40 @@ impl Settings {
         !self.notify_webhook_url.trim().is_empty()
     }
 
+    /// 诊断包里的设置快照（PRD FR-9:196「脱敏后的配置快照」）。
+    ///
+    /// **白名单，不是黑名单**：只列明确无秘密的字段。`proxy_url` 与 `notify_webhook_url`
+    /// **只回报「配没配」**——它们的值可能带 userinfo 或 `?token=…`，而本模块没有脱敏能力
+    /// （那是 `redact` 的职责）。
+    ///
+    /// 为什么在这里**不**顺手写一段掩码：M5-S1 已经踩过一次「两条出口各抄一段组合、
+    /// 结果悄悄分叉」（见 `service.rs::export_diagnostics` 的注释），所以宁可少给一个字段，
+    /// 也不在这里长出一条平行的脱敏路径。诊断包是**要发给别人**的东西，少一个字段的代价
+    /// 远小于多一条会分叉的掩码逻辑。
+    pub fn diagnostic_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "refresh_interval_secs": self.refresh_interval_secs,
+            "balance_alert_threshold": self.balance_alert_threshold,
+            "drift_check_on_start": self.drift_check_on_start,
+            "gateway_enabled": self.gateway_enabled,
+            "gateway_port": self.gateway_port,
+            "theme": self.theme,
+            "language": self.language,
+            "telemetry_enabled": self.telemetry_enabled,
+            "auto_update_enabled": self.auto_update_enabled,
+            "notify_system_enabled": self.notify_system_enabled,
+            "notify_timeout_secs": self.notify_timeout_secs,
+            "rotation_max_age_days": self.rotation_max_age_days,
+            "rotation_warn_before_days": self.rotation_warn_before_days,
+            "autostart_enabled": self.autostart_enabled,
+            "close_to_tray": self.close_to_tray,
+            "start_hidden": self.start_hidden,
+            // 只回报「配没配」，不回报值：
+            "proxy_configured": !self.proxy_url.trim().is_empty(),
+            "webhook_configured": self.webhook_enabled(),
+        })
+    }
+
     /// 关窗时该隐藏到托盘吗？
     ///
     /// # 为什么需要 `tray_available`

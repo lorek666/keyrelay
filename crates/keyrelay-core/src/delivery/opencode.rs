@@ -30,6 +30,11 @@ use crate::inject::Patch;
 
 pub struct OpenCodeWriter {
     path: PathBuf,
+    /// 本写入器服务的通道：`OpenCode`（`.json`）或 `OpenCodeJsonc`（`.jsonc`）。
+    ///
+    /// 内容逻辑两者**完全相同**，只有落点与 `channel()` 的回报不同——
+    /// 回报错了会让漂移报告与同意记录把两条通道混成一条（它们的 `agent_id` 都是 `"opencode"`）。
+    channel: DeliveryChannel,
     provider_id: String,
     base_url: String,
     /// `None` = 不写、也不动已有的 `model` 键。
@@ -66,8 +71,36 @@ impl OpenCodeWriter {
         base_url: &str,
         model: Option<&str>,
     ) -> Self {
+        Self::with_path_and_channel(
+            path,
+            DeliveryChannel::OpenCode,
+            provider_id,
+            base_url,
+            model,
+        )
+    }
+
+    /// M7-S3：**内容与 `OpenCode` 完全相同**，只是落点与通道标识不同（`.jsonc`）。
+    ///
+    /// `channel` 只允许是 `OpenCode` 或 `OpenCodeJsonc`（其余通道由别的写入器负责）——
+    /// 传错会让 [`DeliveryWriter::channel`] 说谎，因此用 `debug_assert!` 在测试里立刻暴露。
+    pub fn with_path_and_channel(
+        path: impl Into<PathBuf>,
+        channel: DeliveryChannel,
+        provider_id: &str,
+        base_url: &str,
+        model: Option<&str>,
+    ) -> Self {
+        debug_assert!(
+            matches!(
+                channel,
+                DeliveryChannel::OpenCode | DeliveryChannel::OpenCodeJsonc
+            ),
+            "OpenCodeWriter 只服务 OpenCode / OpenCodeJsonc，收到 {channel:?}"
+        );
         Self {
             path: path.into(),
+            channel,
             provider_id: provider_id.to_string(),
             base_url: base_url.to_string(),
             // 全空白的 model 与「没给 model」等价：写一个空字符串只会让 OpenCode 选不出模型。
@@ -157,7 +190,7 @@ impl OpenCodeWriter {
 
 impl DeliveryWriter for OpenCodeWriter {
     fn channel(&self) -> DeliveryChannel {
-        DeliveryChannel::OpenCode
+        self.channel
     }
 
     fn target_path(&self) -> PathBuf {
@@ -194,9 +227,30 @@ impl DeliveryWriter for OpenCodeWriter {
 
     fn plan(&self, api_key: &str) -> Result<Patch> {
         let before = read_text_or_empty(&self.path)?;
+        // M7-S3 / D-1：`.jsonc` 通道**只接受严格 JSON**。
+        // 带 JSONC 专有语法时明确拒绝——静默丢注释是数据损坏，拒绝不是（spec §6.2 / §13.1 O-1）。
+        if self.channel == DeliveryChannel::OpenCodeJsonc {
+            if let Some(hazard) = super::jsonc_hazard(&before) {
+                return Err(Error::inject(&self.path, jsonc_refusal(hazard)));
+            }
+        }
         let after = self.build_after(&before, api_key)?;
         Ok(Patch::secret_bearing(self.path.clone(), before, after))
     }
+}
+
+/// `.jsonc` 专有语法的拒绝文案：说清**是什么**、**为什么不改写**、**两条出路**。
+fn jsonc_refusal(hazard: super::JsoncHazard) -> String {
+    let what = match hazard {
+        super::JsoncHazard::LineComment => "行注释（// …）",
+        super::JsoncHazard::BlockComment => "块注释（/* … */）",
+        super::JsoncHazard::TrailingComma => "尾随逗号",
+    };
+    format!(
+        "opencode.jsonc 里有 JSONC 专有语法（{what}），而 KeyRelay 不做「保注释改写」：\
+         改写会把你的注释静默丢掉。两条出路：① 手工把注释与尾随逗号删掉后重投；\
+         ② 改用 opencode 通道写 .json（如果你确认 opencode 读的是 .json）。"
+    )
 }
 
 /// 能否安全地嵌进点号分段路径（不需要方括号引号）。

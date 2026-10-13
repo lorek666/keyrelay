@@ -16,7 +16,10 @@
 //! 的调用方必须用 [`GatewayHandle::shutdown_and_wait`]；`start()` 另外对 bind 的
 //! `AddrInUse` 做有界退避重试（见 [`BIND_RETRY_ATTEMPTS`] / [`BIND_RETRY_DELAY`]）。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -26,8 +29,10 @@ use axum::routing::any;
 use axum::Router;
 use futures_util::TryStreamExt;
 use tokio::sync::oneshot;
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
+use crate::routing::{should_failover, Breaker, BreakerPolicy, BreakerState, RouteTable, Upstream};
 
 /// 回传上游响应体的大小上限。
 ///
@@ -208,16 +213,44 @@ pub struct GatewayConfig {
     pub port: u16,
     /// 本地令牌。**不是**站点密钥。
     pub token: String,
-    /// 转发目标（站点根，无尾斜杠）
+    /// 转发目标（站点根，无尾斜杠）。`route` 为空时**只**用它。
     pub base_url: String,
-    /// 站点密钥（从钥匙串取）
+    /// 站点密钥（从钥匙串取）。`route` 为空时**只**用它。
     pub api_key: String,
     pub site_display_name: String,
+    /// 多上游路由表（M7-S1）。**空表 ⇒ 转发行为与单上游时代逐字节相同**。
+    pub route: RouteTable,
+    /// 熔断策略（M7-S1）。熔断**状态**由 `start()` 建在 `AppState` 里（跨请求共享），
+    /// 配置里只放策略——策略是纯数据、可 `Clone`，状态不是。
+    pub breaker: BreakerPolicy,
+    /// `key_ref` → 明文。**仅进程内**；`Debug` 不打印（见下方手写 `Debug`）。
+    ///
+    /// 值是 [`Zeroizing<String>`]：`GatewayConfig` 在每请求里被 clone，
+    /// 用 `Zeroizing` 让这些副本在 drop 时擦掉内存（M7-S1 章程 v1.1 的硬化要求）。
+    pub keys_by_ref: HashMap<String, Zeroizing<String>>,
+    /// 失败事件的出口。`None` = 不记（`single_upstream` 的默认 ⇒ 既有行为不变）。
+    ///
+    /// 用注入出口而不是直接依赖 `store`：网关不该为了记一条事件而拿到整个存储层。
+    pub on_failure: Option<Arc<dyn Fn(GatewayFailure) + Send + Sync>>,
+}
+
+/// 一次「因可切换状态而放弃当前上游」的元数据。
+///
+/// **恰好这三个字段**——这是结构上的白名单：装不下 prompt 正文、响应正文、
+/// 密钥或本地令牌（FR-5:161 + FR-8 红线）。`model` 是调用方自由文本，
+/// 写事件前必须过 `redact::scrub`（由 S5 的出口负责，本结构不替它决定）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayFailure {
+    pub site_id: i64,
+    pub status: u16,
+    pub model: String,
 }
 
 impl std::fmt::Debug for GatewayConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // 令牌与密钥都不打印
+        // 令牌与密钥都不打印。**新增字段刻意不进 field 列表**：
+        // `keys_by_ref` 是明文密钥的 map，`on_failure` 是闭包（也没有有意义的 Debug 形态）。
+        // `finish_non_exhaustive()` 会把未列出的字段显示成 `..`。
         f.debug_struct("GatewayConfig")
             .field("port", &self.port)
             .field("base_url", &self.base_url)
@@ -234,6 +267,7 @@ impl GatewayConfig {
     /// 「新增一个上游概念」不该要求改两个包的文件（同 M6-S0 §9.1 对 `relative_target` 的处置）。
     ///
     /// `service.rs::gateway_config` 的对外行为因此**逐字不变**：仍然是「一个站点、一把密钥」。
+    /// 新字段一律取「空 / 默认 / 不记事件」，所以走这条构造器的调用方行为零变化。
     pub fn single_upstream(
         port: u16,
         token: String,
@@ -247,6 +281,10 @@ impl GatewayConfig {
             base_url,
             api_key,
             site_display_name,
+            route: RouteTable::default(),
+            breaker: BreakerPolicy::default(),
+            keys_by_ref: HashMap::new(),
+            on_failure: None,
         }
     }
 }
@@ -351,7 +389,9 @@ fn bind_error_message(port: u16, e: &std::io::Error) -> String {
 
 /// 启动网关。**只绑定 `127.0.0.1`**（配置里没有别的选项）。
 pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
-    if config.base_url.trim().is_empty() {
+    // 单上游（`route` 为空）时 `base_url` 是**唯一**的转发目标，必须非空——与既有行为一致。
+    // 路由非空时 `base_url` 不再被使用（每个上游自带 `base_url`），因此不再强制。
+    if config.route.is_empty() && config.base_url.trim().is_empty() {
         return Err(Error::Store("网关的上游地址为空".into()));
     }
     if config.token.trim().is_empty() {
@@ -363,6 +403,7 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
         .map_err(|e| Error::Transport(format!("构造网关的上游客户端失败: {e}")))?;
 
     let state = AppState {
+        breaker: Arc::new(Mutex::new(Breaker::new(config.breaker.clone()))),
         config: config.clone(),
         upstream,
     };
@@ -408,6 +449,11 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
 struct AppState {
     config: GatewayConfig,
     upstream: reqwest::Client,
+    /// 熔断**状态**：跨请求共享，所以是 `Arc<Mutex<_>>`。
+    ///
+    /// 不能放进 `config`：axum 的 `State` 每个请求 clone 一份，
+    /// 裸值会变成「每个请求各有一份熔断历史」——熔断永远不生效。
+    breaker: Arc<Mutex<Breaker>>,
 }
 
 /// 取出请求里的本地令牌。支持 `Authorization: Bearer` 与 `X-KeyRelay-Token`。
@@ -477,28 +523,10 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
             .into_response();
     }
 
-    let url = format!("{}{}{}", state.config.base_url, path, query);
     let method = request.method().clone();
-
-    // ③ 逐条重建请求头：**丢掉**调用方的 Authorization，换成站点密钥。
-    //    另外把「值里带着本地令牌」的头也丢掉——不管它叫什么名字，
-    //    本地令牌都不许发给上游（M4-S2 复审 P2-2 的双头形态）。
-    let local_token = state.config.token.as_str();
-    let mut headers = HeaderMap::new();
-    for (name, value) in request.headers().iter() {
-        if should_strip_request_header(name.as_str()) {
-            continue;
-        }
-        if value.to_str().is_ok_and(|text| text.contains(local_token)) {
-            continue;
-        }
-        headers.insert(name.clone(), value.clone());
-    }
-    headers.insert(
-        HeaderName::from_static("authorization"),
-        HeaderValue::from_str(&format!("Bearer {}", state.config.api_key))
-            .unwrap_or_else(|_| HeaderValue::from_static("Bearer ")),
-    );
+    // 入站头先克隆一份：下面要按上游逐次重建（换 `Authorization`），
+    // 但「丢掉带本地令牌的头」这条规则对每个上游都一样。
+    let inbound = request.headers().clone();
 
     let body = match axum::body::to_bytes(request.into_body(), MAX_REQUEST_BYTES).await {
         Ok(bytes) => bytes,
@@ -511,27 +539,170 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         }
     };
 
-    let upstream_request = state
-        .upstream
-        .request(method, &url)
-        .headers(headers)
-        .body(body);
+    // ③ 空路由表 ⇒ 单上游时代的**逐字节相同**行为：不解析 body、不查 `keys_by_ref`、
+    //    不查熔断、不写失败事件、只发一次请求。
+    if state.config.route.is_empty() {
+        let url = format!("{}{}{}", state.config.base_url, path, query);
+        let headers = upstream_headers(&state.config, &inbound, &state.config.api_key);
+        return forward_to(&state, method, &url, headers, body).await;
+    }
 
-    let upstream_response = match upstream_request.send().await {
-        Ok(response) => response,
-        Err(e) => {
-            // 只记错误分类，不记请求体
-            return (
-                StatusCode::BAD_GATEWAY,
-                axum::Json(serde_json::json!({
-                    "error": format!("转发到上游失败: {e}")
-                })),
-            )
-                .into_response();
-        }
+    // ④ 路由非空：选候选（首位即首选，顺序由 `RouteTable` 保证确定）
+    let model = model_from_body(&body);
+    let candidates: Vec<&Upstream> = match &model {
+        Some(m) => state.config.route.candidates(m),
+        // 没有 body（`GET /v1/models`）或 body 里没有 `model`：用**同一个**排序键取首选。
+        // 开了路由不该把一个 PRD 端点变成 404。
+        None => state.config.route.preferred().into_iter().collect(),
     };
+    if candidates.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": format!(
+                    "没有可服务模型 {} 的上游",
+                    model.as_deref().unwrap_or("(请求里未指定)")
+                )
+            })),
+        )
+            .into_response();
+    }
 
-    // ④ 回传：过滤掉敏感响应头
+    let now = Instant::now();
+    let eligible = eligible_candidates(&state.breaker, &candidates, now);
+    if eligible.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "所有候选上游都在熔断冷却中，请稍后重试"
+            })),
+        )
+            .into_response();
+    }
+
+    // 别名命中时才改写 body 里的 `model`；未命中时 body 逐字节原样转发。
+    let outbound = match &model {
+        Some(m) => rewrite_model(&body, m, &state.config.route),
+        None => body,
+    };
+    let event_model = model.unwrap_or_default();
+    let attempts = eligible.len();
+
+    let mut last_error: Option<String> = None;
+    for (index, upstream) in eligible.iter().enumerate() {
+        let is_last = index + 1 == attempts;
+        let Some(key) = state.config.keys_by_ref.get(&upstream.key_ref) else {
+            // 路由指向一个没有明文的上游：**不静默换一把密钥**（那会花用户没指定的钱），
+            // 当成该上游不可用，切下一个。
+            last_error = Some(format!(
+                "上游站点 {} 的密钥引用 {} 没有对应的明文",
+                upstream.site_id, upstream.key_ref
+            ));
+            continue;
+        };
+        let url = format!("{}{}{}", upstream.base_url, path, query);
+        let headers = upstream_headers(&state.config, &inbound, key);
+
+        match send_once(&state, method.clone(), &url, headers, outbound.clone()).await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if should_failover(status) {
+                    report_failure(&state, upstream.site_id, status, &event_model, now);
+                    if !is_last {
+                        continue; // 丢掉这个响应，试下一个
+                    }
+                } else {
+                    record_success(&state, upstream.site_id, now);
+                }
+                // 不可切换的状态、或已经是最后一个候选 ⇒ **如实返回上游的响应**
+                // （包括它的状态码，不做 500 兜底）。
+                return into_upstream_response(response);
+            }
+            Err(message) => {
+                // 传输层失败没有 HTTP 状态码：按 502 记（与 legacy 路径的错误码一致）并切下一个。
+                report_failure(&state, upstream.site_id, 502, &event_model, now);
+                last_error = Some(message);
+                if is_last {
+                    break;
+                }
+            }
+        }
+    }
+
+    (
+        StatusCode::BAD_GATEWAY,
+        axum::Json(serde_json::json!({
+            "error": last_error.unwrap_or_else(|| "所有候选上游都失败了".to_string())
+        })),
+    )
+        .into_response()
+}
+
+/// 重建发往上游的请求头：**丢掉**调用方的 `Authorization`，换成该上游的站点密钥；
+/// 另外把「值里带着本地令牌」的头也丢掉——不管它叫什么名字，本地令牌都不许发给上游
+/// （M4-S2 复审 P2-2 的双头形态）。
+fn upstream_headers(config: &GatewayConfig, inbound: &HeaderMap, key: &str) -> HeaderMap {
+    let local_token = config.token.as_str();
+    let mut headers = HeaderMap::new();
+    for (name, value) in inbound.iter() {
+        if should_strip_request_header(name.as_str()) {
+            continue;
+        }
+        if value.to_str().is_ok_and(|text| text.contains(local_token)) {
+            continue;
+        }
+        headers.insert(name.clone(), value.clone());
+    }
+    headers.insert(
+        HeaderName::from_static("authorization"),
+        HeaderValue::from_str(&format!("Bearer {key}"))
+            .unwrap_or_else(|_| HeaderValue::from_static("Bearer ")),
+    );
+    headers
+}
+
+/// 发一次请求。`Err(人话原因)` 表示**传输层**失败（连不上 / TLS / 超时）——没有 HTTP 状态码。
+async fn send_once(
+    state: &AppState,
+    method: axum::http::Method,
+    url: &str,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> std::result::Result<reqwest::Response, String> {
+    state
+        .upstream
+        .request(method, url)
+        .headers(headers)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("转发到上游失败: {e}"))
+}
+
+/// 单上游（legacy）转发：只发一次，错误按既有形态返回。
+async fn forward_to(
+    state: &AppState,
+    method: axum::http::Method,
+    url: &str,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Response {
+    match send_once(state, method, url, headers, body).await {
+        Ok(response) => into_upstream_response(response),
+        Err(message) => (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+    }
+}
+
+/// 回传：过滤掉敏感响应头 + **流式**回传（带上限）。
+///
+/// 流式的理由（M4-S2 复审 P1-2）：整段缓冲会让客户端等上游吐完才见到第一个字节，
+/// 而且响应体没有上限。超过 [`MAX_RESPONSE_BYTES`] 时让流以错误结束、连接随之断开——
+/// 此时响应头已经发出去了，改不了状态码，只能如实断流，不静默截断。
+fn into_upstream_response(upstream_response: reqwest::Response) -> Response {
     let status = upstream_response.status();
     let mut builder = Response::builder().status(status);
     for (name, value) in upstream_response.headers().iter() {
@@ -541,15 +712,152 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         builder = builder.header(name, value);
     }
 
-    // ⑤ **流式**回传，带上限：不整段缓冲，首字节到了就往下发
-    //    （M4-S2 复审 P1-2：之前用 `.bytes()` 全缓冲，客户端要等上游吐完才见到第一个字节，
-    //    而且响应体没有上限）。超过 `MAX_RESPONSE_BYTES` 时让流以错误结束、连接随之断开——
-    //    此时响应头已经发出去了，改不了状态码，只能如实断流，不静默截断。
     let capped = cap_stream(upstream_response.bytes_stream(), MAX_RESPONSE_BYTES);
 
     builder
         .body(Body::from_stream(capped))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// 跳过 `Open` 的候选；`HalfOpen` 只取排序里的**第一个**作为探针（其余本轮不参与）。
+fn eligible_candidates<'a>(
+    breaker: &Arc<Mutex<Breaker>>,
+    candidates: &[&'a Upstream],
+    now: Instant,
+) -> Vec<&'a Upstream> {
+    let Ok(guard) = breaker.lock() else {
+        // 锁中毒：放行全部候选。可用性优先——一次 panic 不该让网关永久 503。
+        return candidates.to_vec();
+    };
+    let mut out = Vec::with_capacity(candidates.len());
+    let mut took_half_open = false;
+    for upstream in candidates {
+        match guard.state(upstream.site_id, now) {
+            BreakerState::Open => continue,
+            BreakerState::HalfOpen => {
+                if took_half_open {
+                    continue;
+                }
+                took_half_open = true;
+                out.push(*upstream);
+            }
+            BreakerState::Closed => out.push(*upstream),
+        }
+    }
+    out
+}
+
+fn record_success(state: &AppState, site_id: i64, now: Instant) {
+    if let Ok(mut guard) = state.breaker.lock() {
+        guard.record_success(site_id, now);
+    }
+}
+
+/// 记一次失败：更新熔断，并通过注入出口上报**只有元数据**的事件。
+///
+/// 出口是 `Option<Arc<dyn Fn>>`：网关不该为了记一条事件而拿到整个存储层；
+/// 也让测试能把事件捕获到 `Vec` 里**逐字段**断言白名单。
+fn report_failure(state: &AppState, site_id: i64, status: u16, model: &str, now: Instant) {
+    if let Ok(mut guard) = state.breaker.lock() {
+        guard.record_failure(site_id, now);
+    }
+    if let Some(sink) = &state.config.on_failure {
+        sink(GatewayFailure {
+            site_id,
+            status,
+            model: model.to_string(),
+        });
+    }
+}
+
+/// 从请求体里**尽力**取出 `model`。取不到返回 `None`，不报错——
+/// `GET /v1/models` 本来就没有 body，那不是一个错误。
+fn model_from_body(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.get("model")?.as_str().map(|s| s.to_string())
+}
+
+/// 别名命中时，**只**替换顶层 `"model"` 的字符串值，其余字节一个不动。
+///
+/// 为什么不整份重序列化：那会改掉无关字段的形态（`1.50` → `1.5`、转义规范化），
+/// 与 BACKLOG B-45 的既有取舍同一理由。未命中别名时直接返回原 body。
+fn rewrite_model(body: &[u8], model: &str, route: &RouteTable) -> bytes::Bytes {
+    let real = route.resolve_model(model);
+    if real == model {
+        return bytes::Bytes::copy_from_slice(body);
+    }
+    let Some((start, end)) = top_level_model_span(body) else {
+        return bytes::Bytes::copy_from_slice(body);
+    };
+    let mut out = Vec::with_capacity(body.len() + real.len());
+    out.extend_from_slice(&body[..start]);
+    // 用 JSON 字面量写回：`real` 里可能有需要转义的字符
+    out.extend_from_slice(serde_json::Value::String(real).to_string().as_bytes());
+    out.extend_from_slice(&body[end..]);
+    bytes::Bytes::from(out)
+}
+
+/// 在**顶层**对象里找到 `"model"` 键的字符串值区间（含两侧引号）。
+///
+/// 只认顶层：嵌套对象里的 `model`（例如某个工具的参数 schema）不是我们要改的那个。
+/// 键名不做转义解码——`"\u006dodel"` 这种写法不会被识别，但真实客户端不会那么写。
+fn top_level_model_span(body: &[u8]) -> Option<(usize, usize)> {
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < body.len() {
+        match body[i] {
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'"' => {
+                let end = scan_string_end(body, i)?;
+                if depth == 1 && &body[i + 1..end - 1] == b"model" {
+                    let mut j = end;
+                    while j < body.len() && body[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if body.get(j) == Some(&b':') {
+                        j += 1;
+                        while j < body.len() && body[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if body.get(j) == Some(&b'"') {
+                            return Some((j, scan_string_end(body, j)?));
+                        }
+                    }
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// 读一个 JSON 字符串字面量的**结束下标**（`start` 处必须是 `"`）。
+///
+/// 只需要区间、不需要解码内容，所以转义一律按两字节跳过（`\uXXXX` 会多跳 4 字节）。
+fn scan_string_end(body: &[u8], start: usize) -> Option<usize> {
+    if body.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut i = start + 1;
+    while i < body.len() {
+        match body[i] {
+            b'\\' => {
+                // `\uXXXX` 里的 4 个 hex 也走这条；`i += 2` 之后循环会继续正常推进
+                i += 2;
+            }
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// 生成一个本地令牌。不是秘密级别的要求（只防同机其它程序误用），
@@ -580,16 +888,43 @@ mod tests {
 
     #[test]
     fn config_debug_hides_the_token_and_key() {
-        let config = GatewayConfig {
-            port: 8787,
-            token: "kr-gw-SECRET-TOKEN".into(),
-            base_url: "https://relay.example.com".into(),
-            api_key: "sk-SECRET-KEY".into(),
-            site_display_name: "测试站".into(),
-        };
+        let config = GatewayConfig::single_upstream(
+            8787,
+            "kr-gw-SECRET-TOKEN".into(),
+            "https://relay.example.com".into(),
+            "sk-SECRET-KEY".into(),
+            "测试站".into(),
+        );
         let text = format!("{config:?}");
         assert!(!text.contains("SECRET-TOKEN"), "{text}");
         assert!(!text.contains("SECRET-KEY"), "{text}");
+        assert!(text.contains("8787"), "{text}");
+    }
+
+    /// M7-S1 章程 v1.1 的硬化要求：`keys_by_ref` 是**明文密钥的 map**，
+    /// 手写 `Debug` 必须不打印它（先例：`site/mod.rs::session_debug_hides_secrets`）。
+    #[test]
+    fn config_debug_hides_the_key_map() {
+        let mut config = GatewayConfig::single_upstream(
+            8787,
+            "kr-gw-token".into(),
+            "https://relay.example.com".into(),
+            "sk-legacy-key".into(),
+            "测试站".into(),
+        );
+        config.keys_by_ref.insert(
+            "kr/key/1/secret".to_string(),
+            Zeroizing::new("sk-MAP-SECRET-0123456789".to_string()),
+        );
+        // 顺手把闭包出口也装上：它同样不该在 Debug 里出现
+        config.on_failure = Some(Arc::new(|_| {}));
+
+        let text = format!("{config:?}");
+        assert!(!text.contains("MAP-SECRET"), "{text}");
+        assert!(!text.contains("sk-"), "{text}");
+        assert!(!text.contains("keys_by_ref"), "{text}");
+        assert!(!text.contains("on_failure"), "{text}");
+        // 有用的诊断信息仍在
         assert!(text.contains("8787"), "{text}");
     }
 
@@ -744,13 +1079,13 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_an_empty_upstream_or_token() {
-        let base = GatewayConfig {
-            port: 0,
-            token: "t".into(),
-            base_url: "https://x".into(),
-            api_key: "k".into(),
-            site_display_name: "s".into(),
-        };
+        let base = GatewayConfig::single_upstream(
+            0,
+            "t".into(),
+            "https://x".into(),
+            "k".into(),
+            "s".into(),
+        );
         assert!(start(GatewayConfig {
             base_url: "  ".into(),
             ..base.clone()
@@ -769,13 +1104,13 @@ mod tests {
 
     /// 本组测试用的最小配置：不发任何请求，`base_url` 只要求非空。
     fn test_config(port: u16) -> GatewayConfig {
-        GatewayConfig {
+        GatewayConfig::single_upstream(
             port,
-            token: "kr-gw-unit-test-token".into(),
-            base_url: "http://127.0.0.1:1".into(),
-            api_key: "sk-unit-test".into(),
-            site_display_name: "单测站点".into(),
-        }
+            "kr-gw-unit-test-token".into(),
+            "http://127.0.0.1:1".into(),
+            "sk-unit-test".into(),
+            "单测站点".into(),
+        )
     }
 
     /// 「真的等到监听套接字释放」的**确定性**证据。

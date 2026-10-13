@@ -66,10 +66,35 @@ pub struct StoredKeyDto {
 #[serde(rename_all = "camelCase")]
 pub struct BalanceDto {
     currency: String,
-    remaining: f64,
-    used: f64,
+    /// **该站点的余额是否可观测**（M7-S5 接线，M7-S2 定义）。
+    ///
+    /// `false` 时下面两个数值字段是 `null`——这是**结构性保证**：界面拿不到 0.00，
+    /// 也就不可能把它渲染成 0.00。`custom-openai-compatible` 站点永远是 `false`。
+    known: bool,
+    remaining: Option<f64>,
+    used: Option<f64>,
     raw_quota: Option<i64>,
     quota_per_unit: Option<i64>,
+}
+
+impl BalanceDto {
+    fn from_balance(balance: keyrelay_core::site::Balance) -> Self {
+        // 未知态一律把数值字段置 `null`：不要「反正它是 0」把它们照传——
+        // 那等于把「不知道」伪装成「余额为零」，而这两件事在界面上必须能分开。
+        let (remaining, used) = if balance.known {
+            (Some(balance.remaining), Some(balance.used))
+        } else {
+            (None, None)
+        };
+        Self {
+            currency: balance.currency,
+            known: balance.known,
+            remaining,
+            used,
+            raw_quota: balance.raw_quota,
+            quota_per_unit: balance.quota_per_unit,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -410,13 +435,7 @@ pub async fn site_balance(state: State<'_, AppState>, site_id: i64) -> Result<Ba
         .service
         .balance(site_id)
         .await
-        .map(|balance| BalanceDto {
-            currency: balance.currency,
-            remaining: balance.remaining,
-            used: balance.used,
-            raw_quota: balance.raw_quota,
-            quota_per_unit: balance.quota_per_unit,
-        })
+        .map(BalanceDto::from_balance)
         .map_err(|e| e.to_string())
 }
 
@@ -1169,6 +1188,64 @@ pub fn autostart_set(state: State<'_, AppState>, enabled: bool) -> Result<Autost
     Ok(dto)
 }
 
+/// 回收站点上的某把令牌（B-82 的独立路径）。
+///
+/// **不是**「删除本地记录」：本地行会被标成 `revoked` 并保留——`bindings` 与漂移追溯
+/// 靠 `keys.id` 存活，删行会一起带走（M7-S4 spec §6.1 有实测）。
+///
+/// `confirm` 必须是 `true`。回收是不可逆的站点侧动作，**不提供「无参数即执行」的形态**：
+/// 误触的代价是用户正在用的 key 在站点上消失。
+#[tauri::command]
+pub async fn revoke_key(
+    state: State<'_, AppState>,
+    site_id: i64,
+    remote_id: String,
+    confirm: bool,
+) -> Result<(), String> {
+    if !confirm {
+        return Err("回收站点侧密钥需要二次确认".to_string());
+    }
+    state
+        .service
+        .revoke_key(site_id, &remote_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 清空钥匙串里属于本产品的条目（FR-8:191）。
+///
+/// `confirm` 必须是 `true`，理由同上：这个动作不可逆（秘密删了就没了，站点侧那把 key
+/// 还在，但本地再也取不回明文）。**不删** SQLite 记录。
+#[tauri::command]
+pub fn purge_keychain(
+    state: State<'_, AppState>,
+    confirm: bool,
+) -> Result<KeychainPurgeDto, String> {
+    if !confirm {
+        return Err("清理钥匙串需要二次确认".to_string());
+    }
+    state
+        .service
+        .purge_keychain()
+        .map(|report| KeychainPurgeDto {
+            attempted: report.attempted,
+            removed: report.removed,
+            failed: report.failed,
+            first_error: report.first_error,
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeychainPurgeDto {
+    attempted: usize,
+    removed: usize,
+    failed: usize,
+    /// 第一条失败的文案（已脱敏）。没有失败时为 `null`。
+    first_error: Option<String>,
+}
+
 /// 落盘一份环境/自启计划。
 ///
 /// Windows 形态（`EnvPlan::Registry`）走 `reg.exe`，**不经 shell**——值里的空格、
@@ -1288,14 +1365,24 @@ mod tests {
 
         let balance = BalanceDto {
             currency: "USD".into(),
-            remaining: 1.5,
-            used: 0.5,
+            known: true,
+            remaining: Some(1.5),
+            used: Some(0.5),
             raw_quota: Some(750_000),
             quota_per_unit: Some(500_000),
         };
         let value = to_value(&balance);
         assert_eq!(value["rawQuota"], 750_000);
         assert_eq!(value["quotaPerUnit"], 500_000);
+        assert_eq!(value["known"], true);
+        assert_eq!(value["remaining"], 1.5);
+
+        // M7-S5：未知余额必须**结构上**不可能被渲染成 0.00 —— 数值字段是 null，不是 0。
+        let unknown = BalanceDto::from_balance(keyrelay_core::site::Balance::unknown("USD"));
+        let value = to_value(&unknown);
+        assert_eq!(value["known"], false);
+        assert_eq!(value["remaining"], Value::Null, "未知余额不得给 0");
+        assert_eq!(value["used"], Value::Null, "未知余额不得给 0");
 
         let info = AppInfoDto {
             name: "KeyRelay".into(),

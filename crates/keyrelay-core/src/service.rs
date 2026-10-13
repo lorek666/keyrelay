@@ -108,6 +108,25 @@ fn is_auth_failure(err: &Error) -> bool {
     matches!(err, Error::AuthFailed(_))
 }
 
+/// 能力门的统一出口（M7-S5）：站点类型**设计上**不支持某操作时返回 [`Error::Unsupported`]。
+///
+/// 为什么要有它：适配器自己返回的 `Unsupported` 只能覆盖它实现的那几条路径，
+/// 而「这个站点类型没有令牌管理端点」是**站点类型**的属性——任何新增入口都该自动继承这条判断。
+/// 判据来自 `site::capability::capabilities()`（纯函数，不联网）。
+///
+/// **调用时机是硬要求**：必须在 `self.session(site_id)?` **之前**。
+/// 没有令牌管理端点的站点通常也没有会话，先要会话会先报「未登录」，
+/// 把用户引向一个根本不存在的登录流程——这正是 `custom-openai-compatible` 会踩的坑。
+fn capability_gate(kind: crate::site::SiteKind, supported: bool, action: &str) -> Result<()> {
+    if supported {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "{} 站点不支持{action}",
+        kind.as_str()
+    )))
+}
+
 /// 进程内会话缓存（按站点隔离）。持久化属 M1-S2。
 #[derive(Default)]
 pub struct SessionCache {
@@ -168,6 +187,19 @@ impl std::fmt::Debug for StoredKey {
             .field("masked", &self.masked)
             .finish()
     }
+}
+
+/// `purge_keychain()` 的结果。**只报计数**，不报被删的条目名（条目名本身也是线索）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeychainPurgeReport {
+    /// 尝试删除的条目数（去重后）。
+    pub attempted: usize,
+    /// 删除成功的条目数。
+    pub removed: usize,
+    /// 删除失败的条目数。
+    pub failed: usize,
+    /// 第一条失败的文案（已脱敏）。没有失败时为 `None`。
+    pub first_error: Option<String>,
 }
 
 /// `sites.health` 的取值（与 [`Store::set_site_health`] 的约定一致，见 M5-S0 章程 §4.1）。
@@ -542,8 +574,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
 
     pub async fn list_keys(&self, site_id: i64) -> Result<Vec<KeyMeta>> {
         let site = self.site(site_id)?;
+        let kind = self.kind_of(&site)?;
+        capability_gate(
+            kind,
+            crate::site::capability::capabilities(kind).list_keys,
+            "列举令牌",
+        )?;
         let session = self.session(site_id)?;
-        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        let adapter = self.registry.adapter(kind);
         match adapter.list_keys(&site.base_url, &session).await {
             Ok(keys) => {
                 self.log(observability::event_with_payload(
@@ -560,8 +598,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
 
     pub async fn create_key(&self, site_id: i64, spec: KeySpec) -> Result<StoredKey> {
         let site = self.site(site_id)?;
+        let kind = self.kind_of(&site)?;
+        capability_gate(
+            kind,
+            crate::site::capability::capabilities(kind).create_key,
+            "创建令牌",
+        )?;
         let session = self.session(site_id)?;
-        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        let adapter = self.registry.adapter(kind);
         let name = spec.name.clone();
         match adapter.create_key(&site.base_url, &session, spec).await {
             Ok(material) => {
@@ -1470,8 +1514,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 站点侧可用分组与倍率（FR-2）。
     pub async fn available_groups(&self, site_id: i64) -> Result<Vec<crate::site::GroupInfo>> {
         let site = self.site(site_id)?;
+        let kind = self.kind_of(&site)?;
+        capability_gate(
+            kind,
+            crate::site::capability::capabilities(kind).groups,
+            "读取分组",
+        )?;
         let session = self.session(site_id)?;
-        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        let adapter = self.registry.adapter(kind);
         adapter.available_groups(&site.base_url, &session).await
     }
 
@@ -1655,8 +1705,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 读某把令牌的明文。**只有显式调用才会返回密钥本体**——列举接口一律不含明文。
     pub async fn reveal_key(&self, site_id: i64, remote_id: &str) -> Result<KeyMaterial> {
         let site = self.site(site_id)?;
+        let kind = self.kind_of(&site)?;
+        capability_gate(
+            kind,
+            crate::site::capability::capabilities(kind).reveal_key,
+            "读取令牌明文",
+        )?;
         let session = self.session(site_id)?;
-        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        let adapter = self.registry.adapter(kind);
         match adapter
             .reveal_key(&site.base_url, &session, remote_id)
             .await
@@ -1674,26 +1730,137 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         }
     }
 
-    /// 删除站点上的某把令牌。
+    /// 回收站点上的某把令牌，并把本地记录标成**已回收**（B-82 的独立路径）。
+    ///
+    /// # 顺序（硬要求）
+    ///
+    /// **先站点、后本地**。站点侧失败时**不**写本地状态——否则会出现「本地说已回收、
+    /// 站点上还活着」这种最坏的组合（用户以为泄漏面关掉了，实际没关）。
+    /// 反过来「站点已删、本地没标上」是可修的：下一次 `sync_site_keys` 会把它标成 `missing`。
+    ///
+    /// # 为什么不删本地行
+    ///
+    /// `bindings.key_id` 是 `ON DELETE CASCADE`——删行会把绑定与漂移追溯一起带走，
+    /// 而 `journals` 表**没有** `key_id`，溯源链的起点就是 `keys.id`（M7-S4 spec §6.1 有实测）。
+    /// 所以「回收」= 改状态，不是删记录。
     pub async fn revoke_key(&self, site_id: i64, remote_id: &str) -> Result<()> {
         let site = self.site(site_id)?;
+        let kind = self.kind_of(&site)?;
+        capability_gate(
+            kind,
+            crate::site::capability::capabilities(kind).revoke_key,
+            "回收令牌",
+        )?;
         let session = self.session(site_id)?;
-        let adapter = self.registry.adapter(self.kind_of(&site)?);
+        let adapter = self.registry.adapter(kind);
         match adapter
             .revoke_key(&site.base_url, &session, remote_id)
             .await
         {
             Ok(()) => {
+                let key_id = self.local_key_id_for_remote(site_id, remote_id)?;
+                if let Some(key_id) = key_id {
+                    self.store
+                        .set_key_status(key_id, crate::store::KEY_STATUS_REVOKED)?;
+                }
+                // payload 只记 id 与状态：这里经手的是「哪一把」，不是「那一把的值」。
                 self.log(observability::event_with_payload(
                     Level::Info,
                     "key",
-                    "已删除站点上的密钥",
-                    serde_json::json!({ "site_id": site_id, "remote_id": remote_id }),
+                    "已回收站点上的密钥",
+                    serde_json::json!({
+                        "site_id": site_id,
+                        "key_id": key_id,
+                        "status": crate::store::KEY_STATUS_REVOKED,
+                    }),
                 ));
                 Ok(())
             }
             Err(err) => Err(self.on_auth_error(site_id, err)),
         }
+    }
+
+    /// `remote_id → 本地 key_id`（限定同一站点）。找不到 ⇒ `Ok(None)`。
+    ///
+    /// 用内存里的 `stored_keys()` 匹配，而不是给 `store` 加一个查询：
+    /// 这是一次内部查找，不值得为它扩存储层的接口面（M7-S5 §3 决策）。
+    /// 找不到不是错误——用户可能在站点网页上手工建过一把我们没记过的 key。
+    fn local_key_id_for_remote(&self, site_id: i64, remote_id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .stored_keys()?
+            .into_iter()
+            .find(|row| row.site_id == site_id && row.remote_id.as_deref() == Some(remote_id))
+            .map(|row| row.id))
+    }
+
+    /// 本产品在钥匙串里拥有**哪些条目**（去重、已排序）。
+    ///
+    /// 这是「我们拥有什么」的**唯一**来源，`purge_keychain()` 与将来的「导出引用清单」
+    /// 都必须走它——把枚举收在一处，将来新增一种凭据（例如账号会话）时，
+    /// 漏删的风险集中在**一个**函数里，而不是散在若干处。
+    ///
+    /// 今天只有 `keys.secret_ref` 一种：`accounts` 表有 `credential_ref` 列，
+    /// 但全仓没有写入器（M7-S4 的同类发现），所以它现在不可能有行。
+    fn owned_secret_refs(&self) -> Result<Vec<String>> {
+        let mut refs: Vec<String> = self
+            .store
+            .list_keys()?
+            .into_iter()
+            .map(|row| row.secret_ref)
+            .collect();
+        refs.sort();
+        refs.dedup();
+        Ok(refs)
+    }
+
+    /// 清空钥匙串里属于本产品的条目（FR-8:191「卸载后钥匙串条目可一键清理」）。
+    ///
+    /// # 为什么按库里的引用枚举，而不是枚举钥匙串
+    ///
+    /// macOS 上枚举某个 service 的条目要过 keychain ACL（`security dump-keychain` 会弹授权），
+    /// 在应用内不可靠。而我们写过的每一条引用都在库里——按库删，既准确又可测。
+    ///
+    /// # 不读明文、不删记录
+    ///
+    /// 全程**不调用 `vault.get`**：只需要删，不需要把秘密读进内存一次。
+    /// 也**不删 SQLite 行**——清的是秘密，不是记录；删记录会带走绑定与漂移追溯
+    /// （`ON DELETE CASCADE`），而用户可能只是想把秘密挪走、留着历史。
+    ///
+    /// 逐条尽力而为：单条失败不中断其余，返回计数与第一条错误文案（脱敏后）。
+    /// `Vault::delete` 是幂等的，所以「本来就没了」算成功——清理要的是「现在没有了」这个结果。
+    pub fn purge_keychain(&self) -> Result<KeychainPurgeReport> {
+        let refs = self.owned_secret_refs()?;
+        let mut removed = 0usize;
+        let mut failed = 0usize;
+        let mut first_error: Option<String> = None;
+        for secret_ref in &refs {
+            match self.vault.delete(secret_ref) {
+                Ok(()) => removed += 1,
+                Err(err) => {
+                    failed += 1;
+                    if first_error.is_none() {
+                        first_error = Some(crate::redact::scrub(&err.to_string()));
+                    }
+                }
+            }
+        }
+        self.log(observability::event_with_payload(
+            Level::Warn,
+            "vault",
+            "已清理钥匙串条目",
+            // 只记计数：条目名本身也是线索，不进事件表。
+            serde_json::json!({
+                "attempted": refs.len(),
+                "removed": removed,
+                "failed": failed,
+            }),
+        ));
+        Ok(KeychainPurgeReport {
+            attempted: refs.len(),
+            removed,
+            failed,
+            first_error,
+        })
     }
 
     /// 组装网关配置（含站点密钥）。调用方负责真正启动网关。
@@ -2046,7 +2213,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         self.store.list_events(limit.min(1000))
     }
 
-    /// 诊断导出：事件表 → JSON 文本。**导出前再过一遍 `scrub`**（纵深防御）。
+    /// 诊断导出：事件表 + 设置快照 + 版本信息 → JSON 文本。**导出前再过一遍 `scrub`**（纵深防御）。
+    ///
+    /// M7-S5 补的是 PRD FR-9:196 缺的两块：**脱敏后的配置快照**与**版本信息**（报障时
+    /// 第一句要问的就是「你装的哪个版本、库结构是哪一版」）。设置快照走
+    /// `Settings::diagnostic_snapshot()` 的白名单，**不含**代理与 webhook 的值。
     pub fn export_diagnostics(&self, limit: usize) -> Result<String> {
         let events = self.recent_events(limit)?;
         let rows: Vec<serde_json::Value> = events
@@ -2064,9 +2235,18 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 })
             })
             .collect();
+        let settings = self.settings()?;
+        let schema = self.store.schema_version()?;
         serde_json::to_string_pretty(&serde_json::json!({
             "vault_backend": self.vault.backend_name(),
             "home": self.home.display().to_string(),
+            "version": {
+                "app": env!("CARGO_PKG_VERSION"),
+                "schema": schema,
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+            },
+            "settings": settings.diagnostic_snapshot(),
             "events": rows,
         }))
         .map_err(|e| Error::Store(format!("导出诊断失败: {e}")))
