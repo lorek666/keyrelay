@@ -60,6 +60,18 @@ export default function Agents() {
   const activeKey = keyId ?? null;
   const [channel, setChannel] = useState(CHANNELS[0].id);
 
+  // 模型名：只有 Continue 需要（它的 schema 把条目的 `model` 定为必填，缺了整份配置拒绝加载）。
+  // 这是**输入框显不显示**的界面判断，不是能力判断：要不要、缺了怎么办由后端决定并报错说明。
+  // 防抖后再进查询键——每次预览都要读一次钥匙串，不该每敲一个字读一次。
+  const needsModel = channel === "continue";
+  const [modelInput, setModelInput] = useState("");
+  const [modelTyped, setModelTyped] = useState("");
+  useEffect(() => {
+    const timer = setTimeout(() => setModelTyped(modelInput.trim()), 400);
+    return () => clearTimeout(timer);
+  }, [modelInput]);
+  const model = needsModel && modelTyped ? modelTyped : undefined;
+
   const [agreeChecked, setAgreeChecked] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [revoking, setRevoking] = useState(false);
@@ -78,25 +90,25 @@ export default function Agents() {
   });
 
   const plan = useQuery({
-    queryKey: ["plan", activeKey, channel],
-    queryFn: () => deliveryPlan({ keyId: activeKey!, channel }),
+    queryKey: ["plan", activeKey, channel, model],
+    queryFn: () => deliveryPlan({ keyId: activeKey!, channel, model }),
     enabled: activeKey !== null,
     retry: false,
   });
 
-  // 切换 key/通道时，同意勾选必须重置（避免「上次勾过了」的错觉）
+  // 切换 key/通道/模型名时，同意勾选必须重置（避免「上次勾过了」的错觉：预览已经变了）
   useEffect(() => {
     setAgreeChecked(false);
     setNotice(null);
     setError(null);
-  }, [activeKey, channel]);
+  }, [activeKey, channel, model]);
 
   const noChange = plan.data?.preview.trim() === "(无变化)";
 
   const grantAndApply = useMutation({
     mutationFn: async () => {
       await grantConsent({ keyId: activeKey!, channel });
-      return applyDelivery({ keyId: activeKey!, channel });
+      return applyDelivery({ keyId: activeKey!, channel, model });
     },
     onSuccess: async (outcome) => {
       setError(null);
@@ -215,7 +227,25 @@ export default function Agents() {
               ))}
             </select>
           </label>
+          {needsModel ? (
+            <label className="field-inline">
+              <span>模型名</span>
+              <input
+                className="input"
+                value={modelInput}
+                onChange={(e) => setModelInput(e.target.value)}
+                placeholder="例如 gpt-4o"
+                spellCheck={false}
+              />
+            </label>
+          ) : null}
         </div>
+        {needsModel ? (
+          <p className="muted">
+            Continue 要求每个模型条目都写明模型名，缺了它整份配置都无法加载。
+            KeyRelay 不替你猜：首次投递请填写；留空则沿用上次投递时写下的模型名。
+          </p>
+        ) : null}
       </div>
 
       {activeKey === null ? (

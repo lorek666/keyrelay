@@ -79,9 +79,15 @@ fn mode_of(path: &Path) -> u32 {
     fs::metadata(path).expect("stat").permissions().mode() & 0o777
 }
 
+/// Continue 的条目必须有模型名（Continue 的 schema 必填；KeyRelay 不编造默认模型），
+/// 其余通道不需要。对 `ALL` 循环的用例统一从这里取。
+fn model_for(channel: DeliveryChannel) -> Option<&'static str> {
+    (channel == DeliveryChannel::Continue).then_some("gpt-4o")
+}
+
 fn target_of(f: &Fixture, channel: DeliveryChannel) -> PathBuf {
     f.service
-        .delivery_plan(f.key_id, channel)
+        .delivery_plan_with_model(f.key_id, channel, model_for(channel))
         .expect("生成计划")
         .target_path
 }

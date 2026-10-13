@@ -307,12 +307,21 @@ fn consent_is_per_channel_and_target() {
     assert_eq!(consents[0].channel, "codex-auth-json");
 }
 
+/// Continue 的条目必须有模型名（Continue 的 schema 必填；KeyRelay 不编造默认模型），
+/// 其余通道不需要。对 `ALL` 循环的用例统一从这里取。
+fn model_for(channel: DeliveryChannel) -> Option<&'static str> {
+    (channel == DeliveryChannel::Continue).then_some("gpt-4o")
+}
+
 #[test]
 fn all_channels_leave_no_plaintext_outside_their_target() {
     let f = setup();
     for channel in DeliveryChannel::ALL {
         f.service.grant_consent(f.key_id, channel).unwrap();
-        let plan = f.service.delivery_plan(f.key_id, channel).unwrap();
+        let plan = f
+            .service
+            .delivery_plan_with_model(f.key_id, channel, model_for(channel))
+            .unwrap();
         assert!(
             !plan.preview.contains(SECRET),
             "{} 预览泄漏",
@@ -323,7 +332,10 @@ fn all_channels_leave_no_plaintext_outside_their_target() {
             "{} 的 Debug 泄漏",
             channel.as_str()
         );
-        let outcome = f.service.apply_delivery(f.key_id, channel).unwrap();
+        let outcome = f
+            .service
+            .apply_delivery_with_model(f.key_id, channel, model_for(channel))
+            .unwrap();
         assert!(
             !format!("{outcome:?}").contains(SECRET),
             "{} 的结果泄漏",
@@ -385,7 +397,10 @@ fn channel_whitelist_rejects_a_mismatched_target() {
 fn plan_reports_missing_consent_for_all_channels() {
     let f = setup();
     for channel in DeliveryChannel::ALL {
-        let plan = f.service.delivery_plan(f.key_id, channel).unwrap();
+        let plan = f
+            .service
+            .delivery_plan_with_model(f.key_id, channel, model_for(channel))
+            .unwrap();
         assert_eq!(plan.consent, ConsentState::Missing);
         assert_eq!(plan.agent_id, channel.agent_id());
     }

@@ -99,6 +99,20 @@ fn error_kind(err: &Error) -> &'static str {
     }
 }
 
+/// 已回收（`keys.status = revoked`）的 key 不得再被使用：投递、网关、轮换都在这里拒绝。
+///
+/// 站点上已经没有它了：投递出去 agent 只会收到 401；对它轮换会先在站点上**新建**一把，
+/// 再去 DELETE 一个不存在的 id。用 `NotFound`（「远端资源不存在」）——这正是事实。
+fn ensure_not_revoked(row: &crate::store::KeyRow) -> Result<()> {
+    if row.status == crate::store::KEY_STATUS_REVOKED {
+        return Err(Error::NotFound(format!(
+            "密钥 #{} 已回收，站点上已经没有它了；不能再投递、启动网关或轮换，需要的话请新建一把",
+            row.id
+        )));
+    }
+    Ok(())
+}
+
 /// 是不是「认证类失败」——即 `error_kind` 判为「认证失败」的那一类（M5-S0 章程 §4.1 规则 2）。
 ///
 /// 只认 [`Error::AuthFailed`]：`CaptchaRequired` / `SecondFactorRequired` 的会话**未必**失效
@@ -763,7 +777,21 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
 
     /// 生成投递预览。**不含密钥明文**；不落盘、不写库。
     pub fn delivery_plan(&self, key_id: i64, channel: DeliveryChannel) -> Result<DeliveryPlan> {
-        let writer = self.prepare_delivery(key_id, channel)?;
+        self.delivery_plan_with_model(key_id, channel, None)
+    }
+
+    /// 带模型名的投递预览。`model` 只对 OpenCode / OpenCodeJsonc / Continue 生效
+    /// （[`delivery::resolve_for_binding`]），其余通道忽略。
+    ///
+    /// Continue 的条目**必须**有模型名（Continue 的 schema 必填，缺了整份配置拒绝加载）：
+    /// `None` 时沿用受管块里已有的，块里也没有就拒绝——KeyRelay 不编造默认模型。
+    pub fn delivery_plan_with_model(
+        &self,
+        key_id: i64,
+        channel: DeliveryChannel,
+        model: Option<&str>,
+    ) -> Result<DeliveryPlan> {
+        let writer = self.prepare_delivery(key_id, channel, model)?;
         let api_key = self.key_secret(key_id)?;
         let patch = writer.plan(&api_key)?;
         let target_path = writer.target_path();
@@ -787,7 +815,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
 
     /// 记录用户同意（幂等：重复同意刷新时间戳并解除撤销）。
     pub fn grant_consent(&self, key_id: i64, channel: DeliveryChannel) -> Result<()> {
-        let writer = self.prepare_delivery(key_id, channel)?;
+        let writer = self.prepare_delivery(key_id, channel, None)?;
         let target = self.checked_target(channel, &writer.target_path())?;
         // 记录同意**不需要**读钥匙串：用户此刻同意的是「写哪些键」，不是「密钥是否存在」。
         let fields = writer.field_names();
@@ -812,7 +840,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
 
     /// 撤销同意。**不**回滚已写入的文件（回滚是独立动作）。
     pub fn revoke_consent(&self, key_id: i64, channel: DeliveryChannel) -> Result<()> {
-        let writer = self.prepare_delivery(key_id, channel)?;
+        let writer = self.prepare_delivery(key_id, channel, None)?;
         let target = self.checked_target(channel, &writer.target_path())?;
         self.store.revoke_consent(
             channel.agent_id(),
@@ -837,9 +865,21 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     }
 
     /// 真正把密钥写进目标文件。步骤与顺序见 spec §6.1，**同意是第一步**。
+    ///
+    /// 不带模型名：轮换第②步走的就是这条——Continue 沿用受管块里已有的模型名。
     pub fn apply_delivery(&self, key_id: i64, channel: DeliveryChannel) -> Result<DeliveryOutcome> {
+        self.apply_delivery_with_model(key_id, channel, None)
+    }
+
+    /// 带模型名的投递。`model` 的口径见 [`KeyRelayService::delivery_plan_with_model`]。
+    pub fn apply_delivery_with_model(
+        &self,
+        key_id: i64,
+        channel: DeliveryChannel,
+        model: Option<&str>,
+    ) -> Result<DeliveryOutcome> {
         // ① 同意（未同意时**不读钥匙串、不落盘**）
-        let writer = self.prepare_delivery(key_id, channel)?;
+        let writer = self.prepare_delivery(key_id, channel, model)?;
         let target = self.checked_target(channel, &writer.target_path())?;
         if !self.consent_state(channel, &target)?.is_granted() {
             self.log(observability::event_with_payload(
@@ -1298,10 +1338,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // `store::KeyRow` 与 `rotation::KeyRow` 是同名不同字段的两个类型：
         // 前者没有 `created_at`（现在补上了），后者只要 4 个字段。
         // 编译器会挡住传错类型，这里的映射是显式的。
+        //
+        // 已回收的 key 不参与判定：站点上已经没有它了，提醒用户「该轮换」只会把他引到
+        // 一条注定失败的路上（`rotation_plan` 会拒绝它）。成功轮换后旧 key 也是这个状态。
         let rows: Vec<crate::rotation::KeyRow> = self
             .store
             .list_keys()?
             .into_iter()
+            .filter(|row| row.status != crate::store::KEY_STATUS_REVOKED)
             .map(|row| {
                 crate::rotation::KeyRow::new(row.id, row.site_id, row.name, Some(row.created_at))
             })
@@ -1435,6 +1479,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .store
             .get_key(key_id)?
             .ok_or_else(|| Error::NotFound(format!("密钥 #{key_id} 不存在")))?;
+        // `rotate_key` 的第一步就是本函数：在这里拒绝 = 在**建新 key 之前**拒绝。
+        ensure_not_revoked(&row)?;
         let (channels, unmapped_targets) = self.rotation_targets(key_id)?;
 
         Ok(RotationPlan {
@@ -1998,6 +2044,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 "密钥 #{key_id} 不属于站点 #{site_id}"
             )));
         }
+        ensure_not_revoked(&row)?;
         let api_key = self.vault.get(&row.secret_ref)?.ok_or_else(|| {
             Error::Vault(format!(
                 "钥匙串中没有该密钥（{}）；请先重新取一次钥匙",
@@ -2424,10 +2471,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     }
 
     /// 解析通道写入器 + 校验 `key_id` 存在。**不读钥匙串**（同意检查必须在读密钥之前）。
+    ///
+    /// 走 `resolve_for_binding` 而不是 `resolve_for`：后者固定 `model = None`，
+    /// 生产路径因此从来没法给 Continue 写模型名（Continue 拒绝加载缺 `model` 的配置）。
     fn prepare_delivery(
         &self,
         key_id: i64,
         channel: DeliveryChannel,
+        model: Option<&str>,
     ) -> Result<Box<dyn delivery::DeliveryWriter>> {
         // key_id 存在性先校验：不存在时连通道都不必解析
         let row = self
@@ -2436,15 +2487,25 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
         // Claude Code / shell 块两个通道要写 endpoint，需要该密钥所属站点的 base_url
         let site = self.site(row.site_id)?;
-        delivery::resolve_for(channel, &self.home, &site.base_url)
+        delivery::resolve_for_binding(
+            channel,
+            &self.home,
+            &site.base_url,
+            delivery::opencode::OpenCodeWriter::DEFAULT_PROVIDER_ID,
+            model,
+        )
     }
 
     /// 从钥匙串取密钥明文。调用方必须立刻用掉，不得记录。
+    ///
+    /// 已回收的 key 在这里拒绝（投递预览与投递都经过本函数）；同意的授予 / 撤销**不**经过
+    /// 这里——那两步只关心「写哪个文件」，不该因为选中的 key 已回收就撤不掉同意。
     fn key_secret(&self, key_id: i64) -> Result<String> {
         let row = self
             .store
             .get_key(key_id)?
             .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
+        ensure_not_revoked(&row)?;
         self.vault.get(&row.secret_ref)?.ok_or_else(|| {
             Error::Vault(format!(
                 "钥匙串中没有该密钥（{}）；请先在该站点重新取一次钥匙",

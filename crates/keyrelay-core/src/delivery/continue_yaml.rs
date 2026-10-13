@@ -40,6 +40,16 @@ const ENTRY_NAME: &str = "keyrelay";
 /// OpenAI 兼容入口的 provider id。**本包唯一未经本机验证的字段**（spec §14-3）：
 /// Continue 未安装，无法核实该写哪个 provider id；改动点只有本常量一行。
 const ENTRY_PROVIDER: &str = "openai";
+/// 新建文件时的配置头。Continue 的 schema 把顶层 `name` / `version` 定为**必填**——
+/// 用它自己的解析器（`@continuedev/config-yaml` 1.42.0 `parseConfigYaml`）实测：
+/// 缺了报 `name: Required, version: Required`，整份配置拒绝加载。
+/// 取值是本产品自己的字面量（只在**新建**时写；已有文件的头部归用户，我们不动）。
+const CONFIG_NAME: &str = "KeyRelay";
+const CONFIG_VERSION: &str = "1.0.0";
+/// 取不到模型名时的拒绝文案。
+const MODEL_REQUIRED: &str =
+    "Continue 要求每个模型条目都写明模型名（`model`），缺了它 Continue 会拒绝加载\
+     整份配置；KeyRelay 不编造默认模型：请在投递时填写模型名";
 /// 没有既有列表项时使用的缩进。
 const DEFAULT_INDENT: &str = "  ";
 /// 条目字段相对条目起始的额外缩进（对齐 `- ` 的宽度）。
@@ -48,7 +58,8 @@ const FIELD_INDENT: &str = "  ";
 pub struct ContinueWriter {
     path: PathBuf,
     base_url: String,
-    /// `None` = 不写 `model:` 行（**不编造默认模型**，章程 §4.2 点 4）。
+    /// `None` = 沿用受管块里已有的模型名（重投 / 轮换）；块里也没有 ⇒ `plan()` 拒绝。
+    /// **不编造默认模型**（章程 §4.2 点 4），也不写缺 `model` 的条目（Continue 必填）。
     model: Option<String>,
 }
 
@@ -81,6 +92,18 @@ impl ContinueWriter {
     /// 形态下语义会变，而 `apiKey` / `apiBase` 都是**外部输入**，不能靠「碰巧安全」。
     /// 控制字符的**拒绝**发生在 [`ContinueWriter::build_after`]（本函数是纯渲染，不返回 `Result`）。
     pub fn render_block(&self, api_key: &str, indent: &str, line_ending: &str) -> String {
+        self.render_block_with(api_key, self.model.as_deref(), indent, line_ending)
+    }
+
+    /// [`ContinueWriter::render_block`] 的实体：`model` 由调用方给（`build_after` 用的是
+    /// 「显式给的 ∨ 块里已有的」，不一定是 `self.model`）。
+    fn render_block_with(
+        &self,
+        api_key: &str,
+        model: Option<&str>,
+        indent: &str,
+        line_ending: &str,
+    ) -> String {
         let field_indent = format!("{indent}{FIELD_INDENT}");
         let mut lines = vec![
             format!("{indent}{BLOCK_BEGIN}"),
@@ -88,7 +111,7 @@ impl ContinueWriter {
             format!("{indent}- name: {}", quote(ENTRY_NAME)),
             format!("{field_indent}provider: {}", quote(ENTRY_PROVIDER)),
         ];
-        if let Some(model) = &self.model {
+        if let Some(model) = model {
             lines.push(format!("{field_indent}model: {}", quote(model)));
         }
         if !self.base_url.is_empty() {
@@ -112,16 +135,36 @@ impl ContinueWriter {
 
         let eol = detect_line_ending(before);
 
-        // ① 新建（文件不存在 / 0 字节 / 纯空白）
+        // 模型名：显式给的优先；没给就只能来自既有受管块（重投 / 轮换）。两处都没有 ⇒ 拒绝——
+        // 缺 `model` 的条目会让 Continue 拒绝加载**整份**配置，比不投递更糟。
+        // 放在各分支里取（而不是一进来就拒绝）：结构性的拒绝（重复 `models:`、行内值、
+        // 残缺块）先报，那些是用户必须先手工处理的。
+        let require_model = |model: Option<String>| -> Result<String> {
+            let model = model.ok_or_else(|| Error::inject(&self.path, MODEL_REQUIRED))?;
+            validate_value(&self.path, "model", &model)?;
+            Ok(model)
+        };
+
+        // ① 新建（文件不存在 / 0 字节 / 纯空白）：整份文件都是我们写的，补上 Continue 必填的配置头
         if before.trim().is_empty() {
-            let block = self.render_block(api_key, DEFAULT_INDENT, eol);
-            return Ok(format!("models:{eol}{block}{eol}"));
+            let model = require_model(self.model.clone())?;
+            let block = self.render_block_with(api_key, Some(&model), DEFAULT_INDENT, eol);
+            return Ok(format!(
+                "name: {}{eol}version: {}{eol}models:{eol}{block}{eol}",
+                quote(CONFIG_NAME),
+                quote(CONFIG_VERSION)
+            ));
         }
 
         // ② 已有块：原地替换，缩进沿用**旧块首行**（不因重投递而漂移）
         if let Some((begin, end)) = locate_block(before, &self.path)? {
+            let model = require_model(
+                self.model
+                    .clone()
+                    .or_else(|| block_model(&before[begin..end])),
+            )?;
             let indent = leading_indent(&before[begin..]);
-            let block = self.render_block(api_key, &indent, eol);
+            let block = self.render_block_with(api_key, Some(&model), &indent, eol);
             let had_eol = before[begin..end].ends_with('\n');
             let mut out = String::with_capacity(before.len() + block.len() + 2);
             out.push_str(&before[..begin]);
@@ -159,17 +202,24 @@ impl ContinueWriter {
                  请把它改成块序列（`models:` 换行后缩进列表项），或改用其它通道",
             )),
             Some((index, line, ModelsLine::Block)) => {
+                let model = require_model(self.model.clone())?;
                 let indent = infer_item_indent(&lines, *index);
-                let block = self.render_block(api_key, &indent, eol);
+                let block = self.render_block_with(api_key, Some(&model), &indent, eol);
                 let mut out = String::with_capacity(before.len() + block.len() + eol.len() * 2);
                 out.push_str(&before[..line.end]);
+                // `models:` 是最后一行且没有行尾时先补一个：否则开始标记粘在 `models:` 同一行，
+                // `locate_block` 只认行首标记，下一次投递就认不出这个块了。
+                if !before[..line.end].ends_with('\n') {
+                    out.push_str(eol);
+                }
                 out.push_str(&block);
                 out.push_str(eol);
                 out.push_str(&before[line.end..]);
                 Ok(out)
             }
             None => {
-                let block = self.render_block(api_key, DEFAULT_INDENT, eol);
+                let model = require_model(self.model.clone())?;
+                let block = self.render_block_with(api_key, Some(&model), DEFAULT_INDENT, eol);
                 let mut out = String::with_capacity(before.len() + block.len() + 16);
                 out.push_str(before);
                 if !before.ends_with('\n') {
@@ -195,14 +245,14 @@ impl DeliveryWriter for ContinueWriter {
     }
 
     /// 将被写入的键名（**不需要密钥**，供「记录用户同意」使用）。
+    ///
+    /// `model` 总在其中：每次成功的写入都带它（显式给的，或沿用块里已有的）。
     fn field_names(&self) -> Vec<String> {
         let mut names = vec!["apiKey".to_string()];
         if !self.base_url.is_empty() {
             names.push("apiBase".to_string());
         }
-        if self.model.is_some() {
-            names.push("model".to_string());
-        }
+        names.push("model".to_string());
         names
     }
 
@@ -236,8 +286,14 @@ enum ModelsLine {
 /// 判定某一行是不是**顶层** `models:`。`None` = 不是。
 ///
 /// 「顶层」= 行首无空白（缩进的 `models:` 属于别的映射，不是我们要挂的地方）。
+///
+/// 文件首行可能带 BOM，键也可以写成 `"models"` / `'models'`——YAML 里这三种写法是**同一个键**。
+/// 认不出来就会走「追加」分支，写出第二个顶层 `models:`（重复键，Continue 拒绝加载）。
 fn classify_models_line(content: &str) -> Option<ModelsLine> {
-    let rest = content.strip_prefix("models")?;
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
+    let rest = ["models", "\"models\"", "'models'"]
+        .into_iter()
+        .find_map(|key| content.strip_prefix(key))?;
     let rest = rest.trim_start();
     let after_colon = rest.strip_prefix(':')?;
     let tail = after_colon.trim();
@@ -333,6 +389,46 @@ fn quote(value: &str) -> String {
     out
 }
 
+/// 从既有受管块里取模型名（重投 / 轮换沿用它）。
+///
+/// 只认本模块自己渲染的形态：块内某行去掉缩进后是 `model: "<quote 的产物>"`。
+/// 手工改成别的写法 ⇒ 取不到 ⇒ 由调用方拒绝并要求填写模型名——不猜。
+fn block_model(block: &str) -> Option<String> {
+    block.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("model:")?.trim();
+        unquote(value).filter(|model| !model.trim().is_empty())
+    })
+}
+
+/// [`quote`] 的逆：只接受 `quote` 能产生的转义（`\\` `\"` `\n` `\t` `\r` `\xNN`），其余 ⇒ `None`。
+fn unquote(value: &str) -> Option<String> {
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return None, // 未转义的引号：不是 `quote` 的产物
+            '\\' => match chars.next()? {
+                '\\' => out.push('\\'),
+                '"' => out.push('"'),
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                'x' => {
+                    let hex: String = chars.by_ref().take(2).collect();
+                    let code = u32::from_str_radix(&hex, 16)
+                        .ok()
+                        .filter(|_| hex.len() == 2)?;
+                    out.push(char::from_u32(code)?);
+                }
+                _ => return None,
+            },
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
 /// 值校验：C0 控制字符（`\t` `\n` `\r` 除外）⇒ 拒绝（spec §4.3）。
 fn validate_value(path: &Path, what: &str, value: &str) -> Result<()> {
     if value
@@ -385,9 +481,11 @@ mod tests {
     #[test]
     fn fresh_file_is_byte_exact() {
         let dir = tmp();
-        let patch = writer_in(dir.path(), BASE, None).plan(SECRET).unwrap();
+        let patch = writer_in(dir.path(), BASE, Some(MODEL))
+            .plan(SECRET)
+            .unwrap();
         assert_eq!(patch.before, "");
-        let expected = "models:\n  # >>> keyrelay managed >>>\n  # 由 KeyRelay 管理；手工修改会在下次投递时被覆盖\n  - name: \"keyrelay\"\n    provider: \"openai\"\n    apiBase: \"https://relay.example.com/v1\"\n    apiKey: \"sk-continue-0123456789abcdef\"\n  # <<< keyrelay managed <<<\n";
+        let expected = "name: \"KeyRelay\"\nversion: \"1.0.0\"\nmodels:\n  # >>> keyrelay managed >>>\n  # 由 KeyRelay 管理；手工修改会在下次投递时被覆盖\n  - name: \"keyrelay\"\n    provider: \"openai\"\n    model: \"gpt-4o\"\n    apiBase: \"https://relay.example.com/v1\"\n    apiKey: \"sk-continue-0123456789abcdef\"\n  # <<< keyrelay managed <<<\n";
         assert_eq!(patch.after, expected);
         assert_eq!(patch.new_file_mode, Some(0o600), "含密钥 → 新建 0600");
     }
@@ -396,9 +494,11 @@ mod tests {
     fn insert_goes_right_after_models_and_keeps_user_items() {
         let dir = tmp();
         let before = "name: my-config\nmodels:\n  - name: mine\n    provider: openai\n";
-        std::fs::write(writer_in(dir.path(), BASE, None).path(), before).unwrap();
+        std::fs::write(writer_in(dir.path(), BASE, Some(MODEL)).path(), before).unwrap();
 
-        let patch = writer_in(dir.path(), BASE, None).plan(SECRET).unwrap();
+        let patch = writer_in(dir.path(), BASE, Some(MODEL))
+            .plan(SECRET)
+            .unwrap();
         assert!(
             patch.after.starts_with("name: my-config\nmodels:\n  # >>>"),
             "{}",
@@ -419,9 +519,11 @@ mod tests {
     fn indent_follows_the_existing_list() {
         let dir = tmp();
         let before = "models:\n    - name: mine\n      provider: openai\n";
-        std::fs::write(writer_in(dir.path(), BASE, None).path(), before).unwrap();
+        std::fs::write(writer_in(dir.path(), BASE, Some(MODEL)).path(), before).unwrap();
 
-        let patch = writer_in(dir.path(), BASE, None).plan(SECRET).unwrap();
+        let patch = writer_in(dir.path(), BASE, Some(MODEL))
+            .plan(SECRET)
+            .unwrap();
         assert!(
             patch.after.contains("    # >>> keyrelay managed >>>"),
             "{}",
@@ -441,9 +543,11 @@ mod tests {
         // 旧实现在这里回落成 2 空格 ⇒ 同一个序列两种缩进 ⇒ 产物非法 YAML。
         let dir = tmp();
         let before = "models:\n- name: mine\n- name: second\n";
-        std::fs::write(writer_in(dir.path(), BASE, None).path(), before).unwrap();
+        std::fs::write(writer_in(dir.path(), BASE, Some(MODEL)).path(), before).unwrap();
 
-        let patch = writer_in(dir.path(), BASE, None).plan(SECRET).unwrap();
+        let patch = writer_in(dir.path(), BASE, Some(MODEL))
+            .plan(SECRET)
+            .unwrap();
         assert!(
             patch.after.contains("\n- name: \"keyrelay\"\n"),
             "块内条目必须与既有条目同缩进（空）: {}",
@@ -465,9 +569,11 @@ mod tests {
     fn appends_models_when_absent() {
         let dir = tmp();
         let before = "name: my-config\n"; // 不以换行结尾也覆盖
-        std::fs::write(writer_in(dir.path(), BASE, None).path(), before).unwrap();
+        std::fs::write(writer_in(dir.path(), BASE, Some(MODEL)).path(), before).unwrap();
 
-        let patch = writer_in(dir.path(), BASE, None).plan(SECRET).unwrap();
+        let patch = writer_in(dir.path(), BASE, Some(MODEL))
+            .plan(SECRET)
+            .unwrap();
         assert!(patch.after.starts_with(before), "原内容必须逐字保留");
         assert!(
             patch.after.contains("\nmodels:\n  # >>>"),
@@ -479,14 +585,20 @@ mod tests {
     #[test]
     fn replaces_the_block_in_place_and_is_idempotent() {
         let dir = tmp();
-        let path = writer_in(dir.path(), BASE, None).path().to_path_buf();
-        let first = writer_in(dir.path(), BASE, None).plan(SECRET).unwrap();
+        let path = writer_in(dir.path(), BASE, Some(MODEL))
+            .path()
+            .to_path_buf();
+        let first = writer_in(dir.path(), BASE, Some(MODEL))
+            .plan(SECRET)
+            .unwrap();
         std::fs::write(&path, &first.after).unwrap();
 
-        let second = writer_in(dir.path(), BASE, None).plan(SECRET).unwrap();
+        let second = writer_in(dir.path(), BASE, Some(MODEL))
+            .plan(SECRET)
+            .unwrap();
         assert_eq!(second.after, first.after, "同输入二次投递不得产生额外改动");
 
-        let rotated = writer_in(dir.path(), BASE, None)
+        let rotated = writer_in(dir.path(), BASE, Some(MODEL))
             .plan("sk-continue-ROTATED-999999")
             .unwrap();
         assert!(rotated.after.contains("sk-continue-ROTATED-999999"));
@@ -498,9 +610,11 @@ mod tests {
     fn keeps_the_file_line_ending() {
         let dir = tmp();
         let before = "models:\r\n  - name: mine\r\n";
-        std::fs::write(writer_in(dir.path(), BASE, None).path(), before).unwrap();
+        std::fs::write(writer_in(dir.path(), BASE, Some(MODEL)).path(), before).unwrap();
 
-        let patch = writer_in(dir.path(), BASE, None).plan(SECRET).unwrap();
+        let patch = writer_in(dir.path(), BASE, Some(MODEL))
+            .plan(SECRET)
+            .unwrap();
         assert!(
             patch.after.contains("  # >>> keyrelay managed >>>\r\n"),
             "{:?}",
@@ -574,7 +688,7 @@ mod tests {
 
         // 落到文件里也是同一形态（值里的 `: ` 与 ` #` 不会把 YAML 读成别的意思）
         let dir = tmp();
-        let patch = writer_in(dir.path(), "https://x/a: b #c", None)
+        let patch = writer_in(dir.path(), "https://x/a: b #c", Some(MODEL))
             .plan(SECRET)
             .unwrap();
         assert!(
@@ -612,6 +726,47 @@ mod tests {
         assert_eq!(classify_models_line("modelsX:"), None);
         assert_eq!(classify_models_line("# models:"), None);
         assert_eq!(classify_models_line("name: models"), None);
+    }
+
+    #[test]
+    fn classifies_bom_and_quoted_models_keys() {
+        // 文件首行可能带 BOM；YAML 键也可以加单 / 双引号——三种写法都是同一个 `models` 键
+        assert_eq!(
+            classify_models_line("\u{FEFF}models:"),
+            Some(ModelsLine::Block)
+        );
+        assert_eq!(classify_models_line("\"models\":"), Some(ModelsLine::Block));
+        assert_eq!(classify_models_line("'models':"), Some(ModelsLine::Block));
+        assert_eq!(
+            classify_models_line("\"models\" : # 注释"),
+            Some(ModelsLine::Block)
+        );
+        assert_eq!(
+            classify_models_line("\u{FEFF}\"models\": []"),
+            Some(ModelsLine::Flow)
+        );
+        assert_eq!(classify_models_line("\"modelsX\":"), None);
+        assert_eq!(classify_models_line("\"models':"), None, "引号不成对");
+        assert_eq!(classify_models_line("\"models:"), None, "引号不成对");
+        assert_eq!(classify_models_line(" \"models\":"), None, "缩进的不算顶层");
+    }
+
+    #[test]
+    fn insert_after_models_without_trailing_newline_starts_a_new_line() {
+        let dir = tmp();
+        let before = "models:";
+        std::fs::write(writer_in(dir.path(), BASE, Some(MODEL)).path(), before).unwrap();
+
+        let patch = writer_in(dir.path(), BASE, Some(MODEL))
+            .plan(SECRET)
+            .unwrap();
+        assert!(
+            patch
+                .after
+                .starts_with("models:\n  # >>> keyrelay managed >>>\n"),
+            "{:?}",
+            patch.after
+        );
     }
 
     #[test]
