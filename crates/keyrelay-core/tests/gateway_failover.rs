@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use keyrelay_core::gateway::{generate_token, start, GatewayConfig, GatewayFailure, GatewayHandle};
+use keyrelay_core::gateway::{
+    generate_token, start, GatewayConfig, GatewayFailure, GatewayHandle, UpstreamTimeout,
+};
 use keyrelay_core::routing::{BreakerPolicy, RouteTable, Upstream};
 use zeroize::Zeroizing;
 
@@ -152,6 +154,9 @@ async fn start_routed(
         route,
         breaker,
         keys_by_ref: keys,
+        upstream_timeout: UpstreamTimeout::default(),
+        revoked_refs: None,
+        on_observation: None,
         on_failure: Some(Arc::new(move |f| {
             if let Ok(mut log) = sink.lock() {
                 log.push(f);
@@ -384,6 +389,10 @@ async fn failure_event_scrubs_a_key_shaped_model() {
             route: RouteTable::new(vec![up_a, up_b]),
             breaker: long_cooldown(),
             keys_by_ref: keys,
+            // M8-S1 新增的三个字段：这里都用默认 / 不启用，让既有用例的语义不变。
+            upstream_timeout: UpstreamTimeout::default(),
+            revoked_refs: None,
+            on_observation: None,
             on_failure: Some(Arc::new(move |f| {
                 if let Ok(mut log) = sink.lock() {
                     log.push(f);
@@ -433,4 +442,406 @@ async fn failure_event_scrubs_a_key_shaped_model() {
         );
     }
     handle.shutdown_and_wait().await;
+}
+
+// ============================================================ M8-S1：§3.5 的调试余项
+
+/// 起一个**延迟 `delay` 之后**才回 `status_line` 的假上游。
+///
+/// 用途：制造「失败本身比冷却期还慢」的形态——§3.5-1 的缺陷只在这种输入下显形。
+fn spawn_upstream_delayed(
+    site_id: i64,
+    key_ref: &str,
+    status_line: &str,
+    delay: Duration,
+) -> FakeUpstream {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+    let addr = listener.local_addr().expect("读取地址");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let status_line = status_line.to_string();
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let raw = read_request(&mut stream);
+            if let Ok(mut log) = recorder.lock() {
+                log.push(raw);
+            }
+            thread::sleep(delay);
+            let body = format!(r#"{{"from":"site{site_id}"}}"#);
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    FakeUpstream {
+        site_id,
+        base_url: format!("http://{addr}"),
+        key_ref: key_ref.to_string(),
+        seen,
+    }
+}
+
+/// 起一个**接了连接但永不回应**的假上游：§3.5-2 要抓的就是这种病态形态。
+fn spawn_stalled_upstream(site_id: i64, key_ref: &str) -> FakeUpstream {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+    let addr = listener.local_addr().expect("读取地址");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+
+    thread::spawn(move || {
+        let mut held: Vec<TcpStream> = Vec::new();
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let raw = read_request(&mut stream);
+            if let Ok(mut log) = recorder.lock() {
+                log.push(raw);
+            }
+            // **不回任何字节**，把连接攥在手里。连接不断，上游就没有「错误」——
+            // 只有超时才能把它判成故障。
+            held.push(stream);
+        }
+    });
+
+    FakeUpstream {
+        site_id,
+        base_url: format!("http://{addr}"),
+        key_ref: key_ref.to_string(),
+        seen,
+    }
+}
+
+/// 与 [`start_routed`] 同形，但可以调超时 / 给已回收集合 / 收集观测。
+async fn start_routed_with(
+    upstreams: &[(&FakeUpstream, f64)],
+    breaker: BreakerPolicy,
+    timeout: UpstreamTimeout,
+    revoked: Option<Vec<String>>,
+    keys: Vec<(&str, &str)>,
+) -> (
+    GatewayHandle,
+    String,
+    Failures,
+    Arc<Mutex<Vec<keyrelay_core::gateway::UpstreamObservation>>>,
+) {
+    let route = RouteTable::new(
+        upstreams
+            .iter()
+            .map(|(u, rate)| u.upstream(*rate))
+            .collect(),
+    );
+    let mut map = std::collections::HashMap::new();
+    for (r, plain) in keys {
+        map.insert(r.to_string(), Zeroizing::new(plain.to_string()));
+    }
+    let failures: Failures = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&failures);
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let obs_sink = Arc::clone(&observations);
+
+    let handle = start(GatewayConfig {
+        port: 0,
+        token: generate_token(),
+        base_url: String::new(),
+        api_key: String::new(),
+        site_display_name: "路由模式".to_string(),
+        route,
+        breaker,
+        keys_by_ref: map,
+        upstream_timeout: timeout,
+        revoked_refs: revoked.map(|refs| {
+            Arc::new(Mutex::new(
+                refs.into_iter().collect::<std::collections::HashSet<_>>(),
+            ))
+        }),
+        on_observation: Some(Arc::new(move |o| {
+            if let Ok(mut log) = obs_sink.lock() {
+                log.push(o);
+            }
+        })),
+        on_failure: Some(Arc::new(move |f| {
+            if let Ok(mut log) = sink.lock() {
+                log.push(f);
+            }
+        })),
+    })
+    .await
+    .expect("网关应能启动");
+
+    let token = handle.token.clone();
+    (handle, token, failures, observations)
+}
+
+fn body_with_model() -> String {
+    format!(r#"{{"model":"{MODEL}","messages":[]}}"#)
+}
+
+#[tokio::test]
+async fn breaker_opens_even_when_the_failure_is_slower_than_the_cooldown() {
+    // §3.5-1（DEBUG 报告 §2.1）：`opened_at` 用的是**请求开始**时刻时，
+    // 一次比冷却期还慢的失败（真实形态：Cloudflare 524 ≈ 100s > 冷却 60s）记下的那一刻
+    // 冷却就已经「过期」⇒ 这个上游**永远熔断不了**。
+    //
+    // 判据（章程 §3.5-1 原文）：打 5 次，A 只应被调用 **3** 次（threshold = 3）。
+    let cooldown = Duration::from_millis(50);
+    let slow = Duration::from_millis(150); // > cooldown ⇒ 失败本身就跨过了冷却期
+    let a = spawn_upstream_delayed(1, REF_A, "503 Service Unavailable", slow);
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+
+    let (handle, token, _failures, _obs) = start_routed_with(
+        &[(&a, 1.0), (&b, 2.0)],
+        BreakerPolicy {
+            threshold: 3,
+            cooldown,
+        },
+        UpstreamTimeout::default(),
+        None,
+        vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+    )
+    .await;
+
+    for _ in 0..5 {
+        let (status, _) = post(&handle, &token, &body_with_model()).await;
+        assert_eq!(status, 200, "B 应当接住每一次请求");
+    }
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(
+        a.request_count(),
+        3,
+        "A 应当在第 3 次失败后熔断住；修复前（opened_at = 请求开始）它会被调用 5 次——\
+         因为每次失败的耗时都超过了冷却期，冷却在记下的那一刻就已过期"
+    );
+}
+
+#[tokio::test]
+async fn the_last_sendable_candidate_returns_its_own_status() {
+    // §3.5-3（DEBUG 报告 §2.3）：`is_last` 把**没有明文**的候选也计进去，
+    // 于是「最后一个真的发得出去的候选」被误判成「不是最后一个」，它的响应被丢掉、
+    // 继续往下走 → 502。症状：唯一可用上游返回 429，用户看到 502，`Retry-After` 被吞掉。
+    let a = spawn_upstream_always(1, REF_A, "429 Too Many Requests");
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+
+    let (handle, token, _failures, _obs) = start_routed_with(
+        &[(&a, 1.0), (&b, 2.0)],
+        BreakerPolicy {
+            threshold: 3,
+            cooldown: Duration::from_secs(60),
+        },
+        UpstreamTimeout::default(),
+        None,
+        // **只给 A 明文**：B 进不了 sendable，因此 A 就是最后一个发得出去的候选。
+        vec![(REF_A, KEY_A)],
+    )
+    .await;
+
+    let (status, _) = post(&handle, &token, &body_with_model()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(
+        status, 429,
+        "A 是最后一个发得出去的候选 ⇒ 必须如实返回它的 429；\
+         修复前会继续往下走，最终 502（B 没有明文，发不出去）"
+    );
+    assert_eq!(b.request_count(), 0, "B 没有明文，不该被请求");
+}
+
+#[tokio::test]
+async fn a_missing_plaintext_is_visible_not_silent() {
+    // §10（M7 审计 D-2）：缺明文的候选原来**静默** `continue`。
+    // 若构造方忘了填 `keys_by_ref`，表现是「每个上游都跳过 → 502」，
+    // 看起来像「故障切换不工作」，根因却是密钥映射空着——没有任何线索。
+    let a = spawn_upstream_always(1, REF_A, "200 OK");
+
+    let (handle, token, failures, _obs) = start_routed_with(
+        &[(&a, 1.0)],
+        BreakerPolicy {
+            threshold: 3,
+            cooldown: Duration::from_secs(60),
+        },
+        UpstreamTimeout::default(),
+        None,
+        // 故意不给任何明文。
+        vec![],
+    )
+    .await;
+
+    let (status, _) = post(&handle, &token, &body_with_model()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(
+        status, 502,
+        "没有可用的上游 ⇒ 502（这是对的，只是不能**静默**）"
+    );
+    assert_eq!(a.request_count(), 0, "没有明文就不该发出去");
+
+    let log = failures.lock().expect("锁").clone();
+    assert!(
+        !log.is_empty(),
+        "缺明文必须产生失败事件，否则用户拿不到任何线索"
+    );
+    assert!(
+        log.iter().all(|f| f.status == 0),
+        "「一个候选都没发出去」没有 HTTP 状态码，用 0 这个哨兵（编 503 会让事件说谎）: {log:?}"
+    );
+    assert!(
+        log.iter().all(|f| !f.model.contains("kr/key")),
+        "事件里不得出现 key_ref 原文（引用本身是线索）: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn all_candidates_open_still_produces_an_event() {
+    // §9 第 2 条：`eligible.is_empty()` 是一次**没有发出任何请求**的失败，
+    // 它也必须可见——否则用户看到 503 而事件表里什么都没有。
+    let a = spawn_upstream_always(1, REF_A, "503 Service Unavailable");
+
+    let (handle, token, failures, _obs) = start_routed_with(
+        &[(&a, 1.0)],
+        BreakerPolicy {
+            threshold: 1, // 一次失败就熔断
+            cooldown: Duration::from_secs(60),
+        },
+        UpstreamTimeout::default(),
+        None,
+        vec![(REF_A, KEY_A)],
+    )
+    .await;
+
+    let (first, _) = post(&handle, &token, &body_with_model()).await;
+    assert_eq!(first, 503, "第一次是上游真的返回了 503");
+    let after_first = failures.lock().expect("锁").len();
+
+    let (second, _) = post(&handle, &token, &body_with_model()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(second, 503, "候选全被熔断 ⇒ 503");
+    let log = failures.lock().expect("锁").clone();
+    assert!(
+        log.len() > after_first,
+        "「一个候选都没发出去」也必须产生事件（修复前这里静默）"
+    );
+    assert_eq!(a.request_count(), 1, "第二次不该再打到 A");
+    assert!(
+        log.iter().any(|f| f.status == 0),
+        "全熔断的失败没有状态码，用 0 哨兵: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_key_ref_is_never_used() {
+    // §3.5-5 / DEBUG §1.2 残留：`ensure_not_revoked` 只拦**新启动**。
+    // 网关运行期间某把 key 被回收后，它仍在 `keys_by_ref` 里 ⇒ 继续被使用，
+    // agent 收到的是 401。
+    let a = spawn_upstream_always(1, REF_A, "200 OK");
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+
+    let (handle, token, failures, _obs) = start_routed_with(
+        &[(&a, 1.0), (&b, 2.0)],
+        BreakerPolicy {
+            threshold: 3,
+            cooldown: Duration::from_secs(60),
+        },
+        UpstreamTimeout::default(),
+        Some(vec![REF_A.to_string()]),
+        vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+    )
+    .await;
+
+    let (status, _) = post(&handle, &token, &body_with_model()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(status, 200, "应当切到 B");
+    assert_eq!(a.request_count(), 0, "已回收的 key 一次都不该被使用");
+    assert_eq!(b.request_count(), 1);
+    // **请求成功时不上报**：`report_failure` 同时喂熔断，而「某个候选被跳过」
+    // 在请求成功时不是故障——那时也上报，一个长期缺明文/已回收的候选会把熔断喂开。
+    assert!(
+        failures.lock().expect("锁").is_empty(),
+        "请求成功了就不该产生失败事件（否则会误喂熔断）"
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_only_candidate_reports_why_it_was_skipped() {
+    // 与上一条互补：**没有别的候选可去**时，跳过原因必须可见。
+    // 契约的原话是「不得静默 **502**」——指的就是这条路径。
+    let a = spawn_upstream_always(1, REF_A, "200 OK");
+
+    let (handle, token, failures, _obs) = start_routed_with(
+        &[(&a, 1.0)],
+        BreakerPolicy {
+            threshold: 3,
+            cooldown: Duration::from_secs(60),
+        },
+        UpstreamTimeout::default(),
+        Some(vec![REF_A.to_string()]),
+        vec![(REF_A, KEY_A)],
+    )
+    .await;
+
+    let (status, _) = post(&handle, &token, &body_with_model()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(status, 502);
+    assert_eq!(a.request_count(), 0);
+    let log = failures.lock().expect("锁").clone();
+    assert!(
+        log.iter().any(|f| f.site_id == 1 && f.status == 0),
+        "被跳过的原因要可见（与「缺明文」文案不同）: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_upstream_times_out_and_fails_over() {
+    // §3.5-2（DEBUG 报告 §2.2）：上游客户端原来**没有任何超时**——
+    // 上游接了连接却不回应时，请求永远挂着，既不切下一个候选，也不喂熔断。
+    // 实测：卡 8.5s、B 收到 0 次、失败事件 0 条。
+    let stalled = spawn_stalled_upstream(1, REF_A);
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+
+    let (handle, token, failures, obs) = start_routed_with(
+        &[(&stalled, 1.0), (&b, 2.0)],
+        BreakerPolicy {
+            threshold: 3,
+            cooldown: Duration::from_secs(60),
+        },
+        // 测试把 read 调小到 200ms 来复现判据。**这不代表生产上切换很快**：
+        // 默认是 300s（BACKLOG B-112 已登记为未标定常量）。
+        UpstreamTimeout {
+            connect: Duration::from_millis(200),
+            read: Duration::from_millis(200),
+        },
+        None,
+        vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+    )
+    .await;
+
+    let (status, _) = post(&handle, &token, &body_with_model()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(status, 200, "卡住的上游必须被超时判死，切到 B");
+    assert_eq!(b.request_count(), 1, "B 应当收到请求（修复前收到 0 次）");
+    let log = failures.lock().expect("锁").clone();
+    assert!(
+        log.iter().any(|f| f.site_id == 1),
+        "超时也是一次失败，必须喂熔断并产生事件（修复前 0 条）: {log:?}"
+    );
+
+    // §5.3：观测出口只把**成功**的延迟记进 last-value，但两条都要上报。
+    let seen = obs.lock().expect("锁").clone();
+    assert!(
+        seen.iter().any(|o| o.site_id == 1 && !o.ok),
+        "失败尝试也要上报观测（由服务侧决定不采信）: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|o| o.site_id == 2 && o.ok),
+        "成功尝试要上报延迟: {seen:?}"
+    );
 }

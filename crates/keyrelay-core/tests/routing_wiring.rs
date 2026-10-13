@@ -34,7 +34,7 @@ fn build_route_table_maps_every_field() {
         latency_ms: Some(180),
         key_ref: "kr/key/42/secret".to_string(),
     };
-    let table = build_route_table(&[f.clone()]);
+    let table = build_route_table(std::slice::from_ref(&f));
     let up = table.preferred().expect("非空表应有首选");
 
     assert_eq!(up.site_id, f.site_id);
