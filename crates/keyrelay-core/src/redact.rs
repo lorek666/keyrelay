@@ -374,14 +374,89 @@ fn mask_whole_url_userinfo(value: &str) -> String {
     }
 }
 
-/// 结构化载荷里每个「整个值就是 URL」的字符串过 [`mask_whole_url_userinfo`]（递归进容器）。
+/// **值内任意位置**的 `scheme://user:pass@host` ⇒ 把 userinfo 换成 [`MASK`]。
+///
+/// 与 [`mask_url_userinfo`]（文本层）的关键差别：authority 的终止符**只有**
+/// `/` `?` `#` 与**值结尾**——密码里的引号、反斜杠、空白、尖括号、反引号**都算在
+/// authority 之内**。这正是文本层做不到的那一角：
+///
+/// ```text
+/// 值：见 https://alice:p"w@hook.example.com/x 已失效
+/// 文本层：authority 在 `\` 处被截断 ⇒ 找不到 `@` ⇒ 原样放行（两层全漏）
+/// 本函数：authority 一路读到 `/` ⇒ 掩成 https://***@hook.example.com/x
+/// ```
+///
+/// scheme 判定是**往前回溯**的：`://` 前面那几个字符才是 scheme（`见 https` 这种
+/// 「前缀文本 + scheme」必须认出来，否则句内 URL 永远掩不到——第一版就栽在这里）。
+///
+/// **代价（明确记录）**：不校验 `://` 后面是不是真的一个 authority。一句正常的话里
+/// 出现 `foo://bar@baz` 也会被掩成 `foo://***@baz`。方向取「宁可多掩」——
+/// 它只影响**显示**，而漏一个密码的代价是不可撤销的。
+///
+/// 幂等：掩出来的 `***@host` 再跑一遍，`@` 仍在 authority 内 ⇒ 结果不变。
+fn mask_any_url_userinfo(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(pos) = rest.find("://") {
+        // scheme 从 `://` 往前回溯：只认「紧贴 `://` 的那一段 scheme 字符」。
+        // 前面还有别的字符（`见 https`）时，那些字符属于**正文**，原样留在 `out` 里。
+        let mut scheme_start = pos;
+        while scheme_start > 0 {
+            let c = rest[..scheme_start]
+                .chars()
+                .next_back()
+                .expect("scheme_start > 0 ⇒ 前面有字符");
+            if c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.') {
+                scheme_start -= c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let scheme = &rest[scheme_start..pos];
+        let is_scheme = !scheme.is_empty()
+            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+
+        if !is_scheme {
+            // 不是 scheme：把 `://` 原样吐出，从它之后继续找（`a1://b://c@d` 要能掩到第二个）
+            let skip = pos + "://".len();
+            out.push_str(&rest[..skip]);
+            rest = &rest[skip..];
+            continue;
+        }
+
+        let authority_start = pos + "://".len();
+        // scheme 之前的正文原样保留
+        out.push_str(&rest[..scheme_start]);
+        out.push_str(&rest[scheme_start..authority_start]);
+        let tail = &rest[authority_start..];
+        let authority_end = tail.find(['/', '?', '#']).unwrap_or(tail.len());
+        let authority = &tail[..authority_end];
+        match authority.rfind('@') {
+            Some(at) => {
+                out.push_str(MASK);
+                out.push_str(&authority[at..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &tail[authority_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 结构化载荷里每个字符串值过 [`mask_any_url_userinfo`]（递归进容器）。
 ///
 /// 给**事件写入口**用（`observability::event_with_payload`）：那里随后对序列化文本做的
-/// [`scrub`] 只能按文本规则猜 authority 的边界，带引号的密码会漏（独立复审 P2-1）。
+/// [`scrub`] 只能按文本规则猜 authority 的边界，带引号的密码会漏（独立复审 P2-1）；
+/// M8-S3 的 A-13 又实测出**句内** URL（`"见 https://alice:p\"w@h/x 已失效"`）两层全漏——
+/// 因为文本层把 `\` 当 authority 终止符，而这个函数不把 `\` 当终止符。
 /// 不按键名打码——那是导出侧 [`scrub_payload`] 的契约，写入口不改变它。
 pub fn mask_url_userinfo_in_json(value: &mut serde_json::Value) {
     match value {
-        serde_json::Value::String(text) => *text = mask_whole_url_userinfo(text),
+        serde_json::Value::String(text) => *text = mask_any_url_userinfo(text),
         serde_json::Value::Array(items) => items.iter_mut().for_each(mask_url_userinfo_in_json),
         serde_json::Value::Object(map) => map.values_mut().for_each(mask_url_userinfo_in_json),
         _ => {}
@@ -801,6 +876,94 @@ mod tests {
     fn strip_url_userinfo_is_idempotent() {
         let once = strip_url_userinfo("https://user:pass@relay.example.com/x");
         assert_eq!(strip_url_userinfo(&once), once);
+    }
+
+    // ---------- mask_url_userinfo_in_json：结构化层（M8-S3 独立复审 P1-3） ----------
+
+    /// 把字符串包成 JSON 值过一遍结构化层，取出结果。
+    fn json_masked(text: &str) -> String {
+        let mut value = serde_json::Value::String(text.to_string());
+        mask_url_userinfo_in_json(&mut value);
+        value.as_str().expect("仍是字符串").to_string()
+    }
+
+    #[test]
+    fn json_layer_masks_an_embedded_url_with_an_escaped_password() {
+        // 复审 P1-3 的最小反例：URL 不在值的开头 + 密码含引号。
+        // 修前两层全漏（结构化层要求「整个值是 URL」，文本层把 `\` 当终止符）。
+        assert_eq!(
+            json_masked("见 https://alice:p\"w@hook.example.com/x 已失效"),
+            "见 https://***@hook.example.com/x 已失效"
+        );
+    }
+
+    #[test]
+    fn json_layer_masks_passwords_holding_text_layer_terminators() {
+        // 文本层的 authority 止于 `"` `\` 空白 `<` `>` 反引号；结构化层一路读到 `/` `?` `#`
+        for password in ["p\"w", "p\\\\w", "p w", "p<w", "p>w", "p`w"] {
+            let input = format!("站 https://alice:{password}@hook.example.com/x 挂了");
+            let masked = json_masked(&input);
+            assert!(
+                !masked.contains(password),
+                "密码 {password:?} 漏了: {masked}"
+            );
+            assert!(!masked.contains("alice"), "用户名漏了: {masked}");
+            assert!(masked.contains("hook.example.com"), "主机要留着: {masked}");
+        }
+    }
+
+    #[test]
+    fn json_layer_masks_a_whole_value_url_too() {
+        // 原来的形态也不能退步：整个值就是 URL 时照样掩
+        assert_eq!(
+            json_masked("https://alice:pw@hook.example.com/x"),
+            "https://***@hook.example.com/x"
+        );
+    }
+
+    #[test]
+    fn json_layer_leaves_text_without_userinfo_untouched() {
+        for clean in [
+            "正常一句话，没有 URL",
+            "https://relay.example.com/v1/chat?x=1#frag",
+            "a1://b://c@d 两个冒号",
+            "",
+            // `@` 在 query / fragment 里，不是 userinfo（与 strip_url_userinfo 同口径）
+            "https://relay.example.com/v1?email=a@b.com",
+        ] {
+            assert_eq!(json_masked(clean), clean, "「{clean}」不该被改动");
+        }
+        // 只有用户名、没有密码的 userinfo **也要掩**（与 `strip_url_userinfo` 的
+        // `https://token@host` 口径一致：`@` 之前的一律算 userinfo）
+        assert_eq!(
+            json_masked("详见 https://bob@relay.example.com/y 无密码"),
+            "详见 https://***@relay.example.com/y 无密码"
+        );
+    }
+
+    #[test]
+    fn json_layer_is_idempotent() {
+        let input = "见 https://alice:p\"w@hook.example.com/x 已失效";
+        let once = json_masked(input);
+        assert_eq!(json_masked(&once), once, "结构化层必须幂等");
+    }
+
+    #[test]
+    fn json_layer_recurses_into_containers() {
+        let mut value = serde_json::json!({
+            "title": "见 https://alice:p\"w@h.example.com/x",
+            "nested": {"list": ["https://bob:pw@h.example.com/y"]},
+            "count": 7,
+            "flag": true,
+        });
+        mask_url_userinfo_in_json(&mut value);
+        let text = serde_json::to_string(&value).expect("可序列化");
+        assert!(!text.contains("alice"), "{text}");
+        assert!(!text.contains("bob"), "{text}");
+        assert!(text.contains("h.example.com"), "{text}");
+        // 数字与布尔不参与（不是字符串）
+        assert!(text.contains("\"count\":7"), "{text}");
+        assert!(text.contains("\"flag\":true"), "{text}");
     }
 
     // ---------- scrub：文本里的 URL userinfo（B-63 的出口那一半） ----------

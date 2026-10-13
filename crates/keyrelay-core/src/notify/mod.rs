@@ -23,10 +23,14 @@
 //! `evaluate` 与派发由 M6-S5 挂进 `refresh_all`（章程 §4.5）。本模块不依赖 `store` /
 //! `service` / `settings`：通知渠道不该有落库能力，也不该被设置模型绑住（章程 §5.2 的中间态）。
 
+pub mod baseline;
+pub mod models;
 pub mod rules;
 pub mod system;
 pub mod webhook;
 
+pub use baseline::{decode_snapshot, encode_snapshot, BASELINE_MAX_AGE_SECS, BASELINE_SETTING_KEY};
+pub use models::{merge_models, should_collect_models, ModelsPolicy};
 pub use rules::{
     evaluate, BalanceSnapshot, DriftFact, RotationDueFact, SiteSnapshot, Snapshot,
     USAGE_SPIKE_MIN_DELTA, USAGE_SPIKE_RATIO,

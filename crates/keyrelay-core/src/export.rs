@@ -117,19 +117,30 @@ pub fn to_json(bundle: &ExportBundle) -> Result<String> {
 /// `to_json` 是明文导出与加密导出**共同的唯一出口**（`encrypt` 内部也调它），
 /// 钉在这里等于「默认安全」—— 任何调用方都绕不过去，将来新增导出入口也不会忘记脱敏。
 ///
-/// 三处（对应 BACKLOG 的三条）：
+/// 四处（前三处对应 BACKLOG 的 B-62 / B-63；第四处是 M8-S3 验收矩阵 A-3 实测发现的缺口）：
 /// - `sites[].base_url`：剥掉 userinfo（`https://user:pass@host` → `https://host`，B-63）；
+/// - `sites[].display_name`：`scrub`（**用户可控自由文本**——站点名可以取成
+///   `sk-0123…`，此前它原样进导出包，A-3 的四出口扫描就是这么抓到的）；
 /// - `events[].message`：`scrub` + 钥匙串引用脱敏（B-62）；
 /// - `events[].payload`：按键名结构化脱敏 + 引用脱敏（B-62）。
 ///
 /// `service::export_bundle` 已经在拼装时对 message/payload 调过一次 `scrub`，
 /// 这里**再调一次是刻意的**：`scrub` 幂等，代价是一次多余扫描，换来的是
 /// 「脱敏不依赖调用方记性」。
+///
+/// # 「对干净包是恒等变换」的已知例外
+///
+/// `scrub` 的规则是**形态匹配**（`sk-` / `nap-` / `Bearer ` / ≥32 位 hex），
+/// 因此一个**合法但恰好长得像密钥**的站点名（例如用户把某段哈希粘进去当备注）
+/// 也会被掩成 `***`。导出物是给人看的，这个方向（宁可多掩）可接受；
+/// `sanitize_is_a_no_op_for_a_clean_bundle` 用的夹具名不含这类形态，所以它仍然绿。
 pub fn sanitize_bundle(bundle: &ExportBundle) -> ExportBundle {
     let mut sanitized = bundle.clone();
 
     for site in &mut sanitized.sites {
         site.base_url = crate::redact::strip_url_userinfo(&site.base_url);
+        // 显示名是用户自己填的：它长得像密钥时就该被掩掉（与 events 同一条规则）
+        site.display_name = crate::redact::scrub(&site.display_name);
     }
 
     for event in &mut sanitized.events {
@@ -413,6 +424,22 @@ mod tests {
         assert_eq!(
             to_json(&bundle).unwrap(),
             serde_json::to_string_pretty(&bundle).unwrap()
+        );
+    }
+
+    #[test]
+    fn sanitize_masks_a_secret_shaped_display_name() {
+        // M8-S3 A-3 实测发现的缺口：站点显示名是**用户可控自由文本**，
+        // 此前的 `sanitize_bundle` 只掩 base_url 与 events，显示名原样进导出包。
+        let mut bundle = sample();
+        bundle.sites[0].display_name = "sk-0123456789abcdef".into();
+
+        let once = sanitize_bundle(&bundle);
+        assert_eq!(once.sites[0].display_name, "sk-***");
+        assert_eq!(sanitize_bundle(&once), once, "脱敏必须幂等");
+        assert!(
+            !to_json(&bundle).unwrap().contains("sk-0123456789abcdef"),
+            "导出文本里不得出现密钥形态"
         );
     }
 

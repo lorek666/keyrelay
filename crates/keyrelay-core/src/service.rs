@@ -26,6 +26,8 @@ use crate::site::{
 use crate::store::{ConsentRow, SiteRow, Store};
 use crate::vault::{KeychainVault, Vault};
 
+use futures_util::stream::{self, StreamExt};
+
 /// 服务装配参数。核心层**不读环境变量**，`home` 与 `backup_dir` 一律由壳层传入，
 /// 这样测试可以把它们指向临时目录。
 ///
@@ -622,6 +624,37 @@ struct SiteObservations {
 
 /// 网关失败的内存缓冲上限。见 [`KeyRelayService::gateway_failures`] 的说明。
 pub const MAX_BUFFERED_GATEWAY_FAILURES: usize = 256;
+
+/// 一轮刷新里**同时在途**的站点数上限（M8-S3 §3.4 异议 O-1 的裁决 ①）。
+///
+/// 取 4 的理由：
+/// ① 顺序循环在真实网络下总耗时 ≈ Σ(每站点 RTT × 请求数)：20 站点 × 2 请求 × 300ms ≈ 12s，
+///    正好贴着 PRD 的「20 站点刷新 ≤ 15s」门槛，400ms RTT 就越线；
+/// ② **不设上界**（= 20 并发）会对站点打出 20 个并发会话：容易被限流，失败风暴也更难读；
+/// ③ 4 是「比 1 明显快、比 N 温和」的中间档，且与 M8-S3 §3.2 的 B3 基线口径一致。
+///
+/// **并发只改「在途」，不改「结论顺序」**：`refresh_all` 收齐结果后仍按站点 id 升序
+/// 记账与写事件，所以事件顺序与本改造之前逐字一致。
+pub const MAX_REFRESH_CONCURRENCY: usize = 4;
+
+/// 单个站点的刷新结果（有界并发改造后，循环体被拆成「取事实」与「记账」两半）。
+///
+/// 只为在 `refresh_all` 内部传递，不进任何公开 API。
+struct SiteRefresh {
+    site_id: i64,
+    display_name: String,
+    /// 站点地址：失败事件的 payload 要带它（走 `event_with_payload` 的脱敏入口）。
+    base_url: String,
+    /// 这一轮**有没有会话**。`false` ⇒ 不联网、不计成功也不计失败（纯本地判定）。
+    had_session: bool,
+    /// 没有会话时：上一轮是否已判过「需要重新登录」（`health == needs_login`）。
+    needs_login_without_session: bool,
+    /// 有会话时的两项结果（`had_session == false` 时为 `None`）。
+    balance: Option<Result<Balance>>,
+    keys: Option<Result<Vec<KeyMeta>>>,
+    drift: Vec<crate::notify::DriftFact>,
+    rotation_due: Vec<crate::notify::RotationDueFact>,
+}
 
 /// 往缓冲里放一条，满了丢**最旧**的一条。
 ///
@@ -1357,6 +1390,58 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         Ok(())
     }
 
+    /// 单个站点的刷新**工作单元**（M8-S3 §3.4 裁决 ①：有界并发的执行体）。
+    ///
+    /// 只做「取事实」：会话判定、余额、令牌列表、余额进观测缓存。
+    /// **记账、事件与快照留在调用方**——那样日志顺序仍按站点 id 升序，与本改造之前逐字一致。
+    /// 单元内部**不上抛**任何错误：结果原样带回给调用方分类（单站点失败不中断整轮）。
+    async fn refresh_site(
+        &self,
+        site: SiteRow,
+        drift: Vec<crate::notify::DriftFact>,
+        rotation_due: Vec<crate::notify::RotationDueFact>,
+    ) -> SiteRefresh {
+        // 没有会话：要么用户从没登录过它（跳过），要么上一轮已判过「需要重新登录」
+        // ——后者必须每轮都带出来，且**不发任何请求**（纯本地判定）。
+        if self.sessions.get(site.id).is_none() {
+            return SiteRefresh {
+                needs_login_without_session: site.health == HEALTH_NEEDS_LOGIN,
+                site_id: site.id,
+                display_name: site.display_name,
+                base_url: site.base_url,
+                had_session: false,
+                balance: None,
+                keys: None,
+                drift,
+                rotation_due,
+            };
+        }
+
+        let balance = self.balance(site.id).await;
+        // M8-S1 §5.1：余额进**观测缓存**（供路由表排序用）。
+        // `known == false` ⇒ `None`——绝不 `unwrap_or(0.0)`：那会把「不知道」
+        // 变成「已耗尽」，直接改变候选顺序（`health_rank` 的档位就是为这件事存在的）。
+        if let Ok(b) = &balance {
+            if let Ok(mut map) = self.site_facts.lock() {
+                map.entry(site.id).or_default().balance_usd =
+                    if b.known { Some(b.remaining) } else { None };
+            }
+        }
+        let keys = self.list_keys(site.id).await;
+
+        SiteRefresh {
+            needs_login_without_session: false,
+            site_id: site.id,
+            display_name: site.display_name,
+            base_url: site.base_url,
+            had_session: true,
+            balance: Some(balance),
+            keys: Some(keys),
+            drift,
+            rotation_due,
+        }
+    }
+
     /// 刷新全部**已登录**站点的余额与密钥数。
     ///
     /// 单个站点失败**不中断**其余站点：把失败计数与原因分类写进事件，
@@ -1365,6 +1450,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 会话失效的站点（无会话 + `health == "needs_login"`）不联网、不计成功也不计失败，
     /// 但每轮都会出现在 [`RefreshSummary::needs_login`] 里——否则用户在界面上永远
     /// 看不到「这个站需要重新登录」（B-61）。
+    ///
+    /// **并发布局**（M8-S3 §3.4 裁决 ①）：站点之间**有界并发**
+    /// （[`MAX_REFRESH_CONCURRENCY`] 个在途），站点内部仍是顺序的两步
+    /// （余额 → 令牌）。收齐结果后按 id 升序记账，所以事件顺序与快照顺序不随并发漂移。
     pub async fn refresh_all(&self) -> Result<RefreshSummary> {
         // 先把网关攒下的失败落库（FR-5:160）。放在最前面：它们是**已经发生过**的事实，
         // 而下面的刷新要跑网络；先落库能让「网关为什么切换了上游」在事件面板里
@@ -1391,17 +1480,33 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let rotation_by_site =
             self.collect_notify_input("轮换到期", || self.rotation_facts_by_site());
 
-        for site in sites {
+        // 站点之间**有界并发**（M8-S3 §3.4 裁决 ①）：最多 `MAX_REFRESH_CONCURRENCY` 个在途。
+        // 用 `buffer_unordered` 而不是 `spawn`：工作单元借用 `&self`（`Store` 不是 `Clone`，
+        // 也不值得为一次刷新引入任务调度），而 `spawn` 要求 `'static`。
+        let mut outcomes: Vec<SiteRefresh> = stream::iter(sites)
+            .map(|site| {
+                let drift = drift_by_site.get(&site.id).cloned().unwrap_or_default();
+                let rotation_due = rotation_by_site.get(&site.id).cloned().unwrap_or_default();
+                async move { self.refresh_site(site, drift, rotation_due).await }
+            })
+            .buffer_unordered(MAX_REFRESH_CONCURRENCY)
+            .collect()
+            .await;
+        // 完成顺序 ≠ 站点顺序：先恢复确定性再记账。
+        // 下面的事件与快照都依赖「按 id 升序」——否则同一轮刷新的事件顺序会随网络抖动变化。
+        outcomes.sort_by_key(|outcome| outcome.site_id);
+
+        for outcome in outcomes {
             // 没有会话：要么用户从没登录过它（跳过），要么上一轮已判过「需要重新登录」
             // ——后者必须每轮都带出来，且不发任何请求（纯本地判定）。
-            if self.sessions.get(site.id).is_none() {
-                let needs_login = site.health == HEALTH_NEEDS_LOGIN;
+            if !outcome.had_session {
+                let needs_login = outcome.needs_login_without_session;
                 if needs_login {
-                    summary.needs_login.push(site.id);
+                    summary.needs_login.push(outcome.site_id);
                 }
                 snapshots.push(crate::notify::SiteSnapshot {
-                    site_id: site.id,
-                    display_name: site.display_name.clone(),
+                    site_id: outcome.site_id,
+                    display_name: outcome.display_name,
                     balance: None,
                     needs_login,
                     quota_exceeded: false,
@@ -1409,38 +1514,32 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                     // 漂移与轮换到期都**不依赖会话**（前者由投递绑定推出、后者只看本地密钥
                     // 的创建时间），所以「没会话」这个分支同样要带上——否则用户在一个会话
                     // 失效的站点上反而看不到「这个站点的密钥该换了」。
-                    drift: drift_by_site.get(&site.id).cloned().unwrap_or_default(),
-                    rotation_due: rotation_by_site.get(&site.id).cloned().unwrap_or_default(),
+                    drift: outcome.drift,
+                    rotation_due: outcome.rotation_due,
                 });
                 continue;
             }
 
-            let balance = self.balance(site.id).await;
-            // M8-S1 §5.1：余额进**观测缓存**（供路由表排序用）。
-            // `known == false` ⇒ `None`——绝不 `unwrap_or(0.0)`：那会把「不知道」
-            // 变成「已耗尽」，直接改变候选顺序（`health_rank` 的档位就是为这件事存在的）。
-            if let Ok(b) = &balance {
-                if let Ok(mut map) = self.site_facts.lock() {
-                    map.entry(site.id).or_default().balance_usd =
-                        if b.known { Some(b.remaining) } else { None };
-                }
-            }
-            let keys = self.list_keys(site.id).await;
+            let balance = outcome.balance;
+            let keys = outcome.keys;
             let mut quota_exceeded = false;
 
             match (&balance, &keys) {
-                (Ok(_), Ok(list)) => {
+                (Some(Ok(_)), Some(Ok(list))) => {
                     summary.sites_ok += 1;
                     summary.keys_total += list.len();
                 }
                 _ => {
                     summary.sites_failed += 1;
-                    let failure = balance.as_ref().err().or_else(|| keys.as_ref().err());
+                    let failure = balance
+                        .as_ref()
+                        .and_then(|result| result.as_ref().err())
+                        .or_else(|| keys.as_ref().and_then(|result| result.as_ref().err()));
                     let reason = failure.map(error_kind).unwrap_or("未知");
                     // 认证失败 = 会话已失效：`on_auth_error` 已经把它落库，
                     // 这里再带进本轮汇总，用户当场就能看到。
                     if failure.is_some_and(is_auth_failure) {
-                        summary.needs_login.push(site.id);
+                        summary.needs_login.push(outcome.site_id);
                     }
                     // 额度耗尽（HTTP 403 + 已知错误码）是**独立**于会话失效的一种状态：
                     // 会话是好的，只是没钱了。分开判定，否则用户会去重新登录一个
@@ -1450,16 +1549,16 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                         Level::Warn,
                         "site",
                         format!("刷新站点失败: {reason}"),
-                        serde_json::json!({ "site_id": site.id, "base_url": site.base_url }),
+                        serde_json::json!({ "site_id": outcome.site_id, "base_url": outcome.base_url }),
                     ));
                 }
             }
 
-            if let Ok(balance) = &balance {
+            if let Some(Ok(balance)) = &balance {
                 if settings.balance_alert_threshold > 0.0
                     && balance.remaining < settings.balance_alert_threshold
                 {
-                    summary.balance_alerts.push(site.id);
+                    summary.balance_alerts.push(outcome.site_id);
                     self.log(observability::event_with_payload(
                         Level::Warn,
                         "site",
@@ -1468,8 +1567,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                             balance.remaining, balance.currency, settings.balance_alert_threshold
                         ),
                         serde_json::json!({
-                            "site_id": site.id,
-                            "base_url": site.base_url,
+                            "site_id": outcome.site_id,
+                            "base_url": outcome.base_url,
                             "remaining": balance.remaining,
                         }),
                     ));
@@ -1477,11 +1576,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             }
 
             snapshots.push(crate::notify::SiteSnapshot {
-                site_id: site.id,
-                display_name: site.display_name.clone(),
+                site_id: outcome.site_id,
+                display_name: outcome.display_name,
                 balance: balance
                     .as_ref()
-                    .ok()
+                    .and_then(|result| result.as_ref().ok())
                     // 硬要求 (b)（M7-S2 复审 S-2）：**未知余额不进快照**。
                     //
                     // `BalanceSnapshot` 只有 `remaining: f64`，装不下「不知道」；
@@ -1498,14 +1597,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                         used: b.used,
                         currency: b.currency.clone(),
                     }),
-                needs_login: summary.needs_login.contains(&site.id),
+                needs_login: summary.needs_login.contains(&outcome.site_id),
                 quota_exceeded,
                 // `models` 本轮不取：拿模型列表要先用某把 key 调 `/v1/models`，
                 // 那是「每个站点每轮一次额外的带密钥请求」。见 spec §6 的
                 // `ModelsChanged` 未接线说明（已登记为**有意取舍**，见 BACKLOG B-80）。
                 models: None,
-                drift: drift_by_site.get(&site.id).cloned().unwrap_or_default(),
-                rotation_due: rotation_by_site.get(&site.id).cloned().unwrap_or_default(),
+                drift: outcome.drift,
+                rotation_due: outcome.rotation_due,
             });
         }
 
