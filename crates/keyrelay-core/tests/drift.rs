@@ -55,9 +55,17 @@ fn setup() -> Fixture {
     }
 }
 
+/// Continue 的条目必须有模型名（Continue 的 schema 必填；KeyRelay 不编造默认模型），
+/// 其余通道不需要。对 `ALL` 循环的用例统一从这里取。
+fn model_for(channel: DeliveryChannel) -> Option<&'static str> {
+    (channel == DeliveryChannel::Continue).then_some("gpt-4o")
+}
+
 fn deliver(f: &Fixture, channel: DeliveryChannel) -> PathBuf {
     f.service.grant_consent(f.key_id, channel).unwrap();
-    f.service.apply_delivery(f.key_id, channel).unwrap();
+    f.service
+        .apply_delivery_with_model(f.key_id, channel, model_for(channel))
+        .unwrap();
     f.service
         .delivery_plan(f.key_id, channel)
         .unwrap()

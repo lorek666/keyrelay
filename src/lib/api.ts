@@ -323,6 +323,8 @@ export type CreateKeyArgs = {
 export type DeliveryArgs = {
   keyId: number;
   channel: string;
+  /** 模型名。Continue 通道必填（留空 = 沿用上次投递写下的）；其余通道不读它。 */
+  model?: string;
 };
 
 const hasTauri =

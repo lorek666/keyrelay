@@ -65,9 +65,13 @@ fn display_name(items: &[Value], url: &str) -> String {
 }
 
 /// 从 URL 里取 host（含端口）。不引入 URL 解析库：本函数只服务于一个显示名。
+///
+/// authority 里的 userinfo（`user:pass@`）删到**最后一个** `@`：显示名会进界面、事件、
+/// 导出与通知正文，而这个形态没有 scheme，出口的 `scrub` 认不出它（B-63）。
 fn host_of(url: &str) -> Option<&str> {
     let rest = url.split_once("://")?.1;
-    let host = rest.split(['/', '?', '#']).next()?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?;
     (!host.is_empty()).then_some(host)
 }
 
@@ -222,5 +226,16 @@ mod tests {
         );
         assert_eq!(host_of("http://127.0.0.1/v1/models"), Some("127.0.0.1"));
         assert_eq!(host_of("not-a-url"), None);
+    }
+
+    #[test]
+    fn host_of_drops_url_userinfo() {
+        // 显示名会进界面、事件、导出与通知正文：`user:pass@` 一个字节都不能带出去
+        assert_eq!(
+            host_of("https://alice:s3cretPW@relay.example.com/v1/models"),
+            Some("relay.example.com")
+        );
+        assert_eq!(host_of("https://a@b:pw@host:8443/"), Some("host:8443"));
+        assert_eq!(host_of("https://alice:pw@/v1/models"), None);
     }
 }

@@ -404,9 +404,11 @@ fn every_channel_produces_a_plan() {
     // 预览不含密钥、且都没同意时投递会被拒。
     let f = setup();
     for channel in DeliveryChannel::ALL {
+        // Continue 的条目必须有模型名（Continue 的 schema 必填），其余通道不需要
+        let model = (channel == DeliveryChannel::Continue).then_some("gpt-4o");
         let plan = f
             .service
-            .delivery_plan(f.key_id, channel)
+            .delivery_plan_with_model(f.key_id, channel, model)
             .unwrap_or_else(|e| panic!("{} 应能生成计划: {e}", channel.as_str()));
 
         assert_eq!(plan.channel, channel);

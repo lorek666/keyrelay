@@ -8,7 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use keyrelay_core::delivery::continue_yaml::{ContinueWriter, BLOCK_BEGIN, BLOCK_END};
-use keyrelay_core::delivery::{resolve_for, DeliveryChannel, DeliveryWriter};
+use keyrelay_core::delivery::opencode::OpenCodeWriter;
+use keyrelay_core::delivery::{resolve_for, resolve_for_binding, DeliveryChannel, DeliveryWriter};
 use keyrelay_core::error::Error;
 use keyrelay_core::inject::sha256_hex;
 
@@ -90,10 +91,23 @@ fn assert_insertion_preserved(label: &str, original: &str, after: &str) {
 
 // ============================================================ 新建
 
+/// 新建文件的逐字节产物。
+///
+/// 两处与 M7-S3 spec §5.3 原文不同，都是**用 Continue 自己的解析器实测**后订正的
+/// （`@continuedev/config-yaml` 1.42.0 的 `parseConfigYaml`）：
+/// - 顶层 `name` / `version` 是必填：缺了报 `name: Required, version: Required`，整份配置拒绝加载；
+/// - 条目的 `model` 是必填：缺了报 `models.0: Invalid input`，用户原有的模型也跟着失效。
 #[test]
 fn creates_the_file_with_the_documented_bytes() {
     let dir = tmp();
-    let plan = resolve_for(DeliveryChannel::Continue, dir.path(), BASE).unwrap();
+    let plan = resolve_for_binding(
+        DeliveryChannel::Continue,
+        dir.path(),
+        BASE,
+        OpenCodeWriter::DEFAULT_PROVIDER_ID,
+        Some(MODEL),
+    )
+    .unwrap();
     assert_eq!(
         plan.target_path(),
         dir.path().join(".continue").join("config.yaml")
@@ -101,27 +115,77 @@ fn creates_the_file_with_the_documented_bytes() {
 
     let patch = plan.plan(SECRET).unwrap();
     assert_eq!(patch.before, "");
-    let expected = "models:\n  # >>> keyrelay managed >>>\n  # 由 KeyRelay 管理；手工修改会在下次投递时被覆盖\n  - name: \"keyrelay\"\n    provider: \"openai\"\n    apiBase: \"https://relay.example.com/v1\"\n    apiKey: \"sk-continue-INT-0123456789abcdef\"\n  # <<< keyrelay managed <<<\n";
-    assert_eq!(patch.after, expected, "新建内容必须与 spec §5.3 逐字相等");
+    let expected = "name: \"KeyRelay\"\nversion: \"1.0.0\"\nmodels:\n  # >>> keyrelay managed >>>\n  # 由 KeyRelay 管理；手工修改会在下次投递时被覆盖\n  - name: \"keyrelay\"\n    provider: \"openai\"\n    model: \"gpt-4o\"\n    apiBase: \"https://relay.example.com/v1\"\n    apiKey: \"sk-continue-INT-0123456789abcdef\"\n  # <<< keyrelay managed <<<\n";
+    assert_eq!(patch.after, expected, "新建内容必须逐字相等");
     assert_eq!(patch.new_file_mode, Some(0o600));
 }
 
+/// 没有模型名就**拒绝写入**：写出一个缺 `model` 的条目会让 Continue 拒绝加载整份配置，
+/// 比不投递更糟；而 KeyRelay 不编造默认模型（M7-S0 章程 §4.2 点 4）。
 #[test]
-fn model_line_appears_only_when_provided() {
+fn refuses_to_write_an_entry_without_a_model() {
     let dir = tmp();
-    let without = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
-    assert!(!without.after.contains("model:"), "{}", without.after);
+    let path = writer(dir.path(), BASE, None).path().to_path_buf();
 
-    let with = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
-    assert!(
-        with.after.contains("    model: \"gpt-4o\"\n"),
-        "{}",
-        with.after
+    // ① 新建：没有任何地方能取到模型名
+    let err = writer(dir.path(), BASE, None).plan(SECRET).unwrap_err();
+    assert!(matches!(err, Error::Inject { .. }), "{err:?}");
+    assert!(err.to_string().contains("模型名"), "{err}");
+    // 纯空白 model 与「没给」等价
+    let err = writer(dir.path(), BASE, Some("   "))
+        .plan(SECRET)
+        .unwrap_err();
+    assert!(err.to_string().contains("模型名"), "{err}");
+
+    // ② 已有 `models:`、还没有受管块：同样拒绝，且磁盘零改动
+    let before =
+        "name: mine\nversion: 1.0.0\nmodels:\n  - name: mine\n    provider: openai\n    model: x\n";
+    fs::write(&path, before).unwrap();
+    let err = writer(dir.path(), BASE, None).plan(SECRET).unwrap_err();
+    assert!(err.to_string().contains("模型名"), "{err}");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        before,
+        "拒绝时磁盘零改动"
     );
+}
 
-    // 纯空白 model 与「没给」等价（不编造默认模型）
-    let blank = writer(dir.path(), BASE, Some("   ")).plan(SECRET).unwrap();
-    assert!(!blank.after.contains("model:"), "{}", blank.after);
+/// 重投 / 轮换（第②步走的是不带模型名的 `apply_delivery`）沿用**块里已有的**模型名。
+#[test]
+fn redelivery_without_a_model_keeps_the_one_already_in_the_block() {
+    let dir = tmp();
+    let path = writer(dir.path(), BASE, Some(MODEL)).path().to_path_buf();
+    let first = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
+    fs::write(&path, &first.after).unwrap();
+
+    let rotated = writer(dir.path(), BASE, None).plan(ROTATED).unwrap();
+    assert!(rotated.after.contains(ROTATED));
+    assert!(
+        rotated.after.contains("    model: \"gpt-4o\"\n"),
+        "{}",
+        rotated.after
+    );
+    assert_outside_unchanged("沿用块内模型名", &first.after, &rotated.after);
+
+    // 显式给了新的模型名 ⇒ 以新的为准
+    let switched = writer(dir.path(), BASE, Some("claude-sonnet"))
+        .plan(SECRET)
+        .unwrap();
+    assert!(switched.after.contains("    model: \"claude-sonnet\"\n"));
+    assert!(!switched.after.contains("gpt-4o"), "{}", switched.after);
+}
+
+/// 块内模型名是本模块自己用双引号渲染的：带引号 / 反斜杠的值必须原样取回（`quote` 的逆）。
+#[test]
+fn model_with_escapes_round_trips_through_the_block() {
+    let dir = tmp();
+    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+    let model = "org/\"quoted\" \\ name";
+    let first = writer(dir.path(), BASE, Some(model)).plan(SECRET).unwrap();
+    fs::write(&path, &first.after).unwrap();
+
+    let again = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
+    assert_eq!(again.after, first.after, "沿用的模型名必须逐字相同");
 }
 
 // ============================================================ 插入 / 替换
@@ -147,16 +211,16 @@ fn zero_indent_list_keeps_zero_indent_and_a_uniform_sequence() {
     // 旧实现要求「缩进 > 0」才沿用，于是给这种文件塞了 2 空格的条目 ⇒ 序列内两种缩进 ⇒
     // 原文 `safe_load` 通过、投递之后 `ParserError: expected <block end>, but found '-'`。
     let dir = tmp();
-    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+    let path = writer(dir.path(), BASE, Some(MODEL)).path().to_path_buf();
     let before = "name: cfg\nmodels:\n- name: \"mine\"\n- name: \"second\"\n";
     fs::write(&path, before).unwrap();
 
-    let patch = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
+    let patch = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
 
     // 块内行首缩进为**空**（与既有条目同缩进）；字段相对条目再缩进两格
     let expected = format!(
         "name: cfg\nmodels:\n{BLOCK_BEGIN}\n# 由 KeyRelay 管理；手工修改会在下次投递时被覆盖\n\
-         - name: \"keyrelay\"\n  provider: \"openai\"\n  apiBase: \"{BASE}\"\n  apiKey: \"{SECRET}\"\n{BLOCK_END}\n\
+         - name: \"keyrelay\"\n  provider: \"openai\"\n  model: \"{MODEL}\"\n  apiBase: \"{BASE}\"\n  apiKey: \"{SECRET}\"\n{BLOCK_END}\n\
          - name: \"mine\"\n- name: \"second\"\n"
     );
     assert_eq!(patch.after, expected, "0 缩进的产物必须逐字如此");
@@ -166,18 +230,18 @@ fn zero_indent_list_keeps_zero_indent_and_a_uniform_sequence() {
 
     // 幂等：二次投递不得产生额外改动
     fs::write(&path, &patch.after).unwrap();
-    let second = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
+    let second = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
     assert_eq!(second.after, patch.after);
 }
 
 #[test]
 fn inserts_after_the_existing_models_key() {
     let dir = tmp();
-    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+    let path = writer(dir.path(), BASE, Some(MODEL)).path().to_path_buf();
     let before = "name: my-config\nversion: 0.0.1\nmodels:\n  - name: mine\n    provider: openai\n";
     fs::write(&path, before).unwrap();
 
-    let patch = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
+    let patch = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
     assert!(
         patch
             .after
@@ -199,11 +263,11 @@ fn inserts_after_the_existing_models_key() {
 #[test]
 fn appends_models_when_the_file_has_none() {
     let dir = tmp();
-    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+    let path = writer(dir.path(), BASE, Some(MODEL)).path().to_path_buf();
     let before = "name: my-config"; // 刻意不以换行结尾
     fs::write(&path, before).unwrap();
 
-    let patch = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
+    let patch = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
     assert!(patch.after.starts_with(before), "{}", patch.after);
     assert!(
         patch.after.contains("\nmodels:\n  # >>>"),
@@ -216,11 +280,11 @@ fn appends_models_when_the_file_has_none() {
 #[test]
 fn replaces_the_block_in_place() {
     let dir = tmp();
-    let path = writer(dir.path(), BASE, None).path().to_path_buf();
-    let first = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
+    let path = writer(dir.path(), BASE, Some(MODEL)).path().to_path_buf();
+    let first = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
     fs::write(&path, &first.after).unwrap();
 
-    let rotated = writer(dir.path(), BASE, None).plan(ROTATED).unwrap();
+    let rotated = writer(dir.path(), BASE, Some(MODEL)).plan(ROTATED).unwrap();
     assert!(rotated.after.contains(ROTATED));
     assert!(!rotated.after.contains(SECRET), "旧密钥必须被替换掉");
     assert_eq!(rotated.after.matches(BLOCK_BEGIN).count(), 1);
@@ -245,7 +309,7 @@ fn is_idempotent() {
 #[test]
 fn outside_the_block_is_byte_identical_with_hostile_surroundings() {
     let dir = tmp();
-    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+    let path = writer(dir.path(), BASE, Some(MODEL)).path().to_path_buf();
 
     // 夹具：块前有中文注释 + emoji + 用户的条目；块后有不以换行结尾的尾巴
     let head = "# 我的配置 🚀\nname: \"my config\"\nmodels:\n  # 下面这条是给我自己用的\n  - name: \"mine\"\n    provider: openai\n";
@@ -255,7 +319,7 @@ fn outside_the_block_is_byte_identical_with_hostile_surroundings() {
     );
     fs::write(&path, &with_block).unwrap();
 
-    let patch = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
+    let patch = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
     assert_outside_unchanged("敌意环境（替换）", &with_block, &patch.after);
     assert!(patch.after.ends_with("# 没有尾随换行"), "{}", patch.after);
     assert!(patch.after.contains("# 我的配置 🚀\n"), "{}", patch.after);
@@ -269,11 +333,11 @@ fn outside_the_block_is_byte_identical_with_hostile_surroundings() {
 #[test]
 fn outside_the_block_is_byte_identical_when_inserting() {
     let dir = tmp();
-    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+    let path = writer(dir.path(), BASE, Some(MODEL)).path().to_path_buf();
     let before = "# 头注释\nmodels:\n  - name: \"mine\"\n    provider: openai\n# 尾注释（无换行）";
     fs::write(&path, before).unwrap();
 
-    let patch = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
+    let patch = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
     let (pre, suf) = outside(&patch.after);
     assert_eq!(pre, "# 头注释\nmodels:\n", "块前必须逐字节相同");
     assert_eq!(
@@ -281,6 +345,77 @@ fn outside_the_block_is_byte_identical_when_inserting() {
         "  - name: \"mine\"\n    provider: openai\n# 尾注释（无换行）"
     );
     assert_eq!(sha256_hex(suf.as_bytes()), sha256_hex(suf.as_bytes()));
+}
+
+/// `models:` 是最后一行且**没有结尾换行**：开始标记不得粘在 `models:` 同一行。
+///
+/// 粘上之后 `locate_block` 只认行首标记，下一次投递就认不出这个块 ⇒ 换 key、同 key 重投、
+/// 轮换第②步全部报「受管块不完整」——而轮换走到这一步时新 key 已经在站点上建好了。
+#[test]
+fn models_as_the_last_line_without_newline_stays_redeliverable() {
+    let dir = tmp();
+    let path = writer(dir.path(), BASE, Some(MODEL)).path().to_path_buf();
+    let before = "name: my-config\nversion: 1.0.0\nmodels:"; // 刻意不以换行结尾
+    fs::write(&path, before).unwrap();
+
+    let first = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
+    assert!(
+        first
+            .after
+            .starts_with(&format!("{before}\n  {BLOCK_BEGIN}\n")),
+        "开始标记必须另起一行:\n{}",
+        first.after
+    );
+    fs::write(&path, &first.after).unwrap();
+
+    let second = writer(dir.path(), BASE, Some(MODEL))
+        .plan(ROTATED)
+        .expect("重投必须认得出上一次写下的块");
+    assert!(second.after.contains(ROTATED));
+    assert!(!second.after.contains(SECRET), "旧密钥必须被替换掉");
+    assert_eq!(second.after.matches(BLOCK_BEGIN).count(), 1);
+    assert_outside_unchanged("EOF 无换行后重投", &first.after, &second.after);
+}
+
+/// 带 BOM 或带引号的 `models` 键必须被认出来——否则会走「追加」分支，
+/// 写出第二个顶层 `models:`（Continue 报 `Map keys must be unique`；
+/// PyYAML 则静默以后一个为准，用户自己的模型被覆盖）。
+#[test]
+fn recognizes_bom_and_quoted_models_keys() {
+    let dir = tmp();
+    let path = writer(dir.path(), BASE, Some(MODEL)).path().to_path_buf();
+    for models_line in [
+        "\u{FEFF}models:",
+        "\"models\":",
+        "'models':",
+        "\"models\" : # 注释",
+    ] {
+        let before = format!("{models_line}\n  - name: mine\n    provider: openai\n");
+        fs::write(&path, &before).unwrap();
+
+        let patch = writer(dir.path(), BASE, Some(MODEL))
+            .plan(SECRET)
+            .unwrap_or_else(|e| panic!("「{models_line}」: {e}"));
+        assert!(
+            !patch.after.contains("\nmodels:"),
+            "「{models_line}」被当成没有 models，追加出了第二个 models 键:\n{}",
+            patch.after
+        );
+        assert!(
+            patch
+                .after
+                .starts_with(&format!("{models_line}\n  {BLOCK_BEGIN}\n")),
+            "块必须紧跟既有的 models 行:\n{}",
+            patch.after
+        );
+        assert!(
+            patch
+                .after
+                .ends_with("  - name: mine\n    provider: openai\n"),
+            "用户条目必须原样保留:\n{}",
+            patch.after
+        );
+    }
 }
 
 // ============================================================ 拒绝面
@@ -346,7 +481,7 @@ fn errors_never_echo_the_key() {
 #[test]
 fn quotes_and_escapes_values() {
     let dir = tmp();
-    let patch = writer(dir.path(), "https://x/a: b #c\"d\\e", None)
+    let patch = writer(dir.path(), "https://x/a: b #c\"d\\e", Some(MODEL))
         .plan(SECRET)
         .unwrap();
     assert!(
@@ -361,11 +496,11 @@ fn quotes_and_escapes_values() {
 #[test]
 fn keeps_the_file_line_ending() {
     let dir = tmp();
-    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+    let path = writer(dir.path(), BASE, Some(MODEL)).path().to_path_buf();
     let before = "models:\r\n  - name: mine\r\n";
     fs::write(&path, before).unwrap();
 
-    let patch = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
+    let patch = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
     assert!(
         patch.after.contains("  # >>> keyrelay managed >>>\r\n"),
         "{:?}",
@@ -394,15 +529,15 @@ fn preview_fields_mask_only_the_key() {
 #[test]
 fn plan_does_not_depend_on_the_process_environment() {
     let dir = tmp();
-    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+    let path = writer(dir.path(), BASE, Some(MODEL)).path().to_path_buf();
     fs::write(&path, "models:\n").unwrap();
 
-    let first = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
+    let first = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
     let saved_home = std::env::var("HOME").ok();
     let saved_override = std::env::var("KEYRELAY_HOME").ok();
     std::env::set_var("HOME", "/tmp/keyrelay-not-this-home");
     std::env::set_var("KEYRELAY_HOME", "/tmp/keyrelay-not-this-home");
-    let second = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
+    let second = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
     match saved_home {
         Some(value) => std::env::set_var("HOME", value),
         None => std::env::remove_var("HOME"),

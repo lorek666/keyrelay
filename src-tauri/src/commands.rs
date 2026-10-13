@@ -378,6 +378,9 @@ pub struct PruneArgs {
 pub struct DeliveryArgs {
     key_id: i64,
     channel: String,
+    /// 模型名（可缺）。Continue 通道必须有：Continue 的 schema 把条目的 `model` 定为必填。
+    /// 只有预览与投递两条命令读它；同意的授予 / 撤销与模型名无关。
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -525,7 +528,7 @@ pub fn delivery_plan(
     let channel = parse_channel(&args.channel)?;
     state
         .service
-        .delivery_plan(args.key_id, channel)
+        .delivery_plan_with_model(args.key_id, channel, args.model.as_deref())
         .map(|plan| {
             let (consent, granted_at, revoked_at) = match plan.consent {
                 ConsentState::Missing => ("missing", None, None),
@@ -627,7 +630,7 @@ pub fn apply_delivery(
     let channel = parse_channel(&args.channel)?;
     state
         .service
-        .apply_delivery(args.key_id, channel)
+        .apply_delivery_with_model(args.key_id, channel, args.model.as_deref())
         .map(|outcome| DeliveryOutcomeDto {
             channel: outcome.channel.as_str().to_string(),
             target_path: outcome.target_path.display().to_string(),
@@ -1663,6 +1666,19 @@ mod tests {
         .expect("解析 DeliveryArgs");
         assert_eq!(args.key_id, 7);
         assert_eq!(args.channel, "codex-auth-json");
+        assert_eq!(args.model, None, "不传 model 的旧调用方必须照常可用");
+    }
+
+    #[test]
+    fn delivery_args_carry_an_optional_model() {
+        // Continue 通道必须带模型名（Continue 的 schema 把条目的 `model` 定为必填）
+        let args: DeliveryArgs = serde_json::from_value(serde_json::json!({
+            "keyId": 7,
+            "channel": "continue",
+            "model": "gpt-4o"
+        }))
+        .expect("解析 DeliveryArgs");
+        assert_eq!(args.model.as_deref(), Some("gpt-4o"));
     }
 
     #[test]

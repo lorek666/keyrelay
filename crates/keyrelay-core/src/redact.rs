@@ -5,6 +5,7 @@
 //! - NewAPI 应用开户密钥：`nap-` 前缀
 //! - 站点 PAT / access_token：32 位以上十六进制串
 //! - HTTP 头：`Authorization: Bearer <token>`、`X-App-Secret: <token>`
+//! - URL 内嵌凭证：`scheme://user:pass@host` 的 userinfo（B-63）
 
 use sha2::{Digest, Sha256};
 
@@ -20,6 +21,7 @@ fn is_token_char(c: char) -> bool {
 ///
 /// 该函数是幂等的：对已脱敏的文本再次调用结果不变。
 pub fn scrub(input: &str) -> String {
+    let input = mask_url_userinfo(input);
     let mut out = String::with_capacity(input.len());
     let bytes: Vec<char> = input.chars().collect();
     let mut i = 0usize;
@@ -263,6 +265,43 @@ pub fn strip_url_userinfo(url: &str) -> String {
     out.push_str(&url[..authority_start]);
     out.push_str(&authority[at + 1..]);
     out.push_str(&rest[authority_end..]);
+    out
+}
+
+/// [`scrub`] 的第一步：**文本里**每个 `scheme://userinfo@host` 的 userinfo 换成 [`MASK`]。
+///
+/// 与 [`strip_url_userinfo`] 的区别：那个函数的输入是**一整个 URL**，这里的输入是
+/// 任意文本（事件文案、序列化后的 payload、错误信息），所以 authority 除了止于
+/// `/` `?` `#`，还止于空白、引号、尖括号、反引号与反斜杠——否则 JSON 里的
+/// `"https://u:p@h"` 会把结尾引号吃进 authority。
+///
+/// 为什么放在 `scrub` 里而不是各调用点（B-63 只剥了导出的 `sites[].base_url`）：
+/// 事件 payload 原样记着 `base_url`，按调用点剥就一定会漏一处；`scrub` 是
+/// 事件 / 通知 / 错误的共同咽喉点。没有 `://` 的形态（`user@host`、邮箱）**不猜**。
+fn mask_url_userinfo(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(pos) = rest.find("://") {
+        let authority_start = pos + "://".len();
+        out.push_str(&rest[..authority_start]);
+        let tail = &rest[authority_start..];
+        let authority_end = tail
+            .find(|c: char| {
+                matches!(c, '/' | '?' | '#' | '"' | '\'' | '<' | '>' | '`' | '\\')
+                    || c.is_whitespace()
+            })
+            .unwrap_or(tail.len());
+        let authority = &tail[..authority_end];
+        match authority.rfind('@') {
+            Some(at) => {
+                out.push_str(MASK);
+                out.push_str(&authority[at..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &tail[authority_end..];
+    }
+    out.push_str(rest);
     out
 }
 
@@ -676,6 +715,55 @@ mod tests {
     fn strip_url_userinfo_is_idempotent() {
         let once = strip_url_userinfo("https://user:pass@relay.example.com/x");
         assert_eq!(strip_url_userinfo(&once), once);
+    }
+
+    // ---------- scrub：文本里的 URL userinfo（B-63 的出口那一半） ----------
+
+    #[test]
+    fn scrub_masks_url_userinfo_inside_text() {
+        assert_eq!(
+            scrub("连接 https://alice:s3cretPW@relay.example.com/v1 失败"),
+            "连接 https://***@relay.example.com/v1 失败"
+        );
+        // 事件 payload 是序列化后的 JSON 文本：authority 到引号为止，结构不能被破坏
+        let payload = r#"{"site_id":1,"base_url":"https://alice:s3cretPW@relay.example.com"}"#;
+        let scrubbed = scrub(payload);
+        assert_eq!(
+            scrubbed,
+            r#"{"site_id":1,"base_url":"https://***@relay.example.com"}"#
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(&scrubbed).is_ok());
+        // 多个 `@` 删到最后一个（与 strip_url_userinfo 同口径：宁可多掩）
+        assert_eq!(scrub("https://a@b:pw@host/x"), "https://***@host/x");
+        // 一段文本里有多个 URL
+        assert_eq!(
+            scrub("a=http://u:p@h1 b=https://h2/p c=ssh://git@h3"),
+            "a=http://***@h1 b=https://h2/p c=ssh://***@h3"
+        );
+        assert!(contains_secret("https://alice:s3cretPW@relay.example.com"));
+    }
+
+    #[test]
+    fn scrub_leaves_urls_without_userinfo_byte_identical() {
+        for clean in [
+            "https://relay.example.com/v1/chat?x=1#frag",
+            // `@` 在 path / query / fragment 里，不是 userinfo
+            "https://host/p@q",
+            "https://host/p?q=a@b",
+            "https://host#a@b",
+            // 没有 `://`：不猜（邮箱、无 scheme 的 `user@host` 一律不动）
+            "mailto:someone@example.com",
+            "someone@example.com",
+            "https://host 与 someone@example.com",
+        ] {
+            assert_eq!(scrub(clean), clean, "「{clean}」不该被改动");
+        }
+    }
+
+    #[test]
+    fn scrub_url_userinfo_is_idempotent() {
+        let once = scrub("见 https://alice:s3cretPW@relay.example.com/v1");
+        assert_eq!(scrub(&once), once);
     }
 
     // ---------- M5-S1：scrub_reference_tokens ----------
