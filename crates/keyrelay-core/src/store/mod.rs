@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::inject::Journal;
 use crate::site::KeyStatus;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// 「已回收」——**本地**密钥生命周期状态（M7-S4 / FR-2）。
 ///
@@ -87,7 +87,10 @@ CREATE TABLE IF NOT EXISTS bindings(
   target_path TEXT NOT NULL,
   managed_json TEXT,
   applied_at INTEGER NOT NULL,
-  journal_id TEXT
+  journal_id TEXT,
+  -- M8-S4：解绑标记（FR-2:115）。**不删行**——漂移追溯与 journals 的溯源靠它存活。
+  -- NULL = 仍然绑定。老库靠 `add_column_if_missing` 补上（见 `migrate()`）。
+  unbound_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS journals(
   id TEXT PRIMARY KEY,
@@ -205,6 +208,36 @@ pub struct BindingDriftRow {
     pub key_id: i64,
 }
 
+/// 一条投递绑定（M8-S4 的解绑与「同时回收」都要按它走）。
+///
+/// 含**已解绑**的行：`also_revoke` 要按「这次解绑之前有哪些绑定」去回收站点侧，
+/// 而解绑本身不删行（§5.1），所以读的时候必须能把两者分开——判据是 `unbound_at`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingRow {
+    pub id: i64,
+    pub agent_id: String,
+    pub key_id: i64,
+    pub target_path: String,
+    pub applied_at: i64,
+    /// `None` = 仍然绑定。
+    pub unbound_at: Option<i64>,
+    /// 该绑定所用密钥所属的站点。
+    pub site_id: i64,
+    /// 站点侧的令牌 id（回收要用它）。
+    pub remote_id: Option<String>,
+}
+
+/// 解绑的返回语义（**逐条**，因为它们都会被 UI 直接念给用户听）：
+/// - `unbound`：本次**新标记**的行数（已解绑过的行不计 ⇒ 幂等，二次调用返回 0）
+/// - `already_unbound`：本次看到但**早已解绑**的行数（用于「本来就是解绑状态」的文案）
+///
+/// 两者之和 = 这次调用**匹配到**的绑定总数。这是一条可断言的恒等式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnbindReport {
+    pub unbound: usize,
+    pub already_unbound: usize,
+}
+
 /// 投递授权行。`fields` 是 JSON 数组，**只有键名**。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsentRow {
@@ -229,6 +262,64 @@ pub struct Store {
     conn: Mutex<Connection>,
     /// 文件库的路径；内存库为 `None`。审计要用它定位 `*.db` / `-wal` / `-shm`。
     path: Option<std::path::PathBuf>,
+}
+
+/// `scheme://user:pass@host/...` 里的 `user:pass@host` 部分（**不含**路径 / query / fragment）。
+///
+/// 返回的是带 userinfo 的整个 authority，而不是只返回 userinfo：被修的历史数据形态是
+/// `display_name == "alice:pw@host.example"`（当时的 `host_of` 把整个 authority 当成了 host）。
+/// 逐字比对整段 ⇒ 零误伤。
+fn authority_of(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    Some(authority.to_string())
+}
+
+/// 从 URL 里取 host[:port]（不含 userinfo、不含路径）。取不到时原样返回。
+fn host_of_url(url: &str) -> String {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    if host.is_empty() {
+        url.to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+/// 表里没有这一列时才 `ALTER TABLE` 加上它。
+///
+/// 为什么不能直接 `ALTER TABLE ... ADD COLUMN`：`migrate()` 每次打开都跑，
+/// 第二次会因 `duplicate column name` 失败。为什么也不能只靠 DDL：
+/// `CREATE TABLE IF NOT EXISTS` 对已存在的表是空操作，加列不会生效（M8-S4 §5.2）。
+fn add_column_if_missing(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| Error::Store(format!("读取表结构失败: {e}")))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| Error::Store(format!("读取表结构失败: {e}")))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::Store(format!("读取表结构失败: {e}")))?;
+    drop(stmt);
+
+    if existing.iter().any(|name| name == column) {
+        return Ok(());
+    }
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+        .map_err(|e| Error::Store(format!("为 {table} 增加 {column} 列失败: {e}")))?;
+    Ok(())
 }
 
 impl Store {
@@ -288,6 +379,14 @@ impl Store {
         // `grant_consent` 会直接报 `no such table`（M1-S4 真实启动时发现）。
         conn.execute_batch(DDL)
             .map_err(|e| Error::Store(format!("建表失败: {e}")))?;
+
+        // **加列必须显式迁移**（M8-S4 §5.2）。DDL 里全是 `CREATE TABLE IF NOT EXISTS`——
+        // 对**已存在**的表它是空操作，所以往建表语句里加一列，老库永远不会有那一列。
+        // 这正是 `keys.status` 那个形态：列在 DDL 里、老库里没有。
+        //
+        // **必须先判存在**：不判的话第二次打开会因 `duplicate column name` 直接失败——
+        // 而 `migrate()` 是每次打开都跑的。
+        add_column_if_missing(&conn, "bindings", "unbound_at", "INTEGER")?;
 
         // 版本号仍然只在升级时写，保留它作为「将来需要非幂等迁移」的锚点。
         if version < SCHEMA_VERSION {
@@ -449,6 +548,150 @@ impl Store {
         )
         .map_err(|e| Error::Store(format!("写入投递绑定失败: {e}")))?;
         Ok(())
+    }
+
+    /// 解绑一个 agent 与它的密钥（FR-2:115）。**默认只解绑不回收**（可恢复）。
+    ///
+    /// **解绑不是删除**：`bindings` 行**保留**，只写 `unbound_at`。
+    /// 删行会连带丢掉 `managed_json` / `journal_id`（回滚要靠它），
+    /// 而 `keys.id` 是漂移追溯链的起点——与 B-82 同一条纪律（M7-S4 spec §6.1 有实测）。
+    ///
+    /// **幂等**：命中已解绑的行时**不刷新时间戳**，只计入 `already_unbound`。
+    /// 刷新时间戳会让「什么时候解绑的」随着重复点击漂移。
+    pub fn unbind_agent(&self, agent_id: &str) -> Result<UnbindReport> {
+        self.unbind_where("agent_id = ?1", &[&agent_id])
+    }
+
+    /// 只解绑**某一个目标文件**上的绑定（同一 agent 可能有多个落点）。
+    pub fn unbind_target(&self, target_path: &str) -> Result<UnbindReport> {
+        self.unbind_where("target_path = ?1", &[&target_path])
+    }
+
+    fn unbind_where(
+        &self,
+        predicate: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Result<UnbindReport> {
+        let conn = self.lock()?;
+        // 先数「早已解绑」的：`UPDATE` 的 `changes()` 只报**真的改了**的行数，
+        // 而用户需要知道「本来就是解绑状态」与「这次才解开」的区别（UI 两种文案）。
+        let already_unbound: usize = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM bindings WHERE {predicate} AND unbound_at IS NOT NULL"
+                ),
+                params,
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| Error::Store(format!("统计解绑记录失败: {e}")))?
+            .max(0) as usize;
+        // 时间戳**内联**成一个整数字面量而不是占位符：谓词里的占位符编号由调用方给，
+        // 再塞一个 `?2` 会让「谓词有几个参数」与「这条语句要几个参数」耦合成一个陷阱
+        // （第一版就是这么写的，实测 `Wrong number of parameters`）。
+        // 值是 `i64`，不来自任何外部输入，拼接是安全的。
+        let unbound = conn
+            .execute(
+                &format!(
+                    "UPDATE bindings SET unbound_at = {} WHERE {predicate} AND unbound_at IS NULL",
+                    now_secs()
+                ),
+                params,
+            )
+            .map_err(|e| Error::Store(format!("写入解绑标记失败: {e}")))?;
+        Ok(UnbindReport {
+            unbound,
+            already_unbound,
+        })
+    }
+
+    /// 一个 agent 的绑定（含已解绑的行——`also_revoke` 要按**当时的**绑定去回收）。
+    pub fn bindings_of_agent(&self, agent_id: &str) -> Result<Vec<BindingRow>> {
+        self.bindings_where("b.agent_id = ?1", &[&agent_id])
+    }
+
+    /// 某一个目标文件上的绑定。
+    pub fn bindings_of_target(&self, target_path: &str) -> Result<Vec<BindingRow>> {
+        self.bindings_where("b.target_path = ?1", &[&target_path])
+    }
+
+    fn bindings_where(
+        &self,
+        predicate: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<BindingRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT b.id, b.agent_id, b.key_id, b.target_path, b.applied_at, b.unbound_at,
+                        k.site_id, k.remote_id
+                 FROM bindings b JOIN keys k ON k.id = b.key_id
+                 WHERE {predicate}
+                 ORDER BY b.id"
+            ))
+            .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
+        let rows = stmt
+            .query_map(params, |row| {
+                Ok(BindingRow {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    key_id: row.get(2)?,
+                    target_path: row.get(3)?,
+                    applied_at: row.get(4)?,
+                    unbound_at: row.get(5)?,
+                    site_id: row.get(6)?,
+                    remote_id: row.get(7)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("查询绑定失败: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("读取绑定行失败: {e}")))
+    }
+
+    /// 把 `sites.display_name` 里**逐字等于该站点 `base_url` 的 userinfo** 的行改写成 host。
+    ///
+    /// M7 版本录入 `https://alice:pw@host` 时，`display_name` 被写成了 `alice:pw@host`
+    /// （`custom_openai::host_of` 当时的形态）。那条数据**已经入库**，而文本级脱敏
+    /// 没有 `://` 抓不到它——所以通知与 webhook 正文会持续带出密码（DEBUG 报告 §1.3 / 复审 P2-4）。
+    ///
+    /// **判据是「逐字等于」而不是「看起来像 URL」**：只有 `display_name` 与从 `base_url`
+    /// 里剥出来的 userinfo 完全一致时才改写，所以**零误伤**——一个用户真的想把显示名
+    /// 取成 `alice:pw@host` 的情形，与这条迁移想修的形态在字节上无法区分，
+    /// 但那种命名本身没有意义，代价可接受。
+    pub fn migrate_display_names_stripping_userinfo(&self) -> Result<usize> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT id, base_url, display_name FROM sites")
+            .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| Error::Store(format!("查询站点失败: {e}")))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("读取站点行失败: {e}")))?;
+        drop(stmt);
+
+        let mut changed = 0usize;
+        for (id, base_url, display_name) in rows {
+            // **判据是「逐字等于带 userinfo 的 authority」**，不是「看起来像 userinfo」。
+            //
+            // 被修的那种形态是 `custom_openai::host_of` 当时产出的：它把整个 authority
+            // 当成了 host，所以 `display_name` 是 `alice:pw@host.example`
+            // （含 `@` 与 host），不是 `alice:pw`。逐字相等 ⇒ 零误伤。
+            let Some(authority) = authority_of(&base_url) else {
+                continue;
+            };
+            if display_name != authority || !authority.contains('@') {
+                continue;
+            }
+            let stripped = crate::redact::strip_url_userinfo(&base_url);
+            let host = host_of_url(&stripped);
+            conn.execute(
+                "UPDATE sites SET display_name = ?1 WHERE id = ?2",
+                rusqlite::params![host, id],
+            )
+            .map_err(|e| Error::Store(format!("改写显示名失败: {e}")))?;
+            changed += 1;
+        }
+        Ok(changed)
     }
 
     /// 还原一个 journal 的条目，供 `rollback_delivery` 重建 `Journal`。
@@ -674,7 +917,10 @@ impl Store {
                 "SELECT b.agent_id, b.target_path, COALESCE(b.journal_id, '') AS journal_id,
                         j.after_sha256, k.site_id, b.key_id
                  FROM bindings b
-                 JOIN (SELECT target_path, MAX(id) AS mid FROM bindings GROUP BY target_path) latest
+                 -- M8-S4：**已解绑的目标不再出现在漂移报告里**。文件已经不属于我们，
+                 -- 继续报「配置已漂移」等于指挥用户去修一个我们不该管的文件。
+                 JOIN (SELECT target_path, MAX(id) AS mid FROM bindings
+                        WHERE unbound_at IS NULL GROUP BY target_path) latest
                    ON b.id = latest.mid
                  JOIN keys k ON k.id = b.key_id
                  LEFT JOIN journals j ON j.id = b.journal_id || ':' || b.target_path
