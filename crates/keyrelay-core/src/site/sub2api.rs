@@ -21,8 +21,9 @@ use serde_json::{json, Value};
 
 use super::transport::{HttpRequest, HttpTransport, Method};
 use super::{
-    json_str, map_http_error, normalize_base_url, scrub_error, Balance, Credentials, GroupInfo,
-    KeyMaterial, KeyMeta, KeySpec, KeyStatus, Session, SiteAdapter, SiteFingerprint, SiteKind,
+    json_str, map_http_error, normalize_base_url, parse_rate, scrub_error, Balance, Credentials,
+    GroupInfo, KeyMaterial, KeyMeta, KeySpec, KeyStatus, Session, SiteAdapter, SiteFingerprint,
+    SiteKind,
 };
 use crate::error::{Error, Result, SecondFactorKind};
 
@@ -366,8 +367,10 @@ fn parse_group_rates(data: &Value) -> Result<Option<HashMap<i64, f64>>> {
     };
     let mut rates: HashMap<i64, f64> = HashMap::with_capacity(map.len());
     for (key, value) in map {
-        // 解析不出分组 id / 值不是数字的条目直接忽略：它们永远匹配不上任何分组。
-        let (Ok(id), Some(rate)) = (key.parse::<i64>(), value.as_f64()) else {
+        // 倍率统一走 `parse_rate`（B-91）：负数 / NaN / ±inf / 非数字 ⇒ `None` ⇒ 该条目**忽略**
+        // （与既有口径一致：匹配不上任何分组的条目直接忽略）；`0` ⇒ `Some(0.0)`，**保留**
+        // （免费分组必须能显示成 0，不能被当成「没有倍率」丢掉）。
+        let (Ok(id), Some(rate)) = (key.parse::<i64>(), parse_rate(value)) else {
             continue;
         };
         rates.insert(id, rate);
