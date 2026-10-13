@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Copy, Play, Square } from "lucide-react";
+import { AlertTriangle, Copy, Play, RefreshCw, Square } from "lucide-react";
 import {
+  gatewayRotateToken,
   gatewayStart,
   gatewayStatus,
   gatewayStop,
@@ -21,8 +22,9 @@ type Props = {
 /**
  * 本地网关卡片。
  *
- * 网关只绑 `127.0.0.1`，并且**必须**带本地令牌——令牌只在启动后显示一次，
- * 用户拿它去配置 agent。站点密钥永远不会离开本机。
+ * 网关只绑 `127.0.0.1`，并且**必须**带本地令牌——令牌在启动后显示给用户配置 agent，
+ * 并**持久化在系统钥匙串**里（M8-S4 §6.4）：不持久化的话每次重启都作废 agent 配置，
+ * 「换站零改动」（FR-5:158）就不成立。站点密钥永远不会离开本机。
  */
 export default function GatewayCard({
   enabled,
@@ -40,6 +42,7 @@ export default function GatewayCard({
   const [keyId, setKeyId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [rotated, setRotated] = useState(false);
 
   const token = status.data?.token ?? "";
 
@@ -90,6 +93,23 @@ export default function GatewayCard({
     onError: (err: Error) => setError(err.message),
   });
 
+  /**
+   * 显式轮换本地令牌（M8-S4 §6.4）。
+   *
+   * 后端把「换令牌 + 重启网关」合成一个动作：只换钥匙串会让运行中的网关与 agent
+   * 配置不一致，只重启等于没轮换。轮换后**旧令牌立即失效** ⇒ 指向网关的通道需要重新投递，
+   * 所以这里必须把这句话说出来（否则用户只会看到 agent 开始 401）。
+   */
+  const rotate = useMutation({
+    mutationFn: () => gatewayRotateToken({ siteId: activeSite!, keyId: activeKey! }),
+    onSuccess: async () => {
+      setError(null);
+      setRotated(true);
+      await qc.invalidateQueries({ queryKey: ["gateway"] });
+    },
+    onError: (err: Error) => setError(err.message),
+  });
+
   const running = status.data?.running ?? false;
 
   return (
@@ -98,7 +118,7 @@ export default function GatewayCard({
       <p className="muted">
         让任何支持 OpenAI 兼容接口的 agent 把 base_url 指向
         <span className="mono"> http://127.0.0.1:{port}/v1 </span>
-        即可——密钥不必写进它们的配置里。只监听回环地址，并且**必须**带下面的本地令牌。
+        即可——密钥不必写进它们的配置里。只监听回环地址，并且必须带下面的本地令牌。
       </p>
 
       <label className="checkline">
@@ -141,14 +161,44 @@ export default function GatewayCard({
             <dd className="mono ellipsis" title={status.data?.token ?? ""}>
               {status.data?.token}
             </dd>
+            <dt>令牌存储</dt>
+            <dd>
+              {status.data?.tokenPersistent ? (
+                <span className="badge badge-ok">已存入系统钥匙串</span>
+              ) : (
+                <span className="badge badge-warn">
+                  临时（钥匙串不可用）——重启后会变
+                </span>
+              )}
+            </dd>
           </dl>
           <p className="muted">
-            把地址与令牌填进 agent 的配置即可。令牌每次启动都会重新生成，
-            不会写进任何文件或日志。
+            把地址与令牌填进 agent 的配置即可；也可以到「Agent 投递」页把通道勾上
+            「指向本地网关」，让 KeyRelay 替你写。
           </p>
+          {status.data?.tokenPersistent ? (
+            <p className="muted">
+              令牌存在系统钥匙串里，<strong>跨重启不变</strong>——所以换站时只要重启网关，
+              agent 侧不用改（它的配置里写的是网关地址与这个令牌）。
+            </p>
+          ) : (
+            <p className="muted">
+              这次用的是<strong>临时令牌</strong>：钥匙串不可用，重启后令牌会变，
+              届时指向网关的通道需要重新投递。已写入 agent 配置的旧令牌会立刻失效。
+            </p>
+          )}
           <div className="row">
             <button type="button" className="btn" onClick={copyToken}>
               <Copy size={14} aria-hidden /> 复制令牌
+            </button>
+            <button
+              type="button"
+              className="btn btn-danger"
+              disabled={rotate.isPending}
+              onClick={() => rotate.mutate()}
+            >
+              <RefreshCw size={14} aria-hidden />{" "}
+              {rotate.isPending ? "轮换中…" : "重新生成令牌"}
             </button>
             {copied ? (
               <span className="muted" role="status">
@@ -157,6 +207,12 @@ export default function GatewayCard({
               </span>
             ) : null}
           </div>
+          {rotated ? (
+            <p className="warnline" role="status">
+              <AlertTriangle size={14} aria-hidden /> 已换新令牌：旧令牌立即失效，
+              指向网关的通道需要重新投递一次，agent 需要重启才能读到新配置。
+            </p>
+          ) : null}
           <button
             type="button"
             className="btn btn-danger"

@@ -85,11 +85,18 @@ export default function Keys() {
 
   const revoke = useMutation({
     mutationFn: () => revokeKey(revoking!.siteId, revoking!.remoteId!, true),
-    onSuccess: async () => {
+    onSuccess: async (report) => {
       setError(null);
+      // B-100：站点侧删掉了（不可逆）与本地记账写上了是**两件事**。本地状态没写上时
+      // 整体仍然是成功——把不可逆的成功报成失败会让用户去重试一次注定失败的删除，
+      // 所以这里说的是「已回收，但本地状态没记上」。
       setNotice(
         `已在站点侧回收「${revoking?.name ?? ""}」。本地记录被标成「已回收」并保留——` +
-          `站点上那把 key 已经没了，这个动作不可逆。`,
+          `站点上那把 key 已经没了，这个动作不可逆。` +
+          (report.localStatusUpdated
+            ? ""
+            : "注意：本地状态没能写上（原因见下），下次对账会再试。") +
+          (report.note ? `\n${report.note}` : ""),
       );
       setRevokeAgreed(false);
       setRevoking(null);

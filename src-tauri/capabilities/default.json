@@ -44,6 +44,8 @@
     "allow-revoke-key",
     "allow-purge-keychain",
     "allow-detect-unmanaged-targets",
-    "allow-suggest-key-name"
+    "allow-suggest-key-name",
+    "allow-unbind-agent",
+    "allow-gateway-rotate-token"
   ]
 }

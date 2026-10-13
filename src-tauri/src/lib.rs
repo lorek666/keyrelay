@@ -92,7 +92,16 @@ fn state_from_store(store: Store, db_path: PathBuf, db_error: Option<String>) ->
 
 /// 测试用：内存钥匙串，绝不触碰用户真实钥匙串与 `~/.keyrelay`。
 fn state_in_memory(store: Store, db_path: PathBuf) -> AppState {
-    let tmp = std::env::temp_dir().join(format!("keyrelay-test-{}", std::process::id()));
+    // **每个 app 一个独立目录**（进程内自增序号）。
+    //
+    // 原先只用 pid：一个测试进程里所有 app 共享同一个 `keyrelay-test-<pid>`，
+    // 于是「另一个测试写进 `exports` / `backups` 的文件」会被本测试的审计扫描到——
+    // `export_diagnostics_writes_a_package_and_registers_it_for_the_audit` 的
+    // 「文件数必须 +1」因此变成一条**看时序**的断言（并发跑时偶发红）。
+    // 隔离目录之后，扫描集合只由本 app 自己写过的东西决定。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let tmp = std::env::temp_dir().join(format!("keyrelay-test-{}-{seq}", std::process::id()));
     state_with_config(store, db_path, None, ServiceConfig::in_memory(tmp))
 }
 
@@ -195,7 +204,10 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::revoke_key,
             commands::purge_keychain,
             commands::detect_unmanaged_targets,
-            commands::suggest_key_name
+            commands::suggest_key_name,
+            // M8-S4：解绑（FR-2:115）、网关令牌轮换（§6.4）
+            commands::unbind_agent,
+            commands::gateway_rotate_token
         ])
 }
 

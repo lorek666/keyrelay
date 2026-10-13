@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, RotateCcw, Send, ShieldCheck, Undo2 } from "lucide-react";
+import { AlertTriangle, RotateCcw, Send, ShieldCheck, Undo2, Unlink } from "lucide-react";
 import {
   applyDelivery,
   deliveryPlan,
@@ -11,9 +11,12 @@ import {
   listSites,
   revokeConsent,
   rollbackDelivery,
+  unbindAgent,
+  type DeliveryMode,
   type DeliveryOutcome,
   type DeliveryPlan,
   type RestartHint,
+  type UnbindOutcome,
 } from "../lib/api";
 import ConfirmDialog from "../components/ConfirmDialog";
 
@@ -64,6 +67,10 @@ export default function Agents() {
   // 这是**输入框显不显示**的界面判断，不是能力判断：要不要、缺了怎么办由后端决定并报错说明。
   // 防抖后再进查询键——每次预览都要读一次钥匙串，不该每敲一个字读一次。
   const needsModel = channel === "continue";
+  // 当前通道所属的 agent（解绑按 agent 做，不是按通道）。
+  // `channel` 只可能来自 `CHANNELS`（初始值与下拉都在其中），所以这里的兜底不可达；
+  // 用空串而不是 `!`：解绑命令对空 agent_id 只会返回 `{0, 0}`（幂等零报告），不会误伤。
+  const activeAgent = CHANNELS.find((c) => c.id === channel)?.agent ?? "";
   const [modelInput, setModelInput] = useState("");
   const [modelTyped, setModelTyped] = useState("");
   useEffect(() => {
@@ -80,6 +87,16 @@ export default function Agents() {
   const [error, setError] = useState<string | null>(null);
   const [lastOutcome, setLastOutcome] = useState<DeliveryOutcome | null>(null);
 
+  // 投递模式（M8-S4 §6.2）：指向站点，还是指向本地网关。
+  // 这是**投递参数**，不是新通道——通道集合不变，只换写进去的那两个值。
+  const [gatewayMode, setGatewayMode] = useState(false);
+  const mode: DeliveryMode = gatewayMode ? "gateway" : "site";
+
+  // 解绑（M8-S4 §5.4）。`alsoRevoke` **默认不勾**：默认路径纯本地、一个站点请求都不发。
+  const [unbinding, setUnbinding] = useState(false);
+  const [alsoRevoke, setAlsoRevoke] = useState(false);
+  const [unbindResult, setUnbindResult] = useState<UnbindOutcome | null>(null);
+
   const consents = useQuery({ queryKey: ["consents"], queryFn: listConsents });
 
   // 未托管落点（Cline / Roo Code）：只读探测，永远不写盘
@@ -90,25 +107,25 @@ export default function Agents() {
   });
 
   const plan = useQuery({
-    queryKey: ["plan", activeKey, channel, model],
-    queryFn: () => deliveryPlan({ keyId: activeKey!, channel, model }),
+    queryKey: ["plan", activeKey, channel, model, mode],
+    queryFn: () => deliveryPlan({ keyId: activeKey!, channel, model, mode }),
     enabled: activeKey !== null,
     retry: false,
   });
 
-  // 切换 key/通道/模型名时，同意勾选必须重置（避免「上次勾过了」的错觉：预览已经变了）
+  // 切换 key/通道/模型名/模式时，同意勾选必须重置（避免「上次勾过了」的错觉：预览已经变了）
   useEffect(() => {
     setAgreeChecked(false);
     setNotice(null);
     setError(null);
-  }, [activeKey, channel, model]);
+  }, [activeKey, channel, model, mode]);
 
   const noChange = plan.data?.preview.trim() === "(无变化)";
 
   const grantAndApply = useMutation({
     mutationFn: async () => {
       await grantConsent({ keyId: activeKey!, channel });
-      return applyDelivery({ keyId: activeKey!, channel, model });
+      return applyDelivery({ keyId: activeKey!, channel, model, mode });
     },
     onSuccess: async (outcome) => {
       setError(null);
@@ -154,6 +171,26 @@ export default function Agents() {
     onError: (err: Error) => {
       setError(err.message);
       setConfirmingRollback(false);
+    },
+  });
+
+  /**
+   * 解绑（M8-S4 §5.4）。结果文案**逐态**给出，四件事互相独立：
+   * 「这次新解开了几条」「本来就是解绑状态」「回收成功几把」「回收失败几把（附原因）」。
+   */
+  const unbind = useMutation({
+    mutationFn: () => unbindAgent(activeAgent, alsoRevoke, alsoRevoke),
+    onSuccess: async (outcome) => {
+      setError(null);
+      setUnbindResult(outcome);
+      setUnbinding(false);
+      await qc.invalidateQueries({ queryKey: ["drift"] });
+      await qc.invalidateQueries({ queryKey: ["events"] });
+      await qc.invalidateQueries({ queryKey: ["stored-keys"] });
+    },
+    onError: (err: Error) => {
+      setError(err.message);
+      setUnbinding(false);
     },
   });
 
@@ -240,6 +277,25 @@ export default function Agents() {
             </label>
           ) : null}
         </div>
+
+        {/*
+          指向本地网关（M8-S4 §6.2）。这是**投递参数**，不是新通道：
+          通道还是那七条，落点一字不变，只把写进去的 base_url 与密钥换成网关的。
+          换站时靠它做到「agent 侧零改动」（FR-5:158）。
+        */}
+        <label className="checkline">
+          <input
+            type="checkbox"
+            checked={gatewayMode}
+            onChange={(e) => setGatewayMode(e.target.checked)}
+          />
+          <span>
+            指向本地网关：写进去的是网关地址（<span className="mono">/v1</span>
+            ）与<strong>本地令牌</strong>，不是站点密钥。之后换站只要重启网关，
+            agent 侧不用改。需要网关正在运行。
+          </span>
+        </label>
+
         {needsModel ? (
           <p className="muted">
             Continue 要求每个模型条目都写明模型名，缺了它整份配置都无法加载。
@@ -374,6 +430,70 @@ export default function Agents() {
         )}
       </div>
 
+      {/*
+        解绑（M8-S4 §5.4 / FR-2:115）。「解绑」不是「删除」：
+        `bindings` 的行是「哪个 agent 曾被哪个 key 写到哪个文件」的唯一记录，
+        删掉它等于同时丢掉漂移追溯与「这把 key 服务过哪些目标」。
+      */}
+      <div className="card">
+        <h3>解绑</h3>
+        <p className="muted">
+          解绑只解除 KeyRelay 与本机 agent 配置的绑定关系，
+          <strong>不会</strong>动站点侧那把 key，也不会删除本地的密钥记录——
+          解绑之后该目标不再出现在「配置漂移」里，历史仍可查。
+        </p>
+        <p className="muted mono">agent = {activeAgent}</p>
+        <button
+          type="button"
+          className="btn btn-danger"
+          disabled={!activeAgent}
+          onClick={() => {
+            setAlsoRevoke(false);
+            setUnbinding(true);
+          }}
+        >
+          <Unlink size={14} aria-hidden /> 解绑 {activeAgent || "该 agent"}
+        </button>
+
+        {unbindResult ? (
+          <div className="okbox" role="status">
+            <p>
+              {unbindResult.unbound > 0
+                ? `本次解绑了 ${unbindResult.unbound} 条绑定。`
+                : "本次没有新解开任何绑定。"}
+              {unbindResult.alreadyUnbound > 0
+                ? `另有 ${unbindResult.alreadyUnbound} 条本来就是解绑状态。`
+                : ""}
+            </p>
+            {unbindResult.revoked.length > 0 ? (
+              <ul className="list">
+                {unbindResult.revoked.map((r) => (
+                  <li key={`${r.siteId}-${r.remoteId ?? "local"}`}>
+                    {r.revoked ? (
+                      <span className="badge badge-ok">已回收</span>
+                    ) : (
+                      <span className="badge badge-warn">回收失败</span>
+                    )}{" "}
+                    <span className="mono">
+                      站点 #{r.siteId} · {r.remoteId ?? "（本地无站点侧 id）"}
+                    </span>
+                    {r.revoked && !r.localStatusUpdated ? (
+                      <div className="muted">
+                        站点侧已删除（不可逆），但本地状态没写上。
+                      </div>
+                    ) : null}
+                    {r.note ? <div className="muted">{r.note}</div> : null}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {unbindResult.note ? (
+              <p className="muted">{unbindResult.note}</p>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+
       <ConfirmDialog
         open={confirming}
         title="确认投递"
@@ -426,6 +546,32 @@ export default function Agents() {
           如需还原内容，请到「变更历史」页回滚。
         </p>
       </ConfirmDialog>
+
+      <ConfirmDialog
+        open={unbinding}
+        title={`解绑 ${activeAgent}`}
+        danger
+        confirmLabel={unbind.isPending ? "处理中…" : "解绑"}
+        onCancel={() => setUnbinding(false)}
+        onConfirm={() => unbind.mutate()}
+      >
+        <p>
+          解绑只解除 KeyRelay 与本机 agent 配置的绑定关系，
+          <strong>不会</strong>动站点侧那把 key。已写入的文件内容保持不变，
+          之后仍可用「变更历史」页回滚那次投递。
+        </p>
+        <label className="checkline">
+          <input
+            type="checkbox"
+            checked={alsoRevoke}
+            onChange={(e) => setAlsoRevoke(e.target.checked)}
+          />
+          <span>
+            同时回收站点侧的这把 key（<strong>不可逆</strong>：站点上删掉就没有了，
+            正在别处使用它的程序会立刻失效）
+          </span>
+        </label>
+      </ConfirmDialog>
     </section>
   );
 }
@@ -471,6 +617,22 @@ function PlanView({
         <dt>目标文件</dt>
         <dd className="mono ellipsis" title={plan.targetPath}>
           {plan.targetPath} {plan.targetExists ? "（已存在）" : "（将新建）"}
+        </dd>
+        {/* 模式必须显式说出来（M8-S4 §6.6）：两种模式的字段名一模一样
+            （`apiKey` / `apiBase`），不说用户分不清写进去的是站点密钥还是本地令牌。 */}
+        <dt>写入的是</dt>
+        <dd>
+          {plan.mode === "gateway" ? (
+            <span className="badge badge-warn">
+              本地网关令牌（不是站点密钥）
+            </span>
+          ) : plan.mode === "site" ? (
+            <span className="badge badge-ok">站点密钥</span>
+          ) : (
+            <span className="badge badge-warn">
+              未知的投递模式：{plan.mode}
+            </span>
+          )}
         </dd>
         <dt>将写入</dt>
         <dd>

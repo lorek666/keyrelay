@@ -218,7 +218,12 @@ pub struct GatewayConfig {
     /// 转发目标（站点根，无尾斜杠）。`route` 为空时**只**用它。
     pub base_url: String,
     /// 站点密钥（从钥匙串取）。`route` 为空时**只**用它。
-    pub api_key: String,
+    ///
+    /// `Zeroizing`：`GatewayConfig` 在每请求里被 clone（与 `keys_by_ref` 同一个理由）。
+    /// M8-S1 章程 §3.5 第 13 行记的就是这里——`keys_by_ref` 那条路径已经是 `Zeroizing`，
+    /// 而单上游这条还是裸 `String`，于是 `service.rs` 那一次 `.to_string()` 产生的副本
+    /// 没有清零保护。M8-S4 收口：类型换成 `Zeroizing`，那个裸副本在类型上就不存在了。
+    pub api_key: Zeroizing<String>,
     pub site_display_name: String,
     /// 多上游路由表（M7-S1）。**空表 ⇒ 转发行为与单上游时代逐字节相同**。
     pub route: RouteTable,
@@ -335,7 +340,7 @@ impl GatewayConfig {
         port: u16,
         token: String,
         base_url: String,
-        api_key: String,
+        api_key: Zeroizing<String>,
         site_display_name: String,
     ) -> Self {
         Self {
@@ -1081,7 +1086,7 @@ mod tests {
             8787,
             "kr-gw-SECRET-TOKEN".into(),
             "https://relay.example.com".into(),
-            "sk-SECRET-KEY".into(),
+            Zeroizing::new("sk-SECRET-KEY".to_string()),
             "测试站".into(),
         );
         let text = format!("{config:?}");
@@ -1098,7 +1103,7 @@ mod tests {
             8787,
             "kr-gw-token".into(),
             "https://relay.example.com".into(),
-            "sk-legacy-key".into(),
+            Zeroizing::new("sk-legacy-key".to_string()),
             "测试站".into(),
         );
         config.keys_by_ref.insert(
@@ -1272,7 +1277,7 @@ mod tests {
             0,
             "t".into(),
             "https://x".into(),
-            "k".into(),
+            Zeroizing::new("k".to_string()),
             "s".into(),
         );
         assert!(start(GatewayConfig {
@@ -1297,7 +1302,7 @@ mod tests {
             port,
             "kr-gw-unit-test-token".into(),
             "http://127.0.0.1:1".into(),
-            "sk-unit-test".into(),
+            Zeroizing::new("sk-unit-test".to_string()),
             "单测站点".into(),
         )
     }

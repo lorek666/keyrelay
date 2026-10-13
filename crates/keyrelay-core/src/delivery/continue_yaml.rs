@@ -15,9 +15,14 @@
 //!
 //! # 块外字节不变的保证
 //!
-//! 只有三处拼接（新建 / 原地替换 / 插入），每处都只做「切两刀 + 塞一段」：
-//! 块区间之外的两段原样搬运，因此「块外逐字节不变」是**构造性**的，而不是靠自觉。
-//! 集成测试对块外前后缀做**逐字节比对 + sha256**（spec §5.6）。
+//! 只有四处拼接（新建 / 原地替换 / 插入到 `models:` 之下 / 空 flow 序列规范化），
+//! 每处都只做「切两刀 + 塞一段」：块区间之外的两段原样搬运，因此「块外逐字节不变」是
+//! **构造性**的，而不是靠自觉。集成测试对块外前后缀做**逐字节比对 + sha256**（spec §5.6）。
+//!
+//! 唯一一处例外是 `models: []`（§9-10 / §13 D-4）：那一行的 `[]` 这一个 token 会被抹掉
+//! （`[` 与 `]` 之间的空白属于同一个 token，一并抹掉），**其余字节逐字节不变**，
+//! 注释留在原位。空序列没有条目 ⇒ 信息损失为 0；不这么做，Continue 自己生成的默认模板
+//! 永远投不进去。
 
 use std::path::{Path, PathBuf};
 
@@ -52,6 +57,10 @@ const CONFIG_VERSION: &str = "1.0.0";
 const MODEL_REQUIRED: &str =
     "Continue 要求每个模型条目都写明模型名（`model`），缺了它 Continue 会拒绝加载\
      整份配置；KeyRelay 不编造默认模型：请在投递时填写模型名";
+/// 预览里「沿用受管块里已有的名字」的前缀（P3-1）。
+const MODEL_INHERIT_PREFIX: &str = "沿用：";
+/// 预览里「这次没有名字可沿用」的提示（P3-1）。
+const MODEL_NONE_HINT: &str = "（首次投递必须填写）";
 /// 没有既有列表项时使用的缩进。
 const DEFAULT_INDENT: &str = "  ";
 /// 条目字段相对条目起始的额外缩进（对齐 `- ` 的宽度）。
@@ -86,6 +95,24 @@ impl ContinueWriter {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 预览用：本次**会沿用的**模型名（读受管块，best-effort，P3-1）。
+    ///
+    /// 与 `build_after` 用的是同一个 `block_model`（同一套「只认自己渲染的形态」的判据），
+    /// 因此预览与产物不会分叉。读不到（文件不存在 / 没有块 / 块里没有 model）⇒ 提示必填。
+    fn inherited_model_hint(&self) -> String {
+        let text = match read_text_or_empty(&self.path) {
+            Ok(text) => text,
+            Err(_) => return MODEL_NONE_HINT.to_string(),
+        };
+        match locate_block(&text, &self.path) {
+            Ok(Some((begin, end))) => match block_model(&text[begin..end]) {
+                Some(model) => format!("{MODEL_INHERIT_PREFIX}{model}"),
+                None => MODEL_NONE_HINT.to_string(),
+            },
+            _ => MODEL_NONE_HINT.to_string(),
+        }
     }
 
     /// 纯函数：渲染受管块。返回块的各行，**以 `line_ending` 相连、不带尾随行尾**。
@@ -203,6 +230,27 @@ impl ContinueWriter {
                 "顶层 `models:` 是行内值（不是块序列），KeyRelay 不改写它：\
                  请把它改成块序列（`models:` 换行后缩进列表项），或改用其它通道",
             )),
+            // `models: []` ⇒ 抹掉 `[]` 这一个 token，再按块键插入（§9-10 / §13 D-4）。
+            // 「块外字节不变」在这条上的精确表述：**除 `[]` 之外逐字节不变**——
+            // `[` 与 `]` 之间的空白一并抹掉（那是同一个 token 的内部），注释原样留在原位。
+            Some((index, line, ModelsLine::EmptyFlow)) => {
+                let model = require_model(self.model.clone())?;
+                let indent = infer_item_indent(&lines, *index);
+                let block = self.render_block_with(api_key, Some(&model), &indent, eol);
+                let (open, close) = empty_flow_token(line.content)
+                    .expect("EmptyFlow 由 empty_flow_token 判定，区间必然取得到");
+                let mut out = String::with_capacity(before.len() + block.len() + eol.len() * 2);
+                out.push_str(&before[..line.start + open]);
+                out.push_str(&before[line.start + close..line.end]);
+                // 与 `Block` 分支同形：`models:` 是最后一行且没有行尾时先补一个。
+                if !before[..line.end].ends_with('\n') {
+                    out.push_str(eol);
+                }
+                out.push_str(&block);
+                out.push_str(eol);
+                out.push_str(&before[line.end..]);
+                Ok(out)
+            }
             Some((index, line, ModelsLine::Block)) => {
                 let model = require_model(self.model.clone())?;
                 let indent = infer_item_indent(&lines, *index);
@@ -263,8 +311,12 @@ impl DeliveryWriter for ContinueWriter {
         if !self.base_url.is_empty() {
             fields.push(literal_field("apiBase", &self.base_url));
         }
-        if let Some(model) = &self.model {
-            fields.push(literal_field("model", model));
+        // P3-1：没传 model = **沿用**受管块里已有的名字（重投 / 轮换）。预览必须把「沿用的那个
+        // 名字」念出来，否则用户看到的是「没有 model 这一行」，而写下去的其实是另一个名字。
+        // `fields()` 不返回 `Result` ⇒ 读失败只是少一行提示；硬门在 `plan()`（`MODEL_REQUIRED`）。
+        match self.model.as_deref() {
+            Some(model) => fields.push(literal_field("model", model)),
+            None => fields.push(literal_field("model", self.inherited_model_hint())),
         }
         fields
     }
@@ -276,13 +328,16 @@ impl DeliveryWriter for ContinueWriter {
     }
 }
 
-/// 顶层 `models:` 的两种形态。
+/// 顶层 `models:` 的三种形态。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ModelsLine {
     /// `models:` / `models: # 注释`——可以在其后插入块序列
     Block,
-    /// `models: [a, b]` 这类行内值——**不改写**
+    /// `models: [a, b]` 这类**非空**行内值——**不改写**
     Flow,
+    /// `models: []` / `models: [ ]`——**空** flow 序列，可以规范化成 `models:` + 块（§9-10）。
+    /// Continue 自己生成的默认模板就是这个形状；把它当成 `Flow` 拒绝会让最常见的初始状态投不进去。
+    EmptyFlow,
 }
 
 /// 判定某一行是不是**顶层** `models:`。`None` = 不是。
@@ -292,26 +347,60 @@ enum ModelsLine {
 /// 文件首行可能带 BOM，键也可以写成 `"models"` / `'models'`——YAML 里这三种写法是**同一个键**。
 /// 认不出来就会走「追加」分支，写出第二个顶层 `models:`（重复键，Continue 拒绝加载）。
 fn classify_models_line(content: &str) -> Option<ModelsLine> {
-    let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
+    let stripped = content.strip_prefix('\u{FEFF}').unwrap_or(content);
     let rest = ["models", "\"models\"", "'models'"]
         .into_iter()
-        .find_map(|key| content.strip_prefix(key))?;
+        .find_map(|key| stripped.strip_prefix(key))?;
     let rest = rest.trim_start();
     let after_colon = rest.strip_prefix(':')?;
     let tail = after_colon.trim();
     if tail.is_empty() || tail.starts_with('#') {
         Some(ModelsLine::Block)
+    } else if empty_flow_token(content).is_some() {
+        Some(ModelsLine::EmptyFlow)
     } else {
         Some(ModelsLine::Flow)
     }
 }
 
+/// `models: []` 里 `[]` 这一个 token 在**行内**的字节范围（`[` 起点 .. `]` 之后）。
+/// `None` = 不是空 flow 序列。
+///
+/// 判据（窄口径，§9-10）：`:` 之后、`[` 之前只有空白，`[` 与 `]` 之间只有空白，
+/// `]` 之后只有空白或一个**带前置空白**的注释。其余一律 `None` ⇒ 落到 `Flow` ⇒ 拒绝。
+///
+/// `[ ]`（带内空白）也算空序列：YAML 里它是同一个空 flow 序列，只是多了一个空格。
+fn empty_flow_token(content: &str) -> Option<(usize, usize)> {
+    let stripped = content.strip_prefix('\u{FEFF}').unwrap_or(content);
+    let rest = ["models", "\"models\"", "'models'"]
+        .into_iter()
+        .find_map(|key| stripped.strip_prefix(key))?;
+    let after_colon = rest.trim_start().strip_prefix(':')?;
+    let tail = after_colon.trim_start();
+    let after_open = tail.strip_prefix('[')?.trim_start();
+    let after_close = after_open.strip_prefix(']')?;
+    let after = after_close.trim_start();
+    // `#` 必须被空白隔开才是注释（YAML 的规则）；`[]#c` 不是注释，不认。
+    let tail_is_comment = after.starts_with('#') && after.len() < after_close.len();
+    if !after.is_empty() && !tail_is_comment {
+        return None;
+    }
+    // `tail` / `after_close` 都是 `content` 的后缀 ⇒ 长度差就是偏移，无需指针运算。
+    Some((
+        content.len() - tail.len(),
+        content.len() - after_close.len(),
+    ))
+}
+
 struct LineSpan<'a> {
     content: &'a str,
+    /// 行首在原文里的偏移（`content` 的第一个字节）。
+    start: usize,
+    /// 行尾**之后**的偏移（含 `\n`；`\r` 从 `content` 里剥掉）。
     end: usize,
 }
 
-/// 按行切分并记录每行**行尾之后**的偏移（含 `\n`；`\r` 从 `content` 里剥掉）。
+/// 按行切分并记录行首 / 行尾之后的偏移。
 fn split_lines_with_spans(text: &str) -> Vec<LineSpan<'_>> {
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -323,6 +412,7 @@ fn split_lines_with_spans(text: &str) -> Vec<LineSpan<'_>> {
             }
             out.push(LineSpan {
                 content: &text[start..content_end],
+                start,
                 end: i + 1,
             });
             start = i + 1;
@@ -331,6 +421,7 @@ fn split_lines_with_spans(text: &str) -> Vec<LineSpan<'_>> {
     if start < text.len() {
         out.push(LineSpan {
             content: &text[start..],
+            start,
             end: text.len(),
         });
     }
@@ -724,10 +815,48 @@ mod tests {
         );
         assert_eq!(classify_models_line("models :"), Some(ModelsLine::Block));
         assert_eq!(classify_models_line("models: [a]"), Some(ModelsLine::Flow));
+        assert_eq!(
+            classify_models_line("models: []"),
+            Some(ModelsLine::EmptyFlow)
+        );
+        assert_eq!(
+            classify_models_line("models: [ ]"),
+            Some(ModelsLine::EmptyFlow)
+        );
+        assert_eq!(
+            classify_models_line("models: [] # 我的模型"),
+            Some(ModelsLine::EmptyFlow)
+        );
+        assert_eq!(
+            classify_models_line("models: []#c"),
+            Some(ModelsLine::Flow),
+            "`#` 没被空白隔开就不是注释"
+        );
+        assert_eq!(classify_models_line("models: []x"), Some(ModelsLine::Flow));
         assert_eq!(classify_models_line("  models:"), None, "缩进的不算顶层");
         assert_eq!(classify_models_line("modelsX:"), None);
         assert_eq!(classify_models_line("# models:"), None);
         assert_eq!(classify_models_line("name: models"), None);
+    }
+
+    #[test]
+    fn empty_flow_token_points_at_the_brackets() {
+        let line = "models: [ ] # 注释";
+        let (open, close) = empty_flow_token(line).expect("空序列");
+        assert_eq!(&line[open..close], "[ ]", "含 `[` 与 `]` 之间的空白");
+        assert_eq!(open, 8);
+        assert_eq!(&line[close..], " # 注释", "注释留在原位，不在 token 里");
+
+        let bom = "\u{FEFF}models: []";
+        let (open, close) = empty_flow_token(bom).expect("带 BOM 的行");
+        assert_eq!(
+            &bom[open..close],
+            "[]",
+            "偏移是**原文**的偏移，含 BOM 的 3 字节"
+        );
+
+        assert_eq!(empty_flow_token("models:"), None);
+        assert_eq!(empty_flow_token("models: [a]"), None);
     }
 
     #[test]
@@ -745,7 +874,7 @@ mod tests {
         );
         assert_eq!(
             classify_models_line("\u{FEFF}\"models\": []"),
-            Some(ModelsLine::Flow)
+            Some(ModelsLine::EmptyFlow)
         );
         assert_eq!(classify_models_line("\"modelsX\":"), None);
         assert_eq!(classify_models_line("\"models':"), None, "引号不成对");
