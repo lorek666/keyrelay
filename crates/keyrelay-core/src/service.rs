@@ -17,9 +17,12 @@ use crate::export::{
 use crate::inject;
 use crate::observability::{self, Event, Level};
 use crate::settings::Settings;
+use crate::site::captcha::{self, CaptchaEvent, CaptchaPhase};
 use crate::site::registry::SiteRegistry;
 use crate::site::transport::HttpTransport;
-use crate::site::{Balance, Credentials, KeyMaterial, KeyMeta, KeySpec, Session, SiteKind};
+use crate::site::{
+    Balance, CaptchaChallenge, Credentials, KeyMaterial, KeyMeta, KeySpec, Session, SiteKind,
+};
 use crate::store::{ConsentRow, SiteRow, Store};
 use crate::vault::{KeychainVault, Vault};
 
@@ -589,6 +592,11 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     /// `Debug` 脱敏都已经定稿，为一个状态位去动它不划算；而状态的**生产者**本来就是这里。
     /// 语义是「最近一次装配网关时，令牌落进钥匙串了吗」——网关没在跑时这个值没有意义。
     gateway_token_persistent: Arc<std::sync::atomic::AtomicBool>,
+    /// 人工过验证码的**相位表**（M8-S2 §3）：按站点，多站点可同时处于不同相位。
+    ///
+    /// 只放相位、不放 cookie——cookie 在 [`SessionCache`]（同样只在内存）。
+    /// **不入库**：重启后回到 `Idle` 是对的（等待中的窗口本来就不存在了）。
+    captcha_phases: Mutex<HashMap<i64, CaptchaPhase>>,
 }
 
 /// 缓冲里的一条：**失败发生的时刻** + 失败本身。
@@ -657,6 +665,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             site_facts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             revoked_refs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             gateway_token_persistent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            captcha_phases: Mutex::new(HashMap::new()),
         }
     }
 
@@ -747,6 +756,23 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let adapter = self.registry.adapter(kind);
         let session = match adapter.login(&site.base_url, cred).await {
             Ok(session) => session,
+            // 站点要求人机验证：**转人工态**（M8-S2 T1）——这不是终点，是分流。
+            // 前端收到 `CaptchaRequired` 后弹「打开官方页面过一次」（用户自己过），
+            // 过完之后由 [`Self::complete_captcha`] 把 WebView 抓到的会话接上。
+            Err(Error::CaptchaRequired) => {
+                let challenge = CaptchaChallenge {
+                    site_id,
+                    url: captcha::captcha_page_url(&site.base_url)?,
+                };
+                let next = captcha::step(
+                    self.captcha_phase(site_id),
+                    CaptchaEvent::LoginRejected { challenge },
+                );
+                self.set_captcha_phase(site_id, next);
+                // 错误类型**不变**（S2 §9）：前端据此弹人工验证的入口。
+                // 这里**不写**「登录失败」事件：人工态不是失败（S2 §5 T12）。
+                return Err(Error::CaptchaRequired);
+            }
             Err(err) => {
                 self.log(observability::event_with_payload(
                     Level::Warn,
@@ -757,6 +783,9 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 return Err(err);
             }
         };
+        // 登录真的成功了：清掉可能挂着的相位（否则会出现「会话已建立、还在等人工验证」
+        // 的僵尸态）。这条转移不在 T1–T8 里——那八条覆盖的是「登录被拒」的分支。
+        self.set_captcha_phase(site_id, CaptchaPhase::Idle);
         self.store.set_site_health(site_id, HEALTH_OK)?;
         self.sessions.put(site_id, session)?;
         self.log(observability::event_with_payload(
@@ -766,6 +795,98 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             serde_json::json!({ "site_id": site_id }),
         ));
         Ok(())
+    }
+
+    // ============================================================== 人工过验证码（M8-S2 / FR-1:102）
+
+    /// 当前人工验证相位（缺省 `Idle`）。命令层与测试可见。
+    pub fn captcha_phase(&self, site_id: i64) -> CaptchaPhase {
+        self.captcha_phases
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&site_id).cloned())
+            .unwrap_or(CaptchaPhase::Idle)
+    }
+
+    /// 写相位；`Idle` 一律**移除**（表里只留非平凡态，`len()` 才有意义）。
+    fn set_captcha_phase(&self, site_id: i64, phase: CaptchaPhase) {
+        if let Ok(mut map) = self.captcha_phases.lock() {
+            match phase {
+                CaptchaPhase::Idle => {
+                    map.remove(&site_id);
+                }
+                other => {
+                    map.insert(site_id, other);
+                }
+            }
+        }
+    }
+
+    /// 进入人工态的下一步（M8-S2 §9）：把要打开的**官方页面**地址交给前端/窗口层。
+    ///
+    /// 前置：该站点当前相位是 `AwaitingHuman`；否则 `Err(AuthFailed)`——
+    /// 用户点到一个不该出现的按钮时，要的是一条能读懂的原因，不是一个空白窗口。
+    pub fn begin_captcha(&self, site_id: i64) -> Result<CaptchaChallenge> {
+        match self.captcha_phase(site_id) {
+            CaptchaPhase::AwaitingHuman { challenge, .. } => {
+                // 双保险：站点记录没了的话，窗口打开了也没有意义
+                //（相位会在 `remove_site` 里一并清掉，这里是第二道防线）。
+                self.site(site_id)?;
+                Ok(challenge)
+            }
+            CaptchaPhase::Idle => Err(Error::AuthFailed(
+                "该站点当前不需要人机验证（没有等待中的挑战）".to_string(),
+            )),
+        }
+    }
+
+    /// 收下 WebView 抓到的 cookie（M8-S2 §9）。
+    ///
+    /// 顺序：**先做纯校验、再动状态**——校验失败时相位**留在** `AwaitingHuman`
+    /// （T5：用户可以重开窗口再试一次），且**不**碰任何存储、**不**写事件、**不**碰站点健康
+    /// （M8-S2 G-SPEC O-2：这是格式校验，不是会话失效）。
+    /// 校验通过 ⇒ 会话进 `SessionCache` + 健康状态回 `ok`（镜像 `login` 的 B-61 顺序）。
+    ///
+    /// cookie **不落库、不进事件、不进诊断导出**（S2 §5 红线）：本函数里它只经过
+    /// `validate` / `session_from_captcha_cookies` 两条**纯内存**路径。
+    pub fn complete_captcha(&self, site_id: i64, cookies: Vec<(String, String)>) -> Result<()> {
+        let phase = self.captcha_phase(site_id);
+        if !matches!(phase, CaptchaPhase::AwaitingHuman { .. }) {
+            // T7：不在人工态时收到 cookie ⇒ 忽略（**不得**把「没经过挑战的 cookie」当会话）。
+            return Err(Error::AuthFailed(
+                "该站点当前不在等待人工验证：收到的 cookie 已忽略".to_string(),
+            ));
+        }
+        let validated = captcha::validate_captcha_cookies(&cookies);
+        // T4 / T5：ok 才回 `Idle`；失败留在人工态（先落相位，再决定要不要上抛）。
+        let next = captcha::step(
+            phase,
+            CaptchaEvent::CookiesSubmitted {
+                ok: validated.is_ok(),
+            },
+        );
+        self.set_captcha_phase(site_id, next);
+        validated?;
+        let session = captcha::session_from_captcha_cookies(&cookies);
+        self.store.set_site_health(site_id, HEALTH_OK)?;
+        self.sessions.put(site_id, session)?;
+        // **成功**才留痕：人工验证真的完成、会话真的换了——这条是用户能看懂的因果。
+        // 进入人工态 / 取消 / 校验失败都**不写**事件（S2 §5 T12）。
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "site",
+            "人机验证完成：会话已更新",
+            serde_json::json!({ "site_id": site_id }),
+        ));
+        Ok(())
+    }
+
+    /// 用户关窗 / 取消（M8-S2 T6 / §9 第 4 条）：相位回 `Idle`。
+    ///
+    /// **不留半截会话**：不写缓存、不写钥匙串、不写事件；不在人工态时是 no-op（T8 幂等）。
+    pub fn cancel_captcha(&self, site_id: i64) {
+        let next = captcha::step(self.captcha_phase(site_id), CaptchaEvent::Cancelled);
+        self.set_captcha_phase(site_id, next);
     }
 
     pub async fn list_keys(&self, site_id: i64) -> Result<Vec<KeyMeta>> {
@@ -880,12 +1001,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         }
     }
 
-    /// 删除站点记录，**同时清掉该 id 的会话缓存**。
+    /// 删除站点记录，**同时清掉该 id 的会话缓存与人工验证相位**。
     ///
     /// 复审 P2-6：SQLite rowid 会复用（删掉最大 id 后新站点可能拿到同一 id），
     /// 若不联动清理，旧站点的会话会被套用到新站点上，造成跨站串号。
+    /// 相位同理：一个「等待人工验证」的僵尸相位会让新站点直接拿到旧站点的挑战。
     pub fn remove_site(&self, site_id: i64) -> Result<()> {
         self.sessions.invalidate(site_id);
+        self.set_captcha_phase(site_id, CaptchaPhase::Idle);
         self.store.delete_site(site_id)
     }
 

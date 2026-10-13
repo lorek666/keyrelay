@@ -1021,6 +1021,34 @@ fn gateway_rotate_token_reaches_the_business_path() {
     assert_eq!(value["tokenPersistent"], true, "写进钥匙串了");
 }
 
+// ---------- M8-S2：人工过验证码（IPC 可达性与业务前置） ----------
+
+#[test]
+fn captcha_begin_without_a_pending_challenge_reports_business_error() {
+    // 没有「等待中的挑战」时点入口 ⇒ 明确拒绝（而不是打开一个空白窗口）。
+    // 这条同时证明：窗口创建发生在相位检查**之后**（无 GUI 环境也不会先炸一步）。
+    let err =
+        invoke_impl("captcha_begin", json!({"siteId": 999})).expect_err("没有等待中的挑战应被拒");
+    assert_not_acl_rejection("captcha_begin", &err);
+    assert!(err.to_string().contains("人机验证"), "{err}");
+}
+
+#[test]
+fn captcha_complete_without_a_pending_challenge_reports_business_error() {
+    // T7：不在人工态的提交一律拒绝（不建会话）——同样发生在抓 cookie 之前。
+    let err =
+        invoke_impl("captcha_complete", json!({"siteId": 999})).expect_err("不在人工态应被拒");
+    assert_not_acl_rejection("captcha_complete", &err);
+    assert!(err.to_string().contains("人工验证"), "{err}");
+}
+
+#[test]
+fn captcha_cancel_is_idempotent_without_a_window() {
+    // T8：取消是幂等的 no-op（这里连窗口都没有）——不得报错、不得炸。
+    let value = invoke_impl("captcha_cancel", json!({"siteId": 999})).expect("取消必须幂等");
+    assert_not_acl_rejection("captcha_cancel", &value);
+}
+
 #[test]
 fn delivery_plan_rejects_an_unknown_mode_and_refuses_gateway_mode_without_a_gateway() {
     // 模式认不出 ⇒ 明确拒绝（**不**静默回退成站点模式：那会让用户以为已经切过去了）。

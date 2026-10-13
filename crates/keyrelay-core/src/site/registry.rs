@@ -96,13 +96,17 @@ impl<T: HttpTransport + Clone + 'static> SiteRegistry<T> {
 
 /// 组装「探测全失败」的错误：无原因（全是占位适配器）与多原因两种形态。
 fn detection_failure(base_url: &str, reasons: Vec<String>) -> Result<SiteFingerprint> {
+    // 复核 N-2（M8-S2 §6）：录入的地址可能带 userinfo（`alice:pw@host`），
+    // 而这条文案**不经过** `scrub` ⇒ 必须在拼进去之前就先掩掉。
+    // 请求用的 `base_url` 一个字不改（这里只是显示用的一份）。
+    let shown = super::display_url(base_url);
     if reasons.is_empty() {
         return Err(Error::FingerprintMismatch(format!(
-            "没有可用适配器能识别 {base_url}"
+            "没有可用适配器能识别 {shown}"
         )));
     }
     Err(Error::FingerprintMismatch(format!(
-        "{base_url} 未被识别（{}）",
+        "{shown} 未被识别（{}）",
         reasons.join("; ")
     )))
 }

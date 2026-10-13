@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-captcha-cancel"
+description = "Enables the captcha_cancel command without any pre-configured scope."
+commands.allow = ["captcha_cancel"]
+
+[[permission]]
+identifier = "deny-captcha-cancel"
+description = "Denies the captcha_cancel command without any pre-configured scope."
+commands.deny = ["captcha_cancel"]

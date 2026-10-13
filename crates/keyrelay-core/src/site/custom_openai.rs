@@ -92,6 +92,8 @@ impl<T: HttpTransport + 'static> SiteAdapter for CustomOpenAi<T> {
     /// 其余一律 `FingerprintMismatch`（**不猜**，M7-S2 spec §5）。
     async fn detect(&self, base_url: &str) -> Result<SiteFingerprint> {
         let url = format!("{}/v1/models", normalize_base_url(base_url));
+        // 复核 N-2：文案用掩过 userinfo 的形态，请求仍用 `url`（一字不改）。
+        let shown = super::display_url(&url);
         // 头集合保持为空：不携带 Authorization / Cookie / X-Api-Key。
         let resp = self
             .transport
@@ -100,13 +102,13 @@ impl<T: HttpTransport + 'static> SiteAdapter for CustomOpenAi<T> {
 
         if !(200..300).contains(&resp.status) {
             return Err(Error::FingerprintMismatch(format!(
-                "{url} 返回 {}",
+                "{shown} 返回 {}",
                 resp.status
             )));
         }
 
         let value = resp.json_value().map_err(|_| {
-            Error::FingerprintMismatch(format!("{url} 不是 JSON，可能不是 OpenAI 兼容端点"))
+            Error::FingerprintMismatch(format!("{shown} 不是 JSON，可能不是 OpenAI 兼容端点"))
         })?;
 
         let Some(object) = value.as_object() else {

@@ -207,7 +207,11 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::suggest_key_name,
             // M8-S4：解绑（FR-2:115）、网关令牌轮换（§6.4）
             commands::unbind_agent,
-            commands::gateway_rotate_token
+            commands::gateway_rotate_token,
+            // M8-S2：人工过验证码（FR-1:102）
+            commands::captcha_begin,
+            commands::captcha_complete,
+            commands::captcha_cancel
         ])
 }
 

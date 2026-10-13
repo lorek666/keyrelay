@@ -332,6 +332,13 @@ export type UnbindOutcome = {
   note?: string | null;
 };
 
+/** 一次「等待人工验证」的挑战（M8-S2 §2.1）。 */
+export type CaptchaChallenge = {
+  siteId: number;
+  /** 站点自己的官方页面地址（永不带 userinfo、永不指向第三方域名）。 */
+  url: string;
+};
+
 export type ExportResult = {
   path: string;
   encrypted: boolean;
@@ -549,6 +556,50 @@ export async function addSite(baseUrl: string): Promise<SiteRow> {
 export async function loginSite(args: LoginArgs): Promise<void> {
   if (!hasTauri) return mock(undefined);
   return invokeCommand<void>("login_site", { args });
+}
+
+/**
+ * 人工过验证码：打开站点官方页面（内嵌窗口），**用户自己**过一次（FR-1:102 / M8-S2）。
+ *
+ * 红线：不绕过验证码——窗口里只有官方页面本身，不注入脚本、不读 DOM、不自动点击。
+ * 窗口的创建与 cookie 抓取都在后端（`src-tauri`）；本函数只负责发起与收结果。
+ */
+export async function captchaBegin(siteId: number): Promise<CaptchaChallenge> {
+  if (!hasTauri) {
+    return mock({ siteId, url: "https://relay.example.com/login" });
+  }
+  return invokeCommand<CaptchaChallenge>("captcha_begin", { siteId });
+}
+
+/**
+ * 「我已过完」：后端去窗口里抓会话 cookie 并接上会话。
+ *
+ * cookie 值**不经过前端**（从 WebView 直接进核心层）；提交前后端会先比对页面 origin，
+ * 页面离开了站点域名就拒绝提交（防止把别处的 cookie 存成本站会话）。
+ */
+export async function captchaComplete(siteId: number): Promise<void> {
+  if (!hasTauri) {
+    return mock(undefined);
+  }
+  return invokeCommand<void>("captcha_complete", { siteId });
+}
+
+/** 取消人工验证（关窗）：相位回空闲态，不保存任何东西。幂等。 */
+export async function captchaCancel(siteId: number): Promise<void> {
+  if (!hasTauri) {
+    return mock(undefined);
+  }
+  return invokeCommand<void>("captcha_cancel", { siteId });
+}
+
+/**
+ * 「这个登录错误是不是站点要求人机验证」——界面据此切到人工兜底面板（M8-S2 §9）。
+ *
+ * 匹配的是 `Error::CaptchaRequired` 的 Display 原文（`invokeCommand` 已把后端错误
+ * 转成 `Error(message)`，这里只看 message）。
+ */
+export function isCaptchaRequired(err: unknown): boolean {
+  return err instanceof Error && err.message.includes("需要人工完成验证码");
 }
 
 export async function listKeys(siteId: number): Promise<KeyRow[]> {

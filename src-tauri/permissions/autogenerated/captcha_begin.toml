@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-captcha-begin"
+description = "Enables the captcha_begin command without any pre-configured scope."
+commands.allow = ["captcha_begin"]
+
+[[permission]]
+identifier = "deny-captcha-begin"
+description = "Denies the captcha_begin command without any pre-configured scope."
+commands.deny = ["captcha_begin"]

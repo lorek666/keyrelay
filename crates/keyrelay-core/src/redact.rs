@@ -273,6 +273,37 @@ pub fn strip_url_userinfo(url: &str) -> String {
     out
 }
 
+/// [`strip_url_userinfo`] 的**掩蔽**版：authority 里的 userinfo 换成 [`MASK`]。
+///
+/// 与 [`strip_url_userinfo`] 的分工（M8-S2 §7.2 O-1 裁决）：
+/// - `strip_url_userinfo`：输入是**一整个 URL**，userinfo **整段删掉**（导出物用）。
+///   没有 `://` 时它**不猜**——那是它的契约，不改；
+/// - 本函数：输入是**已知是 URL 或 authority** 的东西（站点 `base_url`、`{base}/api/status`
+///   这种拼出来的地址），**没有 `://` 也要处理**——`carol:pw@host.example` 这种录入形态
+///   必须能被掩住，否则它会原样进错误文案（复核 N-2 的第二种形态）。
+///
+/// 规则（**宁可多掩**：掩错了只影响显示，漏掩是泄漏）：
+/// - 有 `://`：authority 段（`://` 之后到第一个 `/` / `?` / `#`）里**最后一个** `@` 之前
+///   的部分换成 `***`；
+/// - 无 `://`：把**第一个 `/` 之前**那一段当作 authority，同样处理
+///   （`carol:pw@host.example/x` ⇒ `***@host.example/x`）；
+/// - 没有 `@` ⇒ **逐字节不变**（`https://host/a@b` 不动：那个 `@` 在路径里，不是 userinfo）。
+pub fn mask_authority_userinfo(raw: &str) -> String {
+    let (prefix, authority_start) = match raw.find("://") {
+        Some(scheme_end) => (&raw[..scheme_end + 3], scheme_end + 3),
+        // 无 scheme：前缀为空，authority 从 0 开始（这就是「已知是 authority」的含义）。
+        None => ("", 0),
+    };
+    let rest = &raw[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let Some(at) = authority.rfind('@') else {
+        return raw.to_string();
+    };
+    // 从 `@` 起（含）原样保留：`@host…`。多掩的那部分只影响显示。
+    format!("{prefix}{MASK}{}", &rest[at..])
+}
+
 /// [`scrub`] 的首尾两步：**文本里**每个 `scheme://userinfo@host` 的 userinfo 换成 [`MASK`]。
 ///
 /// 与 [`strip_url_userinfo`] 的区别：那个函数的输入是**一整个 URL**，这里的输入是
