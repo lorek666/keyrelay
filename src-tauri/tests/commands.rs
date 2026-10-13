@@ -571,6 +571,78 @@ fn prune_backups_reports_zero_when_there_is_nothing_to_prune() {
     assert_eq!(value["removed"], 0);
 }
 
+#[test]
+fn export_diagnostics_writes_a_package_and_registers_it_for_the_audit() {
+    // DEBUG 报告 §1.6：`service::export_diagnostics` 当时**零生产调用点**，
+    // 而 `M7-收口记录` 把它记成已交付。这条同时钉三件事：
+    // ① 命令真的能落盘；② 条数与文件内容自洽；③ 登记进「已知导出物」表
+    // （否则审计扫不到它——B-60 的另一半）。
+    let (_app, webview) = build_app();
+
+    let before = invoke_on(&webview, "audit_redaction", json!({})).expect("审计应成功");
+    let dir = tempfile::tempdir().expect("临时目录");
+    let path = dir.path().join("diag.json");
+
+    let value = invoke_on(
+        &webview,
+        "export_diagnostics",
+        json!({"args": {"path": path.display().to_string()}}),
+    )
+    .expect("export_diagnostics 应成功");
+
+    assert_eq!(
+        value["registered"], true,
+        "必须登记，否则审计看不到它: {value}"
+    );
+    assert_eq!(value["path"], path.display().to_string());
+
+    let text = std::fs::read_to_string(&path).expect("读诊断包");
+    let parsed: Value = serde_json::from_str(&text).expect("诊断包必须是合法 JSON");
+    for key in ["version", "settings", "events", "vault_backend", "home"] {
+        assert!(parsed.get(key).is_some(), "诊断包缺 {key}: {text}");
+    }
+    // 条数自洽：命令回报的 `events` 必须等于文件里真的写了几条。
+    // 只断言「> 0」的话，`diagnostics_json` 少写一半也照样绿。
+    let written = parsed["events"]
+        .as_array()
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
+    assert_eq!(
+        value["events"].as_u64().unwrap_or(u64::MAX),
+        written as u64,
+        "{value}"
+    );
+    assert_eq!(value["bytes"].as_u64().unwrap_or(0), text.len() as u64);
+
+    assert!(!text.contains("sk-"), "诊断包出现密钥形态: {text}");
+    assert!(!text.contains("secret_ref"), "{text}");
+
+    let after = invoke_on(&webview, "audit_redaction", json!({})).expect("审计应成功");
+    assert_eq!(after["clean"], true, "诊断包必须自身干净: {after}");
+    assert_eq!(
+        after["filesScanned"].as_u64().unwrap_or(0),
+        before["filesScanned"].as_u64().unwrap_or(0) + 1,
+        "登记的意义是进扫描集合：文件数必须 +1（登记失败的话这条会红）"
+    );
+}
+
+#[test]
+fn export_diagnostics_is_reachable_from_the_ui() {
+    // 「函数存在但没有调用点」是 DEBUG 报告 §4-3 点名的模式。命令层注册由
+    // `every_declared_command_is_registered_and_allowed` 守着，这里补另一半：
+    // **前端真的调它**。少了这一半，PRD 里算已交付、用户手里不存在。
+    const API: &str = include_str!("../../src/lib/api.ts");
+    assert!(
+        API.contains("\"export_diagnostics\""),
+        "api.ts 里没有 export_diagnostics 的调用点"
+    );
+    const SETTINGS: &str = include_str!("../../src/pages/Settings.tsx");
+    assert!(
+        SETTINGS.contains("exportDiagnostics("),
+        "Settings.tsx 没有调用 exportDiagnostics——诊断包在界面上不可达"
+    );
+}
+
 // ============================================ M5-S5：会话失效可见性 + 网关启停串行化
 
 #[test]
@@ -954,7 +1026,9 @@ fn the_frontend_channel_list_matches_the_backend_channels_exactly() {
             continue;
         };
         let tail = &line[at + 5..];
-        let Some(close) = tail.find('"') else { continue };
+        let Some(close) = tail.find('"') else {
+            continue;
+        };
         frontend.push(tail[..close].to_string());
     }
     frontend.sort();
