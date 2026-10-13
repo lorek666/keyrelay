@@ -437,6 +437,63 @@ pub fn resolve_for_binding(
     }
 }
 
+/// 「指向网关」的目标：agent 侧该写什么（M8-S4 §6.2 / FR-5:158）。
+///
+/// **不是新通道**：落点与站点模式**逐字相同**（同一个 `relative_target`），只换两个值——
+/// `base_url` 换成网关的本地地址、`api_key` 换成网关的本地令牌。
+/// 新增一条通道会让 `DeliveryChannel::ALL` 膨胀，而「指向哪里」与「写到哪个文件」
+/// 是两件正交的事。
+///
+/// 手写 `Debug`：`token` 是秘密。它只对回环地址有效，但那不构成「可以打印」的理由——
+/// 拿到它就等于拿到「以本机身份经网关转发」的能力。
+#[derive(Clone, PartialEq, Eq)]
+pub struct GatewayEndpoint {
+    /// 网关的本地地址，**含 `/v1` 前缀**（网关只服务 `/health` 与 `/v1/*`）。
+    pub base_url: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for GatewayEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayEndpoint")
+            .field("base_url", &self.base_url)
+            .field("token", &"***")
+            .finish()
+    }
+}
+
+/// 预检用的占位密钥（M8-S4 §9-8）。
+///
+/// **不是**任何真实密钥形态（没有 `sk-` / `nap-` 前缀，也不像 32 位 hex）——
+/// 它只用于 `writer.plan()` 的空跑，证明「每个通道都写得进去」，
+/// 从而让轮换在**建新 key 之前**就失败，而不是建好之后再停在第②步。
+pub const PLACEHOLDER_KEY: &str = "keyrelay-dry-run-placeholder";
+
+/// 指向网关的解析入口（M8-S4 §6.2）。
+///
+/// `provider_id` / `model` 的语义与 [`resolve_for_binding`] **完全一致**——
+/// 因为它就是同一个函数，只是 `base_url` 换成了网关地址。
+/// 这样「落点与站点模式逐字相同」不是靠人工比对，而是靠**同一个构造路径**保证的。
+///
+/// 空 `base_url` / 空 `token` 在这里就拒绝：写一个空 base_url 会把 agent 指向一个
+/// 语法错误的目标，而那种失败要到 agent 启动时才看得见。
+pub fn resolve_for_gateway(
+    channel: DeliveryChannel,
+    home: &Path,
+    gateway: &GatewayEndpoint,
+    provider_id: &str,
+    model: Option<&str>,
+) -> Result<Box<dyn DeliveryWriter>> {
+    let target = home.join(channel.relative_target());
+    if gateway.base_url.trim().is_empty() {
+        return Err(Error::inject(target, "网关地址为空，拒绝写入"));
+    }
+    if gateway.token.trim().is_empty() {
+        return Err(Error::inject(target, "网关令牌为空，拒绝写入"));
+    }
+    resolve_for_binding(channel, home, &gateway.base_url, provider_id, model)
+}
+
 /// 构造一个掩码字段（用于密钥值）。
 pub fn masked_field(key: impl Into<String>, secret: &str) -> DeliveryField {
     DeliveryField {
