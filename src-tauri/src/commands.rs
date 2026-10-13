@@ -3,7 +3,7 @@
 //! 安全约束：`create_key` 返回的密钥只在**返回值**里出现一次，不写日志、不落库。
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use keyrelay_core::delivery::ConsentState;
 
@@ -1685,6 +1685,231 @@ impl From<keyrelay_core::service::UnbindOutcome> for UnbindOutcomeDto {
     }
 }
 
+// ============================================================== 人工过验证码（M8-S2 / FR-1:102）
+
+/// 人机验证窗口的标签。**按站点**：同一站点的重复打开是「聚焦已有窗口」。
+fn captcha_window_label(site_id: i64) -> String {
+    format!("captcha-{site_id}")
+}
+
+/// 站点 `base_url` 的 host（**去掉端口**）。
+///
+/// 取不出来（空 host）⇒ `None`：调用方 fail-closed 拒绝本次提交——
+/// 「域名不确定」意味着 cookie 的归属过滤无从做起。
+fn site_host_of(base_url: &str) -> Option<String> {
+    let rest = match base_url.find("://") {
+        Some(i) => &base_url[i + 3..],
+        None => base_url,
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host_port = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    if host_port.is_empty() {
+        return None;
+    }
+    // IPv6（`[::1]:8443`）走 `rsplit_once` 也能正确切出端口；切不出端口时整体当 host。
+    let host = match host_port.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => host_port,
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// 只保留**属于该站点**的 cookie：domain 等于 host，或是 host 的父域（含前导点写法）。
+///
+/// 为什么必须过滤（S2 §9 第 3 条的接线细节）：`webview.cookies()` 返回的是**整个
+/// cookie store** 里的全部 cookie——多站点窗口、挑战页的第三方域都在里面。而会话的
+/// `Cookie:` 头是把逐条 cookie 拼起来发出去的：不过滤就会把**别的站点**的 cookie
+/// 发给本站（跨站串号，同时是对别站的凭证泄漏）。
+///
+/// 空 domain 一律丢弃：归属不明的 cookie 不进会话（fail-closed）。
+fn cookie_belongs_to_site(domain: &str, host: &str) -> bool {
+    let domain = domain.trim().trim_start_matches('.').to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+    if domain.is_empty() || host.is_empty() {
+        return false;
+    }
+    // 带点的后缀比较：`ample.com` 这种「半个标签」的伪装不会命中。
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+/// 一次「等待人工验证」的挑战（M8-S2 §2.1）。
+///
+/// `url` 恒为**站点自己的**官方页面地址（`captcha_page_url` 的保证：只可能是
+/// `{站点 origin}/login`、永不带 userinfo、永不指向第三方 host）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptchaChallengeDto {
+    site_id: i64,
+    url: String,
+}
+
+/// 人工过验证码：把「等待中的官方页面」交给用户，并打开内嵌窗口（M8-S2 §9）。
+///
+/// # 红线（不得动摇）
+///
+/// **不绕过验证码**：窗口只是把**官方页面**原样打开，用户**自己**过一次。
+/// 不注入脚本、不读 DOM、不自动点击、不调任何打码服务（S2 §9 第 5 条）。
+///
+/// # 为什么窗口在这里开（而不是前端）
+///
+/// cookie 的抓取要走 `webview.cookies()`（Rust 侧）——窗口的归属、标签、关窗事件
+/// 都必须与「哪个站点」绑定；把窗口生命周期放在命令层是唯一能保证这一点的做法。
+/// 前端只负责展示「需要人机验证」与两个按钮（我已过完 / 取消）。
+///
+/// # 重复点击
+///
+/// 同站点已有窗口 ⇒ **聚焦**，不重建：`destroy()` 本身不发事件，但任何在重建路径上
+/// 误触发的「关窗 = 取消」都会把刚拿到的相位清掉；聚焦是更简单也更符合预期的行为。
+#[tauri::command]
+pub async fn captcha_begin<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    site_id: i64,
+) -> Result<CaptchaChallengeDto, String> {
+    // ① 相位必须是「等待人工验证」——不在人工态时明确拒绝，而不是打开一个空白窗口
+    let challenge = state
+        .service
+        .begin_captcha(site_id)
+        .map_err(|e| e.to_string())?;
+
+    // ② 站点显示名（窗口标题要能认出是哪个站；拿不到就退回站点号）
+    let display_name = state
+        .service
+        .sites()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|site| site.id == site_id)
+        .map(|site| site.display_name)
+        .unwrap_or_else(|| format!("站点 #{site_id}"));
+
+    let label = captcha_window_label(site_id);
+    if let Some(existing) = app.get_webview_window(&label) {
+        // 窗口已开着：聚焦。**不重建**——见函数的「重复点击」说明。
+        let _ = existing.set_focus();
+    } else {
+        let url = challenge
+            .url
+            .parse::<tauri::Url>()
+            .map_err(|e| format!("人机验证页面地址无法解析: {e}"))?;
+        let window =
+            tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::External(url))
+                .title(format!("人机验证 · {display_name}"))
+                .inner_size(1000.0, 760.0)
+                .build()
+                .map_err(|e| format!("打开人机验证窗口失败: {e}"))?;
+
+        // 关窗 = 取消（T6）：相位回 `Idle`，不写缓存 / 钥匙串 / 事件。
+        // 只监听 `CloseRequested`（用户发起的关闭）——`destroy()`（我们主动关）不触发它，
+        // 于是「提交成功后由我们关窗」不会被误记成取消（相位那时也已是 `Idle`，取消是 no-op）。
+        let app_for_close = app.clone();
+        window.on_window_event(move |event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                if let Some(state) = app_for_close.try_state::<AppState>() {
+                    state.service.cancel_captcha(site_id);
+                }
+            }
+        });
+    }
+
+    Ok(CaptchaChallengeDto {
+        site_id: challenge.site_id,
+        url: challenge.url,
+    })
+}
+
+/// 「我已过完」：抓窗口里的会话 cookie → 校验 → 接上会话（M8-S2 §9）。
+///
+/// # 抓取前置（硬要求，顺序不可换）
+///
+/// 1. `origin_matches`：页面必须**仍属于该站点**——防「站点把我跳到第三方，我在那边登录」；
+/// 2. 按 cookie 的 domain 过滤到本站（见 [`cookie_belongs_to_site`]）。
+///
+/// # cookie 值不过 IPC
+///
+/// 值从 WebView 直接进服务层（`complete_captcha`），**不经过前端 JS 堆**——
+/// 这也是线上 `captcha_complete` 不带 `cookies` 参数的原因（S2 实现步 D-9）。
+#[tauri::command]
+pub async fn captcha_complete<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    site_id: i64,
+) -> Result<(), String> {
+    // ① 相位必须是「等待人工验证」（T7：不在人工态的提交一律拒绝，不建会话）
+    if !matches!(
+        state.service.captcha_phase(site_id),
+        keyrelay_core::site::captcha::CaptchaPhase::AwaitingHuman { .. }
+    ) {
+        return Err("该站点当前不在等待人工验证：请先在「站点」页重新发起登录。".to_string());
+    }
+
+    // ② 窗口必须在
+    let window = app
+        .get_webview_window(&captcha_window_label(site_id))
+        .ok_or_else(|| "人机验证窗口已关闭：请重新点「打开官方页面过一次」".to_string())?;
+
+    // ③ 抓 cookie **之前**做 origin 比对（S2 §9 第 2 条）
+    let base_url = state
+        .service
+        .sites()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|site| site.id == site_id)
+        .map(|site| site.base_url)
+        .ok_or_else(|| format!("站点 #{site_id} 不存在"))?;
+    let page_url = window.url().map_err(|e| format!("读取窗口地址失败: {e}"))?;
+    if !keyrelay_core::site::captcha::origin_matches(&base_url, page_url.as_str()) {
+        return Err(
+            "页面已不在该站点的域名下（可能被跳转到了别处）；为避免把别处的 cookie 存进来，\
+             本次提交被拒绝。请在窗口里回到该站点页面后重试。"
+                .to_string(),
+        );
+    }
+
+    // ④ 抓 + 过滤（值不过 IPC）
+    let host = site_host_of(&base_url)
+        .ok_or_else(|| "无法从站点地址解析出域名，本次提交被拒绝".to_string())?;
+    let cookies = window
+        .cookies()
+        .map_err(|e| format!("读取窗口 cookie 失败: {e}"))?;
+    let pairs: Vec<(String, String)> = cookies
+        .into_iter()
+        .filter(|cookie| cookie_belongs_to_site(cookie.domain().unwrap_or(""), &host))
+        .map(|cookie| (cookie.name().to_string(), cookie.value().to_string()))
+        .collect();
+
+    // ⑤ 校验 + 接上会话；失败时窗口**留着**、相位留在人工态，用户可以重试
+    state
+        .service
+        .complete_captcha(site_id, pairs)
+        .map_err(|e| e.to_string())?;
+
+    // ⑥ 成功才关窗（`destroy` 不发事件；相位已回 `Idle`）
+    let _ = window.destroy();
+    Ok(())
+}
+
+/// 取消人工验证（关窗）：相位回 `Idle`，窗口关闭。幂等（T6 / T8）。
+#[tauri::command]
+pub async fn captcha_cancel<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    site_id: i64,
+) -> Result<(), String> {
+    state.service.cancel_captcha(site_id);
+    if let Some(window) = app.get_webview_window(&captcha_window_label(site_id)) {
+        let _ = window.destroy();
+    }
+    Ok(())
+}
+
 /// 落盘一份环境/自启计划。
 ///
 /// Windows 形态（`EnvPlan::Registry`）走 `reg.exe`，**不经 shell**——值里的空格、
@@ -2010,5 +2235,79 @@ mod tests {
         .expect("解析 CreateKeyArgs");
         assert_eq!(create.site_id, 7);
         assert_eq!(create.group.as_deref(), Some("default"));
+    }
+
+    // ---------- M8-S2：人工过验证码（窗口/cookie 归属的接线细节） ----------
+
+    #[test]
+    fn captcha_challenge_dto_serializes_in_camel_case() {
+        let challenge = CaptchaChallengeDto {
+            site_id: 7,
+            url: "https://relay.example.com/login".into(),
+        };
+        let value = to_value(&challenge);
+        assert_eq!(value["siteId"], 7);
+        assert_eq!(value["url"], "https://relay.example.com/login");
+    }
+
+    #[test]
+    fn captcha_cookie_domain_filter_keeps_only_the_sites_cookies() {
+        // 本站的 cookie（精确 / 前导点 / 大小写 / 父域四种写法）留下
+        assert!(cookie_belongs_to_site(
+            "relay.example.com",
+            "relay.example.com"
+        ));
+        assert!(cookie_belongs_to_site(
+            ".relay.example.com",
+            "relay.example.com"
+        ));
+        assert!(cookie_belongs_to_site(
+            "Relay.Example.COM",
+            "relay.example.com"
+        ));
+        assert!(
+            cookie_belongs_to_site("example.com", "relay.example.com"),
+            "注册域 cookie 覆盖本站（站点把 cookie 设在父域上）"
+        );
+        // 别的站 / 后缀伪装 / 空 domain 一律不留（fail-closed）
+        assert!(!cookie_belongs_to_site(
+            "other.example.com",
+            "relay.example.com"
+        ));
+        assert!(
+            !cookie_belongs_to_site("ample.com", "relay.example.com"),
+            "「半个标签」的后缀伪装不得命中"
+        );
+        assert!(!cookie_belongs_to_site(
+            "example.com.evil.com",
+            "relay.example.com"
+        ));
+        assert!(!cookie_belongs_to_site("", "relay.example.com"));
+        assert!(!cookie_belongs_to_site("relay.example.com", ""));
+    }
+
+    #[test]
+    fn site_host_of_strips_port_and_userinfo() {
+        assert_eq!(
+            site_host_of("https://relay.example.com").as_deref(),
+            Some("relay.example.com")
+        );
+        assert_eq!(
+            site_host_of("https://relay.example.com:8443/x").as_deref(),
+            Some("relay.example.com")
+        );
+        assert_eq!(
+            site_host_of("http://alice:pw@relay.example.com/api").as_deref(),
+            Some("relay.example.com")
+        );
+        assert_eq!(
+            site_host_of("http://127.0.0.1:8787").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            site_host_of("https://[::1]:8443/x").as_deref(),
+            Some("[::1]")
+        );
+        assert_eq!(site_host_of("https://").as_deref(), None);
     }
 }

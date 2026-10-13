@@ -1,6 +1,7 @@
 //! 站点适配器契约与共享类型。
 
 pub mod capability;
+pub mod captcha;
 pub mod custom_openai;
 pub mod newapi;
 pub mod password_crypto;
@@ -53,6 +54,50 @@ pub struct SiteFingerprint {
     pub kind: SiteKind,
     pub display_name: String,
     pub version: Option<String>,
+}
+
+/// 一次需要人工过验证码的会话（FR-1:102）。
+///
+/// **不含任何密钥**：`url` 是站点页面地址，用户在 WebView 里过完验证之后站点下发的
+/// 会话凭证**不进这个结构**——它由 [`captcha::session_from_captcha_cookies`] 直接变成
+/// [`Session`]（进内存 / 钥匙串，不进 SQLite、不进日志、不进事件）。
+///
+/// # 红线（章程 §3.2）
+///
+/// **不绕过验证码**：本结构存在的唯一理由是「把**官方页面**给用户，让用户自己过一次」。
+/// `url` 只可能是 `{站点 origin}/login`（[`captcha::captcha_page_url`]），
+/// 不含 userinfo、不指向第三方 host。
+#[derive(Clone, PartialEq, Eq)]
+pub struct CaptchaChallenge {
+    pub site_id: i64,
+    pub url: String,
+}
+
+impl std::fmt::Debug for CaptchaChallenge {
+    /// 手写 `Debug`：**只打 `site_id` 与 host**。
+    ///
+    /// 不打 path/query：页面地址可能带查询串（真实站点常见 `?redirect=…`），
+    /// 而 `Debug` 会进日志与 panic 信息——那是 cookie 之外的线索面，能不打就不打。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CaptchaChallenge")
+            .field("site_id", &self.site_id)
+            .field("host", &captcha::host_of(&self.url))
+            .finish()
+    }
+}
+
+/// 把地址渲染成**可以进文案**的形态（复核 N-2 / M8-S2 §6）。
+///
+/// 一步就够：[`crate::redact::mask_authority_userinfo`] **已经**覆盖了「有 scheme」与
+/// 「无 scheme（`carol:pw@host`）」两种形态，也取**最后一个** `@`（`a@b:pw@host` 不会漏）。
+/// 之所以不在这里再补第二道「结果里还有 `@` 就整段掩」：掩完之后 authority 里**必然**
+/// 还有一个分隔用的 `@`（`***@host`），那种判据只会把 host 一起掩掉——掩得更多，
+/// 但用户就再也不能从文案里认出是哪个站了（排障能力是我们明确要保留的）。
+///
+/// **只用于显示**：不改变任何请求用的 URL（请求仍用原始 `base_url`）。
+/// 宁可多掩：掩错了只影响显示，漏掩是泄漏。
+pub(crate) fn display_url(raw: &str) -> String {
+    crate::redact::mask_authority_userinfo(raw)
 }
 
 /// 会话凭证。**禁止** derive Debug 泄露 cookie/token，故手写 `Debug`。
@@ -469,6 +514,44 @@ mod tests {
     fn key_material_debug_hides_secret() {
         let k = KeyMaterial::new("12", "sk-abcdefgh12345678");
         assert!(!format!("{k:?}").contains("sk-abcdefgh"));
+    }
+
+    // ============================================================ M8-S2（复核 N-2 的显示层）
+
+    /// spec §6.5 第 5 行（T16）：`display_url` 的纯函数表。
+    #[test]
+    fn display_url_masks_only_the_userinfo() {
+        // 带 scheme：authority 里的 userinfo 整段变 `***`
+        assert_eq!(
+            display_url("https://alice:supersecret123@host.example"),
+            "https://***@host.example"
+        );
+        // 纯字母数字的密码（不匹配 `scrub` 的任何规则，也必须掩住）
+        assert_eq!(
+            display_url("https://bob:pw123456@host.example"),
+            "https://***@host.example"
+        );
+        // 无 scheme——`strip_url_userinfo` 明确「不猜」的形态，本函数必须处理
+        assert_eq!(
+            display_url("carol:pw654321@host.example/x"),
+            "***@host.example/x"
+        );
+        // 没有 userinfo ⇒ 逐字不变
+        assert_eq!(
+            display_url("https://plain.example.com"),
+            "https://plain.example.com"
+        );
+        // `@` 在路径里（不是 userinfo）⇒ 不动
+        assert_eq!(display_url("https://h/a@b"), "https://h/a@b");
+        // 多个 `@`：取最后一个（它前面的整段都掩掉）
+        assert_eq!(
+            display_url("https://a@b:pw@host.example"),
+            "https://***@host.example"
+        );
+        // 掩完之后仍要认得出来是哪个站（排障能力是刻意保留的）
+        let shown = display_url("https://alice:pw@host.example/api/status 返回 404");
+        assert!(shown.contains("host.example"), "{shown}");
+        assert!(!shown.contains("alice") && !shown.contains("pw"), "{shown}");
     }
 
     #[test]

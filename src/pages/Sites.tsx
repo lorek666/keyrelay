@@ -3,7 +3,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Plus, RefreshCw } from "lucide-react";
 import {
   addSite,
+  captchaBegin,
+  captchaCancel,
+  captchaComplete,
   detectSite,
+  isCaptchaRequired,
   listSites,
   loginSite,
   siteBalance,
@@ -22,6 +26,10 @@ export default function Sites() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [secondFactor, setSecondFactor] = useState("");
+  /** 处于人工验证兜底流程的站点（M8-S2）：登录被要求人机验证时置上。 */
+  const [captchaSite, setCaptchaSite] = useState<SiteRow | null>(null);
+  /** 官方页面窗口是否已打开（打开后才能提交「我已过完」）。 */
+  const [captchaOpened, setCaptchaOpened] = useState(false);
 
   const sites = useQuery({ queryKey: ["sites"], queryFn: listSites });
 
@@ -67,13 +75,67 @@ export default function Sites() {
       setPassword("");
       setSecondFactor("");
       setLoginTarget(null);
-      await qc.invalidateQueries({ queryKey: ["keys"] });
+      // 登录改变的是「会话状态」与「远端密钥的可见性」。
+      // 此处早先失效的是 `["keys"]`——**那个 key 从来不存在**（实际叫 `["stored-keys"]`，
+      // 见 Keys.tsx / Overview.tsx），于是这条失效一直在空转（M8-S5A §3.6-6 的同一条，
+      // 本次随人工验证批次一并订正）。
+      await qc.invalidateQueries({ queryKey: ["sites"] });
+      await qc.invalidateQueries({ queryKey: ["stored-keys"] });
+      await qc.invalidateQueries({ queryKey: ["remote-keys"] });
+      await qc.invalidateQueries({ queryKey: ["balance"] });
     },
     onError: (err: Error) => {
       // 失败时也要清密码：错误文案由后端给，前端不留副本
       setPassword("");
+      if (isCaptchaRequired(err)) {
+        // 人工兜底通道（M8-S2 / FR-1:102）：站点要求人机验证。
+        // 按红线**不绕过**——收起登录框，切到「打开官方页面过一次」面板，让用户自己过。
+        setError(null);
+        setLoginTarget(null);
+        setCaptchaSite(loginTarget);
+        setCaptchaOpened(false);
+        return;
+      }
       setError(err.message);
     },
+  });
+
+  // 打开站点官方页面（内嵌窗口由后端创建；用户自己在窗口里过验证码）。
+  const beginCaptcha = useMutation({
+    mutationFn: (siteId: number) => captchaBegin(siteId),
+    onSuccess: () => {
+      setError(null);
+      setCaptchaOpened(true);
+      setNotice("已打开站点官方页面。请在窗口里由您自己完成登录与验证码，完成后回到这里点「我已过完，接上会话」。");
+    },
+    onError: (err: Error) => setError(err.message),
+  });
+
+  // 「我已过完」：后端去窗口里抓会话 cookie（值不经过前端）并接上会话。
+  const finishCaptcha = useMutation({
+    mutationFn: (siteId: number) => captchaComplete(siteId),
+    onSuccess: async () => {
+      setError(null);
+      setNotice(`人机验证完成，会话已接上：${captchaSite?.displayName ?? ""}`);
+      setCaptchaSite(null);
+      setCaptchaOpened(false);
+      // 与「登录成功」同一组失效：会话状态、远端/本地密钥、余额。
+      await qc.invalidateQueries({ queryKey: ["sites"] });
+      await qc.invalidateQueries({ queryKey: ["stored-keys"] });
+      await qc.invalidateQueries({ queryKey: ["remote-keys"] });
+      await qc.invalidateQueries({ queryKey: ["balance"] });
+    },
+    onError: (err: Error) => setError(err.message),
+  });
+
+  const cancelCaptcha = useMutation({
+    mutationFn: (siteId: number) => captchaCancel(siteId),
+    onSuccess: () => {
+      setNotice("已取消人工验证。需要时重新点「登录」即可再试一次。");
+      setCaptchaSite(null);
+      setCaptchaOpened(false);
+    },
+    onError: (err: Error) => setError(err.message),
   });
 
   return (
@@ -117,6 +179,43 @@ export default function Sites() {
         <p className="error" role="alert">
           <AlertTriangle size={14} aria-hidden /> {error}
         </p>
+      ) : null}
+
+      {captchaSite ? (
+        <div className="card">
+          <h3>需要人机验证：{captchaSite.displayName}</h3>
+          <p className="muted">
+            该站点要求人机验证。KeyRelay 不绕过验证码——请点下面的按钮打开站点官方页面，
+            由您自己完成登录与验证；过完之后回到这里点「我已过完，接上会话」。
+            窗口里的页面是站点自己的页面，我们不会替您点击、也不会读取页面内容。
+          </p>
+          <div className="row">
+            <button
+              type="button"
+              className="btn"
+              disabled={beginCaptcha.isPending}
+              onClick={() => beginCaptcha.mutate(captchaSite.id)}
+            >
+              打开官方页面过一次
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={!captchaOpened || finishCaptcha.isPending}
+              onClick={() => finishCaptcha.mutate(captchaSite.id)}
+            >
+              {finishCaptcha.isPending ? "接上会话中…" : "我已过完，接上会话"}
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              disabled={cancelCaptcha.isPending}
+              onClick={() => cancelCaptcha.mutate(captchaSite.id)}
+            >
+              取消
+            </button>
+          </div>
+        </div>
       ) : null}
 
       <div className="card">

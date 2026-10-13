@@ -490,6 +490,8 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
 
     async fn detect(&self, base_url: &str) -> Result<SiteFingerprint> {
         let url = format!("{}/api/status", normalize_base_url(base_url));
+        // 复核 N-2：文案用掩过 userinfo 的形态，请求仍用 `url`（一字不改）。
+        let shown = super::display_url(&url);
         let resp = self
             .transport
             .request(HttpRequest::new(Method::Get, url.clone()))
@@ -497,13 +499,13 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
 
         if resp.status != 200 {
             return Err(Error::FingerprintMismatch(format!(
-                "{url} 返回 {}",
+                "{shown} 返回 {}",
                 resp.status
             )));
         }
 
         let value = resp.json_value().map_err(|_| {
-            Error::FingerprintMismatch(format!("{url} 不是 JSON，可能不是 NewAPI 站点"))
+            Error::FingerprintMismatch(format!("{shown} 不是 JSON，可能不是 NewAPI 站点"))
         })?;
 
         let data = value

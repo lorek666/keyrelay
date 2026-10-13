@@ -53,4 +53,8 @@ pub const COMMANDS: &[&str] = &[
     // M8-S4：解绑（FR-2:115）、网关令牌轮换（§6.4）
     "unbind_agent",
     "gateway_rotate_token",
+    // M8-S2：人工过验证码（FR-1:102）
+    "captcha_begin",
+    "captcha_complete",
+    "captcha_cancel",
 ];
