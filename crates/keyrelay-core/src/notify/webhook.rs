@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::redact::{scrub, strip_url_userinfo};
+use crate::redact::{mask_url_userinfo_in_json, scrub, strip_url_userinfo};
 use crate::site::transport::{HttpRequest, HttpTransport, Method};
 use crate::site::transport_reqwest::{ReqwestTransport, TransportConfig};
 
@@ -142,19 +142,38 @@ impl Notifier for WebhookNotifier {
     }
 }
 
-/// 纯函数：构造 Webhook 报文。**内部对整段 JSON 文本再过一次 `scrub`**。
+/// 纯函数：构造 Webhook 报文。
 ///
-/// 整串脱敏不会破坏 JSON：`scrub` 的 token 字符集不含 `"`，掩码只能发生在字符串字面量内部；
-/// 未加引号的数字只有 `site_id` / `ts`，数量级远小于「≥32 位 hex」的阈值。
+/// # 脱敏是两层，两层都留（§3.5-7 / M8-S3 §9）
+///
+/// 1. **结构化层**（先跑）：对 [`serde_json::Value`] 调 [`mask_url_userinfo_in_json`]——
+///    按**值**的边界找 authority，密码里的引号 / 反斜杠 / 空白都算在 authority 之内，
+///    且**不要求整个值就是 URL**（句内 URL 也掩）；
+/// 2. **文本层**（后跑）：整段 JSON 文本过 [`scrub`]——按文本规则猜 authority 边界
+///    （authority 止于 `"` `\` 空白 ⇒ 带引号的密码它掩不住，这正是第 1 层存在的理由），
+///    并兜住 `sk-` / `nap-` / 长 hex 这些 URL 之外的凭证形态。
+///
+/// 两层都不会破坏 JSON：结构化层只改字符串值的内容，`scrub` 的 token 字符集不含 `"`，
+/// 掩码只能发生在字符串字面量内部；未加引号的数字只有 `site_id` / `ts`，
+/// 数量级远小于「≥32 位 hex」的阈值。
+///
+/// # 已知边界（M8-S3 独立复审 P1-3，已修但记在这里）
+///
+/// 结构化层的 authority 只止于 `/` `?` `#` 与值结尾，**不校验** `://` 之后是不是真
+/// authority ⇒ 正常句子里的 `foo://bar@baz` 也会被掩成 `foo://***@baz`。方向取
+/// 「宁可多掩」：它只影响显示，而漏一个密码的代价不可撤销。
 pub fn webhook_payload(n: &Notification) -> String {
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "kind": n.kind.as_str(),
         "site_id": n.site_id,
         "title": n.title,
         "body": n.body,
         "ts": n.ts,
     });
+    // 第一层：结构化 URL 掩码（在序列化之前，那时值还是未转义的原样）
+    mask_url_userinfo_in_json(&mut value);
     match serde_json::to_string(&value) {
+        // 第二层：整串脱敏（含 URL 文本规则 + 前缀型凭证 + 长 hex）
         Ok(text) => scrub(&text),
         // 不可达（`Value` 一定能序列化）。真出问题也绝不把未脱敏的内容发出去。
         Err(_) => scrub(r#"{"kind":"unknown","site_id":null,"title":"","body":"","ts":0}"#),
@@ -294,6 +313,90 @@ mod tests {
         assert!(!text.contains(SECRET), "{text}");
         assert!(!text.contains(PAT), "{text}");
         assert!(text.contains("sk-***"), "{text}");
+    }
+
+    #[test]
+    fn payload_masks_url_userinfo_on_both_layers() {
+        // 两个形态各测一个：① 整个值就是 URL（带引号的密码）② URL 嵌在句子里。
+        // 两层都留的理由见 `webhook_payload` 的文档。
+        let mut n = note();
+        n.title = "https://alice:p\"w@hook.example.com/x".to_string();
+        n.body = "详见 https://bob:pw2@other.example.com/y 已下线".to_string();
+
+        let text = webhook_payload(&n);
+        assert!(!text.contains("alice"), "用户名漏了: {text}");
+        assert!(!text.contains("p\"w"), "带引号的密码漏了: {text}");
+        assert!(!text.contains("bob"), "句内 URL 的用户名漏了: {text}");
+        assert!(!text.contains("pw2"), "句内 URL 的密码漏了: {text}");
+        // 可诊断性要留着：主机不丢
+        assert!(text.contains("hook.example.com"), "{text}");
+        assert!(text.contains("other.example.com"), "{text}");
+
+        // ① 证明文本层**掩不住带引号的密码**：只跑旧的文本层（序列化后整串 scrub），
+        //    带引号的密码会因为 `\` 被当成 authority 终止符而整段漏掉。
+        let mut value = serde_json::json!({
+            "kind": n.kind.as_str(),
+            "site_id": n.site_id,
+            "title": n.title,
+            "body": n.body,
+            "ts": n.ts,
+        });
+        let text_only = scrub(&serde_json::to_string(&value).expect("可序列化"));
+        assert!(
+            text_only.contains("alice") && text_only.contains("p\\\"w"),
+            "文本层本该漏掉带引号的密码（这正是结构化层要补的）: {text_only}"
+        );
+
+        // ② 证明文本层**掩不住句内 URL** 的那一半（简单密码它其实掩得住，见下）；
+        //    结构化层则两种都掩 —— 它不把 `"` `\` 空白当 authority 终止符。
+        mask_url_userinfo_in_json(&mut value);
+        let structured_only = serde_json::to_string(&value).expect("可序列化");
+        assert!(
+            !structured_only.contains("alice"),
+            "结构化层必须掩掉整个值是 URL 的那种: {structured_only}"
+        );
+        assert!(
+            !structured_only.contains("bob") && !structured_only.contains("pw2"),
+            "结构化层也必须掩掉句内 URL（M8-S3 复审 P1-3 修的正是这个）: {structured_only}"
+        );
+    }
+
+    #[test]
+    fn payload_masks_an_embedded_url_with_an_escaped_password() {
+        // M8-S3 独立复审 P1-3 的最小反例：URL **不在值的开头**、且密码含引号。
+        // 修前两层全漏——结构化层要求「整个值是 URL」，文本层把 `\` 当 authority 终止符。
+        let mut n = note();
+        n.title = "见 https://alice:p\"w@hook.example.com/x 已失效".to_string();
+
+        let text = webhook_payload(&n);
+        assert!(!text.contains("alice"), "用户名漏了: {text}");
+        assert!(!text.contains("p\\\"w"), "带引号的密码漏了: {text}");
+        assert!(
+            text.contains("hook.example.com"),
+            "主机要留着（可诊断性）: {text}"
+        );
+        // 报文仍是合法 JSON
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("合法 JSON");
+        assert_eq!(parsed["kind"], "balance_low");
+    }
+
+    #[test]
+    fn payload_masks_a_url_whose_password_holds_whitespace_or_angle_brackets() {
+        // 同一族的其它终止符：空白、`<`、`>`、反引号。文本层的 authority 在第一个
+        // 这类字符处断掉 ⇒ 找不到 `@` ⇒ 漏。结构化层一路读到 `/` `?` `#`。
+        for password in ["p w", "p<w", "p>w", "p`w", "p\\\\w"] {
+            let mut n = note();
+            n.title = format!("站 https://alice:{password}@hook.example.com/x 挂了");
+            let text = webhook_payload(&n);
+            assert!(
+                !text.contains("alice"),
+                "密码 {password:?} 的用户名漏了: {text}"
+            );
+            assert!(
+                !text.contains(&format!(":{password}@")),
+                "密码 {password:?} 漏了: {text}"
+            );
+        }
     }
 
     #[test]
