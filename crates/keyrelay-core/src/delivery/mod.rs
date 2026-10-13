@@ -395,8 +395,9 @@ pub fn resolve_for(
 ///
 /// `provider_id` 为空（trim 后）时**在这里就报错**，而不是等到 `plan()`：
 /// 调用方传空 provider 名是接线错误，早报比写到一个 `provider.""` 上强。
-/// `model` 为 `None` 或 trim 后为空 → 不写、也不动已有的 `model` 键（`Continue` 同理：
-/// 不写 `model:` 行，**不编造默认模型**）。
+/// `model` 为 `None` 或 trim 后为空 → 不写、也不动已有的 `model` 键。`Continue` 例外：
+/// 它的 schema 把条目的 `model` 定为必填，于是沿用受管块里已有的，块里也没有就**拒绝**
+/// ——两种情况都**不编造默认模型**。
 pub fn resolve_for_binding(
     channel: DeliveryChannel,
     home: &Path,

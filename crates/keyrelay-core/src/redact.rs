@@ -272,8 +272,16 @@ pub fn strip_url_userinfo(url: &str) -> String {
 ///
 /// 与 [`strip_url_userinfo`] 的区别：那个函数的输入是**一整个 URL**，这里的输入是
 /// 任意文本（事件文案、序列化后的 payload、错误信息），所以 authority 除了止于
-/// `/` `?` `#`，还止于空白、引号、尖括号、反引号与反斜杠——否则 JSON 里的
-/// `"https://u:p@h"` 会把结尾引号吃进 authority。
+/// `/` `?` `#`，还止于空白、双引号、尖括号、反引号与反斜杠——否则 JSON 里的
+/// `"https://u:p@h"` 会把结尾引号吃进 authority。这几个字符 RFC 3986 都不允许裸出现在
+/// userinfo 里，URL 解析器（`reqwest`）序列化时会转成 `%XX`。
+///
+/// **不**在单引号与 `,` `;` `(` `)` 等 sub-delims 处截断：它们在 userinfo 里是合法的、
+/// 解析后原样保留，截断就会把 `p'w@host` 切成没有 `@` 的片段而整段放行（独立复审 P2-1）。
+/// 代价是相邻文本里的 `@` 偶尔被多掩一段——只影响显示，不泄漏。
+///
+/// 结构化值里**整个值就是 URL** 的字符串另走 [`mask_whole_url_userinfo`]：那里知道值在
+/// 哪儿结束，不需要靠上面这些字符去猜。
 ///
 /// 为什么放在 `scrub` 里而不是各调用点（B-63 只剥了导出的 `sites[].base_url`）：
 /// 事件 payload 原样记着 `base_url`，按调用点剥就一定会漏一处；`scrub` 是
@@ -287,8 +295,7 @@ fn mask_url_userinfo(input: &str) -> String {
         let tail = &rest[authority_start..];
         let authority_end = tail
             .find(|c: char| {
-                matches!(c, '/' | '?' | '#' | '"' | '\'' | '<' | '>' | '`' | '\\')
-                    || c.is_whitespace()
+                matches!(c, '/' | '?' | '#' | '"' | '<' | '>' | '`' | '\\') || c.is_whitespace()
             })
             .unwrap_or(tail.len());
         let authority = &tail[..authority_end];
@@ -303,6 +310,46 @@ fn mask_url_userinfo(input: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// **整个值就是一个 URL**（`scheme://` 开头）时，按整串 URL 的口径把 userinfo 换成 [`MASK`]：
+/// authority 只止于 `/` `?` `#`（与 [`strip_url_userinfo`] 同口径），密码里的引号、空白、
+/// 尖括号、反斜杠都算在 authority 之内。不是这种形态 ⇒ 原样返回。
+///
+/// 只用于**已知边界**的值（JSON 字符串值）；任意文本仍走 [`mask_url_userinfo`]。
+fn mask_whole_url_userinfo(value: &str) -> String {
+    let Some(scheme_end) = value.find("://") else {
+        return value.to_string();
+    };
+    let scheme = &value[..scheme_end];
+    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if !is_scheme {
+        return value.to_string();
+    }
+    let authority_start = scheme_end + "://".len();
+    let rest = &value[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{}{MASK}{}", &value[..authority_start], &rest[at..]),
+        None => value.to_string(),
+    }
+}
+
+/// 结构化载荷里每个「整个值就是 URL」的字符串过 [`mask_whole_url_userinfo`]（递归进容器）。
+///
+/// 给**事件写入口**用（`observability::event_with_payload`）：那里随后对序列化文本做的
+/// [`scrub`] 只能按文本规则猜 authority 的边界，带引号的密码会漏（独立复审 P2-1）。
+/// 不按键名打码——那是导出侧 [`scrub_payload`] 的契约，写入口不改变它。
+pub fn mask_url_userinfo_in_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = mask_whole_url_userinfo(text),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(mask_url_userinfo_in_json),
+        serde_json::Value::Object(map) => map.values_mut().for_each(mask_url_userinfo_in_json),
+        _ => {}
+    }
 }
 
 /// 钥匙串引用的段字符集：`kr/<scope>/<id>/<field>` 的 scope / id / field 只可能是这些字符。
@@ -405,7 +452,8 @@ fn is_sensitive_key(key: &str) -> bool {
     SENSITIVE_KEYS.contains(&normalized.as_str())
 }
 
-/// 递归脱敏一个 JSON 值：对象按键名判命中，数组逐元素递归，字符串值过 [`scrub`]。
+/// 递归脱敏一个 JSON 值：对象按键名判命中，数组逐元素递归，字符串值先过
+/// [`mask_whole_url_userinfo`]（整个值是 URL 时）再过 [`scrub`]。
 fn scrub_json_value(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -418,7 +466,9 @@ fn scrub_json_value(value: &mut serde_json::Value) {
                     }
                     // 命中键的标量值整体换成 MASK（含 null / 数字 / 布尔：不保留类型）
                     _ if sensitive => *child = serde_json::Value::String(MASK.to_string()),
-                    serde_json::Value::String(text) => *text = scrub(text.as_str()),
+                    serde_json::Value::String(text) => {
+                        *text = scrub(&mask_whole_url_userinfo(text))
+                    }
                     _ => {}
                 }
             }
@@ -428,7 +478,7 @@ fn scrub_json_value(value: &mut serde_json::Value) {
                 scrub_json_value(item);
             }
         }
-        serde_json::Value::String(text) => *text = scrub(text.as_str()),
+        serde_json::Value::String(text) => *text = scrub(&mask_whole_url_userinfo(text)),
         _ => {}
     }
 }
@@ -764,6 +814,44 @@ mod tests {
     fn scrub_url_userinfo_is_idempotent() {
         let once = scrub("见 https://alice:s3cretPW@relay.example.com/v1");
         assert_eq!(scrub(&once), once);
+    }
+
+    /// RFC 3986 的 userinfo 允许 sub-delims（`!$&'()*+,;=`），`reqwest` 解析后 `'` 也原样保留：
+    /// 文本规则在它们处截断 authority，截出的片段里没有 `@`，整段就放行了（独立复审 P2-1）。
+    #[test]
+    fn scrub_masks_userinfo_with_sub_delims_in_the_password() {
+        assert_eq!(
+            scrub("连接 https://alice:p'w(x),y;z@relay.example.com/v1 失败"),
+            "连接 https://***@relay.example.com/v1 失败"
+        );
+    }
+
+    /// JSON 文本里 URL 止于结尾引号：引号之后另一个值里的 `@` 不是 userinfo（独立复审 P3-3）。
+    #[test]
+    fn scrub_stops_the_authority_at_a_json_quote() {
+        let text = r#"{"a":"https://h","b":"u@x"}"#;
+        assert_eq!(scrub(text), text);
+    }
+
+    /// 结构化值里「整个值就是 URL」的字符串：authority 只止于 `/` `?` `#`（与
+    /// [`strip_url_userinfo`] 同口径），密码里的引号、空白、尖括号、反引号、反斜杠都算在
+    /// authority 之内——文本规则不知道值在哪儿结束，做不到这一点（独立复审 P2-1）。
+    #[test]
+    fn scrub_payload_masks_userinfo_of_a_whole_url_value() {
+        for special in ["'", "\"", " ", "<", "`", "\\"] {
+            let url = format!("https://alice:pw{special}tail@relay.example.com/v1");
+            let raw = serde_json::json!({"base_url": url, "list": [url]}).to_string();
+            let scrubbed = scrub_payload(Some(&raw)).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&scrubbed).unwrap();
+            assert_eq!(
+                value["base_url"], "https://***@relay.example.com/v1",
+                "{special:?}"
+            );
+            assert_eq!(
+                value["list"][0], "https://***@relay.example.com/v1",
+                "{special:?}"
+            );
+        }
     }
 
     // ---------- M5-S1：scrub_reference_tokens ----------

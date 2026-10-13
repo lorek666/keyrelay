@@ -94,12 +94,16 @@ pub fn event(level: Level, source: &str, message: impl AsRef<str>) -> Event {
 }
 
 /// 唯一入口（带载荷）。载荷整体序列化后过 `scrub`，嵌套深层的密钥同样会被替换。
+///
+/// 序列化**之前**先把「整个值就是 URL」的字符串按 URL 口径掩掉 userinfo：序列化后的
+/// 文本里，密码中的 `"` 已变成 `\"`，文本规则找不到 authority 的真实边界（独立复审 P2-1）。
 pub fn event_with_payload(
     level: Level,
     source: &str,
     message: impl AsRef<str>,
-    payload: Value,
+    mut payload: Value,
 ) -> Event {
+    crate::redact::mask_url_userinfo_in_json(&mut payload);
     let mut e = event(level, source, message);
     // `serde_json::to_string` 对 `Value` 不会失败；失败时退化为不带载荷而不是 panic。
     e.payload = serde_json::to_string(&payload).ok().map(|s| scrub(&s));
