@@ -21,7 +21,6 @@ fn is_token_char(c: char) -> bool {
 ///
 /// 该函数是幂等的：对已脱敏的文本再次调用结果不变。
 pub fn scrub(input: &str) -> String {
-    let input = mask_url_userinfo(input);
     let mut out = String::with_capacity(input.len());
     let bytes: Vec<char> = input.chars().collect();
     let mut i = 0usize;
@@ -70,7 +69,10 @@ pub fn scrub(input: &str) -> String {
         i += 1;
     }
 
-    out
+    // URL 规则放在**最后**：前缀规则的 token 字符含 `/`，`sk-…/p@x` 被整段吞成 `sk-***` 之后，
+    // `@` 就贴到了 authority 上。URL 规则若先跑，这个 `@` 要到第二遍 `scrub` 才被掩，
+    // 幂等就破了（复核 N-1）。前缀 / hex 规则不会吃掉 `@` 或 `://`，所以放在最后掩得只多不少。
+    mask_url_userinfo(&out)
 }
 
 /// 判断一段文本中是否**可能**仍含未脱敏凭证（用于测试与运行时自检）。
@@ -268,7 +270,7 @@ pub fn strip_url_userinfo(url: &str) -> String {
     out
 }
 
-/// [`scrub`] 的第一步：**文本里**每个 `scheme://userinfo@host` 的 userinfo 换成 [`MASK`]。
+/// [`scrub`] 的最后一步：**文本里**每个 `scheme://userinfo@host` 的 userinfo 换成 [`MASK`]。
 ///
 /// 与 [`strip_url_userinfo`] 的区别：那个函数的输入是**一整个 URL**，这里的输入是
 /// 任意文本（事件文案、序列化后的 payload、错误信息），所以 authority 除了止于
@@ -814,6 +816,47 @@ mod tests {
     fn scrub_url_userinfo_is_idempotent() {
         let once = scrub("见 https://alice:s3cretPW@relay.example.com/v1");
         assert_eq!(scrub(&once), once);
+    }
+
+    /// 前缀规则的 token 字符含 `/`：`sk-…/p` 被整段吞掉后，`@` 贴到了 authority 上，
+    /// 第二遍才被 URL 规则掩掉——违反幂等契约（独立复核 N-1，复核者模糊测试的反例）。
+    /// 片段穷举（长度 ≤ 4）覆盖前缀、URL、hex 三条规则两两相邻的组合。
+    #[test]
+    fn scrub_is_idempotent_across_rule_interactions() {
+        for text in [
+            "见 https://sk-abcdefgh.example.com/p@x",
+            "\\b\\(中://sk-bahttps/b@",
+        ] {
+            let once = scrub(text);
+            assert_eq!(scrub(&once), once, "{text:?}");
+        }
+
+        let fragments = [
+            "sk-abcdefgh",
+            "Bearer ",
+            "0123456789abcdef0123456789abcdef",
+            "https://",
+            "@",
+            "/",
+            "p",
+            " ",
+            "\"",
+            "'",
+            "h.example.com",
+            "中",
+        ];
+        let n = fragments.len();
+        for len in 1..=4u32 {
+            for mut code in 0..n.pow(len) {
+                let mut text = String::new();
+                for _ in 0..len {
+                    text.push_str(fragments[code % n]);
+                    code /= n;
+                }
+                let once = scrub(&text);
+                assert_eq!(scrub(&once), once, "{text:?}");
+            }
+        }
     }
 
     /// RFC 3986 的 userinfo 允许 sub-delims（`!$&'()*+,;=`），`reqwest` 解析后 `'` 也原样保留：
