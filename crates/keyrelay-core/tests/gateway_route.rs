@@ -62,8 +62,10 @@ fn unknown_balance_sorts_between_healthy_and_exhausted() {
 }
 
 #[test]
-fn nan_and_negative_rate_sort_last_without_panicking() {
-    // NaN 必须被当成「未知」而不是参与比较；负倍率按数值升序（会排在 0 之前）
+fn negative_rate_sorts_by_value_and_nan_is_safe() {
+    // 这条原本叫 `nan_and_negative_rate_sort_last_without_panicking`，但它自己的断言是
+    // 「**负倍率按数值升序、排最前**（`[2,3,1]`）」——名字与断言矛盾，会误导下一个人
+    // （M7-S1 复审 P2-1）。行为是对的，只改名。
     let table = RouteTable::new(vec![
         up(1, Some(f64::NAN), Some(1.0), None),
         up(2, Some(-1.0), Some(1.0), None),

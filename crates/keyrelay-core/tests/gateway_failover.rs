@@ -346,3 +346,91 @@ async fn unknown_model_404s_instead_of_falling_back() {
 
     handle.shutdown_and_wait().await;
 }
+
+/// **M7-S1 复审 P1-1 的回归**：`model` 是调用方自由文本，**可以是密钥形状**。
+///
+/// 出口 `store.insert_event` 原样入库（不做脱敏），所以脱敏必须在**值被创造的地方**完成——
+/// 即 `report_failure` 里先过 `redact::scrub`。若把义务推给下游，密钥形状的自由文本
+/// 会进事件表并随导出与审计外流（B-75 同类）。
+///
+/// 同时断言**另一半**：正常的模型名不得被整条吃掉（否则事件就失去了「这是哪个模型」的信息）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failure_event_scrubs_a_key_shaped_model() {
+    const KEY_SHAPED: &str = "sk-PROBE-LEAK-0123456789abcdef";
+
+    /// 起一个「只服务 `models` 里那些名字」的两上游网关（A 恒 503、B 恒 200）。
+    async fn start_with_models(
+        models: Vec<String>,
+    ) -> (GatewayHandle, String, Failures, FakeUpstream, FakeUpstream) {
+        let a = spawn_upstream_always(1, REF_A, "503 Service Unavailable");
+        let b = spawn_upstream_always(2, REF_B, "200 OK");
+        let mut up_a = a.upstream(0.1);
+        up_a.models = models.clone();
+        let mut up_b = b.upstream(1.0);
+        up_b.models = models;
+
+        let failures: Failures = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&failures);
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(REF_A.to_string(), Zeroizing::new(KEY_A.to_string()));
+        keys.insert(REF_B.to_string(), Zeroizing::new(KEY_B.to_string()));
+
+        let handle = start(GatewayConfig {
+            port: 0,
+            token: generate_token(),
+            base_url: String::new(),
+            api_key: String::new(),
+            site_display_name: "路由模式".to_string(),
+            route: RouteTable::new(vec![up_a, up_b]),
+            breaker: long_cooldown(),
+            keys_by_ref: keys,
+            on_failure: Some(Arc::new(move |f| {
+                if let Ok(mut log) = sink.lock() {
+                    log.push(f);
+                }
+            })),
+        })
+        .await
+        .expect("网关应能启动");
+        let token = handle.token.clone();
+        (handle, token, failures, a, b)
+    }
+
+    // ---- ① 密钥形状的模型名：必须被打码 ----
+    let (handle, token, failures, a, _b) = start_with_models(vec![KEY_SHAPED.to_string()]).await;
+    let body = format!(r#"{{"model":"{KEY_SHAPED}","messages":[]}}"#);
+    assert_eq!(
+        post(&handle, &token, &body).await.0,
+        200,
+        "应当切到第二个上游"
+    );
+
+    {
+        let events = failures.lock().unwrap();
+        assert_eq!(events.len(), 1, "一次失败切换写一条事件");
+        let model = &events[0].model;
+        assert!(
+            !model.contains("PROBE-LEAK"),
+            "密钥形状的模型名必须被打码，实际: {model}"
+        );
+        assert!(!model.contains("0123456789abcdef"), "实际: {model}");
+        assert_eq!(model, "sk-***", "打码形态应当是 scrub 的标准掩码");
+        // 事件里其余字段不受影响
+        assert_eq!(events[0].site_id, a.site_id);
+        assert_eq!(events[0].status, 503);
+    }
+    handle.shutdown_and_wait().await;
+
+    // ---- ② 正常模型名：逐字保留，可用信息没被整条吃掉 ----
+    let (handle, token, failures, _a, _b) = start_with_models(vec![MODEL.to_string()]).await;
+    assert_eq!(post(&handle, &token, &chat_body()).await.0, 200);
+    {
+        let events = failures.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].model, MODEL,
+            "正常模型名必须逐字保留（否则事件读不出「这是哪个模型」）"
+        );
+    }
+    handle.shutdown_and_wait().await;
+}

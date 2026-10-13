@@ -43,7 +43,9 @@ pub const COMMANDS: &[&str] = &[
     "rotate_key",
     "autostart_status",
     "autostart_set",
-    // M7-S5：FR-2 回收（B-82）与 FR-8 钥匙串清理
+    // M7-S5：FR-2 回收（B-82）、FR-8 钥匙串清理、FR-4 未托管落点探测（R-7）
     "revoke_key",
     "purge_keychain",
+    "detect_unmanaged_targets",
+    "suggest_key_name",
 ];

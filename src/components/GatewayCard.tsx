@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Play, Square } from "lucide-react";
+import { Copy, Play, Square } from "lucide-react";
 import {
   gatewayStart,
   gatewayStatus,
@@ -39,6 +39,35 @@ export default function GatewayCard({
   const [siteId, setSiteId] = useState<number | null>(null);
   const [keyId, setKeyId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const token = status.data?.token ?? "";
+
+  // 网关重启会换一个新令牌：把「已复制」的提示清掉，免得它对着一个过期的值显示。
+  useEffect(() => {
+    setCopied(false);
+  }, [token]);
+
+  /**
+   * 复制本地令牌到剪贴板（PRD FR-8:189）。
+   *
+   * 这是本产品**唯一**把秘密放进剪贴板的地方：站点密钥的明文从不到达界面
+   * （命令层没有一条命令返回过明文），所以不存在「复制 key」按钮。
+   * 提示是必须的——用户有权知道这个值可能被剪贴板历史记录带走；
+   * 而**不**自动清空剪贴板（那会跟用户的正常复制打架，且 macOS 上无法保证）。
+   */
+  async function copyToken() {
+    try {
+      await navigator.clipboard.writeText(token);
+      setError(null);
+      setCopied(true);
+    } catch (err) {
+      setCopied(false);
+      setError(
+        `复制失败（${(err as Error).message}）——请手动选中上面的令牌文本。`,
+      );
+    }
+  }
 
   const activeSite = siteId ?? sites.data?.[0]?.id ?? null;
   const siteKeys = (keys.data ?? []).filter((k) => k.siteId === activeSite);
@@ -117,6 +146,17 @@ export default function GatewayCard({
             把地址与令牌填进 agent 的配置即可。令牌每次启动都会重新生成，
             不会写进任何文件或日志。
           </p>
+          <div className="row">
+            <button type="button" className="btn" onClick={copyToken}>
+              <Copy size={14} aria-hidden /> 复制令牌
+            </button>
+            {copied ? (
+              <span className="muted" role="status">
+                已复制到剪贴板，可能被剪贴板历史记录（系统或其他应用）带走。
+                KeyRelay 不会自动清空剪贴板——那会跟你自己的复制操作打架。
+              </span>
+            ) : null}
+          </div>
           <button
             type="button"
             className="btn btn-danger"

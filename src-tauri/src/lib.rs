@@ -189,9 +189,11 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::rotate_key,
             commands::autostart_status,
             commands::autostart_set,
-            // M7-S5：FR-2 回收（B-82）与 FR-8 钥匙串清理
+            // M7-S5：FR-2 回收（B-82）、FR-8 钥匙串清理、FR-4 未托管落点探测（R-7）
             commands::revoke_key,
-            commands::purge_keychain
+            commands::purge_keychain,
+            commands::detect_unmanaged_targets,
+            commands::suggest_key_name
         ])
 }
 

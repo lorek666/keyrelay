@@ -30,6 +30,74 @@ pub struct SiteSummaryDto {
     base_url: String,
     display_name: String,
     health: String,
+    /// 该站点类型的**设计能力**（M7-S5 / M7-S2 的 `capabilities()`）。
+    ///
+    /// 界面用它灰显按钮，**不得**在页面里按 `kind` 硬编码判断——否则新增站点类型时
+    /// 每加一个页面都要改一次，而漏掉的那一处会给出一个点了才报错的按钮。
+    capabilities: SiteCapabilitiesDto,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteCapabilitiesDto {
+    login: bool,
+    list_keys: bool,
+    create_key: bool,
+    reveal_key: bool,
+    revoke_key: bool,
+    balance: bool,
+    groups: bool,
+    key_usage: bool,
+}
+
+impl SiteCapabilitiesDto {
+    fn from_kind(kind: keyrelay_core::site::SiteKind) -> Self {
+        let caps = keyrelay_core::site::capability::capabilities(kind);
+        Self {
+            login: caps.login,
+            list_keys: caps.list_keys,
+            create_key: caps.create_key,
+            reveal_key: caps.reveal_key,
+            revoke_key: caps.revoke_key,
+            balance: caps.balance,
+            groups: caps.groups,
+            key_usage: caps.key_usage,
+        }
+    }
+
+    /// 解析不出站点类型时的**兜底**：全部 `false`。
+    ///
+    /// 这是 fail-closed 的方向——界面会把按钮全灰掉，用户看到一个明确的空状态；
+    /// 反过来（猜一个「什么都能做」）会给出点了才报错的按钮，而报的错还是别的原因。
+    fn none() -> Self {
+        Self {
+            login: false,
+            list_keys: false,
+            create_key: false,
+            reveal_key: false,
+            revoke_key: false,
+            balance: false,
+            groups: false,
+            key_usage: false,
+        }
+    }
+}
+
+impl SiteSummaryDto {
+    fn from_row(row: keyrelay_core::service::SiteSummary) -> Self {
+        let capabilities = match keyrelay_core::site::SiteKind::parse(&row.kind) {
+            Some(kind) => SiteCapabilitiesDto::from_kind(kind),
+            None => SiteCapabilitiesDto::none(),
+        };
+        Self {
+            id: row.id,
+            kind: row.kind,
+            base_url: row.base_url,
+            display_name: row.display_name,
+            health: row.health,
+            capabilities,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -122,6 +190,26 @@ pub struct DeliveryPlanDto {
     /// 提示项（**不是错误**）。当前只有一条来源：同目录下存在「同主名、不同扩展名」
     /// 的兄弟文件，可能被 agent 优先读取，从而让本次投递静默不生效（BACKLOG B-76）。
     warnings: Vec<String>,
+    /// 投递后该 agent 是否需要重启才读到新配置（PRD FR-4:137）。
+    ///
+    /// 取值只能来自 `delivery::restart_hint(channel)`——**界面不得自己判断**。
+    /// 这里是**穷举 match**（没有 `_` 分支）：新增一条通道时它会编译失败，
+    /// 而不是悄悄给出一个空提示。
+    restart_hint: &'static str,
+}
+
+/// [`keyrelay_core::delivery::RestartHint`] 的线格式。
+///
+/// 为什么这个映射在命令层而不是核心层：核心的 `delivery/mod.rs` 在本波次是
+/// M7-S3 的写域、且正处于复审冻结期；把它放在这里不改变任何语义
+/// （穷举 match 保证新增变体会编译失败），等 `delivery` 解冻后再收进去。
+fn restart_hint_str(hint: keyrelay_core::delivery::RestartHint) -> &'static str {
+    use keyrelay_core::delivery::RestartHint;
+    match hint {
+        RestartHint::NotNeeded => "notNeeded",
+        RestartHint::Needed => "needed",
+        RestartHint::DependsOnNewSession => "dependsOnNewSession",
+    }
 }
 
 #[derive(Serialize)]
@@ -314,17 +402,7 @@ pub fn list_sites(state: State<'_, AppState>) -> Result<Vec<SiteSummaryDto>, Str
     state
         .service
         .sites()
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| SiteSummaryDto {
-                    id: row.id,
-                    kind: row.kind,
-                    base_url: row.base_url,
-                    display_name: row.display_name,
-                    health: row.health,
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(SiteSummaryDto::from_row).collect())
         .map_err(|e| e.to_string())
 }
 
@@ -362,13 +440,7 @@ pub async fn add_site(
         .service
         .add_site(&base_url)
         .await
-        .map(|row| SiteSummaryDto {
-            id: row.id,
-            kind: row.kind,
-            base_url: row.base_url,
-            display_name: row.display_name,
-            health: row.health,
-        })
+        .map(SiteSummaryDto::from_row)
         .map_err(|e| e.to_string())
 }
 
@@ -483,6 +555,7 @@ pub fn delivery_plan(
                 consent_granted_at: granted_at,
                 consent_revoked_at: revoked_at,
                 warnings,
+                restart_hint: restart_hint_str(keyrelay_core::delivery::restart_hint(plan.channel)),
             }
         })
         .map_err(|e| e.to_string())
@@ -1188,6 +1261,52 @@ pub fn autostart_set(state: State<'_, AppState>, enabled: bool) -> Result<Autost
     Ok(dto)
 }
 
+/// 探测「已知但本版本不托管」的 agent 落点（M7-S3 / 章程 R-7）。
+///
+/// 只读：核心层永不创建目录、永不写盘。它存在的理由是**不静默**——
+/// 用户在 Cline / Roo Code 里配了中转站，本产品既不能帮他注入，也不该假装没这回事。
+#[tauri::command]
+pub fn detect_unmanaged_targets(state: State<'_, AppState>) -> Vec<UnmanagedTargetDto> {
+    keyrelay_core::delivery::detect_unmanaged_targets(state.service.home())
+        .into_iter()
+        .map(|target| UnmanagedTargetDto {
+            label: target.label.to_string(),
+            path: target.path.display().to_string(),
+            exists: target.exists,
+            note: target.note.to_string(),
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnmanagedTargetDto {
+    /// `"Cline"` / `"Roo Code"`
+    label: String,
+    path: String,
+    exists: bool,
+    /// 面向用户的一句话：**为什么不写**。UI 直接显示，不得改写。
+    note: String,
+}
+
+/// 按 FR-2:113 的命名规范给一个默认名：`<app-id>/<agent-id>/<yyyymmdd>`。
+///
+/// **日期由调用方给**（M7-S5 决策 D-5）：Rust 侧不读时钟、不做时区——
+/// 用户看到的「今天」应当是他所在时区的今天，而 `std` 没有日历 API，
+/// 为一个**标签**引入 `libc` + unsafe FFI 不值。前端用本地日期算 `(y,m,d)` 传进来。
+///
+/// 返回 `None` 表示入参不合法（段里有 `/`、空段、超长）——此时界面**不要**回退到
+/// 硬编码的默认名，那正是这条规范要消灭的东西（`Keys.tsx` 里原本写死的 `"codex/daily"`
+/// 看着像规范、其实是个占位）。
+#[tauri::command]
+pub fn suggest_key_name(agent_id: String, year: i32, month: u32, day: u32) -> Option<String> {
+    keyrelay_core::naming::default_key_name(
+        keyrelay_core::naming::DEFAULT_APP_ID,
+        &agent_id,
+        (year, month, day),
+    )
+}
+
 /// 回收站点上的某把令牌（B-82 的独立路径）。
 ///
 /// **不是**「删除本地记录」：本地行会被标成 `revoked` 并保留——`bindings` 与漂移追溯
@@ -1308,19 +1427,37 @@ mod tests {
     /// 这里把每个 DTO 的线上字段名钉死，改字段名（含 snake_case 回归）会立刻失败。
     #[test]
     fn dtos_serialize_in_camel_case_with_expected_keys() {
-        let summary = SiteSummaryDto {
+        let summary = SiteSummaryDto::from_row(keyrelay_core::service::SiteSummary {
             id: 1,
             kind: "newapi".into(),
             base_url: "https://relay.example.com".into(),
             display_name: "测试站".into(),
             health: "unknown".into(),
-        };
+        });
         let value = to_value(&summary);
         assert_eq!(value["id"], 1);
         assert_eq!(value["kind"], "newapi");
         assert_eq!(value["baseUrl"], "https://relay.example.com");
         assert_eq!(value["displayName"], "测试站");
         assert_eq!(value["health"], "unknown");
+        // M7-S5：能力集随站点类型下发，界面据此灰显（不得在页面里按 kind 硬编码）。
+        assert_eq!(value["capabilities"]["listKeys"], true);
+        assert_eq!(
+            value["capabilities"]["keyUsage"], false,
+            "用量取不到，见 B-96"
+        );
+
+        // 认不出的站点类型 ⇒ 全部 false（fail-closed：宁可全灰，也不给点了才报错的按钮）。
+        let unknown = SiteSummaryDto::from_row(keyrelay_core::service::SiteSummary {
+            id: 2,
+            kind: "some-future-site".into(),
+            base_url: "https://x.example.com".into(),
+            display_name: String::new(),
+            health: "unknown".into(),
+        });
+        let value = to_value(&unknown);
+        assert_eq!(value["capabilities"]["listKeys"], false);
+        assert_eq!(value["capabilities"]["login"], false);
         assert!(
             value.get("base_url").is_none(),
             "不得出现 snake_case: {value}"
@@ -1424,6 +1561,11 @@ mod tests {
             // M6-S5：同目录有「同主名、不同扩展名」的兄弟文件时的提示（BACKLOG B-76）。
             // 这里塞一条真的，顺带断言它确实到了线上字段名 `warnings` 上。
             warnings: vec!["同目录下还有 auth.jsonc。".into()],
+            // M7-S5：生效策略（PRD FR-4:137）。这里取真实值而不是字面量——
+            // 若 `restart_hint` 表变了，这条断言跟着变，不会变成一份假的留档。
+            restart_hint: restart_hint_str(keyrelay_core::delivery::restart_hint(
+                keyrelay_core::delivery::DeliveryChannel::CodexAuthJson,
+            )),
         };
         let value = to_value(&plan);
         assert_eq!(value["agentId"], "codex");
@@ -1434,7 +1576,26 @@ mod tests {
         assert_eq!(value["consent"], "missing");
         assert_eq!(value["consentGrantedAt"], Value::Null);
         assert_eq!(value["warnings"][0], "同目录下还有 auth.jsonc。");
+        assert_eq!(value["restartHint"], "needed", "codex 的配置进程启动时才读");
         assert!(value.get("target_path").is_none(), "不得出现 snake_case");
+
+        // M7-S5：**每个**通道都必须给出一个非空提示——新增通道时穷举 match 会编译失败，
+        // 而不是悄悄给一个空串（界面会因此显示「无需重启」这种最危险的假话）。
+        for channel in keyrelay_core::delivery::DeliveryChannel::ALL {
+            let hint = restart_hint_str(keyrelay_core::delivery::restart_hint(channel));
+            assert!(
+                !hint.is_empty(),
+                "{} 的 restartHint 不得为空",
+                channel.as_str()
+            );
+        }
+        assert_eq!(
+            restart_hint_str(keyrelay_core::delivery::restart_hint(
+                keyrelay_core::delivery::DeliveryChannel::ShellBlock
+            )),
+            "dependsOnNewSession",
+            "shell rc 只对新开的终端生效，不是「重启某个 agent」能解决的"
+        );
 
         let outcome = DeliveryOutcomeDto {
             channel: "codex-auth-json".into(),

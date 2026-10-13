@@ -280,19 +280,24 @@ fn split_lines_with_spans(text: &str) -> Vec<LineSpan<'_>> {
 }
 
 /// 推断 `models:` 之下列表项的缩进：看**第一个**非空、非注释行；
-/// 它以空白开头且首个非空字符是 `-` ⇒ 用它的缩进，否则用默认两空格。
+/// 它是列表项（首个非空字符是 `-`）⇒ 沿用它的缩进（**包括空缩进**），否则用默认两空格。
 ///
 /// 为什么必须推断而不是写死：YAML 的块序列要求同一序列内缩进一致，
 /// 给一个 4 空格缩进的文件塞 2 空格的条目会让文件变成**非法 YAML**。
+///
+/// **空缩进也必须沿用**（M7-S3 复审 P1-1）：YAML 允许块序列项与父键**同缩进**——
+/// `models:` 的下一行直接是 `- name: x`（0 缩进）。旧实现要求「缩进 > 0」才沿用，
+/// 于是给这种文件塞了 2 空格的条目，同一个序列出现两种缩进 ⇒ 产物**非法 YAML**：
+/// 原文能 `safe_load`，投递之后 `ParserError: expected <block end>, but found '-'`。
+/// 「投递成功但产物不可解析」比没投递更糟——用户以为成功了。
 fn infer_item_indent(lines: &[LineSpan<'_>], models_index: usize) -> String {
     for line in lines.iter().skip(models_index + 1) {
         let trimmed = line.content.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let indent = leading_indent(line.content);
-        if !indent.is_empty() && trimmed.starts_with('-') {
-            return indent;
+        if trimmed.starts_with('-') {
+            return leading_indent(line.content);
         }
         return DEFAULT_INDENT.to_string();
     }
@@ -428,6 +433,32 @@ mod tests {
             patch.after
         );
         assert!(patch.after.contains("      apiKey:"), "{}", patch.after);
+    }
+
+    #[test]
+    fn zero_indent_list_keeps_zero_indent() {
+        // **M7-S3 复审 P1-1 的回归**（单元层）：`models:` 的下一行直接是 0 缩进的列表项。
+        // 旧实现在这里回落成 2 空格 ⇒ 同一个序列两种缩进 ⇒ 产物非法 YAML。
+        let dir = tmp();
+        let before = "models:\n- name: mine\n- name: second\n";
+        std::fs::write(writer_in(dir.path(), BASE, None).path(), before).unwrap();
+
+        let patch = writer_in(dir.path(), BASE, None).plan(SECRET).unwrap();
+        assert!(
+            patch.after.contains("\n- name: \"keyrelay\"\n"),
+            "块内条目必须与既有条目同缩进（空）: {}",
+            patch.after
+        );
+        assert!(
+            patch.after.contains("\n  apiKey:"),
+            "条目字段相对条目再缩进两格: {}",
+            patch.after
+        );
+        assert!(
+            !patch.after.contains("\n  - name:"),
+            "不得给 0 缩进的序列塞 2 空格的条目: {}",
+            patch.after
+        );
     }
 
     #[test]

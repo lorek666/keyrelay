@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, KeyRound, Plus, RefreshCw, RotateCw } from "lucide-react";
+import { AlertTriangle, KeyRound, Plus, RefreshCw, RotateCw, Trash2 } from "lucide-react";
 import {
   availableGroups,
   createKey,
@@ -8,14 +8,18 @@ import {
   listKeys,
   listSites,
   listStoredKeys,
+  revokeKey,
   rotateKey,
   rotationDue,
   rotationPlan,
   syncSiteKeys,
   type RotationPlan,
   type RotationRun,
+  type SiteRow,
+  type StoredKeyRow,
 } from "../lib/api";
 import ConfirmDialog from "../components/ConfirmDialog";
+import CapButton from "../components/CapButton";
 
 export default function Keys() {
   const qc = useQueryClient();
@@ -31,17 +35,23 @@ export default function Keys() {
   const [rotating, setRotating] = useState<RotationPlan | null>(null);
   const [rotationName, setRotationName] = useState("");
   const [rotationResult, setRotationResult] = useState<RotationRun | null>(null);
+  // 回收站点侧密钥（B-82）：先出二次确认，确认里还要**明确勾选**才会带 `confirm=true`
+  const [revoking, setRevoking] = useState<StoredKeyRow | null>(null);
+  const [revokeAgreed, setRevokeAgreed] = useState(false);
 
   const activeSite = siteId ?? sites.data?.[0]?.id ?? null;
+  const activeSiteRow = (sites.data ?? []).find((s) => s.id === activeSite);
+  /** 能力集：`undefined`（站点还没读出来）按「全不支持」处理，绝不乐观放行。 */
+  const caps = activeSiteRow?.capabilities;
 
   // 该轮换的密钥（FR-7）。纯本地判定：不联网、不读密钥。
   const rotation = useQuery({ queryKey: ["rotation-due"], queryFn: rotationDue });
 
-  // 站点侧分组与倍率（FR-2）。只在真的要建密钥时才问站点。
+  // 站点侧分组与倍率（FR-2）。只在真的要建密钥时才问站点，且该站点类型得真有分组概念。
   const groups = useQuery({
     queryKey: ["groups", activeSite],
     queryFn: () => availableGroups(activeSite!),
-    enabled: creating && activeSite !== null,
+    enabled: creating && activeSite !== null && (caps?.groups ?? false),
     retry: false,
   });
 
@@ -50,8 +60,31 @@ export default function Keys() {
   const remote = useQuery({
     queryKey: ["remote-keys", activeSite],
     queryFn: () => listKeys(activeSite!),
-    enabled: activeSite !== null,
+    // 没有密钥列表端点就不发请求（后端也会拒，但先发一次注定失败的请求只会让
+    // 这里显示一个错的原因）
+    enabled: activeSite !== null && (caps?.listKeys ?? false),
     retry: false,
+  });
+
+  const revoke = useMutation({
+    mutationFn: () => revokeKey(revoking!.siteId, revoking!.remoteId!, true),
+    onSuccess: async () => {
+      setError(null);
+      setNotice(
+        `已在站点侧回收「${revoking?.name ?? ""}」。本地记录被标成「已回收」并保留——` +
+          `站点上那把 key 已经没了，这个动作不可逆。`,
+      );
+      setRevokeAgreed(false);
+      setRevoking(null);
+      await qc.invalidateQueries({ queryKey: ["stored-keys"] });
+      await qc.invalidateQueries({ queryKey: ["remote-keys", activeSite] });
+      await qc.invalidateQueries({ queryKey: ["events"] });
+    },
+    onError: (err: Error) => {
+      setError(err.message);
+      setRevokeAgreed(false);
+      setRevoking(null);
+    },
   });
 
   const rotationPreview = useMutation({
@@ -135,10 +168,10 @@ export default function Keys() {
               <RefreshCw size={14} aria-hidden /> 刷新
             </button>
           </div>
-          <button
-            type="button"
+          <CapButton
+            allowed={caps?.createKey ?? false}
+            reason={capReason(caps, "该站点类型不支持在站点侧建密钥")}
             className="btn btn-primary"
-            disabled={activeSite === null}
             onClick={() => {
               setError(null);
               setNotice(null);
@@ -146,7 +179,7 @@ export default function Keys() {
             }}
           >
             <Plus size={14} aria-hidden /> 新建密钥
-          </button>
+          </CapButton>
         </div>
 
         {notice ? <p className="ok" role="status">{notice}</p> : null}
@@ -174,14 +207,19 @@ export default function Keys() {
                     <td>{due.name}</td>
                     <td className="mono">{formatTs(due.dueAt)}</td>
                     <td>
-                      <button
-                        type="button"
+                      {/* 轮换是「建 / 读 / 回收」三连，缺一不可（M7-S2 §3.3） */}
+                      <CapButton
+                        allowed={rotationAllowed(caps)}
+                        reason={capReason(
+                          caps,
+                          "轮换需要建 / 读 / 回收三连，该类型缺其中一步",
+                        )}
+                        busy={rotationPreview.isPending || rotationExecute.isPending}
                         className="btn btn-ghost"
                         onClick={() => rotationPreview.mutate(due.keyId)}
-                        disabled={rotationPreview.isPending || rotationExecute.isPending}
                       >
                         <RotateCw size={13} aria-hidden /> 轮换…
-                      </button>
+                      </CapButton>
                     </td>
                   </tr>
                 ))}
@@ -196,10 +234,15 @@ export default function Keys() {
         {rotationResult ? <div className="warnbox" role="status">{renderRun(rotationResult)}</div> : null}
 
         <div className="row">
-          <button
-            type="button"
-            className="btn"
-            disabled={activeSite === null || syncing}
+          {/* 对齐站点密钥 = 列举站点令牌 + 读回明文，两者缺一不可（M7-S2 §3.3） */}
+          <CapButton
+            allowed={syncAllowed(caps)}
+            reason={
+              caps && !caps.listKeys
+                ? "该站点类型没有密钥列表端点"
+                : capReason(caps, "站点不提供明文回读")
+            }
+            busy={syncing}
             onClick={async () => {
               if (activeSite === null) return;
               setError(null);
@@ -232,7 +275,7 @@ export default function Keys() {
           >
             <RefreshCw size={14} aria-hidden /> 对齐站点密钥
             {syncing ? "…" : ""}
-          </button>
+          </CapButton>
           <span className="muted">
             把站点侧已有密钥的明文取回本地钥匙串。明文**不会显示在这里**，
             也不会经过 IPC——命令层至今没有任何一条命令返回过密钥明文。
@@ -258,24 +301,50 @@ export default function Keys() {
                 <th>分组</th>
                 <th>远端 id</th>
                 <th>状态</th>
+                <th>操作</th>
               </tr>
             </thead>
             <tbody>
-              {keys.data.map((key) => (
-                <tr key={key.id}>
-                  <td className="mono">{key.id}</td>
-                  <td>
-                    <KeyRound size={13} aria-hidden /> {key.name}
-                  </td>
-                  <td className="mono">{key.group ?? "—"}</td>
-                  <td className="mono">{key.remoteId ?? "—"}</td>
-                  <td>
-                    <span className={`badge badge-${statusTone(key.status)}`}>
-                      {key.status}
-                    </span>
-                  </td>
-                </tr>
-              ))}
+              {keys.data.map((key) => {
+                const site = (sites.data ?? []).find((s) => s.id === key.siteId);
+                const gate = revokeGate(site, key);
+                return (
+                  <tr key={key.id}>
+                    <td className="mono">{key.id}</td>
+                    <td>
+                      <KeyRound size={13} aria-hidden /> {key.name}
+                    </td>
+                    <td className="mono">{key.group ?? "—"}</td>
+                    <td className="mono">{key.remoteId ?? "—"}</td>
+                    <td>
+                      {/* `revoked`（我回收的·本地）与 `disabled`（站点禁的）**必须能分开**：
+                          恢复方式不同，混成一个词会让用户不知道去哪处理（M7-S4）。 */}
+                      <span
+                        className={`badge badge-${statusTone(key.status)}`}
+                        title={statusHint(key.status)}
+                      >
+                        {statusLabel(key.status)}
+                      </span>
+                    </td>
+                    <td>
+                      <CapButton
+                        allowed={gate.allowed}
+                        reason={gate.reason}
+                        busy={revoke.isPending}
+                        className="btn btn-ghost"
+                        onClick={() => {
+                          setError(null);
+                          setNotice(null);
+                          setRevokeAgreed(false);
+                          setRevoking(key);
+                        }}
+                      >
+                        <Trash2 size={13} aria-hidden /> 回收
+                      </CapButton>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         ) : null}
@@ -288,6 +357,11 @@ export default function Keys() {
 
       <div className="card">
         <h3>站点上的令牌（只读对照）</h3>
+        {!(caps?.listKeys ?? false) ? (
+          <p className="muted">
+            该站点类型没有密钥列表端点，无法对照站点侧令牌（判断来自能力集）。
+          </p>
+        ) : null}
         {remote.isLoading ? <p className="muted">加载中…</p> : null}
         {remote.isError ? (
           <p className="muted">
@@ -312,8 +386,11 @@ export default function Keys() {
                   <td className="mono">{key.group ?? "—"}</td>
                   <td className="mono">{key.remoteId}</td>
                   <td>
-                    <span className={`badge badge-${statusTone(key.status)}`}>
-                      {key.status}
+                    <span
+                      className={`badge badge-${statusTone(key.status)}`}
+                      title={statusHint(key.status)}
+                    >
+                      {statusLabel(key.status)}
                     </span>
                   </td>
                   <td className="mono">{formatTs(key.createdAt)}</td>
@@ -350,7 +427,7 @@ export default function Keys() {
             className="input"
             value={group}
             onChange={(e) => setGroup(e.target.value)}
-            disabled={groups.isLoading}
+            disabled={groups.isLoading || !(caps?.groups ?? false)}
           >
             <option value="">不指定（跟随站点默认）</option>
             {(groups.data ?? []).map((option) => (
@@ -360,6 +437,12 @@ export default function Keys() {
             ))}
           </select>
         </label>
+        {!(caps?.groups ?? false) ? (
+          <p className="muted">
+            该站点类型没有分组概念，将按站点默认分组创建（这个判断来自能力集，
+            不是按站点类型名硬编码的）。
+          </p>
+        ) : null}
         {groups.isError ? (
           <p className="muted">
             读不到分组列表（{(groups.error as Error).message}），将按站点默认分组创建。
@@ -421,6 +504,44 @@ export default function Keys() {
           </>
         ) : null}
       </ConfirmDialog>
+
+      {/*
+        回收站点侧密钥（B-82）。破坏性且**不可逆**：站点上那把 key 真的没了。
+        所以 `confirm=true` 只能来自这里的**明确勾选**——默认 false，不勾就点不动
+        （后端也会拒绝 `confirm=false`，两处都不给「无参数即执行」的形态）。
+      */}
+      <ConfirmDialog
+        open={revoking !== null}
+        title="回收站点上的密钥"
+        danger
+        confirmLabel={revoke.isPending ? "回收中…" : "确认回收"}
+        confirmDisabled={!revokeAgreed || revoke.isPending}
+        onCancel={() => {
+          setRevokeAgreed(false);
+          setRevoking(null);
+        }}
+        onConfirm={() => revoke.mutate()}
+      >
+        <p>
+          将在<strong>站点上</strong>回收「{revoking?.name ?? ""}」（远端 id{" "}
+          <span className="mono">{revoking?.remoteId ?? "—"}</span>）。
+          这把 key 在站点侧会<strong>立即失效</strong>，任何正在用它的人都将被拒。
+        </p>
+        <p className="muted">
+          本地记录<strong>不会</strong>被删除，只会被标成「已回收」——`bindings` 与漂移追溯靠它存活。
+          已经投递到 agent 配置里的旧值需要你自己重新投递覆盖。
+        </p>
+        <label className="checkline">
+          <input
+            type="checkbox"
+            checked={revokeAgreed}
+            onChange={(e) => setRevokeAgreed(e.target.checked)}
+          />
+          <span>
+            我确认要在站点上回收这把密钥，并明白它<strong>不可逆</strong>（站点侧无法恢复）
+          </span>
+        </label>
+      </ConfirmDialog>
     </section>
   );
 }
@@ -478,11 +599,92 @@ const STEP_LABELS: Record<string, string> = {
   revoke_old: "回收旧密钥",
 };
 
+/**
+ * 状态文案。**两套词表必须能区分**（M7-S4 / 冻结契约 7）：
+ *
+ * - `"revoked"` 是**本地**状态：用户在本产品里把它在站点侧回收了（`store::KEY_STATUS_REVOKED`）；
+ * - `"disabled"` 是**站点**状态：站点自己把它禁用了。
+ *
+ * 用同一个词显示这两件事，用户就不知道该去哪里恢复——一个是「我干的、不可逆」，
+ * 另一个是「站点干的、可能能解禁」。
+ */
+const STATUS_LABELS: Record<string, string> = {
+  enabled: "启用",
+  disabled: "站点禁用",
+  exhausted: "额度耗尽",
+  revoked: "已回收",
+  unknown: "未知",
+};
+
+function statusLabel(status: string): string {
+  // 认不出的取值原样显示，不猜——猜错会让用户按错误的状态处理。
+  return STATUS_LABELS[status] ?? status;
+}
+
+function statusHint(status: string): string {
+  if (status === "revoked") {
+    return "本地状态：你已在站点侧回收它（不可逆）。本地记录保留，供溯源与漂移追溯。";
+  }
+  if (status === "disabled") {
+    return "站点状态：站点自己禁用了这把令牌——与本产品无关。";
+  }
+  return `站点返回的原始状态：${status}`;
+}
+
 function statusTone(status: string): string {
   if (status === "enabled") return "ok";
   if (status === "disabled") return "warn";
   if (status === "exhausted") return "danger";
+  // 已回收 = 站点侧真的没了，不能看着像「未知」那样无害
+  if (status === "revoked") return "danger";
   return "muted";
+}
+
+/** 轮换的三连门槛：建 / 读 / 回收**缺一不可**（M7-S2 §3.3）。 */
+function rotationAllowed(caps: SiteRow["capabilities"] | undefined): boolean {
+  if (!caps) return false;
+  return caps.createKey && caps.revealKey && caps.revokeKey;
+}
+
+/** 「对齐站点密钥」= 列举站点令牌 + 读回明文，两者缺一不可。 */
+function syncAllowed(caps: SiteRow["capabilities"] | undefined): boolean {
+  if (!caps) return false;
+  return caps.listKeys && caps.revealKey;
+}
+
+/**
+ * 灰显的原因文案。
+ *
+ * 「能力集为 false」与「还没有站点」是**两个不同的原因**，不能都写成
+ * 「该站点类型不支持…」——那会把「你还没接入站点」说成产品缺陷。
+ */
+function capReason(
+  caps: SiteRow["capabilities"] | undefined,
+  unsupported: string,
+): string {
+  return caps ? unsupported : "先接入一个站点（或站点列表还没加载出来）";
+}
+
+/**
+ * 单把密钥能不能回收。三个条件各自有各自的**原因文案**——灰显必须说明原因，
+ * 否则用户只会觉得按钮坏了（`capabilities.revokeKey` 是站点类型问题，
+ * 缺 `remoteId` / 已回收是这把 key 自己的状态问题，处理方式完全不同）。
+ */
+function revokeGate(
+  site: SiteRow | undefined,
+  key: StoredKeyRow,
+): { allowed: boolean; reason: string } {
+  if (!site) return { allowed: false, reason: "找不到这把密钥所属的站点记录" };
+  if (!site.capabilities.revokeKey) {
+    return { allowed: false, reason: "该站点类型不支持回收" };
+  }
+  if (!key.remoteId) {
+    return { allowed: false, reason: "这把密钥没有站点侧 id，站点上定位不到它" };
+  }
+  if (key.status === "revoked") {
+    return { allowed: false, reason: "已经在站点侧回收过了（本地记录保留）" };
+  }
+  return { allowed: true, reason: "" };
 }
 
 function formatTs(ts?: number | null): string {
