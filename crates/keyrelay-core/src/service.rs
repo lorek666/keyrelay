@@ -1975,7 +1975,16 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     ///
     /// **先站点、后本地**。站点侧失败时**不**写本地状态——否则会出现「本地说已回收、
     /// 站点上还活着」这种最坏的组合（用户以为泄漏面关掉了，实际没关）。
-    /// 反过来「站点已删、本地没标上」是可修的：下一次 `sync_site_keys` 会把它标成 `missing`。
+    /// 反过来「站点已删、本地没标上」是可修的：本地状态没写上会**留痕**（Warn 事件），
+    /// 用户能在事件面板看到，`sync_site_keys` 下一轮也不会把它当成「站点上还有」。
+    ///
+    /// **订正（M8-S5A §4）**：本行原来写的是「下一次 `sync_site_keys` 会把它标成 `missing`」——
+    /// **那句是假的**：`sync_site_keys` 从不改已有行的状态，而 `missing` 也不在 `set_key_status`
+    /// 的合法值里。B-100 的处置一度建立在这个不存在的前提上。现在如实写成上面这句。
+    ///
+    /// **已知缺口（未接线 + 去向）**：没有任何机制会主动发现「站点侧被删、本地仍是 enabled」
+    /// 的行——`sync_site_keys` 只看站点侧**还有**什么，不看**少了**什么。
+    /// 去向：`docs/BACKLOG.md` 的 B-115。
     ///
     /// # 为什么不删本地行
     ///
@@ -1997,7 +2006,25 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .await
         {
             Ok(()) => {
-                let key_id = self.local_key_id_for_remote(site_id, remote_id)?;
+                // **读本地行失败也不能把整次操作报成失败**（M8-S5A §4）：
+                // 站点侧那一把已经删了，这个动作不可逆。原来的 `?` 会让「DELETE 成功、
+                // 但本地这一读失败」表现为「回收失败」——与下面 `set_key_status` 那条注释里
+                // 写着的原则**自相矛盾**（同一类事实，两种处置）。
+                let key_id = match self.local_key_id_for_remote(site_id, remote_id) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        self.log(observability::event_with_payload(
+                            Level::Warn,
+                            "key",
+                            "站点侧已回收，但读本地记录失败（本地状态没写上）",
+                            serde_json::json!({
+                                "site_id": site_id,
+                                "reason": crate::redact::scrub(&err.to_string()),
+                            }),
+                        ));
+                        None
+                    }
+                };
                 // 本地记账失败**不让命令失败**（M7-S4 复审 P2-1 的建议，Lead 采纳）。
                 //
                 // 理由：站点侧那一把**已经删了**，这个动作不可逆。若因为本地写状态失败就返回
