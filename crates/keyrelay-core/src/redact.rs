@@ -21,6 +21,9 @@ fn is_token_char(c: char) -> bool {
 ///
 /// 该函数是幂等的：对已脱敏的文本再次调用结果不变。
 pub fn scrub(input: &str) -> String {
+    // URL 规则在**原文**上先跑一遍：前缀规则的 token 字符含 `/`，会把外层路径连同内层 URL 的
+    // scheme 一起吞掉，吞完之后内层的 `://` 就不在了（第二次复核 R-1）。
+    let input = &mask_url_userinfo(input);
     let mut out = String::with_capacity(input.len());
     let bytes: Vec<char> = input.chars().collect();
     let mut i = 0usize;
@@ -69,9 +72,9 @@ pub fn scrub(input: &str) -> String {
         i += 1;
     }
 
-    // URL 规则放在**最后**：前缀规则的 token 字符含 `/`，`sk-…/p@x` 被整段吞成 `sk-***` 之后，
-    // `@` 就贴到了 authority 上。URL 规则若先跑，这个 `@` 要到第二遍 `scrub` 才被掩，
-    // 幂等就破了（复核 N-1）。前缀 / hex 规则不会吃掉 `@` 或 `://`，所以放在最后掩得只多不少。
+    // 收尾再跑一遍：`sk-…/p@x` 被前缀规则整段吞成 `sk-***` 之后，`@` 贴到了 authority 上；
+    // 不在这里掩掉，就要等第二遍 `scrub` 才掩，幂等就破了（复核 N-1）。
+    // 两遍都需要：只留开头漏嵌套 URL，只留收尾破幂等。
     mask_url_userinfo(&out)
 }
 
@@ -270,7 +273,7 @@ pub fn strip_url_userinfo(url: &str) -> String {
     out
 }
 
-/// [`scrub`] 的最后一步：**文本里**每个 `scheme://userinfo@host` 的 userinfo 换成 [`MASK`]。
+/// [`scrub`] 的首尾两步：**文本里**每个 `scheme://userinfo@host` 的 userinfo 换成 [`MASK`]。
 ///
 /// 与 [`strip_url_userinfo`] 的区别：那个函数的输入是**一整个 URL**，这里的输入是
 /// 任意文本（事件文案、序列化后的 payload、错误信息），所以 authority 除了止于
@@ -816,6 +819,23 @@ mod tests {
     fn scrub_url_userinfo_is_idempotent() {
         let once = scrub("见 https://alice:s3cretPW@relay.example.com/v1");
         assert_eq!(scrub(&once), once);
+    }
+
+    /// 外层 host 含 `sk-` / `nap-` 子串、路径里内嵌另一个带 userinfo 的 URL（代理地址的典型形态）：
+    /// 前缀规则连 `/` 一起吞到内层的 `:` 为止，剩下的 `//alice:pw@…` 再也找不到 `://`。
+    /// URL 规则若只在前缀规则**之后**跑，内层密码就漏了（第二次复核 R-1）。
+    #[test]
+    fn scrub_masks_userinfo_of_a_url_nested_behind_a_prefix_lookalike_host() {
+        for text in [
+            "https://desk-proxy.example.com/fetch/https://alice:PWnested7@relay.example.com",
+            "https://snap-cdn.example.com/x/https://alice:PWnested7@relay.example.com/v1",
+            "https://ask-ai.example.com/v1/https://alice:PWnested7@relay.example.com",
+            "https://sk-abcdefgh/x://b:PWnested7@h",
+        ] {
+            let once = scrub(text);
+            assert!(!once.contains("PWnested7"), "{text:?} → {once:?}");
+            assert_eq!(scrub(&once), once, "{text:?}");
+        }
     }
 
     /// 前缀规则的 token 字符含 `/`：`sk-…/p` 被整段吞掉后，`@` 贴到了 authority 上，
