@@ -25,6 +25,8 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use std::time::Duration;
+
 use axum::routing::any;
 use axum::Router;
 use futures_util::TryStreamExt;
@@ -232,6 +234,60 @@ pub struct GatewayConfig {
     ///
     /// 用注入出口而不是直接依赖 `store`：网关不该为了记一条事件而拿到整个存储层。
     pub on_failure: Option<Arc<dyn Fn(GatewayFailure) + Send + Sync>>,
+    /// 上游请求的两段超时（M8-S1 §3.5-2）。默认见 [`UpstreamTimeout::default`]。
+    pub upstream_timeout: UpstreamTimeout,
+    /// 共享的「已回收」视图（M8-S1 §3.5-5）：`key_ref` 命中 ⇒ 该上游**不再被选用**。
+    ///
+    /// `None` = 不做运行时校验（`single_upstream` 的默认 ⇒ 既有行为不变）。
+    /// 为什么用共享集合而不是「网关自己去查」：`ensure_not_revoked` 建立的**唯一**取密钥路径
+    /// 不能被绕过——网关不新开一条读路径，它只查一个由那条路径维护的集合。
+    pub revoked_refs: Option<Arc<Mutex<std::collections::HashSet<String>>>>,
+    /// 每次上游尝试结束时的观测出口（M8-S1 §5.3）。`None` = 不采集。
+    ///
+    /// 与 `on_failure` 同形（注入出口），理由相同：网关不碰存储层。
+    pub on_observation: Option<Arc<dyn Fn(UpstreamObservation) + Send + Sync>>,
+}
+
+/// 上游请求的两段超时。
+///
+/// **刻意不用 `reqwest::ClientBuilder::timeout`**：它的语义是「从开始连接直到 body 读完」的
+/// **总 deadline**（依赖源码原文见 `docs/specs/M8-S1-路由数据源与跨站选路.md` §15 证据②），
+/// 会把**合法的长流式补全**判成超时——而流式回传正是 `the_response_is_forwarded_as_a_stream_not_buffered`
+/// 钉住的既有行为。
+///
+/// 用的是 `connect_timeout` + `read_timeout`：后者计的是「多久没有新字节」，成功读到就重置，
+/// 它抓的是「接了连接却永远不回应」那种病态上游，不是「慢」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpstreamTimeout {
+    /// 连接阶段（TCP + TLS）。
+    pub connect: Duration,
+    /// **每次读**的超时。
+    pub read: Duration,
+}
+
+impl Default for UpstreamTimeout {
+    fn default() -> Self {
+        // connect 10s：对中转站足够宽松。
+        // read 300s：**故意很大**——一次合法的非流式推理可能在吐出第一个字节前就要几分钟，
+        // 取小了会把合法慢请求判成故障。代价写在明处：真·卡死的上游要等满 300s 才切换。
+        // 这个数**没有真实站点标定**（BACKLOG B-112），测试用配置把它调小来复现判据。
+        Self {
+            connect: Duration::from_secs(10),
+            read: Duration::from_secs(300),
+        }
+    }
+}
+
+/// 一次上游尝试的观测。**只有元数据**（不记请求 / 响应正文、不记密钥）。
+///
+/// 与 [`GatewayFailure`] 一样刻意保持字段极少：这是结构上的白名单。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamObservation {
+    pub site_id: i64,
+    /// 从「开始发这一次请求」到「拿到响应头」的毫秒数。**不含读 body**——
+    /// 流式响应的 body 可能持续几分钟，算进去会让这个数失去比较意义。
+    pub latency_ms: u64,
+    pub ok: bool,
 }
 
 /// 一次「因可切换状态而放弃当前上游」的元数据。
@@ -292,6 +348,9 @@ impl GatewayConfig {
             breaker: BreakerPolicy::default(),
             keys_by_ref: HashMap::new(),
             on_failure: None,
+            upstream_timeout: UpstreamTimeout::default(),
+            revoked_refs: None,
+            on_observation: None,
         }
     }
 }
@@ -406,6 +465,10 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
     }
 
     let upstream = reqwest::Client::builder()
+        // §3.5-2：上游**必须**有超时。没有它，一个接了连接却不回应的上游会让请求永远挂着，
+        // 既不切下一个候选，也不喂熔断（实测：卡 8.5s、下一个上游收到 0 次、失败事件 0 条）。
+        .connect_timeout(config.upstream_timeout.connect)
+        .read_timeout(config.upstream_timeout.read)
         .build()
         .map_err(|e| Error::Transport(format!("构造网关的上游客户端失败: {e}")))?;
 
@@ -578,6 +641,18 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     let now = Instant::now();
     let eligible = eligible_candidates(&state.breaker, &candidates, now);
     if eligible.is_empty() {
+        // §9 第 2 条：**「一个候选都没发出去」也必须可见**。
+        //
+        // `status = 0` 是哨兵值（HTTP 里不存在 0），表示「没有任何上游返回过状态码」。
+        // **不编一个 503**：那会让事件说谎——读者会以为某个上游真的返回了 503。
+        // 文案必须写明原因，否则 0 会被误读成真实状态码。
+        report_failure(
+            &state,
+            candidates[0].site_id,
+            0,
+            &model.clone().unwrap_or_default(),
+            Instant::now(),
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
@@ -593,47 +668,105 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         None => body,
     };
     let event_model = model.unwrap_or_default();
-    let attempts = eligible.len();
+
+    // §3.5-3 / §10：先把候选分成「发得出去」与「发不出去」两类。
+    //
+    // 修复前 `is_last` 用的是 `eligible.len()`——里面**含没有明文的候选**（它们会 `continue`）。
+    // 于是「最后一个真的发得出去的候选」被误判成「不是最后一个」，它的响应被丢掉、
+    // 继续往下走 → 最终 502。症状：唯一可用上游返回 `429 + Retry-After`，
+    // 用户看到 502（而不是 429），`Retry-After` 被吞掉。
+    let sendable: Vec<&Upstream> = eligible
+        .iter()
+        .copied()
+        .filter(|u| is_sendable(&state, u))
+        .collect();
 
     let mut last_error: Option<String> = None;
-    for (index, upstream) in eligible.iter().enumerate() {
+    let attempts = sendable.len();
+    for (index, upstream) in sendable.iter().enumerate() {
         let is_last = index + 1 == attempts;
+        // 这里 `unwrap` 不会 panic：`sendable` 就是按同一个判据过滤出来的。
+        // 但仍然写 `let Some(..) else` ——「过滤」与「取用」共用同一个函数
+        // （`is_sendable`），所以两者不可能分叉。
         let Some(key) = state.config.keys_by_ref.get(&upstream.key_ref) else {
-            // 路由指向一个没有明文的上游：**不静默换一把密钥**（那会花用户没指定的钱），
-            // 当成该上游不可用，切下一个。
-            last_error = Some(format!(
-                "上游站点 {} 的密钥引用 {} 没有对应的明文",
-                upstream.site_id, upstream.key_ref
-            ));
             continue;
         };
         let url = format!("{}{}{}", upstream.base_url, path, query);
         let headers = upstream_headers(&state.config, &inbound, key);
 
+        let started = Instant::now();
         match send_once(&state, method.clone(), &url, headers, outbound.clone()).await {
             Ok(response) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
                 let status = response.status().as_u16();
+                observe(
+                    &state,
+                    upstream.site_id,
+                    latency_ms,
+                    !should_failover(status),
+                );
                 if should_failover(status) {
-                    report_failure(&state, upstream.site_id, status, &event_model, now);
+                    // §3.5-1：`opened_at` 必须是**失败发生**的时刻，不是请求开始的时刻。
+                    // 用请求开始时刻的话，一次比冷却期还慢的失败（524 ≈ 100s > 冷却 60s）
+                    // 记下的那一刻冷却就已经「过期」⇒ 这个上游**永远熔断不了**；
+                    // 即使不慢，有效冷却也被缩短了「本次请求耗时」那么多。
+                    report_failure(
+                        &state,
+                        upstream.site_id,
+                        status,
+                        &event_model,
+                        Instant::now(),
+                    );
                     if !is_last {
                         continue; // 丢掉这个响应，试下一个
                     }
                 } else {
-                    record_success(&state, upstream.site_id, now);
+                    record_success(&state, upstream.site_id, Instant::now());
                 }
                 // 不可切换的状态、或已经是最后一个候选 ⇒ **如实返回上游的响应**
                 // （包括它的状态码，不做 500 兜底）。
                 return into_upstream_response(response);
             }
             Err(message) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                observe(&state, upstream.site_id, latency_ms, false);
                 // 传输层失败没有 HTTP 状态码：按 502 记（与 legacy 路径的错误码一致）并切下一个。
-                report_failure(&state, upstream.site_id, 502, &event_model, now);
+                report_failure(&state, upstream.site_id, 502, &event_model, Instant::now());
                 last_error = Some(message);
                 if is_last {
                     break;
                 }
             }
         }
+    }
+
+    // §10 第 2 条：**发不出去**的候选也要产生事件。
+    //
+    // 修复前它们静默 `continue`：若构造方忘了填 `keys_by_ref`（M7 审计 D-2），
+    // 表现是「每个上游都跳过 → 502」，看起来像「故障切换不工作」，
+    // 根因却是密钥映射空着——**没有任何线索**。
+    //
+    // **只在失败路径上报**（即上面那个 `for` 没有 `return`）。理由不是省事：
+    // `report_failure` 同时**喂熔断**，而「某个候选被跳过」在请求**成功**时不是故障——
+    // 若那时也上报，一个长期缺明文的候选会把熔断喂开，进而影响别的判断。
+    // 契约的原话是「不得静默 **502**」，指的正是这条路径。
+    //
+    // 文案区分两种原因（缺明文 / 已回收），但**都不写 `key_ref` 原文**：
+    // 引用本身是线索（M7-S0 §4.3 的红线）。
+    for upstream in eligible.iter().filter(|u| !is_sendable(&state, u)) {
+        let (status, reason) = if is_revoked(&state, upstream) {
+            (0u16, "该密钥已被回收，不再使用")
+        } else {
+            (0u16, "密钥引用没有对应的明文")
+        };
+        last_error = Some(format!("上游站点 {}: {reason}", upstream.site_id));
+        report_failure(
+            &state,
+            upstream.site_id,
+            status,
+            &event_model,
+            Instant::now(),
+        );
     }
 
     (
@@ -643,6 +776,41 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         })),
     )
         .into_response()
+}
+
+/// 这个上游**能不能真的发出去**：有明文，且该明文没被回收。
+///
+/// 「过滤」与「取用」共用这一个函数——两处各写一份判据正是 M7 那类分叉的来源。
+fn is_sendable(state: &AppState, upstream: &Upstream) -> bool {
+    !is_revoked(state, upstream) && state.config.keys_by_ref.contains_key(&upstream.key_ref)
+}
+
+/// 该上游的密钥是否**已被回收**（§3.5-5）。
+///
+/// 回收只拦新启动是不够的：网关运行期间某把 key 被回收后，它仍在 `keys_by_ref` 里。
+/// 服务侧在 `revoke_key` 成功后把 `secret_ref` 插进这个集合，网关只查它——
+/// **不新开取密钥路径**。
+fn is_revoked(state: &AppState, upstream: &Upstream) -> bool {
+    let Some(refs) = &state.config.revoked_refs else {
+        return false;
+    };
+    refs.lock()
+        .map(|set| set.contains(&upstream.key_ref))
+        // 锁中毒：**按「没被回收」处理**。可用性优先——一次 panic 不该让网关停止服务；
+        // 而这里误判的代价是「多试一次注定 401 的上游」，由故障切换兜住。
+        .unwrap_or(false)
+}
+
+/// 上报一次观测（§5.3）。失败尝试也上报，但服务侧**只把成功的记进 last-value**
+/// （失败耗时没有比较意义）。
+fn observe(state: &AppState, site_id: i64, latency_ms: u64, ok: bool) {
+    if let Some(sink) = &state.config.on_observation {
+        sink(UpstreamObservation {
+            site_id,
+            latency_ms,
+            ok,
+        });
+    }
 }
 
 /// 重建发往上游的请求头：**丢掉**调用方的 `Authorization`，换成该上游的站点密钥；
