@@ -2061,12 +2061,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             )));
         }
         ensure_not_revoked(&row)?;
-        let api_key = self.vault.get(&row.secret_ref)?.ok_or_else(|| {
-            Error::Vault(format!(
-                "钥匙串中没有该密钥（{}）；请先重新取一次钥匙",
-                row.secret_ref
-            ))
-        })?;
+        // 走 `key_secret` 而不是在这里再抄一遍 `vault.get` + 回收判定（M8-S5A §2.2）：
+        // 一个咽喉点比两处同义代码好，`ensure_not_revoked` 也不会再漏。
+        //
+        // **未接线（去向 M8-S1）**：`GatewayConfig::api_key` 的类型仍是裸 `String`
+        // （`gateway.rs` 属 M8-S1 写域），所以下面这一次 `.to_string()` 产生的副本
+        // **没有**被 `Zeroizing` 包住。`keys_by_ref` 那条路径已经是 `Zeroizing` 了，
+        // 单上游这条还不是——`M8-S0` §4 增量① 要求把这件事说出来，不能假装覆盖了。
+        let api_key = self.key_secret(key_id)?.to_string();
 
         let mut config = crate::gateway::GatewayConfig::single_upstream(
             port,
@@ -2580,18 +2582,34 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     ///
     /// 已回收的 key 在这里拒绝（投递预览与投递都经过本函数）；同意的授予 / 撤销**不**经过
     /// 这里——那两步只关心「写哪个文件」，不该因为选中的 key 已回收就撤不掉同意。
-    fn key_secret(&self, key_id: i64) -> Result<String> {
+    fn key_secret(&self, key_id: i64) -> Result<zeroize::Zeroizing<String>> {
         let row = self
             .store
             .get_key(key_id)?
             .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
         ensure_not_revoked(&row)?;
-        self.vault.get(&row.secret_ref)?.ok_or_else(|| {
+        let secret = self.vault.get(&row.secret_ref)?.ok_or_else(|| {
             Error::Vault(format!(
                 "钥匙串中没有该密钥（{}）；请先在该站点重新取一次钥匙",
                 row.secret_ref
             ))
-        })
+        })?;
+        // M7-S5 spec §2.1 要求的 `Zeroizing` 直到 M8-S5A 才真正落地：此前它是裸 `String`，
+        // 而复审 §6-4 写的却是「核了」（DEBUG 报告 §1.10）。
+        //
+        // 返回 `Zeroizing` 而不是在调用点各自包一层：调用点会变多，咽喉点只有一个。
+        // 调用方拿到的东西类型上就不是裸 `String`，所以「某次调用忘了清零」在编译期就不成立。
+        Ok(zeroize::Zeroizing::new(secret))
+    }
+
+    /// 仅测试用：把 `key_secret` 暴露给集成测试，用于断言**返回类型**本身。
+    ///
+    /// 为什么要一条专门的断言：`Zeroizing<String>` 的 deref 让所有调用点照旧能编译，
+    /// 所以「返回类型被改回裸 `String`」这件事**没有任何现有测试会红**——
+    /// 而那正是这次修复的全部内容。
+    #[doc(hidden)]
+    pub fn key_secret_for_test(&self, key_id: i64) -> Result<zeroize::Zeroizing<String>> {
+        self.key_secret(key_id)
     }
 
     /// 目标路径白名单：既要落在 `home` 之内，也要与**该通道声明的相对路径**逐字相等。
