@@ -26,6 +26,10 @@ sha2 = "0.10.9"
 thiserror = "2.0.21"
 tokio = { version = "1.53.2", features = ["full"] }
 toml_edit = "0.25.5"
+# M7-S0：提升为直接依赖。它**本来就在** Cargo.lock（rsa / aes-gcm 的传递依赖）与本机缓存里，
+# 因此不引入新的第三方代码、也不需要联网。用途见 docs/specs/M7-S0-V1.1波次章程.md §3.1（网关明文键）
+# 与 docs/specs/M7-S5-接线与运行时.md §2.1（内存清零）。
+zeroize = "1.9"
 
 [dev-dependencies]
 # 集成测试直接开库制造故障（例如 DROP TABLE journals）验证补偿路径
