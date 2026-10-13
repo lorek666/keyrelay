@@ -779,6 +779,8 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
             used: used_quota as f64 / unit as f64,
             raw_quota,
             quota_per_unit: Some(unit),
+            // NewAPI 有余额端点：读到了就是可观测（M7-S2）。
+            known: true,
         })
     }
 

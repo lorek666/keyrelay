@@ -96,8 +96,14 @@ fn platform_specific_files_match_the_known_inventory() {
     // - `autostart.rs`（M6-S2）：`cfg!(target_os = "windows")` 分派到注册表形态，macOS 走 LaunchAgent plist
     // - `notify/system.rs`（M6-S3）：macOS 走 `osascript`，Windows 走 PowerShell toast
     // 两者都在 `docs/evidence/platform-parity.md` §1 补了双端说明。
+    //
+    // M7 波次新增一项（2026-10-13）：
+    // - `delivery/mod.rs`（M7-S3）：`current_host_os()` 按宿主平台分派 VS Code `globalStorage`
+    //   候选路径（macOS `Library/Application Support/Code/…` / Windows `AppData/Roaming/Code/…`），
+    //   给 Cline / Roo 的「探测 + 明确拒绝」用。双端说明见 `docs/evidence/platform-parity.md` §1.1。
     let expected = vec![
         "autostart.rs".to_string(),
+        "delivery/mod.rs".to_string(),
         "delivery/shell_block.rs".to_string(),
         "inject/mod.rs".to_string(),
         "notify/system.rs".to_string(),

@@ -209,13 +209,13 @@ fn read_first_body_bytes(url: &str, token: &str, path: &str) -> String {
 
 async fn start_gateway(upstream: &FakeUpstream) -> (keyrelay_core::gateway::GatewayHandle, String) {
     let token = generate_token();
-    let handle = start(GatewayConfig {
-        port: 0, // 让内核分配
-        token: token.clone(),
-        base_url: upstream.base_url.clone(),
-        api_key: SITE_KEY.to_string(),
-        site_display_name: "假站点".to_string(),
-    })
+    let handle = start(GatewayConfig::single_upstream(
+        0, // 让内核分配
+        token.clone(),
+        upstream.base_url.clone(),
+        SITE_KEY.to_string(),
+        "假站点".to_string(),
+    ))
     .await
     .expect("网关应能启动");
     (handle, token)
@@ -226,13 +226,13 @@ async fn start_gateway_on(
     upstream: &FakeUpstream,
     port: u16,
 ) -> keyrelay_core::Result<GatewayHandle> {
-    start(GatewayConfig {
+    start(GatewayConfig::single_upstream(
         port,
-        token: generate_token(),
-        base_url: upstream.base_url.clone(),
-        api_key: SITE_KEY.to_string(),
-        site_display_name: "假站点".to_string(),
-    })
+        generate_token(),
+        upstream.base_url.clone(),
+        SITE_KEY.to_string(),
+        "假站点".to_string(),
+    ))
     .await
 }
 
@@ -512,13 +512,13 @@ async fn a_busy_port_is_reported_clearly() {
     let occupied = TcpListener::bind("127.0.0.1:0").expect("占住一个端口");
     let port = occupied.local_addr().unwrap().port();
 
-    let err = start(GatewayConfig {
+    let err = start(GatewayConfig::single_upstream(
         port,
-        token: generate_token(),
-        base_url: upstream.base_url.clone(),
-        api_key: SITE_KEY.to_string(),
-        site_display_name: "假站点".to_string(),
-    })
+        generate_token(),
+        upstream.base_url.clone(),
+        SITE_KEY.to_string(),
+        "假站点".to_string(),
+    ))
     .await
     .expect_err("端口被占用时必须报错");
     assert!(err.to_string().contains("端口"), "{err}");
@@ -602,4 +602,77 @@ async fn a_second_start_without_shutdown_fails_after_the_full_retry_budget() {
     );
 
     first.shutdown_and_wait().await;
+}
+
+// ==================================================== M7-S1：空路由表的 legacy 等价
+
+/// 带 body 的 POST（既有 `http_request` 固定 `Content-Length: 0`，用来验证空路由表时
+/// **请求体逐字节原样转发**需要能发 body）。
+fn http_post(url: &str, token: &str, path: &str, body: &str) -> (u16, String) {
+    let without_scheme = url.trim_start_matches("http://");
+    let mut stream = TcpStream::connect(without_scheme).expect("连接网关");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {without_scheme}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("发送请求");
+    stream.flush().ok();
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).expect("读响应");
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    let (_, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    (status, body.to_string())
+}
+
+/// **章程 §3.1 点名的测试**：`route.is_empty()` 时转发行为必须与单上游时代**逐字节相同**。
+///
+/// 四条断言分别对应「不引入新行为」的四个面：目标、凭证、请求体、请求次数。
+/// 若将来有人在空表路径上也接了 body 解析 / 别名改写 / 熔断，这条会红。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_route_table_keeps_legacy_behaviour() {
+    let upstream = spawn_fake_upstream();
+    let (handle, token) = start_gateway(&upstream).await;
+    let url = format!("http://{}", handle.addr);
+
+    // 这个 body 里**故意**放一个 `model`：若空表路径也做了别名/路由处理，它就有机会被改写。
+    let body =
+        r#"{"model":"gpt-5.6","messages":[{"role":"user","content":"hi"}],"temperature":0.50}"#;
+    let (status, resp_body) = tokio::task::spawn_blocking({
+        let url = url.clone();
+        let token = token.clone();
+        let body = body.to_string();
+        move || http_post(&url, &token, "/v1/chat/completions", &body)
+    })
+    .await
+    .expect("阻塞任务");
+
+    assert_eq!(status, 200);
+    assert!(resp_body.contains("upstream"), "{resp_body}");
+
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "空路由表必须只发一次请求");
+
+    let raw = &seen[0];
+    // ① 转发目标是 config.base_url 对应的那个上游（就是这个假上游）
+    assert!(raw.starts_with("POST /v1/chat/completions"), "{raw}");
+    // ② 凭证是站点密钥，不是本地令牌
+    assert!(
+        raw.contains(&format!("authorization: Bearer {SITE_KEY}")),
+        "{raw}"
+    );
+    assert!(!raw.contains(&token), "本地令牌不得出现在上游请求里: {raw}");
+    // ③ 请求体**逐字节**原样（`0.50` 没有被规范化成 `0.5`）
+    assert!(
+        raw.ends_with(body),
+        "空路由表时请求体必须逐字节原样转发:\n{raw}"
+    );
+    assert!(raw.contains("0.50"), "数值形态不得被重序列化改写: {raw}");
 }

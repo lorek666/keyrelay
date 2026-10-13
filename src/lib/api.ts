@@ -729,6 +729,43 @@ export async function rotateKey(keyId: number, name: string): Promise<RotationRu
 }
 
 /**
+ * 回收站点上的某把令牌（B-82 的独立路径）。
+ *
+ * **不是**「删除本地记录」：本地行会被标成 `revoked` 并保留——`bindings` 与漂移追溯
+ * 靠 `keys.id` 存活，删行会把它们一起带走。
+ *
+ * 破坏性且不可逆（站点侧那把 key 真的没了），所以 `confirm` 必须显式为 `true`；
+ * 核心层会拒绝 `false`，界面上也必须先问过一次。
+ */
+export async function revokeKey(
+  siteId: number,
+  remoteId: string,
+  confirm: boolean,
+): Promise<void> {
+  if (!hasTauri) return mock(undefined);
+  return invokeCommand<void>("revoke_key", { siteId, remoteId, confirm });
+}
+
+export type KeychainPurgeReport = {
+  attempted: number;
+  removed: number;
+  failed: number;
+  /** 第一条失败的文案（已脱敏）。没有失败时为 `null`。 */
+  firstError: string | null;
+};
+
+/**
+ * 清空钥匙串里属于本产品的条目（FR-8「卸载后钥匙串条目可一键清理」）。
+ *
+ * 不可逆：秘密删了就没了（站点侧那把 key 还在，但本地再也取不回明文）。
+ * 本地 SQLite 记录**保留**——清理的是秘密，不是历史。
+ */
+export async function purgeKeychain(confirm: boolean): Promise<KeychainPurgeReport> {
+  if (!hasTauri) return mock({ attempted: 3, removed: 3, failed: 0, firstError: null });
+  return invokeCommand<KeychainPurgeReport>("purge_keychain", { confirm });
+}
+
+/**
  * 分组倍率的展示口径（M6-S4 复审 P2-4 / P2-5 的裁决）。
  *
  * 只在**展示层**收紧，核心层不加校验：我们没有站点事实支撑「倍率 0 是不是合法值」

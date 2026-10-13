@@ -876,3 +876,66 @@ fn rotate_key_rejects_a_missing_argument() {
     let err = invoke_impl("rotate_key", json!({})).expect_err("缺参数应被拒");
     assert_not_acl_rejection("rotate_key", &err);
 }
+
+#[test]
+fn list_stored_keys_is_empty_on_a_fresh_install() {
+    // B-93（M7-S5 补）：`list_stored_keys` 出自 M1-S4，是 35 条命令里**唯一**没有
+    // IPC 层断言的一条。它此前只在核心层的测试里被覆盖过——而「命令已注册 + 过了 ACL +
+    // 返回形状是数组」这三件事只有 IPC 层能证明。
+    let value = invoke("list_stored_keys").expect("list_stored_keys 应成功");
+    assert_not_acl_rejection("list_stored_keys", &value);
+    assert_eq!(value, json!([]), "空安装应是空数组");
+}
+
+#[test]
+fn revoke_key_requires_confirmation_before_touching_anything() {
+    // 破坏性且不可逆：`confirm` 缺失或为 false 时必须在**参数校验**就停住，
+    // 不能「先查站点再报错」——那样一次误触就会走到站点侧删除的边界上。
+    let err = invoke_impl(
+        "revoke_key",
+        json!({"siteId": 999, "remoteId": "12", "confirm": false}),
+    )
+    .expect_err("未确认应被拒");
+    assert_not_acl_rejection("revoke_key", &err);
+    assert!(
+        err.to_string().contains("二次确认"),
+        "应给出「需要二次确认」而不是别的错误: {err}"
+    );
+
+    // 确认之后才走到业务路径：站点不存在 ⇒ 业务错误（而不是 ACL / 参数错误）。
+    let err = invoke_impl(
+        "revoke_key",
+        json!({"siteId": 999, "remoteId": "12", "confirm": true}),
+    )
+    .expect_err("不存在的站点应报错");
+    assert_not_acl_rejection("revoke_key", &err);
+}
+
+#[test]
+fn purge_keychain_requires_confirmation_and_reports_counts() {
+    let err = invoke_impl("purge_keychain", json!({"confirm": false})).expect_err("未确认应被拒");
+    assert_not_acl_rejection("purge_keychain", &err);
+    assert!(
+        err.to_string().contains("二次确认"),
+        "应给出「需要二次确认」而不是别的错误: {err}"
+    );
+
+    // 空安装：没有引用 ⇒ 三个计数都是 0，且不是错误。
+    // 「没有东西可清」不是失败——把它做成错误会让卸载脚本平白报错。
+    let value = invoke_impl("purge_keychain", json!({"confirm": true})).expect("空安装应成功");
+    assert_not_acl_rejection("purge_keychain", &value);
+    assert_eq!(value["attempted"], 0);
+    assert_eq!(value["removed"], 0);
+    assert_eq!(value["failed"], 0);
+    assert_eq!(value["firstError"], Value::Null);
+}
+
+#[test]
+fn site_balance_reports_unknown_without_pretending_it_is_zero() {
+    // M7-S5 接线：未知余额必须**结构上**给 null，而不是 0——
+    // 界面拿到 0 就会渲染成 `0.00`，而那与「不知道」是两件事。
+    // 这里用不存在的站点拿不到余额（业务错误），所以真正的形状断言在
+    // `commands.rs` 的 `BalanceDto` 单测里；本测试钉的是「命令已注册且过 ACL」。
+    let err = invoke_impl("site_balance", json!({"siteId": 999})).expect_err("不存在的站点应报错");
+    assert_not_acl_rejection("site_balance", &err);
+}
