@@ -41,6 +41,19 @@ pub trait Vault: Send + Sync {
     /// 不存在返回 `Ok(None)`（**不是**错误）。
     fn get(&self, key: &str) -> Result<Option<String>>;
 
+    /// 条目**在不在**（`Ok(false)` = 不存在，`Err` = 读失败——两者必须分开）。
+    ///
+    /// 存在的意义是**把「查一下在不在」与「把明文取出来用」在名字上分开**：
+    /// `sync_site_keys` 要的是前者（判断本地记录还能不能用），
+    /// `key_secret` 要的是后者（交给投递 / 网关）。两者都调 `get` 的话，
+    /// 「明文出口只能有一处」那条结构守卫就没法写——它分不清哪一处是出口。
+    ///
+    /// 默认实现走 [`Self::get`]：后端不必各写一遍，语义也一致
+    /// （**读失败不等于不存在**，这是调用方最需要区分的）。
+    fn has(&self, key: &str) -> Result<bool> {
+        Ok(self.get(key)?.is_some())
+    }
+
     /// 幂等：不存在也返回 `Ok(())`。
     fn delete(&self, key: &str) -> Result<()>;
 }

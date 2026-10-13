@@ -1734,9 +1734,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 missing.push(meta.remote_id.clone());
                 continue;
             };
-            match self.vault.get(&row.secret_ref) {
-                Ok(Some(_)) => already_local += 1,
-                Ok(None) => restorable.push((meta.remote_id.clone(), row.secret_ref.clone())),
+            // `vault.has` 而不是 `vault.get`：这里要的是「还在不在」，不是「把明文取出来」。
+            // 两者分开之后，「明文出口只能有一处」那条结构守卫才写得出来
+            // （见 `tests/zeroize_hygiene.rs`）。
+            match self.vault.has(&row.secret_ref) {
+                Ok(true) => already_local += 1,
+                Ok(false) => restorable.push((meta.remote_id.clone(), row.secret_ref.clone())),
                 Err(err) => {
                     // 钥匙串**读失败**（例如被锁）不能当成「没有」：当成没有就会去新建一行，
                     // 而那一行与现有行是同一个 `remote_id`，`keys` 表上**没有唯一约束**
