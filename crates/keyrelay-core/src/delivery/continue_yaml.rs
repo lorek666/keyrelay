@@ -2,7 +2,8 @@
 //!
 //! # 为什么是标记块
 //!
-//! Continue 的 `models:` 是**用户的**列表（本机没装 Continue，schema 未验证）。往里面塞条目有两条路：
+//! Continue 的 `models:` 是**用户的**列表（schema 已用 Continue 自己的解析器核实，见 [`CONFIG_NAME`]）。
+//! 往里面塞条目有两条路：
 //! ① 整份 YAML 解析后重写——会把用户的注释、键序、引号风格全部重排（违反 PRD FR-4:135 ③）；
 //! ② 在 `models:` 之下插一个**注释标记块**，只动块内字节。本模块选 ②。
 //!
@@ -37,8 +38,9 @@ pub const BLOCK_END: &str = "# <<< keyrelay managed <<<";
 const BLOCK_NOTE: &str = "# 由 KeyRelay 管理；手工修改会在下次投递时被覆盖";
 /// 条目的显示名：**本产品自己的字面量**，不从站点或用户数据里编造。
 const ENTRY_NAME: &str = "keyrelay";
-/// OpenAI 兼容入口的 provider id。**本包唯一未经本机验证的字段**（spec §14-3）：
-/// Continue 未安装，无法核实该写哪个 provider id；改动点只有本常量一行。
+/// OpenAI 兼容入口的 provider id。schema 层已核实（`provider` 是自由字符串，`parseConfigYaml`
+/// 接受）；**运行期**是否按 OpenAI 兼容协议走 `apiBase` 仍未在装了 Continue 的机器上验证
+/// （spec §14-3）。改动点只有本常量一行。
 const ENTRY_PROVIDER: &str = "openai";
 /// 新建文件时的配置头。Continue 的 schema 把顶层 `name` / `version` 定为**必填**——
 /// 用它自己的解析器（`@continuedev/config-yaml` 1.42.0 `parseConfigYaml`）实测：

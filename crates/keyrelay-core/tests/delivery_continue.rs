@@ -180,12 +180,42 @@ fn redelivery_without_a_model_keeps_the_one_already_in_the_block() {
 fn model_with_escapes_round_trips_through_the_block() {
     let dir = tmp();
     let path = writer(dir.path(), BASE, None).path().to_path_buf();
-    let model = "org/\"quoted\" \\ name";
+    // `quote` 会产生的每一种转义都要往返：`\"` `\\` `\t` `\n` `\r`，以及结尾的反斜杠
+    let model = "org/\"quoted\" \\ name\ttab\nline\rcr trailing\\";
     let first = writer(dir.path(), BASE, Some(model)).plan(SECRET).unwrap();
     fs::write(&path, &first.after).unwrap();
 
     let again = writer(dir.path(), BASE, None).plan(SECRET).unwrap();
     assert_eq!(again.after, first.after, "沿用的模型名必须逐字相同");
+}
+
+/// 块里的 `model:` 被手工改成 `quote` 产生不了的写法 ⇒ 不猜，拒绝并要求填写模型名；
+/// 文件不动（独立复审 P3-2：「拒绝未转义引号」原先没有用例守护）。
+#[test]
+fn hand_edited_model_that_quote_cannot_produce_is_not_guessed() {
+    let dir = tmp();
+    let path = writer(dir.path(), BASE, None).path().to_path_buf();
+    let first = writer(dir.path(), BASE, Some(MODEL)).plan(SECRET).unwrap();
+    let rendered = format!("model: \"{MODEL}\"");
+    assert!(first.after.contains(&rendered), "{}", first.after);
+
+    for hand_edited in [
+        "model: \"a\"b\"",   // 未转义的引号
+        "model: 'single'",   // 单引号
+        "model: bare",       // 裸值
+        "model: \"bad\\q\"", // quote 不会产生的转义
+        "model: \"\"",       // 空
+    ] {
+        let before = first.after.replace(&rendered, hand_edited);
+        fs::write(&path, &before).unwrap();
+        let err = writer(dir.path(), BASE, None).plan(SECRET).unwrap_err();
+        assert!(err.to_string().contains("模型名"), "{hand_edited}: {err}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "拒绝时不得改动文件"
+        );
+    }
 }
 
 // ============================================================ 插入 / 替换
