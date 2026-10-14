@@ -30,6 +30,15 @@ pub struct SiteSummaryDto {
     base_url: String,
     display_name: String,
     health: String,
+    /// 登录账号栏的输入约定（M9-S2 / B-120）：`"username"` / `"email"` / `null`。
+    ///
+    /// 与 `capabilities` **同一处派生**（都从 `SiteKind` 查表）：界面据此决定标签与
+    /// placeholder，**不得**在页面里按 `kind` 硬编码——那正是 M7-S2 §3.3 禁掉的形态，
+    /// 而这里的代价比灰显更重：标签写错会让用户填一个**注定被站点拒绝**的值
+    /// （B-120 的原始症状：Sub2API 的账号栏被标成「用户名」）。
+    ///
+    /// 认不出的 `kind` ⇒ `null`：界面回落到中性标签「账号」，**不猜**是用户名。
+    login_field: Option<&'static str>,
     /// 该站点类型的**设计能力**（M7-S5 / M7-S2 的 `capabilities()`）。
     ///
     /// 界面用它灰显按钮，**不得**在页面里按 `kind` 硬编码判断——否则新增站点类型时
@@ -85,16 +94,23 @@ impl SiteCapabilitiesDto {
 
 impl SiteSummaryDto {
     fn from_row(row: keyrelay_core::service::SiteSummary) -> Self {
-        let capabilities = match keyrelay_core::site::SiteKind::parse(&row.kind) {
+        // 只解析一次 `kind`：`capabilities` 与 `login_field` 必须来自**同一个**判断，
+        // 两次 `parse` 写两遍就是两处事实（将来改了其中一处就会分叉）。
+        let kind = keyrelay_core::site::SiteKind::parse(&row.kind);
+        let capabilities = match kind {
             Some(kind) => SiteCapabilitiesDto::from_kind(kind),
             None => SiteCapabilitiesDto::none(),
         };
+        let login_field = kind
+            .and_then(keyrelay_core::site::login_field::LoginField::of)
+            .map(keyrelay_core::site::login_field::LoginField::as_str);
         Self {
             id: row.id,
             kind: row.kind,
             base_url: row.base_url,
             display_name: row.display_name,
             health: row.health,
+            login_field,
             capabilities,
         }
     }
@@ -2040,6 +2056,21 @@ mod tests {
             value["capabilities"]["keyUsage"], false,
             "用量取不到，见 B-96"
         );
+        // M9-S2 / B-120：登录账号栏的约定也随站点类型下发（NewAPI 是用户名）。
+        assert_eq!(value["loginField"], "username");
+
+        // Sub2API：账号栏是**邮箱**——真实站点只认邮箱形态，用户名必被 400
+        // （`api.example.com` 实测，见 M9-S1 证据 §3）。界面据此改标签，
+        // 因此这个取值是**用户可见行为**，不是内部字段。
+        let sub2api = SiteSummaryDto::from_row(keyrelay_core::service::SiteSummary {
+            id: 3,
+            kind: "sub2api".into(),
+            base_url: "https://api.example.com".into(),
+            display_name: "Sub2API 站".into(),
+            health: "unknown".into(),
+        });
+        let value = to_value(&sub2api);
+        assert_eq!(value["loginField"], "email");
 
         // 认不出的站点类型 ⇒ 全部 false（fail-closed：宁可全灰，也不给点了才报错的按钮）。
         let unknown = SiteSummaryDto::from_row(keyrelay_core::service::SiteSummary {
@@ -2052,8 +2083,18 @@ mod tests {
         let value = to_value(&unknown);
         assert_eq!(value["capabilities"]["listKeys"], false);
         assert_eq!(value["capabilities"]["login"], false);
+        // 认不出类型 ⇒ 账号约定为 `null`：界面回落到中性标签「账号」，**不猜**是用户名
+        // （猜错的代价与 B-120 一样：用户按标签填，站点直接拒）。
+        assert!(
+            value["loginField"].is_null(),
+            "认不出的类型不得猜一个账号形态: {value}"
+        );
         assert!(
             value.get("base_url").is_none(),
+            "不得出现 snake_case: {value}"
+        );
+        assert!(
+            value.get("login_field").is_none(),
             "不得出现 snake_case: {value}"
         );
 

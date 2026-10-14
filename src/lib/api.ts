@@ -53,6 +53,17 @@ export type SiteRow = {
    * `"unknown"`（从没登录过）| `"ok"`（登录过且会话有效）| `"needs_login"`（会话已失效，需要重新登录）
    */
   health: string;
+  /**
+   * 登录账号栏的**输入约定**（M9-S2 / B-120）：`"username"` | `"email"` | `null`。
+   *
+   * 判据**只**来自后端那张表（`site::login_field`）——页面里不得出现
+   * 「`kind === "sub2api"` 就该填邮箱」这类硬编码：新增站点类型时，硬编码的那处会给出一个
+   * **错的标签**，而错标签让用户填一个注定被站点拒的值（B-120 的原始症状：
+   * Sub2API 的账号栏被标成「用户名」，用户按标签填用户名 → 站点 400）。
+   *
+   * `null` = 该站点类型没有登录流程（`capabilities.login === false`，登录按钮本来就是灰的）。
+   */
+  loginField: "username" | "email" | null;
   /** 该站点类型支持什么（唯一出处，页面不得自己判断 `kind`） */
   capabilities: SiteCapabilities;
 };
@@ -415,7 +426,7 @@ async function invokeCommand<T>(
 // ============================================================ mock（浏览器预览）
 
 /** mock 用的能力集：与 `site/capability.rs` 的两行**逐格一致**（NewAPI/Sub2Api 同表）。 */
-const MOCK_CAPS_NEWAPI: SiteCapabilities = {
+const MOCK_CAPS_LOGINABLE: SiteCapabilities = {
   login: true,
   listKeys: true,
   createKey: true,
@@ -427,25 +438,40 @@ const MOCK_CAPS_NEWAPI: SiteCapabilities = {
 };
 
 /**
- * mock 里放**两个**站点是有意的：第二个 `custom-openai-compatible` 站点全能力为 `false`，
- * 于是浏览器预览（`pnpm dev`）里能直接看到「灰显 + 不可观测」长什么样——
- * 本机没有 GUI 会话，预览是唯一能肉眼核 W2/W5 的路径。
+ * mock 里放**三个**站点是有意的：
+ *
+ * - `newapi`：全能力 + 账号栏是**用户名**；
+ * - `sub2api`：全能力 + 账号栏是**邮箱**（M9-S2 / B-120）——`pnpm dev` 里点它的「登录」
+ *   就能肉眼核标签与 placeholder 是否跟着 `loginField` 变（本机没有 GUI 会话，
+ *   浏览器预览是唯一能肉眼核界面文案的路径）；
+ * - `custom-openai-compatible`：全能力 `false`，用来看「灰显 + 不可观测」长什么样。
  */
 const MOCK_SITES: SiteRow[] = [
   {
     id: 1,
     kind: "newapi",
     baseUrl: "https://relay.example.com",
-    displayName: "示例中转站（mock）",
+    displayName: "示例中转站（mock·用户名登录）",
     health: "unknown",
-    capabilities: MOCK_CAPS_NEWAPI,
+    loginField: "username",
+    capabilities: MOCK_CAPS_LOGINABLE,
   },
   {
     id: 2,
+    kind: "sub2api",
+    baseUrl: "https://api.example.com",
+    displayName: "示例 Sub2API（mock·邮箱登录）",
+    health: "unknown",
+    loginField: "email",
+    capabilities: MOCK_CAPS_LOGINABLE,
+  },
+  {
+    id: 3,
     kind: "custom-openai-compatible",
     baseUrl: "https://compatible.example.com",
     displayName: "只读兼容端点（mock·无令牌管理）",
     health: "unknown",
+    loginField: null,
     capabilities: {
       login: false,
       listKeys: false,
