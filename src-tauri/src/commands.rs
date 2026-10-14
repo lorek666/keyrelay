@@ -2085,8 +2085,19 @@ mod tests {
         assert_eq!(value["capabilities"]["login"], false);
         // 认不出类型 ⇒ 账号约定为 `null`：界面回落到中性标签「账号」，**不猜**是用户名
         // （猜错的代价与 B-120 一样：用户按标签填，站点直接拒）。
+        //
+        // 「键存在且值为 null」要分两条断言：`value["loginField"].is_null()` 对
+        // **键缺失**也为真（`serde_json::Value` 索引不存在的键返回 `Null`），单靠它
+        // 挡不住 `#[serde(skip_serializing_if = "Option::is_none")]` 这类回归——
+        // 那时 TS 侧读到的是 `undefined`，而类型声明是 `"username" | "email" | null`。
+        let object = value.as_object().expect("序列化结果必须是对象");
         assert!(
-            value["loginField"].is_null(),
+            object.contains_key("loginField"),
+            "loginField 必须始终存在（值是 null 也行，但键不能在）：{value}"
+        );
+        assert_eq!(
+            value["loginField"],
+            serde_json::json!(null),
             "认不出的类型不得猜一个账号形态: {value}"
         );
         assert!(

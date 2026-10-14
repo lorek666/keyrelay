@@ -97,27 +97,43 @@ impl LoginField {
 /// 允许 unicode 域名。本函数若比它严，就会把站点**接受**的输入挡在门外，那是把
 /// 「能登录」变成「不能登录」，比少省一次往返严重得多。
 ///
-/// 因此只判这四类形态（逐条对应 [`LoginField::precheck`] 文档里的编号）：
+/// 因此只判这 5 类形态（逐条对应 [`LoginField::precheck`] 文档里的编号）：
 ///
 /// | # | 判据 | 为什么邮箱必然满足 |
 /// |---|------|--------------------|
+/// | ① | `trim()` 后为空 | 站点 `binding:"required,email"` 的 `required` 先拦空串 |
 /// | ② | 整串没有 `@` | 站点正则两侧分支都要求字面量 `@` |
-/// | ③ | 本地部为空（以 `@` 开头） | 本地部至少一个字符 |
-/// | ④ | 域名为空（以 `@` 结尾） | 域名至少一个字符 |
+/// | ③ | **原串**以 `@` 开头（本地部零字符） | 本地部至少一个字符 |
+/// | ④ | 最后一个 `@` 之后为空 | 域名至少一个字符 |
 /// | ⑤ | 域名里没有 `.` | 站点正则域名部分是 `(?:label\.)+tld`，至少一个点 |
+///
+/// ③ 只查**原串**，不查 trim 后的串（M9-S2 复审 P2-1 的修法）：「本地部零字符」与
+/// 「本地部只有空白」是两件事。站点正则的本地部字符类把 `[\x{00A0}-\x{D7FF}]` 整段算
+/// 合法，于是 `"\u{a0}@example.com"`（NBSP 当本地部）在站点侧**合法**——若先 trim 掉
+/// NBSP 再判「以 `@` 开头」，剩下的 `"@example.com"` 会被当成空本地部而**误拦**一次本来
+/// 能成功的登录，而用户没有任何绕过手段。代价是 `"   @example.com"`（前导 ASCII 空白 +
+/// 空本地部）改由站点去拒，这按「宁可漏拦」的方向走。修完与真 validator 正则对
+/// 46 + 11 个样本逐条比对：误拦 0（证据 §4.1）。
 ///
 /// 刻意不判的：多个 `@`（`"a@b"@x.com` 在站点正则里**合法**）、空白、域名首尾点、
 /// 空 label（`a@.com`）、长度上限——多一条规则就多一次误拦的机会。
 fn looks_like_email(raw: &str) -> bool {
-    let value = raw.trim();
+    // ①：trim 后为空。逻辑上已被 ② 覆盖（空串没有 `@`），显式写出来只为与 spec §4.2
+    //    的编号对齐。不可能误拦：全空白的串里不可能有 `@`，也就不可能是邮箱形态。
+    if raw.trim().is_empty() {
+        return false;
+    }
     // ②：整串没有 `@`。分隔符取**最后一个** `@`——带引号的本地部里允许出现 `@`
     // （`"a@b"@x.com`），判「恰好一个 @」会误拦这种站点接受的形态。
-    let Some((_, domain)) = value.rsplit_once('@') else {
+    let Some((_, domain)) = raw.rsplit_once('@') else {
         return false;
     };
-    // ③ 本地部为空（以 `@` 开头）；④ 域名为空（最后一个 `@` 之后什么都没有）。
-    // 用 `starts_with` 而不是对 `split_once` 取段，理由同 ②。
-    if value.starts_with('@') || domain.is_empty() {
+    // ③ 本地部零字符：判定用**原串**，不用 trim 后的串。站点正则的本地部字符类把
+    //    `[\x{00A0}-\x{D7FF}]` 整段算合法 ⇒ NBSP/U+3000 等可以当本地部，先 trim 再判
+    //    「以 @ 开头」会把它们误拦掉（详见上方表格 ③ 的说明）。
+    // ④ 域名为空（最后一个 `@` 之后什么都没有）。用 `starts_with` 而不是对
+    //    `split_once` 取段，理由同 ②。
+    if raw.starts_with('@') || domain.is_empty() {
         return false;
     }
     // ⑤ 域名里必须有点。
@@ -161,7 +177,10 @@ mod tests {
         assert_ne!(LoginField::Username.as_str(), LoginField::Email.as_str());
     }
 
-    /// 判据 ②③④⑤：**一定不是邮箱**的输入必须被拦下，且文案要指向「邮箱」。
+    /// 判据 ①②④⑤ 里「**一定不是邮箱**」的输入必须被拦下，且文案要指向「邮箱」。
+    ///
+    /// ③（原串以 `@` 开头）也在里面（`"@qq.com"` / `"@"`）：它同样不可能是邮箱，只是
+    /// 判定时**不能**先 trim（见 `looks_like_email` 上方表格 ③ 的说明）。
     #[test]
     fn email_precheck_rejects_only_what_cannot_be_an_email() {
         for bad in [
@@ -189,10 +208,14 @@ mod tests {
     ///
     /// 每一条都对应一次**差点写出来**的误拦；站点可能接受它们，判严了就是把
     /// 「能登录」变成「不能登录」。
+    ///
+    /// 后面 10 条 Unicode 空白用例是 M9-S2 复审 P2-1 的直接产物：它们都曾被
+    /// 「先 `trim()` 再判本地部是否为空」这条实现**误拦**，而真 validator 正则
+    /// （`regexes.go` 的本地部字符类含 `[\x{00A0}-\x{D7FF}]`）**收下**它们。
+    /// 单独列在这里而不是混在末尾，是为了让「这里每一条都是真出过事的」可读。
     #[test]
     fn email_precheck_accepts_what_the_site_may_accept() {
         for ok in [
-            "me@example.com",
             "me@example.com",
             "a@b.c",
             "  me@example.com  ", // trim 后是邮箱（站点会不会拒带空格的，由站点判）
@@ -202,6 +225,17 @@ mod tests {
             "a@@b.com",           // 两个 @：由站点判
             "用户@例子.中国",     // unicode：站点正则接受
             "a b@x.com",          // 本地部带空格：站点正则的引号分支允许空白，交站点判
+            // ↓ P2-1：本地部**整体是** Unicode 空白。站点收，我们不得拦。
+            "\u{a0}@example.com",
+            "\u{a0}@b.c",        // NBSP 单字符本地部
+            "\u{a0}\u{a0}@b.c",  // 两个 NBSP
+            "\u{3000}@x.com",    // 表意空格
+            "\u{2000}@b.c",      // en quad
+            "\u{2028}@b.c",      // 行分隔符
+            "\u{202f}@b.c",      // 窄 NBSP
+            "\u{205f}@b.c",      // 数学空格
+            "\u{1680}@b.c",      // 欧甘空格
+            "\u{a0}@\u{a0}.com", // 域名 label 也是 NBSP：同样不在我们判据内
         ] {
             assert!(
                 LoginField::Email.precheck(ok).is_ok(),
@@ -217,6 +251,69 @@ mod tests {
             assert!(
                 LoginField::Username.precheck(value).is_ok(),
                 "{value:?} 不该被拦（NewAPI 的账号栏不限形态）"
+            );
+        }
+    }
+
+    /// P2-1 的**定向回归**：复述旧的（错的）实现，证明新实现与它不同且只在正确的一侧。
+    ///
+    /// 直接写 `assert_ne!` 没有意义（那只是在测断言本身）；这里把「先 trim 再判空本地部」
+    /// 这个具体缺陷重写成一份对照函数，让两件事同时可读：
+    /// ① 旧实现确实会把 NBSP 本地部判成 `false`（误拦真的存在过）；
+    /// ② 新实现对同一批输入全部放行。
+    /// 将来若有人把 `raw.starts_with('@')` 改回 `value.starts_with('@')`，这条会先红。
+    #[test]
+    fn the_predicate_does_not_treat_a_unicode_whitespace_local_part_as_empty() {
+        // 旧的实现（P2-1 中被证伪的那一版），原样搬过来当对照。
+        fn old_looks_like_email(raw: &str) -> bool {
+            let value = raw.trim();
+            let Some((_, domain)) = value.rsplit_once('@') else {
+                return false;
+            };
+            if value.starts_with('@') || domain.is_empty() {
+                return false;
+            }
+            domain.contains('.')
+        }
+
+        for local_part in [
+            "\u{a0}",
+            "\u{a0}\u{a0}",
+            "\u{3000}",
+            "\u{2000}",
+            "\u{2028}",
+            "\u{202f}",
+            "\u{205f}",
+            "\u{1680}",
+        ] {
+            let value = format!("{local_part}@example.com");
+            // ① 旧实现确实误拦——否则这条对照就没有证明力。
+            assert!(
+                !old_looks_like_email(&value),
+                "对照函数应该拦 {value:?}；若它不拦了，说明它已经不是 P2-1 的那一版"
+            );
+            // ② 新实现必须放行。
+            assert!(
+                looks_like_email(&value),
+                "{value:?} 的本地部是 Unicode 空白，站点正则收，不得误拦"
+            );
+        }
+
+        // 反向：真正的空本地部仍然要被拒（修 ③ 不能顺手把 ③ 一起废掉）。
+        //
+        // 注意 `"   @example.com"`（ASCII 空白 + 空本地部）**不在**这个清单里：新实现对
+        // 它放行（原串不以 `@` 开头），这是 ③ 改用原串判定的既定代价——交给站点拒。
+        // 这些例子上两个实现**行为相同**（差异只发生在「trim 会改动首字符」的输入上），
+        // 所以断言的是「相等」，不是「都为真」。
+        for value in ["@example.com", "@"] {
+            assert!(
+                !looks_like_email(value),
+                "{value:?} 的本地部是零字符，仍然必须拦"
+            );
+            assert_eq!(
+                old_looks_like_email(value),
+                looks_like_email(value),
+                "对照函数对 {value:?} 应与新实现一致（这一条不是 P2-1 的差异点）"
             );
         }
     }

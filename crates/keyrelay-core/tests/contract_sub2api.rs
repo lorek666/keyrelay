@@ -246,7 +246,7 @@ async fn login_maps_rate_limit_and_auth_failures() {
 /// Error:Field validation for 'Email' failed on the 'email' tag"}`。
 /// 早先 `map_http_error` 没有 400 分支，落到「未预期的状态码 400」兜底支——
 /// 站点把「你的邮箱字段格式不对」说得清清楚楚，用户却只看到一句状态码，
-/// 没有任何线索知道该把 `testuser` 改成 `lorek@qq.com`。
+/// 没有任何线索知道要把账号改成**邮箱形态**。
 #[tokio::test]
 async fn login_400_carries_the_site_message() {
     let transport = MockTransport::new(vec![json_resp(
