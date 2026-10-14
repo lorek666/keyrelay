@@ -48,6 +48,17 @@ pub enum Error {
     #[error("传输错误: {0}")]
     Transport(String),
 
+    /// 输入形态不符合该站点类型的约定（M9-S2 / B-120）。**请求未发出**。
+    ///
+    /// 为什么单开一个变体，而不是复用现成的两个：
+    ///
+    /// - **不是** [`Error::AuthFailed`]：那会命中 `is_auth_failure` 与前端的
+    ///   `isAuthError()`，把「改一下输入」说成「请重新登录」（M9-S1 D-1 的同一条推理）；
+    /// - **不是** [`Error::Transport`]：一个字节都没发出去，说「传输错误」是假话；
+    ///   而且 `Transport` 会被 `is_retryable()` 判为可重试——同一个值重试多少次也不会成功。
+    #[error("输入不符合站点要求: {0}")]
+    InvalidInput(String),
+
     /// 钥匙串读写失败
     #[error("钥匙串错误: {0}")]
     Vault(String),

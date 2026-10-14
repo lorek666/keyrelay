@@ -3,6 +3,7 @@
 pub mod capability;
 pub mod captcha;
 pub mod custom_openai;
+pub mod login_field;
 pub mod newapi;
 pub mod password_crypto;
 pub mod registry;

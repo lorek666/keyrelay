@@ -92,6 +92,8 @@ fn error_kind(err: &Error) -> &'static str {
         Error::QuotaExhausted => "额度不足",
         Error::NotFound(_) => "远端资源不存在",
         Error::Transport(_) => "网络/协议错误",
+        // M9-S2：与「认证失败」分开记——用户要做的是**改输入**，不是重新登录。
+        Error::InvalidInput(_) => "输入不符合站点要求",
         Error::Vault(_) => "钥匙串错误",
         Error::VaultUnavailable(_) => "钥匙串不可用",
         Error::ConsentRequired { .. } => "缺少用户同意",
@@ -784,6 +786,16 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             crate::site::capability::capabilities(kind).login,
             "登录",
         )?;
+        // M9-S2 / B-120：账号形态与该站点类型的约定不符时**本地就拒**——不发注定被
+        // 站点 400 掉的请求（Sub2API 的 `email` 字段带 `binding:"required,email"`，
+        // 用户名必被拒，而站点回的是 Go validator 的英文原文）。
+        //
+        // 判据与界面标签**同源**（都来自 `site::login_field`），所以不会出现
+        // 「标签说邮箱、预检按用户名」这种各说各话的局面；位置在 `adapter.login`
+        // **之前**是硬要求，否则请求已经出去了。
+        if let Some(field) = crate::site::login_field::LoginField::of(kind) {
+            field.precheck(&cred.username)?;
+        }
         // 用户名不是秘密，但仍然过一遍脱敏入口（B-36：站点原文/用户名都可能被规则命中）
         let username = cred.username.clone();
         let adapter = self.registry.adapter(kind);
@@ -3691,6 +3703,26 @@ mod tests {
     use super::*;
     use crate::site::transport::{HttpResponse, MockTransport};
     use serde_json::json;
+
+    // ============================================ M9-S2（错误词表）
+
+    /// 新错误变体的**事件词表**：事件表里「输入不符合站点要求」必须与「认证失败」分开记。
+    ///
+    /// 分开记不是措辞讲究：`is_auth_failure` 会据此把站点标成 `needs_login`，
+    /// 前端 `isAuthError()` 会据此显示「（需登录）」——而用户真正要做的是**改输入**。
+    #[test]
+    fn invalid_input_is_not_classified_as_an_auth_failure() {
+        let err = Error::InvalidInput("该站点要求用邮箱登录".into());
+        assert_eq!(error_kind(&err), "输入不符合站点要求");
+        assert!(
+            !is_auth_failure(&err),
+            "输入形态问题不得被当成会话失效（那会把用户引向「请重新登录」）"
+        );
+        assert!(
+            !err.is_retryable(),
+            "同一个值重试多少次也不会成功，不得被判为可重试"
+        );
+    }
 
     // ============================================ sibling_config_files（B-76）
 

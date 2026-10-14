@@ -139,6 +139,10 @@ export default function Sites() {
     onError: (err: Error) => setError(err.message),
   });
 
+  // 登录账号栏的文案（M9-S2 / B-120）：跟随**当前要登录的那个站点**的约定，
+  // 与后端预检同一出处（`SiteRow.loginField`）。
+  const fieldHint = loginFieldHint(loginTarget?.loginField ?? null);
+
   return (
     <section>
       <h2>站点</h2>
@@ -286,12 +290,14 @@ export default function Sites() {
           凭证不会写入本地数据库。
         </p>
         <label className="field">
-          <span>用户名</span>
+          <span>{fieldHint.label}</span>
           <input
             className="input"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             autoComplete="off"
+            placeholder={fieldHint.placeholder}
+            spellCheck={false}
           />
         </label>
         <label className="field">
@@ -329,6 +335,28 @@ function healthLabel(health: string): string {
       // `unknown` 或将来新增的取值：不谎报「已登录」
       return "未登录";
   }
+}
+
+/**
+ * 登录账号栏的**文案**（M9-S2 / B-120）：标签 + placeholder。
+ *
+ * 判据来自后端（`SiteRow.loginField`，唯一出处 `site::login_field`）——
+ * 这里**只**负责把稳定取值翻成中文，页面里不得出现「哪个 `kind` 该填邮箱」。
+ *
+ * 未知取值（后端将来新增）回落到中性词「账号」：**不猜**是用户名，也不谎称是邮箱。
+ * 猜错的代价与 B-120 一样——用户按标签填，站点直接拒。
+ */
+function loginFieldHint(field: SiteRow["loginField"]): {
+  label: string;
+  placeholder?: string;
+} {
+  if (field === "email") {
+    return { label: "邮箱", placeholder: "name@example.com" };
+  }
+  if (field === "username") {
+    return { label: "用户名" };
+  }
+  return { label: "账号" };
 }
 
 /** 会话状态 → CSS 类名。未知取值落到 `unknown` 的样式，不伪装成正常。 */
