@@ -272,12 +272,24 @@ pub struct UpstreamTimeout {
 
 impl Default for UpstreamTimeout {
     fn default() -> Self {
-        // connect 10s：对中转站足够宽松。
-        // read 300s：**故意很大**——一次合法的非流式推理可能在吐出第一个字节前就要几分钟，
-        // 取小了会把合法慢请求判成故障。代价写在明处：真·卡死的上游要等满 300s 才切换。
-        // 这个数**没有真实站点标定**（BACKLOG B-112），测试用配置把它调小来复现判据。
+        // connect 5s：覆盖 TCP+TLS 两段。真实站点实测（M9-S3 §3.2，NewAPI）：
+        //   DNS   3.3–3.6 ms
+        //   TCP   3.6–4.1 ms
+        //   TLS  532–1145 ms   ← 主要成本
+        //   TTFB 1.16–1.69 s（TLS 之后服务端另耗 0.6–1.1 s，不计入本段）
+        // 上界约 1.15s，留约 4.3 倍余量。刻意取保守的一档而不是 2s：`connect_timeout`
+        // 的代价只落在坏路径上（连接阶段真的卡死才等满它），正常站点 5s 远远够。
+        //
+        // read 300s：**故意很大，且本步只加了依据、没有改数值**。
+        // 它的语义是「多久没有新字节」，抓的是「接了连接却永不回应」的病态上游，不是「慢」。
+        // 同一端点的实测抖动 0.91/0.93/6.30s（M9-S3 §3.3）说明总时长在此毫无参考价值，
+        // 而一次合法的非流式推理可能在吐第一个字节前就要几分钟。
+        // M9-S3 量不到上游推理首字节的分布（本账号在 NewAPI 无可用渠道，§3.4），
+        // 在那一侧无数据时调小等于拿未知分布去赌——且判失败的代价不只是慢：
+        // 网关会切下一个上游并重发同一请求，可能造成重复计费。
+        // 因此这里保持 300s，缺的那份数据拆出登记在 BACKLOG B-124。
         Self {
-            connect: Duration::from_secs(10),
+            connect: Duration::from_secs(5),
             read: Duration::from_secs(300),
         }
     }
@@ -1070,6 +1082,64 @@ pub fn generate_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M9-S3 §5：`connect` 有真实站点标定，取值来自实测上界 1.15s + 约 4.3 倍余量。
+    ///
+    /// 除了等值断言，再钉上下界与上界：真实站点会变（TLS 握手随负载与证书链波动），
+    /// 只钉字面量会让后来者要么不敢改、要么改时无从下手。
+    /// 下界守的是「不能低于实测上界，否则正常站点被判连接失败」，
+    /// 上界守的是「不能大到失去连接卡死时快速切换的意义」。
+    #[test]
+    fn connect_timeout_is_calibrated_against_the_real_site_handshake() {
+        let t = UpstreamTimeout::default();
+        assert_eq!(
+            t.connect,
+            Duration::from_secs(5),
+            "M9-S3 §3.2 实测 TCP 3.6–4.1ms + TLS 532–1145ms；\
+             上界约 1.15s，取 5s 留约 4.3 倍余量"
+        );
+        assert!(
+            t.connect > Duration::from_millis(1150),
+            "connect 必须盖住实测 TLS 上界 1145ms，否则正常站点被判连接失败"
+        );
+        assert!(
+            t.connect <= Duration::from_secs(10),
+            "connect 过大就失去「连接阶段卡死时快速切换」的意义"
+        );
+    }
+
+    /// M9-S3 §5 判据 4：`read` 刻意比 `connect` 大至少一个数量级。
+    ///
+    /// 两者的语义不同，混用会让**合法的长流式补全被误杀**：
+    /// `connect` 是握手容忍（TCP+TLS，实测约 1.15s 上界），
+    /// `read` 是停顿容忍（多久没有新字节，实测同端点抖动到 6.30s 且仍属正常）。
+    /// 若有人把 `read` 调到接近 `connect` 的量级，流式响应会在传输中途被判超时，
+    /// 而网关随后切下一个上游重发——**同一个请求可能被计费两次**。
+    #[test]
+    fn read_timeout_stays_at_least_an_order_of_magnitude_above_connect() {
+        let t = UpstreamTimeout::default();
+        assert!(
+            t.read >= t.connect * 10,
+            "read({:?}) 必须远大于 connect({:?})：前者容停顿、后者容握手，\
+             混用会杀死合法的长流式补全并导致重复计费",
+            t.read,
+            t.connect
+        );
+    }
+
+    /// M9-S3 §5 判据 2：`read` 保持 300s。本步只给它补了依据，**没有改数值**。
+    ///
+    /// 上游推理首字节的分布在 M9-S3 量不到（本账号在 NewAPI 无可用渠道，§3.4），
+    /// 在那一侧无数据时调小等于拿未知分布去赌。这条断言钉住「没数据就别动」。
+    #[test]
+    fn read_timeout_is_unchanged_because_upstream_first_byte_is_unmeasured() {
+        let t = UpstreamTimeout::default();
+        assert_eq!(
+            t.read,
+            Duration::from_secs(300),
+            "上游推理首字节分布未标定（M9-S3 §3.4），缺的数据拆出登记在 BACKLOG B-124"
+        );
+    }
 
     #[test]
     fn generated_tokens_are_unique_and_prefixed() {
