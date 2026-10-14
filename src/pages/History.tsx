@@ -69,10 +69,15 @@ export default function History() {
     mutationFn: (row: DeliveryRecord) => rollbackDelivery(row.journalId),
     onSuccess: async (_, row) => {
       setError(null);
-      // 已解绑的目标不进漂移、轮换与批量改指，回滚之后没有别的后果要交代
+      // 要不要交代后果，看的是**这个目标**还有没有仍绑定的行，不是这一行自己（复审 N-3）：
+      // 解绑之后又投递过的话，同一目标上会有一条更新的、仍绑定的行，漂移与轮换看的是它。
+      // 按 `listDeliveries` 的 limit 语义，每个目标 id 最大的那行一定在列表里，这里算得出来。
+      const bound = (deliveries.data ?? []).find(
+        (d) => d.targetPath === row.targetPath && d.unboundAt === null,
+      );
       setNotice(
         `已回滚 ${row.targetPath}（变更 ${row.journalId}）。` +
-          (row.unboundAt ? "" : rollbackAftermath(row.agentId)),
+          (bound ? rollbackAftermath(bound.agentId) : ""),
       );
       setTarget(null);
       await qc.invalidateQueries({ queryKey: ["deliveries"] });
