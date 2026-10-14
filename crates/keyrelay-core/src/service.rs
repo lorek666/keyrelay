@@ -1183,6 +1183,15 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         self.store.list_consents()
     }
 
+    /// 全部「通道 → key」绑定（M8-S7 / B-116）。
+    ///
+    /// **含已解绑的行**：过滤是调用方的事——命令层按 `unbound_at.is_none()` 筛，
+    /// 而「回收站点侧 key」那条路要按**当时的**绑定走（`bindings_of_agent` 的既有语义）。
+    /// 只读，不写任何东西。
+    pub fn channel_bindings(&self) -> Result<Vec<crate::store::BindingRow>> {
+        self.store.all_bindings()
+    }
+
     /// 真正把密钥写进目标文件。步骤与顺序见 spec §6.1，**同意是第一步**。
     ///
     /// 不带模型名：轮换第②步走的就是这条——Continue 沿用受管块里已有的模型名。

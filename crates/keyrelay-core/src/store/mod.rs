@@ -624,6 +624,15 @@ impl Store {
         self.bindings_where("b.target_path = ?1", &[&target_path])
     }
 
+    /// 全部绑定（含已解绑的行）。
+    ///
+    /// 给**批量**动作用（M8-S7 / B-116：「把已投递的通道批量改指网关」要拿到全部候选）。
+    /// 单 agent 的场景请用 [`Self::bindings_of_agent`]——那个有 predicate，不会把
+    /// 无关 agent 的行也拉回来。
+    pub fn all_bindings(&self) -> Result<Vec<BindingRow>> {
+        self.bindings_where("1 = 1", &[])
+    }
+
     fn bindings_where(
         &self,
         predicate: &str,

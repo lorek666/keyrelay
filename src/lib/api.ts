@@ -694,6 +694,80 @@ export async function listConsents(): Promise<ConsentRow[]> {
   return invokeCommand<ConsentRow[]>("list_consents");
 }
 
+/**
+ * 已投递且**未解绑**的「通道 → key」绑定（M8-S7 / B-116）。
+ *
+ * 批量改指网关用它决定「有哪些通道要改、每条该用哪把 key 重投」。
+ * 只读 `bindings`，不写任何东西。
+ *
+ * **没有 `channel` 字段，这是有意的**：`bindings` 表没有 channel 列。后端
+ * `relative_target()` 按当前 home 解析，而绑定里的 `targetPath` 可能是当年另一个 home
+ * 下写的 ⇒ 后端猜会猜错。前端用 `CHANNELS` 的 `agent` 字段匹配 `agentId`，
+ * 再用 `targetPath` 的文件名二分（`opencode.json` vs `opencode.jsonc`）。
+ */
+export type ChannelBinding = {
+  /**
+   * 绑定行 id（M8-S7 P2-4）。做 React key 与勾选键用——`bindings` 没有 UNIQUE 约束，
+   * 同一文件上可能有多条未解绑的行，用 `${channel}::${targetPath}` 会让它们共用复选框。
+   */
+  bindingId: number;
+  agentId: string;
+  keyId: number;
+  targetPath: string;
+  siteId: number;
+};
+
+export async function listChannelBindings(): Promise<ChannelBinding[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<ChannelBinding[]>("list_channel_bindings");
+}
+
+/**
+ * 前端侧的「agent ⇒ 通道」表（M8-S7 / B-116）。
+ *
+ * 与 `Agents.tsx` 的 `CHANNELS` **同源不同处**：那张表驱动投递页的下拉，
+ * 这张只服务「从一条 binding 反查它属于哪条通道」。两边都由
+ * `scripts/check-commands.mjs` 的通道名对账守着 id 集合一致（B-101），
+ * 所以不会静默分叉。
+ *
+ * `file` 是**文件名**（不是整条路径）：一个 agent 可能对应多条通道
+ * （`opencode` 同时有 `opencode.json` 与 `opencode.jsonc` 两条），靠它二分。
+ */
+/**
+ * agent ⇒ 通道（M8-S7 / B-116），一对一。
+ *
+ * **为什么不需要按文件名二分**（定稿时按独立复审 P3-1 简化）：后端
+ * `DeliveryChannel::agent_id()` 是**注入的**（7 条通道 → 7 个不同 agent 名，
+ * `delivery/mod.rs` 有测试专门钉「agent_id 不重复」），而 `bindings.agent_id`
+ > 写的就是 `channel.agent_id()`。所以本产品写下的行里，
+ * `agent_id == "opencode"` 时目标一定是 `opencode.json`——给它配第二条
+ * `opencode-jsonc` 候选是死逻辑（M8-S7 第一版那么写了，评审抓出）。
+ *
+ * 真正的多通道场景由 `opencode-jsonc` 这个**独立的 agent 名** 承载，它自己一行。
+ * 将来若真出现「一个 agent 名下多条通道」，后端会先有重复的 `agent_id`
+ * ⇒ 那条测试会红 ⇒ 那时再改回带文件名的结构。
+ */
+const AGENT_CHANNELS: Record<string, string> = {
+  codex: "codex-auth-json",
+  "claude-code": "claude-code-settings",
+  shell: "shell-block",
+  opencode: "opencode",
+  "opencode-jsonc": "opencode-jsonc",
+  "gemini-cli": "gemini-cli",
+  continue: "continue",
+};
+
+/**
+ * 一条 binding 属于哪条通道。猜不出来 ⇒ `null`（**不猜**）。
+ *
+ * 猜不出来的真实原因：`targetPath` 是当年**另一个 home** 下写的
+ * （用户改过 `KEYRELAY_HOME`），文件名对不上表里任何一条。
+ * 这时界面显示「无法识别通道」并让用户手工去投递页处理，比猜一个错通道好。
+ */
+export function channelOfBinding(agentId: string): string | null {
+  return AGENT_CHANNELS[agentId] ?? null;
+}
+
 export async function applyDelivery(
   args: DeliveryArgs,
 ): Promise<DeliveryOutcome> {

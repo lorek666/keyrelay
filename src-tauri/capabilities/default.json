@@ -18,6 +18,7 @@
     "allow-delivery-plan",
     "allow-grant-consent",
     "allow-revoke-consent",
+    "allow-list-channel-bindings",
     "allow-list-consents",
     "allow-apply-delivery",
     "allow-rollback-delivery",
