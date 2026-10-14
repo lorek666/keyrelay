@@ -430,6 +430,16 @@ pub fn map_http_error(status: u16, body: &[u8], retry_after_secs: Option<u64>) -
         } else {
             message
         }),
+        // 400（M9-S1）：请求形态不被站点接受——实测最常见的是字段校验失败，
+        // 例如 Sub2API 的 `Field validation for 'Email' failed on the 'email' tag`。
+        // 归 `Transport` 而不是 `AuthFailed`：这不是认证问题，归后者会把 UI
+        // 引到「请重新登录」，而用户真正要做的是改输入。站点原文经上面的
+        // `scrub` 之后原样带出，用户自能判断要改什么。
+        400 => Error::Transport(if message.is_empty() {
+            "请求被站点拒绝（400）".into()
+        } else {
+            message
+        }),
         429 => Error::RateLimited {
             retry_after_secs: retry_after_secs.unwrap_or(60),
         },
@@ -720,6 +730,45 @@ mod tests {
         assert!(!text.contains(hex), "错误文案泄漏 32 位 hex: {text}");
         assert!(text.contains("***"), "应留下脱敏痕迹: {text}");
         assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
+
+    // ============================================================ M9-S1
+
+    /// 400（真实站点 `api.example.com` 实测）：站点把字段校验失败写在
+    /// `message` 里，必须原样带出（已过 `scrub`），且归 `Transport`——
+    /// 这是请求形态问题，不是认证问题。
+    #[test]
+    fn map_http_error_400_carries_site_message_as_transport() {
+        let body = r#"{"code":400,"message":"Invalid request: Key: 'LoginRequest.Email' Error:Field validation for 'Email' failed on the 'email' tag"}"#;
+        let err = map_http_error(400, body.as_bytes(), None);
+        let text = err.to_string();
+        assert!(
+            text.contains("LoginRequest.Email"),
+            "站点原文必须可见: {text}"
+        );
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+    }
+
+    /// 400 但站点没给 message：用本产品自己的兜底文案，别把空串抛给用户。
+    #[test]
+    fn map_http_error_400_without_message_uses_our_fallback() {
+        let err = map_http_error(400, b"not json at all", None);
+        let text = err.to_string();
+        assert!(text.contains("400"), "兜底文案要能认出是 400: {text}");
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+    }
+
+    /// 400 的站点原文同样要过脱敏（与 401/403/404 同一咽喉，同一纪律）。
+    #[test]
+    fn map_http_error_scrubs_site_echoed_secret_in_400() {
+        let secret = "sk-SITE-ECHO-0123456789abcdef";
+        let body = format!(r#"{{"code":400,"message":"field rejects {secret}"}}"#);
+        let err = map_http_error(400, body.as_bytes(), None);
+        let text = err.to_string();
+        assert!(!text.contains(secret), "错误文案泄漏密钥: {text}");
+        assert!(!text.contains("SITE-ECHO"), "错误文案残留密钥片段: {text}");
+        assert!(text.contains("sk-***"), "应留下脱敏痕迹: {text}");
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
     }
 
     #[test]

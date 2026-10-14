@@ -239,6 +239,62 @@ async fn login_maps_rate_limit_and_auth_failures() {
     assert!(matches!(err, Error::AuthFailed(_)), "{err:?}");
 }
 
+/// M9-S1：400 必须把站点原文带出来。
+///
+/// 真实复现（`api.example.com`）：用户名 `testuser`（非邮箱）登录 →
+/// HTTP 400 + `{"code":400,"message":"Invalid request: Key: 'LoginRequest.Email'
+/// Error:Field validation for 'Email' failed on the 'email' tag"}`。
+/// 早先 `map_http_error` 没有 400 分支，落到「未预期的状态码 400」兜底支——
+/// 站点把「你的邮箱字段格式不对」说得清清楚楚，用户却只看到一句状态码，
+/// 没有任何线索知道该把 `testuser` 改成 `lorek@qq.com`。
+#[tokio::test]
+async fn login_400_carries_the_site_message() {
+    let transport = MockTransport::new(vec![json_resp(
+        400,
+        json!({"code": 400, "message": "Invalid request: Key: 'LoginRequest.Email' Error:Field validation for 'Email' failed on the 'email' tag"}),
+    )]);
+    let adapter = Sub2Api::new(transport);
+    let err = adapter
+        .login(BASE, Credentials::new("testuser", "pw-12345678"))
+        .await
+        .unwrap_err();
+
+    let text = err.to_string();
+    assert!(
+        text.contains("LoginRequest.Email"),
+        "站点原文必须可见，实际: {text}"
+    );
+    assert!(
+        text.contains("Field validation"),
+        "站点原文必须可见，实际: {text}"
+    );
+    // 归 `Transport` 而不是 `AuthFailed`：400 是请求形态问题，
+    // 归认证错误会把 UI 引到「请重新登录」——用户真正要做的是改输入。
+    assert!(
+        matches!(err, Error::Transport(_)),
+        "400 不该被当成认证失败，实际: {err:?}"
+    );
+}
+
+/// M9-S1：400 但站点没给 message（非 JSON body）时用本产品自己的兜底文案，
+/// 而不是把空串当原文抛给用户。
+#[tokio::test]
+async fn login_400_without_message_falls_back_to_our_own_wording() {
+    let transport = MockTransport::new(vec![HttpResponse::new(
+        400,
+        b"<html>Bad Request</html>".to_vec(),
+    )]);
+    let adapter = Sub2Api::new(transport);
+    let err = adapter
+        .login(BASE, Credentials::new("me@example.com", "pw"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Transport(m) if m.contains("400")),
+        "兜底文案要能认出是 400，实际: {err}"
+    );
+}
+
 // ================================================================ 密钥（红线：明文剥离）
 
 #[tokio::test]

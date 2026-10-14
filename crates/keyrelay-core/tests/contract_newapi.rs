@@ -85,6 +85,7 @@ async fn login_captures_session_cookie_and_user_id() {
         vec![("session".to_string(), "s3cr3t".to_string())]
     );
     assert_eq!(session.cookie_header().as_deref(), Some("session=s3cr3t"));
+    assert_eq!(session.access_token, None);
 
     let probe = adapter.transport().nth_request(0).unwrap();
     assert_eq!(
@@ -98,6 +99,125 @@ async fn login_captures_session_cookie_and_user_id() {
     let body: serde_json::Value = serde_json::from_slice(req.body.as_ref().unwrap()).unwrap();
     assert_eq!(body["username"], "me");
     assert_eq!(body["password"], "pw");
+}
+
+/// M9-S1：真实站点（`newapi.example.com`）**不发 Set-Cookie 之外的会话**，
+/// 只在响应体 `data.access_token` 里给 JWT。早先的实现把 `access_token` 写死 `None`，
+/// 于是登录返回 200、拿到空会话、随后每个请求 401（真实复现，见
+/// `docs/evidence/real-site-login-2026-10-14.md`）。
+///
+/// fixture 的字段名与形态逐字取自真实响应（JWT 值用占位串，其余一致）。
+#[tokio::test]
+async fn login_captures_body_access_token_when_no_cookie_is_set() {
+    let transport = MockTransport::new(vec![
+        encryption_disabled(),
+        json_resp(
+            200,
+            json!({
+                "success": true,
+                "message": "",
+                "data": {
+                    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.placeholder.sig",
+                    "token_type": "Bearer",
+                    "user": {"id": 207, "username": "testuser", "quota": 0}
+                }
+            }),
+        ),
+    ]);
+    let adapter = NewApi::new(transport);
+
+    let session = adapter
+        .login(BASE, Credentials::new("testuser", "pw"))
+        .await
+        .unwrap();
+
+    // `user_id` 落在 `data.user.id`（旧版是 `data.id`）——两个落点都要认，
+    // 真实站点这条路径只给后者，只读前者会静默丢掉 user_id。
+    assert_eq!(session.user_id.as_deref(), Some("207"));
+    assert_eq!(
+        session.access_token.as_deref(),
+        Some("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.placeholder.sig")
+    );
+    assert!(
+        session.cookies.is_empty(),
+        "真实站点这条路径没有 Set-Cookie"
+    );
+
+    // 关键在下一次请求：Bearer 必须真的发出去。用一个真实读操作（列举令牌）
+    // 驱动，断言落在它发出的请求上——`request()` 是私有 helper，集成测试
+    // 不直接碰它，否则测的是 helper 而不是产品行为。
+    let _ = adapter.list_keys(BASE, &session).await;
+    let list_req = adapter.transport().requests().last().cloned().unwrap();
+    assert!(
+        list_req.url.contains("/api/token/"),
+        "应是列举令牌请求，实际: {}",
+        list_req.url
+    );
+    assert_eq!(
+        header_of(&list_req, "Authorization"),
+        Some("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.placeholder.sig")
+    );
+}
+
+/// M9-S1：两个来源同时存在时**都保留**——token 走 `Authorization`，
+/// cookie 留给仍依赖会话的端点。真实站点同时回 `new_api_refresh` 与
+/// `new_api_has_session` 两条 cookie（见留档）。
+#[tokio::test]
+async fn login_keeps_both_body_token_and_cookies_when_both_exist() {
+    let transport = MockTransport::new(vec![
+        encryption_disabled(),
+        json_resp(
+            200,
+            json!({
+                "success": true,
+                "message": "",
+                "data": {"access_token": "tok_1234567890", "id": 42}
+            }),
+        )
+        .with_header(
+            "Set-Cookie",
+            "new_api_refresh=52d13bc5-x; Path=/api/user/auth; HttpOnly",
+        )
+        .with_header("Set-Cookie", "new_api_has_session=1; Path=/"),
+    ]);
+    let adapter = NewApi::new(transport);
+
+    let session = adapter
+        .login(BASE, Credentials::new("me", "pw"))
+        .await
+        .unwrap();
+
+    assert_eq!(session.access_token.as_deref(), Some("tok_1234567890"));
+    assert_eq!(
+        session.cookies,
+        vec![
+            ("new_api_refresh".to_string(), "52d13bc5-x".to_string()),
+            ("new_api_has_session".to_string(), "1".to_string()),
+        ]
+    );
+}
+
+/// M9-S1：两个来源都没有时**明确失败**。返回空会话会让「登录成功」和
+/// 「什么都做不了」同时成立，而用户看到的是下一跳的 401。
+#[tokio::test]
+async fn login_without_token_or_cookie_is_an_error_not_an_empty_session() {
+    let transport = MockTransport::new(vec![
+        encryption_disabled(),
+        json_resp(
+            200,
+            json!({"success": true, "message": "", "data": {"id": 42, "username": "me"}}),
+        ),
+    ]);
+    let adapter = NewApi::new(transport);
+
+    let err = adapter
+        .login(BASE, Credentials::new("me", "pw"))
+        .await
+        .expect_err("既无 token 也无 cookie 必须报错");
+    assert!(
+        matches!(err, Error::AuthFailed(ref m) if m.contains("access_token") && m.contains("Set-Cookie")),
+        "错误文案要说清两个来源都没有，实际: {err}"
+    );
 }
 
 #[tokio::test]
@@ -168,7 +288,12 @@ async fn login_encrypts_password_when_site_requires_it() {
             200,
             json!({"success": true, "data": {"enabled": true, "kid": "kid-1", "public_key": public_pem}}),
         ),
-        json_resp(200, json!({"success": true, "data": {"id": 42}})),
+        // M9-S1：带上 `access_token`——真实站点（含启用密码加密的那些）
+        // 登录成功后会在 body 里给 token，早先 fixture 只给 `id` 是形态不全。
+        json_resp(
+            200,
+            json!({"success": true, "data": {"id": 42, "access_token": "tok-42"}}),
+        ),
     ]);
     let adapter = NewApi::new(transport);
 
@@ -200,7 +325,11 @@ async fn login_falls_back_to_plaintext_when_encryption_endpoint_missing() {
     // 旧版本 NewAPI 没有该端点 → 404 → 按未启用处理
     let transport = MockTransport::new(vec![
         HttpResponse::new(404, b"404 page not found".to_vec()),
-        json_resp(200, json!({"success": true, "data": {"id": 42}})),
+        // M9-S1：同批补上 body token（真实站点两条路径都给）
+        json_resp(
+            200,
+            json!({"success": true, "data": {"id": 42, "access_token": "tok-42"}}),
+        ),
     ]);
     let adapter = NewApi::new(transport);
 
