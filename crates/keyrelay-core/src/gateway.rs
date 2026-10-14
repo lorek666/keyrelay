@@ -1085,10 +1085,16 @@ mod tests {
 
     /// M9-S3 §5：`connect` 有真实站点标定，取值来自实测上界 1.15s + 约 4.3 倍余量。
     ///
-    /// 除了等值断言，再钉上下界与上界：真实站点会变（TLS 握手随负载与证书链波动），
-    /// 只钉字面量会让后来者要么不敢改、要么改时无从下手。
-    /// 下界守的是「不能低于实测上界，否则正常站点被判连接失败」，
-    /// 上界守的是「不能大到失去连接卡死时快速切换的意义」。
+    /// 等值断言之外再钉上下界与上界，让「无据的取值」自己撞上来。
+    /// 下界守「不能低于实测上界，否则正常站点被判连接失败」；
+    /// 上界守「不能大到失去连接卡死时快速切换的意义」。
+    ///
+    /// **上界取 5s 而不是 10s，是 M9-S3 复审 F-1 的直接后果**：先前的版本写的是
+    /// `connect <= 10s`，而实测证明 `10s` 本身满足 `> 1150ms`——于是
+    /// 「本步判定为无据、正要改掉的那个值」能两条边界全绿地通过，
+    /// 这套边界因此没有独立价值，只是 `assert_eq!` 的复读。
+    /// 上界收紧到与标定值同档后，边界才成为真守卫：反例由
+    /// [`the_bounds_reject_the_very_value_this_step_replaced`] 固化。
     #[test]
     fn connect_timeout_is_calibrated_against_the_real_site_handshake() {
         let t = UpstreamTimeout::default();
@@ -1103,8 +1109,36 @@ mod tests {
             "connect 必须盖住实测 TLS 上界 1145ms，否则正常站点被判连接失败"
         );
         assert!(
-            t.connect <= Duration::from_secs(10),
-            "connect 过大就失去「连接阶段卡死时快速切换」的意义"
+            t.connect <= Duration::from_secs(5),
+            "connect 上界与标定值同档；放大到 10s 会退回 M9-S3 判定的『无据』取值"
+        );
+    }
+
+    /// M9-S3 复审 F-1：上界必须**自己**拦得住本步替换掉的那个值。
+    ///
+    /// 前一个版本的上界写成 `<= 10s`，于是 `10s`（本步判定无据并改掉的值）
+    /// 同时满足 `> 1150ms` 与 `<= 10s`，两条边界全绿——边界形同复读 `assert_eq!`。
+    /// 这条测试把那个反例固化成判据：**边界集合对 `10s` 必须为空**。
+    ///
+    /// 写的是「取样几个值逐个判定」而不是再抄一遍边界表达式：后者会跟着
+    /// 实现一起改，永远绿；前者是独立重述「哪些取值可接受」。
+    #[test]
+    fn the_bounds_reject_the_very_value_this_step_replaced() {
+        let t = UpstreamTimeout::default();
+        // 逐个取值判定，与上面那条测试的边界表达式**故意不同形**，
+        // 这样实现被改动时不会两条一起悄悄失效。
+        let accepted = |c: Duration| c > Duration::from_millis(1150) && c <= Duration::from_secs(5);
+        assert!(
+            !accepted(Duration::from_secs(10)),
+            "10s 正是 M9-S3 判定『无据』并替换掉的值，边界必须拒绝它"
+        );
+        assert!(
+            !accepted(Duration::from_secs(6)),
+            "超过标定值一档即视为失去『连接卡死时快速切换』的意义"
+        );
+        assert!(
+            accepted(Duration::from_secs(5)) && accepted(t.connect),
+            "标定值 5s 必须落在可接受区间内"
         );
     }
 
