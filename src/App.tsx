@@ -15,7 +15,8 @@ import Keys from "./pages/Keys";
 import Agents from "./pages/Agents";
 import History from "./pages/History";
 import SettingsPage from "./pages/Settings";
-import { appInfo, runtimeMode } from "./lib/api";
+import { appInfo, getSettings, runtimeMode } from "./lib/api";
+import { useApplyTheme } from "./lib/theme";
 
 const PAGES = [
   { id: "overview", label: "总览", icon: LayoutDashboard, render: () => <Overview /> },
@@ -31,6 +32,9 @@ type PageId = (typeof PAGES)[number]["id"];
 export default function App() {
   const [page, setPage] = useState<PageId>("overview");
   const { data: info } = useQuery({ queryKey: ["app-info"], queryFn: appInfo });
+  // 与设置页共用 `["settings"]`：设置页保存后会失效这个键，主题随之立即生效（M9-S4 / F）
+  const { data: settings } = useQuery({ queryKey: ["settings"], queryFn: getSettings });
+  useApplyTheme(settings?.theme);
   const current = PAGES.find((p) => p.id === page) ?? PAGES[0];
 
   return (

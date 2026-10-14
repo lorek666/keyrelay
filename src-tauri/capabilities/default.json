@@ -22,6 +22,7 @@
     "allow-list-consents",
     "allow-apply-delivery",
     "allow-rollback-delivery",
+    "allow-list-deliveries",
     "allow-list-stored-keys",
     "allow-recent-events",
     "allow-drift-report",

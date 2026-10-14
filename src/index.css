@@ -1,4 +1,10 @@
-:root {
+/* ============================================================ 主题令牌（M9-S4）
+
+   深色是缺省（没有 data-theme 时也是它）：每个取值都与 M9-S4 之前写死在各处的颜色相同。
+   `--warn` / `--ok` 之前被引用却从未定义——告警盒没有边框、告警字是正文色（M9-S4 / E）。
+   浅色是**占位**：只保证对比度够（文字 ≥ 4.5:1），具体配色留给界面改版整体替换。 */
+:root,
+[data-theme="dark"] {
   --bg: #0f1115;
   --panel: #161a21;
   --line: #242a34;
@@ -6,7 +12,47 @@
   --muted: #8b93a3;
   --accent: #6ea8fe;
   --danger: #ff7b72;
+  --warn: #e3b341;
+  --ok: #7ee787;
+  /* 输入框、diff 等「凹下去」的底色 */
+  --field: #0d1017;
+  /* 普通按钮的底色 */
+  --raised: #1d2330;
+  /* 实心强调色 / 危险色按钮上的字 */
+  --on-accent: #0b1220;
+  --on-danger: #2a0d0b;
+  --accent-soft: rgba(110, 168, 254, 0.14);
+  --accent-faint: rgba(110, 168, 254, 0.08);
+  --ok-soft: rgba(126, 231, 135, 0.12);
+  --warn-soft: rgba(227, 179, 65, 0.12);
+  --danger-soft: rgba(255, 123, 114, 0.12);
+  --muted-soft: rgba(139, 147, 163, 0.12);
+  --backdrop: rgba(0, 0, 0, 0.55);
   color-scheme: dark;
+}
+
+[data-theme="light"] {
+  --bg: #f6f8fa;
+  --panel: #ffffff;
+  --line: #d0d7de;
+  --text: #1f2328;
+  --muted: #59636e;
+  --accent: #0969da;
+  --danger: #cf222e;
+  --warn: #7d4e00;
+  --ok: #116329;
+  --field: #ffffff;
+  --raised: #f6f8fa;
+  --on-accent: #ffffff;
+  --on-danger: #ffffff;
+  --accent-soft: rgba(9, 105, 218, 0.08);
+  --accent-faint: rgba(9, 105, 218, 0.04);
+  --ok-soft: rgba(17, 99, 41, 0.1);
+  --warn-soft: rgba(125, 78, 0, 0.1);
+  --danger-soft: rgba(207, 34, 46, 0.08);
+  --muted-soft: rgba(89, 99, 110, 0.1);
+  --backdrop: rgba(31, 35, 40, 0.45);
+  color-scheme: light;
 }
 
 * {
@@ -56,7 +102,7 @@ body {
 }
 
 .nav-item.active {
-  background: #1d2330;
+  background: var(--raised);
   color: var(--text);
 }
 
@@ -176,14 +222,14 @@ h2 {
 /* 解绑结果（M8-S4 §5.4）。四态文案都在里面，所以用「结果盒子」而不是一行提示：
    同一段里可以同时有「解开了 2 条」「回收成功 1 把」「回收失败 1 把」。 */
 .okbox {
-  border: 1px solid var(--ok, #2ea043);
+  border: 1px solid var(--ok);
   border-radius: 8px;
   padding: 8px 10px;
   margin: 10px 0;
 }
 
 .health-enabled {
-  color: #7ee787;
+  color: var(--ok);
 }
 
 .health-unknown {
@@ -237,12 +283,12 @@ button.ghost:disabled {
 }
 
 .nav-item:hover {
-  background: rgba(110, 168, 254, 0.08);
+  background: var(--accent-faint);
   color: var(--text);
 }
 
 .nav-item.active {
-  background: rgba(110, 168, 254, 0.14);
+  background: var(--accent-soft);
   color: var(--accent);
 }
 
@@ -299,7 +345,7 @@ section > .muted {
 }
 
 .input {
-  background: #0d1017;
+  background: var(--field);
   color: var(--text);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -316,7 +362,7 @@ section > .muted {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  background: #1d2330;
+  background: var(--raised);
   color: var(--text);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -333,14 +379,14 @@ section > .muted {
 .btn-primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #0b1220;
+  color: var(--on-accent);
   font-weight: 600;
 }
 
 .btn-danger {
   background: var(--danger);
   border-color: var(--danger);
-  color: #2a0d0b;
+  color: var(--on-danger);
   font-weight: 600;
 }
 
@@ -367,6 +413,10 @@ section > .muted {
   font-weight: 500;
 }
 
+.nowrap {
+  white-space: nowrap;
+}
+
 .ellipsis {
   max-width: 320px;
   overflow: hidden;
@@ -383,23 +433,23 @@ section > .muted {
 }
 
 .badge-ok {
-  color: #7ee787;
-  background: rgba(126, 231, 135, 0.12);
+  color: var(--ok);
+  background: var(--ok-soft);
 }
 
 .badge-warn {
-  color: #e3b341;
-  background: rgba(227, 179, 65, 0.12);
+  color: var(--warn);
+  background: var(--warn-soft);
 }
 
 .badge-danger {
   color: var(--danger);
-  background: rgba(255, 123, 114, 0.12);
+  background: var(--danger-soft);
 }
 
 .badge-muted {
   color: var(--muted);
-  background: rgba(139, 147, 163, 0.12);
+  background: var(--muted-soft);
 }
 
 .kv {
@@ -451,7 +501,7 @@ section > .muted {
   padding: 10px 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #0d1017;
+  background: var(--field);
   font: 12px/1.6 ui-monospace, "SF Mono", Menlo, monospace;
   white-space: pre-wrap;
   word-break: break-all;
@@ -515,7 +565,7 @@ section > .muted {
 }
 
 .dialog::backdrop {
-  background: rgba(0, 0, 0, 0.55);
+  background: var(--backdrop);
 }
 
 .dialog h2 {
@@ -535,12 +585,12 @@ section > .muted {
 }
 
 .ok {
-  color: #7ee787;
+  color: var(--ok);
   font-size: 13px;
 }
 
 .warn {
-  color: #e3b341;
+  color: var(--warn);
   font-size: 13px;
 }
 

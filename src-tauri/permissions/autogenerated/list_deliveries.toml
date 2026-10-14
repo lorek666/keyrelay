@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-deliveries"
+description = "Enables the list_deliveries command without any pre-configured scope."
+commands.allow = ["list_deliveries"]
+
+[[permission]]
+identifier = "deny-list-deliveries"
+description = "Denies the list_deliveries command without any pre-configured scope."
+commands.deny = ["list_deliveries"]

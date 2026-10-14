@@ -440,7 +440,6 @@ export default function SettingsPage() {
 
   return (
     <section>
-      <h2>设置</h2>
       <p className="muted">
         所有设置都存在本地数据库里，不上传任何地方。
       </p>
@@ -543,6 +542,10 @@ export default function SettingsPage() {
                 <option value="en-US">English</option>
               </select>
             </label>
+            {/* 与遥测 / 自动更新开关同口径：做不到的如实说（M9-S4 / F，B-127） */}
+            <p className="muted">
+              界面目前只有简体中文：选 English 只会记下这个偏好，界面不会切换。
+            </p>
             <label className="field">
               <span>代理（HTTP / SOCKS5，留空 = 直连）</span>
               <input

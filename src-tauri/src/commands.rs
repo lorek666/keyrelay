@@ -767,6 +767,54 @@ pub fn apply_delivery(
         .map_err(|e| e.to_string())
 }
 
+/// 投递历史的一行（M9-S4）。字段语义见 `store::DeliveryHistoryRow`。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryHistoryDto {
+    pub binding_id: i64,
+    pub journal_id: String,
+    pub agent_id: String,
+    pub key_id: i64,
+    pub site_id: i64,
+    pub target_path: String,
+    pub applied_at: i64,
+    pub unbound_at: Option<i64>,
+    pub backup_path: Option<String>,
+    pub has_journal: bool,
+    pub rolled_back: bool,
+    pub superseded: bool,
+}
+
+/// 投递历史，最新的在前（M9-S4）。「变更历史」页的回滚入口从这里取。
+#[tauri::command]
+pub fn list_deliveries(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<DeliveryHistoryDto>, String> {
+    state
+        .service
+        .delivery_history(limit.unwrap_or(100))
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| DeliveryHistoryDto {
+                    binding_id: row.binding_id,
+                    journal_id: row.journal_id,
+                    agent_id: row.agent_id,
+                    key_id: row.key_id,
+                    site_id: row.site_id,
+                    target_path: row.target_path,
+                    applied_at: row.applied_at,
+                    unbound_at: row.unbound_at,
+                    backup_path: row.backup_path,
+                    has_journal: row.has_journal,
+                    rolled_back: row.rolled_back,
+                    superseded: row.superseded,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn rollback_delivery(state: State<'_, AppState>, journal_id: String) -> Result<(), String> {
     state

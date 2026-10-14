@@ -178,8 +178,10 @@ export default function Overview() {
             ))}
           </ul>
           <p className="muted">
-            KeyRelay 不会自动覆盖外部改动。要恢复请到「Agent 投递」页重新投递，
-            或到「变更历史」页回滚。
+            KeyRelay 不会自动覆盖外部改动。要恢复请到「Agent 投递」页重新投递。
+            被删掉的目标（<span className="mono">missing</span>）也可以到「变更历史」页回滚那次投递，
+            恢复成投递之前的内容；被外部改过的（<span className="mono">modified</span>）回滚会被拒绝——
+            回滚不会覆盖别人的改动。
           </p>
           {hasUnreadable ? (
             <p className="muted">

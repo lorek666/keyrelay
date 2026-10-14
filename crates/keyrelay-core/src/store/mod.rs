@@ -227,6 +227,33 @@ pub struct BindingRow {
     pub remote_id: Option<String>,
 }
 
+/// 投递历史的一行（M9-S4）：一次投递 = 一条 `bindings` 行 + 它的 `journals` 行。
+///
+/// 从 `bindings` 出发而不是从 `journals` 出发：`journals` 只有路径与哈希，
+/// 「是哪个 agent、用的哪把 key」只在 `bindings` 上。解绑不删行（M8-S4 §5.1），
+/// 所以已解绑的投递也在这里——它们仍然可以回滚（M8-S4 §5.4）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeliveryHistoryRow {
+    pub binding_id: i64,
+    /// 老库行可能为 NULL ⇒ 空串（与 `binding_drift_rows` 同口径）。
+    pub journal_id: String,
+    pub agent_id: String,
+    pub key_id: i64,
+    pub site_id: i64,
+    pub target_path: String,
+    pub applied_at: i64,
+    /// `None` = 仍然绑定。
+    pub unbound_at: Option<i64>,
+    /// `None`：投递前文件不存在（回滚 = 删掉它），或者没有 journal 行。
+    pub backup_path: Option<String>,
+    /// 没有 journal 行就无从回滚（`rollback_delivery` 会报「变更记录不存在」）。
+    pub has_journal: bool,
+    pub rolled_back: bool,
+    /// 同一目标上有**更新的、未回滚的**投递。为真时回滚必然被哈希校验拒绝：
+    /// 文件里是之后那次写下的内容，不是这次。
+    pub superseded: bool,
+}
+
 /// 解绑的返回语义（**逐条**，因为它们都会被 UI 直接念给用户听）：
 /// - `unbound`：本次**新标记**的行数（已解绑过的行不计 ⇒ 幂等，二次调用返回 0）
 /// - `already_unbound`：本次看到但**早已解绑**的行数（用于「本来就是解绑状态」的文案）
@@ -631,6 +658,67 @@ impl Store {
     /// 无关 agent 的行也拉回来。
     pub fn all_bindings(&self) -> Result<Vec<BindingRow>> {
         self.bindings_where("1 = 1", &[])
+    }
+
+    /// 投递历史，最新的在前，最多 `limit` 行（M9-S4）。只读。
+    ///
+    /// `superseded` 的两条口径（M9-S4 spec §5）：
+    /// - **已解绑**的更新投递也算覆盖：解绑不改文件，文件里仍是那次写下的内容；
+    /// - **已回滚**的更新投递不算覆盖：回滚把文件还原成它之前的样子，也就是更早那次写下的样子。
+    ///
+    /// 这只是界面上的预判；真正的安全闸仍是 `inject::rollback` 的哈希校验。
+    pub fn delivery_history(&self, limit: usize) -> Result<Vec<DeliveryHistoryRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT b.id, COALESCE(b.journal_id, ''), b.agent_id, b.key_id, k.site_id,
+                        b.target_path, b.applied_at, b.unbound_at, j.backup_path,
+                        j.id IS NOT NULL,
+                        COALESCE(j.status, '') = 'rolled_back',
+                        EXISTS (SELECT 1 FROM bindings n
+                                LEFT JOIN journals nj ON nj.id = n.journal_id || ':' || n.target_path
+                                WHERE n.target_path = b.target_path
+                                  AND n.id > b.id
+                                  AND COALESCE(nj.status, 'applied') <> 'rolled_back')
+                 FROM bindings b
+                 JOIN keys k ON k.id = b.key_id
+                 LEFT JOIN journals j ON j.id = b.journal_id || ':' || b.target_path
+                 ORDER BY b.id DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
+        let rows = stmt
+            .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok(DeliveryHistoryRow {
+                    binding_id: row.get(0)?,
+                    journal_id: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    key_id: row.get(3)?,
+                    site_id: row.get(4)?,
+                    target_path: row.get(5)?,
+                    applied_at: row.get(6)?,
+                    unbound_at: row.get(7)?,
+                    backup_path: row.get(8)?,
+                    has_journal: row.get(9)?,
+                    rolled_back: row.get(10)?,
+                    superseded: row.get(11)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("查询投递历史失败: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("读取投递历史行失败: {e}")))
+    }
+
+    /// 把一个 journal 的全部行记为已回滚，返回改动行数（M9-S4）。
+    ///
+    /// 前缀匹配与 [`Self::journal_entries`] 同一写法：`LIKE` 的通配符会让含 `%` / `_` 的 id 误中。
+    pub fn mark_journal_rolled_back(&self, journal_id: &str) -> Result<usize> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE journals SET status = 'rolled_back' WHERE instr(id, ?1 || ':') = 1",
+            params![journal_id],
+        )
+        .map_err(|e| Error::Store(format!("记录回滚状态失败: {e}")))
     }
 
     fn bindings_where(
