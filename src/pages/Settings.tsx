@@ -542,7 +542,7 @@ export default function SettingsPage() {
                 <option value="en-US">English</option>
               </select>
             </label>
-            {/* 与遥测 / 自动更新开关同口径：做不到的如实说（M9-S4 / F，B-127） */}
+            {/* 与遥测 / 自动更新开关同口径：做不到的如实说（M9-S4 / F，B-128） */}
             <p className="muted">
               界面目前只有简体中文：选 English 只会记下这个偏好，界面不会切换。
             </p>
