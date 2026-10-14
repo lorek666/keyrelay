@@ -145,7 +145,6 @@ export default function Sites() {
 
   return (
     <section>
-      <h2>站点</h2>
 
       <div className="card">
         <h3>接入新站点</h3>

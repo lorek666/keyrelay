@@ -1301,3 +1301,63 @@ fn list_channel_bindings_filters_out_unbound_rows() {
         "两条绑定用的是不同的 key（这正是要能让用户分别处理的原因）"
     );
 }
+
+/// M9-S4：「变更历史」页的回滚入口。字段名是前端 `DeliveryRecord` 的契约（camelCase），
+/// `limit` 必须真的生效（历史页只要最近 N 次，不能把整张表搬过来）。
+#[test]
+fn list_deliveries_returns_newest_first_with_camel_case_fields() {
+    use tauri::Manager;
+
+    let (_app, webview) = build_app();
+    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+
+    let site = state
+        .service
+        .store()
+        .upsert_site("newapi", "https://relay.example.com", "历史测试站")
+        .expect("写站点");
+    let key = state
+        .service
+        .store_key_material(site, "codex/a", Some("1"), None, "sk-hist-0123456789abcdef")
+        .expect("写密钥")
+        .id;
+    let store = state.service.store();
+    store
+        .record_binding("codex", key, "/home/u/.codex/auth.json", "j1")
+        .expect("写绑定");
+    store
+        .record_binding("codex", key, "/home/u/.codex/auth.json", "j2")
+        .expect("写绑定");
+    store
+        .record_binding("shell", key, "/home/u/.zshrc", "j3")
+        .expect("写绑定");
+
+    let value = invoke_on(&webview, "list_deliveries", json!({"limit": 2}))
+        .expect("list_deliveries 应成功");
+    assert_not_acl_rejection("list_deliveries", &value);
+    let rows = value.as_array().expect("应返回数组");
+    assert_eq!(rows.len(), 2, "limit 必须生效: {rows:?}");
+    assert_eq!(rows[0]["journalId"], "j3", "最新的在前");
+    assert_eq!(rows[1]["journalId"], "j2");
+    assert_eq!(rows[1]["bindingId"], 2);
+    assert_eq!(rows[1]["agentId"], "codex");
+    assert_eq!(rows[1]["keyId"], key);
+    assert_eq!(rows[1]["siteId"], site);
+    assert_eq!(rows[1]["targetPath"], "/home/u/.codex/auth.json");
+    assert!(rows[1]["appliedAt"].is_i64());
+    assert!(rows[1]["unboundAt"].is_null());
+    assert!(rows[1]["backupPath"].is_null());
+    assert_eq!(rows[1]["hasJournal"], false, "直接写的绑定没有 journal 行");
+    assert_eq!(rows[1]["rolledBack"], false);
+    assert_eq!(rows[1]["superseded"], false, "j2 是这个文件上最新的一次");
+
+    let all = invoke_on(&webview, "list_deliveries", json!({})).expect("无参应成功");
+    let rows = all.as_array().expect("应返回数组");
+    assert_eq!(rows.len(), 3, "缺省 limit 要装得下");
+    assert_eq!(rows[2]["journalId"], "j1");
+    assert_eq!(rows[2]["superseded"], true, "j1 被同一文件上的 j2 覆盖");
+    assert!(
+        !all.to_string().contains("sk-"),
+        "投递历史不得携带密钥: {all}"
+    );
+}

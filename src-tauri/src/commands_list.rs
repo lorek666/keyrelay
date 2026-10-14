@@ -24,6 +24,7 @@ pub const COMMANDS: &[&str] = &[
     "list_channel_bindings",
     "apply_delivery",
     "rollback_delivery",
+    "list_deliveries",
     "recent_events",
     "list_stored_keys",
     "drift_report",

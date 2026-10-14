@@ -668,6 +668,16 @@ export async function listStoredKeys(): Promise<StoredKeyRow[]> {
         group: "default",
         status: "enabled",
       },
+      // 站点 2 上的一把（M9-S4 C/D）：只有一把密钥时，「密钥下拉 / 密钥表跟随所选站点」
+      // 在预览里根本看不出来——过滤写反了也一样显示这一把。
+      {
+        id: 2,
+        siteId: 2,
+        remoteId: "7",
+        name: "keyrelay/claude-code/20251010",
+        group: null,
+        status: "enabled",
+      },
     ]);
   }
   return invokeCommand<StoredKeyRow[]>("list_stored_keys");
@@ -808,6 +818,95 @@ export async function applyDelivery(
   return invokeCommand<DeliveryOutcome>("apply_delivery", { args });
 }
 
+/**
+ * 投递历史的一行（M9-S4）：「变更历史」页的回滚入口。字段语义见 `store::DeliveryHistoryRow`。
+ *
+ * 能不能回滚由三个标志位决定（`rolledBack` / `superseded` / `hasJournal`），
+ * 判据在后端；真正的安全闸是回滚时的哈希校验——这里只负责灰显并说明原因。
+ */
+export type DeliveryRecord = {
+  bindingId: number;
+  journalId: string;
+  agentId: string;
+  keyId: number;
+  siteId: number;
+  targetPath: string;
+  appliedAt: number;
+  /** `null` = 仍然绑定。已解绑的投递**仍可回滚**（M8-S4 §5.4） */
+  unboundAt: number | null;
+  /** `null` 且 `hasJournal`：投递前文件不存在，回滚会删掉它 */
+  backupPath: string | null;
+  hasJournal: boolean;
+  rolledBack: boolean;
+  /** 同一文件之后又投递过（且那次没回滚）：这次的回滚必然被拒 */
+  superseded: boolean;
+};
+
+export async function listDeliveries(limit = 100): Promise<DeliveryRecord[]> {
+  if (!hasTauri) {
+    // 每种状态各一行，预览里四种灰显原因都能看到
+    return mock([
+      {
+        bindingId: 4,
+        journalId: "j-mock-3",
+        agentId: "shell",
+        keyId: 1,
+        siteId: 1,
+        targetPath: "/Users/you/.zshrc",
+        appliedAt: 1_760_000_500,
+        unboundAt: 1_760_000_600,
+        backupPath: "/Users/you/.keyrelay/backups/j-mock-3/0-.zshrc",
+        hasJournal: true,
+        rolledBack: false,
+        superseded: false,
+      },
+      {
+        bindingId: 3,
+        journalId: "j-mock-2",
+        agentId: "codex",
+        keyId: 2,
+        siteId: 2,
+        targetPath: MOCK_PLAN.targetPath,
+        appliedAt: 1_760_000_400,
+        unboundAt: null,
+        backupPath: null,
+        hasJournal: true,
+        rolledBack: false,
+        superseded: false,
+      },
+      {
+        bindingId: 2,
+        journalId: "j-mock-1",
+        agentId: "codex",
+        keyId: 1,
+        siteId: 1,
+        targetPath: MOCK_PLAN.targetPath,
+        appliedAt: 1_760_000_300,
+        unboundAt: null,
+        backupPath: "/Users/you/.keyrelay/backups/j-mock-1/0-auth.json",
+        hasJournal: true,
+        rolledBack: false,
+        superseded: true,
+      },
+      {
+        bindingId: 1,
+        journalId: "j-mock-0",
+        agentId: "claude-code",
+        keyId: 1,
+        siteId: 1,
+        targetPath: "/Users/you/.claude/settings.json",
+        appliedAt: 1_760_000_200,
+        unboundAt: null,
+        backupPath: "/Users/you/.keyrelay/backups/j-mock-0/0-settings.json",
+        hasJournal: true,
+        rolledBack: true,
+        superseded: false,
+      },
+    ]);
+  }
+  return invokeCommand<DeliveryRecord[]>("list_deliveries", { limit });
+}
+
 export async function rollbackDelivery(journalId: string): Promise<void> {
   if (!hasTauri) return mock(undefined);
   return invokeCommand<void>("rollback_delivery", { journalId });
@@ -935,33 +1034,40 @@ export async function driftReport(): Promise<DriftReport[]> {
 }
 
 export async function getSettings(): Promise<Settings> {
-  if (!hasTauri) {
-    return mock({
-      refreshIntervalSecs: 0,
-      balanceAlertThreshold: 0,
-      driftCheckOnStart: true,
-      gatewayEnabled: false,
-      gatewayPort: 8787,
-      theme: "system",
-      language: "zh-CN",
-      proxyUrl: "",
-      telemetryEnabled: false,
-      autoUpdateEnabled: false,
-      notifySystemEnabled: true,
-      notifyWebhookUrl: "",
-      notifyTimeoutSecs: 10,
-      rotationMaxAgeDays: 30,
-      rotationWarnBeforeDays: 7,
-      autostartEnabled: false,
-      closeToTray: true,
-      startHidden: false,
-    });
-  }
+  if (!hasTauri) return mock(mockSettings);
   return invokeCommand<Settings>("get_settings");
 }
 
+/**
+ * 预览模式下的设置「库」（M9-S4）。`updateSettings` 写回这里：主题保存后 `["settings"]`
+ * 会被重读，读到的若还是写死的初始值，界面就会立刻弹回「跟随系统」——预览里核不了主题。
+ */
+let mockSettings: Settings = {
+  refreshIntervalSecs: 0,
+  balanceAlertThreshold: 0,
+  driftCheckOnStart: true,
+  gatewayEnabled: false,
+  gatewayPort: 8787,
+  theme: "system",
+  language: "zh-CN",
+  proxyUrl: "",
+  telemetryEnabled: false,
+  autoUpdateEnabled: false,
+  notifySystemEnabled: true,
+  notifyWebhookUrl: "",
+  notifyTimeoutSecs: 10,
+  rotationMaxAgeDays: 30,
+  rotationWarnBeforeDays: 7,
+  autostartEnabled: false,
+  closeToTray: true,
+  startHidden: false,
+};
+
 export async function updateSettings(settings: Settings): Promise<Settings> {
-  if (!hasTauri) return mock(settings);
+  if (!hasTauri) {
+    mockSettings = { ...settings };
+    return mock(mockSettings);
+  }
   return invokeCommand<Settings>("update_settings", { args: { settings } });
 }
 

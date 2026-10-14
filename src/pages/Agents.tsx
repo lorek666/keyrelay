@@ -58,6 +58,9 @@ export default function Agents() {
 
   // 投递需要**本地 key id**，所以用 stored keys 而不是站点侧列表
   const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
+  // 密钥下拉只列所选站点的（M9-S4 / C）：此前站点下拉只是摆设——选了站点 A，
+  // 密钥下拉里照样是全部站点的密钥，选项文字又不带站点，用户分不出投的是哪个站的 key。
+  const siteKeys = (keys.data ?? []).filter((k) => k.siteId === activeSite);
 
   const [keyId, setKeyId] = useState<number | null>(null);
   const activeKey = keyId ?? null;
@@ -203,7 +206,6 @@ export default function Agents() {
 
   return (
     <section>
-      <h2>Agent 投递</h2>
       <p className="muted">
         投递会把钥匙串里的密钥写进所选 agent 的配置文件。
         任何写入都必须先勾选同意；写入前会展示脱敏后的差异预览。
@@ -248,7 +250,7 @@ export default function Agents() {
               }
             >
               <option value="">（选择一把）</option>
-              {(keys.data ?? []).map((k) => (
+              {siteKeys.map((k) => (
                 <option key={k.id} value={k.id}>
                   {k.name}（#{k.id}）
                 </option>
@@ -310,7 +312,11 @@ export default function Agents() {
       </div>
 
       {activeKey === null ? (
-        <p className="muted">先选一把密钥。</p>
+        <p className="muted">
+          {keys.data && siteKeys.length === 0
+            ? "该站点下还没有本地密钥，先去「密钥」页新建一把。"
+            : "先选一把密钥。"}
+        </p>
       ) : plan.isError ? (
         <p className="error" role="alert">
           {(plan.error as Error).message}
@@ -340,6 +346,8 @@ export default function Agents() {
             journal={lastOutcome.journalId}
             {lastOutcome.backupPath ? `　备份=${lastOutcome.backupPath}` : ""}
           </p>
+          {/* 这张卡只活在本页（切页即卸载）；持久的回滚入口在历史页（M9-S4 / B） */}
+          <p className="muted">离开本页后，这次投递仍可以在「变更历史」页找到并回滚。</p>
           <button
             type="button"
             className="btn btn-danger"

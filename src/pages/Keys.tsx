@@ -113,6 +113,9 @@ export default function Keys() {
 
   // 主表用**本地已存密钥**（投递需要它的本地 id）；站点侧列表只作对照
   const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
+  // 主表跟随所选站点（M9-S4 / D）：此前站点下拉只管「新建 / 对齐 / 对照」，主表却列全部站点，
+  // 表里又没有站点列——同名规范（`app-id/agent-id/日期`）下根本分不出哪把是哪个站的。
+  const siteKeys = (keys.data ?? []).filter((k) => k.siteId === activeSite);
   const remote = useQuery({
     queryKey: ["remote-keys", activeSite],
     queryFn: () => listKeys(activeSite!),
@@ -263,7 +266,6 @@ export default function Keys() {
 
   return (
     <section>
-      <h2>密钥</h2>
 
       {sites.data?.length === 0 ? (
         <p className="muted">先去「站点」页接入一个中转站。</p>
@@ -414,8 +416,14 @@ export default function Keys() {
             KeyRelay 本地还没有密钥。点「新建密钥」——新建成功后密钥会直接进系统钥匙串。
           </p>
         ) : null}
+        {/* 两种空不能混成一句：「本地一把都没有」与「这个站下没有」处理方式不同 */}
+        {keys.data?.length && siteKeys.length === 0 ? (
+          <p className="muted">
+            这个站点下还没有本地密钥（其他站点共 {keys.data.length} 把，切换上面的站点查看）。
+          </p>
+        ) : null}
 
-        {keys.data?.length ? (
+        {siteKeys.length ? (
           <table className="table">
             <thead>
               <tr>
@@ -428,7 +436,7 @@ export default function Keys() {
               </tr>
             </thead>
             <tbody>
-              {keys.data.map((key) => {
+              {siteKeys.map((key) => {
                 const site = (sites.data ?? []).find((s) => s.id === key.siteId);
                 const gate = revokeGate(site, key);
                 return (

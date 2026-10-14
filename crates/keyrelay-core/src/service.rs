@@ -1204,6 +1204,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         self.store.all_bindings()
     }
 
+    /// 投递历史（M9-S4）：「变更历史」页的回滚入口。只读。
+    pub fn delivery_history(&self, limit: usize) -> Result<Vec<crate::store::DeliveryHistoryRow>> {
+        self.store.delivery_history(limit)
+    }
+
     /// 真正把密钥写进目标文件。步骤与顺序见 spec §6.1，**同意是第一步**。
     ///
     /// 不带模型名：轮换第②步走的就是这条——Continue 沿用受管块里已有的模型名。
@@ -1342,6 +1347,19 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             id: journal_id.to_string(),
             entries,
         })?;
+        // 文件已经还原了：记状态失败**不**能把这次回滚报成失败（与 B-100 同口径）。
+        // 没记上的后果只是历史页仍显示「可回滚」；再点一次会被哈希校验拒绝，不会误改文件。
+        if let Err(err) = self.store.mark_journal_rolled_back(journal_id) {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "delivery",
+                "回滚已完成，但本地状态没记上",
+                serde_json::json!({
+                    "journal_id": journal_id,
+                    "error": crate::redact::scrub(&err.to_string()),
+                }),
+            ));
+        }
         self.log(observability::event_with_payload(
             Level::Info,
             "delivery",
