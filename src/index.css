@@ -173,14 +173,6 @@ h2 {
   color: var(--muted);
 }
 
-.badge-newapi {
-  color: #9ecbff;
-}
-
-.badge-sub2api {
-  color: #d2a8ff;
-}
-
 .muted {
   color: var(--muted);
 }
@@ -565,7 +557,9 @@ section > .muted {
 }
 
 .dialog::backdrop {
-  background: var(--backdrop);
+  /* 兜底值不能省（M9-S4 复审 P2-5）：旧版 WebKit（< 17.4，macOS 12/13 未升级的系统 WebView）里
+     `::backdrop` 不继承原始元素，令牌取不到，没有兜底遮罩就变透明 */
+  background: var(--backdrop, rgba(0, 0, 0, 0.55));
 }
 
 .dialog h2 {

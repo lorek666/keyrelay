@@ -1311,6 +1311,12 @@ fn list_deliveries_returns_newest_first_with_camel_case_fields() {
     let (_app, webview) = build_app();
     let state = webview.app_handle().state::<keyrelay_lib::AppState>();
 
+    // 先占掉站点 id 1：否则全新内存库里 site = key = 1，`siteId` 与 `keyId` 互换也照样通过（复审 P2-3）
+    state
+        .service
+        .store()
+        .upsert_site("newapi", "https://placeholder.example.com", "占位站")
+        .expect("写占位站点");
     let site = state
         .service
         .store()
@@ -1321,6 +1327,10 @@ fn list_deliveries_returns_newest_first_with_camel_case_fields() {
         .store_key_material(site, "codex/a", Some("1"), None, "sk-hist-0123456789abcdef")
         .expect("写密钥")
         .id;
+    assert_ne!(
+        site, key,
+        "站点 id 与密钥 id 必须不同，否则 siteId 没被钉住"
+    );
     let store = state.service.store();
     store
         .record_binding("codex", key, "/home/u/.codex/auth.json", "j1")

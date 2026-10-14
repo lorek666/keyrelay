@@ -183,6 +183,13 @@ export default function Overview() {
             恢复成投递之前的内容；被外部改过的（<span className="mono">modified</span>）回滚会被拒绝——
             回滚不会覆盖别人的改动。
           </p>
+          {/* 回滚只还原文件、不动绑定 ⇒ 用户自己回滚过的目标也会被报在这里（M3-S1 既定语义，B-125）。
+              不说这一句，上面「重新投递」那条会把用户引去撤销他刚做的回滚（复审 P2-1）。 */}
+          <p className="muted">
+            <strong>你自己回滚过的目标也会出现在这里</strong>：回滚后文件不再是 KeyRelay
+            写入的内容，漂移检测照样会报（「变更历史」页里对应那一行标着「已回滚」）。
+            这种情况不要重新投递——那等于撤销回滚；不想再让 KeyRelay 管它，到「Agent 投递」页解绑对应的 agent。
+          </p>
           {hasUnreadable ? (
             <p className="muted">
               标记为 <span className="mono">unreadable</span> 的目标
