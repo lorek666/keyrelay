@@ -8,6 +8,7 @@ import {
   rollbackDelivery,
   type DeliveryRecord,
 } from "../lib/api";
+import { rollbackAftermath } from "../lib/rollback";
 import CapButton from "../components/CapButton";
 import ConfirmDialog from "../components/ConfirmDialog";
 
@@ -68,11 +69,10 @@ export default function History() {
     mutationFn: (row: DeliveryRecord) => rollbackDelivery(row.journalId),
     onSuccess: async (_, row) => {
       setError(null);
-      // 漂移检测比的是「KeyRelay 最后写下的内容」：回滚后文件不再是那个样子，
-      // 总览会把它列为需要处理（M3-S1 的既定语义，B-125）。先说出来，免得用户以为回滚出了错。
+      // 已解绑的目标不进漂移、轮换与批量改指，回滚之后没有别的后果要交代
       setNotice(
         `已回滚 ${row.targetPath}（变更 ${row.journalId}）。` +
-          "「总览」可能会把这个目标列为「需要处理」：它已经不是 KeyRelay 最后写入的内容了——这是预期的，不必重新投递。",
+          (row.unboundAt ? "" : rollbackAftermath(row.agentId)),
       );
       setTarget(null);
       await qc.invalidateQueries({ queryKey: ["deliveries"] });
@@ -94,7 +94,8 @@ export default function History() {
   return (
     <section>
       <p className="muted">
-        每次投递都可以在这里回滚。事件流里的所有文本在写入数据库前都经过脱敏——这里不会出现密钥明文。
+        当前生效的每一次投递都可以在这里回滚（更早、已被覆盖的历史只列最近 100 次）。
+        事件流里的所有文本在写入数据库前都经过脱敏——这里不会出现密钥明文。
       </p>
 
       {notice ? <p className="ok" role="status">{notice}</p> : null}

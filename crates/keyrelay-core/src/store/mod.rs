@@ -249,8 +249,10 @@ pub struct DeliveryHistoryRow {
     /// 没有 journal 行就无从回滚（`rollback_delivery` 会报「变更记录不存在」）。
     pub has_journal: bool,
     pub rolled_back: bool,
-    /// 同一目标上有**更新的、未回滚的**投递。为真时回滚必然被哈希校验拒绝：
-    /// 文件里是之后那次写下的内容，不是这次。
+    /// 同一目标上有**更新的、未回滚的**投递。为真时回滚**通常**会被哈希校验拒绝：
+    /// 文件里是之后那次写下的内容，不是这次。两种例外下真回滚会成功——文件已被删除
+    /// （`restore_entry` 对不存在的文件不做哈希校验）、或之后那次写下的字节恰好相同。
+    /// 界面据此灰显，在这两种例外里比实际更保守；真正的闸是哈希校验（M9-S4 复审 P2-2）。
     pub superseded: bool,
 }
 
@@ -660,7 +662,14 @@ impl Store {
         self.bindings_where("1 = 1", &[])
     }
 
-    /// 投递历史，最新的在前，最多 `limit` 行（M9-S4）。只读。
+    /// 投递历史，最新的在前（M9-S4）。只读。
+    ///
+    /// **`limit` 只截历史，不截现状**（复审 P2-4）：返回最近 `limit` 行，**外加**所有
+    /// `superseded = false` 的行——每个目标的「现状」（当前生效、可以回滚的那次，以及在它之后
+    /// 被回滚掉的那几次）不管多早都在。否则一个早就投递、一直生效的目标会被之后别的投递挤出
+    /// 历史页，「当前生效的投递都能在这里回滚」就不成立；「最后一次是被你回滚掉的」也得看得见——
+    /// 总览把这种目标报成需要处理时（B-125），用户要能在历史页找到原因。
+    /// 被截掉的只有更早、已被覆盖的记录——它们本来就不能回滚。
     ///
     /// `superseded` 的两条口径（M9-S4 spec §5）：
     /// - **已解绑**的更新投递也算覆盖：解绑不改文件，文件里仍是那次写下的内容；
@@ -671,20 +680,28 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT b.id, COALESCE(b.journal_id, ''), b.agent_id, b.key_id, k.site_id,
-                        b.target_path, b.applied_at, b.unbound_at, j.backup_path,
-                        j.id IS NOT NULL,
-                        COALESCE(j.status, '') = 'rolled_back',
-                        EXISTS (SELECT 1 FROM bindings n
-                                LEFT JOIN journals nj ON nj.id = n.journal_id || ':' || n.target_path
-                                WHERE n.target_path = b.target_path
-                                  AND n.id > b.id
-                                  AND COALESCE(nj.status, 'applied') <> 'rolled_back')
-                 FROM bindings b
-                 JOIN keys k ON k.id = b.key_id
-                 LEFT JOIN journals j ON j.id = b.journal_id || ':' || b.target_path
-                 ORDER BY b.id DESC
-                 LIMIT ?1",
+                "WITH h AS (
+                   SELECT b.id AS id, COALESCE(b.journal_id, '') AS journal_id,
+                          b.agent_id AS agent_id, b.key_id AS key_id, k.site_id AS site_id,
+                          b.target_path AS target_path, b.applied_at AS applied_at,
+                          b.unbound_at AS unbound_at, j.backup_path AS backup_path,
+                          j.id IS NOT NULL AS has_journal,
+                          COALESCE(j.status, '') = 'rolled_back' AS rolled_back,
+                          EXISTS (SELECT 1 FROM bindings n
+                                  LEFT JOIN journals nj ON nj.id = n.journal_id || ':' || n.target_path
+                                  WHERE n.target_path = b.target_path
+                                    AND n.id > b.id
+                                    AND COALESCE(nj.status, 'applied') <> 'rolled_back') AS superseded,
+                          ROW_NUMBER() OVER (ORDER BY b.id DESC) AS rn
+                   FROM bindings b
+                   JOIN keys k ON k.id = b.key_id
+                   LEFT JOIN journals j ON j.id = b.journal_id || ':' || b.target_path
+                 )
+                 SELECT id, journal_id, agent_id, key_id, site_id, target_path, applied_at,
+                        unbound_at, backup_path, has_journal, rolled_back, superseded
+                 FROM h
+                 WHERE rn <= ?1 OR NOT superseded
+                 ORDER BY id DESC",
             )
             .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
         let rows = stmt

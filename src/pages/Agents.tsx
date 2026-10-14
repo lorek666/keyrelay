@@ -18,6 +18,7 @@ import {
   type RestartHint,
   type UnbindOutcome,
 } from "../lib/api";
+import { rollbackAftermath } from "../lib/rollback";
 import ConfirmDialog from "../components/ConfirmDialog";
 
 /**
@@ -166,7 +167,10 @@ export default function Agents() {
   const rollback = useMutation({
     mutationFn: () => rollbackDelivery(lastOutcome!.journalId),
     onSuccess: async () => {
-      setNotice(`已回滚 ${lastOutcome?.journalId}`);
+      // 与历史页同一句（复审 P2-1）：此前这里只说了「已回滚」，对之后的漂移告警一个字都没提
+      const agent =
+        CHANNELS.find((c) => c.id === lastOutcome?.channel)?.agent ?? lastOutcome?.channel ?? "";
+      setNotice(`已回滚 ${lastOutcome?.journalId}。${rollbackAftermath(agent)}`);
       setLastOutcome(null);
       setConfirmingRollback(false);
       await qc.invalidateQueries({ queryKey: ["events"] });

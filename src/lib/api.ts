@@ -838,7 +838,10 @@ export type DeliveryRecord = {
   backupPath: string | null;
   hasJournal: boolean;
   rolledBack: boolean;
-  /** 同一文件之后又投递过（且那次没回滚）：这次的回滚必然被拒 */
+  /**
+   * 同一文件之后又投递过（且那次没回滚）：这次的回滚通常会被拒，界面据此灰显。
+   * 例外（文件已被删 / 之后写下的字节恰好相同）见 `store::DeliveryHistoryRow::superseded`。
+   */
   superseded: boolean;
 };
 

@@ -1,4 +1,4 @@
-//! 投递历史的端到端验证（M9-S4 spec §7 H1–H8）。
+//! 投递历史的端到端验证（M9-S4 spec §7 H1–H12）。
 //!
 //! 这一批测试守的是「变更历史页能不能真的回滚」这件事的两半：
 //! ① 每次投递在界面上有一行（含已解绑的）；
@@ -21,6 +21,7 @@ struct Fixture {
     _dir: tempfile::TempDir,
     db_path: PathBuf,
     service: KeyRelayService<MockTransport>,
+    site_id: i64,
     keys: Vec<i64>,
 }
 
@@ -31,6 +32,10 @@ fn setup() -> Fixture {
 
     let db_path = dir.path().join("keyrelay.db");
     let store = Store::open(&db_path).expect("文件库");
+    // 先占掉站点 id 1：否则 site = key = 1，`site_id` 与 `key_id` 互换也照样通过（复审 P2-3）
+    store
+        .upsert_site("newapi", "https://placeholder.example.com", "占位站")
+        .expect("写占位站点");
     let site_id = store
         .upsert_site("newapi", "https://relay.example.com", "测试站")
         .expect("写站点");
@@ -71,6 +76,7 @@ fn setup() -> Fixture {
         _dir: dir,
         db_path,
         service,
+        site_id,
         keys,
     }
 }
@@ -107,7 +113,9 @@ fn one_delivery_is_listed_with_its_journal() {
     let row = &rows[0];
     assert_eq!(row.journal_id, outcome.journal_id);
     assert_eq!(row.agent_id, AGENT);
+    assert_ne!(f.site_id, f.keys[0], "两个 id 必须不同，否则互换抓不到");
     assert_eq!(row.key_id, f.keys[0]);
+    assert_eq!(row.site_id, f.site_id);
     assert_eq!(
         row.target_path,
         target_path(&f, DeliveryChannel::CodexAuthJson)
@@ -193,6 +201,15 @@ fn superseded_delivery_cannot_be_rolled_back() {
         matches!(err, keyrelay_core::error::Error::Inject { .. }),
         "被覆盖的那次回滚必须被拒（界面据此灰显）: {err:?}"
     );
+
+    // 被拒 ⇒ 什么都没发生：不得记成「已回滚」（spec §6「回滚失败不记状态」，复审 P2-3）
+    let rows = f.service.delivery_history(100).unwrap();
+    let older = rows
+        .iter()
+        .find(|r| r.journal_id == first.journal_id)
+        .unwrap();
+    assert!(!older.rolled_back, "回滚被拒，状态不能变");
+    assert!(older.superseded, "仍被之后那次覆盖着");
 }
 
 #[tokio::test]
@@ -218,6 +235,42 @@ async fn unbound_delivery_stays_listed_and_can_still_be_rolled_back() {
     assert_eq!(fs::read(&target).unwrap(), before, "解绑后仍能回滚");
 }
 
+#[tokio::test]
+async fn an_unbound_newer_delivery_still_supersedes_the_older_one() {
+    // spec §5：解绑不改文件，文件里仍是之后那次写下的内容 ⇒ 旧那次仍是「被覆盖」，回滚仍会被拒
+    let f = setup();
+    let target = target_path(&f, DeliveryChannel::CodexAuthJson);
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "{\n  \"auth_mode\": \"apikey\"\n}").unwrap();
+
+    let first = deliver(&f, f.keys[0], DeliveryChannel::CodexAuthJson);
+    let second = deliver(&f, f.keys[1], DeliveryChannel::CodexAuthJson);
+    f.service.unbind(AGENT, false).await.unwrap();
+
+    let rows = f.service.delivery_history(100).unwrap();
+    let older = rows
+        .iter()
+        .find(|r| r.journal_id == first.journal_id)
+        .unwrap();
+    let newer = rows
+        .iter()
+        .find(|r| r.journal_id == second.journal_id)
+        .unwrap();
+    assert!(
+        older.unbound_at.is_some() && newer.unbound_at.is_some(),
+        "两行都解绑了"
+    );
+    assert!(older.superseded, "已解绑的那次更新投递仍然覆盖着它");
+    assert!(!newer.superseded);
+
+    // 判据与真实结果一致
+    let err = f.service.rollback_delivery(&first.journal_id).unwrap_err();
+    assert!(
+        matches!(err, keyrelay_core::error::Error::Inject { .. }),
+        "文件里是之后那次的内容，旧那次的回滚必须被拒: {err:?}"
+    );
+}
+
 #[test]
 fn limit_keeps_the_newest_deliveries() {
     let f = setup();
@@ -228,6 +281,47 @@ fn limit_keeps_the_newest_deliveries() {
     let rows = f.service.delivery_history(2).unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].journal_id, third.journal_id);
+}
+
+#[test]
+fn limit_never_hides_a_delivery_that_can_still_be_rolled_back() {
+    // 历史页承诺「当前生效的投递都能在这里回滚」：limit 只能截掉旧的**历史**，
+    // 不能把一个仍然生效、只是比较早的投递挤出页面（复审 P2-4）。
+    let f = setup();
+    let early_but_live = deliver(&f, f.keys[0], DeliveryChannel::ShellBlock);
+    let superseded = deliver(&f, f.keys[0], DeliveryChannel::CodexAuthJson);
+    let newest = deliver(&f, f.keys[1], DeliveryChannel::CodexAuthJson);
+
+    let rows = f.service.delivery_history(1).unwrap();
+    let ids: Vec<&str> = rows.iter().map(|r| r.journal_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            newest.journal_id.as_str(),
+            early_but_live.journal_id.as_str()
+        ],
+        "最新的 1 行 + 更早但仍可回滚的那行；被覆盖的 {} 照常被 limit 截掉",
+        superseded.journal_id
+    );
+}
+
+#[test]
+fn limit_never_hides_a_rolled_back_delivery_that_is_still_the_targets_state() {
+    // 回滚过、之后再没投递过的目标：总览要靠这一行认出「这是你自己回滚的」，不能被 limit 挤掉
+    let f = setup();
+    let rolled = deliver(&f, f.keys[0], DeliveryChannel::CodexAuthJson);
+    f.service.rollback_delivery(&rolled.journal_id).unwrap();
+    deliver(&f, f.keys[0], DeliveryChannel::ShellBlock);
+    let newest = deliver(&f, f.keys[1], DeliveryChannel::ShellBlock);
+
+    let rows = f.service.delivery_history(1).unwrap();
+    let ids: Vec<&str> = rows.iter().map(|r| r.journal_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![newest.journal_id.as_str(), rolled.journal_id.as_str()],
+        "最新的 1 行 + 那个目标的现状（已回滚）；被覆盖的第一次 shell 投递照常被截掉"
+    );
+    assert!(rows[1].rolled_back);
 }
 
 #[test]
