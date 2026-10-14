@@ -451,14 +451,17 @@ pub fn map_http_error(status: u16, body: &[u8], retry_after_secs: Option<u64>) -
 
 /// 把站点原文从错误文案里再脱敏一遍（M6-S4 引入）。
 ///
-/// 只覆盖**带站点原文**的四个变体；`RateLimited` / `QuotaExhausted` / `CaptchaRequired` 等
-/// 变体不含站点文本，原样透传。
+/// 只覆盖**带站点原文**的四个变体 + 输入形态这一个新变体（M9-S2）；
+/// `RateLimited` / `QuotaExhausted` / `CaptchaRequired` 等变体不含站点文本，原样透传。
 ///
 /// **现状（M6-S6 之后）**：`map_http_error` 已经在**源头**对站点 `message` 脱敏，因此本函数
 /// 对 `map_http_error` 产出的错误已是**冗余的第二层**（`scrub` 幂等，叠加无副作用）。
 /// 保留它的理由：① 调用点上还有不经过 `map_http_error` 的错误来源（例如 Sub2API 的
 /// `reveal_keys` 委托既有 `reveal_key`，其错误在方法边界被 `map_err(scrub_error)` 兜住）；
 /// ② 纵深防御——将来若有人绕过咽喉点直接构造带站点文本的错误，这一层仍在。
+/// ②正是 [`Error::InvalidInput`] 的情形：它**今天**的文案是本产品自己的字面量（不含
+/// 站点原文，也不回显用户输入），但「将来有人把站点原文拼进来」这个风险与
+/// [`Error::Unsupported`] 一模一样——所以同等对待，别只靠一句注释承诺。
 pub(crate) fn scrub_error(err: Error) -> Error {
     match err {
         Error::AuthFailed(m) => Error::AuthFailed(crate::redact::scrub(&m)),
@@ -467,6 +470,8 @@ pub(crate) fn scrub_error(err: Error) -> Error {
         Error::FingerprintMismatch(m) => Error::FingerprintMismatch(crate::redact::scrub(&m)),
         // M7-S0：`Unsupported` 的文案可能带上站点回显的原文，因此与上面四条同等对待。
         Error::Unsupported(m) => Error::Unsupported(crate::redact::scrub(&m)),
+        // M9-S2：同上。这个变体今天只带本产品自己的字面量，但类型不保证永远如此。
+        Error::InvalidInput(m) => Error::InvalidInput(crate::redact::scrub(&m)),
         other => other,
     }
 }
@@ -675,6 +680,8 @@ mod tests {
             Error::Transport(format!("boom {secret}")),
             Error::FingerprintMismatch(format!("nope {secret}")),
             Error::Unsupported(format!("站点回显 {secret}")),
+            // M9-S2：新变体也走同一层。今天它只带本产品字面量，但类型不保证永远如此。
+            Error::InvalidInput(format!("站点说：{secret}")),
         ] {
             let text = scrub_error(err).to_string();
             assert!(!text.contains(secret), "错误文案泄漏密钥: {text}");
