@@ -541,13 +541,32 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
         match resp.status {
             200 => {
                 let value = Self::unwrap_success(&resp, "登录")?;
+                // `user_id` 有两个真实落点：旧版在 `data.id`，新版在 `data.user.id`
+                // （`newapi.example.com` 实测只有后者）。只读一个会让另一个形态
+                // 静默丢掉 user_id（M9-S1）。
                 let user_id = value
                     .pointer("/data/id")
+                    .or_else(|| value.pointer("/data/user/id"))
                     .and_then(|v| v.as_i64())
                     .map(|id| id.to_string());
+                // 两个来源都要留（M9-S1，真实站点实测）：
+                // ① 响应体 `data.access_token`（新版 NewAPI 主路径，走 `Authorization: Bearer`）；
+                // ② `Set-Cookie`（旧版/仍依赖会话的端点）。
+                // 早先的实现把 `access_token` 写死 `None`，于是在**不发 Set-Cookie、
+                // 只回 body token** 的站点上，登录返回 200 却拿到一个空会话——
+                // 随后每个带会话的请求都 401（`newapi.example.com` 实测复现）。
+                let access_token = json_str(&value, "/data/access_token").map(str::to_string);
+                let cookies = resp.set_cookies();
+                if access_token.is_none() && cookies.is_empty() {
+                    // 明确的失败。返回空会话会让「登录成功」和「什么都做不了」同时成立，
+                    // 而用户看到的是下一跳的 401，排障时根本指不回登录这一步。
+                    return Err(Error::AuthFailed(
+                        "登录响应既没有 access_token 也没有 Set-Cookie，无法建立会话".into(),
+                    ));
+                }
                 Ok(Session {
-                    cookies: resp.set_cookies(),
-                    access_token: None,
+                    cookies,
+                    access_token,
                     user_id,
                 })
             }
