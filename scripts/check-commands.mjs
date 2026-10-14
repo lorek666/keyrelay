@@ -134,6 +134,60 @@ function parseTsChannels() {
   return ids;
 }
 
+/**
+ * 从 `src/lib/api.ts` 的 `AGENT_CHANNELS` 表里取出 channel id 字面量（M8-S7 / B-116）。
+ *
+ * 为什么单独对账：这张表服务「从一条 binding 反查它属于哪条通道」
+ * （`channelOfBinding`），**`CHANNELS` 的对账覆盖不到它**——两边漏一条的后果不一样：
+ * `CHANNELS` 漏了用户选不到；`AGENT_CHANNELS` 漏了该行显示「无法识别通道」，
+ * 用户没办法批量改指它，而**没有任何东西会红**（M8-S7 独立复审 P2-1）。
+ *
+ * 与 `CHANNELS` 分开断言而不是取并集：并集会让「两边都漏同一条」互相掩护。
+ */
+function parseTsAgentChannels() {
+  const source = stripComments(
+    readFileSync(join(root, "src/lib/api.ts"), "utf8"),
+  );
+  const block = source.match(/const AGENT_CHANNELS[^=]*=\s*\{([\s\S]*?)\n\};/);
+  if (!block) throw new Error("在 api.ts 里找不到 AGENT_CHANNELS 表");
+  // `Record<string, string>`：取值就是 channel id 字面量
+  const ids = [...block[1].matchAll(/:\s*"([a-z0-9-]+)"/g)].map((m) => m[1]);
+  if (ids.length === 0) {
+    throw new Error(
+      "在 api.ts 的 AGENT_CHANNELS 里没解析到任何 channel id——解析器坏了，不能当成通过",
+    );
+  }
+  // agent 键也要与后端 `agent_id()` 的臂对账：键漏了 ⇒ 那个 agent 的绑定全查不到通道
+  // `Record<string, string>`：键在行首（可能带引号），取值是字符串
+  const keys = [...block[1].matchAll(/^\s{2}["']?([a-z0-9-]+)["']?:\s*"/gm)].map(
+    (m) => m[1],
+  );
+  if (keys.length === 0) {
+    throw new Error(
+      "在 api.ts 的 AGENT_CHANNELS 里没解析到任何 agent 键——解析器坏了，不能当成通过",
+    );
+  }
+  return { ids, keys };
+}
+
+/** 后端 `DeliveryChannel::agent_id()` 的臂（与 `as_str` 同形态，只是函数名不同）。 */
+function parseRustAgentIds() {
+  const source = stripComments(
+    readFileSync(join(root, "crates/keyrelay-core/src/delivery/mod.rs"), "utf8"),
+  );
+  const fn = source.match(/pub fn agent_id\(self\)[\s\S]*?\n    \}/);
+  if (!fn) throw new Error("在 delivery/mod.rs 里找不到 agent_id() 函数");
+  const arms = [...fn[0].matchAll(/DeliveryChannel::\w+\s*=>\s*"([a-z0-9-]+)"/g)].map(
+    (m) => m[1],
+  );
+  if (arms.length === 0) {
+    throw new Error(
+      "在 delivery/mod.rs 的 agent_id() 里没解析到任何臂——解析器坏了，不能当成通过",
+    );
+  }
+  return arms;
+}
+
 function parseCapabilities() {
   const raw = readFileSync(
     join(root, "src-tauri/capabilities/default.json"),
@@ -294,6 +348,59 @@ if (onlyBackend.length || onlyFrontend.length) {
   );
 } else {
   ok(`投递通道名两边一致（${rustChannels.length} 条）`);
+}
+
+// ------------------------------------------- 5b. AGENT_CHANNELS 对账（M8-S7 / B-116 P2-1）
+// `channelOfBinding` 用的第二张前端表。`CHANNELS` 的对账覆盖不到它，
+// 而它漏一条的后果是「该通道无法批量改指」且无任何东西会红。
+const agentTable = parseTsAgentChannels();
+const rustChannelsForAgent = parseRustChannels();
+const rustAgentIds = parseRustAgentIds();
+
+// ① channel id 集合：AGENT_CHANNELS ∪ CHANNELS == 后端 as_str()
+const agentOnly = agentTable.ids.filter((c) => !rustChannelsForAgent.includes(c));
+const missingFromAgent = rustChannelsForAgent.filter((c) => !agentTable.ids.includes(c));
+if (agentOnly.length || missingFromAgent.length) {
+  fail(
+    `AGENT_CHANNELS 与后端通道名不一致（M8-S7 / B-116）：\n` +
+      (missingFromAgent.length
+        ? `  后端有、表里没有: ${missingFromAgent.join(", ")}（这些通道无法批量改指）\n`
+        : "") +
+      (agentOnly.length
+        ? `  只有表里有: ${agentOnly.join(", ")}（后端不认识的通道）\n`
+        : "") +
+      `  表在 src/lib/api.ts 的 AGENT_CHANNELS`,
+  );
+}
+
+// ② agent 键集合 == 后端 agent_id() 的臂
+const agentKeyOnly = agentTable.keys.filter((a) => !rustAgentIds.includes(a));
+const agentIdMissing = rustAgentIds.filter((a) => !agentTable.keys.includes(a));
+if (agentKeyOnly.length || agentIdMissing.length) {
+  fail(
+    `AGENT_CHANNELS 的 agent 键与后端 agent_id() 不一致：\n` +
+      (agentIdMissing.length
+        ? `  后端有、表里没有: ${agentIdMissing.join(", ")}（这些 agent 的绑定查不到通道）\n`
+        : "") +
+      (agentKeyOnly.length
+        ? `  只有表里有: ${agentKeyOnly.join(", ")}\n`
+        : ""),
+  );
+}
+
+// ③ 两侧表各自的 id 集合必须相同（防「两边都漏同一条」互相掩护）
+const frontOnlyAgent = agentTable.ids.filter((c) => !tsChannels.includes(c));
+const frontOnlyChannels = tsChannels.filter((c) => !agentTable.ids.includes(c));
+if (frontOnlyAgent.length || frontOnlyChannels.length) {
+  fail(
+    `前端两张表的 channel id 不一致（CHANNELS vs AGENT_CHANNELS）：\n` +
+      (frontOnlyChannels.length ? `  只有 CHANNELS 有: ${frontOnlyChannels.join(", ")}\n` : "") +
+      (frontOnlyAgent.length ? `  只有 AGENT_CHANNELS 有: ${frontOnlyAgent.join(", ")}\n` : ""),
+  );
+} else {
+  ok(
+    `AGENT_CHANNELS 与后端对账一致（${agentTable.ids.length} 条通道 / ${agentTable.keys.length} 个 agent）`,
+  );
 }
 
 if (process.exitCode) {

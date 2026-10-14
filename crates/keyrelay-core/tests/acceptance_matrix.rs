@@ -31,6 +31,7 @@ use keyrelay_core::site::Credentials;
 use keyrelay_core::site::{KeySpec, SiteKind};
 use keyrelay_core::store::Store;
 use keyrelay_core::vault::{secret_ref, MemoryVault, Vault};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 
 const SECRET: &str = "sk-matrix-0123456789abcdef";
@@ -1189,4 +1190,108 @@ fn workspace_root() -> PathBuf {
         .and_then(Path::parent)
         .expect("工作区根")
         .to_path_buf()
+}
+
+// ================================================================ M8-S7：批量改指网关（B-116）
+
+/// 批量动作的候选必须是**仍然有效**的绑定：已解绑的行不该出现
+/// （否则用户会把一个早就解绑的通道「改指网关」，白写一次文件）。
+#[test]
+fn channel_bindings_exclude_unbound_rows() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let db = dir.path().join("keyrelay.db");
+    let store = Store::open(&db).expect("文件库");
+    let site = store
+        .upsert_site("newapi", "https://relay.example.com", "测试站")
+        .expect("写站点");
+    let live = store
+        .insert_key(site, "codex/live", "kr/key/1/secret", Some("1"), None)
+        .expect("写 key");
+    let dead = store
+        .insert_key(site, "codex/dead", "kr/key/2/secret", Some("2"), None)
+        .expect("写 key");
+    store
+        .record_binding("codex", live, "/home/u/.codex/auth.json", "j1")
+        .expect("写绑定");
+    store
+        .record_binding("claude-code", dead, "/home/u/.claude/settings.json", "j2")
+        .expect("写绑定");
+
+    // 把第二条解绑（M8-S4 的语义：标记 `unbound_at`，不删行）
+    store.unbind_agent("claude-code").expect("解绑 claude-code");
+
+    let all = store.all_bindings().expect("读全部绑定");
+    assert_eq!(all.len(), 2, "解绑不删行：两条都还在");
+    // 命令层的过滤口径：`unbound_at.is_none()`
+    let live_rows: Vec<&keyrelay_core::store::BindingRow> =
+        all.iter().filter(|row| row.unbound_at.is_none()).collect();
+    assert_eq!(live_rows.len(), 1, "只有一条仍然有效");
+    assert_eq!(live_rows[0].agent_id, "codex");
+    assert_eq!(live_rows[0].key_id, live);
+    assert_eq!(live_rows[0].target_path, "/home/u/.codex/auth.json");
+    assert_eq!(live_rows[0].site_id, site);
+}
+
+/// 批量动作的数据源必须是**只读**的：调用前后 `bindings` 逐字节相同。
+///
+/// 为什么钉这条：批量 UI 会在打开面板时读一次候选，若这个读取路径顺手写了什么
+/// （例如「顺手标记已处理」），用户只是看了一眼面板就改了数据库。
+#[test]
+fn reading_channel_bindings_does_not_touch_the_database() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let db = dir.path().join("keyrelay.db");
+    let store = Store::open(&db).expect("文件库");
+    let site = store
+        .upsert_site("newapi", "https://relay.example.com", "测试站")
+        .expect("写站点");
+    let key = store
+        .insert_key(site, "codex/daily", "kr/key/1/secret", Some("1"), None)
+        .expect("写 key");
+    store
+        .record_binding("codex", key, "/home/u/.codex/auth.json", "j1")
+        .expect("写绑定");
+
+    // 读之前先把整表抄一份
+    let before = store.all_bindings().expect("读一次");
+    let _ = store.all_bindings().expect("再读一次");
+    let after = store.all_bindings().expect("读第三次");
+    assert_eq!(before, after, "重复读取必须给出同一份数据（只读）");
+
+    // 行数与字段逐一对照：多一个隐式写入就会在这里现形
+    assert_eq!(after.len(), before.len());
+    for (b, a) in before.iter().zip(after.iter()) {
+        assert_eq!(b.id, a.id);
+        assert_eq!(b.key_id, a.key_id);
+        assert_eq!(b.unbound_at, a.unbound_at, "读取不得改动 unbound_at");
+        assert_eq!(b.applied_at, a.applied_at, "读取不得改动 applied_at");
+    }
+
+    // **其它表也不许被碰**（M8-S7 独立复审 P3-2）：只比 `bindings` 抓不到
+    // 「顺手写条事件 / 顺手记个 setting」那种最自然的隐式写。这里比行数——
+    // 不比对 db 文件字节（WAL 的 checkpoint 会让字节数自己变，那是噪声）。
+    let conn = Connection::open(&db).expect("复开库");
+    let count = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+            .expect("计数查询")
+    };
+    assert_eq!(
+        count("SELECT COUNT(*) FROM events"),
+        0,
+        "读绑定不得写事件表（最常见的「顺手写」）"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM keys"),
+        1,
+        "读绑定不得改动 keys 表"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM sites"),
+        1,
+        "读绑定不得改动 sites 表"
+    );
+    let settings = count("SELECT COUNT(*) FROM settings");
+    assert_eq!(
+        settings, 0,
+        "读绑定不得写 settings（例如记一个「读取时间」）"
+    );
 }

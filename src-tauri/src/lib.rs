@@ -175,6 +175,7 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::delivery_plan,
             commands::grant_consent,
             commands::revoke_consent,
+            commands::list_channel_bindings,
             commands::list_consents,
             commands::apply_delivery,
             commands::rollback_delivery,

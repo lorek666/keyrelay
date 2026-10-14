@@ -226,6 +226,28 @@ pub struct ConsentDto {
     revoked_at: Option<i64>,
 }
 
+/// 一条「已投递且未解绑」的通道绑定（M8-S7 / B-116）。
+///
+/// **没有 `channel` 字段，这是有意的**：`bindings` 表没有 channel 列，只有
+/// `agent_id` 与 `target_path`。后端 `DeliveryChannel::relative_target()` 是按**当前**
+/// home 解析的，而绑定里的 `target_path` 可能是当年另一个 home 下写的 ⇒ 后端猜会猜错。
+/// 前端有 `CHANNELS` 那张按 agent 分组的表，用 `agentId` + 文件名二分得到 channel，
+/// 猜错的代价也更小。职责划分写在这里，免得下一个人「顺手补一个 channel 字段」。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelBindingDto {
+    /// 绑定行自己的 id（M8-S7 P2-4）。**不是**可选项：`bindings` 没有 UNIQUE 约束，
+    /// 「换 key 后重投」会在同一文件上留下多条 `unbound_at IS NULL` 的行，
+    /// 前端要用它做 React key 与勾选键——用 `${channel}::${targetPath}` 会让那两行
+    /// 共用一个复选框（勾一个等于勾两个）并报重复 key。
+    pub binding_id: i64,
+    pub agent_id: String,
+    pub key_id: i64,
+    pub target_path: String,
+    /// 该 key 所属站点（界面要显示「这条指向哪个站」）。
+    pub site_id: i64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeliveryOutcomeDto {
@@ -669,6 +691,33 @@ pub fn list_consents(state: State<'_, AppState>) -> Result<Vec<ConsentDto>, Stri
                     fields: row.fields,
                     granted_at: row.granted_at,
                     revoked_at: row.revoked_at,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// 已投递且**未解绑**的通道绑定（M8-S7 / B-116）。
+///
+/// 只读 `bindings`（`unbound_at IS NULL`），不写任何东西——调用前后库内容逐字节相同
+/// （有测试钉住）。批量改指网关用它决定「有哪些通道要改、每条该用哪把 key 重投」。
+#[tauri::command]
+pub fn list_channel_bindings<R: tauri::Runtime>(
+    _app: AppHandle<R>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ChannelBindingDto>, String> {
+    state
+        .service
+        .channel_bindings()
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|row| row.unbound_at.is_none())
+                .map(|row| ChannelBindingDto {
+                    binding_id: row.id,
+                    agent_id: row.agent_id,
+                    key_id: row.key_id,
+                    target_path: row.target_path,
+                    site_id: row.site_id,
                 })
                 .collect()
         })

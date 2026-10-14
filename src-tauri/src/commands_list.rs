@@ -21,6 +21,7 @@ pub const COMMANDS: &[&str] = &[
     "grant_consent",
     "revoke_consent",
     "list_consents",
+    "list_channel_bindings",
     "apply_delivery",
     "rollback_delivery",
     "recent_events",

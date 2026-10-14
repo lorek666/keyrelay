@@ -1203,3 +1203,101 @@ fn site_balance_reports_unknown_without_pretending_it_is_zero() {
     let err = invoke_impl("site_balance", json!({"siteId": 999})).expect_err("不存在的站点应报错");
     assert_not_acl_rejection("site_balance", &err);
 }
+
+/// M8-S7 / B-116：命令层的「未解绑过滤」必须真的在命令里。
+///
+/// 为什么必须在 IPC 层测：过滤那行在 `commands.rs` 里（`.filter(|row| row.unbound_at.is_none())`），
+/// core 测试拿不到 `State`。删掉那一行**没有任何东西会红**——core 侧那两条测试自己写了
+/// 一份同样的过滤，跑的是 `store.all_bindings()`，跟命令层无关（独立复审 P2-2）。
+/// 前端于是会把已解绑的绑定当候选列出来，用户对一个早就解绑的文件白写一次。
+#[test]
+fn list_channel_bindings_filters_out_unbound_rows() {
+    use tauri::Manager;
+
+    let (_app, webview) = build_app();
+    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+
+    let site = state
+        .service
+        .store()
+        .upsert_site("newapi", "https://relay.example.com", "批量测试站")
+        .expect("写站点");
+    let live = state
+        .service
+        .store_key_material(
+            site,
+            "codex/live",
+            Some("1"),
+            None,
+            "sk-live-0123456789abcdef",
+        )
+        .expect("写密钥")
+        .id;
+    let dead = state
+        .service
+        .store_key_material(
+            site,
+            "codex/dead",
+            Some("2"),
+            None,
+            "sk-dead-0123456789abcdef",
+        )
+        .expect("写密钥")
+        .id;
+
+    state
+        .service
+        .store()
+        .record_binding("codex", live, "/home/u/.codex/auth.json", "j1")
+        .expect("写绑定");
+    state
+        .service
+        .store()
+        .record_binding("claude-code", dead, "/home/u/.claude/settings.json", "j2")
+        .expect("写绑定");
+    state
+        .service
+        .store()
+        .unbind_agent("claude-code")
+        .expect("解绑 claude-code");
+
+    let value = invoke_on(&webview, "list_channel_bindings", json!({}))
+        .expect("list_channel_bindings 应成功");
+    assert_not_acl_rejection("list_channel_bindings", &value);
+
+    let rows = value.as_array().expect("应返回数组");
+    assert_eq!(rows.len(), 1, "已解绑的绑定不得出现在候选里: {rows:?}");
+    assert_eq!(
+        rows[0]["bindingId"], 1,
+        "绑定行 id 要带回（前端用它做 key）"
+    );
+    assert_eq!(rows[0]["agentId"], "codex");
+    assert_eq!(rows[0]["keyId"], live);
+    assert_eq!(rows[0]["targetPath"], "/home/u/.codex/auth.json");
+    assert_eq!(rows[0]["siteId"], site);
+
+    // 同一文件上的第二条未解绑绑定必须**各自独立成行**（M8-S7 P2-4）：
+    // `bindings` 没有 UNIQUE 约束，「换 key 后重投」会留下两条。前一个版本用
+    // `${channel}::${targetPath}` 做 key，那两条会共用同一个复选框。
+    state
+        .service
+        .store()
+        .record_binding("codex", dead, "/home/u/.codex/auth.json", "j3")
+        .expect("写第二条同目标绑定");
+    let again = invoke_on(&webview, "list_channel_bindings", json!({})).expect("再查一次应成功");
+    let rows = again.as_array().expect("应返回数组");
+    assert_eq!(rows.len(), 2, "同一文件上的两条未解绑绑定都要列出");
+    let ids: Vec<i64> = rows
+        .iter()
+        .map(|r| r["bindingId"].as_i64().expect("bindingId 是数字"))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1, 3],
+        "两行的 bindingId 必须不同（否则前端 key 会撞）"
+    );
+    assert_ne!(
+        rows[0]["keyId"], rows[1]["keyId"],
+        "两条绑定用的是不同的 key（这正是要能让用户分别处理的原因）"
+    );
+}
