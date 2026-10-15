@@ -30,6 +30,7 @@ const KEY_GATEWAY_PORT: &str = "gateway_port";
 const KEY_THEME: &str = "theme";
 const KEY_LANGUAGE: &str = "language";
 const KEY_PROXY_URL: &str = "proxy_url";
+const KEY_PROXY_MODE: &str = "proxy_mode";
 const KEY_TELEMETRY: &str = "telemetry_enabled";
 const KEY_AUTO_UPDATE: &str = "auto_update_enabled";
 const KEY_NOTIFY_SYSTEM: &str = "notify_system_enabled";
@@ -59,11 +60,16 @@ pub struct Settings {
     pub theme: String,
     /// 界面语言：`zh-CN` / `en-US`。
     pub language: String,
-    /// HTTP/SOCKS5 代理。空 = 直连。
+    /// HTTP/SOCKS5 代理。空 = 直连（manual 模式下）；auto 模式下仅作手填兜底被忽略。
     ///
     /// **注意**：本模块不校验代理串的合法性（那会引入对 `site::transport` 的依赖）。
     /// 非法代理串在真正构造传输层时报错——见 spec §2.2 第 4 条。
     pub proxy_url: String,
+    /// 代理模式（M10-S2）：`auto` / `manual` / `direct`。默认 `auto`。
+    ///
+    /// 字符串而非 `ProxyMode` 枚举：与 `theme`/`language` 同形态，KV 往返简单，
+    /// 解析在 `proxy::ProxyMode::parse`（校验集中在一处）。未知值退回 `auto`。
+    pub proxy_mode: String,
     /// 匿名遥测开关。**默认关**（PRD §5「默认零遥测」）。
     pub telemetry_enabled: bool,
     /// 自动更新开关。默认关。
@@ -107,6 +113,8 @@ impl Default for Settings {
             theme: "system".to_string(),
             language: "zh-CN".to_string(),
             proxy_url: String::new(),
+            // M10-S2：默认 auto——听系统已有的代理，不让用户填第二遍。
+            proxy_mode: "auto".to_string(),
             // PRD §5：默认零遥测
             telemetry_enabled: false,
             auto_update_enabled: false,
@@ -155,6 +163,13 @@ impl Settings {
                 "未知语言「{}」（可选：{}）",
                 self.language,
                 LANGUAGES.join(" / ")
+            )));
+        }
+        // M10-S2：proxy_mode 必须是合法值之一。from_pairs 已过滤，但保存路径要走 validate。
+        if crate::proxy::ProxyMode::parse(&self.proxy_mode).is_none() {
+            return Err(Error::Store(format!(
+                "未知代理模式「{}」（可选：auto / manual / direct）",
+                self.proxy_mode
             )));
         }
         if self.notify_timeout_secs > MAX_NOTIFY_TIMEOUT_SECS {
@@ -234,6 +249,7 @@ impl Settings {
             "start_hidden": self.start_hidden,
             // 只回报「配没配」，不回报值：
             "proxy_configured": !self.proxy_url.trim().is_empty(),
+            "proxy_mode": self.proxy_mode,
             "webhook_configured": self.webhook_enabled(),
         })
     }
@@ -272,6 +288,7 @@ impl Settings {
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
         let mut settings = Self::default();
+        let mut proxy_mode_seen = false;
         for (key, value) in pairs {
             match key {
                 KEY_REFRESH_INTERVAL => {
@@ -320,6 +337,13 @@ impl Settings {
                 KEY_PROXY_URL => {
                     if value.len() <= MAX_PROXY_URL_LEN {
                         settings.proxy_url = value.to_string();
+                    }
+                }
+                KEY_PROXY_MODE => {
+                    // 未知值不收，保留默认 auto。合法值见 `ProxyMode::as_str`。
+                    if crate::proxy::ProxyMode::parse(value).is_some() {
+                        settings.proxy_mode = value.trim().to_ascii_lowercase();
+                        proxy_mode_seen = true;
                     }
                 }
                 KEY_TELEMETRY => {
@@ -383,6 +407,12 @@ impl Settings {
                 _ => {}
             }
         }
+        // 升级迁移（M10-S2）：旧库没有 `proxy_mode` 键。若用户之前手填了 `proxy_url`
+        // （非空），保留其手填语义 ⇒ manual；否则用默认 auto（听系统）。
+        // 不做这条的话，升级后所有手填过代理的用户会突然变成 auto，代理被忽略。
+        if !proxy_mode_seen && !settings.proxy_url.trim().is_empty() {
+            settings.proxy_mode = "manual".to_string();
+        }
         settings
     }
 
@@ -400,6 +430,7 @@ impl Settings {
             (KEY_THEME, self.theme.clone()),
             (KEY_LANGUAGE, self.language.clone()),
             (KEY_PROXY_URL, self.proxy_url.clone()),
+            (KEY_PROXY_MODE, self.proxy_mode.clone()),
             (KEY_TELEMETRY, self.telemetry_enabled.to_string()),
             (KEY_AUTO_UPDATE, self.auto_update_enabled.to_string()),
             (KEY_NOTIFY_SYSTEM, self.notify_system_enabled.to_string()),
@@ -416,7 +447,25 @@ impl Settings {
         ]
     }
 
-    pub const KEYS: [&'static str; 18] = [
+    /// 从存储层一次性读全部键，缺失键退回默认值（走 `from_pairs` 的迁移与容错）。
+    ///
+    /// 与 `KeyRelayService::settings` 同一份逻辑；抽到本模块是为了让壳层（`src-tauri`）
+    /// 在构造 service 之前就能读 settings 解析代理（M10-S2：`build_transport` 要用）。
+    pub fn load_from_store(store: &crate::store::Store) -> Result<Self> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for key in Self::KEYS {
+            if let Some(value) = store.get_setting(key)? {
+                pairs.push((key.to_string(), value));
+            }
+        }
+        let borrowed: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        Ok(Self::from_pairs(borrowed))
+    }
+
+    pub const KEYS: [&'static str; 19] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
@@ -425,6 +474,7 @@ impl Settings {
         KEY_THEME,
         KEY_LANGUAGE,
         KEY_PROXY_URL,
+        KEY_PROXY_MODE,
         KEY_TELEMETRY,
         KEY_AUTO_UPDATE,
         KEY_NOTIFY_SYSTEM,
@@ -699,6 +749,7 @@ mod tests {
             theme: "dark".to_string(),
             language: "en-US".to_string(),
             proxy_url: "socks5://127.0.0.1:1080".to_string(),
+            proxy_mode: "manual".to_string(),
             telemetry_enabled: true,
             auto_update_enabled: true,
             notify_system_enabled: false,

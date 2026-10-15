@@ -248,6 +248,40 @@ mod production_wiring {
     }
 
     #[tokio::test]
+    async fn gateway_config_threads_resolved_proxy_from_settings() {
+        // M10-S2：gateway_config 必须把 settings 解析出的代理填进 upstream_proxy。
+        // 证伪：删掉 service.rs 里 `config.upstream_proxy = self.resolved_upstream_proxy()`
+        // 这一行 ⇒ manual 断言红（None != Some）。
+        let (_dir, service, site_a, key_a, _ref_a, _ref_b) = service_with_two_sites().await;
+
+        // manual + 合法 url ⇒ upstream_proxy == url
+        let mut s = service.settings().expect("读默认 settings");
+        s.proxy_mode = "manual".to_string();
+        s.proxy_url = "socks5://127.0.0.1:1080".to_string();
+        service.update_settings(&s).expect("保存 manual 代理");
+        let cfg = service
+            .gateway_config(site_a, key_a, 0)
+            .expect("组装网关配置");
+        assert_eq!(
+            cfg.upstream_proxy.as_deref(),
+            Some("socks5://127.0.0.1:1080"),
+            "manual 模式：upstream_proxy 应等于 proxy_url"
+        );
+
+        // direct ⇒ None（即便 proxy_url 还留着）
+        let mut s = service.settings().expect("读 settings");
+        s.proxy_mode = "direct".to_string();
+        service.update_settings(&s).expect("保存 direct");
+        let cfg = service
+            .gateway_config(site_a, key_a, 0)
+            .expect("组装网关配置");
+        assert!(
+            cfg.upstream_proxy.is_none(),
+            "direct 模式：upstream_proxy 必须为 None，哪怕 proxy_url 非空"
+        );
+    }
+
+    #[tokio::test]
     async fn a_revoked_key_is_excluded_from_the_route_table() {
         // §3.5-5 的另一半：**新的取密钥路径不得绕过 `ensure_not_revoked` 建立的读者**。
         let (_dir, service, site_a, key_a, _ref_a, _ref_b) = service_with_two_sites().await;

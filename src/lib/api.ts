@@ -251,8 +251,10 @@ export type Settings = {
   theme: string;
   /** "zh-CN" | "en-US" */
   language: string;
-  /** 空 = 直连。合法性由传输层判定，这里只存。 */
+  /** 空 = 直连（manual 模式下）；auto 模式下被忽略。合法性由传输层判定，这里只存。 */
   proxyUrl: string;
+  /** 代理模式（M10-S2）："auto" | "manual" | "direct"。默认 auto。 */
+  proxyMode: string;
   /** 默认关（PRD §5「默认零遥测」）。当前只记录意愿，不发送任何数据。 */
   telemetryEnabled: boolean;
   /** 默认关。当前只记录意愿，未接更新服务器。 */
@@ -1054,6 +1056,7 @@ let mockSettings: Settings = {
   theme: "system",
   language: "zh-CN",
   proxyUrl: "",
+  proxyMode: "auto",
   telemetryEnabled: false,
   autoUpdateEnabled: false,
   notifySystemEnabled: true,

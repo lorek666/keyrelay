@@ -212,6 +212,59 @@ fn detect_site_reaches_real_transport_layer() {
     );
 }
 
+// ---------- M10-S2：站点适配器 transport 的代理接线 ----------
+
+/// `resolved_proxy_url` 是壳层构造站点 transport 时的代理解析入口（M10-S2）。
+/// 它读 settings → resolve_proxy → 返回最终代理 URL。
+/// 证伪：删掉 lib.rs 里对 `resolved_proxy_url(&store)` 的调用、或让它忽略 proxy_mode
+/// ⇒ manual 断言红。
+#[test]
+fn resolved_proxy_url_reads_settings_mode_and_url() {
+    use keyrelay_core::store::Store;
+    use keyrelay_lib::resolved_proxy_url;
+
+    let store = Store::open_in_memory().expect("内存库");
+
+    // manual + 合法 url ⇒ Some(url)
+    store.set_setting("proxy_mode", "manual").unwrap();
+    store
+        .set_setting("proxy_url", "socks5://127.0.0.1:1080")
+        .unwrap();
+    assert_eq!(
+        resolved_proxy_url(&store).as_deref(),
+        Some("socks5://127.0.0.1:1080"),
+        "manual + 合法 url ⇒ 返回该 url"
+    );
+
+    // direct ⇒ None（即便 proxy_url 还留着）
+    store.set_setting("proxy_mode", "direct").unwrap();
+    assert_eq!(
+        resolved_proxy_url(&store),
+        None,
+        "direct 模式 ⇒ None，哪怕 proxy_url 非空"
+    );
+
+    // manual + 空 url ⇒ None（不让空配置把 app 搞崩）
+    store.set_setting("proxy_mode", "manual").unwrap();
+    store.set_setting("proxy_url", "").unwrap();
+    assert_eq!(
+        resolved_proxy_url(&store),
+        None,
+        "manual + 空 url ⇒ None（等价直连）"
+    );
+
+    // manual + 非法 url ⇒ None（不静默直连也不崩，告警后直连；行为见 lib.rs）
+    store.set_setting("proxy_mode", "manual").unwrap();
+    store
+        .set_setting("proxy_url", "file:///etc/passwd")
+        .unwrap();
+    assert_eq!(
+        resolved_proxy_url(&store),
+        None,
+        "manual + 非法 url ⇒ None（告警并直连，不退出）"
+    );
+}
+
 // ---------- M1-S1：成功路径的返回值结构（复审 P2-4）----------
 
 /// 极简假站点：只应答 `GET /api/status`，用于让 `add_site` 走通真实 HTTP 链路

@@ -266,7 +266,7 @@ fn assert_no_secret(label: &str, text: &str) {
 #[test]
 fn webhook_posts_json_with_the_documented_shape() {
     let server = spawn_server(vec![http_response("200 OK", "application/json", "{}")]);
-    let notifier = WebhookNotifier::new(config(Some(&format!("{}/hook", server.base_url))));
+    let notifier = WebhookNotifier::new(config(Some(&format!("{}/hook", server.base_url))), None);
 
     let notification = Notification::new(
         NotifyKind::BalanceLow,
@@ -305,7 +305,7 @@ fn webhook_posts_json_with_the_documented_shape() {
 #[test]
 fn webhook_body_never_carries_a_secret_on_the_wire() {
     let server = spawn_server(vec![http_response("200 OK", "application/json", "{}")]);
-    let notifier = WebhookNotifier::new(config(Some(&format!("{}/hook", server.base_url))));
+    let notifier = WebhookNotifier::new(config(Some(&format!("{}/hook", server.base_url))), None);
 
     // 手工拼一个**绕过构造侧**的通知：发送侧必须兜住
     let raw_notification = Notification {
@@ -335,7 +335,7 @@ fn webhook_does_not_retry_on_5xx() {
         "application/json",
         r#"{"error":{"message":"upstream sk-0123456789abcdefSECRET"}}"#,
     )]);
-    let notifier = WebhookNotifier::new(config(Some(&format!("{}/hook", server.base_url))));
+    let notifier = WebhookNotifier::new(config(Some(&format!("{}/hook", server.base_url))), None);
 
     let err = notifier
         .send(&Notification::new(
@@ -358,7 +358,7 @@ fn webhook_does_not_follow_redirects() {
         "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/hook\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             .to_string(),
     ]);
-    let notifier = WebhookNotifier::new(config(Some(&format!("{}/hook", server.base_url))));
+    let notifier = WebhookNotifier::new(config(Some(&format!("{}/hook", server.base_url))), None);
 
     let err = notifier
         .send(&Notification::new(
@@ -381,7 +381,7 @@ fn webhook_obeys_the_configured_timeout() {
             timeout: Duration::from_millis(300),
             ..config(Some(&format!("{base_url}/hook")))
         },
-        Box::new(keyrelay_core::notify::ReqwestWebhookTransport),
+        Box::new(keyrelay_core::notify::ReqwestWebhookTransport::default()),
     );
 
     let started = Instant::now();
@@ -429,7 +429,7 @@ fn webhook_with_zero_timeout_is_a_race_but_never_hangs() {
                 timeout: Duration::ZERO,
                 ..config(Some(&format!("{}/hook", server.base_url)))
             },
-            Box::new(keyrelay_core::notify::ReqwestWebhookTransport),
+            Box::new(keyrelay_core::notify::ReqwestWebhookTransport::default()),
         );
 
         let started = Instant::now();
@@ -464,9 +464,12 @@ fn webhook_with_zero_timeout_is_a_race_but_never_hangs() {
 #[test]
 fn webhook_error_does_not_leak_url_credentials_on_a_dead_port() {
     // 端口 1 上不会有服务：真实 reqwest 错误里会带完整 URL
-    let notifier = WebhookNotifier::new(config(Some(
-        "http://alice:s3cr3t-token@127.0.0.1:1/hook?token=s3cr3t-token",
-    )));
+    let notifier = WebhookNotifier::new(
+        config(Some(
+            "http://alice:s3cr3t-token@127.0.0.1:1/hook?token=s3cr3t-token",
+        )),
+        None,
+    );
     let err = notifier
         .send(&Notification::new(
             NotifyKind::Drift,
@@ -565,7 +568,7 @@ fn evaluate_then_dispatch_keeps_both_channels_clean() {
             .map(|_| http_response("200 OK", "application/json", "{}"))
             .collect(),
     );
-    let webhook = WebhookNotifier::new(config(Some(&format!("{}/notify", server.base_url))));
+    let webhook = WebhookNotifier::new(config(Some(&format!("{}/notify", server.base_url))), None);
     for n in &notifications {
         webhook.send(n).expect("200 → 成功");
     }

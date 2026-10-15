@@ -13,7 +13,9 @@ use std::path::PathBuf;
 
 use tauri::Manager;
 
+use keyrelay_core::proxy::{self, ProxyMode};
 use keyrelay_core::service::{KeyRelayService, ServiceConfig};
+use keyrelay_core::settings::Settings;
 use keyrelay_core::site::registry::SiteRegistry;
 use keyrelay_core::site::retry::{RetryPolicy, RetryingTransport};
 use keyrelay_core::site::transport_reqwest::{ReqwestTransport, TransportConfig};
@@ -69,8 +71,12 @@ pub fn default_db_path() -> PathBuf {
     home_dir().join(".keyrelay").join("keyrelay.db")
 }
 
-fn build_transport() -> AppTransport {
-    match ReqwestTransport::new(TransportConfig::default()) {
+fn build_transport_with_proxy(proxy: Option<String>) -> AppTransport {
+    let config = TransportConfig {
+        proxy,
+        ..TransportConfig::default()
+    };
+    match ReqwestTransport::new(config) {
         Ok(inner) => RetryingTransport::new(inner, RetryPolicy::default()),
         Err(err) => {
             // 默认配置理论上不会失败；真失败说明构建环境异常，明确退出而不是静默降级
@@ -80,9 +86,33 @@ fn build_transport() -> AppTransport {
     }
 }
 
+/// 从 store 读 settings，按 `proxy_mode` 解析出最终代理 URL（M10-S2）。
+///
+/// 站点适配器 transport 在启动时构造一次、不可变（与 B-54 同口径：代理变更需重启 app）。
+/// 解析失败（manual 非法）⇒ 返回 None 并打印告警，**不让 app 因为代理配置非法而退出**——
+/// 用户还能进设置页改掉它；auto 模式探测失败自然就是 None（直连）。
+pub fn resolved_proxy_url(store: &Store) -> Option<String> {
+    let settings = Settings::load_from_store(store).ok()?;
+    let mode = ProxyMode::parse(&settings.proxy_mode).unwrap_or(ProxyMode::Auto);
+    match proxy::resolve_proxy(mode, &settings.proxy_url) {
+        Ok(Some(d)) => Some(d.url),
+        Ok(None) => None,
+        Err(err) => {
+            // manual 非法：不退出，告警并直连，让用户能进设置页修
+            eprintln!("[keyrelay] 代理配置非法，本次直连: {err}");
+            None
+        }
+    }
+}
+
 /// 仅做指纹识别（不落库），供前端「测试连接」按钮使用。
-pub async fn detect_only(base_url: &str) -> Result<SiteFingerprint> {
-    SiteRegistry::new(build_transport()).detect(base_url).await
+///
+/// 代理从 `state.service` 的 settings 解析（与生产 transport 同一份逻辑），保证
+/// 「测试连接能过 ⇔ 实际请求能过」——不再各走各的（M10-S2 关闭计划书 §2 的死配置）。
+pub async fn detect_only(base_url: &str, proxy: Option<String>) -> Result<SiteFingerprint> {
+    SiteRegistry::new(build_transport_with_proxy(proxy))
+        .detect(base_url)
+        .await
 }
 
 fn state_from_store(store: Store, db_path: PathBuf, db_error: Option<String>) -> AppState {
@@ -120,8 +150,12 @@ fn state_with_config(
     if let Err(err) = config.vault.probe() {
         eprintln!("[keyrelay] 系统钥匙串不可用，密钥投递将被禁用: {err}");
     }
+    // 先借用 store 解析代理（M10-S2），再把 store move 进 service——Store 不是 Clone，
+    // 顺序不能反。代理非法时 resolved_proxy_url 已 eprintln 告警并返回 None（直连），
+    // 不让 app 因此退出。
+    let proxy = resolved_proxy_url(&store);
     AppState {
-        service: KeyRelayService::new(store, build_transport(), config),
+        service: KeyRelayService::new(store, build_transport_with_proxy(proxy), config),
         db_path,
         db_error,
         gateway: std::sync::Mutex::new(None),

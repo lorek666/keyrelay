@@ -1440,6 +1440,28 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         Ok(Settings::from_pairs(borrowed))
     }
 
+    /// 解析当前 settings 的代理 URL（供网关上游 / webhook 复用，M10-S2）。
+    ///
+    /// 与壳层 `build_transport` 的 `resolved_proxy_url` 同一份 `proxy::resolve_proxy`，
+    /// 但在 service 内部、每次调用都读最新 settings——网关/通知因此能感知系统代理变更
+    /// （站点适配器 transport 不可变，仍需重启 app）。
+    ///
+    /// manual 非法 ⇒ `eprintln` 告警并返回 `None`，不 panic 也不 `Err`：网关/通知不该
+    /// 因为代理配置非法而崩，用户能进设置页改掉它。
+    fn resolved_upstream_proxy(&self) -> Option<String> {
+        let settings = self.settings().ok()?;
+        let mode = crate::proxy::ProxyMode::parse(&settings.proxy_mode)
+            .unwrap_or(crate::proxy::ProxyMode::Auto);
+        match crate::proxy::resolve_proxy(mode, &settings.proxy_url) {
+            Ok(Some(d)) => Some(d.url),
+            Ok(None) => None,
+            Err(err) => {
+                eprintln!("[keyrelay] 代理配置非法，上游直连: {err}");
+                None
+            }
+        }
+    }
+
     pub fn update_settings(&self, settings: &Settings) -> Result<()> {
         settings.validate()?;
         for (key, value) in settings.to_pairs() {
@@ -1775,7 +1797,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 .as_deref()
                 .is_some_and(|url| !url.trim().is_empty());
             if has_webhook {
-                let notifier = crate::notify::WebhookNotifier::new(state.config.clone());
+                let notifier = crate::notify::WebhookNotifier::new(
+                    state.config.clone(),
+                    self.resolved_upstream_proxy(),
+                );
                 if let Err(err) = notifier.send(item) {
                     failures.push(format!("webhook: {err}"));
                 }
@@ -2944,6 +2969,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // config.base_url / api_key（所选站点）。多站路由见 B-99。
         // ③ 已回收集合：网关只**查**它，不新开取密钥路径。
         config.revoked_refs = Some(Arc::clone(&self.revoked_refs));
+        // M10-S2：上游客户端走解析后的代理。每次 `gateway_config` 都重读 settings，
+        // 因此系统代理变更「重启网关即生效」（站点适配器 transport 仍需重启 app）。
+        // 解析失败（manual 非法）⇒ None + 告警事件，不让网关因代理非法起不来。
+        config.upstream_proxy = self.resolved_upstream_proxy();
         // ④ 会话代号：本次会话的失败才算本次的（§11.1）。
         let session = self
             .gateway_session

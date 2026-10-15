@@ -33,13 +33,26 @@ pub trait WebhookTransport: Send + Sync {
 /// 每次发送：起一个工作线程 → 在**该线程里**建 current-thread 运行时 → 发请求 → join。
 /// 通知是低频事件（一轮刷新最多几条），一次一个线程是可以接受的代价；
 /// 换来的是「在异步上下文里调用也不会 panic」这条硬保证。
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ReqwestWebhookTransport;
+///
+/// `proxy`（M10-S2）：从 service 的 `resolved_upstream_proxy` 传入，与站点适配器 /
+/// 网关上游同一份 `resolve_proxy`。`None` = 直连。
+#[derive(Clone, Debug, Default)]
+pub struct ReqwestWebhookTransport {
+    proxy: Option<String>,
+}
+
+impl ReqwestWebhookTransport {
+    /// 生产构造：带解析后的代理。
+    pub fn with_proxy(proxy: Option<String>) -> Self {
+        Self { proxy }
+    }
+}
 
 impl WebhookTransport for ReqwestWebhookTransport {
     fn post(&self, url: &str, body: &[u8], timeout: Duration) -> Result<u16> {
         let url = url.to_string();
         let body = body.to_vec();
+        let proxy = self.proxy.clone();
         let worker = std::thread::spawn(move || -> Result<u16> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -51,6 +64,7 @@ impl WebhookTransport for ReqwestWebhookTransport {
                     // 不该被 8s 的默认连接超时悄悄截断
                     timeout,
                     connect_timeout: timeout,
+                    proxy,
                     ..TransportConfig::default()
                 })?;
                 let mut request = HttpRequest::new(Method::Post, url);
@@ -77,10 +91,11 @@ pub struct WebhookNotifier {
 }
 
 impl WebhookNotifier {
-    pub fn new(config: NotifyConfig) -> Self {
+    /// 生产构造：`proxy` 来自 service 的 `resolved_upstream_proxy`（M10-S2）。
+    pub fn new(config: NotifyConfig, proxy: Option<String>) -> Self {
         Self {
             config,
-            transport: Box::new(ReqwestWebhookTransport),
+            transport: Box::new(ReqwestWebhookTransport::with_proxy(proxy)),
         }
     }
 

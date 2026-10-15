@@ -157,6 +157,7 @@ async fn start_routed(
         upstream_timeout: UpstreamTimeout::default(),
         revoked_refs: None,
         on_observation: None,
+        upstream_proxy: None,
         on_failure: Some(Arc::new(move |f| {
             if let Ok(mut log) = sink.lock() {
                 log.push(f);
@@ -444,6 +445,7 @@ async fn failure_event_scrubs_a_key_shaped_model() {
             upstream_timeout: UpstreamTimeout::default(),
             revoked_refs: None,
             on_observation: None,
+            upstream_proxy: None,
             on_failure: Some(Arc::new(move |f| {
                 if let Ok(mut log) = sink.lock() {
                     log.push(f);
@@ -616,6 +618,7 @@ async fn start_routed_with(
                 log.push(o);
             }
         })),
+        upstream_proxy: None,
         on_failure: Some(Arc::new(move |f| {
             if let Ok(mut log) = sink.lock() {
                 log.push(f);
