@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KeyRelay 前端改版预览</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-elev: #161b22;
+    --bg-active: #21262d;
+    --line: #30363d;
+    --text: #e6edf3;
+    --muted: #7d8590;
+    --accent: #58a6ff;
+    --accent-soft: rgba(88, 166, 255, 0.12);
+    --ok: #3fb950;
+    --ok-soft: rgba(63, 185, 80, 0.12);
+    --warn: #d29922;
+    --warn-soft: rgba(210, 153, 34, 0.12);
+    --danger: #f85149;
+    --danger-soft: rgba(248, 81, 73, 0.12);
+    --radius: 10px;
+    --radius-sm: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.6 -apple-system, "SF Pro Text", "PingFang SC", system-ui, sans-serif;
+    min-height: 100vh;
+  }
+  .demo-shell { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+  .sidebar { background: var(--bg-elev); border-right: 1px solid var(--line); padding: 20px 14px; display: flex; flex-direction: column; gap: 8px; }
+  .brand { display: flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 700; margin-bottom: 24px; padding: 0 8px; }
+  .brand-icon { width: 28px; height: 28px; background: linear-gradient(135deg, var(--accent), #a78bfa); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 14px; }
+  .nav-section { margin-top: 8px; }
+  .nav-section-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; padding: 0 8px; margin-bottom: 4px; }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: var(--radius-sm); color: var(--muted); font-size: 13px; cursor: pointer; transition: background 0.15s, color 0.15s; text-decoration: none; }
+  .nav-item:hover { background: var(--bg-active); color: var(--text); }
+  .nav-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .nav-item .nav-badge { margin-left: auto; font-size: 10px; padding: 1px 6px; border-radius: 999px; background: var(--danger-soft); color: var(--danger); font-weight: 600; }
+  .sidebar-footer { margin-top: auto; padding: 12px 8px 0; border-top: 1px solid var(--line); font-size: 11px; color: var(--muted); }
+  .content { padding: 24px 28px; overflow: auto; display: flex; flex-direction: column; gap: 20px; }
+  .page-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .page-head h1 { font-size: 20px; font-weight: 700; }
+  .page-head .sub { font-size: 13px; color: var(--muted); margin-top: 2px; }
+  .page-tabs { display: flex; gap: 4px; background: var(--bg-elev); border: 1px solid var(--line); border-radius: var(--radius); padding: 3px; }
+  .page-tab { padding: 5px 14px; border-radius: 7px; font-size: 12px; color: var(--muted); cursor: pointer; transition: background 0.15s, color 0.15s; border: none; background: transparent; }
+  .page-tab:hover { color: var(--text); }
+  .page-tab.active { background: var(--bg-active); color: var(--text); font-weight: 600; }
+  .card { background: var(--bg-elev); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .card-head h3 { font-size: 14px; font-weight: 600; }
+  .card-head .badge { font-size: 10px; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+  .badge-ok { background: var(--ok-soft); color: var(--ok); }
+  .badge-warn { background: var(--warn-soft); color: var(--warn); }
+  .badge-danger { background: var(--danger-soft); color: var(--danger); }
+  .badge-muted { background: var(--bg-active); color: var(--muted); }
+  .stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .stat { background: var(--bg-elev); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; }
+  .stat-top { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .stat-value { font-size: 24px; font-weight: 700; line-height: 1.2; }
+  .stat-value.accent { color: var(--accent); }
+  .stat-value.ok { color: var(--ok); }
+  .stat-value.warn { color: var(--warn); }
+  .stat-value.danger { color: var(--danger); }
+  .attention-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .attention-item { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--radius-sm); background: var(--warn-soft); border: 1px solid rgba(210, 153, 34, 0.2); }
+  .attention-item .icon { font-size: 16px; flex-shrink: 0; margin-top: 1px; }
+  .attention-item .text { font-size: 13px; line-height: 1.5; }
+  .attention-item .text strong { color: var(--warn); }
+  .attention-item .text .mono { font-size: 12px; color: var(--muted); }
+  .attention-item.danger { background: var(--danger-soft); border-color: rgba(248, 81, 73, 0.2); }
+  .attention-item.danger .text strong { color: var(--danger); }
+  .quick-actions { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+  .quick-action { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 14px 16px; border-radius: var(--radius); background: var(--bg-elev); border: 1px solid var(--line); cursor: pointer; transition: border-color 0.15s, background 0.15s; text-decoration: none; color: inherit; }
+  .quick-action:hover { border-color: var(--accent); background: var(--accent-soft); }
+  .quick-action .qa-icon { font-size: 20px; }
+  .quick-action .qa-label { font-size: 13px; font-weight: 600; }
+  .quick-action .qa-desc { font-size: 11px; color: var(--muted); }
+  .table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .table th { text-align: left; padding: 8px 10px; color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.3px; border-bottom: 1px solid var(--line); }
+  .table td { padding: 10px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .table tr:last-child td { border-bottom: none; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+  .muted { color: var(--muted); }
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 500; border: 1px solid var(--line); background: var(--bg-active); color: var(--text); cursor: pointer; transition: background 0.15s; }
+  .btn:hover { background: var(--bg); }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .btn-primary:hover { background: #79b8ff; }
+  .btn-danger { background: var(--danger); border-color: var(--danger); color: #fff; font-weight: 600; }
+  .btn-ghost { background: transparent; border-color: transparent; color: var(--muted); }
+  .btn-ghost:hover { background: var(--bg-active); color: var(--text); }
+  .input { background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 7px 10px; font-size: 13px; color: var(--text); width: 100%; }
+  .input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 12px; color: var(--muted); }
+  .diff { background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px 14px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; line-height: 1.7; white-space: pre-wrap; word-break: break-all; }
+  .diff .add { color: var(--ok); }
+  .diff .del { color: var(--danger); }
+  .event-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .event-row:last-child { border-bottom: none; }
+  .event-time { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .event-src { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .event-msg { flex: 1; }
+  .hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
+  .entry-list { list-style: none; padding: 0; }
+  .entry-list li { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .entry-list li:last-child { border-bottom: none; }
+  .entry-list .entry-path { font-size: 11px; color: var(--muted); }
+  @media (max-width: 768px) { .demo-shell { grid-template-columns: 1fr; } .sidebar { display: none; } }
+</style>
+</head>
+<body>
+<div class="demo-shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-icon">🔑</div>
+      <span>KeyRelay</span>
+    </div>
+    <div class="nav-section">
+      <div class="nav-section-label">日常</div>
+      <a class="nav-item active"><span>🏠</span> <span>总览</span> <span class="nav-badge">2</span></a>
+    </div>
+    <div class="nav-section">
+      <div class="nav-section-label">资产</div>
+      <a class="nav-item"><span>🌐</span> <span>站点</span></a>
+      <a class="nav-item"><span>🔑</span> <span>密钥</span></a>
+    </div>
+    <div class="nav-section">
+      <div class="nav-section-label">投递</div>
+      <a class="nav-item"><span>📤</span> <span>Agent 投递</span></a>
+      <a class="nav-item"><span>🕐</span> <span>变更历史</span></a>
+    </div>
+    <div class="nav-section">
+      <div class="nav-section-label">系统</div>
+      <a class="nav-item"><span>⚙️</span> <span>设置</span></a>
+    </div>
+    <div class="sidebar-footer">KeyRelay v0.6.0<br><span style="color:var(--ok);">●</span> 后端已连接</div>
+  </aside>
+  <main class="content">
+    <div class="page-head">
+      <div><h1>总览</h1><div class="sub">站点、密钥、投递与告警的统一视图</div></div>
+      <div class="page-tabs">
+        <button class="page-tab active">总览</button>
+        <button class="page-tab">Agent 投递</button>
+        <button class="page-tab">密钥</button>
+      </div>
+    </div>
+    <div class="stat-row">
+      <div class="stat"><div class="stat-top">🌐 站点</div><div class="stat-value">3</div></div>
+      <div class="stat"><div class="stat-top">🔑 密钥</div><div class="stat-value">7</div></div>
+      <div class="stat"><div class="stat-top">✅ 有效同意</div><div class="stat-value ok">4</div></div>
+      <div class="stat"><div class="stat-top">⚠️ 告警</div><div class="stat-value warn">2</div></div>
+      <div class="stat"><div class="stat-top">🔀 配置漂移</div><div class="stat-value danger">1</div></div>
+    </div>
+    <div class="attention-row">
+      <div class="attention-item danger">
+        <div class="icon">🔴</div>
+        <div class="text"><strong>1 个投递目标配置漂移</strong><br><span class="mono">codex · ~/.codex/auth.json</span><br><span class="muted" style="font-size:12px;">文件被外部改动，去「Agent 投递」重新投递或到「变更历史」回滚</span></div>
+      </div>
+      <div class="attention-item">
+        <div class="icon">🟡</div>
+        <div class="text"><strong>1 个站点需要重新登录</strong><br><span class="mono">api.example.com</span><br><span class="muted" style="font-size:12px;">会话已失效，刷新时会跳过该站点</span></div>
+      </div>
+    </div>
+    <div>
+      <h3 style="font-size:14px; font-weight:600; margin-bottom:10px;">快捷操作</h3>
+      <div class="quick-actions">
+        <a class="quick-action"><div class="qa-icon">📤</div><div class="qa-label">投递到 Agent</div><div class="qa-desc">把密钥写入 CLI 配置</div></a>
+        <a class="quick-action"><div class="qa-icon">🌐</div><div class="qa-label">添加站点</div><div class="qa-desc">识别中转站类型</div></a>
+        <a class="quick-action"><div class="qa-icon">🔑</div><div class="qa-label">新建密钥</div><div class="qa-desc">在站点上创建令牌</div></a>
+        <a class="quick-action"><div class="qa-icon">🔄</div><div class="qa-label">刷新全部站点</div><div class="qa-desc">同步余额与会话状态</div></a>
+        <a class="quick-action"><div class="qa-icon">🌐</div><div class="qa-label">启动本地网关</div><div class="qa-desc">统一入口、换站零改动</div></a>
+        <a class="quick-action"><div class="qa-icon">📥</div><div class="qa-label">导出配置</div><div class="qa-desc">备份站点与密钥元数据</div></a>
+      </div>
+    </div>
+    <hr class="hr">
+    <div class="card">
+      <div class="card-head"><h3>最近事件</h3><a class="btn-ghost" style="text-decoration:none; font-size:12px;">查看全部 →</a></div>
+      <div class="event-row"><span class="event-time">14:32</span><span class="badge badge-ok" style="font-size:10px; padding:1px 6px;">info</span><span class="event-src">delivery</span><span class="event-msg">已投递 <span class="mono">codex</span> → <span class="mono">~/.codex/auth.json</span></span></div>
+      <div class="event-row"><span class="event-time">14:28</span><span class="badge badge-warn" style="font-size:10px; padding:1px 6px;">warn</span><span class="event-src">drift</span><span class="event-msg">检测到外部改动：<span class="mono">~/.codex/auth.json</span></span></div>
+      <div class="event-row"><span class="event-time">13:15</span><span class="badge badge-ok" style="font-size:10px; padding:1px 6px;">info</span><span class="event-src">site</span><span class="event-msg">识别成功：<span class="mono">NewAPI v0.7</span></span></div>
+      <div class="event-row"><span class="event-time">12:03</span><span class="badge badge-ok" style="font-size:10px; padding:1px 6px;">info</span><span class="event-src">site</span><span class="event-msg">已登录：<span class="mono">api.example.com</span></span></div>
+    </div>
+  </main>
+</div>
+</body>
+</html>

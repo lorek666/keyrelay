@@ -164,17 +164,21 @@ impl<T: HttpTransport> NewApi<T> {
 
     /// 组装登录请求体：站点启用加密时发送密文（**不含明文 `password` 字段**），否则发送明文。
     async fn login_body(&self, base: &str, cred: &Credentials) -> Result<Value> {
+        // P3-21 / DEBUG-REPORT-v3 §3-21：username 前后空白会让上游 validator 必拒
+        //（用户看到 Go 英文 400）——请求体里 trim 掉。预检（B-120）校验形态但不
+        // trim，这里兜底。
+        let username = cred.username.trim();
         match self.fetch_encryption_key(base).await? {
             Some(key) => {
                 let password_encrypted = encrypt_password(&cred.password, &key)?;
                 Ok(json!({
-                    "username": cred.username,
+                    "username": username,
                     "password_encrypted": password_encrypted,
                     "encryption_key_id": key.kid,
                 }))
             }
             None => Ok(json!({
-                "username": cred.username,
+                "username": username,
                 "password": cred.password,
             })),
         }
