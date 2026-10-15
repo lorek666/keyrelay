@@ -2196,18 +2196,28 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             });
         };
         match self.revoke_key(plan.site_id, &remote_id).await {
-            // `Ok(_)` 里带的是 B-100 的回报；轮换这条路径只关心「站点侧确认删除了」
+            // `Ok(report)` 里带的是 B-100 的回报；轮换这条路径只关心「站点侧确认删除了」
             // （`Ok` 即已删除，本地状态写失败也仍是 `Ok`——理由见 `revoke_key` 的注释）。
-            Ok(_) => {
+            // P3-2 / DEBUG-REPORT-v3 §3-2：不丢弃 `local_status_updated`——站点侧已删
+            // 但本地没写成 revoked 时，不能报纯「已回收」，否则用户以为本地也清了，
+            // 而那把 key 在本地仍是 active，`sync_site_keys` 之前会被当成可用。
+            Ok(report) => {
+                let local_ok = report.local_status_updated;
+                let message = if local_ok {
+                    "轮换完成: 新密钥已全量注入，旧密钥已回收".to_string()
+                } else {
+                    "轮换完成: 新密钥已全量注入，旧密钥站点侧已删除，但本地状态未写成 revoked（对账交给 sync_site_keys）".to_string()
+                };
                 self.log(observability::event_with_payload(
                     Level::Info,
                     "key",
-                    "轮换完成: 新密钥已全量注入，旧密钥已回收",
+                    &message,
                     serde_json::json!({
                         "site_id": plan.site_id,
                         "old_key_id": key_id,
                         "new_key_id": new_key.id,
                         "reinjected": &reinjected,
+                        "local_status_updated": local_ok,
                     }),
                 ));
                 Ok(RotationRun {
@@ -2217,7 +2227,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                     // 本地那一行**刻意不删**：`bindings.key_id` 是 `ON DELETE CASCADE`，
                     // 删行会连带丢掉旧 key 的绑定与漂移追溯；对账交给 `sync_site_keys`。
                     stopped_at: None,
-                    stop_reason: None,
+                    stop_reason: if local_ok {
+                        None
+                    } else {
+                        Some("旧密钥站点侧已删除，但本地状态未写成 revoked".to_string())
+                    },
                 })
             }
             Err(err) => {
