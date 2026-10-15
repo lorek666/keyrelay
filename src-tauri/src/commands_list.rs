@@ -63,4 +63,10 @@ pub const COMMANDS: &[&str] = &[
     // M13-S1：Token 消耗统计
     "recent_gateway_usage",
     "recent_usage_snapshots",
+    // M14-S3：per-key 用量采样（Sub2API usage/daily）
+    "recent_key_usage",
+    // M14-S1：模型别名映射（B-110）
+    "list_alias_map",
+    "upsert_alias",
+    "delete_alias",
 ];

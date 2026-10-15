@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import UpdateChecker from "../components/UpdateChecker";
+import { I18nProvider } from "../i18n";
+import zhCN from "../i18n/zh-CN.json";
 
 vi.mock("../lib/api", () => ({
   checkForUpdates: vi.fn(),
@@ -12,8 +14,14 @@ import { checkForUpdates, downloadAndInstallUpdate } from "../lib/api";
 const mockedCheck = vi.mocked(checkForUpdates);
 const mockedInstall = vi.mocked(downloadAndInstallUpdate);
 
+// M14-S2：UpdateChecker 现在用 useTranslation，渲染时需包 I18nProvider。
+// 默认 zh-CN + 预加载字典，断言不变（spec §10 复审要点：既有断言仍绿）。
 function renderComponent() {
-  return render(<UpdateChecker />);
+  return render(
+    <I18nProvider lang="zh-CN" initialDict={zhCN}>
+      <UpdateChecker />
+    </I18nProvider>,
+  );
 }
 
 describe("UpdateChecker", () => {

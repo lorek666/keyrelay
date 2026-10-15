@@ -382,7 +382,7 @@ fn capabilities_match_the_frozen_table() {
         let caps = capabilities(kind);
         assert!(caps.login && caps.list_keys && caps.create_key);
         assert!(caps.reveal_key && caps.revoke_key && caps.balance && caps.groups);
-        // 用量今天取不到（B-96）
-        assert!(!caps.key_usage, "{} 的 key_usage 应为 false", kind.as_str());
+        // M14-S3：list_keys 带用量，key_usage=true（B-96 已接）
+        assert!(caps.key_usage, "{} 的 key_usage 应为 true", kind.as_str());
     }
 }

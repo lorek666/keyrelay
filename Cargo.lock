@@ -2414,6 +2414,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyrelay-cli"
+version = "0.1.0"
+dependencies = [
+ "keyrelay-core",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "keyrelay-core"
 version = "0.1.0"
 dependencies = [

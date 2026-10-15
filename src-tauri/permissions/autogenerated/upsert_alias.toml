@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-upsert-alias"
+description = "Enables the upsert_alias command without any pre-configured scope."
+commands.allow = ["upsert_alias"]
+
+[[permission]]
+identifier = "deny-upsert-alias"
+description = "Denies the upsert_alias command without any pre-configured scope."
+commands.deny = ["upsert_alias"]

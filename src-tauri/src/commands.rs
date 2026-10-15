@@ -133,6 +133,12 @@ pub struct KeyMetaDto {
     status: String,
     created_at: Option<i64>,
     last_used_at: Option<i64>,
+    /// M14-S3：当前累计已用（USD）。`None` = 站点未给 / 未采集。
+    quota_used: Option<f64>,
+    /// M14-S3：限额（USD）。`None` = 不限 / 未采集。
+    quota_limit: Option<f64>,
+    /// M14-S3：币种。
+    currency: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -307,6 +313,10 @@ pub struct SettingsDto {
     drift_check_on_start: bool,
     gateway_enabled: bool,
     gateway_port: u16,
+    // M14-S1：多站路由 + 模型采集（B-99）
+    gateway_multi_site: bool,
+    collect_models: bool,
+    models_min_interval_secs: u64,
     // ---- M6-S5：FR-9 界面与隐私 ----
     theme: String,
     language: String,
@@ -585,6 +595,9 @@ pub async fn list_keys(
                     status: key.status.as_str().to_string(),
                     created_at: key.created_at,
                     last_used_at: key.last_used_at,
+                    quota_used: key.quota_used,
+                    quota_limit: key.quota_limit,
+                    currency: key.currency,
                 })
                 .collect()
         })
@@ -864,6 +877,12 @@ pub struct StoredKeyRowDto {
     name: String,
     group: Option<String>,
     status: String,
+    /// M14-S3：当前累计已用（USD）。`None` = 未采集。
+    quota_used: Option<f64>,
+    /// M14-S3：限额（USD）。`None` = 不限 / 未采集。
+    quota_limit: Option<f64>,
+    /// M14-S3：币种。
+    currency: Option<String>,
 }
 
 /// 本地已存密钥（不含密钥本体）。
@@ -881,6 +900,9 @@ pub fn list_stored_keys(state: State<'_, AppState>) -> Result<Vec<StoredKeyRowDt
                     name: row.name,
                     group: row.group_name,
                     status: row.status,
+                    quota_used: row.quota_used,
+                    quota_limit: row.quota_limit,
+                    currency: row.currency,
                 })
                 .collect()
         })
@@ -961,6 +983,51 @@ pub fn recent_gateway_usage(
         .map_err(|e| e.to_string())
 }
 
+// ============================================ M14-S1：模型别名映射（B-110）
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AliasEntryDto {
+    pub alias: String,
+    pub real_model: String,
+}
+
+#[tauri::command]
+pub fn list_alias_map(state: State<'_, AppState>) -> Result<Vec<AliasEntryDto>, String> {
+    state
+        .service
+        .store()
+        .list_alias_map()
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(alias, real_model)| AliasEntryDto { alias, real_model })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn upsert_alias(
+    state: State<'_, AppState>,
+    alias: String,
+    real_model: String,
+) -> Result<(), String> {
+    state
+        .service
+        .store()
+        .upsert_alias(&alias, &real_model)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_alias(state: State<'_, AppState>, alias: String) -> Result<(), String> {
+    state
+        .service
+        .store()
+        .delete_alias(&alias)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn recent_usage_snapshots(
     state: State<'_, AppState>,
@@ -986,6 +1053,44 @@ pub fn recent_usage_snapshots(
         .map_err(|e| e.to_string())
 }
 
+/// M14-S3：一把 key 一天的用量采样（Sub2API `usage/daily`）。**不含密钥**。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyUsageSampleDto {
+    date: String,
+    requests: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+    cost: f64,
+}
+
+/// M14-S3：查一把 key 近 `days`（默认 30）天的 per-key 用量采样（PRD FR-3）。
+#[tauri::command]
+pub fn recent_key_usage(
+    state: State<'_, AppState>,
+    key_id: i64,
+    days: Option<i64>,
+) -> Result<Vec<KeyUsageSampleDto>, String> {
+    state
+        .service
+        .store()
+        .recent_key_usage(key_id, days.unwrap_or(30))
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| KeyUsageSampleDto {
+                    date: row.date,
+                    requests: row.requests,
+                    input_tokens: row.input_tokens,
+                    output_tokens: row.output_tokens,
+                    total_tokens: row.total_tokens,
+                    cost: row.cost,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
 // ============================================ 漂移 / 设置 / 刷新（M3-S1）
 
 fn settings_from_dto(dto: &SettingsDto) -> keyrelay_core::settings::Settings {
@@ -995,6 +1100,9 @@ fn settings_from_dto(dto: &SettingsDto) -> keyrelay_core::settings::Settings {
         drift_check_on_start: dto.drift_check_on_start,
         gateway_enabled: dto.gateway_enabled,
         gateway_port: dto.gateway_port,
+        gateway_multi_site: dto.gateway_multi_site,
+        collect_models: dto.collect_models,
+        models_min_interval_secs: dto.models_min_interval_secs,
         theme: dto.theme.clone(),
         language: dto.language.clone(),
         proxy_url: dto.proxy_url.clone(),
@@ -1019,6 +1127,9 @@ fn settings_to_dto(settings: &keyrelay_core::settings::Settings) -> SettingsDto 
         drift_check_on_start: settings.drift_check_on_start,
         gateway_enabled: settings.gateway_enabled,
         gateway_port: settings.gateway_port,
+        gateway_multi_site: settings.gateway_multi_site,
+        collect_models: settings.collect_models,
+        models_min_interval_secs: settings.models_min_interval_secs,
         theme: settings.theme.clone(),
         language: settings.language.clone(),
         proxy_url: settings.proxy_url.clone(),
@@ -2294,8 +2405,8 @@ mod tests {
         // M7-S5：能力集随站点类型下发，界面据此灰显（不得在页面里按 kind 硬编码）。
         assert_eq!(value["capabilities"]["listKeys"], true);
         assert_eq!(
-            value["capabilities"]["keyUsage"], false,
-            "用量取不到，见 B-96"
+            value["capabilities"]["keyUsage"], true,
+            "M14-S3：NewAPI list_keys 带 used_quota，key_usage=true"
         );
         // M9-S2 / B-120：登录账号栏的约定也随站点类型下发（NewAPI 是用户名）。
         assert_eq!(value["loginField"], "username");
@@ -2381,11 +2492,18 @@ mod tests {
             status: "enabled".into(),
             created_at: Some(1_700_000_000),
             last_used_at: None,
+            quota_used: Some(1.2),
+            quota_limit: Some(10.0),
+            currency: Some("USD".into()),
         };
         let value = to_value(&meta);
         assert_eq!(value["remoteId"], "12");
         assert_eq!(value["createdAt"], 1_700_000_000_i64);
         assert_eq!(value["lastUsedAt"], Value::Null);
+        // M14-S3：用量字段进 DTO（camelCase）。
+        assert_eq!(value["quotaUsed"], 1.2);
+        assert_eq!(value["quotaLimit"], 10.0);
+        assert_eq!(value["currency"], "USD");
 
         let balance = BalanceDto {
             currency: "USD".into(),

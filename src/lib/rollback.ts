@@ -1,3 +1,5 @@
+import { translate, getCurrentDict } from "../i18n";
+
 /**
  * 回滚成功之后必须告诉用户的事（M9-S4 复审 P2-1 / BACKLOG B-126）。
  *
@@ -9,14 +11,9 @@
  * 密钥上。这是 M3-S1 的既定语义（改不改由 B-126 决定）——在那之前，至少要把后果说全。
  *
  * 投递页与历史页两处回滚共用这一句：此前两处说法不一，投递页那处一个字都没提。
+ *
+ * M14-S2：文案抽成 i18n key `rollback.aftermath`（带 {agent} 插值）。
  */
 export function rollbackAftermath(agentId: string): string {
-  return (
-    `只要 ${agentId} 还绑着，「总览」就会一直把这个目标列为「需要处理」，每打开一次总览还会记一条「外部改动」告警——` +
-    "文件已经不是 KeyRelay 最后一次投递写入的内容，这是预期的，不要据此重新投递（那等于撤销这次回滚）；" +
-    "轮换这把密钥时，这个文件会被重新写入；批量改指网关时它也仍在候选里。" +
-    "如果这次回滚把文件还原成了更早一次投递写下的另一把密钥：之后轮换或回收那把密钥时，KeyRelay 不会重写这个文件，" +
-    "做完要回来给它投递一把仍然有效的密钥，否则 agent 会留在一把已被回收的密钥上。" +
-    `不想再让 KeyRelay 管它，到「Agent 投递」页解绑 ${agentId}。`
-  );
+  return translate(getCurrentDict(), "rollback.aftermath", { agent: agentId });
 }

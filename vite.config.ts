@@ -12,7 +12,7 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
-    target: "es2021",
+    target: "es2022",
   },
   test: {
     environment: "jsdom",

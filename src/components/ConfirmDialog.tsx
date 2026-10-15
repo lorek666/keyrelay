@@ -1,4 +1,5 @@
 import { useEffect, useRef, type ReactNode } from "react";
+import { useTranslation } from "../i18n";
 
 type Props = {
   open: boolean;
@@ -18,17 +19,20 @@ type Props = {
  *
  * 用原生 `<dialog>` 是为了白拿「焦点陷阱 + Esc 关闭」，避免自己实现出错。
  * 注意：**不做**任何密钥相关的处理，`children` 里的内容由调用方保证已脱敏。
+ *
+ * M14-S2：`title` / `confirmLabel` 由调用方传 `t(...)`；默认确认文案走 `confirm.confirm`。
  */
 export default function ConfirmDialog({
   open,
   title,
   danger = false,
-  confirmLabel = "确认",
+  confirmLabel,
   confirmDisabled = false,
   onCancel,
   onConfirm,
   children,
 }: Props) {
+  const { t } = useTranslation();
   const ref = useRef<HTMLDialogElement>(null);
 
   useEffect(() => {
@@ -55,7 +59,7 @@ export default function ConfirmDialog({
       <div className="dialog-body">{children}</div>
       <div className="dialog-actions">
         <button type="button" className="btn" onClick={onCancel}>
-          取消
+          {t("confirm.cancel")}
         </button>
         <button
           type="button"
@@ -63,7 +67,7 @@ export default function ConfirmDialog({
           disabled={confirmDisabled}
           onClick={onConfirm}
         >
-          {confirmLabel}
+          {confirmLabel ?? t("confirm.confirm")}
         </button>
       </div>
     </dialog>

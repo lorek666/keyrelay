@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delete-alias"
+description = "Enables the delete_alias command without any pre-configured scope."
+commands.allow = ["delete_alias"]
+
+[[permission]]
+identifier = "deny-delete-alias"
+description = "Denies the delete_alias command without any pre-configured scope."
+commands.deny = ["delete_alias"]

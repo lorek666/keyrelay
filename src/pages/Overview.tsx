@@ -13,8 +13,10 @@ import {
   refreshAll,
   runtimeMode,
 } from "../lib/api";
+import { useTranslation } from "../i18n";
 
 export default function Overview() {
+  const { t } = useTranslation();
   const info = useQuery({ queryKey: ["app-info"], queryFn: appInfo });
   const sites = useQuery({ queryKey: ["sites"], queryFn: listSites });
   const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
@@ -55,47 +57,49 @@ export default function Overview() {
       <div className="cards">
         <Stat
           icon={<Server size={16} aria-hidden />}
-          label="站点"
+          label={t("overview.stat.sites")}
           value={sites.data?.length ?? "—"}
         />
         <Stat
           icon={<KeyRound size={16} aria-hidden />}
-          label="本地密钥"
+          label={t("overview.stat.keys")}
           value={keys.data?.length ?? "—"}
         />
         <Stat
           icon={<ShieldCheck size={16} aria-hidden />}
-          label="有效同意"
+          label={t("overview.stat.consents")}
           value={consents.data?.filter((c) => !c.revokedAt).length ?? "—"}
         />
         <Stat
           icon={<AlertTriangle size={16} aria-hidden />}
-          label="告警事件"
+          label={t("overview.stat.alerts")}
           value={warnings.length}
         />
         <Stat
           icon={<ShieldCheck size={16} aria-hidden />}
-          label="配置漂移"
+          label={t("overview.stat.drift")}
           value={drifted.length}
         />
       </div>
 
       <div className="card">
-        <h3>运行状态</h3>
+        <h3>{t("overview.runState.title")}</h3>
         <dl className="kv">
-          <dt>运行模式</dt>
+          <dt>{t("overview.runState.mode")}</dt>
           <dd className="mono">
-            {runtimeMode === "tauri" ? "Tauri（已连接后端）" : "浏览器预览（未连接后端）"}
+            {runtimeMode === "tauri"
+              ? t("overview.runState.modeTauri")
+              : t("overview.runState.modeBrowser")}
           </dd>
-          <dt>本地数据库</dt>
+          <dt>{t("overview.runState.db")}</dt>
           <dd className="mono ellipsis" title={info.data?.dbPath}>
             {info.data?.dbPath ?? "…"}
           </dd>
-          <dt>版本</dt>
+          <dt>{t("overview.runState.version")}</dt>
           <dd className="mono">
             {info.data ? `${info.data.name} ${info.data.version}` : "…"}
           </dd>
-          <dt>系统钥匙串</dt>
+          <dt>{t("overview.runState.vault")}</dt>
           <dd className="mono">{info.data?.vaultBackend ?? "…"}</dd>
         </dl>
 
@@ -105,17 +109,20 @@ export default function Overview() {
           disabled={refresh.isPending}
           onClick={() => refresh.mutate()}
         >
-          {refresh.isPending ? "刷新中…" : "立即刷新全部站点"}
+          {refresh.isPending ? t("overview.btn.refreshing") : t("overview.btn.refreshNow")}
         </button>
         {refresh.data ? (
           <p className="muted">
-            成功 {refresh.data.sitesOk} / 失败 {refresh.data.sitesFailed} /
-            密钥 {refresh.data.keysTotal}
+            {t("overview.refreshResult.base", {
+              ok: refresh.data.sitesOk,
+              failed: refresh.data.sitesFailed,
+              keys: refresh.data.keysTotal,
+            })}
             {refresh.data.balanceAlerts.length
-              ? ` / 余额告警 ${refresh.data.balanceAlerts.length} 个站点`
+              ? t("overview.refreshResult.balanceAlerts", { count: refresh.data.balanceAlerts.length })
               : ""}
             {refresh.data.needsLogin.length
-              ? ` / 需要重新登录 ${refresh.data.needsLogin.length} 个站点`
+              ? t("overview.refreshResult.needsLogin", { count: refresh.data.needsLogin.length })
               : ""}
           </p>
         ) : null}
@@ -124,21 +131,22 @@ export default function Overview() {
             「失败」看不出差别，用户会以为刷新成功了。 */}
         {refresh.isError ? (
           <p className="error" role="alert">
-            <AlertTriangle size={14} aria-hidden /> 刷新失败：{refresh.error.message}
+            <AlertTriangle size={14} aria-hidden /> {t("overview.error.refreshFailed", { error: refresh.error.message })}
           </p>
         ) : null}
 
         {info.data?.vaultBackend === "memory" ? (
           <p className="error" role="alert">
-            <AlertTriangle size={14} aria-hidden /> 当前用的是内存钥匙串：
-            密钥不会进系统钥匙串，进程退出即丢失。真实运行里出现这个后端即为缺陷。
+            <AlertTriangle size={14} aria-hidden /> {t("overview.error.memoryVaultPre")}
+            {t("overview.error.memoryVaultPost")}
           </p>
         ) : null}
 
         {runtimeMode === "browser" ? (
           <p className="warn" role="status">
-            当前是浏览器预览模式：所有数据都是示例，写操作不会生效。
-            要连真实后端请用 <span className="mono">pnpm tauri dev</span>。
+            {t("overview.warn.browserPreviewPre")}
+            <span className="mono">pnpm tauri dev</span>
+            {t("overview.warn.browserPreviewPost")}
           </p>
         ) : null}
       </div>
@@ -146,7 +154,7 @@ export default function Overview() {
       {needsLogin.length ? (
         <div className="card">
           <h3>
-            <AlertTriangle size={15} aria-hidden /> 需要重新登录（{needsLogin.length}）
+            <AlertTriangle size={15} aria-hidden /> {t("overview.needsLogin.title", { count: needsLogin.length })}
           </h3>
           <ul className="list">
             {needsLogin.map((s) => (
@@ -158,17 +166,14 @@ export default function Overview() {
               </li>
             ))}
           </ul>
-          <p className="muted">
-            这些站点的会话已经失效，刷新时会被跳过——既不算成功也不算失败，
-            所以不会出现在上面的「失败」计数里。请到「站点」页重新登录。
-          </p>
+          <p className="muted">{t("overview.needsLogin.hint")}</p>
         </div>
       ) : null}
 
       {drifted.length ? (
         <div className="card">
           <h3>
-            <AlertTriangle size={15} aria-hidden /> 投递目标需要处理（{drifted.length}）
+            <AlertTriangle size={15} aria-hidden /> {t("overview.drift.title", { count: drifted.length })}
           </h3>
           <ul className="list">
             {drifted.map((r) => (
@@ -182,23 +187,25 @@ export default function Overview() {
             ))}
           </ul>
           <p className="muted">
-            KeyRelay 不会自动覆盖外部改动。要恢复请到「Agent 投递」页重新投递。
-            被删掉的目标（<span className="mono">missing</span>）也可以到「变更历史」页回滚那次投递，
-            恢复成投递之前的内容；被外部改过的（<span className="mono">modified</span>）回滚会被拒绝——
-            回滚不会覆盖别人的改动。
+            {t("overview.drift.hint1Pre")}
+            <span className="mono">missing</span>
+            {t("overview.drift.hint1Mid")}
+            <span className="mono">modified</span>
+            {t("overview.drift.hint1Post")}
           </p>
           {/* 回滚只还原文件、不动绑定 ⇒ 用户自己回滚过的目标也会被报在这里（M3-S1 既定语义，B-126）。
               不说这一句，上面「重新投递」那条会把用户引去撤销他刚做的回滚（复审 P2-1）。 */}
           <p className="muted">
-            <strong>你自己回滚过的目标也会出现在这里</strong>：回滚后文件不再是 KeyRelay
-            最后一次投递写入的内容，漂移检测照样会报（「变更历史」页里对应那一行标着「已回滚」）。
-            这种情况不要重新投递——那等于撤销回滚；不想再让 KeyRelay 管它，到「Agent 投递」页解绑对应的 agent。
+            <strong>{t("overview.drift.hint2Pre")}</strong>
+            {t("overview.drift.hint2Post")}
           </p>
           {hasUnreadable ? (
             <p className="muted">
-              标记为 <span className="mono">unreadable</span> 的目标
-              <strong>文件还在</strong>，只是读不到（权限或路径类型问题）。
-              这不是「被删了」——请先检查文件权限，不要直接重新投递。
+              {t("overview.drift.hint3Pre")}
+              <span className="mono">unreadable</span>
+              {t("overview.drift.hint3Mid1")}
+              <strong>{t("overview.drift.hint3Mid2")}</strong>
+              {t("overview.drift.hint3Post")}
             </p>
           ) : null}
         </div>
@@ -206,7 +213,7 @@ export default function Overview() {
 
       {warnings.length ? (
         <div className="card">
-          <h3>最近告警</h3>
+          <h3>{t("overview.alerts.title")}</h3>
           <ul className="list">
             {warnings.slice(0, 5).map((row) => (
               <li key={row.id}>
@@ -221,9 +228,11 @@ export default function Overview() {
       ) : null}
       {gatewayUsage.data?.length || usageSnapshots.data?.length ? (
         <div className="card">
-          <h3>Token 消耗</h3>
+          <h3>{t("overview.usage.title")}</h3>
           {(() => {
-            const siteName = (id: number) => sites.data?.find((s) => s.id === id)?.displayName ?? `站点${id}`;
+            const siteName = (id: number) =>
+              sites.data?.find((s) => s.id === id)?.displayName ??
+              t("overview.usage.siteFallback", { id });
             const usageBySite = new Map<number, { prompt: number; completion: number; total: number }>();
             for (const row of gatewayUsage.data ?? []) {
               const cur = usageBySite.get(row.siteId) ?? { prompt: 0, completion: 0, total: 0 };
@@ -236,13 +245,17 @@ export default function Overview() {
               <>
                 {gatewayUsage.data?.length ? (
                   <dl className="kv">
-                    <dt>网关转发（24h）</dt>
+                    <dt>{t("overview.usage.gateway24h")}</dt>
                     <dd className="mono">
                       {Array.from(usageBySite.entries()).map(([siteId, v], i) => (
                         <span key={siteId}>
-                          {i > 0 ? ' / ' : ''}
-                          {siteName(siteId)}: {v.total.toLocaleString()} tokens
-                          （输入 {v.prompt.toLocaleString()} / 输出 {v.completion.toLocaleString()}）
+                          {i > 0 ? " / " : ""}
+                          {t("overview.usage.tokens", {
+                            site: siteName(siteId),
+                            total: v.total.toLocaleString(),
+                            prompt: v.prompt.toLocaleString(),
+                            completion: v.completion.toLocaleString(),
+                          })}
                         </span>
                       ))}
                     </dd>
@@ -250,7 +263,7 @@ export default function Overview() {
                 ) : null}
                 {usageSnapshots.data?.length ? (
                   <dl className="kv">
-                    <dt>站点余额（7天快照）</dt>
+                    <dt>{t("overview.usage.snapshot7d")}</dt>
                     <dd className="mono">
                       {(() => {
                         const bySite = new Map<number, typeof usageSnapshots.data>();
@@ -264,10 +277,19 @@ export default function Overview() {
                           const delta = prev ? latest.used - prev.used : null;
                           return (
                             <span key={siteId}>
-                              {i > 0 ? ' / ' : ''}
-                              {siteName(siteId)}: 已用 {latest.used.toFixed(2)} {latest.currency}
-                              / 剩余 {latest.remaining.toFixed(2)}
-                              {delta !== null ? `（${delta > 0 ? "+" : ""}${delta.toFixed(2)}）` : ""}
+                              {i > 0 ? " / " : ""}
+                              {t("overview.usage.balance", {
+                                site: siteName(siteId),
+                                used: latest.used.toFixed(2),
+                                currency: latest.currency,
+                                remaining: latest.remaining.toFixed(2),
+                                delta:
+                                  delta !== null
+                                    ? t("overview.usage.delta", {
+                                        delta: `${delta > 0 ? "+" : ""}${delta.toFixed(2)}`,
+                                      })
+                                    : "",
+                              })}
                             </span>
                           );
                         });

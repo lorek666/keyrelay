@@ -9,6 +9,8 @@
  * - 本文件不缓存、不持久化任何密钥；后端返回的 `secret` 只做一次性透传。
  */
 
+import { translate, getCurrentDict } from "../i18n";
+
 /**
  * 站点类型的**设计能力**（M7-S2 的 `site/capability.rs`，IPC 上是 `SiteSummary.capabilities`）。
  *
@@ -92,6 +94,12 @@ export type KeyRow = {
   status: string;
   createdAt?: number | null;
   lastUsedAt?: number | null;
+  /** M14-S3：当前累计已用（USD）。`null` = 站点未给 / 未采集。**不得**渲染成 `0.00`。 */
+  quotaUsed?: number | null;
+  /** M14-S3：限额（USD）。`null` = 不限 / 未采集。 */
+  quotaLimit?: number | null;
+  /** M14-S3：币种（`"USD"`）。 */
+  currency?: string | null;
 };
 
 /** 新建密钥的返回值。`secret` 是**明文**，只允许一次性透传给投递流程，不渲染、不落任何存储。 */
@@ -119,6 +127,12 @@ export type StoredKeyRow = {
    * 站点侧那把 key 已经没了。用 `disabled` 冒充会让界面分不清「站点禁的」与「我回收的」。
    */
   status: string;
+  /** M14-S3：当前累计已用（USD）。`null` = 未采集。**不得**渲染成 `0.00`。 */
+  quotaUsed?: number | null;
+  /** M14-S3：限额（USD）。`null` = 不限 / 未采集。 */
+  quotaLimit?: number | null;
+  /** M14-S3：币种（`"USD"`）。 */
+  currency?: string | null;
 };
 
 /**
@@ -246,6 +260,12 @@ export type Settings = {
   gatewayEnabled: boolean;
   /** 网关端口（只绑 127.0.0.1） */
   gatewayPort: number;
+  /** M14-S1：多站路由开关（默认关，保住换站语义）。 */
+  gatewayMultiSite: boolean;
+  /** M14-S1：模型清单采集开关（默认关）。 */
+  collectModels: boolean;
+  /** M14-S1：模型采集最小间隔秒（默认 1800 = 30min）。 */
+  modelsMinIntervalSecs: number;
   // ---- M6-S5：FR-9 界面与隐私 ----
   /** "system" | "light" | "dark" */
   theme: string;
@@ -436,7 +456,8 @@ const MOCK_CAPS_LOGINABLE: SiteCapabilities = {
   revokeKey: true,
   balance: true,
   groups: true,
-  keyUsage: false,
+  // M14-S3：NewAPI/Sub2API 的 key_usage 从 false 改 true（list_keys 带用量）。
+  keyUsage: true,
 };
 
 /**
@@ -453,7 +474,7 @@ const MOCK_SITES: SiteRow[] = [
     id: 1,
     kind: "newapi",
     baseUrl: "https://relay.example.com",
-    displayName: "示例中转站（mock·用户名登录）",
+    displayName: "示例中转站（mock·用户名登录）",  // i18n:skip
     health: "unknown",
     loginField: "username",
     capabilities: MOCK_CAPS_LOGINABLE,
@@ -462,7 +483,7 @@ const MOCK_SITES: SiteRow[] = [
     id: 2,
     kind: "sub2api",
     baseUrl: "https://api.example.com",
-    displayName: "示例 Sub2API（mock·邮箱登录）",
+    displayName: "示例 Sub2API（mock·邮箱登录）",  // i18n:skip
     health: "unknown",
     loginField: "email",
     capabilities: MOCK_CAPS_LOGINABLE,
@@ -471,7 +492,7 @@ const MOCK_SITES: SiteRow[] = [
     id: 3,
     kind: "custom-openai-compatible",
     baseUrl: "https://compatible.example.com",
-    displayName: "只读兼容端点（mock·无令牌管理）",
+    displayName: "只读兼容端点（mock·无令牌管理）",  // i18n:skip
     health: "unknown",
     loginField: null,
     capabilities: {
@@ -490,7 +511,7 @@ const MOCK_SITES: SiteRow[] = [
 const MOCK_INFO: AppInfo = {
   name: "KeyRelay",
   version: "0.1.0-dev",
-  dbPath: "（浏览器预览模式，无本地数据库）",
+  dbPath: "（浏览器预览模式，无本地数据库）",  // i18n:skip
   siteCount: MOCK_SITES.length,
   dbError: null,
   vaultBackend: "memory",
@@ -506,6 +527,10 @@ const MOCK_KEYS: KeyRow[] = [
     status: "enabled",
     createdAt: 1_760_000_000,
     lastUsedAt: null,
+    // M14-S3：mock 用量数据（让浏览器预览能看到用量列）。
+    quotaUsed: 1.23,
+    quotaLimit: 10.0,
+    currency: "USD",
   },
 ];
 
@@ -534,7 +559,7 @@ const MOCK_EVENTS: EventRow[] = [
     ts: 1_760_000_300,
     level: "info",
     source: "delivery",
-    message: "投递完成: codex-auth-json",
+    message: "投递完成: codex-auth-json",  // i18n:skip
     payload: '{"journal_id":"j1-0","target_path":"/Users/you/.codex/auth.json"}',
   },
   {
@@ -542,7 +567,7 @@ const MOCK_EVENTS: EventRow[] = [
     ts: 1_760_000_200,
     level: "info",
     source: "delivery",
-    message: "已授予投递同意",
+    message: "已授予投递同意",  // i18n:skip
     payload: '{"agent_id":"codex","channel":"codex-auth-json"}',
   },
   {
@@ -550,7 +575,7 @@ const MOCK_EVENTS: EventRow[] = [
     ts: 1_760_000_100,
     level: "info",
     source: "site",
-    message: "站点已识别: newapi 示例中转站（mock）",
+    message: "站点已识别: newapi 示例中转站（mock）",  // i18n:skip
     payload: '{"site_id":1,"version":"v0.0.0-mock"}',
   },
 ];
@@ -571,7 +596,7 @@ export async function listSites(): Promise<SiteRow[]> {
 
 export async function detectSite(baseUrl: string): Promise<SiteFingerprint> {
   if (!hasTauri) {
-    return mock({ kind: "newapi", displayName: "示例中转站（mock）", version: "v0.0.0-mock" });
+    return mock({ kind: "newapi", displayName: "示例中转站（mock）", version: "v0.0.0-mock" });  // i18n:skip
   }
   return invokeCommand<SiteFingerprint>("detect_site", { baseUrl });
 }
@@ -627,7 +652,7 @@ export async function captchaCancel(siteId: number): Promise<void> {
  * 转成 `Error(message)`，这里只看 message）。
  */
 export function isCaptchaRequired(err: unknown): boolean {
-  return err instanceof Error && err.message.includes("需要人工完成验证码");
+  return err instanceof Error && err.message.includes("需要人工完成验证码");  // i18n:skip
 }
 
 /**
@@ -643,7 +668,7 @@ export function isCaptchaRequired(err: unknown): boolean {
  */
 export function isAuthError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
-  return err.message.includes("认证失败") || isCaptchaRequired(err);
+  return err.message.includes("认证失败") || isCaptchaRequired(err);  // i18n:skip
 }
 
 export async function listKeys(siteId: number): Promise<KeyRow[]> {
@@ -777,7 +802,7 @@ export async function listChannelBindings(): Promise<ChannelBinding[]> {
  * **为什么不需要按文件名二分**（定稿时按独立复审 P3-1 简化）：后端
  * `DeliveryChannel::agent_id()` 是**注入的**（7 条通道 → 7 个不同 agent 名，
  * `delivery/mod.rs` 有测试专门钉「agent_id 不重复」），而 `bindings.agent_id`
- > 写的就是 `channel.agent_id()`。所以本产品写下的行里，
+ > 写的就是 `channel.agent_id()`。所以本产品写下的行里，  // i18n:skip
  * `agent_id == "opencode"` 时目标一定是 `opencode.json`——给它配第二条
  * `opencode-jsonc` 候选是死逻辑（M8-S7 第一版那么写了，评审抓出）。
  *
@@ -951,6 +976,53 @@ export async function recentUsageSnapshots(hours = 168): Promise<UsageSnapshotRo
   return invokeCommand<UsageSnapshotRow[]>("recent_usage_snapshots", { hours });
 }
 
+/**
+ * 一把 key 一天的用量采样（M14-S3，Sub2API `usage/daily`）。**不含密钥**。
+ *
+ * 字段名与后端 `KeyUsageSampleDto`（camelCase）一致：`inputTokens` / `outputTokens`
+ *（非 `tokensIn` / `tokensOut`——见 spec §11 差异②）。
+ */
+export type KeyUsageSample = {
+  date: string;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cost: number;
+};
+
+/**
+ * 查一把 key 近 `days`（默认 30）天的 per-key 用量采样（M14-S3 / PRD FR-3）。
+ *
+ * NewAPI 站点无日趋势端点 ⇒ 返回空数组（NewAPI 只取当前累计 `quotaUsed`，不写 `usage_samples`）。
+ * Sub2API 站点返回 `usage/daily` 的 30 天每日采样。
+ */
+export async function recentKeyUsage(
+  keyId: number,
+  days = 30,
+): Promise<KeyUsageSample[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<KeyUsageSample[]>("recent_key_usage", { keyId, days });
+}
+
+/** M14-S1：模型别名映射（B-110）—— agent 侧模型名 → 真实模型名。 */
+export type AliasEntry = { alias: string; realModel: string };
+
+export async function listAliasMap(): Promise<AliasEntry[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<AliasEntry[]>("list_alias_map");
+}
+
+export async function upsertAlias(alias: string, realModel: string): Promise<void> {
+  if (!hasTauri) return;
+  return invokeCommand<void>("upsert_alias", { alias, realModel });
+}
+
+export async function deleteAlias(alias: string): Promise<void> {
+  if (!hasTauri) return;
+  return invokeCommand<void>("delete_alias", { alias });
+}
+
 export async function recentEvents(limit = 100): Promise<EventRow[]> {
   if (!hasTauri) return mock(MOCK_EVENTS);
   return invokeCommand<EventRow[]>("recent_events", { limit });
@@ -978,7 +1050,7 @@ export async function gatewayStart(
       running: true,
       url: "http://127.0.0.1:8787",
       token: "kr-gw-mock0000000000000000000000000",
-      site: "示例中转站（mock）",
+      site: "示例中转站（mock）",  // i18n:skip
       tokenPersistent: true,
     });
   }
@@ -1049,7 +1121,7 @@ export async function auditRedaction(): Promise<AuditReport> {
       bytesScanned: 123456,
       clean: true,
       findings: [],
-      summary: "已扫描 3 个文件 / 123456 字节，未发现明文凭证",
+      summary: "已扫描 3 个文件 / 123456 字节，未发现明文凭证",  // i18n:skip
     });
   }
   return invokeCommand<AuditReport>("audit_redaction");
@@ -1087,6 +1159,9 @@ let mockSettings: Settings = {
   driftCheckOnStart: true,
   gatewayEnabled: false,
   gatewayPort: 8787,
+  gatewayMultiSite: false,
+  collectModels: false,
+  modelsMinIntervalSecs: 1800,
   theme: "system",
   language: "zh-CN",
   proxyUrl: "",
@@ -1157,7 +1232,7 @@ export async function availableGroups(siteId: number): Promise<Group[]> {
   if (!hasTauri) {
     return mock([
       { name: "default", rate: 1, description: null },
-      { name: "vip", rate: 0.5, description: "折扣分组" },
+      { name: "vip", rate: 0.5, description: "折扣分组" },  // i18n:skip
     ]);
   }
   return invokeCommand<Group[]>("available_groups", { siteId });
@@ -1404,7 +1479,7 @@ export async function detectUnmanagedTargets(): Promise<UnmanagedTarget[]> {
         label: "Cline",
         path: "/Users/u/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev",
         exists: false,
-        note: "本版本不向 Cline 写入：它的配置落点尚未核实，写错文件会让你以为投递成功。",
+        note: "本版本不向 Cline 写入：它的配置落点尚未核实，写错文件会让你以为投递成功。",  // i18n:skip
       },
     ]);
   }
@@ -1457,7 +1532,7 @@ export async function suggestKeyName(
  * 那会让用户按错误的成本预期选分组，而选错分组的代价是真实的钱。
  */
 export function formatGroupRate(rate: number | null): string {
-  if (rate === null || !Number.isFinite(rate) || rate <= 0) return "倍率未知";
+  if (rate === null || !Number.isFinite(rate) || rate <= 0) return translate(getCurrentDict(), "common.rateUnknown");
   return `${rate}×`;
 }
 
@@ -1481,7 +1556,7 @@ export async function setAutostart(enabled: boolean): Promise<Autostart> {
   if (!hasTauri) {
     return mock({
       state: (enabled ? "enabled" : "disabled") as AutostartState,
-      plan: enabled ? "新建 ~/Library/LaunchAgents/keyrelay-autostart.plist" : "删除自启项",
+      plan: enabled ? "新建 ~/Library/LaunchAgents/keyrelay-autostart.plist" : "删除自启项",  // i18n:skip
       manualAction: null,
     });
   }
@@ -1536,7 +1611,7 @@ export async function downloadAndInstallUpdate(): Promise<void> {
   const { check } = await import("@tauri-apps/plugin-updater");
   const result = await check();
   if (!result) {
-    throw new Error("没有可用的更新");
+    throw new Error(translate(getCurrentDict(), "common.noUpdate"));
   }
   await result.downloadAndInstall();
 }

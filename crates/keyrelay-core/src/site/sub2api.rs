@@ -22,8 +22,8 @@ use serde_json::{json, Value};
 use super::transport::{HttpRequest, HttpTransport, Method};
 use super::{
     json_str, map_http_error, normalize_base_url, parse_rate, scrub_error, Balance, Credentials,
-    GroupInfo, KeyMaterial, KeyMeta, KeySpec, KeyStatus, Session, SiteAdapter, SiteFingerprint,
-    SiteKind,
+    GroupInfo, KeyDailyUsage, KeyMaterial, KeyMeta, KeySpec, KeyStatus, Session, SiteAdapter,
+    SiteFingerprint, SiteKind,
 };
 use crate::error::{Error, Result, SecondFactorKind};
 
@@ -403,6 +403,15 @@ fn key_meta_from(item: &Value) -> Option<KeyMeta> {
         Some(Value::String(s)) if !s.is_empty() => s.clone(),
         _ => return None,
     };
+    // M14-S3：Sub2API `list_keys` 列表项含 `quota`（限额）/ `quota_used`（已用）（M9-S6 §2）。
+    // 单位 USD（与 `balance()` 实测一致）。缺字段 ⇒ `None`（不写 0）。
+    let quota_used = item.get("quota_used").and_then(|v| v.as_f64());
+    let quota_limit = item.get("quota").and_then(|v| v.as_f64());
+    let currency = if quota_used.is_some() || quota_limit.is_some() {
+        Some("USD".to_string())
+    } else {
+        None
+    };
     Some(KeyMeta {
         remote_id,
         name: json_str(item, "/name").unwrap_or_default().to_string(),
@@ -413,6 +422,9 @@ fn key_meta_from(item: &Value) -> Option<KeyMeta> {
         status: map_status(item.get("status")),
         created_at: parse_rfc3339_secs(item.get("created_at")),
         last_used_at: parse_rfc3339_secs(item.get("last_used_at")),
+        quota_used,
+        quota_limit,
+        currency,
     })
 }
 
@@ -823,6 +835,65 @@ impl<T: HttpTransport + 'static> SiteAdapter for Sub2Api<T> {
         }
         Ok(out)
     }
+
+    /// M14-S3 / PRD FR-3：`GET /api/v1/user/api-keys/:id/usage/daily?days=30`。
+    ///
+    /// 返回 items 元素（`APIKeyDailyUsagePoint`，源码 `usage_log_types.go:210`）解析成的
+    /// [`KeyDailyUsage`] 列表。`items` 为空（新建 key 无用量）⇒ 空 `Vec`，不报错。
+    ///
+    /// 节流：本方法只负责**单把 key 一次请求**；每轮调不调、并发上限、失败如何处理由
+    /// `service::refresh_site` 决定（spec §7.4：每 key 每轮一次、并发 ≤ 2、失败静默）。
+    async fn fetch_key_daily_usage(
+        &self,
+        base_url: &str,
+        session: &Session,
+        remote_id: &str,
+    ) -> Result<Vec<KeyDailyUsage>> {
+        let base = normalize_base_url(base_url);
+        let id = safe_path_segment(remote_id)?;
+        let url = format!("{base}/api/v1/user/api-keys/{id}/usage/daily?days=30");
+        let resp = self
+            .transport
+            .request(Self::request(Method::Get, url, session))
+            .await?;
+        if resp.status != 200 {
+            return Err(map_http_error(
+                resp.status,
+                &resp.body,
+                resp.retry_after_secs(),
+            ));
+        }
+        let data = Self::unwrap_data(&resp, "拉取 key 用量")?;
+        // items 在 data 顶层（handler `response.Success(c, gin.H{"items": items, ...})`，
+        // M9-S6 实测一致）。`items` 缺失或非数组 ⇒ 空 `Vec`（不报错：新建 key 本就无用量）。
+        let items = data.get("items").and_then(|v| v.as_array());
+        let mut out: Vec<KeyDailyUsage> = Vec::new();
+        if let Some(items) = items {
+            for item in items {
+                // 字段名按 Sub2API 源码 `APIKeyDailyUsagePoint`：`input_tokens` / `output_tokens`
+                //（非任务描述的 `tokens_in` / `tokens_out`——spec §11 差异②）。
+                // 缺字段的条目用 0 兜底，不跳过（一条里缺 cost 不该丢掉它的 tokens）。
+                out.push(KeyDailyUsage {
+                    date: json_str(item, "/date").unwrap_or_default().to_string(),
+                    requests: item.get("requests").and_then(|v| v.as_i64()).unwrap_or(0),
+                    input_tokens: item
+                        .get("input_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                    output_tokens: item
+                        .get("output_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                    total_tokens: item
+                        .get("total_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                    cost: item.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                });
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// 从登录响应的 `data` 里取出会话。Sub2API 用 `Authorization: Bearer`，不用 Cookie。
@@ -895,20 +966,33 @@ mod tests {
             "created_at": "2026-07-27T05:03:01.628Z",
             "last_used_at": null,
             "quota": 10.0,
+            "quota_used": 2.5,
         });
         let meta = key_meta_from(&item).expect("应能解析");
         assert_eq!(meta.remote_id, "12");
         assert_eq!(meta.name, "codex/daily");
         assert_eq!(meta.group.as_deref(), Some("3"));
         assert_eq!(meta.status, KeyStatus::Enabled);
+        // M14-S3：quota / quota_used 解析进 KeyMeta（USD）。
+        assert_eq!(meta.quota_used, Some(2.5));
+        assert_eq!(meta.quota_limit, Some(10.0));
+        assert_eq!(meta.currency.as_deref(), Some("USD"));
 
         let text = format!("{meta:?}");
         assert!(!text.contains("sk-SUB2API"), "KeyMeta 泄漏明文: {text}");
         // 用「序列化等价物」代替：`KeyMeta` 本身不实现 Serialize（它不该出现在线上契约里），
-        // 这里逐字段拼一遍，确认没有任何字段携带明文。
+        // 这里逐字段拼一遍，确认没有任何字段携带明文（含 M14-S3 新增的用量字段）。
         let flattened = format!(
-            "{}{}{:?}{:?}{:?}{:?}",
-            meta.remote_id, meta.name, meta.group, meta.status, meta.created_at, meta.last_used_at
+            "{}{}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            meta.remote_id,
+            meta.name,
+            meta.group,
+            meta.status,
+            meta.created_at,
+            meta.last_used_at,
+            meta.quota_used,
+            meta.quota_limit,
+            meta.currency,
         );
         assert!(!flattened.contains("sk-SUB2API"), "{flattened}");
     }

@@ -1,0 +1,500 @@
+//! `mock-agent` 子命令：只读解析注入产物，校验密钥字段在（mock 首 token）。
+//!
+//! **只读**：不写、不创建文件、不联网。按通道分流（11 通道，M14-S1 起）：
+//! - JSON 通道（codex / claude-code / opencode(-jsonc) / claude-desktop / pi）：`serde_json` 解析后定位密钥字段；
+//! - dotenv 通道（gemini-cli）：行级扫描 `GEMINI_API_KEY=`；
+//! - TOML 通道（grok-build）：行级扫描 `[models.custom]` 段内 `api_key =`；
+//! - 标记块通道（openclaw / hermes / mcode）：定位受管块后校验密钥行。
+//!
+//! 退出码：0 字段在 / 1 字段缺失 / 2 文件不存在或解析失败。
+
+use std::path::{Path, PathBuf};
+
+use keyrelay_core::delivery::{hermes, mcode, openclaw, DeliveryChannel};
+
+/// mock 校验结论。`main` 据此映射退出码。
+#[derive(Debug)]
+pub enum MockOutcome {
+    /// 密钥字段在且非空（= mock 首 token 成功）→ exit 0
+    Ok,
+    /// 解析成功但密钥字段缺失或空 → exit 1
+    KeyMissing(String),
+    /// 文件不存在 / 解析失败 / 块不完整 → exit 2
+    Fatal(String),
+}
+
+/// 按 channel 校验 `home/<relative_target>` 里的密钥字段。
+pub fn check(channel: DeliveryChannel, home: &Path) -> MockOutcome {
+    let target: PathBuf = home.join(channel.relative_target());
+    let text = match std::fs::read_to_string(&target) {
+        Ok(t) => t,
+        Err(e) => {
+            return MockOutcome::Fatal(format!(
+                "配置文件不存在或不可读: {}: {}",
+                target.display(),
+                e
+            ))
+        }
+    };
+    if text.trim().is_empty() {
+        return MockOutcome::Fatal(format!("配置文件为空: {}", target.display()));
+    }
+    match channel {
+        DeliveryChannel::CodexAuthJson => check_json_top_level(&text, "OPENAI_API_KEY"),
+        DeliveryChannel::ClaudeCodeSettings | DeliveryChannel::ClaudeDesktop => {
+            check_json_nested(&text, &["env", "ANTHROPIC_AUTH_TOKEN"])
+        }
+        DeliveryChannel::OpenCode | DeliveryChannel::OpenCodeJsonc => {
+            check_json_nested(&text, &["provider", "keyrelay", "options", "apiKey"])
+        }
+        DeliveryChannel::GeminiCli => check_dotenv_key(&text, "GEMINI_API_KEY"),
+        DeliveryChannel::GrokBuild => check_toml_key(&text, "api_key"),
+        DeliveryChannel::OpenClaw => check_openclaw(&text),
+        DeliveryChannel::Hermes => {
+            check_managed_block(&text, hermes::BLOCK_BEGIN, hermes::BLOCK_END, "api_key")
+        }
+        DeliveryChannel::MCode => {
+            check_managed_block(&text, mcode::BLOCK_BEGIN, mcode::BLOCK_END, "api_key")
+        }
+        DeliveryChannel::Pi => check_json_nested(&text, &["keyrelay", "api_key"]),
+    }
+}
+
+/// openclaw 双形态：干净文件写结构化 JSON（`models.providers.keyrelay.api_key`），
+/// 带注释的文件写 JSON5 标记块。先试 JSON 嵌套，失败（KeyMissing 或 JSON 解析 Fatal）
+/// 再回退块标记 —— 两种形态都能认。
+fn check_openclaw(text: &str) -> MockOutcome {
+    match check_json_nested(text, &["models", "providers", "keyrelay", "api_key"]) {
+        MockOutcome::Ok => MockOutcome::Ok,
+        // 字段缺失或 JSON 解析失败：可能是块形态（带注释的 JSON5 serde 解析不了），回退
+        _ => check_managed_block(text, openclaw::BLOCK_BEGIN, openclaw::BLOCK_END, "api_key"),
+    }
+}
+
+/// 顶层 JSON 键（codex auth.json 的 `OPENAI_API_KEY`）。
+fn check_json_top_level(text: &str, key: &str) -> MockOutcome {
+    let v: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => return MockOutcome::Fatal(format!("JSON 解析失败: {e}")),
+    };
+    match v.get(key).and_then(|x| x.as_str()) {
+        Some(s) if !s.is_empty() => MockOutcome::Ok,
+        Some(_) => MockOutcome::KeyMissing(format!("{key} 为空字符串")),
+        None => MockOutcome::KeyMissing(format!("缺少 {key} 字段")),
+    }
+}
+
+/// 嵌套 JSON 路径（claude 的 `env.ANTHROPIC_AUTH_TOKEN`、opencode 的
+/// `provider.keyrelay.options.apiKey`）。
+fn check_json_nested(text: &str, path: &[&str]) -> MockOutcome {
+    let v: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => return MockOutcome::Fatal(format!("JSON 解析失败: {e}")),
+    };
+    let mut cur = &v;
+    for seg in path {
+        cur = match cur.get(seg) {
+            Some(x) => x,
+            None => return MockOutcome::KeyMissing(format!("缺少 {} 字段", path.join("."))),
+        };
+    }
+    match cur.as_str() {
+        Some(s) if !s.is_empty() => MockOutcome::Ok,
+        Some(_) => MockOutcome::KeyMissing(format!("{} 为空字符串", path.join("."))),
+        None => MockOutcome::KeyMissing(format!("{} 不是字符串", path.join("."))),
+    }
+}
+
+/// dotenv 行级扫描：找 `GEMINI_API_KEY=...`（允许 `export ` 前缀与引号值）。
+///
+/// 与 `gemini_cli.rs` 的写入形态对齐：行首（去前导空白后）`GEMINI_API_KEY=` 或
+/// `export GEMINI_API_KEY=`。不认注释行（`#`）与别的键（`MY_GEMINI_API_KEY=`）。
+fn check_dotenv_key(text: &str, key: &str) -> MockOutcome {
+    let prefix_eq = format!("{key}=");
+    let prefix_export = format!("export {key}=");
+    for raw in text.lines() {
+        let line = raw.trim_start();
+        if line.starts_with('#') {
+            continue;
+        }
+        let value = if let Some(rest) = line.strip_prefix(&prefix_export) {
+            rest
+        } else if let Some(rest) = line.strip_prefix(&prefix_eq) {
+            rest
+        } else {
+            continue;
+        };
+        let unquoted = strip_dotenv_quotes(value);
+        if unquoted.is_empty() {
+            return MockOutcome::KeyMissing(format!("{key} 为空"));
+        }
+        return MockOutcome::Ok;
+    }
+    MockOutcome::KeyMissing(format!("未找到 {key} 赋值行"))
+}
+
+/// TOML 行级扫描：找 `api_key = "..."`（grok-build 的 `[models.custom]` 段）。
+///
+/// 与 `grok_build.rs` 的写入形态对齐：`api_key = "sk-xxx"`（`=` 两侧可有空白）。
+/// 跳过注释（`#`）与段头（`[...]`）；不认 `api_key_extra =`（键名必须精确匹配后接 `=`）。
+fn check_toml_key(text: &str, key: &str) -> MockOutcome {
+    for raw in text.lines() {
+        let line = raw.trim_start();
+        if line.starts_with('#') || line.starts_with('[') {
+            continue;
+        }
+        let rest = match line.strip_prefix(key) {
+            Some(r) => r.trim_start(),
+            None => continue,
+        };
+        let value = match rest.strip_prefix('=') {
+            Some(v) => v.trim(),
+            None => continue, // `api_key_extra` 等键名前缀相同但后接非 `=`，跳过
+        };
+        let unquoted = strip_dotenv_quotes(value);
+        if !unquoted.is_empty() {
+            return MockOutcome::Ok;
+        }
+    }
+    MockOutcome::KeyMissing(format!("未找到 {key} 赋值行"))
+}
+
+/// 剥掉值两端的引号（单/双），与 dotenv / TOML / YAML / JSON5 写入口径一致。
+fn strip_dotenv_quotes(s: &str) -> &str {
+    let s = s.trim();
+    if (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
+        || (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2)
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// 受管块（openclaw / hermes / mcode）：定位块后校验密钥字段行在块内。
+///
+/// `field_marker`：三者都用 `api_key`（块内行形如 `"api_key": "…"` / `api_key: "…"`，
+/// 子串匹配即可，但要去掉注释行）。openclaw 用 `// >>> keyrelay >>>` 标记，
+/// hermes / mcode 用 `# >>> keyrelay >>>` 标记（各自模块的 `BLOCK_BEGIN`/`BLOCK_END`）。
+fn check_managed_block(text: &str, begin: &str, end: &str, field_marker: &str) -> MockOutcome {
+    let begins = line_starts_of(text, begin);
+    let ends = line_starts_of(text, end);
+    if begins.is_empty() && ends.is_empty() {
+        return MockOutcome::Fatal(format!("找不到受管块标记（{begin} / {end}）"));
+    }
+    if begins.len() != 1 || ends.len() != 1 {
+        return MockOutcome::Fatal(format!(
+            "受管块不完整：{begin} ×{} / {end} ×{}",
+            begins.len(),
+            ends.len()
+        ));
+    }
+    let (b, e) = (begins[0], ends[0]);
+    if e <= b {
+        return MockOutcome::Fatal("受管块结束标记在开始标记之前".into());
+    }
+    let block = &text[b..e];
+    // 块内找密钥字段行（非注释）
+    for raw in block.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.contains(field_marker) {
+            // 进一步确认不是「字段: 空」/「export X=""」
+            if !is_empty_value(line, field_marker) {
+                return MockOutcome::Ok;
+            }
+        }
+    }
+    MockOutcome::KeyMissing(format!("受管块内未找到非空的 {field_marker} 字段"))
+}
+
+/// `text` 里 marker 所在**行首**的字节偏移（行首 = 前面只有空白/换行/文件头）。
+fn line_starts_of(text: &str, marker: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(marker) {
+        let at = from + rel;
+        let mut head = at;
+        while head > 0 && matches!(bytes[head - 1], b' ' | b'\t') {
+            head -= 1;
+        }
+        if head == 0 || bytes[head - 1] == b'\n' {
+            out.push(head);
+        }
+        from = at + marker.len();
+    }
+    out
+}
+
+/// 判断「字段行」是否是空值（`apiKey: ""` / `export OPENAI_API_KEY=""`）。
+fn is_empty_value(line: &str, _marker: &str) -> bool {
+    let after_eq = line
+        .split_once('=')
+        .map(|(_, v)| v)
+        .or_else(|| line.split_once(':').map(|(_, v)| v))
+        .unwrap_or("");
+    strip_dotenv_quotes(after_eq).is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keyrelay_core::delivery::DeliveryChannel;
+
+    fn tmp_home() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tmp")
+    }
+
+    #[test]
+    fn codex_ok_when_key_present() {
+        let d = tmp_home();
+        let p = d.path().join(".codex").join("auth.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-xyz"}"#).unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::CodexAuthJson, d.path()),
+            MockOutcome::Ok
+        ));
+    }
+
+    #[test]
+    fn codex_missing_when_key_absent() {
+        let d = tmp_home();
+        let p = d.path().join(".codex").join("auth.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, r#"{"auth_mode":"apikey"}"#).unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::CodexAuthJson, d.path()),
+            MockOutcome::KeyMissing(_)
+        ));
+    }
+
+    #[test]
+    fn fatal_when_file_missing() {
+        let d = tmp_home();
+        assert!(matches!(
+            check(DeliveryChannel::CodexAuthJson, d.path()),
+            MockOutcome::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn fatal_when_json_unparseable() {
+        let d = tmp_home();
+        let p = d.path().join(".codex").join("auth.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "not json").unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::CodexAuthJson, d.path()),
+            MockOutcome::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn claude_ok_when_token_nested() {
+        let d = tmp_home();
+        let p = d.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"sk-abc","ANTHROPIC_BASE_URL":"https://x"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::ClaudeCodeSettings, d.path()),
+            MockOutcome::Ok
+        ));
+    }
+
+    #[test]
+    fn opencode_ok_when_provider_keyrelay_apikey_present() {
+        let d = tmp_home();
+        let p = d
+            .path()
+            .join(".config")
+            .join("opencode")
+            .join("opencode.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            r#"{"provider":{"keyrelay":{"options":{"apiKey":"sk-oc","baseURL":"https://x"}}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::OpenCode, d.path()),
+            MockOutcome::Ok
+        ));
+    }
+
+    #[test]
+    fn gemini_ok_with_export_prefix_and_quotes() {
+        let d = tmp_home();
+        let p = d.path().join(".gemini").join(".env");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "export GEMINI_API_KEY=\"sk-gem\"\n").unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::GeminiCli, d.path()),
+            MockOutcome::Ok
+        ));
+    }
+
+    #[test]
+    fn gemini_missing_when_only_other_keys() {
+        let d = tmp_home();
+        let p = d.path().join(".gemini").join(".env");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "MY_GEMINI_API_KEY=sk-x\nGEMINI_API_KEY_EXTRA=sk-y\n").unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::GeminiCli, d.path()),
+            MockOutcome::KeyMissing(_)
+        ));
+    }
+
+    #[test]
+    fn claude_desktop_ok_when_env_token_nested() {
+        let d = tmp_home();
+        let p = d
+            .path()
+            .join(DeliveryChannel::ClaudeDesktop.relative_target());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"sk-cd","ANTHROPIC_BASE_URL":"https://x"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::ClaudeDesktop, d.path()),
+            MockOutcome::Ok
+        ));
+    }
+
+    #[test]
+    fn grok_build_ok_when_apikey_in_models_custom() {
+        let d = tmp_home();
+        let p = d.path().join(DeliveryChannel::GrokBuild.relative_target());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            "[models.custom]\napi_key = \"sk-grok\"\nbase_url = \"https://x\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::GrokBuild, d.path()),
+            MockOutcome::Ok
+        ));
+    }
+
+    #[test]
+    fn grok_build_rejects_api_key_extra_prefix() {
+        let d = tmp_home();
+        let p = d.path().join(DeliveryChannel::GrokBuild.relative_target());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        // `api_key_extra` 不应被当作 `api_key` 命中（键名精确匹配后接 `=`）
+        std::fs::write(&p, "[models.custom]\napi_key_extra = \"sk-x\"\n").unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::GrokBuild, d.path()),
+            MockOutcome::KeyMissing(_)
+        ));
+    }
+
+    #[test]
+    fn openclaw_ok_when_structured_json() {
+        // --smoke apply 对干净文件写结构化 JSON（models.providers.keyrelay.api_key）
+        let d = tmp_home();
+        let p = d.path().join(DeliveryChannel::OpenClaw.relative_target());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            r#"{"models":{"providers":{"keyrelay":{"api_key":"sk-oclaw","base_url":"https://x"}}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::OpenClaw, d.path()),
+            MockOutcome::Ok
+        ));
+    }
+
+    #[test]
+    fn openclaw_ok_when_json5_block_form() {
+        // 带注释的文件走 JSON5 标记块形态（serde 解析不了 ⇒ 回退块标记）
+        let d = tmp_home();
+        let p = d.path().join(DeliveryChannel::OpenClaw.relative_target());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let block = format!(
+            "{{\n  {}\n  \"api_key\": \"sk-oclaw\"\n  {}\n}}\n",
+            openclaw::BLOCK_BEGIN,
+            openclaw::BLOCK_END
+        );
+        std::fs::write(&p, &block).unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::OpenClaw, d.path()),
+            MockOutcome::Ok
+        ));
+    }
+
+    #[test]
+    fn hermes_ok_when_apikey_in_yaml_block() {
+        let d = tmp_home();
+        let p = d.path().join(DeliveryChannel::Hermes.relative_target());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let block = format!(
+            "{}\napi_key: \"sk-hermes\"\nbase_url: \"https://x\"\n{}\n",
+            hermes::BLOCK_BEGIN,
+            hermes::BLOCK_END
+        );
+        std::fs::write(&p, &block).unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::Hermes, d.path()),
+            MockOutcome::Ok
+        ));
+    }
+
+    #[test]
+    fn mcode_ok_when_apikey_in_yaml_block() {
+        let d = tmp_home();
+        let p = d.path().join(DeliveryChannel::MCode.relative_target());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let block = format!(
+            "{}\napi_key: \"sk-mcode\"\n{}\n",
+            mcode::BLOCK_BEGIN,
+            mcode::BLOCK_END
+        );
+        std::fs::write(&p, &block).unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::MCode, d.path()),
+            MockOutcome::Ok
+        ));
+    }
+
+    #[test]
+    fn pi_ok_when_apikey_nested_under_keyrelay() {
+        let d = tmp_home();
+        let p = d.path().join(DeliveryChannel::Pi.relative_target());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            r#"{"keyrelay":{"api_key":"sk-pi","base_url":"https://x"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::Pi, d.path()),
+            MockOutcome::Ok
+        ));
+    }
+
+    #[test]
+    fn managed_block_fatal_when_markers_unbalanced() {
+        let d = tmp_home();
+        let p = d.path().join(DeliveryChannel::Hermes.relative_target());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        // 只有开始标记、没有结束标记 ⇒ Fatal
+        std::fs::write(&p, format!("{}\napi_key: x\n", hermes::BLOCK_BEGIN)).unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::Hermes, d.path()),
+            MockOutcome::Fatal(_)
+        ));
+    }
+}

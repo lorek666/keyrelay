@@ -1,37 +1,29 @@
 #!/usr/bin/env node
 /**
- * B-86 冒烟脚本：注入 → agent 冒烟请求 → 回滚 → 字节比对（PRD 第 9 章「三连」）。
+ * B-86 / B-118 冒烟脚本：注入 → agent 冒烟请求 → 回滚 → 字节比对（PRD 第 9 章「三连」）。
  *
- * ## 这个脚本**在本机从未完整跑过**（spec §5.3）
+ * ## 这个脚本现在能跑了（M14-S4 起）
  *
- * 本机**有** codex / claude / continue 三个 agent 可执行文件（实测 `--version` 可用），
- * 但缺两样东西，因此三连走不完：
+ * 投递与回滚走 KeyRelay 的薄 CLI（`KEYRELAY_CLI` 指向 `keyrelay-cli` 二进制），
+ * 它包了 `KeyRelayService::apply_delivery` / `rollback_delivery`。两种模式：
  *
- * 1. **一把可用的 sk- 密钥**：注入本身不需要它（密钥走钥匙串，配置文件里写的是
- *    产品自己那套占位/引用），但「agent 冒烟请求」那一步要的是一次**真的**带认证
- *    调用 —— 没有真密钥，agent 只会回 401（实测 `codex exec` 在无效 key 下的表现）。
- * 2. **KeyRelay 的 CLI / 可脚本化入口**：投递与回滚是 **core 库函数**
- *    （`KeyRelayService::apply_delivery` / `rollback_delivery`），要走到它们就得
- *    起 Tauri 应用或另写一个二进制 —— 本包（M8-S3）的写域里**没有**这一项，
- *    所以本脚本把这一半留成**明确的前置缺口**，不假装调到了。
+ * - **真路径**：`KEYRELAY_REAL_KEY`（真 `sk-`）+ 真 agent 在 PATH ⇒ 用真 key 注入、
+ *   跑真 agent（`codex exec` 等）做一次带认证调用，断言首 token 成功且输出不含密钥形态。
+ * - **mock 路径**：缺真 key 或缺真 agent ⇒ 用占位 key 注入、跑 CLI 的 `mock-agent`
+ *   子命令（只读解析注入产物、校验密钥字段在）。mock 证明「注入产物可解析 + 密钥字段在」，
+ *   **不**证明「真 agent 首 token 成功」——后者只走真路径才算。
  *
- * 因此本文件只声称：
+ * ## 退出码
  *
- * - 脚本存在、`node --check` 通过、前置检查缺什么就**明确说出缺什么**；
- * - 退出码 2 = 前置不满足（**没跑**，不是失败）；0 = 三连全过；1 = 断言失败；
- * - 判定口径写在代码里，补齐前置后可以直接跑。
+ * - 0 = 三连全过（真或 mock）；
+ * - 1 = 断言失败（投递/回滚/字节比对/密钥形态泄漏）；
+ * - 2 = 前置不满足（**没跑**，不是失败）——现在只有 `KEYRELAY_CLI` 缺失才会停在这一档。
  *
- * ## 为什么密钥从环境变量读
+ * ## 密钥从环境变量读
  *
- * 从 `KEYRELAY_SMOKE_KEY` 读：不进命令行参数（`ps` 看得见）、不进临时文件、
- * **不打印**（连长度都不打，只打「已提供 / 未提供」）。
- *
- * ## 与 Rust 侧测试的关系
- *
- * `tests/real_site_smoke.rs` 是 Rust 侧**只读**冒烟（`#[ignore]`，需真实站点）；
- * `tests/acceptance_matrix.rs` 的 A-2 / A-9 已经把「注入 → 回滚 → 字节比对」
- * 在**注入式夹具**上钉死了（含 Continue 传 model）。本脚本多出来的只有一件事：
- * **真的跑一次 agent**。三者互补、不重复。
+ * 从 `KEYRELAY_REAL_KEY` 读：不进命令行参数（`ps` 看得见）、不进临时文件、
+ * **不打印**（连长度都不打，只打「已提供 / 未提供」）。mock 路径用脚本内置的占位 key，
+ * 不需要用户提供。
  */
 
 import { spawnSync } from "node:child_process";
@@ -42,13 +34,13 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const USAGE =
-  "用法: node scripts/smoke-inject.mjs [--agent codex|claude-code|opencode|gemini-cli|continue] [--keep]";
+  "用法: node scripts/smoke-inject.mjs --agent <codex|claude-code|opencode|opencode-jsonc|gemini-cli|claude-desktop|grok-build|openclaw|hermes|mcode|pi> [--mock] [--keep]";
 
 const argv = process.argv.slice(2);
-// P3-16 / DEBUG-REPORT-v3 §3-16：--agent <name> 的值（紧跟 --agent 的那个）不是
-// 未知参数，要跳过——否则 `--agent codex` 里 codex 被当成未知参数 exit 2。
+// --agent <name> 的值不是未知参数；--mock / --keep 是 bool。
 const unknown = argv.filter((a, i) => {
   if (i > 0 && argv[i - 1] === "--agent") return false;
+  if (a === "--mock" || a === "--keep") return false;
   return !a.startsWith("--");
 });
 if (unknown.length) {
@@ -57,20 +49,60 @@ if (unknown.length) {
 }
 
 const agentFlagIndex = argv.indexOf("--agent");
+if (agentFlagIndex < 0) {
+  console.error(`✗ 需要 --agent <name>\n${USAGE}`);
+  process.exit(2);
+}
+const agent = argv[agentFlagIndex + 1];
 const keep = argv.includes("--keep");
-const agent = agentFlagIndex >= 0 ? argv[agentFlagIndex + 1] : "codex";
-const AGENTS = ["codex", "claude-code", "opencode", "gemini-cli", "continue"];
+const forceMock = argv.includes("--mock");
+const AGENTS = [
+  "codex", "claude-code", "opencode", "opencode-jsonc", "gemini-cli",
+  "claude-desktop", "grok-build", "openclaw", "hermes", "mcode", "pi",
+];
 
-/** 每个 agent 的可执行文件名、冒烟用的最小子命令、以及目标配置的相对路径。 */
+if (!AGENTS.includes(agent)) {
+  console.error(`✗ 不认识的 agent：${agent}\n${USAGE}`);
+  process.exit(2);
+}
+
+/** agent → 投递通道名（与 DeliveryChannel::as_str() 一致，11 通道）。 */
+const CHANNEL = {
+  codex: "codex-auth-json",
+  "claude-code": "claude-code-settings",
+  opencode: "opencode",
+  "opencode-jsonc": "opencode-jsonc",
+  "gemini-cli": "gemini-cli",
+  "claude-desktop": "claude-desktop",
+  "grok-build": "grok-build",
+  openclaw: "openclaw",
+  hermes: "hermes",
+  mcode: "mcode",
+  pi: "pi",
+};
+/** M14-S1 起 Continue 已删，11 通道均不要求 model（OpenCode 系列的 model 可选）。 */
+const MODEL = {};
+
+/** 每个 agent 的可执行文件名、冒烟用的最小子命令、目标配置的相对路径。
+ *  新 6 通道（claude-desktop/grok-build/openclaw/hermes/mcode/pi）多为桌面或配置型 agent，
+ *  本机通常无 CLI 二进制 ⇒ realAgentAvailable=false ⇒ 自动落 mock 路径。 */
 const TARGETS = {
   codex: { bin: "codex", smoke: ["exec", "echo ok"], config: ".codex/auth.json" },
   "claude-code": { bin: "claude", smoke: ["-p", "echo ok"], config: ".claude/settings.json" },
   opencode: { bin: "opencode", smoke: ["run", "echo ok"], config: ".config/opencode/opencode.json" },
+  "opencode-jsonc": { bin: "opencode", smoke: ["run", "echo ok"], config: ".config/opencode/opencode.jsonc" },
   "gemini-cli": { bin: "gemini", smoke: ["-p", "echo ok"], config: ".gemini/.env" },
-  continue: { bin: "continue", smoke: ["-p", "echo ok"], config: ".continue/config.yaml" },
+  "claude-desktop": { bin: "claude-desktop", smoke: ["--version"], config: "Library/Application Support/Claude/claude_desktop_config.json" },
+  "grok-build": { bin: "grok", smoke: ["--version"], config: ".grok/config.toml" },
+  openclaw: { bin: "openclaw", smoke: ["--version"], config: ".openclaw/openclaw.json" },
+  hermes: { bin: "hermes", smoke: ["--version"], config: ".hermes/config.yaml" },
+  mcode: { bin: "mcode", smoke: ["--version"], config: ".minimax/config.yaml" },
+  pi: { bin: "pi", smoke: ["--version"], config: ".pi/agent/models.json" },
 };
 
-/** 前置不满足：说清缺什么，退出码 2（没跑，不是失败）。 */
+/** mock 路径用的占位密钥（sk- 形态、长度 ≥ 12；不是任何真实密钥）。 */
+const PLACEHOLDER_KEY = "sk-keyrelay-smoke-mock-0123456789abcdef";
+
 function missing(message) {
   console.error(`✗ 前置不满足：${message}`);
   console.error("  退出码 2 = 没跑（不是失败）。补齐后重跑即可。");
@@ -80,7 +112,6 @@ function missing(message) {
 
 function fail(message) {
   console.error(`✗ ${message}`);
-  // P2-18：运行中失败（投递/回滚没走完）⇒ 保留备份，原配置可能未还原。
   cleanup(true);
   process.exit(1);
 }
@@ -89,17 +120,6 @@ function info(message) {
   console.log(`  ${message}`);
 }
 
-/**
- * 收尾：删掉自己做的备份。
- *
- * 必须挂在**每一条**提前退出的路上：备份是在前置检查里做的，而前置检查可能在第 ⑤ 条
- * 才失败——那时若不删，下一次跑会撞上「`<path>.smoke-backup` 已存在」而永远起不来
- * （实测：第一版就把备份留在 `~/.codex/` 里了）。`--keep` 只影响**跑完之后**的清理。
- *
- * P2-18 / DEBUG-REPORT-v3 §2-18：`preserveBackup = true` 时**保留**备份——用于运行中
- * 失败（回滚没完成、SIGINT 中断）的路径。那时原配置还没还原，删备份 = 把用户真实的
- * agent 配置（含密钥）永久丢失。前置失败（还没投递）仍删（`preserveBackup = false`）。
- */
 let backupPathRef = null;
 function cleanup(preserveBackup = false) {
   if (backupPathRef && existsSync(backupPathRef)) {
@@ -112,43 +132,45 @@ function cleanup(preserveBackup = false) {
   }
 }
 
-if (!AGENTS.includes(agent)) {
-  console.error(`✗ 不认识的 agent：${agent}\n${USAGE}`);
-  process.exit(2);
-}
 const target = TARGETS[agent];
-
+const channel = CHANNEL[agent];
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
 
-// ---------------------------------------------------------------- 前置检查（缺一条就退出码 2）
+// ---------------------------------------------------------------- 前置检查
 
-// ① 产品已构建：`dist/` 在 ⇒ 至少 `pnpm build` 跑过
-if (!existsSync(resolve(root, "dist"))) {
-  missing("dist/ 不存在 —— 先跑 `CI=true pnpm build`");
-}
-
-// ② agent 可执行文件在 PATH 里
-const probe = spawnSync(target.bin, ["--version"], { encoding: "utf8" });
-if (probe.error || probe.status !== 0) {
-  missing(`PATH 里找不到 ${target.bin}（${agent}）—— 冒烟请求那一步需要真的跑一次 agent`);
-}
-info(`agent: ${agent}（${target.bin} 可用）`);
-
-// ③ 一把可用的 sk- 密钥（环境变量；**不打印、不进参数、不落盘**）
-const key = process.env.KEYRELAY_SMOKE_KEY ?? "";
-if (!key.startsWith("sk-") || key.length < 12) {
+// ① KeyRelay CLI 可执行文件在（投递/回滚/mock-agent 都靠它）
+const cli = process.env.KEYRELAY_CLI ?? "";
+if (!cli || !existsSync(cli)) {
   missing(
-    "环境变量 KEYRELAY_SMOKE_KEY 未提供（或不是 sk- 形态）—— 冒烟请求需要一把**真**密钥；" +
-      "没有它，agent 只会回 401，这一跑证明不了任何事",
+    "找不到 KeyRelay 的 CLI（环境变量 KEYRELAY_CLI 指向 keyrelay-cli 二进制）—— " +
+      "M14-S4 交付的薄 CLI；先 `cargo build -p keyrelay-cli` 再指向 target/.../keyrelay-cli",
   );
 }
-info("密钥: 已提供（不打印、不进命令行参数）");
+info(`CLI: ${cli}`);
 
-// ④ 目标配置不存在或可写；存在时先备份到 <path>.smoke-backup。
-//
-// P2-18：默认 home 不再是真实 `$HOME`——冒烟脚本会向 agent 配置写密钥、跑请求，
-// 对真实环境是破坏性的。显式 KEYRELAY_SMOKE_HOME 才允许指向真实目录（提示里写明）。
+// ② 真 agent 可执行文件在 PATH 里（缺失 ⇒ 落 mock 路径，不退出）
+const probe = spawnSync(target.bin, ["--version"], { encoding: "utf8" });
+const realAgentAvailable = !probe.error && probe.status === 0;
+
+// ③ 一把可用的真 sk- 密钥（缺失 ⇒ 落 mock 路径，不退出）
+const realKey = process.env.KEYRELAY_REAL_KEY ?? "";
+const realKeyAvailable = realKey.startsWith("sk-") && realKey.length >= 12;
+
+// 模式裁决：真路径需要真 key + 真 agent 且未强制 mock；否则 mock。
+const realMode = !forceMock && realKeyAvailable && realAgentAvailable;
+const mode = realMode ? "真" : "mock";
+info(
+  `agent: ${agent}` +
+    (realAgentAvailable ? `（${target.bin} 可用）` : `（${target.bin} 不在 PATH）`) +
+    `；密钥: ${realKeyAvailable ? "已提供" : "未提供"}；模式: ${mode}`,
+);
+if (!forceMock && realKeyAvailable && !realAgentAvailable) {
+  info(`  真 key 在但真 agent 不在 ⇒ mock 路径（注入用占位 key，冒烟走 mock-agent）`);
+}
+if (forceMock) info(`  --mock 强制 mock 路径`);
+
+// ④ 目标配置所在的 home（默认临时目录；KEYRELAY_SMOKE_HOME 才允许指向真实目录）
 const home =
   process.env.KEYRELAY_SMOKE_HOME ??
   resolve(tmpdir(), `keyrelay-smoke-${Date.now()}`);
@@ -163,8 +185,6 @@ if (existsSync(backupPath)) {
 }
 let hadConfig = false;
 if (existsSync(configPath)) {
-  // P2-18：备份文件权限继承原文件（原配置通常 0600 且含真实密钥）——
-  // 不再是默认 0644（同机其他用户可读）。原文件权限读不到时保守用 0600。
   let mode;
   try {
     mode = statSync(configPath).mode & 0o777;
@@ -179,8 +199,6 @@ if (existsSync(configPath)) {
   info(`目标配置不存在（将新建）: ${configPath}`);
 }
 
-// P2-18：SIGINT（Ctrl-C）时原配置可能已注入未回滚——与 fail() 同一条路：
-// 保留备份，让用户能手工还原；直接 exit 会跳过 cleanup。
 process.on("SIGINT", () => {
   console.error("\n✗ 收到 SIGINT，中断冒烟");
   cleanup(true);
@@ -192,16 +210,8 @@ process.on("SIGTERM", () => {
   process.exit(143);
 });
 
-// ⑤ 投递 / 回滚的入口：本机**没有** KeyRelay 的 CLI（投递是 core 库函数，
-//    见文件头「从未完整跑过」的第 2 条）。明确报出来，不静默跳过。
-const cli = process.env.KEYRELAY_CLI ?? "";
-if (!cli || !existsSync(cli)) {
-  missing(
-    "找不到 KeyRelay 的可脚本化入口（环境变量 KEYRELAY_CLI 指向一个可执行文件）—— " +
-      "投递与回滚是 core 库函数（apply_delivery / rollback_delivery），" +
-      "当前仓库没有把它们包成 CLI；补上后再跑三连",
-  );
-}
+// 注入用的密钥：真路径用真 key，mock 路径用占位 key（CLI --smoke 始终从 env 读）
+const keyForInject = realMode ? realKey : PLACEHOLDER_KEY;
 
 // ---------------------------------------------------------------- 三连
 
@@ -221,45 +231,76 @@ function check(name, ok, detail) {
   console.log(`${ok ? "✓" : "✗"} ${name}${detail ? ` —— ${detail}` : ""}`);
 }
 
-console.log("\n三连：注入 → agent 冒烟请求 → 回滚 → 字节比对\n");
+console.log(`\n三连（${mode} 路径）：注入 → agent 冒烟请求 → 回滚 → 字节比对\n`);
 
-// ① 注入：调产品自己的投递入口写目标文件（**不手拼配置**——手拼一份「看起来对」的
-//    配置，冒烟通过只能证明 agent 认那份配置，证明不了产品写得对）。
-const inject = spawnSync(cli, ["apply-delivery", "--agent", agent], {
-  encoding: "utf8",
-  env: { ...process.env, HOME: home },
-  timeout: 120_000,
-});
+// ① 注入：CLI apply-delivery --smoke（store/backup 由 --home 派生）
+// CLI 调用不覆盖 HOME：CLI 用 --home flag 解析路径，不读 HOME；让 CLI 看到真实 $HOME，
+// --home=<temp> ≠ $HOME ⇒ --smoke 防呆放行（若覆盖 HOME=temp，--home==HOME 会误触发防呆）。
+const modelArgs = MODEL[agent] ? ["--model", MODEL[agent]] : [];
+const inject = spawnSync(
+  cli,
+  ["apply-delivery", "--channel", channel, "--smoke", "--home", home, ...modelArgs],
+  {
+    encoding: "utf8",
+    env: { ...process.env, KEYRELAY_REAL_KEY: keyForInject },
+    timeout: 120_000,
+  },
+);
 if (inject.error || inject.status !== 0) {
   fail(`投递失败（退出码 ${inject.status}）: ${(inject.stderr ?? "").slice(0, 300)}`);
+}
+const journalId = (inject.stdout ?? "").trim();
+if (!journalId) {
+  fail(`投递报了成功，但 stdout 没有 journal_id: ${(inject.stderr ?? "").slice(0, 300)}`);
 }
 if (!existsSync(configPath)) {
   fail(`投递报了成功，但目标文件不存在: ${configPath}`);
 }
-check("① 注入写出目标文件", true, `${statSync(configPath).size} B`);
+check("① 注入写出目标文件", true, `${statSync(configPath).size} B；journal=${journalId.slice(0, 12)}…`);
 
-// ② 冒烟请求：用注入后的配置跑一次**最小**请求。退出码 0 且输出里不含密钥形态。
-const smoke = spawnSync(target.bin, target.smoke, {
-  encoding: "utf8",
-  timeout: 180_000,
-  env: { ...process.env, HOME: home },
-});
-const smokeOut = `${smoke.stdout ?? ""}${smoke.stderr ?? ""}`;
-if (smoke.error) {
-  check("② agent 冒烟请求", false, `无法执行 ${target.bin}: ${smoke.error.message}`);
-} else {
-  check("② agent 冒烟请求", smoke.status === 0, `退出码 ${smoke.status}`);
+// ② 冒烟请求：真路径跑真 agent；mock 路径跑 CLI mock-agent
+let smokeOk = false;
+let smokeDetail = "";
+if (realMode) {
+  const smoke = spawnSync(target.bin, target.smoke, {
+    encoding: "utf8",
+    timeout: 180_000,
+    env: { ...process.env, HOME: home },
+  });
+  const smokeOut = `${smoke.stdout ?? ""}${smoke.stderr ?? ""}`;
+  if (smoke.error) {
+    smokeDetail = `无法执行 ${target.bin}: ${smoke.error.message}`;
+  } else {
+    smokeOk = smoke.status === 0;
+    smokeDetail = `退出码 ${smoke.status}`;
+  }
+  check("② agent 冒烟请求（真）", smokeOk, smokeDetail);
   check(
     "② 冒烟输出不含密钥形态",
     !looksLikeSecret(smokeOut),
     looksLikeSecret(smokeOut) ? "输出里出现 sk-/nap-/32位hex" : "干净",
   );
+} else {
+  // mock 路径：CLI mock-agent 只读解析注入产物、校验密钥字段在
+  const smoke = spawnSync(cli, ["mock-agent", "--channel", channel, "--home", home], {
+    encoding: "utf8",
+    env: { ...process.env },
+    timeout: 60_000,
+  });
+  if (smoke.error) {
+    smokeDetail = `无法执行 mock-agent: ${smoke.error.message}`;
+  } else {
+    smokeOk = smoke.status === 0;
+    smokeDetail = `退出码 ${smoke.status}（${smoke.status === 0 ? "密钥字段在" : (smoke.stderr ?? "").slice(0, 120)}）`;
+  }
+  check("② mock-agent 校验密钥字段在", smokeOk, smokeDetail);
+  // mock 路径不扫密钥形态：mock-agent 只读不产生密钥输出，扫描无意义
 }
 
-// ③ 回滚：目标文件必须回到注入前的状态（有备份 ⇒ 逐字节相等；没有 ⇒ 文件消失）。
-const rollback = spawnSync(cli, ["rollback-delivery", "--agent", agent], {
+// ③ 回滚：CLI rollback-delivery --journal（store 由 --home 派生）
+const rollback = spawnSync(cli, ["rollback-delivery", "--journal", journalId, "--home", home], {
   encoding: "utf8",
-  env: { ...process.env, HOME: home },
+  env: { ...process.env },
   timeout: 120_000,
 });
 if (rollback.error || rollback.status !== 0) {
@@ -281,5 +322,5 @@ if (!keep && existsSync(backupPath)) {
 }
 
 const failed = results.filter((r) => !r.ok);
-console.log(`\n${failed.length === 0 ? "三连全过" : `${failed.length} 项未过`}`);
+console.log(`\n${failed.length === 0 ? `三连全过（${mode} 路径）` : `${failed.length} 项未过`}`);
 process.exit(failed.length === 0 ? 0 : 1);
