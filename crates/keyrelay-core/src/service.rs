@@ -2877,6 +2877,96 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         }
     }
 
+    /// M15-S1：模型检测（bazaarlink probe）——检测目标模型端点是否真的是它声称的模型。
+    ///
+    /// **apiKey 发给第三方 bazaarlink.ai**——这是新的明文外流路径（既有明文只发给目标
+    /// 中转站做投递/网关）。`confirm` 必须为 `true`，否则 `Error::InvalidInput`（请求未发出）。
+    ///
+    /// 复用 `key_secret`（唯一明文出口 `vault_secret`，M8-S1 守卫）取站点 key 明文，
+    /// 不新开 `vault.get`。`base_url` 默认 = 站点 base_url + `/v1`（已有 `/v1` 不重复），
+    /// `base_url_override` 优先。`claimed_model` 缺省时填 `model_id`（M15-S1 决策）。
+    ///
+    /// 检测结果摘要落 `probe_runs` 表（best-effort：落库失败只 warn，不 mask 检测成功）；
+    /// **不落** `items[].response` / `responseHeaders` / `startedByIp` / `userKey`（敏感）。
+    /// 事件只 log 元数据（site_id / key_id / modelId / verdict），**不 log apiKey**。
+    pub async fn probe_model(
+        &self,
+        key_id: i64,
+        model_id: String,
+        claimed_model: Option<String>,
+        base_url_override: Option<String>,
+        confirm: bool,
+    ) -> Result<crate::probe::ProbeRun> {
+        if !confirm {
+            return Err(Error::InvalidInput(
+                "模型检测需要明确确认：会把该站点的 API key 发送给第三方 bazaarlink.ai".into(),
+            ));
+        }
+        let row = self
+            .store
+            .get_key(key_id)?
+            .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
+        let site = self.site(row.site_id)?;
+        let base_url = base_url_override.unwrap_or_else(|| {
+            let b = site.base_url.trim_end_matches('/');
+            if b.ends_with("/v1") {
+                b.to_string()
+            } else {
+                format!("{b}/v1")
+            }
+        });
+        let api_key = self.key_secret(key_id)?;
+        let claimed = claimed_model.unwrap_or_else(|| model_id.clone());
+        let model_id_for_store = model_id.clone();
+        let req = crate::probe::ProbeRequest {
+            base_url,
+            api_key,
+            model_id,
+            claimed_model: Some(claimed),
+            sync: true,
+        };
+        let run = crate::probe::run_probe(&self.transport, &req).await?;
+        // 持久化摘要（best-effort：落库失败只 warn，不 mask 检测成功）
+        if let Err(err) = self.store.insert_probe_run(
+            row.site_id,
+            key_id,
+            &model_id_for_store,
+            req.claimed_model.as_deref(),
+            &run,
+        ) {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "store",
+                format!("检测历史落库失败: {}", crate::redact::scrub(&err.to_string())),
+                serde_json::json!({ "site_id": row.site_id, "key_id": key_id, "run_id": run.run_id }),
+            ));
+        }
+        // 事件只 log 元数据，不 log apiKey / 响应正文
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "probe",
+            "模型检测完成",
+            serde_json::json!({
+                "site_id": row.site_id,
+                "key_id": key_id,
+                "run_id": run.run_id,
+                "verdict": run.verdict_status,
+                "identity": run.identity_status,
+            }),
+        ));
+        Ok(run)
+    }
+
+    /// M15-S1：最近 `limit` 条检测历史（按 `recorded_at` 降序）。
+    pub fn list_probe_runs(&self, limit: usize) -> Result<Vec<crate::store::ProbeRunRow>> {
+        self.store.list_probe_runs(limit)
+    }
+
+    /// M15-S1：按本地 id 取单条检测记录。
+    pub fn get_probe_run(&self, id: i64) -> Result<Option<crate::store::ProbeRunRow>> {
+        self.store.get_probe_run(id)
+    }
+
     /// 回收站点上的某把令牌，并把本地记录标成**已回收**（B-82 的独立路径）。
     ///
     /// # 顺序（硬要求）
