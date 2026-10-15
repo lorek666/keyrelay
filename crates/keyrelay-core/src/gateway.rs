@@ -939,27 +939,27 @@ fn into_upstream_response(upstream_response: reqwest::Response) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// 跳过 `Open` 的候选；`HalfOpen` 只取排序里的**第一个**作为探针（其余本轮不参与）。
+/// 跳过 `Open` 的候选；`HalfOpen` 只放**一个探针**（P2-8：跨请求共享，不只是单次
+/// 调用内——否则冷却一过所有并发请求都会拿到同一个 HalfOpen 探针涌向坏上游）。
 fn eligible_candidates<'a>(
     breaker: &Arc<Mutex<Breaker>>,
     candidates: &[&'a Upstream],
     now: Instant,
 ) -> Vec<&'a Upstream> {
-    let Ok(guard) = breaker.lock() else {
+    let Ok(mut guard) = breaker.lock() else {
         // 锁中毒：放行全部候选。可用性优先——一次 panic 不该让网关永久 503。
         return candidates.to_vec();
     };
     let mut out = Vec::with_capacity(candidates.len());
-    let mut took_half_open = false;
     for upstream in candidates {
         match guard.state(upstream.site_id, now) {
             BreakerState::Open => continue,
             BreakerState::HalfOpen => {
-                if took_half_open {
-                    continue;
+                // P2-8：第一个拿到探针的请求在 Breaker 里标记，其余并发请求看到标记
+                // 即跳过。探针结果回来后由 record_success / record_failure 清除标记。
+                if guard.try_take_half_open_probe(upstream.site_id, now) {
+                    out.push(*upstream);
                 }
-                took_half_open = true;
-                out.push(*upstream);
             }
             BreakerState::Closed => out.push(*upstream),
         }
