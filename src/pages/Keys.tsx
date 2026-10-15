@@ -432,6 +432,8 @@ export default function Keys() {
                 <th>分组</th>
                 <th>远端 id</th>
                 <th>状态</th>
+                {/* 用量列：位置留给 usage-collector（WP4），本步不接数据（M11-S1 写域避让） */}
+                <th>用量</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -457,6 +459,8 @@ export default function Keys() {
                         {statusLabel(key.status)}
                       </span>
                     </td>
+                    {/* 用量列占位：数据由 usage-collector（WP4）接入，本步留空（M11-S1 写域避让） */}
+                    <td><span className="muted">—</span></td>
                     <td>
                       <CapButton
                         allowed={gate.allowed}

@@ -18,13 +18,17 @@ import SettingsPage from "./pages/Settings";
 import { appInfo, getSettings, runtimeMode } from "./lib/api";
 import { useApplyTheme } from "./lib/theme";
 
+// 侧栏分组（M11-S1 §2）：日常 / 资产 / 投递 / 系统。
+// `group` 只影响侧栏的归类与标题，不改页面组件、不改切换逻辑（本地 state 切换六个原页面）。
+const NAV_GROUPS = ["日常", "资产", "投递", "系统"] as const;
+
 const PAGES = [
-  { id: "overview", label: "总览", icon: LayoutDashboard, render: () => <Overview /> },
-  { id: "sites", label: "站点", icon: Server, render: () => <Sites /> },
-  { id: "keys", label: "密钥", icon: KeyRound, render: () => <Keys /> },
-  { id: "agents", label: "Agent 投递", icon: Plug, render: () => <Agents /> },
-  { id: "history", label: "变更历史", icon: HistoryIcon, render: () => <History /> },
-  { id: "settings", label: "设置", icon: SettingsIcon, render: () => <SettingsPage /> },
+  { id: "overview", label: "总览", icon: LayoutDashboard, group: "日常", render: () => <Overview /> },
+  { id: "sites", label: "站点", icon: Server, group: "资产", render: () => <Sites /> },
+  { id: "keys", label: "密钥", icon: KeyRound, group: "资产", render: () => <Keys /> },
+  { id: "agents", label: "Agent 投递", icon: Plug, group: "投递", render: () => <Agents /> },
+  { id: "history", label: "变更历史", icon: HistoryIcon, group: "日常", render: () => <History /> },
+  { id: "settings", label: "设置", icon: SettingsIcon, group: "系统", render: () => <SettingsPage /> },
 ] as const;
 
 type PageId = (typeof PAGES)[number]["id"];
@@ -45,20 +49,25 @@ export default function App() {
           <span>KeyRelay</span>
         </div>
         <nav>
-          {PAGES.map((item) => {
-            const Icon = item.icon;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                className={item.id === page ? "nav-item active" : "nav-item"}
-                onClick={() => setPage(item.id)}
-              >
-                <Icon size={15} aria-hidden />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
+          {NAV_GROUPS.map((group) => (
+            <div className="nav-group" key={group}>
+              <p className="nav-group-label">{group}</p>
+              {PAGES.filter((item) => item.group === group).map((item) => {
+                const Icon = item.icon;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={item.id === page ? "nav-item active" : "nav-item"}
+                    onClick={() => setPage(item.id)}
+                  >
+                    <Icon size={15} aria-hidden />
+                    <span>{item.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          ))}
         </nav>
         {runtimeMode === "browser" ? (
           <p className="sidebar-note">浏览器预览模式（示例数据）</p>
