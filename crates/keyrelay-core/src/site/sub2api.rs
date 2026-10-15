@@ -314,10 +314,12 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 /// `GET /api/v1/groups/available` 的中间形态。
 ///
 /// `id` 只用于和 `/groups/rates` 的键合并，**不进** `GroupInfo`（`GroupInfo` 没有 id 字段）。
+/// `rate_multiplier` 是分组的基准倍率，当 `/groups/rates` 里没有该用户的专属覆盖倍率时回落到此值（M12-S2）。
 struct RawGroup {
     id: Option<i64>,
     name: String,
     description: Option<String>,
+    rate_multiplier: Option<f64>,
 }
 
 /// 解析 `GET /api/v1/groups/available` 的 `data`（M6-S4 / PRD FR-2）。
@@ -350,6 +352,7 @@ fn parse_available_groups(data: &Value) -> Result<Vec<RawGroup>> {
             description: json_str(item, "/description")
                 .filter(|d| !d.is_empty())
                 .map(|d| d.to_string()),
+            rate_multiplier: item.get("rate_multiplier").and_then(parse_rate),
         });
     }
     if !items.is_empty() && out.is_empty() {
@@ -730,9 +733,9 @@ impl<T: HttpTransport + 'static> SiteAdapter for Sub2Api<T> {
     /// M6-S4 / PRD FR-2：`GET /api/v1/groups/available` + `GET /api/v1/groups/rates` 两次调用合并。
     ///
     /// - 顺序固定：先 `available`（决定分组集合与顺序），再 `rates`（决定倍率）；
-    /// - `rates` 的 `data` 为 `null`（源码里仓库未接线）→ 全部 `rate = None`；
-    /// - `rates` 里没有该分组 → 该分组 `rate = None`（**不**回落到 `available` 里的
-    ///   `rate_multiplier`：那是分组基准倍率，不是该用户的专属覆盖倍率，见 spec D-3）；
+    /// - `rates` 的 `data` 为 `null`（源码里仓库未接线）→ 全部回落到 `rate_multiplier`；
+    /// - `rates` 里没有该分组 → 回落到 `available` 里的 `rate_multiplier`（M12-S2：
+    ///   基准倍率比「倍率未知」有用；覆盖倍率优先，仅当 `rates` 里缺失时才回落）；
     /// - `rates` 调用本身失败（非 2xx / 信封失败）→ **传播错误**，不降级为全 `None`
     ///   （否则会话失效会被伪装成「倍率未知」，违反 M5-S2 的会话失效可见性）。
     async fn available_groups(&self, base_url: &str, session: &Session) -> Result<Vec<GroupInfo>> {
@@ -777,7 +780,8 @@ impl<T: HttpTransport + 'static> SiteAdapter for Sub2Api<T> {
             .map(|group| GroupInfo {
                 rate: group
                     .id
-                    .and_then(|id| rates.as_ref().and_then(|map| map.get(&id).copied())),
+                    .and_then(|id| rates.as_ref().and_then(|map| map.get(&id).copied()))
+                    .or(group.rate_multiplier),
                 name: group.name,
                 description: group.description,
             })

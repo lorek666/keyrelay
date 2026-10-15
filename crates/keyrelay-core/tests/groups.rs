@@ -267,7 +267,7 @@ async fn sub2api_available_groups_merges_two_calls_in_order() {
 }
 
 #[tokio::test]
-async fn sub2api_available_groups_rates_null_yields_none() {
+async fn sub2api_available_groups_rates_null_falls_back_to_rate_multiplier() {
     // 源码：`userGroupRateRepo == nil` 时 `GetUserGroupRates` 返回 `nil, nil` → `data: null`。
     let transport = MockTransport::new(vec![
         sub2api_ok(json!([
@@ -285,17 +285,17 @@ async fn sub2api_available_groups_rates_null_yields_none() {
     assert_eq!(
         groups,
         vec![
-            group("default", None, None),
-            group("vip", None, Some("高级")),
+            group("default", Some(1.0), None),
+            group("vip", Some(1.2), Some("高级")),
         ],
-        "rates 缺失 → rate = None（章程冻结语义）"
+        "rates 缺失 → 回落到 rate_multiplier"
     );
 }
 
 #[tokio::test]
-async fn sub2api_available_groups_missing_id_in_rates_yields_none() {
-    // rates 里没有该分组 → None；**不**回落到 available 的 `rate_multiplier`（spec D-3：
-    // 那是分组基准倍率，不是该用户的专属覆盖倍率）。
+async fn sub2api_available_groups_missing_id_in_rates_falls_back() {
+    // rates 里没有该分组 → 回落到 available 的 rate_multiplier（M12-S2）。
+
     let transport = MockTransport::new(vec![
         sub2api_ok(json!([
             {"id": 1, "name": "default", "description": "", "rate_multiplier": 1.0},
@@ -310,12 +310,50 @@ async fn sub2api_available_groups_missing_id_in_rates_yields_none() {
         .await
         .unwrap();
     assert_eq!(groups[0].rate, Some(0.5));
+    assert_eq!(groups[1].rate, Some(1.2), "rates 缺失 → 回落到基准倍率 1.2");
+}
+
+#[tokio::test]
+async fn sub2api_available_groups_no_rate_multiplier_yields_none() {
+    // available 里没有 rate_multiplier，rates 也没有该分组 → rate = None。
+    let transport = MockTransport::new(vec![
+        sub2api_ok(json!([
+            {"id": 1, "name": "default", "description": ""},
+        ])),
+        sub2api_ok(json!({})),
+    ]);
+    let adapter = Sub2Api::new(transport);
+    let groups = adapter
+        .available_groups(SUB2API_BASE, &bearer_session())
+        .await
+        .unwrap();
     assert_eq!(
-        groups[1].rate, None,
-        "没有专属倍率时必须留空，不得回落到基准倍率 1.2"
+        groups,
+        vec![group("default", None, None)],
+        "既无覆盖倍率也无基准倍率 → rate = None"
     );
 }
 
+#[tokio::test]
+async fn sub2api_available_groups_rate_multiplier_zero() {
+    // rate_multiplier = 0（免费分组）且无覆盖 → 回落显示 Some(0.0)。
+    let transport = MockTransport::new(vec![
+        sub2api_ok(json!([
+            {"id": 1, "name": "free", "description": "免费", "rate_multiplier": 0},
+        ])),
+        sub2api_ok(Value::Null),
+    ]);
+    let adapter = Sub2Api::new(transport);
+    let groups = adapter
+        .available_groups(SUB2API_BASE, &bearer_session())
+        .await
+        .unwrap();
+    assert_eq!(
+        groups,
+        vec![group("free", Some(0.0), Some("免费"))],
+        "rate_multiplier = 0 → 回落后为 Some(0.0)"
+    );
+}
 #[tokio::test]
 async fn sub2api_available_groups_empty_description_is_none() {
     let transport = MockTransport::new(vec![
