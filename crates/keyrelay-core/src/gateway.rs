@@ -564,12 +564,35 @@ fn presented_token(headers: &HeaderMap) -> Option<String> {
         .get("x-keyrelay-token")
         .and_then(|v| v.to_str().ok())
     {
-        return Some(value.to_string());
+        // P3-6：x-keyrelay-token 也要 trim（与 Bearer 路径同口径）。
+        return Some(value.trim().to_string());
     }
     let auth = headers.get("authorization")?.to_str().ok()?;
-    auth.strip_prefix("Bearer ")
-        .or_else(|| auth.strip_prefix("bearer "))
-        .map(|s| s.trim().to_string())
+    // P3-6：Bearer scheme 大小写不敏感（RFC 7235 scheme 是 case-insensitive），
+    // 不只认 "Bearer"/"bearer" 两种。
+    let (scheme, rest) = auth.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    Some(rest.trim().to_string())
+}
+
+/// P3-6：恒定时间比较令牌。`==` / `!=` 在第一个不匹配字节就提前返回，理论上能
+/// 计时侧信道泄漏令牌前缀。本地令牌长期有效，值得用恒定时间比较：异或累积差异，
+/// 最后判零——长度不同也走完 `min` 个字节。
+fn constant_time_eq(a: Option<&str>, b: &str) -> bool {
+    match a {
+        Some(a) => {
+            let a = a.as_bytes();
+            let b = b.as_bytes();
+            let mut diff: u8 = (a.len() != b.len()) as u8;
+            for i in 0..a.len().min(b.len()) {
+                diff |= a[i] ^ b[i];
+            }
+            diff == 0
+        }
+        None => false,
+    }
 }
 
 fn unauthorized(message: &str) -> Response {
@@ -594,7 +617,10 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
 
 async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     // ① 令牌校验：不通过就**不转发**
-    if presented_token(request.headers()).as_deref() != Some(state.config.token.as_str()) {
+    if !constant_time_eq(
+        presented_token(request.headers()).as_deref(),
+        state.config.token.as_str(),
+    ) {
         return unauthorized("缺少或错误的本地令牌");
     }
 
@@ -1332,6 +1358,41 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", HeaderValue::from_static("Basic abc"));
         assert_eq!(presented_token(&headers), None, "非 Bearer 不认");
+    }
+
+    #[test]
+    fn presented_token_accepts_bearer_case_insensitively_and_trims() {
+        // P3-6：Bearer scheme 大小写不敏感（不只认 "Bearer"/"bearer"）；
+        // x-keyrelay-token 也要 trim（与 Bearer 路径同口径）。
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("BEARER abc"));
+        assert_eq!(presented_token(&headers).as_deref(), Some("abc"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("BeArEr abc"));
+        assert_eq!(presented_token(&headers).as_deref(), Some("abc"));
+
+        // 令牌前后空白要 trim
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer  abc "));
+        assert_eq!(presented_token(&headers).as_deref(), Some("abc"));
+
+        // x-keyrelay-token 也 trim
+        let mut headers = HeaderMap::new();
+        headers.insert("x-keyrelay-token", HeaderValue::from_static("  xyz  "));
+        assert_eq!(presented_token(&headers).as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn constant_time_eq_is_correct() {
+        // P3-6：相等 ⇒ true；不等 ⇒ false；长度不同 ⇒ false。
+        assert!(constant_time_eq(Some("abc"), "abc"));
+        assert!(!constant_time_eq(Some("abc"), "abd"));
+        assert!(!constant_time_eq(Some("abc"), "abcd"));
+        assert!(!constant_time_eq(Some("abcd"), "abc"));
+        assert!(!constant_time_eq(None, "abc"));
+        assert!(!constant_time_eq(Some(""), "abc"));
+        assert!(constant_time_eq(Some(""), ""));
     }
 
     #[test]
