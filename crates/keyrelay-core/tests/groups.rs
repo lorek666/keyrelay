@@ -1,7 +1,6 @@
 //! M6-S4 契约测试：**分组与倍率**。
 //!
-//! - NewAPI：`GET /api/token/auto-groups`（真实形态见 `crates/keyrelay-core/src/site/newapi.rs`
-//!   的 `parse_auto_groups` 文档与 `docs/specs/M6-S4-站点能力.md` §5.1）。
+//! - NewAPI：`GET /api/user/self/groups`（M12-S1：替代旧的 `/api/token/auto-groups`）。
 //! - Sub2API：`GET /api/v1/groups/available` + `GET /api/v1/groups/rates` 两次调用合并。
 //!
 //! 本文件用的是**假 transport**，不代表真实站点已验证（M6-S4 spec §9）。
@@ -58,10 +57,10 @@ fn group(name: &str, rate: Option<f64>, description: Option<&str>) -> GroupInfo 
 // ============================================================ NewAPI
 
 #[tokio::test]
-async fn newapi_available_groups_hits_auto_groups_endpoint() {
+async fn newapi_available_groups_hits_user_groups_endpoint() {
     let transport = MockTransport::new(vec![newapi_ok(json!({
-        "groups": ["default", "vip"],
-        "max_count": 3,
+        "default": {"ratio": 1, "desc": "默认分组"},
+        "vip": {"ratio": 0.5, "desc": "VIP 折扣"}
     }))]);
     let adapter = NewApi::new(transport);
 
@@ -72,15 +71,18 @@ async fn newapi_available_groups_hits_auto_groups_endpoint() {
 
     assert_eq!(
         groups,
-        vec![group("default", None, None), group("vip", None, None)],
-        "顺序与站点一致，站点不给倍率时 rate = None"
+        vec![
+            group("default", Some(1.0), Some("默认分组")),
+            group("vip", Some(0.5), Some("VIP 折扣"))
+        ],
+        "顺序与站点一致，带倍率与描述"
     );
 
     let requests = adapter.transport().requests();
     assert_eq!(requests.len(), 1, "只发一次请求");
     assert_eq!(
         requests[0].url,
-        "https://newapi.example.com/api/token/auto-groups"
+        "https://newapi.example.com/api/user/self/groups"
     );
     assert_eq!(
         requests[0].method,
@@ -98,11 +100,11 @@ async fn newapi_available_groups_hits_auto_groups_endpoint() {
 
 #[tokio::test]
 async fn newapi_available_groups_rate_is_none_when_site_has_no_rate_field() {
-    // 真实形态：站点只回分组名（`service.GetUserAutoGroup` → []string），没有倍率字段。
-    // 章程 §4.4：「rate 取站点字段，缺省 None」——不得凭空补一个 1.0。
+    // 分组条目没有 ratio/rate 字段时，rate = None（章程 §4.4：「rate 取站点字段，缺省 None」）。
     let transport = MockTransport::new(vec![newapi_ok(json!({
-        "groups": ["a", "b", "c"],
-        "max_count": 5,
+        "a": {"desc": "分组 A"},
+        "b": {"desc": "分组 B"},
+        "c": {"desc": "分组 C"}
     }))]);
     let adapter = NewApi::new(transport);
 
@@ -112,21 +114,15 @@ async fn newapi_available_groups_rate_is_none_when_site_has_no_rate_field() {
         .unwrap();
     assert_eq!(groups.len(), 3);
     assert!(groups.iter().all(|g| g.rate.is_none()), "{groups:?}");
-    assert!(groups.iter().all(|g| g.description.is_none()), "{groups:?}");
 }
 
 #[tokio::test]
 async fn newapi_available_groups_accepts_object_entries() {
-    // 兼容形态（真实站点未观察到，spec D-6）：对象条目才可能带倍率字段。
+    // 新格式：data 是 {name: {ratio, desc}} 对象；desc 可以缺失或空。
     let transport = MockTransport::new(vec![newapi_ok(json!({
-        "groups": [
-            {"name": "vip", "rate": 0.8, "description": "高级"},
-            {"name": "std", "ratio": 1.5},
-            {"name": ""},
-            42,
-            "basic",
-        ],
-        "max_count": 9,
+        "vip": {"ratio": 0.8, "desc": "高级"},
+        "std": {"ratio": 1.5},
+        "basic": {"desc": ""}
     }))]);
     let adapter = NewApi::new(transport);
 
@@ -146,7 +142,7 @@ async fn newapi_available_groups_accepts_object_entries() {
 
 #[tokio::test]
 async fn newapi_available_groups_empty_list_is_ok() {
-    let transport = MockTransport::new(vec![newapi_ok(json!({"groups": [], "max_count": 3}))]);
+    let transport = MockTransport::new(vec![newapi_ok(json!({}))]);
     let adapter = NewApi::new(transport);
     assert!(adapter
         .available_groups(NEWAPI_BASE, &cookie_session())
@@ -157,11 +153,12 @@ async fn newapi_available_groups_empty_list_is_ok() {
 
 #[tokio::test]
 async fn newapi_available_groups_missing_field_is_an_error() {
-    // 静默返回空列表等于告诉用户「站点没有可选分组」——必须报错。
+    // data 不是对象时必须报错（空对象 {} 是合法的——返回空 Vec）。
     for data in [
-        json!({"max_count": 3}),
-        json!({"groups": "oops"}),
+        json!(["default", "vip"]),
+        json!("oops"),
         Value::Null,
+        json!(42),
     ] {
         let transport = MockTransport::new(vec![newapi_ok(data.clone())]);
         let adapter = NewApi::new(transport);
@@ -170,22 +167,23 @@ async fn newapi_available_groups_missing_field_is_an_error() {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, Error::Transport(ref m) if m.contains("groups")),
+            matches!(err, Error::Transport(ref m) if m.contains("对象")),
             "{data} → {err:?}"
         );
     }
 }
 
 #[tokio::test]
-async fn newapi_available_groups_unrecognized_entries_error() {
-    let transport = MockTransport::new(vec![newapi_ok(json!({"groups": [1, true, null]}))]);
+async fn newapi_available_groups_non_object_data_errors() {
+    // data 是数组而不是对象 → 报错
+    let transport = MockTransport::new(vec![newapi_ok(json!([1, true, null]))]);
     let adapter = NewApi::new(transport);
     let err = adapter
         .available_groups(NEWAPI_BASE, &cookie_session())
         .await
         .unwrap_err();
     assert!(
-        matches!(err, Error::Transport(ref m) if m.contains("分组名")),
+        matches!(err, Error::Transport(ref m) if m.contains("对象")),
         "{err:?}"
     );
 }
@@ -202,7 +200,7 @@ async fn newapi_available_groups_maps_http_and_envelope_failures() {
 
     let transport = MockTransport::new(vec![newapi_ok(Value::Null)]);
     let adapter = NewApi::new(transport);
-    // data = null → 缺少 groups 数组
+    // data = null → 不是对象
     let err = adapter
         .available_groups(NEWAPI_BASE, &cookie_session())
         .await
@@ -457,16 +455,13 @@ async fn groups_errors_never_carry_site_echoed_secret() {
 #[tokio::test]
 async fn newapi_available_groups_rates_follow_parse_rate_semantics() {
     let transport = MockTransport::new(vec![newapi_ok(json!({
-        "groups": [
-            {"name": "free", "rate": 0},
-            {"name": "neg", "rate": -1},
-            {"name": "str", "rate": "2"},
-            {"name": "bad", "rate": "abc"},
-            {"name": "nul", "rate": null},
-            {"name": "ratio", "ratio": 0.5},
-            {"name": "inf", "rate": "inf"},
-        ],
-        "max_count": 9,
+        "free": {"ratio": 0},
+        "neg": {"ratio": -1},
+        "str": {"ratio": "2"},
+        "bad": {"ratio": "abc"},
+        "nul": {"ratio": null},
+        "ratio": {"ratio": 0.5},
+        "inf": {"ratio": "inf"}
     }))]);
     let adapter = NewApi::new(transport);
 
