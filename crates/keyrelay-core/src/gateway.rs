@@ -334,6 +334,11 @@ pub struct GatewayFailure {
     pub site_id: i64,
     pub status: u16,
     pub model: String,
+    /// P2-10 / P2-11（DEBUG-REPORT-v3 §2-10 / §2-11）：人话原因，让事件表能区分
+    /// 「全部熔断」「缺明文」「已回收」三种 status=0，以及「传输层失败（超时 / 连不上）」
+    /// 与「上游真回 502」两种 status=502。M7 冻结的三字段是结构白名单（装不下密钥），
+    /// `reason` 是可显示的人话，不破坏白名单意图；调用方负责先 `scrub` 再传入。
+    pub reason: String,
 }
 
 impl std::fmt::Debug for GatewayConfig {
@@ -678,6 +683,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
             candidates[0].site_id,
             0,
             &model.clone().unwrap_or_default(),
+            "所有候选上游都在熔断冷却中",
             Instant::now(),
         );
         return (
@@ -742,6 +748,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                         upstream.site_id,
                         status,
                         &event_model,
+                        &format!("上游返回可切换状态码 HTTP {status}"),
                         Instant::now(),
                     );
                     if !is_last {
@@ -758,7 +765,17 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 observe(&state, upstream.site_id, latency_ms, false);
                 // 传输层失败没有 HTTP 状态码：按 502 记（与 legacy 路径的错误码一致）并切下一个。
-                report_failure(&state, upstream.site_id, 502, &event_model, Instant::now());
+                report_failure(
+                    &state,
+                    upstream.site_id,
+                    502,
+                    &event_model,
+                    &format!(
+                        "传输层失败（连不上 / 超时）: {}",
+                        crate::redact::scrub(&message)
+                    ),
+                    Instant::now(),
+                );
                 last_error = Some(message);
                 if is_last {
                     break;
@@ -792,6 +809,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
             upstream.site_id,
             status,
             &event_model,
+            reason,
             Instant::now(),
         );
     }
@@ -959,7 +977,14 @@ fn record_success(state: &AppState, site_id: i64, now: Instant) {
 ///
 /// 出口是 `Option<Arc<dyn Fn>>`：网关不该为了记一条事件而拿到整个存储层；
 /// 也让测试能把事件捕获到 `Vec` 里**逐字段**断言白名单。
-fn report_failure(state: &AppState, site_id: i64, status: u16, model: &str, now: Instant) {
+fn report_failure(
+    state: &AppState,
+    site_id: i64,
+    status: u16,
+    model: &str,
+    reason: &str,
+    now: Instant,
+) {
     if let Ok(mut guard) = state.breaker.lock() {
         guard.record_failure(site_id, now);
     }
@@ -967,14 +992,15 @@ fn report_failure(state: &AppState, site_id: i64, status: u16, model: &str, now:
         sink(GatewayFailure {
             site_id,
             status,
-            // **在值被创造的地方脱敏**（M7-S1 复审 P1-1）：`model` 是调用方自由文本，
-            // 可以是任何字符串——包括一把 `sk-…`。出口 `store.insert_event` 原样入库，
-            // 所以脱敏不能推给下游。
+            // **在值被创造的地方脱敏**（M7-S1 复审 P1-1）：`model` 与 `reason` 都是调用方
+            // 自由文本，可以是任何字符串——包括一把 `sk-…`。出口 `store.insert_event`
+            // 原样入库，所以脱敏不能推给下游。
             //
             // 边界：模型名**整体**就是一把密钥时（`sk-…`），`scrub` 会把整条打掉，
             // 事件里只剩 `sk-…`——那是对的取舍（密钥绝不能外流；而那种情况下
             // 「这是哪个模型」本来也没有可用信息）。正常的模型名（`gpt-5.6`）原样通过。
             model: crate::redact::scrub(model),
+            reason: crate::redact::scrub(reason),
         });
     }
 }
