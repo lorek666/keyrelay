@@ -828,6 +828,8 @@ const AGENT_CHANNELS: Record<string, string> = {
   deepseek: "deepseek",
   trae: "trae",
   "mimo-code": "mimo-code",
+  "cline-desktop": "cline-desktop",
+  "dsh": "dsh",
 };
 
 /**
