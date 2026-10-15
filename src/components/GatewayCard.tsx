@@ -267,7 +267,15 @@ export default function GatewayCard({
           min={1024}
           max={65535}
           value={port}
-          onChange={(e) => onPortChange(Number(e.target.value))}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            // P3-14 / DEBUG-REPORT-v3 §3-14：与后端口径一致（≥1024 ≤65535）——
+            // min/max 是 HTML 提示，浏览器不强制，用户仍能输入 80 等特权端口；
+            // 超出范围不调 onPortChange（受控 value 不更新，输入被拒）。
+            if (Number.isFinite(n) && n >= 1024 && n <= 65535) {
+              onPortChange(n);
+            }
+          }}
         />
       </label>
       {settingsDirty ? (
