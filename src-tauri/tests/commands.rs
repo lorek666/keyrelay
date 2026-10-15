@@ -1122,6 +1122,67 @@ fn gateway_rotate_token_refuses_mismatched_key_and_keeps_gateway_running() {
     invoke_on(&webview, "gateway_stop", json!({})).expect("收尾停止");
 }
 
+#[test]
+fn gateway_rotate_token_restarts_the_running_gateway_with_the_new_token() {
+    // P2-7 / DEBUG-REPORT-v3 §2-7：rotate 之后运行中的网关要用**新令牌**。旧实现在
+    // rotate 之前构造 config，start 用旧令牌，网关仍认旧令牌 ⇒ 指向网关的 agent
+    //（新令牌）401/502，直到手动重启。现在 rotate 后重新构造 config。
+    use tauri::Manager;
+
+    let (_app, webview) = build_app();
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("探端口");
+        probe.local_addr().expect("读端口").port()
+    };
+    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let site = state
+        .service
+        .store()
+        .upsert_site("newapi", "https://relay.example.com", "P2-7 站")
+        .expect("写站点");
+    let key = state
+        .service
+        .store_key_material(
+            site,
+            "codex/daily",
+            Some("12"),
+            None,
+            "sk-a-0123456789abcdef",
+        )
+        .expect("写密钥")
+        .id;
+    enable_gateway(&webview, port);
+
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key}}),
+    )
+    .expect("启动");
+    let token_before = started["token"]
+        .as_str()
+        .expect("启动返回 token")
+        .to_string();
+
+    let rotated = invoke_on(
+        &webview,
+        "gateway_rotate_token",
+        json!({"args": {"siteId": site, "keyId": key}}),
+    )
+    .expect("rotate 成功");
+    let token_after = rotated["token"]
+        .as_str()
+        .expect("rotate 返回新 token")
+        .to_string();
+
+    assert_ne!(
+        token_before, token_after,
+        "rotate 后运行中网关的令牌必须换掉（P2-7：start 要用新令牌，不是 rotate 之前那份旧 config）"
+    );
+
+    invoke_on(&webview, "gateway_stop", json!({})).expect("收尾停止");
+}
+
 // ---------- M8-S2：人工过验证码（IPC 可达性与业务前置） ----------
 
 #[test]
