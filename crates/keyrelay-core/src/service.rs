@@ -722,6 +722,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 用的时候 401 才知道，`mark_needs_login` 会清掉坏的）。
     pub fn restore_sessions(&self) {
         let Ok(sites) = self.store.list_sites() else {
+            // best-effort 不阻断启动，但留诊断事件（复审 Low 修正）：否则用户重启后
+            // 未恢复任何 session 时日志无痕，无法区分"没登录过"和"list_sites 失败"。
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "store",
+                "恢复会话失败：无法列举站点",
+                serde_json::json!({}),
+            ));
             return;
         };
         for site in sites {
@@ -1145,18 +1153,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     pub fn remove_site(&self, site_id: i64) -> Result<()> {
         self.sessions.invalidate(site_id);
         self.set_captcha_phase(site_id, CaptchaPhase::Idle);
+        // 先删钥匙串持久化 session，再删 DB 行（复审 High 修正）。
+        // 原顺序（先 DB 后钥匙串 best-effort）在 vault.delete 失败时留孤儿 session_ref：
+        // site_id 已从 list_sites 消失，owned_secret_refs 兜不住，rowid 复用后同 id 新站
+        // restore 会套用旧站 session → 跨站串号。现改为 vault.delete 先且 `?` 传播：
+        // 钥匙串失败则 DB 不删、站点仍在、session 仍在，一致无孤儿；用户可重试删站。
+        // `delete` 幂等（vault/mod.rs:57），无条目也 Ok，重复删站不报错。
+        self.vault.delete(&self.session_ref(site_id))?;
         self.store.delete_site(site_id)?;
-        // 删站后清理钥匙串里的持久化 session（M13-S1）。与清 cache 同理：SQLite rowid
-        // 会复用，旧站的持久化 session 若留着，下次同 id 新站 restore 时会被套用，跨站串号。
-        // best-effort：删失败留孤儿条目，不掩盖已成功的删站。
-        if let Err(err) = self.vault.delete(&self.session_ref(site_id)) {
-            self.log(observability::event_with_payload(
-                Level::Warn,
-                "vault",
-                format!("删除持久化会话失败: {err}"),
-                serde_json::json!({ "site_id": site_id }),
-            ));
-        }
         Ok(())
     }
 
@@ -2942,8 +2946,18 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // 与 GATEWAY_TOKEN_REF 同口径：先 `has` 再列，避免「清掉几条」数字虚高。
         for site in self.store.list_sites()? {
             let reference = self.session_ref(site.id);
-            if self.vault.has(&reference)? {
-                refs.push(reference);
+            // per-site `has` 失败不中断整体枚举（复审 Low 修正）：单点钥匙串 IO 故障时，
+            // 跳过该站点的 session_ref（清不掉它），但其他站点仍能列出。整体 `?` 失败
+            // 会让 purge 清不掉任何条目（含 keys、gateway），爆炸半径更大。
+            match self.vault.has(&reference) {
+                Ok(true) => refs.push(reference),
+                Ok(false) => {}
+                Err(err) => self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "vault",
+                    format!("枚举持久化会话失败，跳过该站点: {err}"),
+                    serde_json::json!({ "site_id": site.id }),
+                )),
             }
         }
         refs.sort();
@@ -4599,16 +4613,137 @@ mod tests {
             .await
             .unwrap();
         let reference = service.session_ref(site.id);
-        assert!(
-            service.vault.has(&reference).unwrap(),
-            "login 后应有持久化"
-        );
+        assert!(service.vault.has(&reference).unwrap(), "login 后应有持久化");
 
         let _ = service.list_keys(site.id).await; // 401
 
         assert!(
             !service.vault.has(&reference).unwrap(),
             "401 后必须删掉持久化 session"
+        );
+    }
+
+    /// 钥匙串 `delete` 永远失败的 Vault（证伪 High：vault.delete 失败时 remove_site
+    /// 必须不删 DB，防 rowid 复用跨站串号）。其余方法委托 `MemoryVault`。
+    struct FailingDeleteVault {
+        inner: crate::vault::MemoryVault,
+    }
+    impl FailingDeleteVault {
+        fn new() -> Self {
+            Self {
+                inner: crate::vault::MemoryVault::new(),
+            }
+        }
+    }
+    impl crate::vault::Vault for FailingDeleteVault {
+        fn backend_name(&self) -> &'static str {
+            "failing-delete"
+        }
+        fn probe(&self) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn put(&self, key: &str, secret: &str) -> crate::error::Result<()> {
+            self.inner.put(key, secret)
+        }
+        fn get(&self, key: &str) -> crate::error::Result<Option<String>> {
+            self.inner.get(key)
+        }
+        fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Err(crate::error::Error::Vault("模拟钥匙串删除失败".into()))
+        }
+    }
+
+    /// `has` 对 `kr/site/` 前缀失败的 Vault（证伪 Low：per-site has 失败不中断
+    /// owned_secret_refs 整体枚举）。其余方法委托 `MemoryVault`。
+    struct SiteHasFailingVault {
+        inner: crate::vault::MemoryVault,
+    }
+    impl SiteHasFailingVault {
+        fn new() -> Self {
+            Self {
+                inner: crate::vault::MemoryVault::new(),
+            }
+        }
+    }
+    impl crate::vault::Vault for SiteHasFailingVault {
+        fn backend_name(&self) -> &'static str {
+            "site-has-failing"
+        }
+        fn probe(&self) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn put(&self, key: &str, secret: &str) -> crate::error::Result<()> {
+            self.inner.put(key, secret)
+        }
+        fn get(&self, key: &str) -> crate::error::Result<Option<String>> {
+            self.inner.get(key)
+        }
+        fn has(&self, key: &str) -> crate::error::Result<bool> {
+            if key.starts_with("kr/site/") {
+                Err(crate::error::Error::Vault("模拟站点会话枚举失败".into()))
+            } else {
+                self.inner.has(key)
+            }
+        }
+        fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_site_vault_delete_failure_keeps_site_and_session() {
+        // 复审 High：vault.delete 失败时 remove_site 必须不删 DB（`?` 传播），
+        // 站点仍在、session 仍在，一致无孤儿——否则 rowid 复用后同 id 新站
+        // restore 套用旧站 session → 跨站串号。
+        let store = Store::open_in_memory().unwrap();
+        let config = ServiceConfig {
+            vault: Arc::new(FailingDeleteVault::new()),
+            ..test_config()
+        };
+        let service =
+            KeyRelayService::new(store, MockTransport::new(vec![status_response()]), config);
+        let site = service.add_site("https://relay.example.com").await.unwrap();
+        let reference = service.session_ref(site.id);
+        service.vault.put(&reference, "{}").unwrap();
+        assert!(
+            service.vault.has(&reference).unwrap(),
+            "前置：有持久化 session"
+        );
+
+        let err = service.remove_site(site.id);
+        assert!(
+            err.is_err(),
+            "vault.delete 失败时 remove_site 必须整体失败（? 传播）"
+        );
+        assert!(
+            service.site(site.id).is_ok(),
+            "vault.delete 失败时 DB 不该删（防 rowid 复用串号）"
+        );
+        assert!(
+            service.vault.has(&reference).unwrap(),
+            "vault.delete 失败时 session 不该被删（站点仍在，一致无孤儿）"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_secret_refs_skips_site_when_has_fails() {
+        // 复审 Low：per-site has 失败不中断整体枚举。site 的 has 失败时，
+        // 该站点的 session_ref 被跳过，owned_secret_refs 仍返回 Ok。
+        let store = Store::open_in_memory().unwrap();
+        let config = ServiceConfig {
+            vault: Arc::new(SiteHasFailingVault::new()),
+            ..test_config()
+        };
+        let service =
+            KeyRelayService::new(store, MockTransport::new(vec![status_response()]), config);
+        let site = service.add_site("https://relay.example.com").await.unwrap();
+        let reference = service.session_ref(site.id);
+        service.vault.put(&reference, "{}").unwrap();
+
+        let refs = service.owned_secret_refs().unwrap();
+        assert!(
+            !refs.contains(&reference),
+            "site has 失败时 session_ref 该被跳过: {refs:?}"
         );
     }
 }
