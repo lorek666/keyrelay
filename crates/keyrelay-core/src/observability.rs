@@ -84,11 +84,17 @@ fn now_secs() -> i64 {
 
 /// 唯一入口（无载荷）。
 pub fn event(level: Level, source: &str, message: impl AsRef<str>) -> Event {
+    let scrubbed = scrub(message.as_ref());
     Event {
         ts: now_secs(),
         level,
         source: normalize_source(source),
-        message: scrub(message.as_ref()),
+        // P2-25 / DEBUG-REPORT-v3 §2-25：message 再过一遍 mask_authority_userinfo——
+        // scrub 的 mask_url_userinfo 为 JSON 文本安全把 `"` 当 authority 终止符，
+        // 自由文本里「带引号密码的 URL」会在 `"` 处截断、找不到 `@` ⇒ 原样落库。
+        // mask_authority_userinfo 不把引号当终止符，能掩住。宁可多掩（email 本地部分
+        // 也会被掩成 `***@host`）——漏一个密码的代价不可撤销。
+        message: crate::redact::mask_authority_userinfo(&scrubbed),
         payload: None,
     }
 }
@@ -139,6 +145,30 @@ mod tests {
         let e = event(Level::Info, "key", format!("已获取密钥 {SECRET}"));
         assert!(!e.message.contains(SECRET), "{}", e.message);
         assert!(e.message.contains("sk-***"), "{}", e.message);
+    }
+
+    #[test]
+    fn scrubs_a_url_with_a_quoted_password_in_the_message() {
+        // P2-25 / DEBUG-REPORT-v3 §2-25：带引号密码的 URL 在自由文本里——scrub 的
+        // mask_url_userinfo 把 `"` 当 authority 终止符（为 JSON 文本安全），在 `"` 处
+        // 截断找不到 `@` ⇒ 原样落库。event() 的 message 再过 mask_authority_userinfo
+        //（不把引号当终止符）掩住。
+        let pw = "p\"ass";
+        let e = event(
+            Level::Info,
+            "site",
+            format!("登录失败：见 https://carol:{pw}@relay.example.com/x"),
+        );
+        assert!(
+            !e.message.contains("ass"),
+            "带引号密码的 URL 不得原样进文案: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("relay.example.com"),
+            "主机名仍要点出: {}",
+            e.message
+        );
     }
 
     #[test]
