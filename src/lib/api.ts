@@ -1077,6 +1077,25 @@ export async function updateSettings(settings: Settings): Promise<Settings> {
   return invokeCommand<Settings>("update_settings", { args: { settings } });
 }
 
+/** `detect_system_proxy` 的返回（M10-S2）：auto 模式下探测到的系统代理（已脱敏）。 */
+export type DetectedSystemProxy = {
+  /** 来源：`macos-system` / `windows-registry` / 环境变量名 / `manual`；`null` = 未检测到 */
+  source: string | null;
+  /** 脱敏后的 URL（含 userinfo 时只显示 `scheme://***@host:port`）；`null` = 未检测到 */
+  maskedUrl: string | null;
+};
+
+/**
+ * 探测系统代理（M10-S2）：只读，不改设置。供设置页「自动」模式展示检测结果。
+ * 无 Tauri 环境（mock）返回未检测到。
+ */
+export async function detectSystemProxy(): Promise<DetectedSystemProxy> {
+  if (!hasTauri) {
+    return mock({ source: null, maskedUrl: null });
+  }
+  return invokeCommand<DetectedSystemProxy>("detect_system_proxy");
+}
+
 export async function refreshAll(): Promise<RefreshSummary> {
   if (!hasTauri) {
     return mock({

@@ -1004,6 +1004,35 @@ pub fn update_settings(
     Ok(settings_to_dto(&settings))
 }
 
+/// `detect_system_proxy` 的返回：auto 模式下探测到的系统代理（已脱敏）。
+///
+/// `source` / `maskedUrl` 都是 `None` ⇒ 未检测到系统代理（auto 模式将直连）。
+/// **不返回原始 URL**：`maskedUrl` 经 `DetectedProxy::masked_url` 脱敏，明文不过 IPC。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectProxyDto {
+    pub source: Option<String>,
+    pub masked_url: Option<String>,
+}
+
+/// 探测系统代理（M10-S2）：供设置页「自动」模式展示「检测到 …（来源 …）」。
+///
+/// 只读、不落库、不改设置；探测是 `scutil` / `reg query` / 环境变量，无副作用。
+/// 失败（探测不到）⇒ `DetectProxyDto { source: None, masked_url: None }`，不报错。
+#[tauri::command]
+pub fn detect_system_proxy() -> DetectProxyDto {
+    match keyrelay_core::proxy::detect_system_proxy() {
+        Some(d) => DetectProxyDto {
+            source: Some(d.source.as_str().to_string()),
+            masked_url: Some(d.masked_url()),
+        },
+        None => DetectProxyDto {
+            source: None,
+            masked_url: None,
+        },
+    }
+}
+
 // ============================================ 网关 / 导出 / 备份清理（M4-S2）
 
 fn gateway_status_of(state: &AppState) -> GatewayStatusDto {

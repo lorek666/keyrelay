@@ -123,6 +123,19 @@ fn app_info_returns_expected_shape() {
 }
 
 #[test]
+fn detect_system_proxy_returns_shape_without_acl_rejection() {
+    // M10-S2：命令必须可达（被 ACL 拒绝时 `invoke` 返回 Err，这里 expect 就会失败），
+    // 且返回 {source, maskedUrl} 两个键。不断言具体值——本机是否配了系统代理不确定，
+    // source/maskedUrl 各自 Some 或 null 都合法。
+    let value = invoke("detect_system_proxy").expect("detect_system_proxy 应可达");
+    assert!(value.get("source").is_some(), "应含 source 键: {value}");
+    assert!(
+        value.get("maskedUrl").is_some(),
+        "应含 maskedUrl 键: {value}"
+    );
+}
+
+#[test]
 fn list_sites_returns_empty_array_on_fresh_state() {
     let value = invoke("list_sites").expect("list_sites 应成功");
     assert_eq!(value, json!([]));

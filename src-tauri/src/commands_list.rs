@@ -30,6 +30,7 @@ pub const COMMANDS: &[&str] = &[
     "drift_report",
     "get_settings",
     "update_settings",
+    "detect_system_proxy",
     "refresh_all",
     "audit_redaction",
     "gateway_status",

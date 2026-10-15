@@ -5,6 +5,7 @@ import { ShieldCheck } from "lucide-react";
 import {
   auditRedaction,
   autostartStatus,
+  detectSystemProxy,
   exportBundle,
   exportDiagnostics,
   getSettings,
@@ -44,6 +45,21 @@ function intInRange(raw: number, min: number, max: number): number | null {
 function finiteNonNegative(raw: number, max: number): number | null {
   if (!Number.isFinite(raw) || raw < 0 || raw > max) return null;
   return raw;
+}
+
+/** M10-S2：把 `ProxySource::as_str` 的英文串翻成中文来源标签（仅展示）。 */
+function proxySourceLabel(source: string): string {
+  switch (source) {
+    case "macos-system":
+      return "macOS 系统设置";
+    case "windows-registry":
+      return "Windows 注册表";
+    case "manual":
+      return "手动";
+    default:
+      // 环境变量名（如 HTTPS_PROXY）原样展示
+      return source;
+  }
 }
 
 const PRESETS = [
@@ -337,6 +353,15 @@ export default function SettingsPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // M10-S2：auto 模式下展示「检测到的系统代理」。只读，不改设置。
+  const detected = useQuery({
+    queryKey: ["detect-system-proxy"],
+    queryFn: detectSystemProxy,
+    retry: false,
+    // 不必轮询：系统代理变更很少；用户点「重新检测」手动 refetch。
+    staleTime: Infinity,
+  });
+
   useEffect(() => {
     if (current.data && draft === null) setDraft(current.data);
   }, [current.data, draft]);
@@ -548,17 +573,76 @@ export default function SettingsPage() {
               界面目前只有简体中文：选 English 只会记下这个偏好，界面不会切换。
             </p>
             <label className="field">
-              <span>代理（HTTP / SOCKS5，留空 = 直连）</span>
-              <input
-                className="input"
-                type="text"
-                placeholder="socks5://127.0.0.1:1080"
-                value={draft.proxyUrl}
-                onChange={(e) => setDraft({ ...draft, proxyUrl: e.target.value })}
-              />
+              <span>代理</span>
+              <div className="radio-row">
+                <label className="radio">
+                  <input
+                    type="radio"
+                    name="proxy-mode"
+                    value="auto"
+                    checked={draft.proxyMode === "auto"}
+                    onChange={() => setDraft({ ...draft, proxyMode: "auto" })}
+                  />
+                  自动
+                </label>
+                <label className="radio">
+                  <input
+                    type="radio"
+                    name="proxy-mode"
+                    value="manual"
+                    checked={draft.proxyMode === "manual"}
+                    onChange={() => setDraft({ ...draft, proxyMode: "manual" })}
+                  />
+                  手动
+                </label>
+                <label className="radio">
+                  <input
+                    type="radio"
+                    name="proxy-mode"
+                    value="direct"
+                    checked={draft.proxyMode === "direct"}
+                    onChange={() => setDraft({ ...draft, proxyMode: "direct" })}
+                  />
+                  直连
+                </label>
+              </div>
             </label>
+            {draft.proxyMode === "auto" && (
+              <p className="muted">
+                {detected.data && detected.data.source ? (
+                  <>
+                    检测到：<code>{detected.data.maskedUrl}</code>
+                    （来源：{proxySourceLabel(detected.data.source)}）
+                  </>
+                ) : (
+                  "未检测到系统代理，将直连。"
+                )}{" "}
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={() => detected.refetch()}
+                  disabled={detected.isFetching}
+                >
+                  {detected.isFetching ? "检测中…" : "重新检测"}
+                </button>
+              </p>
+            )}
+            {draft.proxyMode === "manual" && (
+              <label className="field">
+                <span>代理地址（HTTP / SOCKS5）</span>
+                <input
+                  className="input"
+                  type="text"
+                  placeholder="socks5://127.0.0.1:1080"
+                  value={draft.proxyUrl}
+                  onChange={(e) => setDraft({ ...draft, proxyUrl: e.target.value })}
+                />
+              </label>
+            )}
+            {draft.proxyMode === "direct" && <p className="muted">不使用任何代理。</p>}
             <p className="muted">
-              代理串的合法性在真正发起请求时校验：写法不合法会直接报错，不会静默降级成直连。
+              代理在下次启动应用时生效（网关上游在重启网关时生效）。代理串的合法性在真正发起请求时
+              校验：写法不合法会直接报错，不会静默降级成直连。
             </p>
           </div>
 
