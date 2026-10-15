@@ -194,6 +194,38 @@ fn http_post(url: &str, token: &str, path: &str, body: &str) -> (u16, String) {
     (status, body.to_string())
 }
 
+/// 极简 HTTP 客户端：GET，无 body（P2-9 / B-98：GET /v1/models 等无 body 请求也要故障切换）。
+fn http_get(url: &str, token: &str, path: &str) -> (u16, String) {
+    let without_scheme = url.trim_start_matches("http://");
+    let mut stream = TcpStream::connect(without_scheme).expect("连接网关");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {without_scheme}\r\nAuthorization: Bearer {token}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).expect("发送请求");
+    stream.flush().ok();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).expect("读响应");
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    let (_, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    (status, body.to_string())
+}
+
+async fn get(handle: &GatewayHandle, token: &str, path: &str) -> (u16, String) {
+    let url = format!("http://{}", handle.addr);
+    let token = token.to_string();
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || http_get(&url, &token, &path))
+        .await
+        .expect("阻塞任务")
+}
+
 async fn post(handle: &GatewayHandle, token: &str, body: &str) -> (u16, String) {
     let url = format!("http://{}", handle.addr);
     let token = token.to_string();
@@ -226,6 +258,25 @@ async fn failover_on_503_reaches_the_second_upstream() {
     let (status, body) = post(&handle, &token, &chat_body()).await;
 
     assert_eq!(status, 200, "应当切到第二个上游并拿到 200");
+    assert!(body.contains("site2"), "响应应当来自第二个上游: {body}");
+    assert_eq!(a.request_count(), 1, "首选上游应当被试过一次");
+    assert_eq!(b.request_count(), 1, "第二个上游应当被请求一次");
+
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bodyless_get_request_also_fails_over() {
+    // P2-9 / B-98 / DEBUG-REPORT-v3 §2-9：GET /v1/models 无 body，旧实现只用
+    // preferred() 的单个候选——首选挂了就 502，不切别的上游。现在用 all_candidates()，
+    // 无 body 请求也走故障切换循环。
+    let a = spawn_upstream_always(1, REF_A, "503 Service Unavailable");
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let (handle, token, _failures) = start_routed(&[(&a, 0.1), (&b, 1.0)], long_cooldown()).await;
+
+    let (status, body) = get(&handle, &token, "/v1/models").await;
+
+    assert_eq!(status, 200, "无 body 请求也应当切到第二个上游: {body}");
     assert!(body.contains("site2"), "响应应当来自第二个上游: {body}");
     assert_eq!(a.request_count(), 1, "首选上游应当被试过一次");
     assert_eq!(b.request_count(), 1, "第二个上游应当被请求一次");
