@@ -86,6 +86,8 @@ export default function GatewayCard({
     mutationFn: () => gatewayStart(activeSite!, activeKey!),
     onSuccess: async () => {
       setError(null);
+      // P3-12：重新生成令牌后停启网关 ⇒ 新令牌已生效，rotated 提示该清掉。
+      setRotated(false);
       await qc.invalidateQueries({ queryKey: ["gateway"] });
     },
     onError: (err: Error) => setError(err.message),
@@ -94,6 +96,8 @@ export default function GatewayCard({
   const stop = useMutation({
     mutationFn: gatewayStop,
     onSuccess: async () => {
+      // P3-12：停网关也清掉 rotated 提示（网关已停，旧令牌失效与否不再相关）。
+      setRotated(false);
       await qc.invalidateQueries({ queryKey: ["gateway"] });
     },
     onError: (err: Error) => setError(err.message),
@@ -329,7 +333,17 @@ export default function GatewayCard({
               type="button"
               className="btn btn-danger"
               disabled={rotate.isPending}
-              onClick={() => rotate.mutate()}
+              onClick={() => {
+                // P3-12 / DEBUG-REPORT-v3 §3-12：重新生成令牌是危险操作（旧令牌
+                // 立即失效，指向网关的通道要重投、agent 要重启）——二次确认，避免误点。
+                if (
+                  window.confirm(
+                    "重新生成网关令牌？旧令牌立即失效，指向网关的通道需要重新投递一次。",
+                  )
+                ) {
+                  rotate.mutate();
+                }
+              }}
             >
               <RefreshCw size={14} aria-hidden />{" "}
               {rotate.isPending ? "轮换中…" : "重新生成令牌"}
