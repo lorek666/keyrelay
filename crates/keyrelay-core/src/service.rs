@@ -1614,6 +1614,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
 
             if let Some(Ok(balance)) = &balance {
                 if settings.balance_alert_threshold > 0.0
+                    && balance.known
                     && balance.remaining < settings.balance_alert_threshold
                 {
                     summary.balance_alerts.push(outcome.site_id);
