@@ -223,6 +223,7 @@ export default function Overview() {
         <div className="card">
           <h3>Token 消耗</h3>
           {(() => {
+            const siteName = (id: number) => sites.data?.find((s) => s.id === id)?.displayName ?? `站点${id}`;
             const usageBySite = new Map<number, { prompt: number; completion: number; total: number }>();
             for (const row of gatewayUsage.data ?? []) {
               const cur = usageBySite.get(row.siteId) ?? { prompt: 0, completion: 0, total: 0 };
@@ -240,7 +241,7 @@ export default function Overview() {
                       {Array.from(usageBySite.entries()).map(([siteId, v], i) => (
                         <span key={siteId}>
                           {i > 0 ? ' / ' : ''}
-                          站点{siteId}: {v.total.toLocaleString()} tokens
+                          {siteName(siteId)}: {v.total.toLocaleString()} tokens
                           （输入 {v.prompt.toLocaleString()} / 输出 {v.completion.toLocaleString()}）
                         </span>
                       ))}
@@ -264,7 +265,7 @@ export default function Overview() {
                           return (
                             <span key={siteId}>
                               {i > 0 ? ' / ' : ''}
-                              站点{siteId}: 已用 {latest.used.toFixed(2)} {latest.currency}
+                              {siteName(siteId)}: 已用 {latest.used.toFixed(2)} {latest.currency}
                               / 剩余 {latest.remaining.toFixed(2)}
                               {delta !== null ? `（${delta > 0 ? "+" : ""}${delta.toFixed(2)}）` : ""}
                             </span>

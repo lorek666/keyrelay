@@ -320,6 +320,9 @@ pub struct GatewayConfig {
     pub port: u16,
     /// 本地令牌。**不是**站点密钥。
     pub token: String,
+    /// 绑定的站点 id（M13-S1）：用于 token 用量出口的 `site_id`。
+    /// `single_upstream` 默认 `0`（legacy 兼容）。
+    pub site_id: i64,
     /// 转发目标（站点根，无尾斜杠）。`route` 为空时**只**用它。
     pub base_url: String,
     /// 站点密钥（从钥匙串取）。`route` 为空时**只**用它。
@@ -499,6 +502,7 @@ impl GatewayConfig {
         Self {
             port,
             token,
+            site_id: 0,
             base_url,
             api_key,
             site_display_name,
@@ -1097,7 +1101,7 @@ async fn forward_to(
 ) -> Response {
     let model = model_from_body(&body).unwrap_or_default();
     match send_once(state, method, url, headers, body).await {
-        Ok(response) => into_upstream_response(state, response, 0, &model),
+        Ok(response) => into_upstream_response(state, response, state.config.site_id, &model),
         Err(message) => (
             StatusCode::BAD_GATEWAY,
             axum::Json(serde_json::json!({ "error": message })),
@@ -1980,5 +1984,106 @@ mod tests {
             require_send(handle.shutdown_and_wait());
         }
         let _ = check as fn(GatewayHandle);
+    }
+
+    // ---- M13-S1：token 用量提取测试 ----
+
+    #[test]
+    fn extract_usage_from_json_finds_usage() {
+        let body = br#"{"id":"chatcmpl-1","usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}"#;
+        assert_eq!(extract_usage_from_json(body), Some((100, 50, 150)));
+    }
+
+    #[test]
+    fn extract_usage_from_json_returns_none_when_missing() {
+        let body = br#"{"id":"chatcmpl-1","choices":[]}"#;
+        assert_eq!(extract_usage_from_json(body), None);
+    }
+
+    #[test]
+    fn extract_usage_from_json_returns_none_on_invalid_json() {
+        assert_eq!(extract_usage_from_json(b"not json"), None);
+    }
+
+    #[test]
+    fn extract_usage_from_chunk_finds_usage_in_sse_data() {
+        let chunk = b"data: {\"id\":\"x\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n";
+        assert_eq!(extract_usage_from_chunk(chunk), Some((10, 5, 15)));
+    }
+
+    #[test]
+    fn extract_usage_from_chunk_returns_none_without_usage() {
+        let chunk = b"data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        assert_eq!(extract_usage_from_chunk(chunk), None);
+    }
+
+    #[test]
+    fn extract_usage_from_chunk_returns_none_on_non_utf8() {
+        assert_eq!(extract_usage_from_chunk(b"\xff\xfe"), None);
+    }
+
+    #[tokio::test]
+    async fn cap_stream_with_usage_collects_chunks_and_calls_callback() {
+        use futures_util::StreamExt;
+        let chunks = vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"hello")),
+            Ok(bytes::Bytes::from_static(b" ")),
+            Ok(bytes::Bytes::from_static(b"world")),
+        ];
+        let stream = futures_util::stream::iter(chunks);
+        let collected = Arc::new(Mutex::new(Vec::<bytes::Bytes>::new()));
+        let cb_collected = Arc::clone(&collected);
+        let capped = cap_stream_with_usage(stream, 1024, move |chs| {
+            *cb_collected.lock().unwrap() = chs;
+        });
+        let mut capped = Box::pin(capped);
+        let mut got = Vec::new();
+        while let Some(item) = capped.next().await {
+            got.extend_from_slice(&item.unwrap());
+        }
+        assert_eq!(&got, b"hello world");
+        let collected = collected.lock().unwrap();
+        assert_eq!(collected.len(), 3, "应收集全部 3 个 chunk");
+        assert_eq!(collected[0], b"hello".as_slice());
+        assert_eq!(collected[2], b"world".as_slice());
+    }
+
+    #[tokio::test]
+    async fn cap_stream_with_usage_keeps_only_last_8_chunks() {
+        use futures_util::StreamExt;
+        let chunks: Vec<std::result::Result<bytes::Bytes, std::io::Error>> = (0..12)
+            .map(|i| Ok(bytes::Bytes::from(format!("chunk{i}"))))
+            .collect();
+        let stream = futures_util::stream::iter(chunks);
+        let collected = Arc::new(Mutex::new(Vec::<bytes::Bytes>::new()));
+        let cb_collected = Arc::clone(&collected);
+        let capped = cap_stream_with_usage(stream, 1024, move |chs| {
+            *cb_collected.lock().unwrap() = chs;
+        });
+        let mut capped = Box::pin(capped);
+        while capped.next().await.is_some() {}
+        let collected = collected.lock().unwrap();
+        assert_eq!(collected.len(), 8, "最多保留 8 个 chunk");
+        assert_eq!(collected[0], b"chunk4".as_slice());
+        assert_eq!(collected[7], b"chunk11".as_slice());
+    }
+
+    #[tokio::test]
+    async fn cap_stream_with_usage_errors_on_limit_exceeded() {
+        use futures_util::StreamExt;
+        let chunks = vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"hello")),
+            Ok(bytes::Bytes::from_static(b"!!!")),
+        ];
+        let stream = futures_util::stream::iter(chunks);
+        let capped = cap_stream_with_usage(stream, 5, |_| {});
+        let mut capped = Box::pin(capped);
+        // 第一个 chunk（5 字节）正好不超限
+        let first = capped.next().await.unwrap().unwrap();
+        assert_eq!(first.as_ref(), &b"hello"[..]);
+        // 第二个 chunk 让累计超过 5 字节 ⇒ 错误
+        let second = capped.next().await;
+        assert!(second.is_some(), "第二个 chunk 超限应产生错误");
+        assert!(second.unwrap().is_err());
     }
 }
