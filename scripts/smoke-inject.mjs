@@ -45,7 +45,12 @@ const USAGE =
   "用法: node scripts/smoke-inject.mjs [--agent codex|claude-code|opencode|gemini-cli|continue] [--keep]";
 
 const argv = process.argv.slice(2);
-const unknown = argv.filter((a) => !a.startsWith("--"));
+// P3-16 / DEBUG-REPORT-v3 §3-16：--agent <name> 的值（紧跟 --agent 的那个）不是
+// 未知参数，要跳过——否则 `--agent codex` 里 codex 被当成未知参数 exit 2。
+const unknown = argv.filter((a, i) => {
+  if (i > 0 && argv[i - 1] === "--agent") return false;
+  return !a.startsWith("--");
+});
 if (unknown.length) {
   console.error(`✗ 无法识别的参数：${unknown.join(" ")}\n${USAGE}`);
   process.exit(2);
