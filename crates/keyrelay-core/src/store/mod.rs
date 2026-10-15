@@ -679,6 +679,54 @@ impl Store {
         self.bindings_where("1 = 1", &[])
     }
 
+    /// **当前生效**的通道绑定（P2-16 / DEBUG-REPORT-v3 §2-16）：给 `channel_bindings`
+    /// （批量改指候选、UI 现状）用。
+    ///
+    /// 与 [`Self::all_bindings`] 的区别：同一个 `(agent_id, key_id, target_path)` 上
+    /// 多次重投时，只保留**最新一行**——被同 key 的更新投递取代的旧行不再作为候选列出。
+    /// 否则每重投一次批量候选就多一条重复行（2→4→…），用户对着同一个「文件 × key」
+    /// 看到多个复选框，选了旧的那条等于白写一次（P1-1 误删的根因正是这些旧行）。
+    ///
+    /// 口径与 [`Self::delivery_history`] 的 `superseded` 一致：**同 key 的更新投递**
+    /// 取代旧的；但**换 key 重投**（同 target 不同 key）不算取代——两条都是独立绑定、
+    /// 各自成行（M8-S7 P2-4，`list_channel_bindings_filters_out_unbound_rows` 钉住）。
+    /// 已解绑（`unbound_at IS NOT NULL`）的行也不返回。
+    ///
+    /// 旧行不删（溯源靠它），只是不进候选；看历史走 [`Self::delivery_history`]。
+    pub fn current_bindings(&self) -> Result<Vec<BindingRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT b.id, b.agent_id, b.key_id, b.target_path, b.applied_at, b.unbound_at,
+                        k.site_id, k.remote_id, b.delivery_mode
+                 FROM bindings b JOIN keys k ON k.id = b.key_id
+                 WHERE b.unbound_at IS NULL
+                   AND b.id = (SELECT MAX(b2.id) FROM bindings b2
+                               WHERE b2.agent_id = b.agent_id
+                                 AND b2.key_id = b.key_id
+                                 AND b2.target_path = b.target_path)
+                 ORDER BY b.id",
+            )
+            .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(BindingRow {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    key_id: row.get(2)?,
+                    target_path: row.get(3)?,
+                    applied_at: row.get(4)?,
+                    unbound_at: row.get(5)?,
+                    site_id: row.get(6)?,
+                    remote_id: row.get(7)?,
+                    delivery_mode: row.get(8)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("查询绑定失败: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("读取绑定行失败: {e}")))
+    }
+
     /// 投递历史，最新的在前（M9-S4）。只读。
     ///
     /// **`limit` 只截历史，不截现状**（复审 P2-4）：返回最近 `limit` 行，**外加**所有
