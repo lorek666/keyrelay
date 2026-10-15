@@ -1169,7 +1169,10 @@ fn webhook_body_masks_url_userinfo() {
         NOW,
     ));
     assert!(!payload.contains("alice"), "URL 用户名漏了: {payload}");
-    assert!(!payload.contains("\"pw@"), "URL 密码漏了: {payload}");
+    // P3-31 / DEBUG-REPORT-v3 §3-31：原断言 !contains("\"pw@") 恒真——序列化的
+    // JSON 里 pw 前是 ':' 不是 '"'，就算完全没脱敏也不含 "pw@。改检查真实密码
+    // 片段 :pw@（脱敏后 URL 变 ***@hook，不含 :pw@）。
+    assert!(!payload.contains(":pw@"), "URL 密码漏了: {payload}");
     assert!(!payload.contains("bob"), "句内 URL 用户名漏了: {payload}");
     assert!(!payload.contains("pw2"), "句内 URL 密码漏了: {payload}");
     assert!(
