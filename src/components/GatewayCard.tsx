@@ -516,9 +516,12 @@ export default function GatewayCard({
               disabled={
                 batchApply.isPending ||
                 batchPreview.isPending ||
+                // P2-15：一条都没勾 ⇒ 禁用（与预览按钮同一判据）。
+                Object.values(batchPicked).every((v) => !v) ||
                 // 勾选集必须是**预览集的子集**：有一条勾了却没预览过就不能执行
-                // （P2-3：预览快照与渲染期勾选之间的竞态，单看「预览非空」挡不住）
-                Object.keys(batchPicked).some((k) => !batchPicked[k] || !(k in batchPreviews)) ||
+                // （P2-3：预览快照与渲染期勾选之间的竞态，单看「预览非空」挡不住）。
+                // 只看**勾选的**（batchPicked[k]===true）——取消某个勾选不得永久禁用按钮。
+                Object.keys(batchPicked).some((k) => batchPicked[k] && !(k in batchPreviews)) ||
                 Object.values(batchPreviews).some((p) => typeof p === "string")
               }
               onClick={() => batchApply.mutate()}
