@@ -48,6 +48,8 @@ const CHANNELS = [
   { id: "deepseek", label: "DeepSeek Reasonix（~/.reasonix/config.json）", agent: "deepseek" },
   { id: "trae", label: "Trae（~/.trae/config.json）", agent: "trae" },
   { id: "mimo-code", label: "MiMo Code（~/.mimocode/mimocode.json）", agent: "mimo-code" },
+  { id: "cline-desktop", label: "Cline Desktop（~/.cline/data/settings/providers.json）", agent: "cline-desktop" },
+  { id: "dsh", label: "DeepSeek Harness（~/.dsh/.credentials.yaml）", agent: "dsh" },
 ];
 
 /** 生效策略文案（PRD FR-4:137 / M7-S3）。从 `restartHint` 取值派生，不按通道硬编码。 */

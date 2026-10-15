@@ -11,9 +11,11 @@
 pub mod claude_code;
 pub mod claude_desktop;
 pub mod cline;
+pub mod cline_desktop;
 pub mod codex_auth;
 pub mod cursor;
 pub mod deepseek;
+pub mod dsh;
 pub mod gemini_cli;
 pub mod grok_build;
 pub mod hermes;
@@ -74,10 +76,14 @@ pub enum DeliveryChannel {
     Trae,
     /// `~/.mimocode/mimocode.json`（M14-S2）
     MiMoCode,
+    /// `~/.cline/data/settings/providers.json`（M14-S3）
+    ClineDesktop,
+    /// `~/.dsh/.credentials.yaml`（M14-S3）
+    DeepSeekHarness,
 }
 
 impl DeliveryChannel {
-    pub const ALL: [DeliveryChannel; 17] = [
+    pub const ALL: [DeliveryChannel; 19] = [
         DeliveryChannel::CodexAuthJson,
         DeliveryChannel::ClaudeCodeSettings,
         DeliveryChannel::OpenCode,
@@ -95,6 +101,8 @@ impl DeliveryChannel {
         DeliveryChannel::DeepSeek,
         DeliveryChannel::Trae,
         DeliveryChannel::MiMoCode,
+        DeliveryChannel::ClineDesktop,
+        DeliveryChannel::DeepSeekHarness,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -116,6 +124,8 @@ impl DeliveryChannel {
             DeliveryChannel::DeepSeek => "deepseek",
             DeliveryChannel::Trae => "trae",
             DeliveryChannel::MiMoCode => "mimo-code",
+            DeliveryChannel::ClineDesktop => "cline-desktop",
+            DeliveryChannel::DeepSeekHarness => "dsh",
         }
     }
 
@@ -138,6 +148,8 @@ impl DeliveryChannel {
             "deepseek" => Ok(DeliveryChannel::DeepSeek),
             "trae" => Ok(DeliveryChannel::Trae),
             "mimo-code" => Ok(DeliveryChannel::MiMoCode),
+            "cline-desktop" => Ok(DeliveryChannel::ClineDesktop),
+            "dsh" => Ok(DeliveryChannel::DeepSeekHarness),
             other => Err(Error::NotFound(format!("未知的投递通道: {other}"))),
         }
     }
@@ -172,6 +184,8 @@ impl DeliveryChannel {
             DeliveryChannel::DeepSeek => "deepseek",
             DeliveryChannel::Trae => "trae",
             DeliveryChannel::MiMoCode => "mimo-code",
+            DeliveryChannel::ClineDesktop => "cline-desktop",
+            DeliveryChannel::DeepSeekHarness => "dsh",
         }
     }
 
@@ -216,6 +230,11 @@ impl DeliveryChannel {
             DeliveryChannel::DeepSeek => PathBuf::from(".reasonix").join("config.json"),
             DeliveryChannel::Trae => PathBuf::from(".trae").join("config.json"),
             DeliveryChannel::MiMoCode => PathBuf::from(".mimocode").join("mimocode.json"),
+            DeliveryChannel::ClineDesktop => PathBuf::from(".cline")
+                .join("data")
+                .join("settings")
+                .join("providers.json"),
+            DeliveryChannel::DeepSeekHarness => PathBuf::from(".dsh").join(".credentials.yaml"),
         }
     }
 }
@@ -246,7 +265,9 @@ pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
         | DeliveryChannel::QwenCode
         | DeliveryChannel::DeepSeek
         | DeliveryChannel::Trae
-        | DeliveryChannel::MiMoCode => RestartHint::Needed,
+        | DeliveryChannel::MiMoCode
+        | DeliveryChannel::ClineDesktop
+        | DeliveryChannel::DeepSeekHarness => RestartHint::Needed,
     }
 }
 
@@ -552,6 +573,10 @@ pub fn resolve_for_binding(
         DeliveryChannel::DeepSeek => Ok(Box::new(deepseek::DeepSeekWriter::new(home, base_url))),
         DeliveryChannel::Trae => Ok(Box::new(trae::TraeWriter::new(home, base_url))),
         DeliveryChannel::MiMoCode => Ok(Box::new(mimo_code::MiMoCodeWriter::new(home, base_url))),
+        DeliveryChannel::ClineDesktop => Ok(Box::new(cline_desktop::ClineDesktopWriter::new(
+            home, base_url,
+        ))),
+        DeliveryChannel::DeepSeekHarness => Ok(Box::new(dsh::DshWriter::new(home, base_url))),
     }
 }
 
@@ -864,7 +889,9 @@ mod tests {
                 "qwen-code",
                 "deepseek",
                 "trae",
-                "mimo-code"
+                "mimo-code",
+                "cline-desktop",
+                "dsh"
             ]
         );
         assert_eq!(DeliveryChannel::OpenCode.agent_id(), "opencode");
@@ -887,7 +914,7 @@ mod tests {
             );
             seen.push(id);
         }
-        assert_eq!(seen.len(), 17);
+        assert_eq!(seen.len(), 19);
     }
 
     #[test]
@@ -951,7 +978,7 @@ mod tests {
             );
             seen.push(target);
         }
-        assert_eq!(seen.len(), 17);
+        assert_eq!(seen.len(), 19);
     }
 
     #[test]
@@ -1068,7 +1095,7 @@ mod tests {
                 channel.as_str()
             );
         }
-        assert_eq!(DeliveryChannel::ALL.len(), 17);
+        assert_eq!(DeliveryChannel::ALL.len(), 19);
     }
 
     #[test]

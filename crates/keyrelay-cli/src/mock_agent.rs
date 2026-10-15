@@ -57,6 +57,16 @@ pub fn check(channel: DeliveryChannel, home: &Path) -> MockOutcome {
             check_managed_block(&text, mcode::BLOCK_BEGIN, mcode::BLOCK_END, "api_key")
         }
         DeliveryChannel::Pi => check_json_nested(&text, &["keyrelay", "api_key"]),
+        DeliveryChannel::Cursor => check_json_top_level(&text, "OPENAI_API_KEY"),
+        DeliveryChannel::Cline => check_cline_providers(&text),
+        DeliveryChannel::QwenCode => check_json_nested(&text, &["model", "apiKey"]),
+        DeliveryChannel::DeepSeek => check_json_top_level(&text, "apiKey"),
+        DeliveryChannel::Trae => check_json_top_level(&text, "apiKey"),
+        DeliveryChannel::MiMoCode => check_json_nested(&text, &["providers", "keyrelay", "apiKey"]),
+        DeliveryChannel::ClineDesktop => {
+            check_json_nested(&text, &["providers", "keyrelay", "settings", "apiKey"])
+        }
+        DeliveryChannel::DeepSeekHarness => check_yaml_ref_key(&text, "KEYRELAY_API_KEY"),
     }
 }
 
@@ -103,6 +113,55 @@ fn check_json_nested(text: &str, path: &[&str]) -> MockOutcome {
         Some(_) => MockOutcome::KeyMissing(format!("{} 为空字符串", path.join("."))),
         None => MockOutcome::KeyMissing(format!("{} 不是字符串", path.join("."))),
     }
+}
+
+/// Cline (VS Code) providers 数组：找 `id == "keyrelay"` 的条目里的 `apiKey`。
+fn check_cline_providers(text: &str) -> MockOutcome {
+    let v: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => return MockOutcome::Fatal(format!("JSON 解析失败: {e}")),
+    };
+    let providers = match v.get("providers").and_then(|p| p.as_array()) {
+        Some(arr) => arr,
+        None => return MockOutcome::KeyMissing("缺少 providers 字段".to_string()),
+    };
+    for entry in providers {
+        if entry.get("id").and_then(|i| i.as_str()) == Some("keyrelay") {
+            return match entry.get("apiKey").and_then(|k| k.as_str()) {
+                Some(s) if !s.is_empty() => MockOutcome::Ok,
+                Some(_) => MockOutcome::KeyMissing("apiKey 为空字符串".to_string()),
+                None => MockOutcome::KeyMissing("缺少 apiKey 字段".to_string()),
+            };
+        }
+    }
+    MockOutcome::KeyMissing("providers 数组中缺少 keyrelay 条目".to_string())
+}
+
+/// YAML `refs:` 段行级扫描：找 `  KEYRELAY_API_KEY: ...`（DeepSeek Harness）。
+///
+/// 与 `dsh.rs` 的写入形态对齐：在 `refs:` 段内找 `KEYRELAY_API_KEY:` 行。
+fn check_yaml_ref_key(text: &str, key_name: &str) -> MockOutcome {
+    let pattern = format!("{key_name}:");
+    let mut in_refs = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("refs:") {
+            in_refs = true;
+            continue;
+        }
+        // 遇到下一个顶层段（非缩进行且非空行）→ refs 段结束
+        if in_refs && !line.starts_with(' ') && !line.starts_with('\t') && !trimmed.is_empty() {
+            in_refs = false;
+        }
+        if in_refs && trimmed.starts_with(&pattern) {
+            let value = trimmed[pattern.len()..].trim();
+            if !value.is_empty() {
+                return MockOutcome::Ok;
+            }
+            return MockOutcome::KeyMissing(format!("{key_name} 为空字符串"));
+        }
+    }
+    MockOutcome::KeyMissing(format!("refs 段中缺少 {key_name}"))
 }
 
 /// dotenv 行级扫描：找 `GEMINI_API_KEY=...`（允许 `export ` 前缀与引号值）。
