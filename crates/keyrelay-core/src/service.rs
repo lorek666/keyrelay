@@ -2922,10 +2922,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// # 三条边界
     ///
     /// - **不存在**（第一次启动）⇒ 生成 + `put`；这是唯一「令牌会变」的正常时机。
-    /// - **读失败**（钥匙串锁着 / ACL 拒绝）⇒ 仍然生成一把**临时**令牌让网关照常启动，
-    ///   但 `token_persistent = false` + 一条 Warn 事件。为什么不直接报错：网关是用户显式
-    ///   打开的开关，钥匙串读不了不该让整个功能不可用；而「静默生成一把新的」才是真缺陷
-    ///   ——那会让 agent 配置里那把**无声无息**地失效。所以：降级 + 留痕 + 状态里明示。
+    /// - **读失败**（钥匙串锁着 / ACL 拒绝）⇒ 生成一把**临时**令牌让网关照常启动，
+    ///   `token_persistent = false` + 一条 Warn 事件，且**不写回钥匙串**——钥匙串里若
+    ///   已有持久令牌，覆盖它会让所有指向网关的 agent 配置永久 401（P2-4 / DEBUG-REPORT-v3
+    ///   §2-4）。为什么不直接报错：网关是用户显式打开的开关，钥匙串读不了不该让整个
+    ///   功能不可用；而「静默生成一把新的并覆盖」才是真缺陷——那会让 agent 配置里那把
+    ///   无声无息地失效。所以：降级 + 留痕 + 状态里明示 + 不覆盖。
     /// - **写失败** ⇒ 同上（临时令牌）。两次失败的原因都进事件（脱敏后）。
     ///
     /// 不返回 `Result`：这个方法**没有**失败态——它的失败全部表达为「临时令牌」。
@@ -2937,14 +2939,21 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             // （`config.token.trim().is_empty()` 那条硬门），比生成一把新的更糟。
             Ok(_) => {}
             Err(err) => {
+                // 读失败（瞬时：锁屏 / ACL 拒绝）：生成一把**临时**令牌让网关照常启动，
+                // 但**不写回钥匙串**——钥匙串里可能已有一把仍有效的持久令牌，覆盖它会让
+                // 所有指向网关的 agent 配置永久 401（P2-4 / DEBUG-REPORT-v3 §2-4）。
+                // 临时令牌只在本次进程生命周期有效；下次读成功时仍用钥匙串里那把。
                 self.log(observability::event_with_payload(
                     Level::Warn,
                     "gateway",
-                    "读钥匙串里的网关令牌失败，本次用临时令牌（重启后会变）",
+                    "读钥匙串里的网关令牌失败，本次用临时令牌（重启后会变）；钥匙串里若已有令牌不会被覆盖",
                     serde_json::json!({ "reason": crate::redact::scrub(&err.to_string()) }),
                 ));
+                let token = crate::gateway::generate_token();
+                return (token, false);
             }
         }
+        // Ok(None) 或空：钥匙串里确实没有 ⇒ 生成 + put（首次装配）
         let token = crate::gateway::generate_token();
         match self.vault.put(GATEWAY_TOKEN_REF, &token) {
             Ok(()) => (token, true),

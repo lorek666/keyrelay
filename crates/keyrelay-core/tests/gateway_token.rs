@@ -240,3 +240,133 @@ impl Vault for ReadOnlyVault {
         ))
     }
 }
+
+/// 钥匙串读**瞬时失败**夹具（P2-4 / DEBUG-REPORT-v3 §2-4）：`get(GATEWAY_TOKEN_REF)`
+/// 在 `gateway_read_fails` 为真时返回 `Err`，其余读写委托内部 `MemoryVault`——模拟
+/// 「锁屏 / ACL 拒绝」那次读失败，但钥匙串里已有一把仍有效的持久令牌。
+struct FlakyReadVault {
+    inner: MemoryVault,
+    gateway_read_fails: std::sync::atomic::AtomicBool,
+}
+
+impl FlakyReadVault {
+    fn new() -> Self {
+        Self {
+            inner: MemoryVault::new(),
+            gateway_read_fails: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    fn set_gateway_read_fails(&self, fails: bool) {
+        self.gateway_read_fails
+            .store(fails, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Vault for FlakyReadVault {
+    fn backend_name(&self) -> &'static str {
+        "memory"
+    }
+    fn probe(&self) -> keyrelay_core::error::Result<()> {
+        Ok(())
+    }
+    fn put(&self, key: &str, secret: &str) -> keyrelay_core::error::Result<()> {
+        self.inner.put(key, secret)
+    }
+    fn get(&self, key: &str) -> keyrelay_core::error::Result<Option<String>> {
+        if key == GATEWAY_TOKEN_REF
+            && self
+                .gateway_read_fails
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(keyrelay_core::error::Error::Vault(
+                "钥匙串读失败（测试夹具：模拟锁屏 / ACL 拒绝）".to_string(),
+            ));
+        }
+        self.inner.get(key)
+    }
+    fn delete(&self, key: &str) -> keyrelay_core::error::Result<()> {
+        self.inner.delete(key)
+    }
+}
+
+/// P2-4：钥匙串**读**瞬时失败（锁屏 / ACL 拒绝）时，`gateway_token` 不得生成新令牌
+/// 覆盖已持久化的那把——否则所有指向网关的 agent 配置会永久 401。降级为临时令牌
+/// （`token_persistent = false`）+ Warn 事件，且钥匙串里那把原样保留；读恢复后仍用它。
+#[tokio::test]
+async fn a_flaky_read_does_not_overwrite_the_persisted_gateway_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let store = Store::open(&dir.path().join("keyrelay.db")).unwrap();
+    let site_id = store.upsert_site("newapi", BASE, "测试站").unwrap();
+    let reference = secret_ref("key", 1, "secret");
+    let key_id = store
+        .insert_key(site_id, "codex/daily", &reference, Some("1"), None)
+        .unwrap();
+    let vault = Arc::new(FlakyReadVault::new());
+    vault.put(&reference, SECRET).unwrap();
+    let mock = MockTransport::new(vec![]);
+    let service = KeyRelayService::new(
+        store,
+        mock.clone(),
+        ServiceConfig {
+            vault: vault.clone(),
+            home,
+            backup_dir: dir.path().join("backups"),
+        },
+    );
+    mock.push(encryption_disabled());
+    mock.push(login_ok());
+    service
+        .login(site_id, Credentials::new("me", "pw"))
+        .await
+        .unwrap();
+
+    // 第一次装配：读正常 ⇒ 生成 + 持久化令牌 T1
+    let first = service.gateway_config(site_id, key_id, 0).unwrap();
+    let t1 = first.token.clone();
+    assert!(service.gateway_token_persistent(), "T1 持久化");
+    assert_eq!(
+        vault.get(GATEWAY_TOKEN_REF).unwrap().as_deref(),
+        Some(t1.as_str())
+    );
+
+    // 模拟钥匙串读瞬时失败（锁屏 / ACL 拒绝）
+    vault.set_gateway_read_fails(true);
+    let degraded = service.gateway_config(site_id, key_id, 0).unwrap();
+    assert!(
+        !service.gateway_token_persistent(),
+        "读失败 ⇒ 临时令牌，状态必须明示（不报 token_persistent=true）"
+    );
+    assert_ne!(
+        degraded.token, t1,
+        "临时令牌是新生成的一把，不是钥匙串里那把"
+    );
+    // 关键：钥匙串里那把 T1 没被覆盖——读恢复后仍能拿到它
+    vault.set_gateway_read_fails(false);
+    assert_eq!(
+        vault.get(GATEWAY_TOKEN_REF).unwrap().as_deref(),
+        Some(t1.as_str()),
+        "读失败不得覆盖钥匙串里已持久化的令牌（P2-4）"
+    );
+    // 留痕：Warn 事件说明为什么是临时的
+    let events = service.store().list_events(50).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.level == "warn" && e.message.contains("临时令牌")),
+        "降级必须留痕：{:?}",
+        events
+            .iter()
+            .map(|e| (&e.level, &e.message))
+            .collect::<Vec<_>>()
+    );
+
+    // 读恢复后仍用 T1（没被临时那把顶掉）
+    let again = service.gateway_config(site_id, key_id, 0).unwrap();
+    assert_eq!(
+        again.token, t1,
+        "读恢复 ⇒ 仍用钥匙串里那把 T1，临时令牌不持久"
+    );
+    assert!(service.gateway_token_persistent());
+}
