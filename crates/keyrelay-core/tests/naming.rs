@@ -46,9 +46,9 @@ fn generated_names_parse_back_verbatim() {
         ),
         (
             "my_app-2",
-            "continue",
+            "openclaw",
             (1970, 1, 1),
-            "my_app-2/continue/19700101",
+            "my_app-2/openclaw/19700101",
         ),
         // 边界：段恰好 64 字节
         (

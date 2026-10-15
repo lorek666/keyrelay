@@ -91,7 +91,7 @@ fn target_path(f: &Fixture, channel: DeliveryChannel) -> PathBuf {
 /// 投递一次并返回结果。Continue 之外没有通道需要模型名（Continue 的 schema 必填）。
 fn deliver(f: &Fixture, key_id: i64, channel: DeliveryChannel) -> DeliveryOutcome {
     f.service.grant_consent(key_id, channel).unwrap();
-    let model = (channel == DeliveryChannel::Continue).then_some("gpt-4o");
+    let model = (channel == DeliveryChannel::OpenClaw).then_some("gpt-4o");
     f.service
         .apply_delivery_with_model(key_id, channel, model)
         .unwrap()
@@ -288,7 +288,7 @@ fn limit_never_hides_a_delivery_that_can_still_be_rolled_back() {
     // 历史页承诺「当前生效的投递都能在这里回滚」：limit 只能截掉旧的**历史**，
     // 不能把一个仍然生效、只是比较早的投递挤出页面（复审 P2-4）。
     let f = setup();
-    let early_but_live = deliver(&f, f.keys[0], DeliveryChannel::ShellBlock);
+    let early_but_live = deliver(&f, f.keys[0], DeliveryChannel::Hermes);
     let superseded = deliver(&f, f.keys[0], DeliveryChannel::CodexAuthJson);
     let newest = deliver(&f, f.keys[1], DeliveryChannel::CodexAuthJson);
 
@@ -311,8 +311,8 @@ fn limit_never_hides_a_rolled_back_delivery_that_is_still_the_targets_state() {
     let f = setup();
     let rolled = deliver(&f, f.keys[0], DeliveryChannel::CodexAuthJson);
     f.service.rollback_delivery(&rolled.journal_id).unwrap();
-    deliver(&f, f.keys[0], DeliveryChannel::ShellBlock);
-    let newest = deliver(&f, f.keys[1], DeliveryChannel::ShellBlock);
+    deliver(&f, f.keys[0], DeliveryChannel::Hermes);
+    let newest = deliver(&f, f.keys[1], DeliveryChannel::Hermes);
 
     let rows = f.service.delivery_history(1).unwrap();
     let ids: Vec<&str> = rows.iter().map(|r| r.journal_id.as_str()).collect();
@@ -328,10 +328,10 @@ fn limit_never_hides_a_rolled_back_delivery_that_is_still_the_targets_state() {
 fn different_targets_do_not_supersede_each_other() {
     let f = setup();
     let auth = deliver(&f, f.keys[0], DeliveryChannel::CodexAuthJson);
-    let shell = deliver(&f, f.keys[0], DeliveryChannel::ShellBlock);
+    let shell = deliver(&f, f.keys[0], DeliveryChannel::Hermes);
     assert_ne!(
         target_path(&f, DeliveryChannel::CodexAuthJson),
-        target_path(&f, DeliveryChannel::ShellBlock),
+        target_path(&f, DeliveryChannel::Hermes),
         "两个不同的目标文件"
     );
 

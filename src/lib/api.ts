@@ -391,7 +391,7 @@ export type CreateKeyArgs = {
 export type DeliveryArgs = {
   keyId: number;
   channel: string;
-  /** 模型名。Continue 通道必填（留空 = 沿用上次投递写下的）；其余通道不读它。 */
+  /** 模型名（可缺）。OpenCode 通道可填；其余通道不读它。 */
   model?: string;
   /**
    * 投递模式（M8-S4 §6.2）。缺省 = `"site"`（既有行为一字不变）。
@@ -788,11 +788,15 @@ export async function listChannelBindings(): Promise<ChannelBinding[]> {
 const AGENT_CHANNELS: Record<string, string> = {
   codex: "codex-auth-json",
   "claude-code": "claude-code-settings",
-  shell: "shell-block",
   opencode: "opencode",
   "opencode-jsonc": "opencode-jsonc",
   "gemini-cli": "gemini-cli",
-  continue: "continue",
+  "claude-desktop": "claude-desktop",
+  "grok-build": "grok-build",
+  openclaw: "openclaw",
+  hermes: "hermes",
+  mcode: "mcode",
+  pi: "pi",
 };
 
 /**

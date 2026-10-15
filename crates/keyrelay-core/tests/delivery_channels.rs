@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use keyrelay_core::delivery::shell_block::{BLOCK_BEGIN, BLOCK_END};
+use keyrelay_core::delivery::hermes::{BLOCK_BEGIN, BLOCK_END};
 use keyrelay_core::delivery::{ConsentState, DeliveryChannel};
 use keyrelay_core::error::Error;
 use keyrelay_core::service::{KeyRelayService, ServiceConfig};
@@ -156,19 +156,13 @@ fn claude_code_channel_round_trip() {
 }
 
 #[test]
-fn shell_block_channel_round_trip() {
+fn hermes_channel_round_trip() {
     let f = setup();
-    let rc = f.home.join(
-        keyrelay_core::delivery::shell_block::ShellSyntax::for_current_platform()
-            .default_rc_relative_path(),
-    );
+    let path = f.home.join(DeliveryChannel::Hermes.relative_target());
     round_trip(
         &f,
-        DeliveryChannel::ShellBlock,
-        Some((
-            &rc,
-            "# my rc\nfunction foo() {\n  echo hi\n}\nalias gs='git status'",
-        )),
+        DeliveryChannel::Hermes,
+        Some((&path, "model:\n  default: \"x\"\nagent:\n  max_turns: 50")),
     );
 }
 
@@ -221,9 +215,9 @@ fn claude_code_preserves_unrelated_keys_and_env() {
 }
 
 #[test]
-fn shell_block_preserves_everything_outside_the_block() {
+fn hermes_preserves_everything_outside_the_block() {
     let f = setup();
-    let target = target_of(&f, DeliveryChannel::ShellBlock);
+    let target = target_of(&f, DeliveryChannel::Hermes);
     fs::create_dir_all(target.parent().unwrap()).unwrap();
 
     // 刻意不以换行结尾 + 含函数、注释、别名
@@ -232,10 +226,10 @@ fn shell_block_preserves_everything_outside_the_block() {
     fs::write(&target, outside).unwrap();
 
     f.service
-        .grant_consent(f.key_id, DeliveryChannel::ShellBlock)
+        .grant_consent(f.key_id, DeliveryChannel::Hermes)
         .unwrap();
     f.service
-        .apply_delivery(f.key_id, DeliveryChannel::ShellBlock)
+        .apply_delivery(f.key_id, DeliveryChannel::Hermes)
         .unwrap();
 
     let written = fs::read_to_string(&target).unwrap();
@@ -245,13 +239,13 @@ fn shell_block_preserves_everything_outside_the_block() {
     );
     assert!(written.contains(BLOCK_BEGIN));
     assert!(written.contains(BLOCK_END));
-    assert!(written.contains(&format!("OPENAI_API_KEY=\"{SECRET}\"")));
-    assert!(written.contains(&format!("OPENAI_BASE_URL=\"{BASE_URL}\"")));
+    assert!(written.contains(&format!("api_key: {SECRET}")));
+    assert!(written.contains(&format!("base_url: {BASE_URL}")));
     assert_eq!(written.matches(BLOCK_BEGIN).count(), 1, "区块只应出现一次");
 
     // 再投一次：区块之外仍然逐字节相同
     f.service
-        .apply_delivery(f.key_id, DeliveryChannel::ShellBlock)
+        .apply_delivery(f.key_id, DeliveryChannel::Hermes)
         .unwrap();
     let again = fs::read_to_string(&target).unwrap();
     assert!(again.starts_with(outside), "二次投递后区块外被改动");
@@ -259,19 +253,19 @@ fn shell_block_preserves_everything_outside_the_block() {
 }
 
 #[test]
-fn shell_block_does_not_touch_a_users_own_assignment() {
+fn hermes_does_not_touch_a_users_own_assignment() {
     // 用户在区块外自己写了同名变量：我们不碰它（只维护自己的区块）
     let f = setup();
-    let target = target_of(&f, DeliveryChannel::ShellBlock);
+    let target = target_of(&f, DeliveryChannel::Hermes);
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     let outside = "export OPENAI_API_KEY=\"sk-user-own-value\"\n";
     fs::write(&target, outside).unwrap();
 
     f.service
-        .grant_consent(f.key_id, DeliveryChannel::ShellBlock)
+        .grant_consent(f.key_id, DeliveryChannel::Hermes)
         .unwrap();
     f.service
-        .apply_delivery(f.key_id, DeliveryChannel::ShellBlock)
+        .apply_delivery(f.key_id, DeliveryChannel::Hermes)
         .unwrap();
 
     let written = fs::read_to_string(&target).unwrap();
@@ -279,7 +273,7 @@ fn shell_block_does_not_touch_a_users_own_assignment() {
         written.starts_with(outside),
         "用户自己的赋值必须原样保留:\n{written}"
     );
-    assert!(written.contains(&format!("OPENAI_API_KEY=\"{SECRET}\"")));
+    assert!(written.contains(&format!("api_key: {SECRET}")));
 }
 
 #[test]
@@ -290,10 +284,7 @@ fn consent_is_per_channel_and_target() {
         .grant_consent(f.key_id, DeliveryChannel::CodexAuthJson)
         .unwrap();
 
-    for channel in [
-        DeliveryChannel::ClaudeCodeSettings,
-        DeliveryChannel::ShellBlock,
-    ] {
+    for channel in [DeliveryChannel::ClaudeCodeSettings, DeliveryChannel::Hermes] {
         let err = f.service.apply_delivery(f.key_id, channel).unwrap_err();
         assert!(
             matches!(err, Error::ConsentRequired { .. }),
@@ -310,7 +301,7 @@ fn consent_is_per_channel_and_target() {
 /// Continue 的条目必须有模型名（Continue 的 schema 必填；KeyRelay 不编造默认模型），
 /// 其余通道不需要。对 `ALL` 循环的用例统一从这里取。
 fn model_for(channel: DeliveryChannel) -> Option<&'static str> {
-    (channel == DeliveryChannel::Continue).then_some("gpt-4o")
+    (channel == DeliveryChannel::OpenClaw).then_some("gpt-4o")
 }
 
 #[test]
@@ -376,11 +367,7 @@ fn channel_whitelist_rejects_a_mismatched_target() {
     let expectations = [
         (DeliveryChannel::CodexAuthJson, ".codex/auth.json"),
         (DeliveryChannel::ClaudeCodeSettings, ".claude/settings.json"),
-        (
-            DeliveryChannel::ShellBlock,
-            keyrelay_core::delivery::shell_block::ShellSyntax::for_current_platform()
-                .default_rc_relative_path(),
-        ),
+        (DeliveryChannel::Hermes, ".hermes/config.yaml"),
     ];
     for (channel, rel) in expectations {
         let target = target_of(&f, channel);
