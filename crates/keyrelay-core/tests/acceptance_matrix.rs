@@ -70,7 +70,7 @@ fn login_ok() -> HttpResponse {
 /// §10：某通道该传什么 `model`。判据来自 [`DeliveryChannel`]，不是硬编码通道名。
 fn model_for(channel: DeliveryChannel) -> Option<&'static str> {
     match channel {
-        DeliveryChannel::Continue => Some("gpt-4o"),
+        DeliveryChannel::OpenClaw => Some("gpt-4o"),
         _ => None,
     }
 }

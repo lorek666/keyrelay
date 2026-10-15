@@ -405,7 +405,7 @@ fn every_channel_produces_a_plan() {
     let f = setup();
     for channel in DeliveryChannel::ALL {
         // Continue 的条目必须有模型名（Continue 的 schema 必填），其余通道不需要
-        let model = (channel == DeliveryChannel::Continue).then_some("gpt-4o");
+        let model = (channel == DeliveryChannel::OpenClaw).then_some("gpt-4o");
         let plan = f
             .service
             .delivery_plan_with_model(f.key_id, channel, model)

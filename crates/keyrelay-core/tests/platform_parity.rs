@@ -108,8 +108,8 @@ fn platform_specific_files_match_the_known_inventory() {
     //   跨平台可测；真实进程探测在真机上验证（见 `docs/evidence/platform-parity.md` §1.2）。
     let expected = vec![
         "autostart.rs".to_string(),
+        "delivery/claude_desktop.rs".to_string(),
         "delivery/mod.rs".to_string(),
-        "delivery/shell_block.rs".to_string(),
         "inject/mod.rs".to_string(),
         "notify/system.rs".to_string(),
         "proxy.rs".to_string(),
@@ -183,30 +183,6 @@ fn no_crate_wide_home_env_reads_outside_platform() {
         offenders.is_empty(),
         "主目录解析必须集中在 platform.rs：{offenders:?}"
     );
-}
-
-#[test]
-fn shell_syntax_supports_both_platforms() {
-    use keyrelay_core::delivery::shell_block::ShellSyntax;
-
-    // 两个变体都必须存在且各自可用（真机上只会走其中一个，但代码路径都得在）
-    for syntax in [ShellSyntax::Posix, ShellSyntax::PowerShell] {
-        let rendered = syntax.render_assignment("OPENAI_API_KEY", "sk-x");
-        assert!(
-            rendered.contains("OPENAI_API_KEY"),
-            "{syntax:?} 渲染失败: {rendered}"
-        );
-        assert!(
-            !syntax.default_rc_relative_path().is_empty(),
-            "{syntax:?} 缺少默认 rc 路径"
-        );
-    }
-    assert!(ShellSyntax::PowerShell
-        .render_assignment("K", "v")
-        .starts_with("$env:"));
-    assert!(ShellSyntax::Posix
-        .render_assignment("K", "v")
-        .starts_with("export "));
 }
 
 #[test]

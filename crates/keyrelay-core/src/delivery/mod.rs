@@ -9,12 +9,16 @@
 //! - 生成的 [`Patch`] 含密钥，其 `Debug` 已手写脱敏（BACKLOG B-12）。
 
 pub mod claude_code;
+pub mod claude_desktop;
 pub mod codex_auth;
-pub mod continue_yaml;
 pub mod gemini_cli;
+pub mod grok_build;
+pub mod hermes;
 pub mod json_text;
+pub mod mcode;
+pub mod openclaw;
 pub mod opencode;
-pub mod shell_block;
+pub mod pi;
 
 use std::path::{Path, PathBuf};
 
@@ -29,8 +33,6 @@ pub enum DeliveryChannel {
     CodexAuthJson,
     /// `~/.claude/settings.json` 的 `env` 段（M1-S3）
     ClaudeCodeSettings,
-    /// shell rc 文件的标记块（M1-S3）
-    ShellBlock,
     /// `~/.config/opencode/opencode.json` 的 `provider.<id>.options`（M6-S1）
     OpenCode,
     /// `~/.gemini/.env`（M6-S1）
@@ -42,30 +44,48 @@ pub enum DeliveryChannel {
     /// 目标文件必须是**严格 JSON**；带注释/尾随逗号会被拒绝（见 `delivery/mod.rs::jsonc_hazard`
     /// 与 `docs/specs/M7-S3-落点扩展与生效策略.md` §6.2 / §13.1 O-1）。
     OpenCodeJsonc,
-    /// `~/.continue/config.yaml` 的标记块（M7-S3 / PRD FR-4:151）
-    Continue,
+    /// Claude Desktop 的 `claude_desktop_config.json`（M14-S1）
+    ClaudeDesktop,
+    /// `~/.grok/config.toml` 的 `[models.custom]` 段（M14-S1）
+    GrokBuild,
+    /// `~/.openclaw/openclaw.json`（JSON5，M14-S1）
+    OpenClaw,
+    /// `~/.hermes/config.yaml`（YAML 标记块，M14-S1）
+    Hermes,
+    /// `~/.minimax/config.yaml`（YAML 标记块，M14-S1）
+    MCode,
+    /// `~/.pi/agent/models.json`（JSON，M14-S1）
+    Pi,
 }
 
 impl DeliveryChannel {
-    pub const ALL: [DeliveryChannel; 7] = [
+    pub const ALL: [DeliveryChannel; 11] = [
         DeliveryChannel::CodexAuthJson,
         DeliveryChannel::ClaudeCodeSettings,
-        DeliveryChannel::ShellBlock,
         DeliveryChannel::OpenCode,
         DeliveryChannel::GeminiCli,
         DeliveryChannel::OpenCodeJsonc,
-        DeliveryChannel::Continue,
+        DeliveryChannel::ClaudeDesktop,
+        DeliveryChannel::GrokBuild,
+        DeliveryChannel::OpenClaw,
+        DeliveryChannel::Hermes,
+        DeliveryChannel::MCode,
+        DeliveryChannel::Pi,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             DeliveryChannel::CodexAuthJson => "codex-auth-json",
             DeliveryChannel::ClaudeCodeSettings => "claude-code-settings",
-            DeliveryChannel::ShellBlock => "shell-block",
             DeliveryChannel::OpenCode => "opencode",
             DeliveryChannel::GeminiCli => "gemini-cli",
             DeliveryChannel::OpenCodeJsonc => "opencode-jsonc",
-            DeliveryChannel::Continue => "continue",
+            DeliveryChannel::ClaudeDesktop => "claude-desktop",
+            DeliveryChannel::GrokBuild => "grok-build",
+            DeliveryChannel::OpenClaw => "openclaw",
+            DeliveryChannel::Hermes => "hermes",
+            DeliveryChannel::MCode => "mcode",
+            DeliveryChannel::Pi => "pi",
         }
     }
 
@@ -73,11 +93,15 @@ impl DeliveryChannel {
         match value {
             "codex-auth-json" => Ok(DeliveryChannel::CodexAuthJson),
             "claude-code-settings" => Ok(DeliveryChannel::ClaudeCodeSettings),
-            "shell-block" => Ok(DeliveryChannel::ShellBlock),
             "opencode" => Ok(DeliveryChannel::OpenCode),
             "gemini-cli" => Ok(DeliveryChannel::GeminiCli),
             "opencode-jsonc" => Ok(DeliveryChannel::OpenCodeJsonc),
-            "continue" => Ok(DeliveryChannel::Continue),
+            "claude-desktop" => Ok(DeliveryChannel::ClaudeDesktop),
+            "grok-build" => Ok(DeliveryChannel::GrokBuild),
+            "openclaw" => Ok(DeliveryChannel::OpenClaw),
+            "hermes" => Ok(DeliveryChannel::Hermes),
+            "mcode" => Ok(DeliveryChannel::MCode),
+            "pi" => Ok(DeliveryChannel::Pi),
             other => Err(Error::NotFound(format!("未知的投递通道: {other}"))),
         }
     }
@@ -97,11 +121,15 @@ impl DeliveryChannel {
         match self {
             DeliveryChannel::CodexAuthJson => "codex",
             DeliveryChannel::ClaudeCodeSettings => "claude-code",
-            DeliveryChannel::ShellBlock => "shell",
             DeliveryChannel::OpenCode => "opencode",
             DeliveryChannel::GeminiCli => "gemini-cli",
             DeliveryChannel::OpenCodeJsonc => "opencode-jsonc",
-            DeliveryChannel::Continue => "continue",
+            DeliveryChannel::ClaudeDesktop => "claude-desktop",
+            DeliveryChannel::GrokBuild => "grok-build",
+            DeliveryChannel::OpenClaw => "openclaw",
+            DeliveryChannel::Hermes => "hermes",
+            DeliveryChannel::MCode => "mcode",
+            DeliveryChannel::Pi => "pi",
         }
     }
 
@@ -126,9 +154,6 @@ impl DeliveryChannel {
         match self {
             DeliveryChannel::CodexAuthJson => PathBuf::from(".codex").join("auth.json"),
             DeliveryChannel::ClaudeCodeSettings => PathBuf::from(".claude").join("settings.json"),
-            DeliveryChannel::ShellBlock => PathBuf::from(
-                shell_block::ShellSyntax::for_current_platform().default_rc_relative_path(),
-            ),
             DeliveryChannel::OpenCode => PathBuf::from(".config")
                 .join("opencode")
                 .join("opencode.json"),
@@ -137,7 +162,12 @@ impl DeliveryChannel {
             DeliveryChannel::OpenCodeJsonc => PathBuf::from(".config")
                 .join("opencode")
                 .join("opencode.jsonc"),
-            DeliveryChannel::Continue => PathBuf::from(".continue").join("config.yaml"),
+            DeliveryChannel::ClaudeDesktop => claude_desktop::relative_config_path(),
+            DeliveryChannel::GrokBuild => PathBuf::from(".grok").join("config.toml"),
+            DeliveryChannel::OpenClaw => PathBuf::from(".openclaw").join("openclaw.json"),
+            DeliveryChannel::Hermes => PathBuf::from(".hermes").join("config.yaml"),
+            DeliveryChannel::MCode => PathBuf::from(".minimax").join("config.yaml"),
+            DeliveryChannel::Pi => PathBuf::from(".pi").join("agent").join("models.json"),
         }
     }
 }
@@ -149,7 +179,6 @@ pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
     match channel {
         // rc 文件在 **shell 启动时** source：不是「重启某个 agent」能解决的，
         // 而是「**新开的终端**才生效」——改的是会话环境，不是某个进程的配置。
-        DeliveryChannel::ShellBlock => RestartHint::DependsOnNewSession,
         // 其余六条都是「进程启动时读配置」：已在跑的会话不会自动重读。
         // 保守方向（M7-S3 spec §8）：多提示一次重启无害；反过来（说「改完即生效」而其实没生效）
         // 会让用户以为投递失败。
@@ -158,7 +187,12 @@ pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
         | DeliveryChannel::OpenCode
         | DeliveryChannel::GeminiCli
         | DeliveryChannel::OpenCodeJsonc
-        | DeliveryChannel::Continue => RestartHint::Needed,
+        | DeliveryChannel::ClaudeDesktop
+        | DeliveryChannel::GrokBuild
+        | DeliveryChannel::OpenClaw
+        | DeliveryChannel::Hermes
+        | DeliveryChannel::MCode
+        | DeliveryChannel::Pi => RestartHint::Needed,
     }
 }
 
@@ -170,7 +204,9 @@ pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
 /// P1-2：`service::rotate_key` 构造 Gateway endpoint 时也调它，保证轮换后 base_url 与原投递同口径。
 pub fn gateway_base_url_for(channel: &DeliveryChannel, local_url: &str) -> String {
     match channel {
-        DeliveryChannel::ClaudeCodeSettings => local_url.to_string(),
+        DeliveryChannel::ClaudeCodeSettings | DeliveryChannel::ClaudeDesktop => {
+            local_url.to_string()
+        }
         _ => format!("{}/v1", local_url),
     }
 }
@@ -389,7 +425,7 @@ pub fn resolve(channel: DeliveryChannel, home: &Path) -> Result<Box<dyn Delivery
 /// 本步的作者写域不含 `service.rs`（M6-S0 章程 §3）。
 ///
 /// `base_url` 为空表示「只投递密钥，不动 endpoint」——会写 base_url 的通道
-/// （Claude Code / shell 块 / OpenCode / OpenCodeJsonc / Gemini CLI / Continue）据此少写一行。
+/// （Claude Code / OpenCode / OpenCodeJsonc / Gemini CLI / ClaudeDesktop / GrokBuild / OpenClaw / Hermes / MCode / Pi）据此少写一行。
 ///
 /// OpenCode 通道在这里走**默认 provider 名**
 /// （[`opencode::OpenCodeWriter::DEFAULT_PROVIDER_ID`]）且不写 `model`。
@@ -408,12 +444,12 @@ pub fn resolve_for(
     )
 }
 
-/// 完整入口：`provider_id` / `model` 对 `OpenCode`、`OpenCodeJsonc`、`Continue` 三条通道生效；
+/// 完整入口：`provider_id` / `model` 对 `OpenCode`、`OpenCodeJsonc` 两条通道生效；
 /// 其余通道忽略。
 ///
 /// `provider_id` 为空（trim 后）时**在这里就报错**，而不是等到 `plan()`：
 /// 调用方传空 provider 名是接线错误，早报比写到一个 `provider.""` 上强。
-/// `model` 为 `None` 或 trim 后为空 → 不写、也不动已有的 `model` 键。`Continue` 例外：
+/// `model` 为 `None` 或 trim 后为空 → 不写、也不动已有的 `model` 键。
 /// 它的 schema 把条目的 `model` 定为必填，于是沿用受管块里已有的，块里也没有就**拒绝**
 /// ——两种情况都**不编造默认模型**。
 pub fn resolve_for_binding(
@@ -427,9 +463,6 @@ pub fn resolve_for_binding(
         DeliveryChannel::CodexAuthJson => Ok(Box::new(codex_auth::CodexAuthWriter::new(home))),
         DeliveryChannel::ClaudeCodeSettings => {
             Ok(Box::new(claude_code::ClaudeCodeWriter::new(home, base_url)))
-        }
-        DeliveryChannel::ShellBlock => {
-            Ok(Box::new(shell_block::ShellBlockWriter::new(home, base_url)))
         }
         DeliveryChannel::OpenCode | DeliveryChannel::OpenCodeJsonc => {
             if provider_id.trim().is_empty() {
@@ -449,9 +482,16 @@ pub fn resolve_for_binding(
         DeliveryChannel::GeminiCli => {
             Ok(Box::new(gemini_cli::GeminiCliWriter::new(home, base_url)))
         }
-        DeliveryChannel::Continue => Ok(Box::new(continue_yaml::ContinueWriter::new(
-            home, base_url, model,
+        DeliveryChannel::ClaudeDesktop => Ok(Box::new(claude_desktop::ClaudeDesktopWriter::new(
+            home, base_url,
         ))),
+        DeliveryChannel::GrokBuild => {
+            Ok(Box::new(grok_build::GrokBuildWriter::new(home, base_url)))
+        }
+        DeliveryChannel::OpenClaw => Ok(Box::new(openclaw::OpenClawWriter::new(home, base_url))),
+        DeliveryChannel::Hermes => Ok(Box::new(hermes::HermesWriter::new(home, base_url))),
+        DeliveryChannel::MCode => Ok(Box::new(mcode::MCodeWriter::new(home, base_url))),
+        DeliveryChannel::Pi => Ok(Box::new(pi::PiWriter::new(home, base_url))),
     }
 }
 
@@ -737,75 +777,6 @@ pub(crate) fn jsonc_hazard(text: &str) -> Option<JsoncHazard> {
     None
 }
 
-/// 文件的行尾形态：首个 `\n` 之前若是 `\r` ⇒ CRLF；否则 LF；没有换行 / 空文件 ⇒ LF。
-pub(crate) fn detect_line_ending(text: &str) -> &'static str {
-    match text.find('\n') {
-        Some(i) if i > 0 && text.as_bytes()[i - 1] == b'\r' => "\r\n",
-        _ => "\n",
-    }
-}
-
-/// 收集 `marker` 所在**行首**的字节偏移（含该行的前导缩进）。
-///
-/// 「行首」= 该行在 `marker` 之前**只有空白**（Continue 的块是缩进在 `models:` 之下的，
-/// 与 `shell_block` 那种顶格标记不同）；注释里/字符串里提到标记不算。
-///
-/// 返回**行首**而不是标记自身的偏移：替换块时要把旧行连同它的缩进一起换掉，
-/// 否则会留下旧缩进、与新块自己的缩进叠成两层。
-fn line_start_offsets(text: &str, marker: &str) -> Vec<usize> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::new();
-    let mut from = 0usize;
-    while let Some(rel) = text[from..].find(marker) {
-        let at = from + rel;
-        // 向左跳过行内缩进，落点必须是行首（或文件开头）
-        let mut head = at;
-        while head > 0 && matches!(bytes[head - 1], b' ' | b'\t') {
-            head -= 1;
-        }
-        if head == 0 || bytes[head - 1] == b'\n' {
-            out.push(head);
-        }
-        from = at + marker.len();
-    }
-    out
-}
-
-/// 探测受管块的**行区间** `[begin_line_start, end_line_end)`（含结束标记那一行的行尾）。
-///
-/// 返回 `Ok(None)` = 文件里没有块；`Err` = 块不完整或有歧义（**不修**，章程 §3.3 规则 2）。
-pub(crate) fn locate_block(text: &str, path: &Path) -> Result<Option<(usize, usize)>> {
-    let begins = line_start_offsets(text, continue_yaml::BLOCK_BEGIN);
-    let ends = line_start_offsets(text, continue_yaml::BLOCK_END);
-    if begins.is_empty() && ends.is_empty() {
-        return Ok(None);
-    }
-    if begins.len() != 1 || ends.len() != 1 {
-        return Err(Error::inject(
-            path,
-            format!(
-                "受管块不完整或有歧义（行首开始标记 {} 个、结束标记 {} 个）；\
-                 KeyRelay 不修半成品：请手工补全或删掉残留标记后重试",
-                begins.len(),
-                ends.len()
-            ),
-        ));
-    }
-    let (begin, end_marker) = (begins[0], ends[0]);
-    if end_marker <= begin {
-        return Err(Error::inject(
-            path,
-            "受管块的结束标记出现在开始标记之前；拒绝改写以免吃掉文件内容",
-        ));
-    }
-    // 结束标记那一行的行尾也算在块内（没有行尾 = 块是文件最后一行且无尾换行）
-    let end = text[end_marker..]
-        .find('\n')
-        .map(|i| end_marker + i + 1)
-        .unwrap_or(text.len());
-    Ok(Some((begin, end)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,18 +790,21 @@ mod tests {
             vec![
                 "codex-auth-json",
                 "claude-code-settings",
-                "shell-block",
                 "opencode",
                 "gemini-cli",
                 "opencode-jsonc",
-                "continue"
+                "claude-desktop",
+                "grok-build",
+                "openclaw",
+                "hermes",
+                "mcode",
+                "pi"
             ]
         );
         assert_eq!(DeliveryChannel::OpenCode.agent_id(), "opencode");
         assert_eq!(DeliveryChannel::GeminiCli.agent_id(), "gemini-cli");
         // M7-S0 v1.2 更正：`OpenCodeJsonc` 必须与 `OpenCode` **可区分**（漂移归属靠它）
         assert_eq!(DeliveryChannel::OpenCodeJsonc.agent_id(), "opencode-jsonc");
-        assert_eq!(DeliveryChannel::Continue.agent_id(), "continue");
     }
 
     #[test]
@@ -847,7 +821,7 @@ mod tests {
             );
             seen.push(id);
         }
-        assert_eq!(seen.len(), 7);
+        assert_eq!(seen.len(), 11);
     }
 
     #[test]
@@ -869,9 +843,30 @@ mod tests {
                 .join("opencode")
                 .join("opencode.jsonc")
         );
+        // M14-S1 新通道
         assert_eq!(
-            DeliveryChannel::Continue.relative_target(),
-            PathBuf::from(".continue").join("config.yaml")
+            DeliveryChannel::ClaudeDesktop.relative_target(),
+            claude_desktop::relative_config_path()
+        );
+        assert_eq!(
+            DeliveryChannel::GrokBuild.relative_target(),
+            PathBuf::from(".grok").join("config.toml")
+        );
+        assert_eq!(
+            DeliveryChannel::OpenClaw.relative_target(),
+            PathBuf::from(".openclaw").join("openclaw.json")
+        );
+        assert_eq!(
+            DeliveryChannel::Hermes.relative_target(),
+            PathBuf::from(".hermes").join("config.yaml")
+        );
+        assert_eq!(
+            DeliveryChannel::MCode.relative_target(),
+            PathBuf::from(".minimax").join("config.yaml")
+        );
+        assert_eq!(
+            DeliveryChannel::Pi.relative_target(),
+            PathBuf::from(".pi").join("agent").join("models.json")
         );
     }
 
@@ -890,7 +885,7 @@ mod tests {
             );
             seen.push(target);
         }
-        assert_eq!(seen.len(), 7);
+        assert_eq!(seen.len(), 11);
     }
 
     #[test]
@@ -967,9 +962,13 @@ mod tests {
         for channel in [
             DeliveryChannel::CodexAuthJson,
             DeliveryChannel::ClaudeCodeSettings,
-            DeliveryChannel::ShellBlock,
             DeliveryChannel::GeminiCli,
-            DeliveryChannel::Continue,
+            DeliveryChannel::ClaudeDesktop,
+            DeliveryChannel::GrokBuild,
+            DeliveryChannel::OpenClaw,
+            DeliveryChannel::Hermes,
+            DeliveryChannel::MCode,
+            DeliveryChannel::Pi,
         ] {
             assert!(
                 resolve_for_binding(channel, home, "https://x", "", None).is_ok(),
@@ -988,19 +987,16 @@ mod tests {
 
     #[test]
     fn restart_hint_table_is_verbatim() {
-        // M7-S3 spec §8：shell rc 只对新开的终端生效，其余六条按「需要重启」保守标注。
-        assert_eq!(
-            restart_hint(DeliveryChannel::ShellBlock),
-            RestartHint::DependsOnNewSession
-        );
+        // M14-S1：所有通道都按「需要重启」保守标注（DependsOnNewSession 已随 ShellBlock 删除）
         for channel in DeliveryChannel::ALL {
-            let hint = restart_hint(channel);
-            if channel != DeliveryChannel::ShellBlock {
-                assert_eq!(hint, RestartHint::Needed, "{}", channel.as_str());
-            }
+            assert_eq!(
+                restart_hint(channel),
+                RestartHint::Needed,
+                "{}",
+                channel.as_str()
+            );
         }
-        // 七个通道都有取值（穷举 match 由编译器保证；这里钉住数量）
-        assert_eq!(DeliveryChannel::ALL.len(), 7);
+        assert_eq!(DeliveryChannel::ALL.len(), 11);
     }
 
     #[test]
@@ -1108,63 +1104,6 @@ mod tests {
     }
 
     #[test]
-    fn line_ending_follows_the_file() {
-        assert_eq!(detect_line_ending("a\r\nb\r\n"), "\r\n");
-        assert_eq!(detect_line_ending("a\nb\n"), "\n");
-        assert_eq!(detect_line_ending(""), "\n");
-        assert_eq!(detect_line_ending("no newline"), "\n");
-    }
-
-    #[test]
-    fn locate_block_handles_the_three_shapes() {
-        let path = Path::new("/tmp/config.yaml");
-        let ok = format!(
-            "models:\n  {}\n  - name: x\n  {}\n  - name: y\n",
-            continue_yaml::BLOCK_BEGIN,
-            continue_yaml::BLOCK_END
-        );
-        let (begin, end) = locate_block(&ok, path).unwrap().expect("应找到块");
-        assert_eq!(
-            &ok[begin..end],
-            format!(
-                "  {}\n  - name: x\n  {}\n",
-                continue_yaml::BLOCK_BEGIN,
-                continue_yaml::BLOCK_END
-            )
-        );
-
-        assert_eq!(locate_block("models:\n", path).unwrap(), None);
-
-        // 孤立 / 重复 / 顺序颠倒 → Err
-        for bad in [
-            format!("  {}\n", continue_yaml::BLOCK_BEGIN),
-            format!("  {}\n", continue_yaml::BLOCK_END),
-            format!(
-                "  {}\n  {}\n  {}\n  {}\n",
-                continue_yaml::BLOCK_BEGIN,
-                continue_yaml::BLOCK_END,
-                continue_yaml::BLOCK_BEGIN,
-                continue_yaml::BLOCK_END
-            ),
-            format!(
-                "  {}\n  {}\n",
-                continue_yaml::BLOCK_END,
-                continue_yaml::BLOCK_BEGIN
-            ),
-        ] {
-            assert!(locate_block(&bad, path).is_err(), "{bad}");
-        }
-
-        // 行内提到标记（非行首）不算块
-        let inline = format!(
-            "models: # 见 {} 与 {}\n",
-            continue_yaml::BLOCK_BEGIN,
-            continue_yaml::BLOCK_END
-        );
-        assert_eq!(locate_block(&inline, path).unwrap(), None);
-    }
-
-    #[test]
     fn channel_roundtrip_and_agent_id() {
         for channel in DeliveryChannel::ALL {
             assert_eq!(DeliveryChannel::parse(channel.as_str()).unwrap(), channel);
@@ -1195,14 +1134,6 @@ mod tests {
                 channel.as_str()
             );
         }
-    }
-
-    #[test]
-    fn shell_block_target_is_platform_specific() {
-        let home = Path::new("/tmp/nobody");
-        let writer = resolve_for(DeliveryChannel::ShellBlock, home, "https://x").unwrap();
-        let expected = shell_block::ShellSyntax::for_current_platform().default_rc_relative_path();
-        assert_eq!(writer.target_path(), home.join(expected));
     }
 
     #[test]
