@@ -535,25 +535,35 @@ mod tests {
         // 穷举 match（**没有 `_` 臂**）强制的是另一件事：新增变体时这个 match 编不过，
         // 人就被迫回来——而回来就要面对「ALL 要不要加它」这个问题。
         // 每个臂返回 `true` 表示「这个变体已确认在 ALL 里」。
-        let in_all = |kind: SiteKind| -> bool {
-            match kind {
-                SiteKind::NewApi => SiteKind::ALL.contains(&SiteKind::NewApi),
-                SiteKind::Sub2Api => SiteKind::ALL.contains(&SiteKind::Sub2Api),
-                SiteKind::CustomOpenAiCompatible => {
-                    SiteKind::ALL.contains(&SiteKind::CustomOpenAiCompatible)
-                }
-            }
+        // P2-21 / DEBUG-REPORT-v3 §2-21：原来的 `for kind in ALL` 只遍历 ALL 里的变体——
+        // 新增变体忘了加进 ALL 时，循环不碰它，补一条「同样写法」的 match 臂就能全绿，
+        // 新变体永远不被探测。改成**每个变体单独 assert**：穷举 match（无 `_` 臂）强制
+        // 新增变体时编译失败、迫使回来补臂；臂本身是 assert，补臂就要面对「它在 ALL 里吗」。
+        // 仍非完美（Rust 无变体数反射，补臂不补 assert 仍能绕过），但比「循环只看 ALL」严。
+        assert!(
+            SiteKind::ALL.contains(&SiteKind::NewApi),
+            "NewApi 不在 ALL 里"
+        );
+        assert!(
+            SiteKind::ALL.contains(&SiteKind::Sub2Api),
+            "Sub2Api 不在 ALL 里"
+        );
+        assert!(
+            SiteKind::ALL.contains(&SiteKind::CustomOpenAiCompatible),
+            "CustomOpenAiCompatible 不在 ALL 里"
+        );
+        // 穷举 match（无 `_` 臂）：新增变体时编译失败，迫使回来面对 ALL。
+        let _force_exhaustive = |kind: SiteKind| match kind {
+            SiteKind::NewApi => (),
+            SiteKind::Sub2Api => (),
+            SiteKind::CustomOpenAiCompatible => (),
         };
-        // 上面的 match 无 `_` 臂 ⇒ 新增变体时编译失败。下面这几条是**运行期**兜底：
-        // 防的是「ALL 里出现重复项」与「as_str 撞名」这两种不靠编译期能发现的退化。
+        // 运行期兜底：ALL 里出现重复项 / as_str 撞名（不靠编译期能发现的退化）。
         assert_eq!(
             SiteKind::ALL.len(),
             3,
             "SiteKind::ALL 的长度变了：新增变体时必须同步改这条测试的穷举 match（B-119）"
         );
-        for kind in SiteKind::ALL {
-            assert!(in_all(kind), "{kind:?} 不在 ALL 里（穷举 match 没覆盖它）");
-        }
         // `as_str` 逐个不同：ALL 里有两个变体撞名会让 `sites.kind` 列无法区分
         let mut names: Vec<&str> = SiteKind::ALL.iter().map(|k| k.as_str()).collect();
         names.sort_unstable();
