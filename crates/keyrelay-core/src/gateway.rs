@@ -251,6 +251,12 @@ pub struct GatewayConfig {
     ///
     /// 与 `on_failure` 同形（注入出口），理由相同：网关不碰存储层。
     pub on_observation: Option<Arc<dyn Fn(UpstreamObservation) + Send + Sync>>,
+    /// 上游客户端走的代理（M10-S2）。`None` = 直连。
+    ///
+    /// 由 `service::gateway_config` 从 settings 解析后填入（与站点适配器 transport 同一份
+    /// `proxy::resolve_proxy`）。网关每次 `start()` 都重读最新 settings，因此代理变更
+    /// **重启网关即生效**（站点适配器 transport 仍需重启 app）。
+    pub upstream_proxy: Option<String>,
 }
 
 /// 上游请求的两段超时。
@@ -383,6 +389,7 @@ impl GatewayConfig {
             upstream_timeout: UpstreamTimeout::default(),
             revoked_refs: None,
             on_observation: None,
+            upstream_proxy: None,
         }
     }
 }
@@ -496,11 +503,26 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
         return Err(Error::Store("网关的本地令牌为空".into()));
     }
 
-    let upstream = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         // §3.5-2：上游**必须**有超时。没有它，一个接了连接却不回应的上游会让请求永远挂着，
         // 既不切下一个候选，也不喂熔断（实测：卡 8.5s、下一个上游收到 0 次、失败事件 0 条）。
         .connect_timeout(config.upstream_timeout.connect)
-        .read_timeout(config.upstream_timeout.read)
+        .read_timeout(config.upstream_timeout.read);
+
+    // M10-S2：上游客户端走解析后的代理（与站点适配器 transport 同一份 resolve_proxy）。
+    // 校验复用 `proxy::validate_proxy_url`——非法代理在这里就 Err，不静默直连。
+    if let Some(proxy_url) = config.upstream_proxy.as_deref() {
+        crate::proxy::validate_proxy_url(proxy_url)?;
+        let proxy = reqwest::Proxy::all(proxy_url.to_string()).map_err(|e| {
+            Error::Transport(format!(
+                "网关上游代理配置无效（{}），拒绝静默直连: {e}",
+                crate::proxy::mask_proxy(proxy_url)
+            ))
+        })?;
+        builder = builder.proxy(proxy);
+    }
+
+    let upstream = builder
         .build()
         .map_err(|e| Error::Transport(format!("构造网关的上游客户端失败: {e}")))?;
 

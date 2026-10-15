@@ -311,6 +311,8 @@ pub struct SettingsDto {
     theme: String,
     language: String,
     proxy_url: String,
+    // M10-S2：代理模式 auto / manual / direct。camelCase `proxyMode`。
+    proxy_mode: String,
     telemetry_enabled: bool,
     auto_update_enabled: bool,
     // ---- M6-S5：FR-3 通知 ----
@@ -514,8 +516,22 @@ pub fn app_info(state: State<'_, AppState>) -> Result<AppInfoDto, String> {
 }
 
 #[tauri::command]
-pub async fn detect_site(base_url: String) -> Result<SiteFingerprintDto, String> {
-    crate::detect_only(&base_url)
+pub async fn detect_site<R: tauri::Runtime>(
+    _app: AppHandle<R>,
+    state: State<'_, AppState>,
+    base_url: String,
+) -> Result<SiteFingerprintDto, String> {
+    // 代理从 settings 解析，与生产 transport 同一份逻辑（M10-S2）：
+    // 测试连接与实际请求走同一条代理，不再各走各的。
+    let proxy = state.service.settings().ok().and_then(|s| {
+        let mode = keyrelay_core::proxy::ProxyMode::parse(&s.proxy_mode)
+            .unwrap_or(keyrelay_core::proxy::ProxyMode::Auto);
+        keyrelay_core::proxy::resolve_proxy(mode, &s.proxy_url)
+            .ok()
+            .flatten()
+            .map(|d| d.url)
+    });
+    crate::detect_only(&base_url, proxy)
         .await
         .map(|fingerprint| SiteFingerprintDto {
             kind: fingerprint.kind.as_str().to_string(),
@@ -906,6 +922,7 @@ fn settings_from_dto(dto: &SettingsDto) -> keyrelay_core::settings::Settings {
         theme: dto.theme.clone(),
         language: dto.language.clone(),
         proxy_url: dto.proxy_url.clone(),
+        proxy_mode: dto.proxy_mode.clone(),
         telemetry_enabled: dto.telemetry_enabled,
         auto_update_enabled: dto.auto_update_enabled,
         notify_system_enabled: dto.notify_system_enabled,
@@ -929,6 +946,7 @@ fn settings_to_dto(settings: &keyrelay_core::settings::Settings) -> SettingsDto 
         theme: settings.theme.clone(),
         language: settings.language.clone(),
         proxy_url: settings.proxy_url.clone(),
+        proxy_mode: settings.proxy_mode.clone(),
         telemetry_enabled: settings.telemetry_enabled,
         auto_update_enabled: settings.auto_update_enabled,
         notify_system_enabled: settings.notify_system_enabled,
