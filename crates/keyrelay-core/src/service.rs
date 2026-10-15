@@ -1968,10 +1968,48 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                         continue;
                     }
                 };
+            let target = writer.target_path();
+            // P2-2 / DEBUG-REPORT-v3 §2-2：`plan()` 只验「文件写得进」，验不出「同意被撤销」
+            // 和「目标是符号链接」——这两种在 `apply_delivery` 时才失败，而那时 `create_key`
+            // 已经在站点建了新 key，每重试一次站点多一把。预检里就地补这两条。
+            match self.consent_state(*channel, &target) {
+                Ok(state) if state.is_granted() => {}
+                Ok(state) => {
+                    let label = match state {
+                        crate::delivery::ConsentState::Revoked { .. } => "同意已被撤销",
+                        crate::delivery::ConsentState::Missing => "尚未同意",
+                        crate::delivery::ConsentState::Granted { .. } => unreachable!(),
+                    };
+                    blocked.push(BlockedTarget {
+                        channel: channel.as_str().to_string(),
+                        target: target.display().to_string(),
+                        reason: format!(
+                            "{label}，轮换会在建新密钥后才停在这里——每重试一次站点多一把"
+                        ),
+                    });
+                    continue;
+                }
+                Err(err) => {
+                    blocked.push(BlockedTarget {
+                        channel: channel.as_str().to_string(),
+                        target: target.display().to_string(),
+                        reason: crate::redact::scrub(&err.to_string()),
+                    });
+                    continue;
+                }
+            }
+            if target.is_symlink() {
+                blocked.push(BlockedTarget {
+                    channel: channel.as_str().to_string(),
+                    target: target.display().to_string(),
+                    reason: "目标是符号链接，轮换会在建新密钥后才在写入时失败".to_string(),
+                });
+                continue;
+            }
             if let Err(err) = writer.plan(delivery::PLACEHOLDER_KEY) {
                 blocked.push(BlockedTarget {
                     channel: channel.as_str().to_string(),
-                    target: writer.target_path().display().to_string(),
+                    target: target.display().to_string(),
                     reason: crate::redact::scrub(&err.to_string()),
                 });
             }
