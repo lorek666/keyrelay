@@ -273,6 +273,23 @@ pub fn strip_url_userinfo(url: &str) -> String {
     out
 }
 
+/// 可安全回显的 webhook 地址：`scheme://host[:port]`，**userinfo / path / query / fragment 一律丢掉**。
+///
+/// webhook URL 的凭据常在 path / query 里（Slack `/services/T/B/<token>`、Discord
+/// `?key=<uuid>`），[`strip_url_userinfo`] 只剥 userinfo 不够（P1-10）。本函数收窄到
+/// authority，与 `notify::webhook` 的错误文案同口径。
+pub fn mask_webhook_url(url: &str) -> String {
+    let stripped = strip_url_userinfo(url);
+    let Some((scheme, rest)) = stripped.split_once("://") else {
+        return "<无 scheme>".to_string();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return format!("{scheme}://<已隐藏>");
+    }
+    format!("{scheme}://{authority}")
+}
+
 /// [`strip_url_userinfo`] 的**掩蔽**版：authority 里的 userinfo 换成 [`MASK`]。
 ///
 /// 与 [`strip_url_userinfo`] 的分工（M8-S2 §7.2 O-1 裁决）：
@@ -535,7 +552,7 @@ pub fn scrub_reference_tokens(input: &str) -> String {
 /// 清单**不得外扩**：章程把这份集合冻结了，悄悄加一个键名等于悄悄改宽契约。
 /// 已知未覆盖的复合键名（如 `session_token` → `sessiontoken`、`x_api_key` → `xapikey`）
 /// 记录在 M5-S1 spec §9，不在这里补。
-const SENSITIVE_KEYS: [&str; 16] = [
+const SENSITIVE_KEYS: [&str; 17] = [
     "password",
     "passwd",
     "pwd",
@@ -552,6 +569,10 @@ const SENSITIVE_KEYS: [&str; 16] = [
     "credential",
     "credentials",
     "privatekey",
+    // P1-10：webhook URL 的凭据常在 path/query（Slack `/services/T/B/<token>`、
+    // Discord `?key=<uuid>`），`scrub` 不认这类形态。按键名脱敏是纵深防御——
+    // 源头（`service.rs` 事件 payload）已用 `mask_webhook_url` 收窄到 scheme+host。
+    "webhook",
 ];
 
 fn is_sensitive_key(key: &str) -> bool {
@@ -1338,5 +1359,48 @@ mod tests {
                 "「{key}」不在章程 §4.3 的命中集合里，当前不该被掩（已知代价）"
             );
         }
+    }
+
+    #[test]
+    fn mask_webhook_url_drops_path_query_fragment() {
+        // P1-10：webhook 凭据常在 path/query（Slack `/services/T/B/<token>`、Discord `?key=<uuid>`），
+        // strip_url_userinfo 只剥 userinfo 不够。
+        assert_eq!(
+            mask_webhook_url("https://hooks.slack.com/services/T/B/abc123"),
+            "https://hooks.slack.com"
+        );
+        assert_eq!(
+            mask_webhook_url("https://discord.com/api/webhooks/123?key=uuid-xyz"),
+            "https://discord.com"
+        );
+    }
+
+    #[test]
+    fn mask_webhook_url_keeps_port_and_strips_userinfo() {
+        assert_eq!(
+            mask_webhook_url("http://localhost:9090/webhook/secret"),
+            "http://localhost:9090"
+        );
+        assert_eq!(
+            mask_webhook_url("https://user:pass@hooks.slack.com/services/T"),
+            "https://hooks.slack.com"
+        );
+    }
+
+    #[test]
+    fn mask_webhook_url_no_scheme() {
+        assert_eq!(
+            mask_webhook_url("hooks.slack.com/services/T"),
+            "<无 scheme>"
+        );
+    }
+
+    #[test]
+    fn sensitive_keys_includes_webhook() {
+        // P1-10：webhook 键名按敏感键脱敏（纵深防御，防别的出口把 webhook URL 原样进 JSON）
+        assert!(is_sensitive_key("webhook"));
+        assert!(is_sensitive_key("Webhook"));
+        assert!(is_sensitive_key("web-hook"));
+        assert!(is_sensitive_key("WEBHOOK"));
     }
 }

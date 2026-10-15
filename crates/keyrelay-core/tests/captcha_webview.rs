@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use keyrelay_core::error::Error;
-use keyrelay_core::service::{KeyRelayService, ServiceConfig, HEALTH_OK};
+use keyrelay_core::service::{KeyRelayService, ServiceConfig, HEALTH_NEEDS_LOGIN};
 use keyrelay_core::site::captcha::CaptchaPhase;
 use keyrelay_core::site::registry::SiteRegistry;
 use keyrelay_core::site::transport::{HttpResponse, MockTransport};
@@ -220,7 +220,10 @@ async fn captcha_cookies_never_reach_events() {
     let rows = f.service.store().list_events(500).unwrap();
     assert_eq!(rows.len(), flow.events_after);
     // 最新一条就是完成事件（`ORDER BY id DESC`）。
-    assert_eq!(rows[0].message, "人机验证完成：会话已更新");
+    assert_eq!(
+        rows[0].message,
+        "人机验证已通过：cookie 已更新，需重新登录获取访问令牌"
+    );
     assert!(
         rows[0].payload.as_deref().unwrap_or("").contains("site_id"),
         "完成事件应只带站点号: {:?}",
@@ -250,7 +253,7 @@ async fn captcha_cookies_never_reach_diagnostics() {
     assert!(!text.contains(COOKIE_VALUE), "诊断导出含 cookie 值");
     assert!(!text.contains(&COOKIE_VALUE[..8]), "诊断导出含 cookie 片段");
     // 反倒是那条**不含 cookie** 的完成事件应当能在诊断里看到（证明导出不是空的）。
-    assert!(text.contains("人机验证完成"), "诊断里应能看到完成事件");
+    assert!(text.contains("人机验证已通过"), "诊断里应能看到完成事件");
 }
 
 #[tokio::test]
@@ -271,13 +274,20 @@ async fn captcha_cookies_never_reach_audit() {
 // ============================================================ 会话真的接上了（§1 目标）
 
 #[tokio::test]
-async fn captcha_completion_makes_the_session_usable() {
+async fn captcha_completion_leaves_session_cookie_only_needs_relogin() {
+    // P1-8：cookie-only 会话在 Sub2API（要 Authorization 头）上不可用。
+    // captcha 兜底后 health = needs_login（不谎报 ok），但 cookie 仍进 SessionCache
+    //（mock 不验 Authorization，list_keys 仍能调通；真实站点会 401）。
     let f = setup();
     run_captcha_flow(&f).await;
 
-    // `list_keys` 需要会话；能成功 ⇒ `SessionCache` 里真的有那对 cookie。
+    // `list_keys` 需要会话；mock 里仍能调通（cookie 进了 SessionCache）。
     f.mock.push(keys_ok());
-    let keys = f.service.list_keys(f.site_id).await.expect("会话必须可用");
+    let keys = f
+        .service
+        .list_keys(f.site_id)
+        .await
+        .expect("mock 不验 auth，list_keys 应调通");
     assert!(keys.is_empty());
 
     // 而且请求里确实带上了 WebView 抓到的 cookie（不是别处凑出来的会话）。
@@ -295,14 +305,14 @@ async fn captcha_completion_makes_the_session_usable() {
         cookie.contains(COOKIE_VALUE),
         "会话 cookie 应进 `Cookie:` 头: {cookie}"
     );
-    // 健康状态也回到了 `ok`（镜像 `login` 的顺序）。
+    // P1-8：健康状态是 needs_login（cookie-only 不可用），不谎报 ok。
     let site = f
         .service
         .store()
         .get_site(f.site_id)
         .unwrap()
         .expect("站点");
-    assert_eq!(site.health, HEALTH_OK);
+    assert_eq!(site.health, HEALTH_NEEDS_LOGIN);
 }
 
 // ============================================================ T15：复核 N-2（§6.5）

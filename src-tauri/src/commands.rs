@@ -388,6 +388,18 @@ pub struct GatewayStartArgs {
     key_id: i64,
 }
 
+/// 运行中的网关 + 它启动时绑定的 `site_id` / `key_id`（P1-6 完整修复）。
+///
+/// `gateway_rotate_token` 网关在跑时，从这里读 site_id / key_id 构造 config——
+/// **不**用命令参数：切页后 UI state 可能带默认值，用 args 会把网关悄悄换到
+/// 错误的 site/key（令牌轮换的语义是「不换站、不换密钥」，只换本地令牌）。
+/// 前端传来的 `args` 仅作一致性校验：与启动时不一致 ⇒ 拒绝，避免静默切站。
+pub struct GatewayRunning {
+    pub handle: keyrelay_core::gateway::GatewayHandle,
+    pub site_id: i64,
+    pub key_id: i64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportResultDto {
@@ -610,7 +622,9 @@ pub fn delivery_plan(
     let mode = parse_delivery_mode(args.mode.as_deref())?;
     let endpoint = match mode {
         keyrelay_core::delivery::DeliveryMode::Site => None,
-        keyrelay_core::delivery::DeliveryMode::LocalGateway => Some(gateway_endpoint_of(&state)?),
+        keyrelay_core::delivery::DeliveryMode::LocalGateway => {
+            Some(gateway_endpoint_of(&state, &channel)?)
+        }
     };
     let source = match &endpoint {
         Some(endpoint) => keyrelay_core::delivery::DeliverySource::Gateway(endpoint),
@@ -749,7 +763,9 @@ pub fn apply_delivery(
     let mode = parse_delivery_mode(args.mode.as_deref())?;
     let endpoint = match mode {
         keyrelay_core::delivery::DeliveryMode::Site => None,
-        keyrelay_core::delivery::DeliveryMode::LocalGateway => Some(gateway_endpoint_of(&state)?),
+        keyrelay_core::delivery::DeliveryMode::LocalGateway => {
+            Some(gateway_endpoint_of(&state, &channel)?)
+        }
     };
     let source = match &endpoint {
         Some(endpoint) => keyrelay_core::delivery::DeliverySource::Gateway(endpoint),
@@ -990,11 +1006,11 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
         return empty;
     };
     match guard.as_ref() {
-        Some(handle) => GatewayStatusDto {
+        Some(run) => GatewayStatusDto {
             running: true,
-            url: Some(handle.local_url()),
-            token: Some(handle.token.clone()),
-            site: Some(handle.site_display_name.clone()),
+            url: Some(run.handle.local_url()),
+            token: Some(run.handle.token.clone()),
+            site: Some(run.handle.site_display_name.clone()),
             token_persistent,
         },
         None => empty,
@@ -1006,21 +1022,26 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
 /// 拼 `/v1` 是硬要求：网关只服务 `/health` 与 `/v1/*`，而 `local_url()` 没有路径段。
 /// 少拼一次的表现是「投递成功、agent 404」——那是最难查的一类失败。
 ///
+/// **例外（P1-5）**：Claude Code（Anthropic SDK）的 `ANTHROPIC_BASE_URL` 约定**不带** `/v1`
+/// ——SDK 自己拼 `/v1/messages`。给它带 `/v1` 会变成 `/v1/v1/messages`，网关原样转发 ⇒ 404。
+/// OpenAI / Codex 等 SDK 的 base_url 仍要带 `/v1`（SDK 拼 `/chat/completions`）。
+///
 /// 网关没在跑 ⇒ 明确拒绝：此时**没有**可信的地址可写（端口来自设置，但网关没跑时
 /// 写下去只会让 agent 连不上）。这不是限制，是把「指向网关」的定义执行到底。
 fn gateway_endpoint_of(
     state: &State<'_, AppState>,
+    channel: &keyrelay_core::delivery::DeliveryChannel,
 ) -> Result<keyrelay_core::delivery::GatewayEndpoint, String> {
     let guard = state
         .gateway
         .lock()
         .map_err(|_| "网关状态锁失效（需要重启应用）".to_string())?;
-    let handle = guard.as_ref().ok_or_else(|| {
+    let run = guard.as_ref().ok_or_else(|| {
         "本地网关没有在运行：请先在「网关」页启动它，再把通道改为指向网关。".to_string()
     })?;
     Ok(keyrelay_core::delivery::GatewayEndpoint {
-        base_url: format!("{}/v1", handle.local_url()),
-        token: handle.token.clone(),
+        base_url: keyrelay_core::delivery::gateway_base_url_for(channel, &run.handle.local_url()),
+        token: run.handle.token.clone(),
     })
 }
 
@@ -1099,7 +1120,7 @@ pub async fn gateway_start(
         Err(_) => None,
     };
     if let Some(previous) = previous {
-        stop_gateway(previous).await;
+        stop_gateway(previous.handle).await;
         // 与 `gateway_stop` 同一条理由（M7-S5 复审 P2-1）：换网关之前先把**旧网关**的
         // 失败落库，否则它们会被归到新会话的时间线上。
         state.service.drain_gateway_failures();
@@ -1122,7 +1143,11 @@ pub async fn gateway_start(
         token_persistent: state.service.gateway_token_persistent(),
     };
     if let Ok(mut guard) = state.gateway.lock() {
-        *guard = Some(handle);
+        *guard = Some(GatewayRunning {
+            handle,
+            site_id: args.site_id,
+            key_id: args.key_id,
+        });
     }
     Ok(status)
 }
@@ -1150,31 +1175,41 @@ pub async fn gateway_rotate_token(
 ) -> Result<GatewayStatusDto, String> {
     let _op = state.gateway_op.lock().await;
 
-    // ① 先换钥匙串里那一份。**失败即中止**（不重启）：否则用户以为换掉了，
-    //    而重启后会读到旧令牌（或者第三把），状态与预期不符。
-    state
-        .service
-        .rotate_gateway_token()
-        .map_err(|e| e.to_string())?;
-
-    // ② 网关没在跑 ⇒ 到此为止（下一次启动用新令牌）。
-    let running = match state.gateway.lock() {
-        Ok(mut guard) => guard.take(),
-        Err(_) => None,
-    };
-    let Some(handle) = running else {
+    // P1-6 完整修复：网关在跑时，用**运行态**记录的 site_id/key_id 构造 config，
+    // 不用命令参数。切页后 args 可能带默认值，用它会把网关悄悄换到错误的 site/key
+    //（令牌轮换的语义是「不换站、不换密钥」，只换本地令牌）。args 仅作一致性校验。
+    //
+    // 网关没在跑 ⇒ 只换钥匙串（不需要 args，下一次启动用新令牌）。
+    let running = state.gateway.lock().map(|g| g.is_some()).unwrap_or(false);
+    if !running {
+        state
+            .service
+            .rotate_gateway_token()
+            .map_err(|e| e.to_string())?;
         return Ok(gateway_status_of(&state));
+    }
+
+    // 网关在跑：从运行态读 site_id/key_id（不 take——校验/构造/换令牌失败时网关继续跑）。
+    let (site_id, key_id) = {
+        let guard = state
+            .gateway
+            .lock()
+            .map_err(|_| "网关状态锁失效（需要重启应用）".to_string())?;
+        let run = guard.as_ref().ok_or_else(|| "网关已不在运行".to_string())?;
+        // args 一致性校验：前端传来的 site/key 必须与启动时一致，否则拒绝，
+        // 避免「以为在轮换 A 站令牌、实际切到 B 站」。
+        if let Some(args) = args {
+            if args.site_id != run.site_id || args.key_id != run.key_id {
+                return Err(format!(
+                    "轮换令牌不切换站点/密钥：网关运行在站点 #{} 密钥 #{}，但参数指向站点 #{} 密钥 #{}",
+                    run.site_id, run.key_id, args.site_id, args.key_id
+                ));
+            }
+        }
+        (run.site_id, run.key_id)
     };
 
-    // ③ 重启：先停（等端口释放）→ 再按**同一组**站点/密钥启。
-    //    取不到参数就明确拒绝：把「轮换」做成「顺手把网关关掉」是最坏的结果。
-    let args = args.ok_or_else(|| {
-        "轮换令牌需要同时重启网关，请从「网关」页触发（缺少站点与密钥参数）".to_string()
-    })?;
-    stop_gateway(handle).await;
-    state.service.drain_gateway_failures();
-    state.service.end_gateway_session();
-
+    // 构造 config（gateway_config 校验 key 存在 + 未回收 + 属于站点）。
     let port = state
         .service
         .settings()
@@ -1182,8 +1217,26 @@ pub async fn gateway_rotate_token(
         .gateway_port;
     let config = state
         .service
-        .gateway_config(args.site_id, args.key_id, port)
+        .gateway_config(site_id, key_id, port)
         .map_err(|e| e.to_string())?;
+
+    // 校验通过才换令牌。失败即中止（没 take、没 stop，网关继续跑旧令牌）。
+    state
+        .service
+        .rotate_gateway_token()
+        .map_err(|e| e.to_string())?;
+
+    // take + stop + start（用运行态的 site_id/key_id，与启动时相同）。
+    let run = state
+        .gateway
+        .lock()
+        .map_err(|_| "网关状态锁失效（需要重启应用）".to_string())?
+        .take()
+        .ok_or_else(|| "网关已不在运行".to_string())?;
+    stop_gateway(run.handle).await;
+    state.service.drain_gateway_failures();
+    state.service.end_gateway_session();
+
     let handle = keyrelay_core::gateway::start(config)
         .await
         .map_err(|e| e.to_string())?;
@@ -1195,7 +1248,11 @@ pub async fn gateway_rotate_token(
         token_persistent: state.service.gateway_token_persistent(),
     };
     if let Ok(mut guard) = state.gateway.lock() {
-        *guard = Some(handle);
+        *guard = Some(GatewayRunning {
+            handle,
+            site_id,
+            key_id,
+        });
     }
     Ok(status)
 }
@@ -1209,9 +1266,9 @@ pub async fn gateway_stop(state: State<'_, AppState>) -> Result<GatewayStatusDto
         Ok(mut guard) => guard.take(),
         Err(_) => None,
     };
-    if let Some(handle) = running {
+    if let Some(run) = running {
         // 等端口真正释放再返回：否则调用方紧接着 start 会撞 AddrInUse
-        stop_gateway(handle).await;
+        stop_gateway(run.handle).await;
     }
     // M7-S5 复审 P2-1：把网关攒下的失败**在这里落库一次**。
     //
@@ -1905,7 +1962,9 @@ pub async fn captcha_begin<R: tauri::Runtime>(
 
     let label = captcha_window_label(site_id);
     if let Some(existing) = app.get_webview_window(&label) {
-        // 窗口已开着：聚焦。**不重建**——见函数的「重复点击」说明。
+        // 窗口已存在（可能被隐藏过）：show + 聚焦。P1-7：旧实现只 set_focus，
+        // macOS 对不可见窗口 set_focus 是空操作 ⇒ 关闭后再也打不开。
+        let _ = existing.show();
         let _ = existing.set_focus();
     } else {
         let url = challenge
@@ -2433,6 +2492,30 @@ mod tests {
         ));
         assert!(!cookie_belongs_to_site("", "relay.example.com"));
         assert!(!cookie_belongs_to_site("relay.example.com", ""));
+    }
+
+    #[test]
+    fn gateway_base_url_for_omits_v1_for_claude_code_only() {
+        // P1-5：Claude Code（Anthropic SDK）的 ANTHROPIC_BASE_URL 不带 /v1（SDK 自己拼 /v1/messages），
+        // 给它带 /v1 会变成 /v1/v1/messages。其他通道（OpenAI/Codex 等）带 /v1。
+        use keyrelay_core::delivery::{gateway_base_url_for, DeliveryChannel};
+        let url = "http://127.0.0.1:19387";
+        assert_eq!(
+            gateway_base_url_for(&DeliveryChannel::ClaudeCodeSettings, url),
+            url
+        );
+        assert_eq!(
+            gateway_base_url_for(&DeliveryChannel::CodexAuthJson, url),
+            format!("{url}/v1")
+        );
+        assert_eq!(
+            gateway_base_url_for(&DeliveryChannel::Continue, url),
+            format!("{url}/v1")
+        );
+        assert_eq!(
+            gateway_base_url_for(&DeliveryChannel::ShellBlock, url),
+            format!("{url}/v1")
+        );
     }
 
     #[test]

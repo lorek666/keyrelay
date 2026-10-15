@@ -20,7 +20,7 @@ fn store_with_one_binding() -> (tempfile::TempDir, Store, i64, i64) {
         .insert_key(site, "codex/daily", "kr/key/1/secret", Some("1"), None)
         .unwrap();
     store
-        .record_binding("codex", key, "/home/u/.codex/auth.json", "j1")
+        .record_binding("codex", key, "/home/u/.codex/auth.json", "j1", "site")
         .unwrap();
     (dir, store, site, key)
 }
@@ -74,7 +74,13 @@ fn unbinding_one_target_leaves_the_others_alone() {
     // 同一 agent 可能有多个落点；`unbind_target` 只解绑**那一个文件**。
     let (_dir, store, site, key) = store_with_one_binding();
     store
-        .record_binding("codex", key, "/home/u/.config/opencode/opencode.json", "j2")
+        .record_binding(
+            "codex",
+            key,
+            "/home/u/.config/opencode/opencode.json",
+            "j2",
+            "site",
+        )
         .unwrap();
 
     let report = store.unbind_target("/home/u/.codex/auth.json").unwrap();
@@ -117,7 +123,7 @@ fn re_delivering_after_unbinding_inserts_a_new_row() {
     store.unbind_agent("codex").unwrap();
 
     store
-        .record_binding("codex", key, "/home/u/.codex/auth.json", "j3")
+        .record_binding("codex", key, "/home/u/.codex/auth.json", "j3", "site")
         .unwrap();
 
     let rows = store.bindings_of_agent("codex").unwrap();

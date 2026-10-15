@@ -162,6 +162,19 @@ pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
     }
 }
 
+/// 按 channel 决定网关 base_url 是否带 `/v1`（P1-5 / P1-2）。
+///
+/// Claude Code（Anthropic SDK）的 `ANTHROPIC_BASE_URL` 不带 `/v1`——SDK 自己拼 `/v1/messages`，
+/// 给它带 `/v1` 会变成 `/v1/v1/messages`。OpenAI / Codex 等 SDK 的 base_url 带 `/v1`（SDK 拼 `/chat/completions`）。
+///
+/// P1-2：`service::rotate_key` 构造 Gateway endpoint 时也调它，保证轮换后 base_url 与原投递同口径。
+pub fn gateway_base_url_for(channel: &DeliveryChannel, local_url: &str) -> String {
+    match channel {
+        DeliveryChannel::ClaudeCodeSettings => local_url.to_string(),
+        _ => format!("{}/v1", local_url),
+    }
+}
+
 /// 生效策略（章程 §3.3 冻结）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestartHint {

@@ -293,3 +293,40 @@ async fn unbind_keeps_the_key_usable_elsewhere() {
         .unwrap();
     assert!(outcome.journal_id.starts_with('j'), "{outcome:?}");
 }
+
+#[tokio::test]
+async fn unbind_revoke_skips_already_unbound_bindings() {
+    // P1-1：解绑 + 回收只回收「当前仍绑定的」行对应的 key，跳过已解绑的
+    // （agent 历史用过的、可能已给了别的 agent 的）。旧实现遍历全部 affected
+    // （含已解绑），会把 K1（已解绑给 B）也删掉，导致 B 立刻失效。
+    let f = setup().await;
+    // K1 投递给 codex，然后解绑（不回收）—— 模拟「K1 已解绑」
+    deliver(&f, DeliveryChannel::CodexAuthJson);
+    f.service.unbind("codex", false).await.unwrap();
+    // K2 投递给 codex（当前绑定）。复用 K1 的 secret_ref（vault 已有该 secret）。
+    let reference = secret_ref("key", 1, "secret");
+    let key_id2 = f
+        .service
+        .store()
+        .insert_key(f.site_id, "codex/daily2", &reference, Some("2"), None)
+        .unwrap();
+    f.service
+        .grant_consent(key_id2, DeliveryChannel::CodexAuthJson)
+        .unwrap();
+    f.service
+        .apply_delivery(key_id2, DeliveryChannel::CodexAuthJson)
+        .unwrap();
+    // mock 回收响应（只期望 K2 被回收一次）
+    f.mock.push(delete_ok());
+    let before = f.mock.request_count();
+
+    let outcome = f.service.unbind("codex", true).await.unwrap();
+
+    // 只回收 K2（当前绑定），不回收 K1（已解绑）⇒ 只 1 次站点请求
+    assert_eq!(
+        f.mock.request_count(),
+        before + 1,
+        "只回收当前绑定的 K2，不回收已解绑的 K1"
+    );
+    assert_eq!(outcome.revoked.len(), 1, "只回收 1 把");
+}

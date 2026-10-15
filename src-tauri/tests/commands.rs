@@ -1040,6 +1040,88 @@ fn gateway_rotate_token_reaches_the_business_path() {
     assert_eq!(value["tokenPersistent"], true, "写进钥匙串了");
 }
 
+#[test]
+fn gateway_rotate_token_refuses_mismatched_key_and_keeps_gateway_running() {
+    // P1-6 完整修复：网关在跑时，rotate 用运行态记录的 site_id/key_id，不用命令参数。
+    // 切页后 args 带错的密钥 ⇒ 一致性校验拒绝，且网关不被停（令牌没换、继续跑）。
+    use tauri::Manager;
+
+    let (_app, webview) = build_app();
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("探端口");
+        probe.local_addr().expect("读端口").port()
+    };
+
+    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let site = state
+        .service
+        .store()
+        .upsert_site("newapi", "https://relay.example.com", "P1-6 站")
+        .expect("写站点");
+    let key_a = state
+        .service
+        .store_key_material(
+            site,
+            "codex/daily",
+            Some("12"),
+            None,
+            "sk-a-0123456789abcdef",
+        )
+        .expect("写密钥 A")
+        .id;
+    let key_b = state
+        .service
+        .store_key_material(
+            site,
+            "codex/night",
+            Some("13"),
+            None,
+            "sk-b-0123456789abcdef",
+        )
+        .expect("写密钥 B")
+        .id;
+    assert_ne!(key_a, key_b, "两把密钥必须不同");
+
+    enable_gateway(&webview, port);
+
+    // 用密钥 A 启动。
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_a}}),
+    )
+    .expect("启动");
+    assert_eq!(started["running"], true, "{started}");
+
+    // P1-6 核心：rotate 传密钥 B（与启动时的 A 不一致）⇒ 拒绝。
+    let err = invoke_on(
+        &webview,
+        "gateway_rotate_token",
+        json!({"args": {"siteId": site, "keyId": key_b}}),
+    )
+    .expect_err("不一致的密钥必须被拒");
+    assert_not_acl_rejection("gateway_rotate_token", &err);
+    assert!(
+        err.to_string().contains("不切换站点"),
+        "应说明不切换站点/密钥: {err}"
+    );
+
+    // 拒绝后网关仍在跑（没被停、令牌没换）。
+    let status = invoke_on(&webview, "gateway_status", json!({})).expect("查状态");
+    assert_eq!(status["running"], true, "拒绝后网关应仍在跑: {status}");
+
+    // 用一致的密钥 A rotate ⇒ 成功。
+    let rotated = invoke_on(
+        &webview,
+        "gateway_rotate_token",
+        json!({"args": {"siteId": site, "keyId": key_a}}),
+    )
+    .expect("一致的密钥应成功");
+    assert_eq!(rotated["running"], true, "{rotated}");
+
+    invoke_on(&webview, "gateway_stop", json!({})).expect("收尾停止");
+}
+
 // ---------- M8-S2：人工过验证码（IPC 可达性与业务前置） ----------
 
 #[test]
@@ -1248,12 +1330,18 @@ fn list_channel_bindings_filters_out_unbound_rows() {
     state
         .service
         .store()
-        .record_binding("codex", live, "/home/u/.codex/auth.json", "j1")
+        .record_binding("codex", live, "/home/u/.codex/auth.json", "j1", "site")
         .expect("写绑定");
     state
         .service
         .store()
-        .record_binding("claude-code", dead, "/home/u/.claude/settings.json", "j2")
+        .record_binding(
+            "claude-code",
+            dead,
+            "/home/u/.claude/settings.json",
+            "j2",
+            "site",
+        )
         .expect("写绑定");
     state
         .service
@@ -1282,7 +1370,7 @@ fn list_channel_bindings_filters_out_unbound_rows() {
     state
         .service
         .store()
-        .record_binding("codex", dead, "/home/u/.codex/auth.json", "j3")
+        .record_binding("codex", dead, "/home/u/.codex/auth.json", "j3", "site")
         .expect("写第二条同目标绑定");
     let again = invoke_on(&webview, "list_channel_bindings", json!({})).expect("再查一次应成功");
     let rows = again.as_array().expect("应返回数组");
@@ -1333,13 +1421,13 @@ fn list_deliveries_returns_newest_first_with_camel_case_fields() {
     );
     let store = state.service.store();
     store
-        .record_binding("codex", key, "/home/u/.codex/auth.json", "j1")
+        .record_binding("codex", key, "/home/u/.codex/auth.json", "j1", "site")
         .expect("写绑定");
     store
-        .record_binding("codex", key, "/home/u/.codex/auth.json", "j2")
+        .record_binding("codex", key, "/home/u/.codex/auth.json", "j2", "site")
         .expect("写绑定");
     store
-        .record_binding("shell", key, "/home/u/.zshrc", "j3")
+        .record_binding("shell", key, "/home/u/.zshrc", "j3", "site")
         .expect("写绑定");
 
     let value = invoke_on(&webview, "list_deliveries", json!({"limit": 2}))

@@ -1211,10 +1211,16 @@ fn channel_bindings_exclude_unbound_rows() {
         .insert_key(site, "codex/dead", "kr/key/2/secret", Some("2"), None)
         .expect("写 key");
     store
-        .record_binding("codex", live, "/home/u/.codex/auth.json", "j1")
+        .record_binding("codex", live, "/home/u/.codex/auth.json", "j1", "site")
         .expect("写绑定");
     store
-        .record_binding("claude-code", dead, "/home/u/.claude/settings.json", "j2")
+        .record_binding(
+            "claude-code",
+            dead,
+            "/home/u/.claude/settings.json",
+            "j2",
+            "site",
+        )
         .expect("写绑定");
 
     // 把第二条解绑（M8-S4 的语义：标记 `unbound_at`，不删行）
@@ -1248,7 +1254,7 @@ fn reading_channel_bindings_does_not_touch_the_database() {
         .insert_key(site, "codex/daily", "kr/key/1/secret", Some("1"), None)
         .expect("写 key");
     store
-        .record_binding("codex", key, "/home/u/.codex/auth.json", "j1")
+        .record_binding("codex", key, "/home/u/.codex/auth.json", "j1", "site")
         .expect("写绑定");
 
     // 读之前先把整表抄一份

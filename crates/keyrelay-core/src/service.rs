@@ -913,14 +913,18 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         self.set_captcha_phase(site_id, next);
         validated?;
         let session = captcha::session_from_captcha_cookies(&cookies);
-        self.store.set_site_health(site_id, HEALTH_OK)?;
+        // P1-8：cookie-only 会话在 Sub2API（要 `Authorization` 头）上不可用，不报 ok。
+        // 标成 `needs_login`：下一次请求会 401，但 health 已如实标记，不谎报「会话已接上」。
+        // 覆盖原会话成 cookie-only：触发 captcha 时原会话通常已失效（401 触发 captcha），
+        // 覆盖影响有限；若原 Bearer 仍有效，captcha 不会触发。
+        self.store.set_site_health(site_id, HEALTH_NEEDS_LOGIN)?;
         self.sessions.put(site_id, session)?;
-        // **成功**才留痕：人工验证真的完成、会话真的换了——这条是用户能看懂的因果。
+        // **成功**才留痕：人工验证真的完成——但 cookie-only 会话不可用，文案如实。
         // 进入人工态 / 取消 / 校验失败都**不写**事件（S2 §5 T12）。
         self.log(observability::event_with_payload(
             Level::Info,
             "site",
-            "人机验证完成：会话已更新",
+            "人机验证已通过：cookie 已更新，需重新登录获取访问令牌",
             serde_json::json!({ "site_id": site_id }),
         ));
         Ok(())
@@ -1238,6 +1242,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         model: Option<&str>,
         source: delivery::DeliverySource<'_>,
     ) -> Result<DeliveryOutcome> {
+        // P1-2：记录投递模式（轮换按它走，不把网关模式改成站点模式）。
+        let delivery_mode = match &source {
+            delivery::DeliverySource::Gateway(_) => "gateway",
+            delivery::DeliverySource::Site => "site",
+        };
         // ① 同意（未同意时**不读钥匙串、不落盘**）
         let writer = self.prepare_delivery(key_id, channel, model, source)?;
         let target = self.checked_target(channel, &writer.target_path())?;
@@ -1307,6 +1316,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 key_id,
                 &target.display().to_string(),
                 &journal.id,
+                delivery_mode,
             )
         }) {
             return match inject::rollback(&journal) {
@@ -1759,7 +1769,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                     format!("通知发送失败: {}", failures.join(" | ")),
                     serde_json::json!({
                         "kind": format!("{:?}", item.kind),
-                        "webhook": crate::redact::strip_url_userinfo(
+                        "webhook": crate::redact::mask_webhook_url(
                             state.config.webhook_url.as_deref().unwrap_or("")
                         ),
                     }),
@@ -2054,9 +2064,35 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
 
         // ② 全量重注入
         let mut reinjected: Vec<String> = Vec::new();
+        // P1-2：按原绑定的 delivery_mode 走，不把网关模式改成站点模式（写明文 key）。
+        let port = self.settings()?.gateway_port;
+        let gateway_token = self.gateway_token().0;
         for channel in channels {
             let channel_name = channel.as_str();
-            if let Err(err) = self.apply_delivery(new_key.id, channel) {
+            let mode = self.rotation_delivery_mode(key_id, &channel)?;
+            let result = match mode.as_str() {
+                "gateway" => {
+                    let local_url = format!("http://127.0.0.1:{}", port);
+                    let base_url = delivery::gateway_base_url_for(&channel, &local_url);
+                    let endpoint = delivery::GatewayEndpoint {
+                        base_url,
+                        token: gateway_token.clone(),
+                    };
+                    self.apply_delivery_in(
+                        new_key.id,
+                        channel,
+                        None,
+                        delivery::DeliverySource::Gateway(&endpoint),
+                    )
+                }
+                _ => self.apply_delivery_in(
+                    new_key.id,
+                    channel,
+                    None,
+                    delivery::DeliverySource::Site,
+                ),
+            };
+            if let Err(err) = result {
                 let reason = crate::redact::scrub(&err.to_string());
                 self.log(observability::event_with_payload(
                     Level::Warn,
@@ -2615,8 +2651,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// # 为什么先读后标记
     ///
     /// 「要回收哪几把」必须在标记**之前**读：标记之后 `bindings_of_agent` 仍然会返回这些行
-    /// （行没删），但语义上我们要的是「**这次**解绑影响到的那些」。两次调用之间没有写操作，
-    /// 所以顺序只影响可读性——先读再标记，代码说的就是它做的事。
+    /// （行没删），但回收只针对「当前仍绑定的」行（P1-1：`unbound_at` 为 `None` 的），
+    /// 已解绑的不回收。两次调用之间没有写操作，所以顺序只影响可读性——先读再标记。
     pub async fn unbind(&self, agent_id: &str, also_revoke: bool) -> Result<UnbindOutcome> {
         let affected = self.store.bindings_of_agent(agent_id)?;
         let report = self.store.unbind_agent(agent_id)?;
@@ -2631,6 +2667,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 std::collections::HashSet::new();
             let mut unmanaged = 0usize;
             for row in &affected {
+                // P1-1：只回收「当前仍绑定的」行对应的 key，跳过已解绑的。
+                // 旧实现遍历全部 affected（含已解绑），会把 agent 历史用过的所有 key
+                // 在站点删掉——包括已经解绑给别的 agent 的，导致那个 agent 立刻失效。
+                if row.unbound_at.is_some() {
+                    continue;
+                }
                 let Some(remote_id) = row.remote_id.clone() else {
                     // 站点侧没有记录（用户在站点网页上手工建的 key）⇒ 没有可回收的 id。
                     unmanaged += 1;
@@ -2810,8 +2852,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // （原来那一版是 `.to_string()`，把 `Zeroizing` 里的明文复制成裸 `String`）。
         let api_key = self.key_secret(key_id)?;
 
-        let (route, keys_by_ref) = self.build_gateway_route()?;
-
+        // P1-4：当前按 M8-S4（用户选的站点 = 上游）。route 为空表 ⇒ 走 legacy 单上游路径
+        //（config.base_url / api_key = 所选站点）。多站路由（M8-S1）是 B-99 接线后的未来，
+        // 届时再建非空 route。旧实现 build_gateway_route 把所有站点建进路由表，gateway.rs
+        // 的非空路由分支不读用户选择 ⇒ 界面显示「上游 B」请求却发往 A。
+        //
         // 令牌**跨重启稳定**（M8-S4 §6.4）：不稳定的令牌会让每次 `stop → start` 都作废
         // agent 配置里那把，而那正是 FR-5:158「换站零改动」要消灭的一步。
         let (token, token_persistent) = self.gateway_token();
@@ -2825,12 +2870,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             api_key,
             site.display_name,
         );
-        // ① 路由表：**非空**（只要至少有一个可用站点）。空表会退回 legacy 单上游路径，
-        //    那正是 M7 的 D-4——所以这里非空本身就是本包存在的意义。
-        config.route = route;
-        // ② 明文映射：`route` 里出现的每个 `key_ref` 都在这里。集合不变式由
-        //    `tests/routing_wiring.rs` 的 W3 守着（缺一个 ⇒ 网关静默 502）。
-        config.keys_by_ref = keys_by_ref;
+        // route / keys_by_ref 保持 single_upstream 的默认（空）：legacy 单上游路径用
+        // config.base_url / api_key（所选站点）。多站路由见 B-99。
         // ③ 已回收集合：网关只**查**它，不新开取密钥路径。
         config.revoked_refs = Some(Arc::clone(&self.revoked_refs));
         // ④ 会话代号：本次会话的失败才算本次的（§11.1）。
@@ -2958,6 +2999,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// **每个站点取哪一把 key**：取该站点**最新**的一条（`list_keys` 按 id 倒序无所谓，
     /// 这里显式按 id 取最大）。多把 key 的站点应当由用户自己决定用哪把——今天没有这个界面，
     /// 登记为限制（不是缺陷：站点的多把 key 在额度上等价，取最新那把是最不容易过期的）。
+    /// B-99 接线后启用（多站路由）。当前 gateway_config 用空 route（legacy 单上游，P1-4）。
+    #[allow(dead_code)]
     fn build_gateway_route(
         &self,
     ) -> Result<(
@@ -3011,7 +3054,9 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         Ok((crate::routing::build_route_table(&facts), keys))
     }
 
-    /// 该站点用来出网的 key：**未回收**里 id 最大的那一条（最新的一把）。
+    /// 该站点用来出网的 key：**未回收**且未禁用/耗尽里 id 最大的那一条（最新的一把）。
+    /// B-99 接线后启用。当前不被调用（build_gateway_route 死代码，P1-4）。
+    #[allow(dead_code)]
     fn pick_gateway_key(&self, site_id: i64) -> Result<Option<crate::store::KeyRow>> {
         Ok(self
             .store
@@ -3019,7 +3064,24 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .into_iter()
             .filter(|row| row.site_id == site_id)
             .filter(|row| row.status != crate::store::KEY_STATUS_REVOKED)
+            // P1-4：也不选 disabled / exhausted（旧实现只过滤 revoked）
+            .filter(|row| {
+                row.status != crate::site::KeyStatus::Disabled.as_str()
+                    && row.status != crate::site::KeyStatus::Exhausted.as_str()
+            })
             .max_by_key(|row| row.id))
+    }
+
+    /// P1-2：读旧 key 在该 channel 的绑定的 delivery_mode（轮换按它走）。
+    /// 没有原绑定（首次投递）⇒ 默认 "site"（既有行为）。
+    fn rotation_delivery_mode(&self, old_key_id: i64, channel: &DeliveryChannel) -> Result<String> {
+        let bindings = self.store.bindings_of_agent(channel.agent_id())?;
+        Ok(bindings
+            .into_iter()
+            .filter(|b| b.key_id == old_key_id && b.unbound_at.is_none())
+            .max_by_key(|b| b.id)
+            .map(|b| b.delivery_mode)
+            .unwrap_or_else(|| "site".to_string()))
     }
 
     /// 作废当前网关会话（M8-S1 §11.1）。
