@@ -3,7 +3,8 @@
 //! 设计取舍：
 //! - **默认不跟随重定向**：站点 API 出现 302 通常意味着会话失效或域名迁移，静默跟随会把
 //!   凭据带到非预期主机上。
-//! - **代理显式配置**：不读系统代理（M1-S0 范围外），配置非法时构造即失败，绝不静默直连。
+//! - **代理显式配置**：校验与脱敏集中在 `crate::proxy`（M10-S2 起系统代理探测也复用同一份），
+//!   配置非法时构造即失败，绝不静默直连。
 //! - **User-Agent 固定**：站点侧便于识别与限流；不携带任何密钥信息。
 
 use std::time::Duration;
@@ -14,6 +15,7 @@ use reqwest::{redirect, Method as HttpMethod, Proxy};
 
 use super::transport::{HttpRequest, HttpResponse, HttpTransport, Method};
 use crate::error::{Error, Result};
+use crate::proxy::{mask_proxy, validate_proxy_url};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct TransportConfig {
@@ -77,59 +79,6 @@ impl std::fmt::Debug for ReqwestTransport {
     }
 }
 
-/// 只保留 `scheme://host[:port]`，丢弃 userinfo、path、query、fragment。
-///
-/// 复审 P2-1 只处理了 `user:pass@`；复核 N-1 补上 `@` 之后的秘密：
-/// `http://u:p@host/x?token=SECRET` 旧实现会原样回显 `?token=SECRET`。
-fn mask_proxy(raw: &str) -> String {
-    let Some((scheme, rest)) = raw.split_once("://") else {
-        return "<非法代理串>".to_string();
-    };
-    // authority 截止到 path / query / fragment 的第一个分隔符
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    if host.is_empty() {
-        return format!("{scheme}://<已隐藏>");
-    }
-    format!("{scheme}://{host}")
-}
-
-/// authority 之后的部分（path/query/fragment）。没有 `://` 时返回 `""`。
-fn proxy_tail(raw: &str) -> &str {
-    let Some((_, rest)) = raw.split_once("://") else {
-        return "";
-    };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    &rest[end..]
-}
-
-/// 非法后缀的**形态描述**：只报种类与字符数，**绝不回显内容**。
-///
-/// `http://u:p@host/x?token=SECRET` 里的 path / query 同样是秘密——
-/// 复核 N-1 已经把 `mask_proxy` 改成剥掉它们，这里不能再把正文放回错误串。
-fn describe_illegal_proxy_tail(tail: &str) -> String {
-    let (path, after_path) = match tail.find(['?', '#']) {
-        Some(index) => (&tail[..index], &tail[index..]),
-        None => (tail, ""),
-    };
-
-    let mut parts: Vec<String> = Vec::new();
-    if !path.is_empty() && path != "/" {
-        parts.push(format!("path(长度 {})", path.chars().count()));
-    }
-    if after_path.starts_with('?') {
-        parts.push("query".to_string());
-    }
-    if after_path.contains('#') {
-        parts.push("fragment".to_string());
-    }
-    if parts.is_empty() {
-        // 调用方只对非空、非 "/" 的后缀调用本函数；保底文案避免产出空括号。
-        parts.push("非空后缀".to_string());
-    }
-    parts.join(" / ")
-}
-
 impl ReqwestTransport {
     pub fn new(config: TransportConfig) -> Result<Self> {
         let mut headers = HeaderMap::new();
@@ -154,36 +103,9 @@ impl ReqwestTransport {
             .gzip(true);
 
         if let Some(proxy_url) = config.proxy.as_deref() {
-            // 先自校验 scheme：`Proxy::all` 对 `file:///etc/passwd`、无 scheme 的
-            // `alice:pw@host:1080` 都会**构造成功**，与模块文档「配置非法时构造即失败」
-            // 不符（复核 P2-4）。这里按 reqwest 实际支持的代理 scheme 白名单收口。
-            let scheme = proxy_url
-                .split_once("://")
-                .map(|(s, _)| s.to_ascii_lowercase())
-                .unwrap_or_default();
-            const ALLOWED: [&str; 6] = ["http", "https", "socks4", "socks4a", "socks5", "socks5h"];
-            if !ALLOWED.contains(&scheme.as_str()) {
-                return Err(Error::Transport(format!(
-                    "代理配置无效（{}）：scheme 必须是 {} 之一，拒绝静默直连",
-                    mask_proxy(proxy_url),
-                    ALLOWED.join(" / ")
-                )));
-            }
-
-            // BACKLOG B-42：`Proxy::all` 会接受 `socks5://127.0.0.1:1080/pac?query`，
-            // 而 reqwest 实际只用 scheme/host/port —— 用户以为配了 PAC 路径，实际是
-            // 普通代理，与模块文档「配置非法时构造即失败，绝不静默直连」不符。
-            // 这里要求 authority 之后为空（允许单个尾斜杠这种等价写法）。
-            let tail = proxy_tail(proxy_url);
-            if !matches!(tail, "" | "/") {
-                return Err(Error::Transport(format!(
-                    "代理配置无效（{}）：代理地址只能是 scheme://host[:port]（可带 userinfo），\
-                     检测到非法片段（{}，共 {} 个字符），拒绝静默直连",
-                    mask_proxy(proxy_url),
-                    describe_illegal_proxy_tail(tail),
-                    tail.chars().count()
-                )));
-            }
+            // scheme 白名单 + path/query/fragment 拒绝集中在 `proxy::validate_proxy_url`，
+            // 与系统代理探测路径共用同一份校验（M10-S2）。非法 ⇒ Err，绝不静默直连。
+            validate_proxy_url(proxy_url)?;
 
             let proxy = Proxy::all(proxy_url.to_string()).map_err(|e| {
                 Error::Transport(format!(
@@ -342,37 +264,6 @@ mod tests {
     }
 
     #[test]
-    fn mask_proxy_drops_userinfo() {
-        assert_eq!(
-            mask_proxy("http://alice:s3cr3t@127.0.0.1:7897"),
-            "http://127.0.0.1:7897"
-        );
-        assert_eq!(
-            mask_proxy("socks5://127.0.0.1:1080"),
-            "socks5://127.0.0.1:1080"
-        );
-        assert_eq!(mask_proxy("这不是一个 URL"), "<非法代理串>");
-    }
-
-    #[test]
-    fn mask_proxy_drops_path_query_fragment() {
-        // 复核 N-1：`@` 之后的 path / query / fragment 同样是秘密
-        assert_eq!(
-            mask_proxy("http://alice:s3cr3t@127.0.0.1:7897/pac?token=s3cr3t#frag"),
-            "http://127.0.0.1:7897"
-        );
-        assert_eq!(
-            mask_proxy("http://127.0.0.1:7897?k=v"),
-            "http://127.0.0.1:7897"
-        );
-        assert_eq!(mask_proxy("http://alice:s3cr3t@"), "http://<已隐藏>");
-        assert_eq!(
-            mask_proxy("http://alice:s3cr3t@/x?token=SECRET"),
-            "http://<已隐藏>"
-        );
-    }
-
-    #[test]
     fn proxy_credentials_never_reach_error_message() {
         // 复审 P2-1：错误串里不得出现 user:pass
         let config = TransportConfig {
@@ -491,29 +382,6 @@ mod tests {
         );
         assert!(!message.contains("s3cr3t-token"), "泄漏了凭据: {message}");
         assert!(!message.contains("alice"), "泄漏了用户名: {message}");
-    }
-
-    #[test]
-    fn describe_illegal_proxy_tail_names_the_parts() {
-        let path_only = describe_illegal_proxy_tail("/pac");
-        assert!(path_only.contains("path"), "{path_only}");
-        assert!(path_only.contains('4'), "{path_only}");
-
-        let query_only = describe_illegal_proxy_tail("?token=x");
-        assert_eq!(query_only, "query", "{query_only}");
-
-        let all = describe_illegal_proxy_tail("/x?y#z");
-        assert!(all.contains("path"), "{all}");
-        assert!(all.contains("query"), "{all}");
-        assert!(all.contains("fragment"), "{all}");
-
-        // 调用方不会对 "/" 调用本函数，但保底文案不能是空串
-        assert!(!describe_illegal_proxy_tail("/").is_empty());
-
-        assert_eq!(proxy_tail("http://127.0.0.1:7897"), "");
-        assert_eq!(proxy_tail("http://127.0.0.1:7897/"), "/");
-        assert_eq!(proxy_tail("http://u:p@h:1/x?y#z"), "/x?y#z");
-        assert_eq!(proxy_tail("没有 scheme"), "");
     }
 
     #[test]

@@ -101,12 +101,18 @@ fn platform_specific_files_match_the_known_inventory() {
     // - `delivery/mod.rs`（M7-S3）：`current_host_os()` 按宿主平台分派 VS Code `globalStorage`
     //   候选路径（macOS `Library/Application Support/Code/…` / Windows `AppData/Roaming/Code/…`），
     //   给 Cline / Roo 的「探测 + 明确拒绝」用。双端说明见 `docs/evidence/platform-parity.md` §1.1。
+    //
+    // M10-S2 新增一项（2026-10-15）：
+    // - `proxy.rs`：系统代理探测按平台分派——macOS 走 `scutil --proxy`、Windows 走 `reg query`
+    //   `HKCU\…\Internet Settings`、其余平台只读环境变量。解析 `scutil`/`reg query` 文本是纯函数，
+    //   跨平台可测；真实进程探测在真机上验证（见 `docs/evidence/platform-parity.md` §1.2）。
     let expected = vec![
         "autostart.rs".to_string(),
         "delivery/mod.rs".to_string(),
         "delivery/shell_block.rs".to_string(),
         "inject/mod.rs".to_string(),
         "notify/system.rs".to_string(),
+        "proxy.rs".to_string(),
         "vault/keychain.rs".to_string(),
     ];
 
