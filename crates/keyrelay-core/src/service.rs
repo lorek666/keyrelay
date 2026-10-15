@@ -693,7 +693,7 @@ struct NotifyState {
 
 impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     pub fn new(store: Store, transport: T, config: ServiceConfig) -> Self {
-        Self {
+        let svc = Self {
             registry: SiteRegistry::new(transport),
             store,
             sessions: SessionCache::new(),
@@ -709,6 +709,35 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             revoked_refs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             gateway_token_persistent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             captcha_phases: Mutex::new(HashMap::new()),
+        };
+        // M13-S1：启动时从钥匙串恢复持久化 session，重启免登。best-effort，不阻断启动。
+        svc.restore_sessions();
+        svc
+    }
+
+    /// 从钥匙串恢复所有站点的持久化 session 到内存缓存（M13-S1）。
+    ///
+    /// 启动时由 [`Self::new`] 调一次。best-effort：钥匙串无条目 / 反序列化失败 ⇒ 跳过该站点，
+    /// 不报错、不阻断启动——下次 `login` 会覆盖。session 是否仍有效不在此判断（lazy：
+    /// 用的时候 401 才知道，`mark_needs_login` 会清掉坏的）。
+    pub fn restore_sessions(&self) {
+        let Ok(sites) = self.store.list_sites() else {
+            return;
+        };
+        for site in sites {
+            let reference = self.session_ref(site.id);
+            // 走唯一明文出口 `vault_secret`（M8-S1 守卫：`vault.get(` 在 service.rs 只出现一次），
+            // 不在这里新开 `vault.get` 调用点——否则「明文出口单一」守卫会红。
+            match self.vault_secret(&reference) {
+                Ok(Some(stored)) => {
+                    if let Ok(session) = Session::from_stored(stored.as_str()) {
+                        let _ = self.sessions.put(site.id, session);
+                    }
+                    // 反序列化失败：跳过（不删——下次 login 会覆盖；删了反而损失可能可用的会话）
+                }
+                Ok(None) => {} // 未持久化（没登录过 / 已失效被删）
+                Err(_) => {}   // 钥匙串读失败：跳过，不阻断启动
+            }
         }
     }
 
@@ -840,7 +869,20 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // 的僵尸态）。这条转移不在 T1–T8 里——那八条覆盖的是「登录被拒」的分支。
         self.set_captcha_phase(site_id, CaptchaPhase::Idle);
         self.store.set_site_health(site_id, HEALTH_OK)?;
+        // 先序列化（session 即将被 move 进 cache）：M13-S1 持久化到钥匙串。
+        // best-effort：序列化/写钥匙串失败不掩盖登录成功——内存会话已可用，只是下次重启没得恢复。
+        let stored = session.to_stored();
         self.sessions.put(site_id, session)?;
+        if let Ok(s) = stored {
+            if let Err(err) = self.vault.put(&self.session_ref(site_id), &s) {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "vault",
+                    format!("持久化会话失败: {err}"),
+                    serde_json::json!({ "site_id": site_id }),
+                ));
+            }
+        }
         self.log(observability::event_with_payload(
             Level::Info,
             "site",
@@ -926,7 +968,18 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // 覆盖原会话成 cookie-only：触发 captcha 时原会话通常已失效（401 触发 captcha），
         // 覆盖影响有限；若原 Bearer 仍有效，captcha 不会触发。
         self.store.set_site_health(site_id, HEALTH_NEEDS_LOGIN)?;
+        let stored = session.to_stored();
         self.sessions.put(site_id, session)?;
+        if let Ok(s) = stored {
+            if let Err(err) = self.vault.put(&self.session_ref(site_id), &s) {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "vault",
+                    format!("持久化会话失败: {err}"),
+                    serde_json::json!({ "site_id": site_id }),
+                ));
+            }
+        }
         // **成功**才留痕：人工验证真的完成——但 cookie-only 会话不可用，文案如实。
         // 进入人工态 / 取消 / 校验失败都**不写**事件（S2 §5 T12）。
         self.log(observability::event_with_payload(
@@ -1054,8 +1107,17 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         err
     }
 
+    /// 站点会话的钥匙串引用（M13-S1）：`kr/site/<site_id>/session`。
+    fn session_ref(&self, site_id: i64) -> String {
+        crate::vault::secret_ref("site", site_id, "session")
+    }
+
     /// 把站点标成「需要重新登录」。**best-effort**：写库失败只留一条 warn 事件，
     /// 不改写调用方看到的原始错误——调用方要的是「为什么失败」，不是「状态没存上」。
+    ///
+    /// 同时删掉钥匙串里的持久化 session（M13-S1）：session 已被判坏，不能再留给下次
+    /// 启动加载——否则重启后 restore 一个已知 401 的会话，用户又得手动重登一次。
+    /// `vault.delete` 幂等，无条目也 Ok。
     fn mark_needs_login(&self, site_id: i64) {
         if let Err(err) = self.store.set_site_health(site_id, HEALTH_NEEDS_LOGIN) {
             self.log(observability::event_with_payload(
@@ -1063,6 +1125,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 "store",
                 format!("站点状态落库失败: {err}"),
                 serde_json::json!({ "site_id": site_id, "health": HEALTH_NEEDS_LOGIN }),
+            ));
+        }
+        if let Err(err) = self.vault.delete(&self.session_ref(site_id)) {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "vault",
+                format!("删除持久化会话失败: {err}"),
+                serde_json::json!({ "site_id": site_id }),
             ));
         }
     }
@@ -1075,7 +1145,19 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     pub fn remove_site(&self, site_id: i64) -> Result<()> {
         self.sessions.invalidate(site_id);
         self.set_captcha_phase(site_id, CaptchaPhase::Idle);
-        self.store.delete_site(site_id)
+        self.store.delete_site(site_id)?;
+        // 删站后清理钥匙串里的持久化 session（M13-S1）。与清 cache 同理：SQLite rowid
+        // 会复用，旧站的持久化 session 若留着，下次同 id 新站 restore 时会被套用，跨站串号。
+        // best-effort：删失败留孤儿条目，不掩盖已成功的删站。
+        if let Err(err) = self.vault.delete(&self.session_ref(site_id)) {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "vault",
+                format!("删除持久化会话失败: {err}"),
+                serde_json::json!({ "site_id": site_id }),
+            ));
+        }
+        Ok(())
     }
 
     fn site(&self, site_id: i64) -> Result<SiteRow> {
@@ -2855,6 +2937,15 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         if self.vault.has(GATEWAY_TOKEN_REF)? {
             refs.push(GATEWAY_TOKEN_REF.to_string());
         }
+        // M13-S1：每个站点的持久化 session（`kr/site/<id>/session`）也属本产品拥有的
+        // 钥匙串条目，一键清理（FR-8:191）必须带上，否则删站/卸载后留孤儿。
+        // 与 GATEWAY_TOKEN_REF 同口径：先 `has` 再列，避免「清掉几条」数字虚高。
+        for site in self.store.list_sites()? {
+            let reference = self.session_ref(site.id);
+            if self.vault.has(&reference)? {
+                refs.push(reference);
+            }
+        }
         refs.sort();
         refs.dedup();
         Ok(refs)
@@ -4323,5 +4414,201 @@ mod tests {
 
         cache.invalidate(1);
         assert!(cache.is_empty());
+    }
+
+    // ---- M13-S1：会话持久化 ----
+
+    #[tokio::test]
+    async fn login_persists_session_to_vault() {
+        let transport_responses = vec![
+            status_response(),
+            encryption_disabled_response(),
+            login_response(),
+        ];
+        let store = Store::open_in_memory().unwrap();
+        let service = KeyRelayService::new(
+            store,
+            MockTransport::new(transport_responses),
+            test_config(),
+        );
+        let site = service.add_site("https://relay.example.com").await.unwrap();
+        service
+            .login(site.id, Credentials::new("me", "pw"))
+            .await
+            .unwrap();
+
+        let reference = service.session_ref(site.id);
+        assert!(
+            service.vault.has(&reference).unwrap(),
+            "login 后应有持久化 session（钥匙串条目存在）"
+        );
+        // 内容往返 + 含 cookie 值的验证由 restore_sessions_loads_persisted_into_cache
+        // 覆盖（那里 vault.put 正规 JSON + restore + 验证 cache cookies）。本测试只钉
+        // 「login 确实写了钥匙串」——不调 vault.get 以守住 M8-S1 的
+        // 「vault.get 在 service.rs 只出现一次」明文出口守卫。
+    }
+
+    #[tokio::test]
+    async fn mark_needs_login_deletes_vault_session() {
+        let service = service_with(vec![status_response()]).await;
+        let site = service.add_site("https://relay.example.com").await.unwrap();
+        let reference = service.session_ref(site.id);
+        service
+            .vault
+            .put(
+                &reference,
+                "{\"cookies\":[],\"access_token\":null,\"user_id\":null}",
+            )
+            .unwrap();
+        assert!(
+            service.vault.has(&reference).unwrap(),
+            "前置：有持久化 session"
+        );
+
+        service.mark_needs_login(site.id);
+
+        assert!(
+            !service.vault.has(&reference).unwrap(),
+            "mark_needs_login 后必须删掉持久化 session"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_site_deletes_vault_session() {
+        let service = service_with(vec![status_response()]).await;
+        let site = service.add_site("https://relay.example.com").await.unwrap();
+        let reference = service.session_ref(site.id);
+        service
+            .vault
+            .put(
+                &reference,
+                "{\"cookies\":[[\"k\",\"v\"]],\"access_token\":null,\"user_id\":null}",
+            )
+            .unwrap();
+        assert!(service.vault.has(&reference).unwrap());
+
+        service.remove_site(site.id).unwrap();
+
+        assert!(
+            !service.vault.has(&reference).unwrap(),
+            "remove_site 后必须删掉持久化 session（防 rowid 复用串号）"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_secret_refs_includes_site_sessions() {
+        let service = service_with(vec![status_response()]).await;
+        let site = service.add_site("https://relay.example.com").await.unwrap();
+        let reference = service.session_ref(site.id);
+        service.vault.put(&reference, "{}").unwrap();
+
+        let refs = service.owned_secret_refs().unwrap();
+        assert!(
+            refs.contains(&reference),
+            "owned_secret_refs 必须含 site session_ref: {refs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_secret_refs_omits_site_without_persisted_session() {
+        // 没登录过的站点：钥匙串无 session 条目，owned_secret_refs 不该列它（清理数字不虚高）
+        let service = service_with(vec![status_response()]).await;
+        let site = service.add_site("https://relay.example.com").await.unwrap();
+        let reference = service.session_ref(site.id);
+
+        let refs = service.owned_secret_refs().unwrap();
+        assert!(
+            !refs.contains(&reference),
+            "无持久化 session 的站点不该被列进 owned_secret_refs: {refs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_sessions_loads_persisted_into_cache() {
+        let service = service_with(vec![status_response()]).await;
+        let site = service.add_site("https://relay.example.com").await.unwrap();
+        // Service::new 已调过一次 restore（此时 vault 空）
+        assert!(
+            service.sessions.get(site.id).is_none(),
+            "前置：无内存 session"
+        );
+
+        // 模拟上次登录留下的持久化 session
+        let reference = service.session_ref(site.id);
+        let session = Session {
+            cookies: vec![("session".into(), "abc".into())],
+            access_token: None,
+            user_id: None,
+        };
+        service
+            .vault
+            .put(&reference, &session.to_stored().unwrap())
+            .unwrap();
+
+        // 再调 restore（模拟重启后）
+        service.restore_sessions();
+
+        let cached = service
+            .sessions
+            .get(site.id)
+            .expect("restore 后应有内存 session");
+        assert_eq!(cached.cookies, vec![("session".into(), "abc".into())]);
+    }
+
+    #[tokio::test]
+    async fn restore_sessions_skips_missing_and_garbage() {
+        let service = service_with(vec![status_response(), status_response()]).await;
+        let site_a = service.add_site("https://relay.example.com").await.unwrap();
+        let site_b = service.add_site("https://b.example.com").await.unwrap();
+        // site_a：无持久化（missing）
+        // site_b：非法串（garbage）
+        let ref_b = service.session_ref(site_b.id);
+        service.vault.put(&ref_b, "not-json").unwrap();
+
+        service.restore_sessions();
+
+        assert!(
+            service.sessions.get(site_a.id).is_none(),
+            "无持久化 ⇒ 不加载"
+        );
+        assert!(
+            service.sessions.get(site_b.id).is_none(),
+            "非法串 ⇒ 跳过，不 panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_failure_deletes_persisted_session() {
+        // 401 → mark_needs_login → 删持久化 session（M13-S1：坏会话不留给下次启动加载）
+        let transport_responses = vec![
+            status_response(),
+            encryption_disabled_response(),
+            login_response(),
+            HttpResponse::json(401, json!({"success": false, "message": "未授权"}))
+                .expect("构造响应"),
+        ];
+        let store = Store::open_in_memory().unwrap();
+        let service = KeyRelayService::new(
+            store,
+            MockTransport::new(transport_responses),
+            test_config(),
+        );
+        let site = service.add_site("https://relay.example.com").await.unwrap();
+        service
+            .login(site.id, Credentials::new("me", "pw"))
+            .await
+            .unwrap();
+        let reference = service.session_ref(site.id);
+        assert!(
+            service.vault.has(&reference).unwrap(),
+            "login 后应有持久化"
+        );
+
+        let _ = service.list_keys(site.id).await; // 401
+
+        assert!(
+            !service.vault.has(&reference).unwrap(),
+            "401 后必须删掉持久化 session"
+        );
     }
 }
