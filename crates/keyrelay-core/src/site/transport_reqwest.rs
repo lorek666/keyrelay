@@ -217,19 +217,41 @@ fn to_reqwest_method(method: Method) -> HttpMethod {
 }
 
 fn describe(error: &reqwest::Error) -> Error {
+    // P2-19：reqwest 错误原文可能带完整 URL（含 userinfo），进文案前先 scrub。
+    let msg = crate::redact::scrub(&error.to_string());
     if error.is_timeout() {
-        Error::Transport(format!("请求超时: {error}"))
+        Error::Transport(format!("请求超时: {msg}"))
     } else if error.is_connect() {
-        Error::Transport(format!("连接失败: {error}"))
+        Error::Transport(format!("连接失败: {msg}"))
     } else {
-        Error::Transport(format!("请求失败: {error}"))
+        Error::Transport(format!("请求失败: {msg}"))
     }
 }
 
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
     async fn request(&self, req: HttpRequest) -> Result<HttpResponse> {
-        let mut builder = self.client.request(to_reqwest_method(req.method), &req.url);
+        // P2-19 / DEBUG-REPORT-v3 §2-19：无 scheme 的 `user:pass@host` 会被 url crate
+        // 解析成 scheme=user，reqwest 在 builder 里对非 http(s) scheme 报错，错误原文
+        // 带完整 URL（含密码），进而在 detect_site / add_site 的文案里出现三次。先就地
+        // 校验，失败时返回脱敏后的错误，不让密码进文案。
+        let parsed = match reqwest::Url::parse(&req.url) {
+            Ok(u) => u,
+            Err(e) => {
+                let safe = crate::redact::mask_authority_userinfo(&req.url);
+                return Err(Error::Transport(format!(
+                    "URL 非法（{}）: {safe}",
+                    crate::redact::scrub(&e.to_string())
+                )));
+            }
+        };
+        if !matches!(parsed.scheme(), "http" | "https") {
+            let safe = crate::redact::mask_authority_userinfo(&req.url);
+            return Err(Error::Transport(format!(
+                "URL 的 scheme 不是 http/https: {safe}"
+            )));
+        }
+        let mut builder = self.client.request(to_reqwest_method(req.method), parsed);
 
         for (name, value) in &req.headers {
             let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -281,6 +303,23 @@ mod tests {
         assert_eq!(config.follow_redirects, 0, "默认不跟随重定向");
         assert!(config.proxy.is_none());
         assert!(config.user_agent.starts_with("KeyRelay/"));
+    }
+
+    /// P2-19 / DEBUG-REPORT-v3 §2-19：无 scheme 的 `user:pass@host` 会被 url crate
+    /// 解析成 scheme=user，reqwest builder 对非 http(s) scheme 报错，错误原文带完整
+    /// URL（含密码），进而在 detect_site / add_site 的文案里出现三次。预校验在密码
+    /// 进文案之前掩掉它（`mask_authority_userinfo`），仍点出主机名。
+    #[tokio::test]
+    async fn a_schemeless_url_with_userinfo_does_not_leak_the_password_in_the_error() {
+        let transport = ReqwestTransport::new(TransportConfig::default()).unwrap();
+        let req = HttpRequest::new(Method::Get, "carol:s3cr3t@host.example");
+        let err = transport.request(req).await.unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains("s3cr3t"), "错误文案不得带 URL 密码: {text}");
+        assert!(
+            text.contains("host.example"),
+            "错误文案仍要点出是哪个主机: {text}"
+        );
     }
 
     #[test]
