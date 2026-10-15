@@ -22,7 +22,7 @@ import { rollbackAftermath } from "../lib/rollback";
 import ConfirmDialog from "../components/ConfirmDialog";
 
 /**
- * 十一条投递通道（M14-S1 删 Continue/Shell，新增 Claude Desktop/Grok/OpenClaw/Hermes/MCode/Pi）。
+ * 十七条投递通道（M14-S1 删 Continue/Shell，新增 Claude Desktop/Grok/OpenClaw/Hermes/MCode/Pi）。
  *
  * 这里的 `label` 是**给人看的落点提示**；能力判断不在这里——投递能不能做、
  * 改完要不要重启，一律由后端给（`plan.restartHint`），本文件不得按通道硬编码判断。
@@ -39,6 +39,12 @@ const CHANNELS = [
   { id: "hermes", label: "Hermes Agent（~/.hermes/config.yaml）", agent: "hermes" },
   { id: "mcode", label: "MiniMax Code（~/.minimax/config.yaml）", agent: "mcode" },
   { id: "pi", label: "Pi（~/.pi/agent/models.json）", agent: "pi" },
+  { id: "cursor", label: "Cursor（~/.cursor/settings.json）", agent: "cursor" },
+  { id: "cline", label: "Cline（VS Code globalStorage）", agent: "cline" },
+  { id: "qwen-code", label: "Qwen Code（~/.qwen/settings.json）", agent: "qwen-code" },
+  { id: "deepseek", label: "DeepSeek Reasonix（~/.reasonix/config.json）", agent: "deepseek" },
+  { id: "trae", label: "Trae（~/.trae/config.json）", agent: "trae" },
+  { id: "mimo-code", label: "MiMo Code（~/.mimocode/mimocode.json）", agent: "mimo-code" },
 ];
 
 /**
