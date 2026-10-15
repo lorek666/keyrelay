@@ -38,5 +38,13 @@
       "icons/icon.ico",
       "icons/icon.png"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYxRjEzNzNENDA3QkZFQjUKUldTMS9udEFQVGZ4WWJlbG5NQXJnQno1ZVcrWHBTL1p5ZWNDTE1hYW1PTGx3T1Voc0w3cnZBa1EK",
+      "endpoints": [
+        "https://github.com/keyrelay/keyrelay/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

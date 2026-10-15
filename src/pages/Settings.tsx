@@ -16,6 +16,7 @@ import {
   type Settings,
 } from "../lib/api";
 import GatewayCard from "../components/GatewayCard";
+import UpdateChecker from "../components/UpdateChecker";
 import ConfirmDialog from "../components/ConfirmDialog";
 
 /** 「系统里的实际状态」的显示文案。`unknown` 是「读不出来」，不是「没开」——两者不能混。 */
@@ -738,9 +739,13 @@ export default function SettingsPage() {
                 }
               />
               <span>
-                自动更新（默认关）。**当前版本只记录这个开关**，尚未接入更新服务器。
+                自动更新（默认关）。打开后启动时自动检查一次，安装仍需手动确认。
               </span>
             </label>
+          </div>
+          <div className="row">
+            <label style={{ fontWeight: 600, marginBottom: 4 }}>应用更新</label>
+            <UpdateChecker autoCheckOnMount={draft?.autoUpdateEnabled ?? false} />
           </div>
 
           <div className="row">
