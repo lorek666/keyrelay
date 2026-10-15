@@ -90,7 +90,7 @@ fn gateway() -> GatewayEndpoint {
 /// 而那是 Continue 自己的 schema 要求，不是本文件的夹具问题。
 fn model_for(channel: DeliveryChannel) -> Option<&'static str> {
     match channel {
-        DeliveryChannel::Continue => Some("gpt-4o"),
+        DeliveryChannel::OpenClaw => Some("gpt-4o"),
         _ => None,
     }
 }

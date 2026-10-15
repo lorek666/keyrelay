@@ -1195,11 +1195,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         self.delivery_plan_with_model(key_id, channel, None)
     }
 
-    /// 带模型名的投递预览。`model` 只对 OpenCode / OpenCodeJsonc / Continue 生效
+    /// 带模型名的投递预览。`model` 只对 OpenCode / OpenCodeJsonc 生效
     /// （[`delivery::resolve_for_binding`]），其余通道忽略。
-    ///
-    /// Continue 的条目**必须**有模型名（Continue 的 schema 必填，缺了整份配置拒绝加载）：
-    /// `None` 时沿用受管块里已有的，块里也没有就拒绝——KeyRelay 不编造默认模型。
     pub fn delivery_plan_with_model(
         &self,
         key_id: i64,
@@ -1325,7 +1322,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
 
     /// 真正把密钥写进目标文件。步骤与顺序见 spec §6.1，**同意是第一步**。
     ///
-    /// 不带模型名：轮换第②步走的就是这条——Continue 沿用受管块里已有的模型名。
+    /// 不带模型名：轮换第②步走的就是这条。
     pub fn apply_delivery(&self, key_id: i64, channel: DeliveryChannel) -> Result<DeliveryOutcome> {
         self.apply_delivery_with_model(key_id, channel, None)
     }
@@ -3948,7 +3945,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 解析通道写入器 + 校验 `key_id` 存在。**不读钥匙串**（同意检查必须在读密钥之前）。
     ///
     /// 走 `resolve_for_binding` / `resolve_for_gateway` 而不是 `resolve_for`：后者固定
-    /// `model = None`，生产路径因此从来没法给 Continue 写模型名（Continue 拒绝加载缺
+    /// `model = None`，生产路径不写 model 字段
     /// `model` 的配置）。
     fn prepare_delivery(
         &self,

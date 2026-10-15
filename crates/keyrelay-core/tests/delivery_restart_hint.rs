@@ -52,7 +52,7 @@ fn tree_snapshot_detects_changes() {
 
 #[test]
 fn restart_hint_covers_every_channel() {
-    assert_eq!(DeliveryChannel::ALL.len(), 7, "M7-S3：ALL 由 5 变 7");
+    assert_eq!(DeliveryChannel::ALL.len(), 11, "M14-S1：ALL 由 7 变 11");
     // 穷举 match 由编译器保证「每个变体都有取值」；这里钉住「七个通道各不相同地可达」
     let mut hints: Vec<&'static str> = Vec::new();
     for channel in DeliveryChannel::ALL {
@@ -62,24 +62,20 @@ fn restart_hint_covers_every_channel() {
             RestartHint::DependsOnNewSession => "new-session",
         });
     }
-    assert_eq!(hints.len(), 7);
+    assert_eq!(hints.len(), 11);
 }
 
 #[test]
 fn restart_hint_table_is_verbatim() {
-    // spec §8 的表：只有 shell rc 是 DependsOnNewSession，其余六条保守标 Needed。
-    assert_eq!(
-        restart_hint(DeliveryChannel::ShellBlock),
-        RestartHint::DependsOnNewSession,
-        "rc 文件只在 shell 启动时 source：改的是会话环境，不是某个进程的配置"
-    );
+    // M14-S1：ShellBlock 已删除，所有通道都标 Needed
+    assert_eq!(restart_hint(DeliveryChannel::Hermes), RestartHint::Needed);
     for channel in [
         DeliveryChannel::CodexAuthJson,
         DeliveryChannel::ClaudeCodeSettings,
         DeliveryChannel::OpenCode,
         DeliveryChannel::GeminiCli,
         DeliveryChannel::OpenCodeJsonc,
-        DeliveryChannel::Continue,
+        DeliveryChannel::OpenClaw,
     ] {
         assert_eq!(
             restart_hint(channel),

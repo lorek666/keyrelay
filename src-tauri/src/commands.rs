@@ -466,7 +466,7 @@ pub struct DiagnosticsArgs {
 pub struct DeliveryArgs {
     key_id: i64,
     channel: String,
-    /// 模型名（可缺）。Continue 通道必须有：Continue 的 schema 把条目的 `model` 定为必填。
+    /// 模型名（可缺）。OpenCode 通道可填，其余通道不读它。
     /// 只有预览与投递两条命令读它；同意的授予 / 撤销与模型名无关。
     model: Option<String>,
     /// 投递模式（M8-S4 §6.2）：`"site"`（默认，缺省即此）或 `"gateway"`。
@@ -2481,13 +2481,6 @@ mod tests {
                 channel.as_str()
             );
         }
-        assert_eq!(
-            restart_hint_str(keyrelay_core::delivery::restart_hint(
-                keyrelay_core::delivery::DeliveryChannel::ShellBlock
-            )),
-            "dependsOnNewSession",
-            "shell rc 只对新开的终端生效，不是「重启某个 agent」能解决的"
-        );
 
         let outcome = DeliveryOutcomeDto {
             channel: "codex-auth-json".into(),
@@ -2547,10 +2540,10 @@ mod tests {
 
     #[test]
     fn delivery_args_carry_an_optional_model() {
-        // Continue 通道必须带模型名（Continue 的 schema 把条目的 `model` 定为必填）
+        // OpenCode 通道可带模型名
         let args: DeliveryArgs = serde_json::from_value(serde_json::json!({
             "keyId": 7,
-            "channel": "continue",
+            "channel": "opencode",
             "model": "gpt-4o"
         }))
         .expect("解析 DeliveryArgs");
@@ -2643,12 +2636,12 @@ mod tests {
             format!("{url}/v1")
         );
         assert_eq!(
-            gateway_base_url_for(&DeliveryChannel::Continue, url),
+            gateway_base_url_for(&DeliveryChannel::GrokBuild, url),
             format!("{url}/v1")
         );
         assert_eq!(
-            gateway_base_url_for(&DeliveryChannel::ShellBlock, url),
-            format!("{url}/v1")
+            gateway_base_url_for(&DeliveryChannel::ClaudeDesktop, url),
+            url.to_string()
         );
     }
 
