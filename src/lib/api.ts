@@ -1465,7 +1465,8 @@ export async function checkForUpdates(): Promise<UpdateInfo | null> {
 }
 
 /**
- * 下载并安装已检查到的更新。安装完成后重启应用。
+ * 下载并安装已检查到的更新。**不重启**——安装完成后由调用方在用户确认后调
+ * [`relaunchApp`]，避免立即重启丢失用户未保存的修改（U4）。
  *
  * 必须先调用 `checkForUpdates()` 并拿到非 null 的结果——但本函数不持有那个
  * 对象（JS 侧 `Update` 对象不可序列化），所以在 Tauri 环境下重新检查一次再下载。
@@ -1482,5 +1483,15 @@ export async function downloadAndInstallUpdate(): Promise<void> {
     throw new Error("没有可用的更新");
   }
   await result.downloadAndInstall();
+}
+
+/**
+ * 重启应用。在 [`downloadAndInstallUpdate`] 完成、用户确认后调用。
+ */
+export async function relaunchApp(): Promise<void> {
+  if (!hasTauri) {
+    await mock(undefined);
+    return;
+  }
   await import("@tauri-apps/plugin-process").then(({ relaunch }) => relaunch());
 }
