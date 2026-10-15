@@ -1,0 +1,85 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import UpdateChecker from "../components/UpdateChecker";
+
+vi.mock("../lib/api", () => ({
+  checkForUpdates: vi.fn(),
+  downloadAndInstallUpdate: vi.fn(),
+}));
+
+import { checkForUpdates, downloadAndInstallUpdate } from "../lib/api";
+
+const mockedCheck = vi.mocked(checkForUpdates);
+const mockedInstall = vi.mocked(downloadAndInstallUpdate);
+
+function renderComponent() {
+  return render(<UpdateChecker />);
+}
+
+describe("UpdateChecker", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedCheck.mockResolvedValue(null);
+    mockedInstall.mockResolvedValue(undefined);
+  });
+
+  it("idle: 初始渲染显示「检查更新」按钮", () => {
+    renderComponent();
+    expect(screen.getByText("检查更新")).toBeInTheDocument();
+  });
+
+  it("checking: 点击按钮后显示「检查中…」", () => {
+    mockedCheck.mockReturnValue(new Promise(() => {}));
+    renderComponent();
+    fireEvent.click(screen.getByText("检查更新"));
+    expect(screen.getByText("检查中…")).toBeInTheDocument();
+  });
+
+  it("available: 有更新时显示新版本号和「下载并安装」按钮", async () => {
+    mockedCheck.mockResolvedValue({
+      version: "0.2.0",
+      currentVersion: "0.1.0",
+      body: "修复若干问题",
+    });
+    renderComponent();
+    fireEvent.click(screen.getByText("检查更新"));
+    await waitFor(() => {
+      expect(screen.getByText(/新版本 0\.2\.0/)).toBeInTheDocument();
+      expect(screen.getByText("下载并安装")).toBeInTheDocument();
+    });
+  });
+
+  it("not-available: 无更新时显示「当前已是最新版本」", async () => {
+    mockedCheck.mockResolvedValue(null);
+    renderComponent();
+    fireEvent.click(screen.getByText("检查更新"));
+    await waitFor(() => {
+      expect(screen.getByText("当前已是最新版本")).toBeInTheDocument();
+    });
+  });
+
+  it("error: 检查失败时显示错误摘要和重试按钮", async () => {
+    mockedCheck.mockRejectedValue(new Error("网络超时"));
+    renderComponent();
+    fireEvent.click(screen.getByText("检查更新"));
+    await waitFor(() => {
+      expect(screen.getByText(/网络超时/)).toBeInTheDocument();
+      expect(screen.getByText("重试")).toBeInTheDocument();
+    });
+  });
+
+  it("downloading: 点击「下载并安装」后显示「下载中…」", async () => {
+    mockedCheck.mockResolvedValue({
+      version: "0.2.0",
+      currentVersion: "0.1.0",
+    });
+    mockedInstall.mockReturnValue(new Promise(() => {}));
+    renderComponent();
+    fireEvent.click(screen.getByText("检查更新"));
+    await waitFor(() => screen.getByText("下载并安装"));
+    fireEvent.click(screen.getByText("下载并安装"));
+    await waitFor(() => {
+      expect(screen.getByText("下载中…")).toBeInTheDocument();
+    });
+  });
+});

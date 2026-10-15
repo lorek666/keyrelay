@@ -166,6 +166,8 @@ pub fn configure_with_state<R: tauri::Runtime>(
     state: AppState,
 ) -> tauri::Builder<R> {
     builder
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::list_sites,
