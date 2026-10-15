@@ -265,3 +265,41 @@ async fn an_auth_failure_is_classified_and_invalidates_the_session() {
         "甲在第二轮不得被再次请求"
     );
 }
+
+#[tokio::test]
+async fn unknown_balance_does_not_trigger_a_balance_alert() {
+    // P2-22（DEBUG-REPORT-v3 P2 #22）：余额告警分支必须看 `balance.known`。
+    // NewAPI 字段缺失 ⇒ `Balance::unknown`（known=false, remaining=0）⇒ 不得计入
+    // `summary.balance_alerts`（否则「余额低于阈值: 0 USD < 15」假告警）。
+    let dir = tempfile::tempdir().unwrap();
+    let (service, mock) = service_on(&dir.path().join("keyrelay.db"));
+
+    let a = service
+        .store()
+        .upsert_site("newapi", "https://a.example.com", "甲")
+        .expect("写站点");
+
+    // 阈值 15.0 USD：unknown 的 remaining=0 < 15，但 known=false ⇒ 不告警。
+    service
+        .update_settings(&Settings {
+            balance_alert_threshold: 15.0,
+            ..Settings::default()
+        })
+        .expect("写设置");
+
+    login_all(&service, &mock, &[a]).await;
+
+    // 余额响应缺 quota ⇒ newapi 返回 Balance::unknown（known=false）。
+    mock.push(
+        HttpResponse::json(200, json!({"success": true, "data": {}}))
+            .expect("构造 unknown 余额响应"),
+    );
+    mock.push(keys_ok());
+
+    let summary = service.refresh_all().await.expect("刷新应成功");
+    assert!(
+        summary.balance_alerts.is_empty(),
+        "未知余额不得触发告警: {:?}",
+        summary.balance_alerts
+    );
+}

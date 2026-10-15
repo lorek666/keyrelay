@@ -307,3 +307,34 @@ fn the_old_database_file_still_opens_after_migration() {
     assert!(path.exists());
     assert!(fs::metadata(&path).unwrap().len() >= before);
 }
+
+#[test]
+fn open_strips_userinfo_from_legacy_display_names_automatically() {
+    // P2-1（DEBUG-REPORT-v3 P2 #1）：Store::open 自动跑 migrate_display_names_stripping_userinfo。
+    // M7 老库里 display_name 带 `user:pw@host` ⇒ 重新 open 后自动剥掉，无需手动调。
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keyrelay.db");
+
+    // 建库 + 写一条带 userinfo 的显示名（模拟 M7 老库）。
+    {
+        let store = Store::open(&path).unwrap();
+        store
+            .upsert_site(
+                "custom-openai-compatible",
+                "https://alice:pw@host.example",
+                "alice:pw@host.example",
+            )
+            .unwrap();
+    }
+
+    // 重新打开：open 应自动跑迁移。
+    let store = Store::open(&path).unwrap();
+    let sites = store.list_sites().unwrap();
+    let name = sites
+        .iter()
+        .find(|s| s.base_url == "https://alice:pw@host.example")
+        .map(|s| s.display_name.clone())
+        .unwrap();
+    assert_eq!(name, "host.example", "open 应自动剥掉 userinfo");
+    assert!(!name.contains("pw"), "密码不得残留");
+}

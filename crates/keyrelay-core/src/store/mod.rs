@@ -389,6 +389,10 @@ impl Store {
             path: None,
         };
         store.migrate()?;
+        // P2-1：接线显示名 userinfo 剥离迁移（DEBUG-REPORT-v3 P2 #1）。
+        // M7 老库里 display_name 仍带 `user:pw@host`，拼进通知后 webhook 两层
+        // 脱敏都掩不掉。迁移函数写对了但只在测试里调用——open 时自动跑（幂等）。
+        store.migrate_display_names_stripping_userinfo()?;
         Ok(store)
     }
 
