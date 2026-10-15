@@ -579,15 +579,23 @@ fn presented_token(headers: &HeaderMap) -> Option<String> {
 
 /// P3-6：恒定时间比较令牌。`==` / `!=` 在第一个不匹配字节就提前返回，理论上能
 /// 计时侧信道泄漏令牌前缀。本地令牌长期有效，值得用恒定时间比较：异或累积差异，
-/// 最后判零——长度不同也走完 `min` 个字节。
+/// 最后判零。
+///
+/// 复审 F3：循环到 `max(len)` 并把超界字节按 0 处理——原实现只到 `min(len)`，
+/// 长度不等时循环次数随较短方变化，可借计时推断「提交长度是否 ≤ 真实令牌长度」。
+/// 改后循环次数恒为 `max(len)`，长度差异仍由预置的 `diff` 位捕获，只泄漏长度上限
+/// （长度本身不是秘密，令牌内容才是）。
 fn constant_time_eq(a: Option<&str>, b: &str) -> bool {
     match a {
         Some(a) => {
             let a = a.as_bytes();
             let b = b.as_bytes();
+            let max = a.len().max(b.len());
             let mut diff: u8 = (a.len() != b.len()) as u8;
-            for i in 0..a.len().min(b.len()) {
-                diff |= a[i] ^ b[i];
+            for i in 0..max {
+                let x = *a.get(i).unwrap_or(&0);
+                let y = *b.get(i).unwrap_or(&0);
+                diff |= x ^ y;
             }
             diff == 0
         }
