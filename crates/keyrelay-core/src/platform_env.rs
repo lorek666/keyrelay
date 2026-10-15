@@ -6,7 +6,7 @@
 //! - `EnvPlan::describe` 只输出路径 / 长度 / 键名，**任何情况下都不得输出 env 值**（值可能是 `sk-` 密钥）。
 //! - Windows 分支只产出纯数据结构 [`RegOp`] 与命令行 argv；本模块**不执行** `reg.exe`（本机不可执行）。
 //!
-//! 与 `delivery/shell_block.rs` 的关系：那个通道管 shell rc 的标记块，本模块管 LaunchAgent plist 的
+//! 与 `delivery/hermes.rs (M14-S1 前为 shell_block.rs)` 的关系：那个通道管 shell rc 的标记块，本模块管 LaunchAgent plist 的
 //! 标记块与注册表值。两者同一哲学——**只动受管区，其余字节逐字保留**；用户手写内容一个字节都不碰。
 //!
 //! plist 是手工拼装 / 解析的（章程未批准新依赖）：`plist` 子模块是一个只覆盖本模块所需形态的
@@ -1030,7 +1030,7 @@ pub(crate) mod plist {
     ///
     /// 孤立开始标记 / 多个块 → `Err`：这两种文件都是被手工改过的，
     /// 按「从开始标记吃到文件末尾」处理会静默删掉用户写在块后面的内容
-    /// （`delivery/shell_block.rs` 的 M2-S2 复审 P1-2 就是这个教训）。
+    /// （`delivery/hermes.rs (M14-S1 前为 shell_block.rs)` 的 M2-S2 复审 P1-2 就是这个教训）。
     pub(crate) fn find_block(text: &str, inner: Span, path: &Path) -> Result<Option<Span>> {
         let hay = &text[inner.start..inner.end];
         let mut starts = Vec::new();

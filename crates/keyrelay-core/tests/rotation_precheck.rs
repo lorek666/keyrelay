@@ -101,13 +101,13 @@ fn created_on_site(f: &Fixture) -> usize {
 
 /// 让 Continue 的落点**写不进去**：文件里有一个残缺的受管块（只有开始标记）。
 fn break_continue_target(f: &Fixture) {
-    let path = f.home.join(".continue").join("config.yaml");
+    let path = f.home.join(DeliveryChannel::OpenClaw.relative_target());
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(
         &path,
         format!(
             "name: mine\nversion: 1.0.0\nmodels:\n  {}\n",
-            keyrelay_core::delivery::continue_yaml::BLOCK_BEGIN
+            keyrelay_core::delivery::hermes::BLOCK_BEGIN
         ),
     )
     .unwrap();
@@ -118,10 +118,10 @@ async fn a_broken_target_blocks_the_rotation_before_a_new_key_exists() {
     let f = setup().await;
     // 前提：这个 agent 有绑定的通道（轮换的目标集合来自已投递的绑定）
     f.service
-        .grant_consent(f.key_id, DeliveryChannel::Continue)
+        .grant_consent(f.key_id, DeliveryChannel::OpenClaw)
         .unwrap();
     f.service
-        .apply_delivery_with_model(f.key_id, DeliveryChannel::Continue, Some("gpt-4o"))
+        .apply_delivery_with_model(f.key_id, DeliveryChannel::OpenClaw, Some("gpt-4o"))
         .unwrap();
     assert_eq!(created_on_site(&f), 0, "前提：还没建过 key");
 
@@ -134,7 +134,7 @@ async fn a_broken_target_blocks_the_rotation_before_a_new_key_exists() {
         .expect_err("目标写不进去时必须在建新 key 之前拒绝");
 
     let text = err.to_string();
-    assert!(text.contains("continue"), "{text}");
+    assert!(text.contains("openclaw"), "{text}");
     assert!(
         text.contains("多一把") || text.contains("新密钥已建好之后"),
         "文案必须说清代价：{text}"
@@ -150,10 +150,10 @@ async fn a_broken_target_blocks_the_rotation_before_a_new_key_exists() {
 async fn a_healthy_target_lets_the_rotation_proceed() {
     let f = setup().await;
     f.service
-        .grant_consent(f.key_id, DeliveryChannel::Continue)
+        .grant_consent(f.key_id, DeliveryChannel::OpenClaw)
         .unwrap();
     f.service
-        .apply_delivery_with_model(f.key_id, DeliveryChannel::Continue, Some("gpt-4o"))
+        .apply_delivery_with_model(f.key_id, DeliveryChannel::OpenClaw, Some("gpt-4o"))
         .unwrap();
 
     f.mock.push(create_key_ok());
@@ -168,50 +168,6 @@ async fn a_healthy_target_lets_the_rotation_proceed() {
     assert_eq!(created_on_site(&f), 1, "只建了一把");
 }
 
-/// `models: []`（Continue 自己生成的默认模板形态）不再是**结构性**拒绝的理由，
-/// 但它仍然过不了「必须有模型名」那道门——而**这一点是诚实的**：
-/// 轮换的重新注入走 `model = None`（沿用受管块里已有的名字），块被清掉之后
-/// 没有任何地方能取到模型名，KeyRelay 不编造（§9-12）。
-///
-/// 本波次的改进不是「让这种情况能轮换」，而是**在烧掉一把新 key 之前**就拒绝，
-/// 并且给的理由是「要填模型名」而不是「`models:` 是行内值」。
-#[tokio::test]
-async fn an_empty_flow_models_block_fails_for_the_model_reason_not_the_shape() {
-    let f = setup().await;
-    f.service
-        .grant_consent(f.key_id, DeliveryChannel::Continue)
-        .unwrap();
-    f.service
-        .apply_delivery_with_model(f.key_id, DeliveryChannel::Continue, Some("gpt-4o"))
-        .unwrap();
-
-    // Continue 的默认模板形态：受管块被清掉、`models: []` 回来了。
-    let path = f.home.join(".continue").join("config.yaml");
-    fs::write(&path, "name: mine\nversion: 1.0.0\nmodels: []\n").unwrap();
-
-    let err = f
-        .service
-        .rotate_key(f.key_id, KeySpec::named("codex/rotated"))
-        .await
-        .expect_err("块被清掉之后没有模型名可沿用 ⇒ 必须在建新 key 之前拒绝");
-    let text = err.to_string();
-    assert!(text.contains("模型名"), "{text}");
-    assert!(
-        !text.contains("行内值"),
-        "`models: []` 已不是「行内值」那条理由：{text}"
-    );
-    assert_eq!(
-        created_on_site(&f),
-        0,
-        "拒绝发生在建新 key 之前（这正是 P2-3 的修复）"
-    );
-    assert_eq!(
-        fs::read_to_string(&path).unwrap(),
-        "name: mine\nversion: 1.0.0\nmodels: []\n",
-        "预检不落盘：文件一个字节都不该动"
-    );
-}
-
 /// P2-2 / DEBUG-REPORT-v3 §2-2：同意被撤销的通道，`plan()` 仍然跑得通（它不读同意），
 /// 于是旧实现会在建新 key **之后**的重注入步才停 ⇒ 每重试一次站点多一把。预检现在
 /// 就地查 `consent_state`，在建 key 之前拒绝。
@@ -219,16 +175,16 @@ async fn an_empty_flow_models_block_fails_for_the_model_reason_not_the_shape() {
 async fn a_revoked_consent_blocks_the_rotation_before_a_new_key_exists() {
     let f = setup().await;
     f.service
-        .grant_consent(f.key_id, DeliveryChannel::Continue)
+        .grant_consent(f.key_id, DeliveryChannel::OpenClaw)
         .unwrap();
     f.service
-        .apply_delivery_with_model(f.key_id, DeliveryChannel::Continue, Some("gpt-4o"))
+        .apply_delivery_with_model(f.key_id, DeliveryChannel::OpenClaw, Some("gpt-4o"))
         .unwrap();
     assert_eq!(created_on_site(&f), 0, "前提：还没建过 key");
 
     // 撤销同意：绑定仍在（轮换目标集合来自绑定），但投递会失败
     f.service
-        .revoke_consent(f.key_id, DeliveryChannel::Continue)
+        .revoke_consent(f.key_id, DeliveryChannel::OpenClaw)
         .unwrap();
 
     let err = f
@@ -252,18 +208,20 @@ async fn a_revoked_consent_blocks_the_rotation_before_a_new_key_exists() {
 async fn a_symlink_target_blocks_the_rotation_before_a_new_key_exists() {
     let f = setup().await;
     f.service
-        .grant_consent(f.key_id, DeliveryChannel::Continue)
+        .grant_consent(f.key_id, DeliveryChannel::OpenClaw)
         .unwrap();
     f.service
-        .apply_delivery_with_model(f.key_id, DeliveryChannel::Continue, Some("gpt-4o"))
+        .apply_delivery_with_model(f.key_id, DeliveryChannel::OpenClaw, Some("gpt-4o"))
         .unwrap();
     assert_eq!(created_on_site(&f), 0);
 
     // 把落点换成符号链接（指向一个普通文件），同意与绑定都不动
-    let path = f.home.join(".continue").join("config.yaml");
-    let real = f.home.join(".continue").join("real_config.yaml");
+    let path = f.home.join(DeliveryChannel::OpenClaw.relative_target());
+    let dir = path.parent().unwrap();
+    fs::create_dir_all(dir).ok();
+    let real = dir.join("real_openclaw.json");
     fs::remove_file(&path).ok();
-    fs::write(&real, "name: mine\nversion: 1.0.0\nmodels:\n  - gpt-4o\n").unwrap();
+    fs::write(&real, "{\n  \"models\": { \"mode\": \"merge\" }\n}\n").unwrap();
     std::os::unix::fs::symlink(&real, &path).unwrap();
 
     let err = f

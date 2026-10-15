@@ -22,7 +22,7 @@ import { rollbackAftermath } from "../lib/rollback";
 import ConfirmDialog from "../components/ConfirmDialog";
 
 /**
- * 七条投递通道（M7-S3 补上 OpenCode `.jsonc` 与 Continue）。
+ * 十一条投递通道（M14-S1 删 Continue/Shell，新增 Claude Desktop/Grok/OpenClaw/Hermes/MCode/Pi）。
  *
  * 这里的 `label` 是**给人看的落点提示**；能力判断不在这里——投递能不能做、
  * 改完要不要重启，一律由后端给（`plan.restartHint`），本文件不得按通道硬编码判断。
@@ -30,11 +30,15 @@ import ConfirmDialog from "../components/ConfirmDialog";
 const CHANNELS = [
   { id: "codex-auth-json", label: "Codex CLI（~/.codex/auth.json）", agent: "codex" },
   { id: "claude-code-settings", label: "Claude Code（~/.claude/settings.json）", agent: "claude-code" },
-  { id: "shell-block", label: "Shell 标记块", agent: "shell" },
   { id: "opencode", label: "OpenCode（~/.config/opencode/opencode.json）", agent: "opencode" },
   { id: "opencode-jsonc", label: "OpenCode JSONC（~/.config/opencode/opencode.jsonc）", agent: "opencode-jsonc" },
   { id: "gemini-cli", label: "Gemini CLI（~/.gemini/.env）", agent: "gemini-cli" },
-  { id: "continue", label: "Continue（~/.continue/config.yaml）", agent: "continue" },
+  { id: "claude-desktop", label: "Claude Desktop（claude_desktop_config.json）", agent: "claude-desktop" },
+  { id: "grok-build", label: "Grok Build（~/.grok/config.toml）", agent: "grok-build" },
+  { id: "openclaw", label: "OpenClaw（~/.openclaw/openclaw.json）", agent: "openclaw" },
+  { id: "hermes", label: "Hermes Agent（~/.hermes/config.yaml）", agent: "hermes" },
+  { id: "mcode", label: "MiniMax Code（~/.minimax/config.yaml）", agent: "mcode" },
+  { id: "pi", label: "Pi（~/.pi/agent/models.json）", agent: "pi" },
 ];
 
 /**
@@ -67,10 +71,10 @@ export default function Agents() {
   const activeKey = keyId ?? null;
   const [channel, setChannel] = useState(CHANNELS[0].id);
 
-  // 模型名：只有 Continue 需要（它的 schema 把条目的 `model` 定为必填，缺了整份配置拒绝加载）。
+  // 模型名：当前没有通道在界面层强制要求模型名（OpenCode 可选填）。
   // 这是**输入框显不显示**的界面判断，不是能力判断：要不要、缺了怎么办由后端决定并报错说明。
   // 防抖后再进查询键——每次预览都要读一次钥匙串，不该每敲一个字读一次。
-  const needsModel = channel === "continue";
+  const needsModel = false;
   // 当前通道所属的 agent（解绑按 agent 做，不是按通道）。
   // `channel` 只可能来自 `CHANNELS`（初始值与下拉都在其中），所以这里的兜底不可达；
   // 用空串而不是 `!`：解绑命令对空 agent_id 只会返回 `{0, 0}`（幂等零报告），不会误伤。
@@ -309,7 +313,7 @@ export default function Agents() {
 
         {needsModel ? (
           <p className="muted">
-            Continue 要求每个模型条目都写明模型名，缺了它整份配置都无法加载。
+            OpenCode 通道可填模型名。
             KeyRelay 不替你猜：首次投递请填写；留空则沿用上次投递时写下的模型名。
           </p>
         ) : null}
