@@ -642,7 +642,8 @@ export default function SettingsPage() {
             {draft.proxyMode === "direct" && <p className="muted">不使用任何代理。</p>}
             <p className="muted">
               代理在下次启动应用时生效（网关上游在重启网关时生效）。代理串的合法性在真正发起请求时
-              校验：写法不合法会直接报错，不会静默降级成直连。
+              校验：手动模式下写法不合法会直接报错；自动模式下探测到的非法代理会被跳过并直连
+              （系统配的垃圾值不应让应用起不来）。
             </p>
           </div>
 
