@@ -179,6 +179,58 @@ fn decoded_path_has_no_traversal(bytes: &[u8]) -> bool {
         .all(|segment| segment != b"." && segment != b"..")
 }
 
+/// 从 JSON 响应体里提取 `usage` 字段（M13-S1）。
+///
+/// OpenAI 兼容的非流式响应：`{ "usage": { "prompt_tokens": 100, ... } }`。
+/// 缺失或类型不对 → `None`。
+fn extract_usage_from_json(body: &[u8]) -> Option<(i64, i64, i64)> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let usage = value.get("usage")?;
+    let prompt = usage.get("prompt_tokens").and_then(|v| v.as_i64())?;
+    let completion = usage.get("completion_tokens").and_then(|v| v.as_i64())?;
+    let total = usage.get("total_tokens").and_then(|v| v.as_i64())?;
+    Some((prompt, completion, total))
+}
+
+/// 从一个 SSE chunk 的文本行里提取 `usage`（M13-S1）。
+///
+/// 扫描 chunk 里所有 `data:` 行，逐行尝试解析 JSON 并找 `usage`。
+fn extract_usage_from_chunk(chunk: &[u8]) -> Option<(i64, i64, i64)> {
+    let text = std::str::from_utf8(chunk).ok()?;
+    for line in text.lines() {
+        let line = match line.strip_prefix("data: ") {
+            Some(s) => s,
+            None => match line.strip_prefix("data:") {
+                Some(s) => s,
+                None => continue,
+            },
+        };
+        if line.trim() == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(usage) = value.get("usage") {
+                let prompt = usage.get("prompt_tokens").and_then(|v| v.as_i64());
+                let completion = usage.get("completion_tokens").and_then(|v| v.as_i64());
+                let total = usage.get("total_tokens").and_then(|v| v.as_i64());
+                if let (Some(p), Some(c), Some(t)) = (prompt, completion, total) {
+                    return Some((p, c, t));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 判断响应是否为 SSE 流（`Content-Type: text/event-stream`）。
+fn is_sse_response(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains("text/event-stream"))
+        .unwrap_or(false)
+}
+
 /// 给上游字节流套一层**累计大小上限**：第 `limit + 1` 个字节让流以错误结束。
 ///
 /// 单独抽出来是为了能直接测——不必真的让假上游吐 64 MiB。
@@ -210,11 +262,67 @@ where
     )
 }
 
+/// 给上游字节流套一层**累计大小上限** + **chunk 收集**（M13-S1）。
+///
+/// 与 `cap_stream` 相同，但在流正常结束后把收集到的 chunk（最多最后 8 个）
+/// 传给 `on_complete` 回调，用于提取 `usage`。
+fn cap_stream_with_usage<S, E, F>(
+    stream: S,
+    limit: u64,
+    on_complete: F,
+) -> impl futures_util::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>
+where
+    S: futures_util::Stream<Item = std::result::Result<bytes::Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + 'static,
+    F: FnOnce(Vec<bytes::Bytes>) + Send + 'static,
+{
+    use std::sync::{Arc, Mutex};
+    let collected: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+    let on_complete: Arc<Mutex<Option<F>>> = Arc::new(Mutex::new(Some(on_complete)));
+
+    futures_util::stream::try_unfold(
+        (Box::pin(stream), 0u64, collected, on_complete),
+        move |(mut stream, sent, collected, on_complete)| async move {
+            match stream.try_next().await {
+                Ok(None) => {
+                    let chunks = collected.lock().map(|g| g.clone()).unwrap_or_default();
+                    if let Ok(mut guard) = on_complete.lock() {
+                        if let Some(cb) = guard.take() {
+                            cb(chunks);
+                        }
+                    }
+                    Ok(None)
+                }
+                Ok(Some(chunk)) => {
+                    let total = sent + chunk.len() as u64;
+                    if total > limit {
+                        return Err(std::io::Error::other(format!(
+                            "上游响应体超过上限 {limit} 字节"
+                        )));
+                    }
+                    if let Ok(mut guard) = collected.lock() {
+                        if guard.len() >= 8 {
+                            let drain_count = guard.len() - 7;
+                            guard.drain(0..drain_count);
+                        }
+                        guard.push(chunk.clone());
+                    }
+                    Ok(Some((chunk, (stream, total, collected, on_complete))))
+                }
+                Err(e) => Err(std::io::Error::other(e.to_string())),
+            }
+        },
+    )
+}
+
 #[derive(Clone)]
 pub struct GatewayConfig {
     pub port: u16,
     /// 本地令牌。**不是**站点密钥。
     pub token: String,
+    /// 绑定的站点 id（M13-S1）：用于 token 用量出口的 `site_id`。
+    /// `single_upstream` 默认 `0`（legacy 兼容）。
+    pub site_id: i64,
     /// 转发目标（站点根，无尾斜杠）。`route` 为空时**只**用它。
     pub base_url: String,
     /// 站点密钥（从钥匙串取）。`route` 为空时**只**用它。
@@ -247,6 +355,9 @@ pub struct GatewayConfig {
     /// 为什么用共享集合而不是「网关自己去查」：`ensure_not_revoked` 建立的**唯一**取密钥路径
     /// 不能被绕过——网关不新开一条读路径，它只查一个由那条路径维护的集合。
     pub revoked_refs: Option<Arc<Mutex<std::collections::HashSet<String>>>>,
+    /// 成功请求的 token 用量出口（M13-S1）。`None` = 不采集（`single_upstream` 默认）。
+    /// 与 `on_failure` / `on_observation` 同形：注入出口，网关不直接依赖 store。
+    pub on_usage: Option<Arc<dyn Fn(GatewayUsage) + Send + Sync>>,
     /// 每次上游尝试结束时的观测出口（M8-S1 §5.3）。`None` = 不采集。
     ///
     /// 与 `on_failure` 同形（注入出口），理由相同：网关不碰存储层。
@@ -323,6 +434,18 @@ pub struct UpstreamObservation {
     pub ok: bool,
 }
 
+/// 一次网关请求的 token 用量（M13-S1）。恰好四个字段——结构上的白名单：
+/// 装不下响应正文、密钥或本地令牌。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayUsage {
+    pub site_id: i64,
+    /// 调用方自由文本，**脱敏在值被创造的地方完成**（与 `GatewayFailure.model` 同口径）。
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
 /// 一次「因可切换状态而放弃当前上游」的元数据。
 ///
 /// **恰好这三个字段**——这是结构上的白名单：装不下 prompt 正文、响应正文、
@@ -379,6 +502,7 @@ impl GatewayConfig {
         Self {
             port,
             token,
+            site_id: 0,
             base_url,
             api_key,
             site_display_name,
@@ -389,6 +513,7 @@ impl GatewayConfig {
             upstream_timeout: UpstreamTimeout::default(),
             revoked_refs: None,
             on_observation: None,
+            on_usage: None,
             upstream_proxy: None,
         }
     }
@@ -821,7 +946,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                 }
                 // 不可切换的状态、或已经是最后一个候选 ⇒ **如实返回上游的响应**
                 // （包括它的状态码，不做 500 兜底）。
-                return into_upstream_response(response);
+                return into_upstream_response(&state, response, upstream.site_id, &event_model);
             }
             Err(message) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
@@ -974,8 +1099,9 @@ async fn forward_to(
     headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Response {
+    let model = model_from_body(&body).unwrap_or_default();
     match send_once(state, method, url, headers, body).await {
-        Ok(response) => into_upstream_response(response),
+        Ok(response) => into_upstream_response(state, response, state.config.site_id, &model),
         Err(message) => (
             StatusCode::BAD_GATEWAY,
             axum::Json(serde_json::json!({ "error": message })),
@@ -989,8 +1115,15 @@ async fn forward_to(
 /// 流式的理由（M4-S2 复审 P1-2）：整段缓冲会让客户端等上游吐完才见到第一个字节，
 /// 而且响应体没有上限。超过 [`MAX_RESPONSE_BYTES`] 时让流以错误结束、连接随之断开——
 /// 此时响应头已经发出去了，改不了状态码，只能如实断流，不静默截断。
-fn into_upstream_response(upstream_response: reqwest::Response) -> Response {
+fn into_upstream_response(
+    state: &AppState,
+    upstream_response: reqwest::Response,
+    site_id: i64,
+    model: &str,
+) -> Response {
     let status = upstream_response.status();
+    let is_success = status.is_success();
+    let is_sse = is_sse_response(&upstream_response);
     let mut builder = Response::builder().status(status);
     for (name, value) in upstream_response.headers().iter() {
         if should_strip_response_header(name.as_str()) {
@@ -999,8 +1132,65 @@ fn into_upstream_response(upstream_response: reqwest::Response) -> Response {
         builder = builder.header(name, value);
     }
 
-    let capped = cap_stream(upstream_response.bytes_stream(), MAX_RESPONSE_BYTES);
+    if !is_success {
+        let capped = cap_stream(upstream_response.bytes_stream(), MAX_RESPONSE_BYTES);
+        return builder
+            .body(Body::from_stream(capped))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
 
+    if !is_sse {
+        // 非流式 2xx：读完 body，提取 usage，再回传
+        let on_usage = state.config.on_usage.clone();
+        let model_scrubbed = crate::redact::scrub(model).to_string();
+        let capped = cap_stream_with_usage(
+            upstream_response.bytes_stream(),
+            MAX_RESPONSE_BYTES,
+            move |chunks: Vec<bytes::Bytes>| {
+                // 非流式：把所有 chunk 拼起来当 JSON 解析
+                let combined: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+                if let Some((p, c, t)) = extract_usage_from_json(&combined) {
+                    if let Some(sink) = &on_usage {
+                        sink(GatewayUsage {
+                            site_id,
+                            model: model_scrubbed.clone(),
+                            prompt_tokens: p,
+                            completion_tokens: c,
+                            total_tokens: t,
+                        });
+                    }
+                }
+            },
+        );
+        return builder
+            .body(Body::from_stream(capped))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    // 流式 SSE 2xx：边转发边扫 chunk，流结束后提取最后的 usage
+    let on_usage = state.config.on_usage.clone();
+    let model_scrubbed = crate::redact::scrub(model).to_string();
+    let capped = cap_stream_with_usage(
+        upstream_response.bytes_stream(),
+        MAX_RESPONSE_BYTES,
+        move |chunks: Vec<bytes::Bytes>| {
+            // 从最后一个 chunk 往前找
+            for chunk in chunks.iter().rev() {
+                if let Some((p, c, t)) = extract_usage_from_chunk(chunk) {
+                    if let Some(sink) = &on_usage {
+                        sink(GatewayUsage {
+                            site_id,
+                            model: model_scrubbed.clone(),
+                            prompt_tokens: p,
+                            completion_tokens: c,
+                            total_tokens: t,
+                        });
+                    }
+                    return;
+                }
+            }
+        },
+    );
     builder
         .body(Body::from_stream(capped))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
@@ -1794,5 +1984,106 @@ mod tests {
             require_send(handle.shutdown_and_wait());
         }
         let _ = check as fn(GatewayHandle);
+    }
+
+    // ---- M13-S1：token 用量提取测试 ----
+
+    #[test]
+    fn extract_usage_from_json_finds_usage() {
+        let body = br#"{"id":"chatcmpl-1","usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}"#;
+        assert_eq!(extract_usage_from_json(body), Some((100, 50, 150)));
+    }
+
+    #[test]
+    fn extract_usage_from_json_returns_none_when_missing() {
+        let body = br#"{"id":"chatcmpl-1","choices":[]}"#;
+        assert_eq!(extract_usage_from_json(body), None);
+    }
+
+    #[test]
+    fn extract_usage_from_json_returns_none_on_invalid_json() {
+        assert_eq!(extract_usage_from_json(b"not json"), None);
+    }
+
+    #[test]
+    fn extract_usage_from_chunk_finds_usage_in_sse_data() {
+        let chunk = b"data: {\"id\":\"x\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n";
+        assert_eq!(extract_usage_from_chunk(chunk), Some((10, 5, 15)));
+    }
+
+    #[test]
+    fn extract_usage_from_chunk_returns_none_without_usage() {
+        let chunk = b"data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        assert_eq!(extract_usage_from_chunk(chunk), None);
+    }
+
+    #[test]
+    fn extract_usage_from_chunk_returns_none_on_non_utf8() {
+        assert_eq!(extract_usage_from_chunk(b"\xff\xfe"), None);
+    }
+
+    #[tokio::test]
+    async fn cap_stream_with_usage_collects_chunks_and_calls_callback() {
+        use futures_util::StreamExt;
+        let chunks = vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"hello")),
+            Ok(bytes::Bytes::from_static(b" ")),
+            Ok(bytes::Bytes::from_static(b"world")),
+        ];
+        let stream = futures_util::stream::iter(chunks);
+        let collected = Arc::new(Mutex::new(Vec::<bytes::Bytes>::new()));
+        let cb_collected = Arc::clone(&collected);
+        let capped = cap_stream_with_usage(stream, 1024, move |chs| {
+            *cb_collected.lock().unwrap() = chs;
+        });
+        let mut capped = Box::pin(capped);
+        let mut got = Vec::new();
+        while let Some(item) = capped.next().await {
+            got.extend_from_slice(&item.unwrap());
+        }
+        assert_eq!(&got, b"hello world");
+        let collected = collected.lock().unwrap();
+        assert_eq!(collected.len(), 3, "应收集全部 3 个 chunk");
+        assert_eq!(collected[0], b"hello".as_slice());
+        assert_eq!(collected[2], b"world".as_slice());
+    }
+
+    #[tokio::test]
+    async fn cap_stream_with_usage_keeps_only_last_8_chunks() {
+        use futures_util::StreamExt;
+        let chunks: Vec<std::result::Result<bytes::Bytes, std::io::Error>> = (0..12)
+            .map(|i| Ok(bytes::Bytes::from(format!("chunk{i}"))))
+            .collect();
+        let stream = futures_util::stream::iter(chunks);
+        let collected = Arc::new(Mutex::new(Vec::<bytes::Bytes>::new()));
+        let cb_collected = Arc::clone(&collected);
+        let capped = cap_stream_with_usage(stream, 1024, move |chs| {
+            *cb_collected.lock().unwrap() = chs;
+        });
+        let mut capped = Box::pin(capped);
+        while capped.next().await.is_some() {}
+        let collected = collected.lock().unwrap();
+        assert_eq!(collected.len(), 8, "最多保留 8 个 chunk");
+        assert_eq!(collected[0], b"chunk4".as_slice());
+        assert_eq!(collected[7], b"chunk11".as_slice());
+    }
+
+    #[tokio::test]
+    async fn cap_stream_with_usage_errors_on_limit_exceeded() {
+        use futures_util::StreamExt;
+        let chunks = vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"hello")),
+            Ok(bytes::Bytes::from_static(b"!!!")),
+        ];
+        let stream = futures_util::stream::iter(chunks);
+        let capped = cap_stream_with_usage(stream, 5, |_| {});
+        let mut capped = Box::pin(capped);
+        // 第一个 chunk（5 字节）正好不超限
+        let first = capped.next().await.unwrap().unwrap();
+        assert_eq!(first.as_ref(), &b"hello"[..]);
+        // 第二个 chunk 让累计超过 5 字节 ⇒ 错误
+        let second = capped.next().await;
+        assert!(second.is_some(), "第二个 chunk 超限应产生错误");
+        assert!(second.unwrap().is_err());
     }
 }

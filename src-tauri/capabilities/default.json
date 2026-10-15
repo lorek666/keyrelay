@@ -53,6 +53,8 @@
     "allow-captcha-begin",
     "allow-captcha-complete",
     "allow-captcha-cancel",
+    "allow-recent-gateway-usage",
+    "allow-recent-usage-snapshots",
     "updater:default",
     "process:allow-restart"
   ]

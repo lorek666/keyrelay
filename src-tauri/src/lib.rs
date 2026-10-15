@@ -254,7 +254,10 @@ pub fn configure_with_state<R: tauri::Runtime>(
             // M8-S2：人工过验证码（FR-1:102）
             commands::captcha_begin,
             commands::captcha_complete,
-            commands::captcha_cancel
+            commands::captcha_cancel,
+            // M13-S1：Token 消耗统计
+            commands::recent_gateway_usage,
+            commands::recent_usage_snapshots
         ])
 }
 

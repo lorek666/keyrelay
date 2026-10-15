@@ -140,6 +140,29 @@ CREATE TABLE IF NOT EXISTS exports(
   exported_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_bindings_target ON bindings(target_path);
+-- M13-S1：网关 token 用量日志（逐请求）。
+CREATE TABLE IF NOT EXISTS gateway_usage_log(
+  id INTEGER PRIMARY KEY,
+  ts INTEGER NOT NULL,
+  site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  model TEXT NOT NULL DEFAULT '',
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_gateway_usage_ts ON gateway_usage_log(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_usage_site ON gateway_usage_log(site_id, ts DESC);
+-- M13-S1：站点余额快照（每轮刷新时写一条）。
+CREATE TABLE IF NOT EXISTS usage_snapshots(
+  id INTEGER PRIMARY KEY,
+  site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  used REAL NOT NULL,
+  remaining REAL NOT NULL,
+  currency TEXT NOT NULL DEFAULT 'USD',
+  known INTEGER NOT NULL DEFAULT 1,
+  ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_snapshots_site ON usage_snapshots(site_id, ts DESC);
 "#;
 
 fn now_secs() -> i64 {
@@ -290,6 +313,30 @@ pub struct ExportRecord {
     pub encrypted: bool,
     pub bytes: i64,
     pub exported_at: i64,
+}
+
+/// 一次网关请求的 token 用量行（M13-S1）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayUsageRow {
+    pub id: i64,
+    pub ts: i64,
+    pub site_id: i64,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+/// 一个站点的余额快照行（M13-S1）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageSnapshotRow {
+    pub id: i64,
+    pub ts: i64,
+    pub site_id: i64,
+    pub used: f64,
+    pub remaining: f64,
+    pub currency: String,
+    pub known: bool,
 }
 
 pub struct Store {
@@ -1378,6 +1425,109 @@ impl Store {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Store(format!("读取导出行失败: {e}")))
     }
+
+    /// M13-S1: insert gateway usage
+    pub fn insert_gateway_usage(
+        &self,
+        site_id: i64,
+        model: &str,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        total_tokens: i64,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![now_secs(), site_id, model, prompt_tokens, completion_tokens, total_tokens],
+        ).map_err(|e| Error::Store(format!("gateway usage insert: {e}")))?;
+        Ok(())
+    }
+
+    /// M13-S1: query recent gateway usage
+    pub fn recent_gateway_usage(&self, hours: i64) -> Result<Vec<GatewayUsageRow>> {
+        let hours = hours.max(1);
+        let cutoff = now_secs() - hours * 3600;
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT id, ts, site_id, model, prompt_tokens, completion_tokens, total_tokens FROM gateway_usage_log WHERE ts >= ?1 ORDER BY ts DESC LIMIT 1000").map_err(|e| Error::Store(format!("prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok(GatewayUsageRow {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    site_id: row.get(2)?,
+                    model: row.get(3)?,
+                    prompt_tokens: row.get(4)?,
+                    completion_tokens: row.get(5)?,
+                    total_tokens: row.get(6)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect: {e}")))
+    }
+
+    /// M13-S1: insert usage snapshot
+    pub fn insert_usage_snapshot(
+        &self,
+        site_id: i64,
+        used: f64,
+        remaining: f64,
+        currency: &str,
+        known: bool,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO usage_snapshots(site_id, used, remaining, currency, known, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![site_id, used, remaining, currency, i64::from(known), now_secs()],
+        ).map_err(|e| Error::Store(format!("snapshot insert: {e}")))?;
+        Ok(())
+    }
+
+    /// M13-S1: query recent usage snapshots
+    pub fn recent_usage_snapshots(&self, hours: i64) -> Result<Vec<UsageSnapshotRow>> {
+        let hours = hours.max(1);
+        let cutoff = now_secs() - hours * 3600;
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT id, ts, site_id, used, remaining, currency, known FROM usage_snapshots WHERE ts >= ?1 ORDER BY site_id ASC, ts DESC LIMIT 500").map_err(|e| Error::Store(format!("prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok(UsageSnapshotRow {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    site_id: row.get(2)?,
+                    used: row.get(3)?,
+                    remaining: row.get(4)?,
+                    currency: row.get(5)?,
+                    known: row.get::<_, i64>(6)? != 0,
+                })
+            })
+            .map_err(|e| Error::Store(format!("query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect: {e}")))
+    }
+
+    /// M13-S1: 裁剪网关用量日志，只保留最近 N 天。在 `refresh_all` 里调用。
+    pub fn prune_gateway_usage_log(&self, days: i64) -> Result<usize> {
+        let cutoff = now_secs() - days * 86400;
+        let conn = self.lock()?;
+        let n = conn
+            .execute(
+                "DELETE FROM gateway_usage_log WHERE ts < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| Error::Store(format!("prune gateway usage: {e}")))?;
+        Ok(n)
+    }
+
+    /// M13-S1: 裁剪余额快照，只保留最近 N 天。
+    pub fn prune_usage_snapshots(&self, days: i64) -> Result<usize> {
+        let cutoff = now_secs() - days * 86400;
+        let conn = self.lock()?;
+        let n = conn
+            .execute("DELETE FROM usage_snapshots WHERE ts < ?1", params![cutoff])
+            .map_err(|e| Error::Store(format!("prune usage snapshots: {e}")))?;
+        Ok(n)
+    }
 }
 
 #[cfg(test)]
@@ -1672,5 +1822,102 @@ mod tests {
         assert!(!is_legal_key_status("REVOKED"), "大小写敏感");
         assert!(!is_legal_key_status(""));
         assert!(!is_legal_key_status(" revoked"));
+    }
+
+    // ---- M13-S1：token 用量 store CRUD ----
+
+    #[test]
+    fn gateway_usage_insert_and_query_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let site_id = store.upsert_site("newapi", "https://a", "A").unwrap();
+        // 用直接 SQL 写入不同时间戳，保证排序确定（now_secs 精度是秒，同秒内顺序不定）
+        let conn = store.lock().unwrap();
+        let now = now_secs();
+        conn.execute(
+            "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?3, 100, 50, 150)",
+            params![now - 60, site_id, "gpt-4"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?3, 200, 100, 300)",
+            params![now, site_id, "gpt-4"],
+        )
+        .unwrap();
+        drop(conn);
+        let rows = store.recent_gateway_usage(24).unwrap();
+        assert_eq!(rows.len(), 2);
+        // 按 ts 降序 ⇒ 最新的在前
+        assert_eq!(rows[0].prompt_tokens, 200);
+        assert_eq!(rows[0].completion_tokens, 100);
+        assert_eq!(rows[0].total_tokens, 300);
+        assert_eq!(rows[1].prompt_tokens, 100);
+        assert_eq!(rows[1].model, "gpt-4");
+        assert_eq!(rows[1].site_id, site_id);
+    }
+
+    #[test]
+    fn gateway_usage_time_filter_excludes_old_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let site_id = store.upsert_site("newapi", "https://a", "A").unwrap();
+        // 直接写一条「2 小时前」的记录
+        let conn = store.lock().unwrap();
+        let old_ts = now_secs() - 7200;
+        conn.execute(
+            "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?3, 1, 1, 2)",
+            params![old_ts, site_id, "gpt-4"],
+        )
+        .unwrap();
+        drop(conn);
+        // 查最近 1 小时 ⇒ 不应包含
+        let rows = store.recent_gateway_usage(1).unwrap();
+        assert!(rows.is_empty(), "2 小时前的记录不该出现在 1h 查询里");
+        // 查最近 3 小时 ⇒ 包含
+        let rows = store.recent_gateway_usage(3).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn usage_snapshot_insert_and_query_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let site_id = store.upsert_site("newapi", "https://a", "A").unwrap();
+        let conn = store.lock().unwrap();
+        let now = now_secs();
+        conn.execute(
+            "INSERT INTO usage_snapshots(site_id, used, remaining, currency, known, ts) VALUES (?1, 10.5, 89.5, 'USD', 1, ?2)",
+            params![site_id, now - 60],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_snapshots(site_id, used, remaining, currency, known, ts) VALUES (?1, 15.0, 85.0, 'USD', 1, ?2)",
+            params![site_id, now],
+        )
+        .unwrap();
+        drop(conn);
+        let rows = store.recent_usage_snapshots(168).unwrap();
+        assert_eq!(rows.len(), 2);
+        // 按 site_id ASC, ts DESC ⇒ 两条同站点，最新的在前
+        assert_eq!(rows[0].used, 15.0);
+        assert_eq!(rows[0].remaining, 85.0);
+        assert_eq!(rows[1].used, 10.5);
+    }
+
+    #[test]
+    fn prune_gateway_usage_log_deletes_old_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let site_id = store.upsert_site("newapi", "https://a", "A").unwrap();
+        let conn = store.lock().unwrap();
+        let old_ts = now_secs() - 86400 * 100; // 100 天前
+        conn.execute(
+            "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?, 1, 1, 2)",
+            params![old_ts, site_id, "old"],
+        )
+        .unwrap();
+        drop(conn);
+        store.insert_gateway_usage(site_id, "new", 1, 1, 2).unwrap();
+        let deleted = store.prune_gateway_usage_log(90).unwrap();
+        assert_eq!(deleted, 1, "应删除 1 条 90 天前的记录");
+        let rows = store.recent_gateway_usage(24).unwrap();
+        assert_eq!(rows.len(), 1, "应只剩 1 条新记录");
+        assert_eq!(rows[0].model, "new");
     }
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-recent-usage-snapshots"
+description = "Enables the recent_usage_snapshots command without any pre-configured scope."
+commands.allow = ["recent_usage_snapshots"]
+
+[[permission]]
+identifier = "deny-recent-usage-snapshots"
+description = "Denies the recent_usage_snapshots command without any pre-configured scope."
+commands.deny = ["recent_usage_snapshots"]
