@@ -1076,16 +1076,15 @@ fn scan_string_end(body: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-/// 生成一个本地令牌。不是秘密级别的要求（只防同机其它程序误用），
-/// 但仍然用足够长的随机串。
+/// 生成一个本地网关令牌。
+///
+/// **P2-6**：用 OS 密码学随机源（`getrandom`），不是 `sha256(nanos+pid)`——
+/// 后者在已知 pid 和大致时间时可在约 29ms 内离线算出（DEBUG-REPORT-v3 P2 #6）。
+/// M8-S4 起令牌跨重启持久化（长期有效），可预测性风险被放大，必须不可预测。
 pub fn generate_token() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let digest = crate::inject::sha256_hex(format!("keyrelay-gateway-{nanos}-{pid}").as_bytes());
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("OS 随机源不可用，无法生成安全网关令牌");
+    let digest = crate::inject::sha256_hex(&bytes);
     format!("kr-gw-{}", &digest[..32])
 }
 
