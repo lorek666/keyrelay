@@ -1209,13 +1209,15 @@ pub async fn gateway_rotate_token(
         (run.site_id, run.key_id)
     };
 
-    // 构造 config（gateway_config 校验 key 存在 + 未回收 + 属于站点）。
+    // 校验（gateway_config 校验 key 存在 + 未回收 + 属于站点）。在 rotate 之前：
+    // 校验失败 ⇒ 不换令牌、网关继续跑旧令牌。这一份 config 的 token 是旧令牌，
+    // 丢弃——rotate 之后要重新构造一份读新令牌（P2-7）。
     let port = state
         .service
         .settings()
         .map_err(|e| e.to_string())?
         .gateway_port;
-    let config = state
+    let _pre_check = state
         .service
         .gateway_config(site_id, key_id, port)
         .map_err(|e| e.to_string())?;
@@ -1224,6 +1226,15 @@ pub async fn gateway_rotate_token(
     state
         .service
         .rotate_gateway_token()
+        .map_err(|e| e.to_string())?;
+
+    // P2-7 / DEBUG-REPORT-v3 §2-7：rotate 之后重新构造 config——gateway_token() 这
+    // 次读到的是新令牌。否则 start 用 rotate 之前那份 config（旧令牌），运行中的网关
+    // 仍认旧令牌，而指向网关的 agent 已用新令牌 ⇒ 永久 401/502，直到手动重启。
+    // rotate 前已校验 key 状态，这里不会因 key 被回收而失败。
+    let config = state
+        .service
+        .gateway_config(site_id, key_id, port)
         .map_err(|e| e.to_string())?;
 
     // take + stop + start（用运行态的 site_id/key_id，与启动时相同）。
