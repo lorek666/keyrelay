@@ -10,15 +10,21 @@
 
 pub mod claude_code;
 pub mod claude_desktop;
+pub mod cline;
 pub mod codex_auth;
+pub mod cursor;
+pub mod deepseek;
 pub mod gemini_cli;
 pub mod grok_build;
 pub mod hermes;
 pub mod json_text;
 pub mod mcode;
+pub mod mimo_code;
 pub mod openclaw;
 pub mod opencode;
 pub mod pi;
+pub mod qwen_code;
+pub mod trae;
 
 use std::path::{Path, PathBuf};
 
@@ -56,10 +62,22 @@ pub enum DeliveryChannel {
     MCode,
     /// `~/.pi/agent/models.json`（JSON，M14-S1）
     Pi,
+    /// `~/.cursor/settings.json`（M14-S2）
+    Cursor,
+    /// VS Code globalStorage Cline 配置（M14-S2）
+    Cline,
+    /// `~/.qwen/settings.json`（M14-S2）
+    QwenCode,
+    /// `~/.reasonix/config.json`（M14-S2）
+    DeepSeek,
+    /// `~/.trae/config.json`（M14-S2）
+    Trae,
+    /// `~/.mimocode/mimocode.json`（M14-S2）
+    MiMoCode,
 }
 
 impl DeliveryChannel {
-    pub const ALL: [DeliveryChannel; 11] = [
+    pub const ALL: [DeliveryChannel; 17] = [
         DeliveryChannel::CodexAuthJson,
         DeliveryChannel::ClaudeCodeSettings,
         DeliveryChannel::OpenCode,
@@ -71,6 +89,12 @@ impl DeliveryChannel {
         DeliveryChannel::Hermes,
         DeliveryChannel::MCode,
         DeliveryChannel::Pi,
+        DeliveryChannel::Cursor,
+        DeliveryChannel::Cline,
+        DeliveryChannel::QwenCode,
+        DeliveryChannel::DeepSeek,
+        DeliveryChannel::Trae,
+        DeliveryChannel::MiMoCode,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -86,6 +110,12 @@ impl DeliveryChannel {
             DeliveryChannel::Hermes => "hermes",
             DeliveryChannel::MCode => "mcode",
             DeliveryChannel::Pi => "pi",
+            DeliveryChannel::Cursor => "cursor",
+            DeliveryChannel::Cline => "cline",
+            DeliveryChannel::QwenCode => "qwen-code",
+            DeliveryChannel::DeepSeek => "deepseek",
+            DeliveryChannel::Trae => "trae",
+            DeliveryChannel::MiMoCode => "mimo-code",
         }
     }
 
@@ -102,6 +132,12 @@ impl DeliveryChannel {
             "hermes" => Ok(DeliveryChannel::Hermes),
             "mcode" => Ok(DeliveryChannel::MCode),
             "pi" => Ok(DeliveryChannel::Pi),
+            "cursor" => Ok(DeliveryChannel::Cursor),
+            "cline" => Ok(DeliveryChannel::Cline),
+            "qwen-code" => Ok(DeliveryChannel::QwenCode),
+            "deepseek" => Ok(DeliveryChannel::DeepSeek),
+            "trae" => Ok(DeliveryChannel::Trae),
+            "mimo-code" => Ok(DeliveryChannel::MiMoCode),
             other => Err(Error::NotFound(format!("未知的投递通道: {other}"))),
         }
     }
@@ -130,6 +166,12 @@ impl DeliveryChannel {
             DeliveryChannel::Hermes => "hermes",
             DeliveryChannel::MCode => "mcode",
             DeliveryChannel::Pi => "pi",
+            DeliveryChannel::Cursor => "cursor",
+            DeliveryChannel::Cline => "cline",
+            DeliveryChannel::QwenCode => "qwen-code",
+            DeliveryChannel::DeepSeek => "deepseek",
+            DeliveryChannel::Trae => "trae",
+            DeliveryChannel::MiMoCode => "mimo-code",
         }
     }
 
@@ -168,6 +210,12 @@ impl DeliveryChannel {
             DeliveryChannel::Hermes => PathBuf::from(".hermes").join("config.yaml"),
             DeliveryChannel::MCode => PathBuf::from(".minimax").join("config.yaml"),
             DeliveryChannel::Pi => PathBuf::from(".pi").join("agent").join("models.json"),
+            DeliveryChannel::Cursor => PathBuf::from(".cursor").join("settings.json"),
+            DeliveryChannel::Cline => cline::relative_config_path(),
+            DeliveryChannel::QwenCode => PathBuf::from(".qwen").join("settings.json"),
+            DeliveryChannel::DeepSeek => PathBuf::from(".reasonix").join("config.json"),
+            DeliveryChannel::Trae => PathBuf::from(".trae").join("config.json"),
+            DeliveryChannel::MiMoCode => PathBuf::from(".mimocode").join("mimocode.json"),
         }
     }
 }
@@ -192,7 +240,13 @@ pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
         | DeliveryChannel::OpenClaw
         | DeliveryChannel::Hermes
         | DeliveryChannel::MCode
-        | DeliveryChannel::Pi => RestartHint::Needed,
+        | DeliveryChannel::Pi
+        | DeliveryChannel::Cursor
+        | DeliveryChannel::Cline
+        | DeliveryChannel::QwenCode
+        | DeliveryChannel::DeepSeek
+        | DeliveryChannel::Trae
+        | DeliveryChannel::MiMoCode => RestartHint::Needed,
     }
 }
 
@@ -492,6 +546,12 @@ pub fn resolve_for_binding(
         DeliveryChannel::Hermes => Ok(Box::new(hermes::HermesWriter::new(home, base_url))),
         DeliveryChannel::MCode => Ok(Box::new(mcode::MCodeWriter::new(home, base_url))),
         DeliveryChannel::Pi => Ok(Box::new(pi::PiWriter::new(home, base_url))),
+        DeliveryChannel::Cursor => Ok(Box::new(cursor::CursorWriter::new(home, base_url))),
+        DeliveryChannel::Cline => Ok(Box::new(cline::ClineWriter::new(home, base_url))),
+        DeliveryChannel::QwenCode => Ok(Box::new(qwen_code::QwenCodeWriter::new(home, base_url))),
+        DeliveryChannel::DeepSeek => Ok(Box::new(deepseek::DeepSeekWriter::new(home, base_url))),
+        DeliveryChannel::Trae => Ok(Box::new(trae::TraeWriter::new(home, base_url))),
+        DeliveryChannel::MiMoCode => Ok(Box::new(mimo_code::MiMoCodeWriter::new(home, base_url))),
     }
 }
 
@@ -798,7 +858,13 @@ mod tests {
                 "openclaw",
                 "hermes",
                 "mcode",
-                "pi"
+                "pi",
+                "cursor",
+                "cline",
+                "qwen-code",
+                "deepseek",
+                "trae",
+                "mimo-code"
             ]
         );
         assert_eq!(DeliveryChannel::OpenCode.agent_id(), "opencode");
@@ -821,7 +887,7 @@ mod tests {
             );
             seen.push(id);
         }
-        assert_eq!(seen.len(), 11);
+        assert_eq!(seen.len(), 17);
     }
 
     #[test]
@@ -885,7 +951,7 @@ mod tests {
             );
             seen.push(target);
         }
-        assert_eq!(seen.len(), 11);
+        assert_eq!(seen.len(), 17);
     }
 
     #[test]
@@ -969,6 +1035,12 @@ mod tests {
             DeliveryChannel::Hermes,
             DeliveryChannel::MCode,
             DeliveryChannel::Pi,
+            DeliveryChannel::Cursor,
+            DeliveryChannel::Cline,
+            DeliveryChannel::QwenCode,
+            DeliveryChannel::DeepSeek,
+            DeliveryChannel::Trae,
+            DeliveryChannel::MiMoCode,
         ] {
             assert!(
                 resolve_for_binding(channel, home, "https://x", "", None).is_ok(),
@@ -996,7 +1068,7 @@ mod tests {
                 channel.as_str()
             );
         }
-        assert_eq!(DeliveryChannel::ALL.len(), 11);
+        assert_eq!(DeliveryChannel::ALL.len(), 17);
     }
 
     #[test]
