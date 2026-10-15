@@ -34,7 +34,7 @@ pub const MAX_CAPTCHA_COOKIES_TOTAL_BYTES: usize = 16 * 1024;
 ///    绝不返回一个会打开本地文件 / 执行脚本的地址。
 pub fn captcha_page_url(base_url: &str) -> Result<String> {
     let (scheme, rest) = split_scheme(base_url)?;
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     // 掩掉 userinfo：`alice:pw@host` ⇒ `host`。用最后一个 `@`（与 `strip_url_userinfo` 同口径）。
     let host = match authority.rfind('@') {
@@ -203,7 +203,7 @@ pub(crate) fn host_of(url: &str) -> String {
         Some(i) => &url[i + 3..],
         None => url,
     };
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     let host = match authority.rfind('@') {
         Some(at) => &authority[at + 1..],
@@ -237,7 +237,7 @@ fn split_scheme(raw: &str) -> Result<(String, &str)> {
 /// `scheme://host[:port]`（小写 scheme、小写 host、默认端口归一）。
 fn origin_of(raw: &str) -> Option<String> {
     let (scheme, rest) = split_scheme(raw).ok()?;
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     let host_port = match authority.rfind('@') {
         Some(at) => &authority[at + 1..],
@@ -344,6 +344,25 @@ mod tests {
                 "{base} ⇒ {url} 的 origin 必须与站点同源"
             );
         }
+    }
+
+    #[test]
+    fn captcha_page_url_treats_backslash_as_authority_separator_whatwg() {
+        // P2-20 / DEBUG-REPORT-v3 §2-20：`https://evil.example\@good.example`——
+        // WHATWG 把 `\` 当 `/`（authority 在 `\` 处结束），reqwest/浏览器认 host=
+        // evil.example。手写解析不把 `\` 当终止符 ⇒ authority = `evil.example\@good.example`，
+        // rfind('@') ⇒ host = good.example，与适配器请求（evil.example）不一致 ⇒
+        // good.example 已过 2FA/验证码的会话 cookie 被发给 evil.example。
+        // 现在 authority 终止符加 `\`，与 WHATWG 一致。
+        let url = captcha_page_url("https://evil.example\\@good.example").unwrap();
+        assert!(
+            url.starts_with("https://evil.example/"),
+            "反斜杠是 authority 终止符（WHATWG），host 应是 evil.example: {url}"
+        );
+        assert!(
+            !url.contains("good.example"),
+            "不得认成 good.example（否则 cookie 归属错）: {url}"
+        );
     }
 
     // ============================================================ T5 origin 比对
