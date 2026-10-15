@@ -105,7 +105,7 @@ async fn a_non_email_account_is_rejected_before_any_request_is_sent() {
         "  testuser  ", // trim 之后仍不是邮箱
         "testuser@qq",  // 域名没有点
         "testuser@",    // 域名为空
-        "@qq.com",   // 本地部为空
+        "@qq.com",      // 本地部为空
     ] {
         let f = setup(SUB2API);
         let err = f

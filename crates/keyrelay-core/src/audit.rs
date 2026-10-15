@@ -232,11 +232,7 @@ mod tests {
     fn clean_directory_reports_clean() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "hello world\n").unwrap();
-        fs::write(
-            dir.path().join("b.txt"),
-            "站点 example 余额 12.5 USD\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join("b.txt"), "站点 example 余额 12.5 USD\n").unwrap();
 
         let report = scan_paths(&[dir.path().to_path_buf()]);
         assert!(report.is_clean(), "{}", report.summary());
