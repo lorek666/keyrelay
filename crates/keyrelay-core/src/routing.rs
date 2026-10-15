@@ -90,6 +90,13 @@ impl RouteTable {
     pub fn preferred(&self) -> Option<&Upstream> {
         ordered(self.upstreams.iter()).into_iter().next()
     }
+
+    /// 所有上游按排序键的有序列表（不过滤 model）。无 body 请求（`GET /v1/models`）
+    /// 用它而不是 [`Self::preferred`] 的单个——故障切换仍要工作（B-98 / P2-9）：
+    /// 只给首选一个候选，它挂了就 502，不会切到别的上游。
+    pub fn all_candidates(&self) -> Vec<&Upstream> {
+        ordered(self.upstreams.iter())
+    }
 }
 
 /// 一个站点能服务哪些模型 + 它的成本 / 健康度（**路由表的输入**）。

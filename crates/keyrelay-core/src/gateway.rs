@@ -653,9 +653,10 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     let model = model_from_body(&body);
     let candidates: Vec<&Upstream> = match &model {
         Some(m) => state.config.route.candidates(m),
-        // 没有 body（`GET /v1/models`）或 body 里没有 `model`：用**同一个**排序键取首选。
-        // 开了路由不该把一个 PRD 端点变成 404。
-        None => state.config.route.preferred().into_iter().collect(),
+        // 没有 body（`GET /v1/models`）或 body 里没有 `model`：用**所有**上游的有序
+        // 列表，而不是 `preferred()` 的单个——否则首选挂了就 502，不切别的上游
+        // （B-98 / P2-9）。开了路由不该把一个 PRD 端点变成 404。
+        None => state.config.route.all_candidates(),
     };
     if candidates.is_empty() {
         return (
