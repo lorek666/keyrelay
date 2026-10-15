@@ -147,6 +147,7 @@ async fn start_routed(
     let handle = start(GatewayConfig {
         port: 0,
         token: generate_token(),
+        site_id: 0,
         // 路由非空时 `base_url` 不被使用；留空正好证明这一点（`start()` 只在空表时要求它非空）
         base_url: String::new(),
         api_key: zeroize::Zeroizing::new(String::new()),
@@ -157,6 +158,7 @@ async fn start_routed(
         upstream_timeout: UpstreamTimeout::default(),
         revoked_refs: None,
         on_observation: None,
+        on_usage: None,
         upstream_proxy: None,
         on_failure: Some(Arc::new(move |f| {
             if let Ok(mut log) = sink.lock() {
@@ -435,6 +437,7 @@ async fn failure_event_scrubs_a_key_shaped_model() {
         let handle = start(GatewayConfig {
             port: 0,
             token: generate_token(),
+            site_id: 0,
             base_url: String::new(),
             api_key: zeroize::Zeroizing::new(String::new()),
             site_display_name: "路由模式".to_string(),
@@ -445,6 +448,7 @@ async fn failure_event_scrubs_a_key_shaped_model() {
             upstream_timeout: UpstreamTimeout::default(),
             revoked_refs: None,
             on_observation: None,
+            on_usage: None,
             upstream_proxy: None,
             on_failure: Some(Arc::new(move |f| {
                 if let Ok(mut log) = sink.lock() {
@@ -601,6 +605,7 @@ async fn start_routed_with(
     let handle = start(GatewayConfig {
         port: 0,
         token: generate_token(),
+        site_id: 0,
         base_url: String::new(),
         api_key: zeroize::Zeroizing::new(String::new()),
         site_display_name: "路由模式".to_string(),
@@ -624,6 +629,7 @@ async fn start_routed_with(
                 log.push(f);
             }
         })),
+        on_usage: None,
     })
     .await
     .expect("网关应能启动");

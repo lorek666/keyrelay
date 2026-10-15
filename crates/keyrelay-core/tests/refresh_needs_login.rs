@@ -492,3 +492,66 @@ async fn a_fresh_service_still_sees_a_persisted_needs_login_site() {
     );
     assert_eq!(fresh_mock.request_count(), 0, "不得联网");
 }
+
+// ==================================================== M13-S1：余额快照
+
+/// 刷新成功（`Balance.known == true`）后必须写一条快照。
+#[tokio::test]
+async fn a_successful_refresh_writes_a_usage_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, mock) = service_on(&dir.path().join("keyrelay.db"));
+    let a = site(&service, "https://a.example.com", "甲");
+    login_site(&service, &mock, a).await;
+
+    mock.push(balance_ok(1_000_000));
+    mock.push(keys_ok());
+    refresh(&service).await;
+
+    let snaps = service.store().recent_usage_snapshots(168).unwrap();
+    assert_eq!(snaps.len(), 1, "known == true 的站点应写一条快照");
+    assert_eq!(snaps[0].site_id, a);
+    assert!(snaps[0].known, "快照的 known 标志必须是 true");
+}
+
+/// 余额查询失败（`Balance.known == false`）时不写快照。
+#[tokio::test]
+async fn a_transport_failure_does_not_write_a_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, mock) = service_on(&dir.path().join("keyrelay.db"));
+    let a = site(&service, "https://a.example.com", "甲");
+    login_site(&service, &mock, a).await;
+
+    mock.push_error(Error::Transport("断网".into()));
+    mock.push(keys_ok());
+    refresh(&service).await;
+
+    let snaps = service.store().recent_usage_snapshots(168).unwrap();
+    assert!(snaps.is_empty(), "known == false 不应写快照");
+}
+
+/// 余额响应 200 但缺 `quota` 字段 ⇒ `Balance::unknown`（`known == false`）
+/// ⇒ **不得写快照**。
+///
+/// 这是 M3 变异守卫：把 `if b.known` 改成 `if true` 后本测试应变红。
+#[tokio::test]
+async fn an_unknown_balance_does_not_write_a_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, mock) = service_on(&dir.path().join("keyrelay.db"));
+    let a = site(&service, "https://a.example.com", "甲");
+    login_site(&service, &mock, a).await;
+
+    // 200 OK 但 data 里没有 quota → NewAPI 适配器返回 Balance::unknown
+    mock.push(
+        HttpResponse::json(200, json!({"success": true, "data": {}}))
+            .expect("构造 unknown 余额响应"),
+    );
+    mock.push(keys_ok());
+    refresh(&service).await;
+
+    let snaps = service.store().recent_usage_snapshots(168).unwrap();
+    assert!(
+        snaps.is_empty(),
+        "known == false（余额未知）不应写快照，实际写了 {} 条",
+        snaps.len()
+    );
+}

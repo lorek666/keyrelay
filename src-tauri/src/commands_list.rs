@@ -60,4 +60,7 @@ pub const COMMANDS: &[&str] = &[
     "captcha_begin",
     "captcha_complete",
     "captcha_cancel",
+    // M13-S1：Token 消耗统计
+    "recent_gateway_usage",
+    "recent_usage_snapshots",
 ];
