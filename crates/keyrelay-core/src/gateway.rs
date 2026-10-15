@@ -830,7 +830,12 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         } else {
             (0u16, "密钥引用没有对应的明文")
         };
-        last_error = Some(format!("上游站点 {}: {reason}", upstream.site_id));
+        // P3-5 / GW-18 / DEBUG-REPORT-v3 §3-5：不覆盖可发送循环已记下的真实失败原因
+        //（传输错误 / 上游状态码）——不可发送的 reason 是配置问题，不是这次请求失败
+        // 的主因，盖住它会让用户以为「密钥没明文」而其实是「上游连不上」。
+        if last_error.is_none() {
+            last_error = Some(format!("上游站点 {}: {reason}", upstream.site_id));
+        }
         report_failure(
             &state,
             upstream.site_id,
