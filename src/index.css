@@ -1,23 +1,31 @@
-/* ============================================================ 主题令牌（M9-S4）
+/* ============================================================ 主题令牌（M11-S1 界面改版）
 
-   深色是缺省（没有 data-theme 时也是它）：每个取值都与 M9-S4 之前写死在各处的颜色相同。
-   `--warn` / `--ok` 之前被引用却从未定义——告警盒没有边框、告警字是正文色（M9-S4 / E）。
-   浅色是**占位**：只保证对比度够（文字 ≥ 4.5:1），具体配色留给界面改版整体替换。 */
+   浅色工作台：灰底、白面板、分组侧栏、蓝色主按钮。
+   深色沿用同一套布局，只换颜色（M9-S4 既定语义不变：`useApplyTheme` 三态仍只由
+   `settings.theme` 决定，system / 未知值仍跟随系统）。
+
+   每个取值都覆盖按钮、告警、对话框遮罩；`::backdrop` 仍保留颜色兜底值（M9-S4 复审 P2-5）。
+   浅色文字对比度不低于 4.5:1（M11-S1 复审要点）。 */
 :root,
 [data-theme="dark"] {
   --bg: #0f1115;
+  /* 侧栏底色：比主区稍深一格，分组与主区在视觉上分开（M11-S1）。 */
+  --sidebar-bg: #0c0e13;
   --panel: #161a21;
   --line: #242a34;
+  --line-soft: #1f2530;
   --text: #e6e9ef;
   --muted: #8b93a3;
   --accent: #6ea8fe;
+  --accent-hover: #8cb5ff;
   --danger: #ff7b72;
   --warn: #e3b341;
   --ok: #7ee787;
   /* 输入框、diff 等「凹下去」的底色 */
   --field: #0d1017;
-  /* 普通按钮的底色 */
+  /* 普通按钮的底色 / 当前导航项圆角块的底色（深色下面板色） */
   --raised: #1d2330;
+  --active-bg: #1d2330;
   /* 实心强调色 / 危险色按钮上的字 */
   --on-accent: #0b1220;
   --on-danger: #2a0d0b;
@@ -28,30 +36,41 @@
   --danger-soft: rgba(255, 123, 114, 0.12);
   --muted-soft: rgba(139, 147, 163, 0.12);
   --backdrop: rgba(0, 0, 0, 0.55);
+  /* 面板浮起的层次（M11-S1 统一）：深色下用黑色阴影 */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.3);
   color-scheme: dark;
 }
 
 [data-theme="light"] {
-  --bg: #f6f8fa;
+  /* 灰底（主区与侧栏同灰系，侧栏稍深），白面板浮起，蓝色主按钮 */
+  --bg: #eef1f6;
+  --sidebar-bg: #e6eaf1;
   --panel: #ffffff;
-  --line: #d0d7de;
+  --line: #d8dde5;
+  --line-soft: #e4e8ee;
   --text: #1f2328;
   --muted: #59636e;
-  --accent: #0969da;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
   --danger: #cf222e;
   --warn: #7d4e00;
   --ok: #116329;
   --field: #ffffff;
-  --raised: #f6f8fa;
+  --raised: #f3f5f8;
+  /* 当前导航项 = 白底圆角块（M11-S1 §8 验收标准 2） */
+  --active-bg: #ffffff;
   --on-accent: #ffffff;
   --on-danger: #ffffff;
-  --accent-soft: rgba(9, 105, 218, 0.08);
-  --accent-faint: rgba(9, 105, 218, 0.04);
+  --accent-soft: rgba(37, 99, 235, 0.12);
+  --accent-faint: rgba(37, 99, 235, 0.06);
   --ok-soft: rgba(17, 99, 41, 0.1);
   --warn-soft: rgba(125, 78, 0, 0.1);
   --danger-soft: rgba(207, 34, 46, 0.08);
   --muted-soft: rgba(89, 99, 110, 0.1);
   --backdrop: rgba(31, 35, 40, 0.45);
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow: 0 1px 3px rgba(16, 24, 40, 0.06), 0 1px 2px rgba(16, 24, 40, 0.04);
   color-scheme: light;
 }
 
@@ -72,16 +91,18 @@ body {
   font: 14px/1.5 -apple-system, "SF Pro Text", "PingFang SC", system-ui, sans-serif;
 }
 
+/* ============================================================ 应用壳（M11-S1 分组侧栏） */
 .app {
   display: grid;
-  grid-template-columns: 208px 1fr;
+  grid-template-columns: 224px 1fr;
   height: 100%;
 }
 
 .sidebar {
   border-right: 1px solid var(--line);
-  background: var(--panel);
+  background: var(--sidebar-bg);
   padding: 16px 12px;
+  overflow: auto;
 }
 
 .brand {
@@ -90,24 +111,60 @@ body {
   gap: 8px;
   font-weight: 600;
   margin-bottom: 20px;
+  padding: 0 4px;
+}
+
+/* 分组：日常 / 资产 / 投递 / 系统（M11-S1 §2） */
+.nav-group {
+  margin-bottom: 18px;
+}
+
+.nav-group-label {
+  margin: 0 0 4px;
+  padding: 0 10px;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .nav-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
   padding: 8px 10px;
+  margin-bottom: 2px;
+  border: 0;
   border-radius: 8px;
+  background: transparent;
   color: var(--muted);
-  text-decoration: none;
+  font: inherit;
   font-size: 13px;
+  text-align: left;
+  cursor: pointer;
 }
 
-.nav-item.active {
-  background: var(--raised);
+.nav-item:hover {
+  background: var(--accent-faint);
   color: var(--text);
+}
+
+/* 当前导航项 = 圆角块（浅色白底 / 深色面板色），蓝字 + 微阴影（§8 验收标准 2） */
+.nav-item.active {
+  background: var(--active-bg);
+  color: var(--accent);
+  box-shadow: var(--shadow-sm);
 }
 
 .nav-item.disabled {
   opacity: 0.45;
+}
+
+.sidebar-note {
+  margin: 16px 4px 0;
+  font-size: 11px;
+  color: var(--muted);
 }
 
 .content {
@@ -134,6 +191,15 @@ h2 {
   margin: 0 0 12px;
 }
 
+section h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+}
+
+section > .muted {
+  margin-top: 0;
+}
+
 .row-between {
   display: flex;
   align-items: center;
@@ -146,11 +212,14 @@ h2 {
   gap: 12px;
 }
 
+/* ============================================================ 卡片 / 面板（M11-S1 统一圆角边框层次） */
 .card {
+  margin-top: 16px;
+  padding: 16px 18px;
   border: 1px solid var(--line);
+  border-radius: 12px;
   background: var(--panel);
-  border-radius: 10px;
-  padding: 14px;
+  box-shadow: var(--shadow-sm);
 }
 
 .card-head {
@@ -162,149 +231,6 @@ h2 {
 
 .card-title {
   font-weight: 600;
-}
-
-.badge {
-  margin-left: auto;
-  font-size: 11px;
-  padding: 1px 7px;
-  border-radius: 999px;
-  border: 1px solid var(--line);
-  color: var(--muted);
-}
-
-.muted {
-  color: var(--muted);
-}
-
-.mono {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
-}
-
-.error {
-  color: var(--danger);
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-/* 投递预览的提示项（BACKLOG B-76）：不是错误，但用户该知道。
-   用告警色而不是错误色——投递照常可以做。 */
-.warnbox {
-  border: 1px solid var(--warn);
-  border-radius: 8px;
-  padding: 8px 10px;
-  margin: 10px 0;
-}
-
-.warnline {
-  color: var(--warn);
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  margin: 0;
-  font-size: 13px;
-}
-
-.warnline + .warnline {
-  margin-top: 6px;
-}
-
-/* 解绑结果（M8-S4 §5.4）。四态文案都在里面，所以用「结果盒子」而不是一行提示：
-   同一段里可以同时有「解开了 2 条」「回收成功 1 把」「回收失败 1 把」。 */
-.okbox {
-  border: 1px solid var(--ok);
-  border-radius: 8px;
-  padding: 8px 10px;
-  margin: 10px 0;
-}
-
-.health-enabled {
-  color: var(--ok);
-}
-
-.health-unknown {
-  color: var(--muted);
-}
-
-/* 会话已失效，需要用户重新登录（B-61）。用告警色，因为它需要人动手。 */
-.health-needs-login {
-  color: var(--warn);
-}
-
-button.ghost {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: transparent;
-  color: var(--text);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 6px 10px;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-button.ghost:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-.footnote {
-  margin-top: 20px;
-  font-size: 12px;
-}
-
-/* ============================================================ M1-S4 界面补充 */
-
-.nav-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 8px 10px;
-  margin-bottom: 2px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--muted);
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-
-.nav-item:hover {
-  background: var(--accent-faint);
-  color: var(--text);
-}
-
-.nav-item.active {
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-
-.sidebar-note {
-  margin: 16px 4px 0;
-  font-size: 11px;
-  color: var(--muted);
-}
-
-section h2 {
-  margin: 0 0 4px;
-  font-size: 18px;
-}
-
-section > .muted {
-  margin-top: 0;
-}
-
-.card {
-  margin-top: 16px;
-  padding: 14px 16px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--panel);
 }
 
 .card h3 {
@@ -321,71 +247,37 @@ section > .muted {
   color: var(--muted);
 }
 
-.row {
+/* 统计卡（Overview 顶部那一排） */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.stat {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: var(--shadow-sm);
+}
+
+.stat-label {
   display: flex;
   align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.row-between {
-  justify-content: space-between;
-}
-
-.grow {
-  flex: 1;
-}
-
-.input {
-  background: var(--field);
-  color: var(--text);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 6px 9px;
-  font: inherit;
-  min-width: 120px;
-}
-
-.input:focus {
-  outline: 1px solid var(--accent);
-}
-
-.btn {
-  display: inline-flex;
-  align-items: center;
   gap: 6px;
-  background: var(--raised);
-  color: var(--text);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 6px 11px;
-  font: inherit;
-  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
 }
 
-.btn:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-.btn-primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--on-accent);
+.stat-value {
+  margin-top: 6px;
+  font-size: 22px;
   font-weight: 600;
 }
 
-.btn-danger {
-  background: var(--danger);
-  border-color: var(--danger);
-  color: var(--on-danger);
-  font-weight: 600;
-}
-
-.btn-ghost {
-  background: transparent;
-}
-
+/* ============================================================ 表格 */
 .table {
   width: 100%;
   border-collapse: collapse;
@@ -394,10 +286,14 @@ section > .muted {
 
 .table th,
 .table td {
-  padding: 7px 8px;
-  border-bottom: 1px solid var(--line);
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line-soft);
   text-align: left;
   vertical-align: top;
+}
+
+.table thead th {
+  border-bottom: 1px solid var(--line);
 }
 
 .table th {
@@ -416,8 +312,10 @@ section > .muted {
   white-space: nowrap;
 }
 
+/* ============================================================ 徽标 / 状态色 */
 .badge {
   display: inline-block;
+  margin-left: auto;
   padding: 1px 7px;
   border-radius: 999px;
   font-size: 11px;
@@ -444,61 +342,6 @@ section > .muted {
   background: var(--muted-soft);
 }
 
-.kv {
-  display: grid;
-  grid-template-columns: 110px 1fr;
-  gap: 6px 12px;
-  margin: 0;
-  font-size: 13px;
-}
-
-.kv dt {
-  color: var(--muted);
-}
-
-.kv dd {
-  margin: 0;
-}
-
-.cards {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 12px;
-  margin-top: 16px;
-}
-
-.stat {
-  padding: 12px 14px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--panel);
-}
-
-.stat-label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.stat-value {
-  margin-top: 6px;
-  font-size: 22px;
-  font-weight: 600;
-}
-
-.diff {
-  margin: 0;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--field);
-  font: 12px/1.6 ui-monospace, "SF Mono", Menlo, monospace;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-
 .chip {
   display: inline-block;
   margin: 0 6px 4px 0;
@@ -508,12 +351,187 @@ section > .muted {
   font-size: 11px;
 }
 
-.checkline {
+.health-enabled {
+  color: var(--ok);
+}
+
+.health-unknown {
+  color: var(--muted);
+}
+
+/* 会话已失效，需要用户重新登录（B-61）。用告警色，因为它需要人动手。 */
+.health-needs-login {
+  color: var(--warn);
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+}
+
+/* ============================================================ 提示 / 告警 / 结果盒 */
+.ok {
+  color: var(--ok);
+  font-size: 13px;
+}
+
+.warn {
+  color: var(--warn);
+  font-size: 13px;
+}
+
+.error {
+  color: var(--danger);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 投递预览的提示项（BACKLOG B-76）：不是错误，但用户该知道。
+   用告警色而不是错误色——投递照常可以做。 */
+.warnbox {
+  border: 1px solid var(--warn);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 10px 0;
+}
+
+.warnline {
+  color: var(--warn);
   display: flex;
   align-items: flex-start;
-  gap: 8px;
-  margin: 12px 0;
+  gap: 6px;
+  margin: 0;
   font-size: 13px;
+}
+
+.warnline + .warnline {
+  margin-top: 6px;
+}
+
+/* 解绑结果（M8-S4 §5.4）。四态文案都在里面，所以用「结果盒子」而不是一行提示：
+   同一段里可以同时有「解开了 2 条」「回收成功 1 把」「回收失败 1 把」。 */
+.okbox {
+  border: 1px solid var(--ok);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 10px 0;
+}
+
+.footnote {
+  margin-top: 20px;
+  font-size: 12px;
+}
+
+/* ============================================================ 按钮（M11-S1 统一圆角边框） */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--raised);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 11px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* 蓝色主按钮（M11-S1 §2 / §8 验收标准 2） */
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.btn-danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--on-danger);
+  font-weight: 600;
+}
+
+.btn-ghost {
+  background: transparent;
+}
+
+/* 次级按钮（UpdateChecker 用到、此前样式表里没有——M11-S1 §2 补上）：
+   与默认 .btn 同口径（raised 底 + line 边），显式声明避免裸样式。 */
+.btn-secondary {
+  background: var(--raised);
+  color: var(--text);
+  border: 1px solid var(--line);
+}
+
+button.ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+button.ghost:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ============================================================ 输入框 / 字段 */
+.input {
+  background: var(--field);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 9px;
+  font: inherit;
+  min-width: 120px;
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.row-between {
+  justify-content: space-between;
+}
+
+.grow {
+  flex: 1;
 }
 
 .field {
@@ -538,6 +556,14 @@ section > .muted {
   gap: 6px;
   font-size: 12px;
   color: var(--muted);
+}
+
+.checkline {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 12px 0;
+  font-size: 13px;
 }
 
 /* M10-S2：代理模式三态单选 */
@@ -566,14 +592,45 @@ section > .muted {
   font-size: 13px;
 }
 
+/* 键值对照 */
+.kv {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 6px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.kv dt {
+  color: var(--muted);
+}
+
+.kv dd {
+  margin: 0;
+}
+
+/* diff 预览 */
+.diff {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--field);
+  font: 12px/1.6 ui-monospace, "SF Mono", Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ============================================================ 对话框（::backdrop 仍保留兜底，M9-S4 复审 P2-5） */
 .dialog {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: 14px;
   background: var(--panel);
   color: var(--text);
   padding: 18px 20px;
   max-width: 560px;
   width: min(560px, 92vw);
+  box-shadow: var(--shadow);
 }
 
 .dialog::backdrop {
@@ -598,29 +655,67 @@ section > .muted {
   margin-top: 16px;
 }
 
-.ok {
-  color: var(--ok);
-  font-size: 13px;
-}
+/* ============================================================ 更新检查器（M11-S1 §2 补上此前样式表里没有的类）
 
-.warn {
-  color: var(--warn);
-  font-size: 13px;
-}
-
-.error {
-  color: var(--danger);
-  font-size: 13px;
+   UpdateChecker 已经用到这些类，但样式表里没定义——M11-S1 随界面改版一并补上。
+   六种状态的按钮与错误文案渲染不变（spec §6 行为表）。 */
+.update-checker {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
-.mono {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+.update-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.muted {
-  color: var(--muted);
+.update-available {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  background: var(--accent-faint);
+}
+
+.update-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.update-body {
+  margin: 0;
   font-size: 12px;
+  color: var(--muted);
+}
+
+.update-downloading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+
+.update-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* 「检查中…」按钮里那个旋转图标 */
+.spinning {
+  animation: kr-spin 1s linear infinite;
+}
+
+@keyframes kr-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
