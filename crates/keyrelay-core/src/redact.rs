@@ -34,6 +34,17 @@ pub fn scrub(input: &str) -> String {
         for p in PREFIXES {
             let plen = p.chars().count();
             if i + plen <= bytes.len() {
+                // P2-26：前缀必须在词边界处——看**已输出的**末尾字符，若是字母数字，
+                // 说明是词中间（如 `desk-assistant` 里的 `sk-`），不得当成密钥前缀。
+                // 看输出而非原文前一个字符：前一个 token 可能已被掩成 `***`（非字母数字），
+                // 此时紧接的 `sk-` 是新 token（如 32 位 hex 后的 `sk-`），应掩。
+                if out
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+                {
+                    continue;
+                }
                 let candidate: String = bytes[i..i + plen].iter().collect();
                 if candidate.eq_ignore_ascii_case(p) {
                     let mut j = i + plen;
@@ -136,6 +147,16 @@ fn scrub_prefixes_only(input: &str) -> String {
         for p in PREFIXES {
             let plen = p.chars().count();
             if i + plen <= chars.len() {
+                // P2-26：前缀必须在词边界处——看**已输出的**末尾字符，若是字母数字，说明是词中间
+                //（如 `desk-assistant` 里的 `sk-`），不得当成密钥前缀。看输出而非原文前一个
+                // 字符：前一个 token 可能已被掩成 `***`，此时紧接的 `sk-` 是新 token，应掩。
+                if out
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+                {
+                    continue;
+                }
                 let candidate: String = chars[i..i + plen].iter().collect();
                 if candidate.eq_ignore_ascii_case(p) {
                     let mut j = i + plen;
@@ -177,6 +198,16 @@ fn scrub_ignoring_sha256(input: &str) -> String {
         for p in PREFIXES {
             let plen = p.chars().count();
             if i + plen <= chars.len() {
+                // P2-26：前缀必须在词边界处——看**已输出的**末尾字符，若是字母数字，说明是词中间
+                //（如 `desk-assistant` 里的 `sk-`），不得当成密钥前缀。看输出而非原文前一个
+                // 字符：前一个 token 可能已被掩成 `***`，此时紧接的 `sk-` 是新 token，应掩。
+                if out
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+                {
+                    continue;
+                }
                 let candidate: String = chars[i..i + plen].iter().collect();
                 if candidate.eq_ignore_ascii_case(p) {
                     let mut j = i + plen;
@@ -662,6 +693,17 @@ pub fn scrub_event_payload(payload: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrub_does_not_mask_prefix_lookalikes_inside_words() {
+        // P2-26：前缀必须在词边界处。`desk-assistant` / `task-scheduler` 里的 `sk-`
+        // 是词中间（前一个字符是字母），不得当成密钥前缀掩掉。
+        assert_eq!(scrub("desk-assistant"), "desk-assistant");
+        assert_eq!(scrub("task-scheduler"), "task-scheduler");
+        // 对照：词边界处的真正密钥仍被掩（前面是空格或行首）。
+        assert!(scrub("key: sk-0123456789abcdef").contains(MASK));
+        assert!(scrub("sk-0123456789abcdef").contains(MASK));
+    }
 
     #[test]
     fn masks_sk_key() {
