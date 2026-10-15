@@ -572,6 +572,10 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     /// 缓冲有上限（见 [`MAX_BUFFERED_GATEWAY_FAILURES`]），满了丢**最旧**的一条——
     /// 宁可丢历史，也不让一个坏掉的上游把内存吃光。
     gateway_failures: Arc<std::sync::Mutex<std::collections::VecDeque<BufferedGatewayFailure>>>,
+    /// P3-7 / §11.3：缓冲满丢弃计数。`push_bounded` 丢最旧时 +1，`drain` 时清零并
+    /// 随事件报出「本轮因缓冲满丢弃 N 条」——否则用户看到的失败是不完整的而没
+    /// 任何提示。只记计数，不逐条记（D-6：逐条记会让「缓冲满」本身把事件表灌满）。
+    gateway_failures_dropped: Arc<std::sync::atomic::AtomicU64>,
     /// 网关**会话**代号（M8-S1 §11.1）。每次 `gateway_config` 递增一次，
     /// `gateway_stop` 再递增一次（= 作废当前会话）。
     ///
@@ -664,10 +668,13 @@ struct SiteRefresh {
 /// 走同一段逻辑**——否则「上限」这条纪律只在一边生效，而测试会证明一个产品里不存在的性质。
 fn push_bounded(
     buffer: &mut std::collections::VecDeque<BufferedGatewayFailure>,
+    dropped: &std::sync::atomic::AtomicU64,
     failure: crate::gateway::GatewayFailure,
 ) {
     if buffer.len() >= MAX_BUFFERED_GATEWAY_FAILURES {
         buffer.pop_front();
+        // P3-7 / §11.3：记丢弃计数，drain 时随事件报出。
+        dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     buffer.push_back(BufferedGatewayFailure {
         // 时刻在**推送侧**取（网关的请求任务里），不是落库时取：
@@ -696,6 +703,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             // 默认**不通知**：通知会弹窗并发网络请求，测试与纯核心用例不该意外触发。
             notify: None,
             gateway_failures: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            gateway_failures_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gateway_session: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             site_facts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             revoked_refs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -2933,6 +2941,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // 不该在那里做 IO，也不该 panic（`Mutex` 中毒时静默丢弃——观测性坏掉
         // 不该让业务请求失败，这是本文件既有的一条口径，见 `log()`）。
         let sink = Arc::clone(&self.gateway_failures);
+        let dropped_sink = Arc::clone(&self.gateway_failures_dropped);
         config.on_failure = Some(Arc::new(move |failure: crate::gateway::GatewayFailure| {
             // 会话比对：**不相等就丢弃**（§11.1）。丢弃的代价写在 spec 的未验证边界里：
             // 停止瞬间在途请求的失败不进事件表——把它记到下一个会话是主动误导，
@@ -2941,7 +2950,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 return;
             }
             if let Ok(mut buffer) = sink.lock() {
-                push_bounded(&mut buffer, failure);
+                push_bounded(&mut buffer, &dropped_sink, failure);
             }
         }));
 
@@ -3166,6 +3175,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     ///
     /// 返回写出的条数（测试用）。
     pub fn drain_gateway_failures(&self) -> usize {
+        // P3-7 / §11.3：先取出本轮丢弃计数（swap 清零），落完事件后报出。
+        let dropped_this_round = self
+            .gateway_failures_dropped
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
         let drained: Vec<BufferedGatewayFailure> = match self.gateway_failures.lock() {
             Ok(mut buffer) => buffer.drain(..).collect(),
             Err(_) => return 0,
@@ -3207,6 +3220,19 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             event.ts = buffered.at;
             self.log(event);
         }
+        // P3-7 / §11.3：缓冲满丢弃的条数随本轮事件报出——否则用户看到的失败是
+        // 不完整的而没有任何提示。只记计数，不逐条记（D-6：逐条记会让「缓冲满」
+        // 本身把事件表灌满，自我放大）。
+        if dropped_this_round > 0 {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "gateway",
+                format!(
+                    "本轮因缓冲满丢弃 {dropped_this_round} 条网关失败事件（仅记计数，不逐条记）"
+                ),
+                serde_json::json!({ "dropped": dropped_this_round }),
+            ));
+        }
         drained.len()
     }
 
@@ -3239,7 +3265,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     #[doc(hidden)]
     pub fn record_gateway_failure_for_test(&self, failure: crate::gateway::GatewayFailure) {
         if let Ok(mut buffer) = self.gateway_failures.lock() {
-            push_bounded(&mut buffer, failure);
+            push_bounded(&mut buffer, &self.gateway_failures_dropped, failure);
         }
     }
 

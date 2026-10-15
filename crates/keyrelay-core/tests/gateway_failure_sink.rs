@@ -118,6 +118,33 @@ async fn the_failure_buffer_is_bounded() {
     assert_eq!(service.drain_gateway_failures(), 0, "抽干后应为空");
 }
 
+/// P3-7 / §11.3：缓冲满丢弃时只记计数——drain 时随事件报出「丢弃 N 条」，
+/// 否则用户看到的失败是不完整的而没有任何提示。
+#[tokio::test]
+async fn a_full_buffer_reports_how_many_were_dropped() {
+    let (_dir, service) = service();
+    let overflow = 10;
+    for i in 0..(keyrelay_core::service::MAX_BUFFERED_GATEWAY_FAILURES + overflow) {
+        service.record_gateway_failure_for_test(GatewayFailure {
+            site_id: i as i64,
+            status: 503,
+            model: "m".into(),
+            reason: "上游返回可切换状态码 HTTP 503".into(),
+        });
+    }
+    let written = service.drain_gateway_failures();
+    assert_eq!(
+        written,
+        keyrelay_core::service::MAX_BUFFERED_GATEWAY_FAILURES
+    );
+    let events = service.recent_events(100).expect("读事件");
+    let dumped = format!("{:?}", events);
+    assert!(
+        dumped.contains(&format!("丢弃 {overflow} 条")),
+        "缓冲满丢弃 {overflow} 条要在事件里报出（P3-7）: {dumped}"
+    );
+}
+
 /// P2-11 / DEBUG-REPORT-v3 §2-11：status=0 的三种原因（全部熔断 / 缺明文 / 已回收）
 /// 必须在事件文案里分得开——之前都挤在「网关没有可用的上游（site {}）」一条里。
 #[tokio::test]
