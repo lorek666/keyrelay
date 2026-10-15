@@ -58,12 +58,14 @@ describe("UpdateChecker", () => {
     });
   });
 
-  it("error: 检查失败时显示错误摘要和重试按钮", async () => {
+  it("error: 检查失败时显示脱敏后的错误摘要和重试按钮", async () => {
     mockedCheck.mockRejectedValue(new Error("网络超时"));
     renderComponent();
     fireEvent.click(screen.getByText("检查更新"));
     await waitFor(() => {
-      expect(screen.getByText(/网络超时/)).toBeInTheDocument();
+      // U6：原始 err.message 不直接展示，归一到通用文案
+      expect(screen.getByText(/更新检查失败/)).toBeInTheDocument();
+      expect(screen.queryByText(/网络超时/)).not.toBeInTheDocument();
       expect(screen.getByText("重试")).toBeInTheDocument();
     });
   });
@@ -82,14 +84,16 @@ describe("UpdateChecker", () => {
       expect(screen.getByText("下载中…")).toBeInTheDocument();
     });
   });
-});
 
-  it("endpoint-unconfigured: endpoint 不可达时显示错误而非「最新版本」", async () => {
+  it("endpoint-unconfigured: endpoint 不可达时显示脱敏错误而非「最新版本」", async () => {
     mockedCheck.mockRejectedValue(new Error("failed to fetch"));
     renderComponent();
     fireEvent.click(screen.getByText("检查更新"));
     await waitFor(() => {
-      expect(screen.getByText(/failed to fetch/)).toBeInTheDocument();
+      // U6：网络/404/fetch 类错误归一到「无法连接更新服务器」，原始 message 不展示
+      expect(screen.getByText(/无法连接更新服务器/)).toBeInTheDocument();
+      expect(screen.queryByText(/failed to fetch/)).not.toBeInTheDocument();
       expect(screen.queryByText("当前已是最新版本")).not.toBeInTheDocument();
     });
   });
+});

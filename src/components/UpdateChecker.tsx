@@ -1,6 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Download, RefreshCw } from "lucide-react";
-import { checkForUpdates, downloadAndInstallUpdate, type UpdateInfo } from "../lib/api";
+import {
+  checkForUpdates,
+  downloadAndInstallUpdate,
+  relaunchApp,
+  type UpdateInfo,
+} from "../lib/api";
 
 type Phase =
   | "idle"
@@ -10,6 +15,14 @@ type Phase =
   | "downloading"
   | "error";
 
+// U6：不直接展示原始 err.message（可能含 URL/内部路径/主机名），按类别归一到通用文案。
+function scrubError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/fetch|network|404|not found|failed to/i.test(msg)) return "无法连接更新服务器";
+  if (/signature|verify|校验/i.test(msg)) return "更新包签名校验失败";
+  return "更新检查失败，请稍后重试";
+}
+
 export default function UpdateChecker({
   autoCheckOnMount = false,
 }: {
@@ -18,8 +31,12 @@ export default function UpdateChecker({
   const [phase, setPhase] = useState<Phase>("idle");
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // U3：防重入——快速双击「再检查一次/重试」时第二次直接 return，避免并发 setPhase 竞态。
+  const inFlight = useRef(false);
 
   async function doCheck() {
+    if (inFlight.current) return;
+    inFlight.current = true;
     setPhase("checking");
     setError(null);
     try {
@@ -31,19 +48,35 @@ export default function UpdateChecker({
         setPhase("not-available");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(scrubError(err));
       setPhase("error");
+    } finally {
+      inFlight.current = false;
     }
   }
 
   async function doInstall() {
+    if (inFlight.current) return;
+    inFlight.current = true;
     setPhase("downloading");
     setError(null);
     try {
       await downloadAndInstallUpdate();
+      // U4：安装完成，relaunch 前让用户确认——未保存的修改（站点表单/配置）会丢失。
+      if (
+        window.confirm(
+          "更新已下载完成，即将重启应用以生效。未保存的修改会丢失，是否现在重启？"
+        )
+      ) {
+        await relaunchApp();
+      } else {
+        setPhase("idle");
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(scrubError(err));
       setPhase("error");
+    } finally {
+      inFlight.current = false;
     }
   }
 
@@ -51,6 +84,8 @@ export default function UpdateChecker({
     if (autoCheckOnMount) {
       doCheck();
     }
+    // mount-only：autoCheckOnMount 是 prop，开关变化由父组件控制（见 Settings.tsx）。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
