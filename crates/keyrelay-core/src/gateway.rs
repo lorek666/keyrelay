@@ -280,17 +280,27 @@ impl Default for UpstreamTimeout {
         // 上界约 1.15s，留约 4.3 倍余量。刻意取保守的一档而不是 2s：`connect_timeout`
         // 的代价只落在坏路径上（连接阶段真的卡死才等满它），正常站点 5s 远远够。
         //
-        // read 300s：**故意很大，且本步只加了依据、没有改数值**。
+        // read 240s：**M9-S5 用真实上游补全标定过**（B-124 关闭）。
         // 它的语义是「多久没有新字节」，抓的是「接了连接却永不回应」的病态上游，不是「慢」。
-        // 同一端点的实测抖动 0.91/0.93/6.30s（M9-S3 §3.3）说明总时长在此毫无参考价值，
-        // 而一次合法的非流式推理可能在吐第一个字节前就要几分钟。
-        // M9-S3 量不到上游推理首字节的分布（本账号在 NewAPI 无可用渠道，§3.4），
-        // 在那一侧无数据时调小等于拿未知分布去赌——且判失败的代价不只是慢：
-        // 网关会切下一个上游并重发同一请求，可能造成重复计费。
-        // 因此这里保持 300s，缺的那份数据拆出登记在 BACKLOG B-124。
+        //
+        // 真实分布（M9-S5，两站充值后用 grok-4.7 / gpt-6-astra 实测）：
+        //   - 流式 grok-4.7：首字节 ≤8.8s，字节间停顿最大 8.6s（推理间歇，有 SSE keepalive）。
+        //   - 流式 gpt-6-astra：首字节 ≤14.6s（把推理全做完才吐第一个字节），字节间 ≤1.4s。
+        //   - **非流式 gpt-6-astra 难题**：TTFB = 49/63/92/95/101s，另有 1 发 >120s（被 curl 砍）。
+        // 非流式是 read 的真正约束——中转站等模型全做完才吐字节，合法「无字节期」观测最大
+        // 100.7s、重尾 >120s。
+        //
+        // 240s = 2× 重尾(120s) = 约 2.4× 观测最大(100.7s)。刻意不取更小：
+        //   - 风险不对称——偏低会**杀掉合法慢推理请求**（用户请求直接失败），
+        //     偏高只是**卡死上游 failover 慢一点**（且卡死上游通常会先抛连接错，很少真等满）。
+        //     前者比后者坏。
+        //   - 180s（1.8× 观测最大）会把 >120s 重尾的合法请求判死。
+        // 相对旧值 300s 砍掉 60s：failover 快 20%，仍在 2× 重尾之上。
+        // 样本有限（非流式 6 发 / 流式 9 发），但取 2× 重尾而非 1.8× 观测最大，正是为了
+        // 给未观测到的更慢推理留余量。证据 `docs/evidence/m9s5-read-timeout-calibration.md`。
         Self {
             connect: Duration::from_secs(5),
-            read: Duration::from_secs(300),
+            read: Duration::from_secs(240),
         }
     }
 }
@@ -1161,17 +1171,69 @@ mod tests {
         );
     }
 
-    /// M9-S3 §5 判据 2：`read` 保持 300s。本步只给它补了依据，**没有改数值**。
+    /// M9-S5：`read` 用真实上游补全标定过（B-124 关闭）。
     ///
-    /// 上游推理首字节的分布在 M9-S3 量不到（本账号在 NewAPI 无可用渠道，§3.4），
-    /// 在那一侧无数据时调小等于拿未知分布去赌。这条断言钉住「没数据就别动」。
+    /// 非流式 gpt-6-astra 难题实测 TTFB = 49/63/92/95/101s + 1 发 >120s（curl 砍）。
+    /// 这是 read 的真正约束——中转站等模型全做完才吐字节，合法「无字节期」最大 100.7s、
+    /// 重尾 >120s。`read = 240s = 2× 重尾 = 约 2.4× 观测最大`。
+    ///
+    /// 边界集用命名常量表达实测上界，让「调小到杀合法请求」自己撞上来：
+    /// 下界 `read >= 2 × OBSERVED_FIRST_BYTE_MAX`——低于它就把观测到的 100.7s 合法请求
+    /// 判进 <2× 余量区，风险不对称里更坏的那一侧（杀合法请求 > 慢 failover）。
+    /// 上界 `read <= 300s`——超过旧值没有数据支持，且让卡死上游 failover 更慢。
+    /// `assert_eq!(240s)` 是主守卫；两条边界是它在「有人故意放松等值」时仍守住语义的反例。
     #[test]
-    fn read_timeout_is_unchanged_because_upstream_first_byte_is_unmeasured() {
+    fn read_timeout_is_calibrated_against_real_upstream_first_byte() {
+        // 非流式 gpt-6-astra 难题实测的最大成功 TTFB（M9-S5 §3）。
+        // 100.7s 四舍五入到 101s，作为「已观测到的合法无字节期上界」。
+        const OBSERVED_FIRST_BYTE_MAX: Duration = Duration::from_secs(101);
         let t = UpstreamTimeout::default();
         assert_eq!(
             t.read,
-            Duration::from_secs(300),
-            "上游推理首字节分布未标定（M9-S3 §3.4），缺的数据拆出登记在 BACKLOG B-124"
+            Duration::from_secs(240),
+            "M9-S5 实测：非流式首字节最大 100.7s、重尾 >120s；240s = 2× 重尾"
+        );
+        assert!(
+            t.read >= OBSERVED_FIRST_BYTE_MAX * 2,
+            "read({:?}) 必须 >= 2× 观测最大首字节({:?})：低于它就把 100.7s 的合法慢推理\
+             判进 <2× 余量区——风险不对称里杀合法请求比慢 failover 更坏",
+            t.read,
+            OBSERVED_FIRST_BYTE_MAX * 2
+        );
+        assert!(
+            t.read <= Duration::from_secs(300),
+            "read({:?}) 不得超过旧值 300s：超过它没有数据支持，且让卡死上游 failover 更慢",
+            t.read
+        );
+    }
+
+    /// M9-S5 复审守卫（对应 M9-S3 的 F-1 教训）：边界必须**自己**拦得住「判它无据的取值」，
+    /// 且必须**读实际值**——否则只是对一个内联闭包做算术，`read` 字段改成什么它都绿
+    ///（M9-S5 复审 P2-1）。
+    ///
+    /// 180s 是本步判定「会把 >120s 重尾的合法请求判死」而**不**采用的取值
+    ///（1.8× 观测最大，但只有 60s 余量给重尾）。360s 则是「超过旧值 300s、无数据支持」的一档。
+    /// 两者都必须被区间排除。与上一条测试**故意不同形**（闭包逐值判定 + 读实际值，
+    /// 而非 assert_eq!），避免实现被改时两条一起悄悄失效。
+    #[test]
+    fn read_timeout_bounds_reject_values_this_step_rejected() {
+        let t = UpstreamTimeout::default();
+        let accepted = |r: Duration| r >= Duration::from_secs(202) && r <= Duration::from_secs(300);
+        // 钉住实际值落在数据支持区间内——这是它对 `read` 字段的独立守卫。
+        // read=180s 或 360s 时这一条会红（accepted 返回 false），与 assert_eq!(240s) 互补。
+        assert!(
+            accepted(t.read),
+            "read({:?}) 必须落在数据支持区间 [202s, 300s] 内：低于 202s 把观测到的 100.7s\
+             合法请求判进 <2× 余量区，高于 300s 无数据支持",
+            t.read
+        );
+        assert!(
+            !accepted(Duration::from_secs(180)),
+            "180s = 1.8× 观测最大，重尾余量不足，本步判定为『会杀合法请求』而不采用"
+        );
+        assert!(
+            !accepted(Duration::from_secs(360)),
+            "360s 超过旧值 300s、无数据支持，本步判定为『无据放大』而不采用"
         );
     }
 
