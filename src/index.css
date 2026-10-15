@@ -540,6 +540,26 @@ section > .muted {
   color: var(--muted);
 }
 
+/* M10-S2：代理模式三态单选 */
+.radio-row {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.radio input {
+  cursor: pointer;
+}
+
 .list {
   margin: 0;
   padding-left: 18px;

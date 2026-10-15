@@ -77,6 +77,15 @@ pub struct DetectedProxy {
     pub source: ProxySource,
 }
 
+impl DetectedProxy {
+    /// 脱敏后的 URL（给 UI 展示用）。含 userinfo 时只显示 `scheme://***@host:port`。
+    ///
+    /// 前端**不拿原始 URL**：`mask_proxy` 在核心层完成，明文不过 IPC 边界。
+    pub fn masked_url(&self) -> String {
+        mask_proxy(&self.url)
+    }
+}
+
 impl std::fmt::Debug for DetectedProxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // 只打脱敏后的 url + 来源，与 `TransportConfig` 手写 Debug 同口径

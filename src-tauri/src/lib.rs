@@ -225,6 +225,7 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::drift_report,
             commands::get_settings,
             commands::update_settings,
+            commands::detect_system_proxy,
             commands::refresh_all,
             commands::audit_redaction,
             commands::gateway_status,
