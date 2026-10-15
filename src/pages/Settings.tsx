@@ -745,7 +745,7 @@ export default function SettingsPage() {
           </div>
           <div className="row">
             <label style={{ fontWeight: 600, marginBottom: 4 }}>应用更新</label>
-            <UpdateChecker />
+            <UpdateChecker autoCheckOnMount={draft?.autoUpdateEnabled ?? false} />
           </div>
 
           <div className="row">

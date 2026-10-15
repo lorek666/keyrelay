@@ -83,3 +83,13 @@ describe("UpdateChecker", () => {
     });
   });
 });
+
+  it("endpoint-unconfigured: endpoint 不可达时显示错误而非「最新版本」", async () => {
+    mockedCheck.mockRejectedValue(new Error("failed to fetch"));
+    renderComponent();
+    fireEvent.click(screen.getByText("检查更新"));
+    await waitFor(() => {
+      expect(screen.getByText(/failed to fetch/)).toBeInTheDocument();
+      expect(screen.queryByText("当前已是最新版本")).not.toBeInTheDocument();
+    });
+  });

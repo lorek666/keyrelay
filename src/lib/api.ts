@@ -1442,28 +1442,26 @@ export interface UpdateInfo {
 }
 
 /**
- * 检查更新。返回 `null` = 无更新或未配置 endpoint。
+ * 检查更新。返回 `null` = 当前已是最新版本。
  *
- * 在浏览器（无 Tauri）环境下，mock 返回 `null`（模拟「未配置更新源」），
- * 使预览页能看到「当前已是最新版本」而非真实网络请求。
+ * 网络错误、签名校验失败等会抛异常——调用方应 catch 并显示错误，
+ * 而不是当成「无更新」。
+ *
+ * 在浏览器（无 Tauri）环境下，mock 返回 `null`。
  */
 export async function checkForUpdates(): Promise<UpdateInfo | null> {
   if (!hasTauri) {
     return mock(null);
   }
   const { check } = await import("@tauri-apps/plugin-updater");
-  try {
-    const result = await check();
-    if (!result) return null;
-    return {
-      version: result.version,
-      currentVersion: result.currentVersion,
-      date: result.date,
-      body: result.body,
-    };
-  } catch {
-    return null;
-  }
+  const result = await check();
+  if (!result) return null;
+  return {
+    version: result.version,
+    currentVersion: result.currentVersion,
+    date: result.date,
+    body: result.body,
+  };
 }
 
 /**
@@ -1484,5 +1482,5 @@ export async function downloadAndInstallUpdate(): Promise<void> {
     throw new Error("没有可用的更新");
   }
   await result.downloadAndInstall();
-  await import("@tauri-apps/plugin-process").then(({ relaunch }) => relaunch()).catch(() => {});
+  await import("@tauri-apps/plugin-process").then(({ relaunch }) => relaunch());
 }
