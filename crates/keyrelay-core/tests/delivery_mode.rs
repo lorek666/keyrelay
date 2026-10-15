@@ -132,12 +132,15 @@ async fn every_channel_can_point_at_the_gateway() {
             plan.fields
         );
 
-        if channel == DeliveryChannel::CodexAuthJson {
-            // §6.3：本通道的 endpoint 在 `~/.codex/config.toml`，不在 auth.json 里（§16 U-1）。
-            // 所以「Codex 换站」今天只换令牌、不换 endpoint——这里断言的是**诚实**。
+        if channel == DeliveryChannel::CodexAuthJson || channel == DeliveryChannel::DeepSeekHarness
+        {
+            // §6.3：CodexAuthJson 的 endpoint 在 `~/.codex/config.toml`，不在 auth.json 里。
+            // DeepSeekHarness 只写 `KEYRELAY_API_KEY` 到 `.credentials.yaml` 的 `refs:` 段，
+            // 不写 base_url——provider 配置在另一个文件 `cordis.patch.yml` 里（spec §3）。
             assert!(
                 !plan.preview.contains("127.0.0.1:8787"),
-                "auth.json 里不该凭空多出一个 base_url：{}",
+                "{} 不该含网关地址：{}",
+                channel.as_str(),
                 plan.preview
             );
         } else {

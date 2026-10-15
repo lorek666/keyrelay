@@ -24,7 +24,7 @@ fn list_channels_matches_all_exactly() {
     let want: Vec<&str> = DeliveryChannel::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(got, want);
     assert_eq!(got.len(), DeliveryChannel::ALL.len());
-    assert_eq!(got.len(), 11, "M14-S1 起 11 通道");
+    assert_eq!(got.len(), 19, "M14-S3 起 19 通道");
 }
 
 #[test]
@@ -53,7 +53,7 @@ fn mock_agent_ok_after_smoke_apply_for_every_channel() {
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&backup).unwrap();
 
-        // M14-S1 起 Continue 已删，11 通道均不要求 model。
+        // M14-S3 起 19 通道均不要求 model。
         let model_arg: Vec<&str> = Vec::new();
         let apply = Command::new(cli_bin())
             .args([
