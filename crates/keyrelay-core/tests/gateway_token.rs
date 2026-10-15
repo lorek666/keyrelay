@@ -207,7 +207,18 @@ async fn purge_keychain_also_removes_the_gateway_token() {
             .is_none(),
         "站点密钥也清了"
     );
-    assert_eq!(report.removed, 2, "两条：站点密钥 + 网关令牌");
+    assert!(
+        f.vault
+            .get(&secret_ref("site", f.site_id, "session"))
+            .unwrap()
+            .is_none(),
+        "持久化会话也清了（M13-S1：login 写入的 session_ref 必须一并清理）"
+    );
+    assert_eq!(
+        report.removed,
+        3,
+        "三条：站点密钥 + 网关令牌 + 持久化会话"
+    );
 }
 
 /// 只读钥匙串：`get` 只认得站点密钥那一条，`put` / `delete` 一律失败。

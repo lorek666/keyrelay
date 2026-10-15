@@ -117,7 +117,7 @@ pub(crate) fn display_url(raw: &str) -> String {
 }
 
 /// 会话凭证。**禁止** derive Debug 泄露 cookie/token，故手写 `Debug`。
-#[derive(Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     pub cookies: Vec<(String, String)>,
     pub access_token: Option<String>,
@@ -149,6 +149,18 @@ impl Session {
                 .collect::<Vec<_>>()
                 .join("; "),
         )
+    }
+
+    /// 序列化给钥匙串持久化（M13-S1）。返回值含明文 cookie/access_token，
+    /// **调用方不得打印 / 落 SQLite / 进事件 / 进导出**——只在 `vault.put` 写、
+    /// `from_stored` 读两条路径流转。
+    pub(crate) fn to_stored(&self) -> Result<String> {
+        serde_json::to_string(self).map_err(|e| Error::Vault(format!("会话序列化失败: {e}")))
+    }
+
+    /// 从钥匙串取回的串反序列化（M13-S1）。非法 JSON ⇒ `Err`（不 panic）。
+    pub(crate) fn from_stored(stored: &str) -> Result<Session> {
+        serde_json::from_str(stored).map_err(|e| Error::Vault(format!("会话反序列化失败: {e}")))
     }
 }
 
@@ -1090,5 +1102,58 @@ mod tests {
             .available_groups(BASE, &bearer()),
         )
         .await;
+    }
+
+    // ---- Session 序列化（M13-S1）----
+
+    #[test]
+    fn session_to_stored_from_stored_round_trips() {
+        let session = Session {
+            cookies: vec![
+                ("session".into(), "abc".into()),
+                ("cf_clearance".into(), "1.2".into()),
+            ],
+            access_token: Some("tok-xyz".into()),
+            user_id: Some("7".into()),
+        };
+        let stored = session.to_stored().expect("序列化");
+        let back = Session::from_stored(&stored).expect("反序列化");
+        assert_eq!(back, session);
+    }
+
+    #[test]
+    fn session_from_stored_rejects_garbage() {
+        assert!(Session::from_stored("not json").is_err());
+        assert!(Session::from_stored("{").is_err());
+        assert!(Session::from_stored("").is_err());
+    }
+
+    #[test]
+    fn session_to_stored_carries_secrets_debug_does_not() {
+        // 结构性钉子：to_stored 的输出含明文 cookie/token（给钥匙串），但 Debug 不含。
+        // 若将来误把 to_stored 改成脱敏，这里会红——提醒同步改调用方（它们依赖明文写钥匙串）。
+        let session = Session {
+            cookies: vec![("session".into(), "SECRET-COOKIE".into())],
+            access_token: Some("SECRET-TOKEN".into()),
+            user_id: None,
+        };
+        let stored = session.to_stored().unwrap();
+        assert!(
+            stored.contains("SECRET-COOKIE"),
+            "to_stored 必须含明文 cookie: {stored}"
+        );
+        assert!(
+            stored.contains("SECRET-TOKEN"),
+            "to_stored 必须含明文 token: {stored}"
+        );
+        let debug = format!("{session:?}");
+        assert!(
+            !debug.contains("SECRET-COOKIE"),
+            "Debug 不得含 cookie: {debug}"
+        );
+        assert!(
+            !debug.contains("SECRET-TOKEN"),
+            "Debug 不得含 token: {debug}"
+        );
     }
 }
