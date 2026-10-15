@@ -1204,8 +1204,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// **含已解绑的行**：过滤是调用方的事——命令层按 `unbound_at.is_none()` 筛，
     /// 而「回收站点侧 key」那条路要按**当时的**绑定走（`bindings_of_agent` 的既有语义）。
     /// 只读，不写任何东西。
+    ///
+    /// 走 [`Store::current_bindings`]：同 `(agent_id, key_id, target_path)` 的重投只留
+    /// 最新一行（P2-16），换 key 的重投仍各自成行（M8-S7 P2-4）。
     pub fn channel_bindings(&self) -> Result<Vec<crate::store::BindingRow>> {
-        self.store.all_bindings()
+        self.store.current_bindings()
     }
 
     /// 投递历史（M9-S4）：「变更历史」页的回滚入口。只读。

@@ -1238,6 +1238,74 @@ fn channel_bindings_exclude_unbound_rows() {
     assert_eq!(live_rows[0].site_id, site);
 }
 
+/// P2-16 / DEBUG-REPORT-v3 §2-16：同一个 `(agent, key, target)` 上重投时，
+/// `current_bindings`（= `channel_bindings` = 批量改指候选）只留最新一行——
+/// 被同 key 的更新投递取代的旧行不再作为候选列出。`all_bindings` 仍返回旧行
+/// （溯源不删行），但候选视图不该把它再露给 UI，否则每重投一次候选翻倍（2→4）。
+#[test]
+fn current_bindings_superseded_by_same_key_redelivery_drops_old_row() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let db = dir.path().join("keyrelay.db");
+    let store = Store::open(&db).expect("文件库");
+    let site = store
+        .upsert_site("newapi", "https://relay.example.com", "测试站")
+        .expect("写站点");
+    let key = store
+        .insert_key(site, "codex/live", "kr/key/1/secret", Some("1"), None)
+        .expect("写 key");
+
+    // 同 (agent, key, target) 重投两次
+    store
+        .record_binding("codex", key, "/home/u/.codex/auth.json", "j1", "site")
+        .expect("第一次投递");
+    store
+        .record_binding("codex", key, "/home/u/.codex/auth.json", "j2", "site")
+        .expect("第二次重投");
+
+    // all_bindings 仍两行（溯源用，不删行）
+    let all = store.all_bindings().expect("全量");
+    assert_eq!(all.len(), 2, "重投不删行：两条都在表里");
+
+    // current_bindings 只留最新一行
+    let cur = store.current_bindings().expect("当前生效");
+    assert_eq!(cur.len(), 1, "同 key 重投：候选只留最新一行，不翻倍");
+    assert_eq!(cur[0].id, 2, "留下的是最新那次（id=2）");
+    assert_eq!(cur[0].key_id, key);
+    assert_eq!(cur[0].target_path, "/home/u/.codex/auth.json");
+}
+
+/// P2-16 口径的另一面（M8-S7 P2-4 钉住）：换 key 重投——同 `(agent, target)` 但
+/// **不同 key**——两条都是独立绑定，`current_bindings` 都要列出，不被互相取代。
+#[test]
+fn current_bindings_keeps_redelivery_with_a_different_key_separate() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let db = dir.path().join("keyrelay.db");
+    let store = Store::open(&db).expect("文件库");
+    let site = store
+        .upsert_site("newapi", "https://relay.example.com", "测试站")
+        .expect("写站点");
+    let key_a = store
+        .insert_key(site, "codex/live", "kr/key/1/secret", Some("1"), None)
+        .expect("写 key A");
+    let key_b = store
+        .insert_key(site, "codex/dead", "kr/key/2/secret", Some("2"), None)
+        .expect("写 key B");
+
+    store
+        .record_binding("codex", key_a, "/home/u/.codex/auth.json", "j1", "site")
+        .expect("用 key A 投");
+    store
+        .record_binding("codex", key_b, "/home/u/.codex/auth.json", "j2", "site")
+        .expect("换 key B 重投");
+
+    let cur = store.current_bindings().expect("当前生效");
+    assert_eq!(cur.len(), 2, "换 key 重投：两条独立绑定都列出（不去重）");
+    let ids: Vec<i64> = cur.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![1, 2]);
+    let keys: Vec<i64> = cur.iter().map(|r| r.key_id).collect();
+    assert!(keys.contains(&key_a) && keys.contains(&key_b));
+}
+
 /// 批量动作的数据源必须是**只读**的：调用前后 `bindings` 逐字节相同。
 ///
 /// 为什么钉这条：批量 UI 会在打开面板时读一次候选，若这个读取路径顺手写了什么
