@@ -211,3 +211,71 @@ async fn an_empty_flow_models_block_fails_for_the_model_reason_not_the_shape() {
         "预检不落盘：文件一个字节都不该动"
     );
 }
+
+/// P2-2 / DEBUG-REPORT-v3 §2-2：同意被撤销的通道，`plan()` 仍然跑得通（它不读同意），
+/// 于是旧实现会在建新 key **之后**的重注入步才停 ⇒ 每重试一次站点多一把。预检现在
+/// 就地查 `consent_state`，在建 key 之前拒绝。
+#[tokio::test]
+async fn a_revoked_consent_blocks_the_rotation_before_a_new_key_exists() {
+    let f = setup().await;
+    f.service
+        .grant_consent(f.key_id, DeliveryChannel::Continue)
+        .unwrap();
+    f.service
+        .apply_delivery_with_model(f.key_id, DeliveryChannel::Continue, Some("gpt-4o"))
+        .unwrap();
+    assert_eq!(created_on_site(&f), 0, "前提：还没建过 key");
+
+    // 撤销同意：绑定仍在（轮换目标集合来自绑定），但投递会失败
+    f.service
+        .revoke_consent(f.key_id, DeliveryChannel::Continue)
+        .unwrap();
+
+    let err = f
+        .service
+        .rotate_key(f.key_id, KeySpec::named("codex/rotated"))
+        .await
+        .expect_err("同意被撤销时必须在建新 key 之前拒绝");
+    let text = err.to_string();
+    assert!(text.contains("同意已被撤销"), "文案必须点出原因: {text}");
+    assert_eq!(
+        created_on_site(&f),
+        0,
+        "预检失败 ⇒ 站点上一把新 key 都没有（P2-2）"
+    );
+}
+
+/// P2-2：落点是符号链接时，`plan()` 跟着链接读到目标、跑得通，但写入会出问题；
+/// 旧实现同样在建新 key 之后才停。预检现在就地查 `is_symlink`。
+#[tokio::test]
+#[cfg(unix)]
+async fn a_symlink_target_blocks_the_rotation_before_a_new_key_exists() {
+    let f = setup().await;
+    f.service
+        .grant_consent(f.key_id, DeliveryChannel::Continue)
+        .unwrap();
+    f.service
+        .apply_delivery_with_model(f.key_id, DeliveryChannel::Continue, Some("gpt-4o"))
+        .unwrap();
+    assert_eq!(created_on_site(&f), 0);
+
+    // 把落点换成符号链接（指向一个普通文件），同意与绑定都不动
+    let path = f.home.join(".continue").join("config.yaml");
+    let real = f.home.join(".continue").join("real_config.yaml");
+    fs::remove_file(&path).ok();
+    fs::write(&real, "name: mine\nversion: 1.0.0\nmodels:\n  - gpt-4o\n").unwrap();
+    std::os::unix::fs::symlink(&real, &path).unwrap();
+
+    let err = f
+        .service
+        .rotate_key(f.key_id, KeySpec::named("codex/rotated"))
+        .await
+        .expect_err("落点是符号链接时必须在建新 key 之前拒绝");
+    let text = err.to_string();
+    assert!(text.contains("符号链接"), "文案必须点出原因: {text}");
+    assert_eq!(
+        created_on_site(&f),
+        0,
+        "预检失败 ⇒ 站点上一把新 key 都没有（P2-2）"
+    );
+}
