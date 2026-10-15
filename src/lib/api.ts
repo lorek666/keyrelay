@@ -822,6 +822,12 @@ const AGENT_CHANNELS: Record<string, string> = {
   hermes: "hermes",
   mcode: "mcode",
   pi: "pi",
+  cursor: "cursor",
+  cline: "cline",
+  "qwen-code": "qwen-code",
+  deepseek: "deepseek",
+  trae: "trae",
+  "mimo-code": "mimo-code",
 };
 
 /**
