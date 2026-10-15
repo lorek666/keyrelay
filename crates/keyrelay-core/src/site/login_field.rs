@@ -184,14 +184,14 @@ mod tests {
     #[test]
     fn email_precheck_rejects_only_what_cannot_be_an_email() {
         for bad in [
-            "",                // ① 空串
-            "   ",             // ① 空白
+            "",                   // ① 空串
+            "   ",                // ① 空白
             "testuser",           // ② 没有 @（真实站点实测被拒的那个值）
             " testuser ",         // ② trim 之后仍没有 @
             "testuser qq",        // ② 空格不算 @
             "testuser@",          // ④ 域名为空
-            "@qq.com",         // ③ 本地部为空
-            "@",               // ③④
+            "@qq.com",            // ③ 本地部为空
+            "@",                  // ③④
             "testuser@qq",        // ⑤ 域名没有点
             "testuser@localhost", // ⑤ 同上（站点正则也要求有点）
         ] {
@@ -247,7 +247,15 @@ mod tests {
     /// NewAPI 的 `username` 字段**不做任何形态限制**：真实站点就是用用户名登录的。
     #[test]
     fn username_precheck_never_blocks() {
-        for value in ["testuser", "", "   ", "用户", "me@example.com", "@", "a b c"] {
+        for value in [
+            "testuser",
+            "",
+            "   ",
+            "用户",
+            "me@example.com",
+            "@",
+            "a b c",
+        ] {
             assert!(
                 LoginField::Username.precheck(value).is_ok(),
                 "{value:?} 不该被拦（NewAPI 的账号栏不限形态）"
