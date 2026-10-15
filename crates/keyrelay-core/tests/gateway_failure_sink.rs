@@ -41,6 +41,7 @@ async fn a_gateway_failure_becomes_an_event_with_exactly_three_metadata_fields()
         site_id: 7,
         status: 503,
         model: "gpt-5.6".into(),
+        reason: "上游返回可切换状态码 HTTP 503".into(),
     });
 
     // 事件是**下一次刷新**时落的（网关回调不碰存储层，见 `service.rs` 的说明）。
@@ -84,6 +85,7 @@ async fn a_key_shaped_model_never_reaches_the_event_table_verbatim() {
         site_id: 7,
         status: 503,
         model: KEY_SHAPED_MODEL.into(),
+        reason: "上游返回可切换状态码 HTTP 503".into(),
     });
     service.refresh_all().await.expect("刷新应成功");
 
@@ -104,6 +106,7 @@ async fn the_failure_buffer_is_bounded() {
             site_id: i as i64,
             status: 503,
             model: "m".into(),
+            reason: "上游返回可切换状态码 HTTP 503".into(),
         });
     }
     // 落库时最多写出上限条数——多出来的那些在 push 时就被丢掉了。
@@ -113,4 +116,88 @@ async fn the_failure_buffer_is_bounded() {
         keyrelay_core::service::MAX_BUFFERED_GATEWAY_FAILURES
     );
     assert_eq!(service.drain_gateway_failures(), 0, "抽干后应为空");
+}
+
+/// P2-11 / DEBUG-REPORT-v3 §2-11：status=0 的三种原因（全部熔断 / 缺明文 / 已回收）
+/// 必须在事件文案里分得开——之前都挤在「网关没有可用的上游（site {}）」一条里。
+#[tokio::test]
+async fn the_event_message_distinguishes_the_three_status_zero_causes() {
+    let (_dir, service) = service();
+    service.record_gateway_failure_for_test(GatewayFailure {
+        site_id: 1,
+        status: 0,
+        model: "gpt-5.6".into(),
+        reason: "所有候选上游都在熔断冷却中".into(),
+    });
+    service.record_gateway_failure_for_test(GatewayFailure {
+        site_id: 2,
+        status: 0,
+        model: "gpt-5.6".into(),
+        reason: "密钥引用没有对应的明文".into(),
+    });
+    service.record_gateway_failure_for_test(GatewayFailure {
+        site_id: 3,
+        status: 0,
+        model: "gpt-5.6".into(),
+        reason: "该密钥已被回收，不再使用".into(),
+    });
+    service.refresh_all().await.expect("刷新落库");
+    let events = service.recent_events(50).expect("读事件");
+    let messages: Vec<&str> = events
+        .iter()
+        .filter(|e| e.source == "gateway")
+        .map(|e| e.message.as_str())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("所有候选上游都在熔断冷却中")),
+        "全熔断原因要进文案: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("密钥引用没有对应的明文")),
+        "缺明文原因要进文案: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("该密钥已被回收")),
+        "已回收原因要进文案: {messages:?}"
+    );
+}
+
+/// P2-10 / DEBUG-REPORT-v3 §2-10：传输层失败（超时 / 连不上）与上游真回 502 都是
+/// status=502，必须在事件文案里分得开——之前都挤在「网关放弃上游（HTTP 502）」里。
+#[tokio::test]
+async fn the_event_message_distinguishes_transport_failure_from_an_upstream_502() {
+    let (_dir, service) = service();
+    service.record_gateway_failure_for_test(GatewayFailure {
+        site_id: 1,
+        status: 502,
+        model: "gpt-5.6".into(),
+        reason: "传输层失败（连不上 / 超时）: connection refused".into(),
+    });
+    service.record_gateway_failure_for_test(GatewayFailure {
+        site_id: 2,
+        status: 502,
+        model: "gpt-5.6".into(),
+        reason: "上游返回可切换状态码 HTTP 502".into(),
+    });
+    service.refresh_all().await.expect("刷新落库");
+    let events = service.recent_events(50).expect("读事件");
+    let messages: Vec<&str> = events
+        .iter()
+        .filter(|e| e.source == "gateway")
+        .map(|e| e.message.as_str())
+        .collect();
+    assert!(
+        messages.iter().any(|m| m.contains("传输层失败")),
+        "传输层失败原因要进文案: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("上游返回可切换状态码 HTTP 502")),
+        "上游真回 502 原因要进文案: {messages:?}"
+    );
 }

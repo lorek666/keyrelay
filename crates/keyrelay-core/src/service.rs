@@ -3175,10 +3175,18 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             // `status == 0` 是哨兵（M8-S1 §9）：HTTP 里不存在 0，它表示
             // 「没有任何上游返回过状态码」（候选全被熔断 / 缺明文 / 已回收）。
             // 文案必须写明，否则读者会把 0 误读成真实状态码。
+            // P2-10 / P2-11：`reason` 让事件表区分三种 status=0，以及传输层失败
+            // （超时 / 连不上）与上游真回 502 两种 status=502——之前都挤在同一条文案里。
             let message = if failure.status == 0 {
-                format!("网关没有可用的上游（site {}）", failure.site_id)
+                format!(
+                    "网关没有可用的上游（site {}）: {}",
+                    failure.site_id, failure.reason
+                )
             } else {
-                format!("网关放弃上游（HTTP {}）", failure.status)
+                format!(
+                    "网关放弃上游（HTTP {}）: {}",
+                    failure.status, failure.reason
+                )
             };
             // **必须走 `event_with_payload`**（而不是手搓一个 `Event`）：它里面那两件事
             // ——`mask_url_userinfo_in_json` 与 `scrub(payload)`——是所有出口共用的咽喉。

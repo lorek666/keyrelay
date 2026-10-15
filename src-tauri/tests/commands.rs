@@ -1259,6 +1259,7 @@ fn gateway_stop_drains_buffered_failures_into_the_event_log() {
                 site_id: 1,
                 status: 503,
                 model: "gpt-5.6".into(),
+                reason: "上游返回可切换状态码 HTTP 503".into(),
             });
     }
 
