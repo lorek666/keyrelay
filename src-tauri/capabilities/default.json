@@ -59,6 +59,9 @@
     "allow-list-alias-map",
     "allow-upsert-alias",
     "allow-delete-alias",
+    "allow-probe-run",
+    "allow-list-probe-runs",
+    "allow-get-probe-run",
     "updater:default",
     "process:allow-restart"
   ]

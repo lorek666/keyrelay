@@ -263,7 +263,11 @@ pub fn configure_with_state<R: tauri::Runtime>(
             // M14-S1：模型别名映射（B-110）
             commands::list_alias_map,
             commands::upsert_alias,
-            commands::delete_alias
+            commands::delete_alias,
+            // M15-S1：模型检测（bazaarlink probe）
+            commands::probe_run,
+            commands::list_probe_runs,
+            commands::get_probe_run
         ])
 }
 

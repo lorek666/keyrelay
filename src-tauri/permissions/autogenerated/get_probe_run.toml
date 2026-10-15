@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-probe-run"
+description = "Enables the get_probe_run command without any pre-configured scope."
+commands.allow = ["get_probe_run"]
+
+[[permission]]
+identifier = "deny-get-probe-run"
+description = "Denies the get_probe_run command without any pre-configured scope."
+commands.deny = ["get_probe_run"]
