@@ -589,11 +589,17 @@ pub fn literal_field(key: impl Into<String>, value: impl Into<String>) -> Delive
     }
 }
 
-/// 行级 diff 预览。任何一行在输出前都会把 `secret` 原文替换成掩码，再过一遍 `scrub`。
+/// 行级 diff 预览。任何一行在输出前都会把 `secrets` 里每一条原文替换成掩码，
+/// 再过一遍 `scrub`。
+///
+/// `secrets` 是**本次要掩的全部密钥**：写入的新密钥、以及 `before` 里可能仍在的
+/// 旧密钥（改指网关时，`-` 行是旧站点密钥——它不一定是 `sk-` / `nap-` / 长 hex
+/// 这类 `scrub` 认得的形态，不显式替换就会明文带出去，P2-5 / DEBUG-REPORT-v3 §2-5）。
+/// `scrub` 仍是兜底，掩掉文件里**别的**密钥形态。
 ///
 /// 只输出**变化了的行**（`-` / `+`）：整份打印会把无关内容淹没掉差异，
 /// 而配置文件（`auth.json` 等）的改动通常只有一两行。
-pub fn diff_preview(before: &str, after: &str, secret: &str) -> String {
+pub fn diff_preview(before: &str, after: &str, secrets: &[&str]) -> String {
     let mut out = String::new();
     for (tag, line) in diff_lines(before, after) {
         let prefix = match tag {
@@ -602,7 +608,7 @@ pub fn diff_preview(before: &str, after: &str, secret: &str) -> String {
             _ => continue,
         };
         out.push_str(prefix);
-        out.push_str(&redact_line(&line, secret));
+        out.push_str(&redact_line(&line, secrets));
         out.push('\n');
     }
     if out.is_empty() {
@@ -611,12 +617,11 @@ pub fn diff_preview(before: &str, after: &str, secret: &str) -> String {
     out
 }
 
-fn redact_line(line: &str, secret: &str) -> String {
-    let replaced = if secret.is_empty() {
-        line.to_string()
-    } else {
-        line.replace(secret, &mask_secret(secret))
-    };
+fn redact_line(line: &str, secrets: &[&str]) -> String {
+    let mut replaced = line.to_string();
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        replaced = replaced.replace(*secret, &mask_secret(secret));
+    }
     crate::redact::scrub(&replaced)
 }
 
@@ -1219,7 +1224,7 @@ mod tests {
         let before = "{\n  \"OPENAI_API_KEY\": \"sk-OLDSECRET0123456\"\n}\n";
         let after = format!("{{\n  \"OPENAI_API_KEY\": \"{secret}\"\n}}\n");
 
-        let preview = diff_preview(before, &after, secret);
+        let preview = diff_preview(before, &after, &[secret]);
         assert!(!preview.contains(secret), "{preview}");
         assert!(!preview.contains("sk-0123"), "{preview}");
         assert!(preview.contains("…cdef"), "{preview}");
@@ -1233,14 +1238,37 @@ mod tests {
         let before = "{\n  \"OTHER\": \"sk-leaked-somewhere-else\"\n}\n";
         let after =
             "{\n  \"OTHER\": \"sk-leaked-somewhere-else\",\n  \"OPENAI_API_KEY\": \"sk-new\"\n}\n";
-        let preview = diff_preview(before, after, "sk-new");
+        let preview = diff_preview(before, after, &["sk-new"]);
         assert!(!preview.contains("sk-leaked"), "{preview}");
     }
 
     #[test]
     fn diff_preview_reports_no_change() {
-        assert_eq!(diff_preview("a\n", "a\n", "s"), "(无变化)\n");
-        assert_eq!(diff_preview("", "", "s"), "(无变化)\n");
+        assert_eq!(diff_preview("a\n", "a\n", &["s"]), "(无变化)\n");
+        assert_eq!(diff_preview("", "", &["s"]), "(无变化)\n");
+    }
+
+    #[test]
+    fn diff_preview_masks_old_secret_that_scrub_does_not_recognize() {
+        // P2-5 / DEBUG-REPORT-v3 §2-5：改指网关时 `-` 行是旧站点密钥，它不是 `sk-` /
+        // `nap-` / 长 hex 这类 `scrub` 认得的形态，`scrub` 兜不住；必须靠 `secrets`
+        // 参数把旧密钥也显式替换掉，否则明文带进 diff。
+        let old_secret = "tok_old_secret_xyz_not_a_known_prefix_shape";
+        let new_secret = "sk-gw-new0123456789abcdef";
+        let before = format!("{{\n  \"OPENAI_API_KEY\": \"{old_secret}\"\n}}\n");
+        let after = format!("{{\n  \"OPENAI_API_KEY\": \"{new_secret}\"\n}}\n");
+
+        // 只传新密钥 ⇒ 旧密钥仍明文（scrub 认不出这个形态）
+        let leaked = diff_preview(&before, &after, &[new_secret]);
+        assert!(
+            leaked.contains(old_secret),
+            "前置：只掩新密钥时旧密钥确实漏出来（scrub 不认这个形态）: {leaked}"
+        );
+
+        // 两个都传 ⇒ 旧密钥也掩掉（修复后的正确用法）
+        let masked = diff_preview(&before, &after, &[new_secret, old_secret]);
+        assert!(!masked.contains(old_secret), "旧密钥必须被掩: {masked}");
+        assert!(!masked.contains(new_secret));
     }
 
     #[test]

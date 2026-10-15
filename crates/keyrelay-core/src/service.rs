@@ -1134,13 +1134,19 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 "mode": mode.as_str(),
             }),
         ));
+        // P2-5：掩掉 before 里可能仍在的旧站点密钥（改指网关时 `-` 行的旧密钥
+        // 不一定是 `scrub` 认得的形态，不显式替换会明文带出去）。新密钥 + 该
+        // target 上当前生效的旧密钥一起替换，`scrub` 兜底掩别的形态。
+        let mut secrets: Vec<String> = vec![api_key.to_string()];
+        secrets.extend(self.previous_secrets_for_target(&target_path, key_id));
+        let secret_refs: Vec<&str> = secrets.iter().map(|s| s.as_str()).collect();
         Ok(DeliveryPlan {
             agent_id: channel.agent_id().to_string(),
             channel,
             target_exists: target_path.exists(),
             mode,
             fields: writer.fields(&api_key),
-            preview: delivery::diff_preview(&patch.before, &patch.after, &api_key),
+            preview: delivery::diff_preview(&patch.before, &patch.after, &secret_refs),
             consent,
             target_path,
         })
@@ -3663,6 +3669,39 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
         ensure_not_revoked(&row)?;
         self.secret_for_row(&row)
+    }
+
+    /// 该 target 上**当前生效**的、非本次 `key_id` 的绑定所用密钥明文（P2-5）。
+    ///
+    /// `diff_preview` 的 `before` 是文件当前内容，改指网关时里面仍是旧站点密钥；
+    /// 它不一定是 `scrub` 认得的形态（`sk-` / `nap-` / 长 hex），不显式替换会明文
+    /// 带出去。这里把旧密钥明文收齐交给 `diff_preview` 一起掩。
+    ///
+    /// 已解绑的、引用已回收 key 的（`key_secret` 会拒）都跳过——它们不在 `before` 里。
+    /// 读钥匙串失败也跳过：那种情况下旧密钥明文也读不到，`scrub` 仍兜底。
+    fn previous_secrets_for_target(
+        &self,
+        target_path: &std::path::Path,
+        current_key_id: i64,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(rows) = self
+            .store
+            .bindings_of_target(&target_path.to_string_lossy())
+        else {
+            return out;
+        };
+        for row in rows
+            .iter()
+            .filter(|r| r.unbound_at.is_none() && r.key_id != current_key_id)
+        {
+            if let Ok(secret) = self.key_secret(row.key_id) {
+                if !secret.trim().is_empty() {
+                    out.push(secret.to_string());
+                }
+            }
+        }
+        out
     }
 
     /// 本次要写进去的那一份「密钥」——**按来源二选一**（M8-S4 §6.2）。
