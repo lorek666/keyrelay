@@ -17,6 +17,7 @@ pub mod notify;
 pub mod observability;
 pub mod platform;
 pub mod platform_env;
+pub mod proxy;
 pub mod redact;
 pub mod rotation;
 pub mod routing;
