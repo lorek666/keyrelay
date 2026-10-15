@@ -1,10 +1,20 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Download, RefreshCw } from "lucide-react";
 import { checkForUpdates, downloadAndInstallUpdate, type UpdateInfo } from "../lib/api";
 
-type Phase = "idle" | "checking" | "available" | "not-available" | "downloading" | "error";
+type Phase =
+  | "idle"
+  | "checking"
+  | "available"
+  | "not-available"
+  | "downloading"
+  | "error";
 
-export default function UpdateChecker({ autoCheckOnMount = false }: { autoCheckOnMount?: boolean }) {
+export default function UpdateChecker({
+  autoCheckOnMount = false,
+}: {
+  autoCheckOnMount?: boolean;
+}) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -37,9 +47,11 @@ export default function UpdateChecker({ autoCheckOnMount = false }: { autoCheckO
     }
   }
 
-  if (autoCheckOnMount && phase === "idle") {
-    doCheck();
-  }
+  useEffect(() => {
+    if (autoCheckOnMount) {
+      doCheck();
+    }
+  }, []);
 
   return (
     <div className="update-checker">
