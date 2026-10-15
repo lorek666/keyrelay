@@ -109,6 +109,7 @@ fn platform_specific_files_match_the_known_inventory() {
     let expected = vec![
         "autostart.rs".to_string(),
         "delivery/claude_desktop.rs".to_string(),
+        "delivery/cline.rs".to_string(),
         "delivery/mod.rs".to_string(),
         "inject/mod.rs".to_string(),
         "notify/system.rs".to_string(),
