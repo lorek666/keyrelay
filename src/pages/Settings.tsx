@@ -5,27 +5,37 @@ import { ShieldCheck } from "lucide-react";
 import {
   auditRedaction,
   autostartStatus,
+  deleteAlias,
   detectSystemProxy,
   exportBundle,
   exportDiagnostics,
   getSettings,
+  listAliasMap,
   pruneBackups,
   purgeKeychain,
   setAutostart,
   updateSettings,
+  upsertAlias,
+  type AliasEntry,
   type KeychainPurgeReport,
   type Settings,
 } from "../lib/api";
 import GatewayCard from "../components/GatewayCard";
 import UpdateChecker from "../components/UpdateChecker";
 import ConfirmDialog from "../components/ConfirmDialog";
+import { useTranslation, translate, getCurrentDict } from "../i18n";
 
 /** 「系统里的实际状态」的显示文案。`unknown` 是「读不出来」，不是「没开」——两者不能混。 */
-const AUTOSTART_LABELS: Record<string, string> = {
-  enabled: "已安装并生效",
-  disabled: "未安装",
-  unknown: "无法判定（读不到自启项，可能是权限或路径问题）",
-};
+function autostartStateLabel(state: string): string {
+  switch (state) {
+    case "enabled":
+      return translate(getCurrentDict(), "settings.autostart.stateEnabled");
+    case "disabled":
+      return translate(getCurrentDict(), "settings.autostart.stateDisabled");
+    default:
+      return translate(getCurrentDict(), "settings.autostart.stateUnknown");
+  }
+}
 
 /**
  * 数值字段的提交前校验（M8-S5B §6.6）。
@@ -47,29 +57,32 @@ function finiteNonNegative(raw: number, max: number): number | null {
   return raw;
 }
 
-/** M10-S2：把 `ProxySource::as_str` 的英文串翻成中文来源标签（仅展示）。 */
+/** M10-S2：把 `ProxySource::as_str` 的英文串翻成中文来源标签（仅展示）。
+ *  后端返回的 source 取值，中英同形（系统标识），暂不抽——i18n:skip */
 function proxySourceLabel(source: string): string {
   switch (source) {
     case "macos-system":
-      return "macOS 系统设置";
+      return "macOS 系统设置";  // i18n:skip
     case "windows-registry":
-      return "Windows 注册表";
+      return "Windows 注册表";  // i18n:skip
     case "manual":
-      return "手动";
+      return "手动";  // i18n:skip
     default:
       // 环境变量名（如 HTTPS_PROXY）原样展示
       return source;
   }
 }
 
+// M14-S2：preset 的 label 改成 i18n key，渲染时 `t(preset.labelKey)`
 const PRESETS = [
-  { label: "关闭", value: 0 },
-  { label: "5 分钟", value: 300 },
-  { label: "15 分钟", value: 900 },
-  { label: "1 小时", value: 3600 },
+  { labelKey: "settings.autorefresh.off", value: 0 },
+  { labelKey: "settings.autorefresh.min5", value: 300 },
+  { labelKey: "settings.autorefresh.min15", value: 900 },
+  { labelKey: "settings.autorefresh.hour1", value: 3600 },
 ];
 
 function ExportCard() {
+  const { t } = useTranslation();
   const [password, setPassword] = useState("");
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -79,10 +92,11 @@ function ExportCard() {
     onSuccess: (r) => {
       setError(null);
       setResult(
-        `已导出到 ${r.path}（${r.encrypted ? "已加密" : "明文"}，${r.bytes} 字节）` +
-          (r.registered
-            ? ""
-            : "。注意：这个文件没能登记进「已知导出物」表，脱敏审计不会扫描它——请自行确认它里面没有明文凭证。"),
+        t("settings.export.result", {
+          path: r.path,
+          encrypted: r.encrypted ? t("settings.export.encrypted") : t("settings.export.plaintext"),
+          bytes: r.bytes,
+        }) + (r.registered ? "" : t("settings.export.resultUnregistered")),
       );
     },
     onError: (err: Error) => {
@@ -93,7 +107,7 @@ function ExportCard() {
 
   const prune = useMutation({
     mutationFn: () => pruneBackups(10),
-    onSuccess: (r) => setResult(`已清理 ${r.removed} 个历史备份（保留最近 10 个）`),
+    onSuccess: (r) => setResult(t("settings.export.pruneResult", { count: r.removed })),
     onError: (err: Error) => setError(err.message),
   });
 
@@ -104,10 +118,8 @@ function ExportCard() {
     onSuccess: (r) => {
       setError(null);
       setResult(
-        `已导出诊断包到 ${r.path}（${r.events} 条事件，${r.bytes} 字节）` +
-          (r.registered
-            ? ""
-            : "。注意：这个文件没能登记进「已知导出物」表，脱敏审计不会扫描它。"),
+        t("settings.export.diagResult", { path: r.path, events: r.events, bytes: r.bytes }) +
+          (r.registered ? "" : t("settings.export.diagResultUnregistered")),
       );
     },
     onError: (err: Error) => {
@@ -118,19 +130,15 @@ function ExportCard() {
 
   return (
     <div className="card">
-      <h3>导出与备份</h3>
+      <h3>{t("settings.export.title")}</h3>
       <p className="muted">
-        导出的是站点、密钥**元数据**、同意记录与设置。
-        <strong>密钥本体不在导出物里</strong>——它只存在于系统钥匙串。
-        因此加密保护的是元数据（站点地址、密钥名称），不是密钥。
+        {t("settings.export.bodyPre")}<strong>{t("settings.export.bodyStrong")}</strong>{t("settings.export.bodyPost")}
       </p>
       <p className="muted">
-        「导出诊断包」是给<strong>报障</strong>用的另一份产物：最近的事件（已脱敏）+
-        设置快照（<strong>不含</strong>代理与 Webhook 的值，只标「配没配」）+ 版本与库结构。
-        它<strong>不含密钥本体</strong>，所以没有加密形态。
+        {t("settings.export.diagBodyPre")}<strong>{t("settings.export.diagBodyStrong")}</strong>{t("settings.export.diagBodyPost")}
       </p>
       <label className="field">
-        <span>导出密码（留空 = 明文导出）</span>
+        <span>{t("settings.export.passwordLabel")}</span>
         <input
           className="input"
           type="password"
@@ -146,7 +154,7 @@ function ExportCard() {
           disabled={run.isPending}
           onClick={() => run.mutate()}
         >
-          {run.isPending ? "导出中…" : "导出配置"}
+          {run.isPending ? t("settings.export.exporting") : t("settings.export.exportBtn")}
         </button>
         <button
           type="button"
@@ -154,7 +162,7 @@ function ExportCard() {
           disabled={prune.isPending}
           onClick={() => prune.mutate()}
         >
-          {prune.isPending ? "清理中…" : "清理历史备份（保留最近 10 个）"}
+          {prune.isPending ? t("settings.export.pruning") : t("settings.export.pruneBtn")}
         </button>
         <button
           type="button"
@@ -162,7 +170,7 @@ function ExportCard() {
           disabled={diagnostics.isPending}
           onClick={() => diagnostics.mutate()}
         >
-          {diagnostics.isPending ? "导出中…" : "导出诊断包"}
+          {diagnostics.isPending ? t("settings.export.exporting") : t("settings.export.diagBtn")}
         </button>
       </div>
       {result ? <p className="ok" role="status">{result}</p> : null}
@@ -181,6 +189,7 @@ function ExportCard() {
  * 后端同样会拒绝 `confirm=false`，两处都不提供「无参数即全删」的形态。
  */
 function KeychainCard() {
+  const { t } = useTranslation();
   const [confirming, setConfirming] = useState(false);
   const [agreed, setAgreed] = useState(false);
   const [report, setReport] = useState<KeychainPurgeReport | null>(null);
@@ -204,15 +213,12 @@ function KeychainCard() {
 
   return (
     <div className="card">
-      <h3>钥匙串条目清理</h3>
+      <h3>{t("settings.keychain.title")}</h3>
       <p className="muted">
-        删除本产品写进<strong>系统钥匙串</strong>的全部条目（按本地数据库里的引用逐条删，
-        不去枚举钥匙串——macOS 上枚举会弹授权）。秘密删掉之后<strong>取不回来</strong>：
-        站点侧那把 key 还在，但本地再也没有它的明文。
+        {t("settings.keychain.bodyPre")}<strong>{t("settings.keychain.bodyStrong")}</strong>{t("settings.keychain.bodyPost")}
       </p>
       <p className="muted">
-        <strong>本地记录不会被删</strong>：站点、密钥元数据、同意记录与变更历史都保留，
-        只是它们指向的钥匙串条目不存在了（重新取一次密钥即可恢复）。
+        {t("settings.keychain.localKeepPre")}<strong>{t("settings.keychain.localKeepStrong")}</strong>{t("settings.keychain.localKeepPost")}
       </p>
       <button
         type="button"
@@ -224,7 +230,7 @@ function KeychainCard() {
           setConfirming(true);
         }}
       >
-        {purge.isPending ? "清理中…" : "清理钥匙串条目"}
+        {purge.isPending ? t("settings.keychain.cleaning") : t("settings.keychain.btn")}
       </button>
 
       {report ? (
@@ -233,17 +239,13 @@ function KeychainCard() {
             className={report.failed > 0 ? "error" : "ok"}
             role="status"
           >
-            清理完成：尝试 {report.attempted} 条 / 删除 {report.removed} 条 /
-            失败 {report.failed} 条。
+            {t("settings.keychain.result", { attempted: report.attempted, removed: report.removed, failed: report.failed })}
           </p>
           {report.firstError ? (
-            <p className="muted">第一条失败：{report.firstError}</p>
+            <p className="muted">{t("settings.keychain.firstError", { error: report.firstError })}</p>
           ) : null}
           {report.failed > 0 ? (
-            <p className="muted">
-              失败的条目仍然留在钥匙串里（单条失败不会中断其余清理）。可以再点一次重试；
-              反复失败通常意味着系统钥匙串的访问权限被拒绝了。
-            </p>
+            <p className="muted">{t("settings.keychain.failHint")}</p>
           ) : null}
         </>
       ) : null}
@@ -254,15 +256,14 @@ function KeychainCard() {
       ) : null}
 
       <p className="muted">
-        卸载说明：macOS <strong>没有</strong>卸载钩子，所以顺序是「先在这里跑一次清理，
-        再删掉 App」——本产品<strong>不会</strong>（也无法）在你删除 App 时自动清理。
+        {t("settings.keychain.uninstallPre")}<strong>{t("settings.keychain.uninstallStrong1")}</strong>{t("settings.keychain.uninstallMid")}<strong>{t("settings.keychain.uninstallStrong2")}</strong>{t("settings.keychain.uninstallPost")}
       </p>
 
       <ConfirmDialog
         open={confirming}
-        title="清理钥匙串条目"
+        title={t("settings.keychain.dialogTitle")}
         danger
-        confirmLabel={purge.isPending ? "清理中…" : "确认清理"}
+        confirmLabel={purge.isPending ? t("settings.keychain.cleaning") : t("settings.keychain.confirm")}
         confirmDisabled={!agreed || purge.isPending}
         onCancel={() => {
           setAgreed(false);
@@ -271,27 +272,116 @@ function KeychainCard() {
         onConfirm={() => purge.mutate()}
       >
         <p>
-          会逐条删除本产品在系统钥匙串里的条目。<strong>不可逆</strong>：删掉之后本地再也取不回
-          那些密钥的明文，已投递到 agent 配置里的旧值不受影响（它们还在文件里，
-          需要你自己重新投递覆盖）。
+          {t("settings.keychain.dialogBodyPre")}<strong>{t("settings.keychain.dialogBodyStrong")}</strong>{t("settings.keychain.dialogBodyPost")}
         </p>
-        <p className="muted">本地数据库记录不会被删除。</p>
+        <p className="muted">{t("settings.keychain.dialogLocalKeep")}</p>
         <label className="checkline">
           <input
             type="checkbox"
             checked={agreed}
             onChange={(e) => setAgreed(e.target.checked)}
           />
-          <span>
-            我确认要删除钥匙串里的密钥条目，并明白它们<strong>不可恢复</strong>
-          </span>
+          <span>{t("settings.keychain.agree")}</span>
         </label>
       </ConfirmDialog>
     </div>
   );
 }
 
+/**
+ * 模型别名映射（M14-S1 / B-110）。
+ * agent 侧模型名 → 真实模型名。用户手填，落 SQLite，接进 RouteTable::with_alias。
+ */
+function AliasCard() {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const list = useQuery({ queryKey: ["alias-map"], queryFn: listAliasMap });
+  const [alias, setAlias] = useState("");
+  const [real, setReal] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const add = useMutation({
+    mutationFn: () => upsertAlias(alias.trim(), real.trim()),
+    onSuccess: async () => {
+      setError(null);
+      setAlias("");
+      setReal("");
+      await qc.invalidateQueries({ queryKey: ["alias-map"] });
+    },
+    onError: (err: Error) => setError(err.message),
+  });
+
+  const remove = useMutation({
+    mutationFn: (a: string) => deleteAlias(a),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["alias-map"] });
+    },
+    onError: (err: Error) => setError(err.message),
+  });
+
+  const entries: AliasEntry[] = list.data ?? [];
+  const canAdd = alias.trim().length > 0 && real.trim().length > 0 && !add.isPending;
+
+  return (
+    <div className="card">
+      <h3>{t("settings.alias.title")}</h3>
+      <p className="muted">{t("settings.alias.body")}</p>
+      <div className="row">
+        <label className="field-inline">
+          <span>{t("settings.alias.agentModel")}</span>
+          <input
+            className="input"
+            type="text"
+            value={alias}
+            onChange={(e) => setAlias(e.target.value)}
+            placeholder="gpt-5.6"
+          />
+        </label>
+        <label className="field-inline">
+          <span>{t("settings.alias.realModel")}</span>
+          <input
+            className="input"
+            type="text"
+            value={real}
+            onChange={(e) => setReal(e.target.value)}
+            placeholder="gpt-5.6-2026"
+          />
+        </label>
+        <button
+          type="button"
+          className="btn btn-primary"
+          disabled={!canAdd}
+          onClick={() => add.mutate()}
+        >
+          {add.isPending ? t("settings.alias.adding") : t("settings.alias.add")}
+        </button>
+      </div>
+      {entries.length === 0 ? (
+        <p className="muted">{t("settings.alias.empty")}</p>
+      ) : (
+        <ul className="list">
+          {entries.map((e) => (
+            <li key={e.alias} className="row">
+              <span className="mono">{e.alias}</span>
+              <span>→</span>
+              <span className="mono">{e.realModel}</span>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                disabled={remove.isPending}
+                onClick={() => remove.mutate(e.alias)}
+              >{t("common.delete")}</button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {error ? <p className="error" role="alert">{error}</p> : null}
+    </div>
+  );
+}
+
 function AuditCard() {
+  const { t } = useTranslation();
   const report = useQuery({
     queryKey: ["audit"],
     queryFn: auditRedaction,
@@ -301,19 +391,16 @@ function AuditCard() {
   return (
     <div className="card">
       <h3>
-        <ShieldCheck size={15} aria-hidden /> 脱敏审计
+        <ShieldCheck size={15} aria-hidden /> {t("settings.audit.title")}
       </h3>
-      <p className="muted">
-        扫描本产品的全部落盘产物（数据库、WAL、备份目录、事件表），确认没有明文凭证。
-        只扫自己的产物，不做全盘扫描。
-      </p>
+      <p className="muted">{t("settings.audit.body")}</p>
       <button
         type="button"
         className="btn"
         disabled={report.isFetching}
         onClick={() => report.refetch()}
       >
-        {report.isFetching ? "扫描中…" : "开始扫描"}
+        {report.isFetching ? t("settings.audit.scanning") : t("settings.audit.btn")}
       </button>
       {report.data ? (
         <>
@@ -325,7 +412,7 @@ function AuditCard() {
               {report.data.findings.map((f, i) => (
                 <li key={`${f.kind}-${i}`}>
                   <span className="badge badge-warn">{f.kind}</span>{" "}
-                  <span className="mono ellipsis">{f.path ?? "事件表"}</span>{" "}
+                  <span className="mono ellipsis">{f.path ?? t("settings.audit.eventTable")}</span>{" "}
                   {f.detail}
                 </li>
               ))}
@@ -341,9 +428,10 @@ function AuditCard() {
 }
 
 export default function SettingsPage() {
+  const { t } = useTranslation();
   const qc = useQueryClient();
   const current = useQuery({ queryKey: ["settings"], queryFn: getSettings });
-  // 系统里自启的**实际**状态（不是设置里那个意愿）。见下方 AUTOSTART_LABELS 处的说明。
+  // 系统里自启的**实际**状态（不是设置里那个意愿）。见下方 autostartStateLabel 处的说明。
   const autostart = useQuery({
     queryKey: ["autostart-status"],
     queryFn: autostartStatus,
@@ -377,8 +465,8 @@ export default function SettingsPage() {
     const wanted = draft.autostartEnabled ? "enabled" : "disabled";
     if (autostart.data.state === wanted) return null;
     return autostart.data.state === "enabled"
-      ? "系统里已经装了自启项，但开关是关的（关掉开关并保存即可移除）"
-      : "系统里没有生效的自启项，但开关是开的（打开开关并保存即可写入）";
+      ? t("settings.autostart.mismatchEnabled")
+      : t("settings.autostart.mismatchDisabled");
   })();
 
   /**
@@ -396,19 +484,19 @@ export default function SettingsPage() {
    */
   function validateDraft(draft: Settings): string | null {
     const refresh = intInRange(draft.refreshIntervalSecs, 0, 86_400);
-    if (refresh === null) return "定时刷新间隔必须是 0 到 86400 之间的整数秒（0 = 关闭）。";
+    if (refresh === null) return t("settings.validate.refresh");
     const threshold = finiteNonNegative(draft.balanceAlertThreshold, 1_000_000);
-    if (threshold === null) return "余额告警阈值必须是不超过 1000000 的非负数（0 = 不告警）。";
+    if (threshold === null) return t("settings.validate.threshold");
     const port = intInRange(draft.gatewayPort, 1, 65_535);
-    if (port === null) return "网关端口必须是 1 到 65535 之间的整数。";
+    if (port === null) return t("settings.validate.port");
     const timeout = intInRange(draft.notifyTimeoutSecs, 1, 60);
-    if (timeout === null) return "Webhook 超时必须是 1 到 60 之间的整数秒。";
+    if (timeout === null) return t("settings.validate.timeout");
     const maxAge = intInRange(draft.rotationMaxAgeDays, 0, 36_500);
-    if (maxAge === null) return "轮换周期必须是 0 到 36500 之间的整数天（0 = 关闭提醒）。";
+    if (maxAge === null) return t("settings.validate.maxAge");
     const warn = intInRange(draft.rotationWarnBeforeDays, 0, 36_500);
-    if (warn === null) return "提前提醒天数必须是 0 到 36500 之间的整数。";
+    if (warn === null) return t("settings.validate.warnBefore");
     if (warn > maxAge && maxAge !== 0) {
-      return "提前提醒天数不能大于轮换周期（要提醒的事得先在那个周期内发生）。";
+      return t("settings.validate.warnGtMax");
     }
     return null;
   }
@@ -434,19 +522,17 @@ export default function SettingsPage() {
       // 两件事分开说（M8-S5B §6.10）：设置**已保存**（这是事实，先讲清楚），
       // 自启的同步结果是另一件事——失败或状态不一致都单独说一句。
       if (autostartError !== null) {
-        setNotice(`设置已保存，但登录自启没能同步：${autostartError}`);
+        setNotice(t("settings.save.autostartFail", { error: autostartError }));
       } else if (autostart) {
         const wanted = saved.autostartEnabled ? "enabled" : "disabled";
         if (autostart.state !== wanted && autostart.state !== "unknown") {
           // 真实状态与用户意愿不一致时**必须说出来**，不能只显示「已保存」。
-          setNotice(
-            `设置已保存，但登录自启的实际状态是「${autostart.state}」，与设置不一致。`,
-          );
+          setNotice(t("settings.save.autostartMismatch", { state: autostart.state }));
         } else {
-          setNotice("已保存。定时刷新间隔的变更在**下次启动**生效。");
+          setNotice(t("settings.save.ok"));
         }
       } else {
-        setNotice("已保存。定时刷新间隔的变更在**下次启动**生效。");
+        setNotice(t("settings.save.ok"));
       }
       setDraft(saved);
       await qc.invalidateQueries({ queryKey: ["settings"] });
@@ -466,9 +552,7 @@ export default function SettingsPage() {
 
   return (
     <section>
-      <p className="muted">
-        所有设置都存在本地数据库里，不上传任何地方。
-      </p>
+      <p className="muted">{t("settings.intro")}</p>
 
       {notice ? <p className="ok" role="status">{notice}</p> : null}
       {error ? (
@@ -478,15 +562,12 @@ export default function SettingsPage() {
       ) : null}
 
       {draft === null ? (
-        <p className="muted">加载中…</p>
+        <p className="muted">{t("settings.loading")}</p>
       ) : (
         <>
           <div className="card">
-            <h3>自动刷新</h3>
-            <p className="muted">
-              默认关闭：KeyRelay 不会替你做任何定时联网。
-              开启后会在后台按间隔刷新已登录站点的余额与密钥列表，失败只记事件、不打断循环。
-            </p>
+            <h3>{t("settings.autorefresh.title")}</h3>
+            <p className="muted">{t("settings.autorefresh.body")}</p>
             <div className="row">
               {PRESETS.map((preset) => (
                 <button
@@ -501,16 +582,16 @@ export default function SettingsPage() {
                     setDraft({ ...draft, refreshIntervalSecs: preset.value })
                   }
                 >
-                  {preset.label}
+                  {t(preset.labelKey)}
                 </button>
               ))}
             </div>
           </div>
 
           <div className="card">
-            <h3>余额告警</h3>
+            <h3>{t("settings.balanceAlert.title")}</h3>
             <label className="field">
-              <span>余额低于该值时告警（USD，0 = 不告警）</span>
+              <span>{t("settings.balanceAlert.label")}</span>
               <input
                 className="input"
                 type="number"
@@ -528,7 +609,7 @@ export default function SettingsPage() {
           </div>
 
           <div className="card">
-            <h3>启动检查</h3>
+            <h3>{t("settings.startupCheck.title")}</h3>
             <label className="checkline">
               <input
                 type="checkbox"
@@ -537,43 +618,39 @@ export default function SettingsPage() {
                   setDraft({ ...draft, driftCheckOnStart: e.target.checked })
                 }
               />
-              <span>
-                启动时检查投递目标是否被外部改动（只读本地文件，不联网）
-              </span>
+              <span>{t("settings.startupCheck.label")}</span>
             </label>
           </div>
 
           <div className="card">
-            <h3>界面</h3>
+            <h3>{t("settings.ui.title")}</h3>
             <label className="field">
-              <span>主题</span>
+              <span>{t("settings.ui.theme")}</span>
               <select
                 className="input"
                 value={draft.theme}
                 onChange={(e) => setDraft({ ...draft, theme: e.target.value })}
               >
-                <option value="system">跟随系统</option>
-                <option value="light">浅色</option>
-                <option value="dark">深色</option>
+                <option value="system">{t("settings.ui.themeSystem")}</option>
+                <option value="light">{t("settings.ui.themeLight")}</option>
+                <option value="dark">{t("settings.ui.themeDark")}</option>
               </select>
             </label>
             <label className="field">
-              <span>语言</span>
+              <span>{t("settings.ui.language")}</span>
               <select
                 className="input"
                 value={draft.language}
                 onChange={(e) => setDraft({ ...draft, language: e.target.value })}
               >
-                <option value="zh-CN">简体中文</option>
-                <option value="en-US">English</option>
+                <option value="zh-CN">{t("settings.ui.languageZh")}</option>
+                <option value="en-US">{t("settings.ui.languageEn")}</option>
               </select>
             </label>
-            {/* 与遥测 / 自动更新开关同口径：做不到的如实说（M9-S4 / F，B-128） */}
-            <p className="muted">
-              界面目前只有简体中文：选 English 只会记下这个偏好，界面不会切换。
-            </p>
+            {/* M14-S2：语言切换已做真（前端文案随语言切换）；后端返回文本仍原文，见 spec §11 D-1/D-2 */}
+            <p className="muted">{t("settings.ui.languageNote")}</p>
             <label className="field">
-              <span>代理</span>
+              <span>{t("settings.ui.proxy")}</span>
               <div className="radio-row">
                 <label className="radio">
                   <input
@@ -583,7 +660,7 @@ export default function SettingsPage() {
                     checked={draft.proxyMode === "auto"}
                     onChange={() => setDraft({ ...draft, proxyMode: "auto" })}
                   />
-                  自动
+                  {t("settings.ui.proxyAuto")}
                 </label>
                 <label className="radio">
                   <input
@@ -593,7 +670,7 @@ export default function SettingsPage() {
                     checked={draft.proxyMode === "manual"}
                     onChange={() => setDraft({ ...draft, proxyMode: "manual" })}
                   />
-                  手动
+                  {t("settings.ui.proxyManual")}
                 </label>
                 <label className="radio">
                   <input
@@ -603,7 +680,7 @@ export default function SettingsPage() {
                     checked={draft.proxyMode === "direct"}
                     onChange={() => setDraft({ ...draft, proxyMode: "direct" })}
                   />
-                  直连
+                  {t("settings.ui.proxyDirect")}
                 </label>
               </div>
             </label>
@@ -611,11 +688,11 @@ export default function SettingsPage() {
               <p className="muted">
                 {detected.data && detected.data.source ? (
                   <>
-                    检测到：<code>{detected.data.maskedUrl}</code>
-                    （来源：{proxySourceLabel(detected.data.source)}）
+                    {t("settings.ui.proxyAutoDetectedPre")}<code>{detected.data.maskedUrl}</code>
+                    {t("settings.ui.proxyAutoDetectedMid", { source: proxySourceLabel(detected.data.source) })}
                   </>
                 ) : (
-                  "未检测到系统代理，将直连。"
+                  t("settings.ui.proxyAutoNone")
                 )}{" "}
                 <button
                   type="button"
@@ -623,36 +700,29 @@ export default function SettingsPage() {
                   onClick={() => detected.refetch()}
                   disabled={detected.isFetching}
                 >
-                  {detected.isFetching ? "检测中…" : "重新检测"}
+                  {detected.isFetching ? t("settings.ui.proxyDetecting") : t("settings.ui.proxyDetectBtn")}
                 </button>
               </p>
             )}
             {draft.proxyMode === "manual" && (
               <label className="field">
-                <span>代理地址（HTTP / SOCKS5）</span>
+                <span>{t("settings.ui.proxyManualLabel")}</span>
                 <input
                   className="input"
                   type="text"
-                  placeholder="socks5://127.0.0.1:1080"
+                  placeholder={t("settings.ui.proxyManualPlaceholder")}
                   value={draft.proxyUrl}
                   onChange={(e) => setDraft({ ...draft, proxyUrl: e.target.value })}
                 />
               </label>
             )}
-            {draft.proxyMode === "direct" && <p className="muted">不使用任何代理。</p>}
-            <p className="muted">
-              代理在下次启动应用时生效（网关上游在重启网关时生效）。代理串的合法性在真正发起请求时
-              校验：手动模式下写法不合法会直接报错；自动模式下探测到的非法代理会被跳过并直连
-              （系统配的垃圾值不应让应用起不来）。
-            </p>
+            {draft.proxyMode === "direct" && <p className="muted">{t("settings.ui.proxyDirectNote")}</p>}
+            <p className="muted">{t("settings.ui.proxyHint")}</p>
           </div>
 
           <div className="card">
-            <h3>通知</h3>
-            <p className="muted">
-              余额低于阈值、会话失效、密钥到期与配置漂移会走这里的渠道。通知正文不含密钥，
-              也不含站点返回的原始文案。
-            </p>
+            <h3>{t("settings.notify.title")}</h3>
+            <p className="muted">{t("settings.notify.body")}</p>
             <label className="checkline">
               <input
                 type="checkbox"
@@ -661,14 +731,14 @@ export default function SettingsPage() {
                   setDraft({ ...draft, notifySystemEnabled: e.target.checked })
                 }
               />
-              <span>系统通知（macOS 通知中心 / Windows Toast）</span>
+              <span>{t("settings.notify.system")}</span>
             </label>
             <label className="field">
-              <span>Webhook 地址（留空 = 不启用）</span>
+              <span>{t("settings.notify.webhookUrl")}</span>
               <input
                 className="input"
                 type="text"
-                placeholder="https://hooks.example.com/keyrelay"
+                placeholder={t("settings.notify.webhookPlaceholder")}
                 value={draft.notifyWebhookUrl}
                 onChange={(e) =>
                   setDraft({ ...draft, notifyWebhookUrl: e.target.value })
@@ -676,7 +746,7 @@ export default function SettingsPage() {
               />
             </label>
             <label className="field">
-              <span>Webhook 超时（秒，上限 60）</span>
+              <span>{t("settings.notify.webhookTimeout")}</span>
               <input
                 className="input"
                 type="number"
@@ -692,19 +762,15 @@ export default function SettingsPage() {
               />
             </label>
             <p className="muted">
-              地址里如果内嵌了凭证（<code>https://user:pass@…</code>），
-              写进事件表与导出包之前会被剥掉。
+              {t("settings.notify.webhookHintPre")}<code>{t("settings.notify.webhookHintCode")}</code>{t("settings.notify.webhookHintPost")}
             </p>
           </div>
 
           <div className="card">
-            <h3>密钥轮换</h3>
-            <p className="muted">
-              到期前提醒你换一把新的。轮换是一次三连操作：新建 key → 全量重注入 → 回收旧 key；
-              中间任何一步失败都会停下，不会留下「旧 key 已回收但新 key 没注入」的状态。
-            </p>
+            <h3>{t("settings.rotation.title")}</h3>
+            <p className="muted">{t("settings.rotation.body")}</p>
             <label className="field">
-              <span>轮换周期（天，0 = 关闭提醒）</span>
+              <span>{t("settings.rotation.maxAge")}</span>
               <input
                 className="input"
                 type="number"
@@ -719,7 +785,7 @@ export default function SettingsPage() {
               />
             </label>
             <label className="field">
-              <span>提前提醒（天）</span>
+              <span>{t("settings.rotation.warnBefore")}</span>
               <input
                 className="input"
                 type="number"
@@ -736,13 +802,13 @@ export default function SettingsPage() {
             {draft.rotationMaxAgeDays > 0 &&
             draft.rotationWarnBeforeDays > draft.rotationMaxAgeDays ? (
               <p className="error" role="alert">
-                <AlertTriangle size={14} aria-hidden /> 提前提醒天数不能大于轮换周期。
+                <AlertTriangle size={14} aria-hidden /> {t("settings.rotation.error")}
               </p>
             ) : null}
           </div>
 
           <div className="card">
-            <h3>常驻与自启</h3>
+            <h3>{t("settings.autostart.title")}</h3>
             <label className="checkline">
               <input
                 type="checkbox"
@@ -751,7 +817,7 @@ export default function SettingsPage() {
                   setDraft({ ...draft, closeToTray: e.target.checked })
                 }
               />
-              <span>关窗时隐藏到托盘而不是退出（关掉后关窗即退出，后台刷新也随之停止）</span>
+              <span>{t("settings.autostart.closeToTray")}</span>
             </label>
             <label className="checkline">
               <input
@@ -761,7 +827,7 @@ export default function SettingsPage() {
                   setDraft({ ...draft, startHidden: e.target.checked })
                 }
               />
-              <span>启动时不显示主窗口（等价于命令行加 --hidden）</span>
+              <span>{t("settings.autostart.startHidden")}</span>
             </label>
             <label className="checkline">
               <input
@@ -772,10 +838,7 @@ export default function SettingsPage() {
                 }
               />
               <span>
-                登录时自动启动（macOS 写入 LaunchAgent，Windows 写入用户级启动项）。
-                点「保存」时才会真正写盘；自启启动时一律带 <code>--hidden</code>
-                ——自启的用途是后台刷新，弹窗会破坏它。托盘不可用时窗口仍会显示，
-                否则你没有任何入口能把它调回来。
+                {t("settings.autostart.autostartLabelPre")}<code>{t("settings.autostart.autostartLabelCode")}</code>{t("settings.autostart.autostartLabelPost")}
               </span>
             </label>
             {/*
@@ -784,24 +847,23 @@ export default function SettingsPage() {
               系统清理了自启项、或写在别的用户目录下，界面都看不出来。
             */}
             <p className="muted">
-              系统里的实际状态：
+              {t("settings.autostart.actualState")}
               {autostart.isLoading
-                ? " 读取中…"
+                ? t("settings.autostart.stateLoading")
                 : autostart.isError
-                  ? ` 读不到（${(autostart.error as Error).message}）`
-                  : ` ${AUTOSTART_LABELS[autostart.data!.state]}`}
+                  ? t("settings.autostart.stateError", { error: (autostart.error as Error).message })
+                  : ` ${autostartStateLabel(autostart.data!.state)}`}
             </p>
             {autostartMismatch ? (
               <p className="warnline" role="alert">
                 <AlertTriangle size={14} aria-hidden />
-                与上面的开关不一致：{autostartMismatch}。
-                点一次「保存」会按开关重写系统里的自启项。
+                {t("settings.autostart.mismatchPre")}{autostartMismatch}{t("settings.autostart.mismatchPost")}
               </p>
             ) : null}
           </div>
 
           <div className="card">
-            <h3>隐私</h3>
+            <h3>{t("settings.privacy.title")}</h3>
             <label className="checkline">
               <input
                 type="checkbox"
@@ -811,8 +873,7 @@ export default function SettingsPage() {
                 }
               />
               <span>
-                匿名遥测（默认关）。**当前版本只记录这个开关，不发送任何数据**——
-                没有服务端，也没有埋点代码。
+                {t("settings.privacy.telemetryPre")}<strong>{t("settings.privacy.telemetryStrong")}</strong>{t("settings.privacy.telemetryPost")}
               </span>
             </label>
             <label className="checkline">
@@ -823,13 +884,11 @@ export default function SettingsPage() {
                   setDraft({ ...draft, autoUpdateEnabled: e.target.checked })
                 }
               />
-              <span>
-                自动更新（默认关）。打开后启动时自动检查一次，安装仍需手动确认。
-              </span>
+              <span>{t("settings.privacy.autoUpdate")}</span>
             </label>
           </div>
           <div className="row">
-            <label style={{ fontWeight: 600, marginBottom: 4 }}>应用更新</label>
+            <label style={{ fontWeight: 600, marginBottom: 4 }}>{t("settings.updateTitle")}</label>
             <UpdateChecker autoCheckOnMount={current.data?.autoUpdateEnabled ?? false} />
           </div>
 
@@ -851,9 +910,9 @@ export default function SettingsPage() {
                 save.mutate(draft);
               }}
             >
-              <Save size={14} aria-hidden /> 保存
+              <Save size={14} aria-hidden /> {t("settings.save.btn")}
             </button>
-            {dirty ? <span className="muted">有未保存的修改</span> : null}
+            {dirty ? <span className="muted">{t("settings.save.dirty")}</span> : null}
           </div>
 
           <GatewayCard
@@ -863,6 +922,8 @@ export default function SettingsPage() {
             onPortChange={(port) => setDraft({ ...draft, gatewayPort: port })}
             settingsDirty={dirty}
           />
+
+          <AliasCard />
 
           <ExportCard />
 

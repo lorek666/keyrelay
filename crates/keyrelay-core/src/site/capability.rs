@@ -37,10 +37,11 @@ pub struct SiteCapabilities {
     ///
     /// **定义（M7-S0 §3.2 裁决，别改成别的意思）**：本产品**今天**能不能从该站点类型取到
     /// 每把 key 的用量 —— 不是「站点端有没有用量字段」。
-    /// 三条通道现在都是 `false`：`site::KeyMeta` 没有用量字段，`keys.quota_used` 列也没有写入器
-    /// （证据见 spec §9 证据 ⑩），所以界面**不显示**用量列。
-    /// 将来真的解析出用量后，**只改这张表**的对应格子。
-    /// （「每把 key 的用量取不到」已登记为 BACKLOG B-96。）
+    /// - NewAPI / Sub2API：`true`（M14-S3 起：`list_keys` 响应带当前累计用量，Sub2API 另有
+    ///   `usage/daily` 日趋势；适配器解析进 `KeyMeta.quota_used`，写 `keys.quota_used`）。
+    /// - `CustomOpenAiCompatible`：`false`（只读 `/v1/models`，无令牌管理端点）。
+    ///
+    /// 界面据本字段决定用量列显示与否（`true` 显示、`false` 隐藏，不按 `kind` 硬编码）。
     pub key_usage: bool,
 }
 
@@ -57,7 +58,10 @@ pub fn capabilities(kind: SiteKind) -> SiteCapabilities {
             revoke_key: true,
             balance: true,
             groups: true,
-            key_usage: false,
+            // M14-S3：两个站点类型的 `list_keys` 响应都带每把 key 的当前累计用量
+            //（NewAPI `used_quota` / Sub2API `quota_used`），Sub2API 另有 `usage/daily` 日趋势。
+            // 适配器已解析进 `KeyMeta.quota_used`，`key_usage` 从 `false` 改 `true`。
+            key_usage: true,
         },
         // 只读的 OpenAI 兼容端点：只有一个 `/v1/models` 可读，没有任何令牌管理端点，
         // 也没有余额/分组概念（M7-S0 §3.2）。
@@ -92,7 +96,7 @@ mod tests {
                 revoke_key: true,
                 balance: true,
                 groups: true,
-                key_usage: false,
+                key_usage: true,
             }
         );
         assert_eq!(
@@ -105,7 +109,7 @@ mod tests {
                 revoke_key: true,
                 balance: true,
                 groups: true,
-                key_usage: false,
+                key_usage: true,
             }
         );
         assert_eq!(

@@ -15,6 +15,7 @@ import {
   type ChannelBinding,
   type DeliveryPlan,
 } from "../lib/api";
+import { useTranslation } from "../i18n";
 
 type Props = {
   enabled: boolean;
@@ -39,6 +40,7 @@ export default function GatewayCard({
   onPortChange,
   settingsDirty,
 }: Props) {
+  const { t } = useTranslation();
   const qc = useQueryClient();
   const status = useQuery({ queryKey: ["gateway"], queryFn: gatewayStatus });
   const sites = useQuery({ queryKey: ["sites"], queryFn: listSites });
@@ -72,9 +74,7 @@ export default function GatewayCard({
       setCopied(true);
     } catch (err) {
       setCopied(false);
-      setError(
-        `复制失败（${(err as Error).message}）——请手动选中上面的令牌文本。`,
-      );
+      setError(t("gateway.copyFail", { error: (err as Error).message }));
     }
   }
 
@@ -181,7 +181,7 @@ export default function GatewayCard({
       for (const { binding, channel, key } of batchCandidates) {
         if (!batchPicked[key]) continue;
         if (channel === null) {
-          out[key] = "无法识别通道（可能是另一个 home 下写的）";
+          out[key] = t("gateway.batch.unmappedFull");
           continue;
         }
         try {
@@ -210,7 +210,7 @@ export default function GatewayCard({
           results.push({
             label: binding.targetPath,
             ok: false,
-            detail: "无法识别通道（可能是另一个 home 下写的），请到「Agent 投递」页手工处理",
+            detail: t("gateway.batch.unmappedApplyDetail"),
           });
           continue;
         }
@@ -223,7 +223,7 @@ export default function GatewayCard({
             channel,
             mode: "gateway",
           });
-          results.push({ label, ok: true, detail: "已改指网关" });
+          results.push({ label, ok: true, detail: t("gateway.batch.appliedOk") });
         } catch (err) {
           // 失败不中断：记录原因，继续下一条（硬约束 3）
           results.push({ label, ok: false, detail: (err as Error).message });
@@ -244,11 +244,9 @@ export default function GatewayCard({
 
   return (
     <div className="card">
-      <h3>本地网关</h3>
+      <h3>{t("gateway.title")}</h3>
       <p className="muted">
-        让任何支持 OpenAI 兼容接口的 agent 把 base_url 指向
-        <span className="mono"> http://127.0.0.1:{port}/v1 </span>
-        即可——密钥不必写进它们的配置里。只监听回环地址，并且必须带下面的本地令牌。
+        {t("gateway.bodyPre")}<span className="mono">{t("gateway.bodyMid", { port })}</span>{t("gateway.bodyPost")}
       </p>
 
       <label className="checkline">
@@ -257,14 +255,11 @@ export default function GatewayCard({
           checked={enabled}
           onChange={(e) => onToggle(e.target.checked)}
         />
-        <span>
-          允许启动本地网关（默认关闭；这个开关只控制「允不允许」，
-          真正启动要点下面的按钮）
-        </span>
+        <span>{t("gateway.allowLabel")}</span>
       </label>
 
       <label className="field">
-        <span>端口（1024–65535）</span>
+        <span>{t("gateway.portLabel")}</span>
         <input
           className="input"
           type="number"
@@ -283,51 +278,42 @@ export default function GatewayCard({
         />
       </label>
       {settingsDirty ? (
-        <p className="muted">端口改动需要先保存设置，并在下次启动网关时生效。</p>
+        <p className="muted">{t("gateway.portDirtyHint")}</p>
       ) : null}
 
       {running ? (
         <>
           <dl className="kv">
-            <dt>状态</dt>
-            <dd className="ok">运行中</dd>
-            <dt>地址</dt>
+            <dt>{t("gateway.kv.status")}</dt>
+            <dd className="ok">{t("gateway.status.running")}</dd>
+            <dt>{t("gateway.kv.url")}</dt>
             <dd className="mono">{status.data?.url}</dd>
-            <dt>上游</dt>
+            <dt>{t("gateway.kv.upstream")}</dt>
             <dd className="mono">{status.data?.site}</dd>
-            <dt>本地令牌</dt>
+            <dt>{t("gateway.kv.token")}</dt>
             <dd className="mono ellipsis" title={status.data?.token ?? ""}>
               {status.data?.token}
             </dd>
-            <dt>令牌存储</dt>
+            <dt>{t("gateway.kv.tokenStorage")}</dt>
             <dd>
               {status.data?.tokenPersistent ? (
-                <span className="badge badge-ok">已存入系统钥匙串</span>
+                <span className="badge badge-ok">{t("gateway.status.persistent")}</span>
               ) : (
-                <span className="badge badge-warn">
-                  临时（钥匙串不可用）——重启后会变
-                </span>
+                <span className="badge badge-warn">{t("gateway.status.temporary")}</span>
               )}
             </dd>
           </dl>
-          <p className="muted">
-            把地址与令牌填进 agent 的配置即可；也可以到「Agent 投递」页把通道勾上
-            「指向本地网关」，让 KeyRelay 替你写。
-          </p>
+          <p className="muted">{t("gateway.hint")}</p>
           {status.data?.tokenPersistent ? (
-            <p className="muted">
-              令牌存在系统钥匙串里，<strong>跨重启不变</strong>——所以换站时只要重启网关，
-              agent 侧不用改（它的配置里写的是网关地址与这个令牌）。
-            </p>
+            <p className="muted">{t("gateway.persistentHint")}</p>
           ) : (
             <p className="muted">
-              这次用的是<strong>临时令牌</strong>：钥匙串不可用，重启后令牌会变，
-              届时指向网关的通道需要重新投递。已写入 agent 配置的旧令牌会立刻失效。
+              {t("gateway.temporaryHintPre")}<strong>{t("gateway.temporaryHintStrong")}</strong>{t("gateway.temporaryHintPost")}
             </p>
           )}
           <div className="row">
             <button type="button" className="btn" onClick={copyToken}>
-              <Copy size={14} aria-hidden /> 复制令牌
+              <Copy size={14} aria-hidden /> {t("gateway.btn.copy")}
             </button>
             <button
               type="button"
@@ -336,29 +322,21 @@ export default function GatewayCard({
               onClick={() => {
                 // P3-12 / DEBUG-REPORT-v3 §3-12：重新生成令牌是危险操作（旧令牌
                 // 立即失效，指向网关的通道要重投、agent 要重启）——二次确认，避免误点。
-                if (
-                  window.confirm(
-                    "重新生成网关令牌？旧令牌立即失效，指向网关的通道需要重新投递一次。",
-                  )
-                ) {
+                if (window.confirm(t("gateway.rotateConfirm"))) {
                   rotate.mutate();
                 }
               }}
             >
               <RefreshCw size={14} aria-hidden />{" "}
-              {rotate.isPending ? "轮换中…" : "重新生成令牌"}
+              {rotate.isPending ? t("gateway.btn.rotating") : t("gateway.btn.rotate")}
             </button>
             {copied ? (
-              <span className="muted" role="status">
-                已复制到剪贴板，可能被剪贴板历史记录（系统或其他应用）带走。
-                KeyRelay 不会自动清空剪贴板——那会跟你自己的复制操作打架。
-              </span>
+              <span className="muted" role="status">{t("gateway.copied")}</span>
             ) : null}
           </div>
           {rotated ? (
             <p className="warnline" role="status">
-              <AlertTriangle size={14} aria-hidden /> 已换新令牌：旧令牌立即失效，
-              指向网关的通道需要重新投递一次，agent 需要重启才能读到新配置。
+              <AlertTriangle size={14} aria-hidden /> {t("gateway.rotatedWarn")}
             </p>
           ) : null}
           <button
@@ -367,14 +345,14 @@ export default function GatewayCard({
             disabled={stop.isPending}
             onClick={() => stop.mutate()}
           >
-            <Square size={14} aria-hidden /> 停止网关
+            <Square size={14} aria-hidden /> {t("gateway.stopBtn")}
           </button>
         </>
       ) : (
         <>
           <div className="row">
             <label className="field-inline">
-              <span>站点</span>
+              <span>{t("keys.siteSelect")}</span>
               <select
                 className="input"
                 value={activeSite ?? ""}
@@ -391,7 +369,7 @@ export default function GatewayCard({
               </select>
             </label>
             <label className="field-inline">
-              <span>密钥</span>
+              <span>{t("agents.select.key")}</span>
               <select
                 className="input"
                 value={activeKey ?? ""}
@@ -402,7 +380,7 @@ export default function GatewayCard({
                   setKeyId(e.target.value === "" ? null : Number(e.target.value))
                 }
               >
-                <option value="">（选择一把）</option>
+                <option value="">{t("agents.select.keyPlaceholder")}</option>
                 {siteKeys.map((k) => (
                   <option key={k.id} value={k.id}>
                     {k.name}（#{k.id}）
@@ -417,12 +395,12 @@ export default function GatewayCard({
             disabled={!enabled || activeSite === null || activeKey === null || start.isPending}
             onClick={() => start.mutate()}
           >
-            <Play size={14} aria-hidden /> {start.isPending ? "启动中…" : "启动网关"}
+            <Play size={14} aria-hidden /> {start.isPending ? t("gateway.btn.starting") : t("gateway.btn.start")}
           </button>
           {!enabled ? (
-            <p className="muted">先勾选上面的开关。</p>
+            <p className="muted">{t("gateway.startHint.notEnabled")}</p>
           ) : siteKeys.length === 0 ? (
-            <p className="muted">该站点下还没有本地密钥，先去「密钥」页新建一把。</p>
+            <p className="muted">{t("gateway.startHint.noKey")}</p>
           ) : null}
         </>
       )}
@@ -440,23 +418,22 @@ export default function GatewayCard({
             setBatchPreviews({});
           }}
         >
-          把已投递的通道批量改指网关…
+          {t("gateway.batch.btn")}
         </button>
         {!running ? (
-          <span className="muted">网关没在运行：改指网关要读本地令牌，先启动网关。</span>
+          <span className="muted">{t("gateway.batch.notRunning")}</span>
         ) : null}
       </div>
 
       {batchOpen ? (
         <div className="card">
-          <h4>选择要改指网关的通道</h4>
+          <h4>{t("gateway.batch.title")}</h4>
           <p className="muted">
-            只会列出<strong>已投递且没解绑</strong>的绑定。每条都要单独勾选——
-            没有「全选」，因为每条都会真的改写一个 agent 的配置文件。
+            {t("gateway.batch.bodyPre")}<strong>{t("gateway.batch.bodyStrong")}</strong>{t("gateway.batch.bodyPost")}
           </p>
-          {batchBindings.isLoading ? <p className="muted">正在读绑定…</p> : null}
+          {batchBindings.isLoading ? <p className="muted">{t("gateway.batch.loading")}</p> : null}
           {batchCandidates.length === 0 && !batchBindings.isLoading ? (
-            <p className="muted">还没有任何已投递的通道。先去「Agent 投递」页投递一条。</p>
+            <p className="muted">{t("gateway.batch.empty")}</p>
           ) : null}
           {batchCandidates.map(({ binding, channel, key }) => {
             const site = (sites.data ?? []).find((s) => s.id === binding.siteId);
@@ -480,13 +457,11 @@ export default function GatewayCard({
                 <span>
                   {channel === null ? (
                     <>
-                      <strong>无法识别通道</strong>（{binding.targetPath}）——
-                      可能是另一个 home 下写的，勾了也会失败并说明原因
+                      {t("gateway.batch.unmappedPre")}{binding.targetPath}{t("gateway.batch.unmappedPost")}
                     </>
                   ) : (
                     <>
-                      {channel} · <span className="mono">{binding.targetPath}</span> · key #{binding.keyId}
-                      {site ? ` · ${site.displayName}` : ""}
+                      {t("gateway.batch.mapped", { channel, path: binding.targetPath, keyId: binding.keyId, site: site ? ` · ${site.displayName}` : "" })}
                     </>
                   )}
                 </span>
@@ -496,21 +471,22 @@ export default function GatewayCard({
           {/* 逐条预览的结果（硬约束 1）：不显示 diff 就不让执行 */}
           {Object.keys(batchPreviews).length > 0 ? (
             <div className="card">
-              <h4>逐条预览</h4>
+              <h4>{t("gateway.batch.previewTitle")}</h4>
               {Object.entries(batchPreviews).map(([key, plan]) => (
                 <div key={key}>
-                  <strong>{planOf(key).channel ?? "无法识别通道"}</strong>{" "}
+                  <strong>{planOf(key).channel ?? t("gateway.batch.unmappedStrong")}</strong>{" "}
                   <span className="mono">{planOf(key).targetPath}</span>
                   {typeof plan === "string" ? (
                     <p className="error" role="alert">
-                      预览失败：{plan}
+                      {t("gateway.batch.previewError", { error: plan })}
                     </p>
                   ) : (
                     <>
                       <p className="muted">
-                        {plan.targetExists ? "改写已存在的文件" : "新建文件"} ·
-                        模式：<strong>{plan.mode === "gateway" ? "指向本地网关" : "指向站点"}</strong>
-                        {plan.warnings.length > 0 ? ` · 提示 ${plan.warnings.length} 条` : ""}
+                        {plan.targetExists ? t("gateway.batch.previewRewrite") : t("gateway.batch.previewNew")}
+                        {t("gateway.batch.previewModePre")}
+                        <strong>{plan.mode === "gateway" ? t("gateway.batch.previewModeGateway") : t("gateway.batch.previewModeSite")}</strong>
+                        {plan.warnings.length > 0 ? t("gateway.batch.previewWarnings", { count: plan.warnings.length }) : ""}
                       </p>
                       <pre className="mono">{plan.preview}</pre>
                     </>
@@ -530,7 +506,7 @@ export default function GatewayCard({
               }
               onClick={() => batchPreview.mutate()}
             >
-              {batchPreview.isPending ? "预览中…" : "预览勾选的条目"}
+              {batchPreview.isPending ? t("gateway.batch.previewBtn") : t("gateway.batch.previewBtnIdle")}
             </button>
             <button
               type="button"
@@ -548,7 +524,7 @@ export default function GatewayCard({
               }
               onClick={() => batchApply.mutate()}
             >
-              {batchApply.isPending ? "处理中…" : "按勾选改指"}
+              {batchApply.isPending ? t("gateway.batch.applyBtn") : t("gateway.batch.applyBtnIdle")}
             </button>
             <button
               type="button"
@@ -559,20 +535,16 @@ export default function GatewayCard({
                 setBatchPicked({});
               }}
             >
-              取消
+              {t("gateway.batch.cancelBtn")}
             </button>
           </div>
-          <p className="muted">
-            某一条失败不会中断其它条（例如目标文件正被别的程序占用）。
-            已经改成功的那几条<strong>不会</strong>回滚——要的是「尽量都改掉」，
-            不是「要么全成要么全不成」。
-          </p>
+          <p className="muted">{t("gateway.batch.hint")}</p>
         </div>
       ) : null}
 
       {batchResults.length > 0 ? (
         <div className="card">
-          <h4>批量结果</h4>
+          <h4>{t("gateway.batch.resultTitle")}</h4>
           {batchResults.map((r) => (
             <p key={`${r.label}-${r.detail}`} className={r.ok ? "muted" : "error"} role={r.ok ? undefined : "alert"}>
               {r.ok ? "✓" : "✗"} {r.label} —— {r.detail}

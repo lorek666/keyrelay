@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::inject::Journal;
 use crate::site::KeyStatus;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// 「已回收」——**本地**密钥生命周期状态（M7-S4 / FR-2）。
 ///
@@ -163,6 +163,29 @@ CREATE TABLE IF NOT EXISTS usage_snapshots(
   ts INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_usage_snapshots_site ON usage_snapshots(site_id, ts DESC);
+-- M14-S1：模型别名映射（B-110 / FR-6）。alias 为主键：重复 alias 后者胜，
+-- 与 routing::alias_map 的 BTreeMap::insert 语义一致。只存映射，不存密钥。
+CREATE TABLE IF NOT EXISTS model_aliases(
+  alias TEXT PRIMARY KEY,
+  real_model TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+-- M14-S3：每把 key 的每日用量采样（Sub2API `usage/daily` 的 items）。NewAPI 不写本表（无日趋势）。
+-- 字段名与 Sub2API 源码 `APIKeyDailyUsagePoint` 一致（input_tokens / output_tokens，非 tokens_in/out）。
+CREATE TABLE IF NOT EXISTS usage_samples(
+  id INTEGER PRIMARY KEY,
+  key_id INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
+  site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  date TEXT NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  cost REAL NOT NULL DEFAULT 0,
+  sampled_at INTEGER NOT NULL,
+  UNIQUE(key_id, date)
+);
+CREATE INDEX IF NOT EXISTS idx_usage_samples_key ON usage_samples(key_id, date DESC);
 "#;
 
 fn now_secs() -> i64 {
@@ -190,7 +213,7 @@ pub struct SiteRow {
     pub health: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct KeyRow {
     pub id: i64,
     pub site_id: i64,
@@ -202,6 +225,12 @@ pub struct KeyRow {
     /// 本地记账的创建时间（unix 秒）。M6-S5 起用于密钥轮换判定
     /// （`rotation::due_keys`）；列一直是 `NOT NULL`，只是先前没进 `SELECT`。
     pub created_at: i64,
+    /// M14-S3：该 key 的当前累计已用（USD）。`None` = 未采集 / 站点未给。
+    pub quota_used: Option<f64>,
+    /// M14-S3：该 key 的限额（USD）。`None` = 不限 / 未采集。
+    pub quota_limit: Option<f64>,
+    /// M14-S3：币种（`"USD"`）。
+    pub currency: Option<String>,
 }
 
 /// 事件行。`message` / `payload` 在写入时已脱敏。
@@ -337,6 +366,21 @@ pub struct UsageSnapshotRow {
     pub remaining: f64,
     pub currency: String,
     pub known: bool,
+}
+
+/// 一把 key 一天的用量采样行（M14-S3，Sub2API `usage/daily`）。**不含密钥**。
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageSampleRow {
+    pub id: i64,
+    pub key_id: i64,
+    pub site_id: i64,
+    pub date: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub cost: f64,
+    pub sampled_at: i64,
 }
 
 pub struct Store {
@@ -606,7 +650,8 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, site_id, remote_id, name, group_name, secret_ref, status, created_at
+                "SELECT id, site_id, remote_id, name, group_name, secret_ref, status, created_at,
+                        quota_used, quota_limit, currency
                  FROM keys WHERE id = ?1",
             )
             .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
@@ -621,6 +666,9 @@ impl Store {
                     secret_ref: row.get(5)?,
                     status: row.get(6)?,
                     created_at: row.get(7)?,
+                    quota_used: row.get(8)?,
+                    quota_limit: row.get(9)?,
+                    currency: row.get(10)?,
                 })
             })
             .map_err(|e| Error::Store(format!("查询密钥失败: {e}")))?;
@@ -964,7 +1012,8 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, site_id, remote_id, name, group_name, secret_ref, status, created_at
+                "SELECT id, site_id, remote_id, name, group_name, secret_ref, status, created_at,
+                        quota_used, quota_limit, currency
                  FROM keys ORDER BY id",
             )
             .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
@@ -979,6 +1028,9 @@ impl Store {
                     secret_ref: row.get(5)?,
                     status: row.get(6)?,
                     created_at: row.get(7)?,
+                    quota_used: row.get(8)?,
+                    quota_limit: row.get(9)?,
+                    currency: row.get(10)?,
                 })
             })
             .map_err(|e| Error::Store(format!("查询密钥失败: {e}")))?;
@@ -1526,6 +1578,160 @@ impl Store {
         let n = conn
             .execute("DELETE FROM usage_snapshots WHERE ts < ?1", params![cutoff])
             .map_err(|e| Error::Store(format!("prune usage snapshots: {e}")))?;
+        Ok(n)
+    }
+
+    // ============================================================ M14-S1：模型别名映射（B-110）
+
+    /// 列出全部别名映射（B-110）。按 `alias` 升序——确定顺序，与
+    /// [`routing::alias_map`] 的 `BTreeMap` 遍历序一致。
+    ///
+    /// 只读，不持有任何锁之外的状态。返回 `Vec<(alias, real_model)>`。
+    pub fn list_alias_map(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT alias, real_model FROM model_aliases ORDER BY alias ASC")
+            .map_err(|e| Error::Store(format!("prepare alias map: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| Error::Store(format!("query alias map: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect alias map: {e}")))
+    }
+
+    /// 插入或覆盖一条别名映射（B-110）。`alias` 为主键 ⇒ 重复后者胜，
+    /// 与 [`routing::alias_map`] 的 `BTreeMap::insert` 语义一致。
+    ///
+    /// **纵深防御**：空 / 空白 / 超长（>128）入参在这里就拒绝——命令层也校验，
+    /// 两层都校验不冲突；store 层是最后一道（防绕过命令层直接写库的路径）。
+    /// 入参先 `trim`：用户前后空格不构成 alias 的一部分。
+    pub fn upsert_alias(&self, alias: &str, real_model: &str) -> Result<()> {
+        let alias = alias.trim();
+        let real_model = real_model.trim();
+        if alias.is_empty() || real_model.is_empty() {
+            return Err(Error::Store("alias 与 real_model 都不能为空或空白".into()));
+        }
+        if alias.len() > 128 || real_model.len() > 128 {
+            return Err(Error::Store("alias 与 real_model 长度上限 128".into()));
+        }
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO model_aliases(alias, real_model, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(alias) DO UPDATE SET real_model = ?2, updated_at = ?3",
+            params![alias, real_model, now_secs()],
+        )
+        .map_err(|e| Error::Store(format!("upsert alias: {e}")))?;
+        Ok(())
+    }
+
+    /// 删除一条别名映射（B-110）。不存在的 `alias` ⇒ 幂等返回 `Ok(())`
+    /// （解绑是收尾动作，二次调用不该报错，与 `unbind_*` 同口径）。
+    /// 入参先 `trim`：与 `upsert` 同口径，防止「存的是 trimmed、删的是带空格」导致删不掉。
+    pub fn delete_alias(&self, alias: &str) -> Result<()> {
+        let alias = alias.trim();
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM model_aliases WHERE alias = ?1", params![alias])
+            .map_err(|e| Error::Store(format!("delete alias: {e}")))?;
+        Ok(())
+    }
+
+    /// M14-S3：写入 / 覆盖一把 key 一天的用量采样（Sub2API `usage/daily`）。
+    /// `UNIQUE(key_id, date)` + `INSERT OR REPLACE`：每轮覆盖同日，不堆积。
+    pub fn upsert_usage_sample(
+        &self,
+        key_id: i64,
+        site_id: i64,
+        sample: &crate::site::KeyDailyUsage,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO usage_samples
+             (key_id, site_id, date, requests, input_tokens, output_tokens, total_tokens, cost, sampled_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                key_id,
+                site_id,
+                sample.date,
+                sample.requests,
+                sample.input_tokens,
+                sample.output_tokens,
+                sample.total_tokens,
+                sample.cost,
+                now_secs()
+            ],
+        )
+        .map_err(|e| Error::Store(format!("upsert usage sample: {e}")))?;
+        Ok(())
+    }
+
+    /// M14-S3：查一把 key 近 `days` 天内采集的用量采样，按 `date` 升序（前端趋势用）。
+    ///
+    /// 过滤用 `sampled_at`（采集时间）而非 `date`（站点侧日期）：每轮覆盖同日，
+    /// `sampled_at` 总是最近一轮；`days=30` 覆盖最近一轮的全部 30 天 `date`。
+    /// 前端若要更窄的 date 窗口，在返回数据上自行截断。
+    pub fn recent_key_usage(&self, key_id: i64, days: i64) -> Result<Vec<UsageSampleRow>> {
+        let days = days.max(1);
+        let cutoff = now_secs() - days * 86400;
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, key_id, site_id, date, requests, input_tokens, output_tokens,
+                        total_tokens, cost, sampled_at
+                 FROM usage_samples
+                 WHERE key_id = ?1 AND sampled_at >= ?2
+                 ORDER BY date ASC LIMIT 90",
+            )
+            .map_err(|e| Error::Store(format!("prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![key_id, cutoff], |row| {
+                Ok(UsageSampleRow {
+                    id: row.get(0)?,
+                    key_id: row.get(1)?,
+                    site_id: row.get(2)?,
+                    date: row.get(3)?,
+                    requests: row.get(4)?,
+                    input_tokens: row.get(5)?,
+                    output_tokens: row.get(6)?,
+                    total_tokens: row.get(7)?,
+                    cost: row.get(8)?,
+                    sampled_at: row.get(9)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect: {e}")))
+    }
+
+    /// M14-S3：更新本地 key 行的当前累计用量（NewAPI / Sub2API 都用）。
+    /// `None` 写 `NULL`（不是 0——「不知道」与「用 0」必须分开，与 `Balance::known` 同纪律）。
+    pub fn update_key_usage(
+        &self,
+        key_id: i64,
+        quota_used: Option<f64>,
+        quota_limit: Option<f64>,
+        currency: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE keys SET quota_used = ?2, quota_limit = ?3, currency = ?4 WHERE id = ?1",
+            params![key_id, quota_used, quota_limit, currency],
+        )
+        .map_err(|e| Error::Store(format!("update key usage: {e}")))?;
+        Ok(())
+    }
+
+    /// M14-S3：裁剪用量采样，只保留最近 N 天。在 `refresh_all` 里调用。
+    pub fn prune_usage_samples(&self, days: i64) -> Result<usize> {
+        let cutoff = now_secs() - days * 86400;
+        let conn = self.lock()?;
+        let n = conn
+            .execute(
+                "DELETE FROM usage_samples WHERE sampled_at < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| Error::Store(format!("prune usage samples: {e}")))?;
         Ok(n)
     }
 }

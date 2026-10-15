@@ -1,0 +1,21 @@
+[package]
+name = "keyrelay-cli"
+description = "KeyRelay 薄 CLI：把 KeyRelayService 的 apply_delivery / rollback_delivery 包成可脚本化入口（B-118 / M14-S4）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "keyrelay-cli"
+path = "src/main.rs"
+
+[dependencies]
+# 仅 keyrelay-core + serde_json。serde_json 本就在 Cargo.lock（keyrelay-core 用），
+# 作为直接依赖不引入新第三方代码（与 M7-S0 zeroize 同口径）。
+# 不引入 clap：手动 argv 解析，零新依赖（章程 §3.3 规则 3 纪律）。
+keyrelay-core = { workspace = true }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -257,7 +257,13 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::captcha_cancel,
             // M13-S1：Token 消耗统计
             commands::recent_gateway_usage,
-            commands::recent_usage_snapshots
+            commands::recent_usage_snapshots,
+            // M14-S3：per-key 用量采样（Sub2API usage/daily）
+            commands::recent_key_usage,
+            // M14-S1：模型别名映射（B-110）
+            commands::list_alias_map,
+            commands::upsert_alias,
+            commands::delete_alias
         ])
 }
 

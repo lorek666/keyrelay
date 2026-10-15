@@ -6,6 +6,7 @@ import {
   relaunchApp,
   type UpdateInfo,
 } from "../lib/api";
+import { useTranslation, translate, getCurrentDict } from "../i18n";
 
 type Phase =
   | "idle"
@@ -16,11 +17,12 @@ type Phase =
   | "error";
 
 // U6：不直接展示原始 err.message（可能含 URL/内部路径/主机名），按类别归一到通用文案。
+// M14-S2：归一文案走 i18n；正则里的「校验」是匹配后端错误原文的串，不抽——i18n:skip
 function scrubError(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
-  if (/fetch|network|404|not found|failed to/i.test(msg)) return "无法连接更新服务器";
-  if (/signature|verify|校验/i.test(msg)) return "更新包签名校验失败";
-  return "更新检查失败，请稍后重试";
+  if (/fetch|network|404|not found|failed to/i.test(msg)) return translate(getCurrentDict(), "update.scrub.network");
+  if (/signature|verify|校验/i.test(msg)) return translate(getCurrentDict(), "update.scrub.signature");  // i18n:skip
+  return translate(getCurrentDict(), "update.scrub.default");
 }
 
 export default function UpdateChecker({
@@ -28,6 +30,7 @@ export default function UpdateChecker({
 }: {
   autoCheckOnMount?: boolean;
 }) {
+  const { t } = useTranslation();
   const [phase, setPhase] = useState<Phase>("idle");
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -63,11 +66,7 @@ export default function UpdateChecker({
     try {
       await downloadAndInstallUpdate();
       // U4：安装完成，relaunch 前让用户确认——未保存的修改（站点表单/配置）会丢失。
-      if (
-        window.confirm(
-          "更新已下载完成，即将重启应用以生效。未保存的修改会丢失，是否现在重启？"
-        )
-      ) {
+      if (window.confirm(t("update.confirm"))) {
         await relaunchApp();
       } else {
         setPhase("idle");
@@ -92,21 +91,21 @@ export default function UpdateChecker({
     <div className="update-checker">
       {phase === "idle" && (
         <button type="button" className="btn btn-secondary" onClick={doCheck}>
-          <RefreshCw size={14} /> 检查更新
+          <RefreshCw size={14} /> {t("update.checkBtn")}
         </button>
       )}
 
       {phase === "checking" && (
         <button type="button" className="btn btn-secondary" disabled>
-          <RefreshCw size={14} className="spinning" /> 检查中…
+          <RefreshCw size={14} className="spinning" /> {t("update.checking")}
         </button>
       )}
 
       {phase === "not-available" && (
         <div className="update-status">
-          <span>当前已是最新版本</span>
+          <span>{t("update.latest")}</span>
           <button type="button" className="btn btn-secondary" onClick={doCheck}>
-            再检查一次
+            {t("update.recheck")}
           </button>
         </div>
       )}
@@ -114,26 +113,26 @@ export default function UpdateChecker({
       {phase === "available" && update && (
         <div className="update-available">
           <div className="update-info">
-            <strong>新版本 {update.version}</strong>
+            <strong>{t("update.newVersion", { version: update.version })}</strong>
             {update.body && <p className="update-body">{update.body}</p>}
           </div>
           <button type="button" className="btn btn-primary" onClick={doInstall}>
-            <Download size={14} /> 下载并安装
+            <Download size={14} /> {t("update.downloadBtn")}
           </button>
         </div>
       )}
 
       {phase === "downloading" && (
         <div className="update-downloading">
-          <span>下载中…</span>
+          <span>{t("update.downloading")}</span>
         </div>
       )}
 
       {phase === "error" && (
         <div className="update-error">
-          <span className="warn">更新检查失败：{error}</span>
+          <span className="warn">{t("update.error", { error: error ?? "" })}</span>
           <button type="button" className="btn btn-secondary" onClick={doCheck}>
-            重试
+            {t("common.retry")}
           </button>
         </div>
       )}

@@ -548,6 +548,11 @@ pub fn sibling_config_files(target: &std::path::Path) -> Vec<std::path::PathBuf>
 
 pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     registry: SiteRegistry<T>,
+    /// M14-S1：模型清单采集（`site::fetch_models`）用。`registry` 已持有一份用于 adapter，
+    /// 这里再留一份是因为 `fetch_models` 是独立函数、不通过 adapter——给 registry 加
+    /// `transport()` getter 要动 `site/registry.rs`（不在写域）。`T: Clone`，clone 成本
+    /// 是 `Arc` 级别（MockTransport / reqwest transport 都是 `Arc` 包裹）。
+    transport: T,
     store: Store,
     sessions: SessionCache,
     vault: Arc<dyn Vault>,
@@ -631,6 +636,9 @@ struct SiteObservations {
     rate: Option<f64>,
     balance_usd: Option<f64>,
     latency_ms: Option<u64>,
+    /// M14-S1：最近一次采集模型清单的 unix 秒（B-99 ① 节流用）。`None` = 从没采过。
+    /// **不落库**——与四项观测同口径（M8-S1 D-4）；重启回到「从没采过」。
+    models_collected_at: Option<i64>,
 }
 
 /// 网关失败的内存缓冲上限。见 [`KeyRelayService::gateway_failures`] 的说明。
@@ -699,7 +707,8 @@ struct NotifyState {
 impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     pub fn new(store: Store, transport: T, config: ServiceConfig) -> Self {
         let svc = Self {
-            registry: SiteRegistry::new(transport),
+            registry: SiteRegistry::new(transport.clone()),
+            transport,
             store,
             sessions: SessionCache::new(),
             vault: config.vault,
@@ -1626,6 +1635,17 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         }
         let keys = self.list_keys(site.id).await;
 
+        // M14-S3：per-key 用量采集（仅 key_usage=true 的站点；失败静默不阻塞，spec §7.4）。
+        // 放在 `keys` 借用之后、move 进 `SiteRefresh` 之前。
+        if let Ok(kind) = self.kind_of(&site) {
+            if crate::site::capability::capabilities(kind).key_usage {
+                if let Ok(list) = &keys {
+                    self.collect_key_usage(site.id, kind, &site.base_url, list)
+                        .await;
+                }
+            }
+        }
+
         SiteRefresh {
             needs_login_without_session: false,
             site_id: site.id,
@@ -1636,6 +1656,98 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             keys: Some(keys),
             drift,
             rotation_due,
+        }
+    }
+
+    /// M14-S3：per-key 用量采集（spec §7）。
+    ///
+    /// - 从站点侧 `list_keys` 的 `KeyMeta` 取当前累计用量，写 `keys.quota_used/quota_limit`；
+    /// - 对 Sub2API（`fetch_key_daily_usage` 返回非空）另写 `usage_samples` 日趋势。
+    ///
+    /// 节流（spec §7.4）：每 key 每轮一次 usage 请求、顺序（并发 1 ≤ 2 上限）、失败静默不阻塞。
+    /// 仅对「本地已登记 + 站点侧仍存在」的 key 做（by `remote_id` join）——用量列只在本地表显示。
+    async fn collect_key_usage(
+        &self,
+        site_id: i64,
+        kind: crate::site::SiteKind,
+        base_url: &str,
+        site_keys: &[crate::site::KeyMeta],
+    ) {
+        // 本地已登记 key（KeyRow），按 site_id 过滤
+        let local_rows = match self.store.list_keys() {
+            Ok(rows) => rows,
+            Err(e) => {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "site",
+                    format!("采集用量时读本地密钥失败: {e}"),
+                    serde_json::json!({ "site_id": site_id }),
+                ));
+                return;
+            }
+        };
+        let session = match self.session(site_id) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let adapter = self.registry.adapter(kind);
+
+        for meta in site_keys {
+            // join：本地 KeyRow.remote_id == Some(meta.remote_id)
+            let Some(local_id) = local_rows
+                .iter()
+                .find(|r| r.remote_id.as_deref() == Some(meta.remote_id.as_str()))
+                .map(|r| r.id)
+            else {
+                continue;
+            };
+            // ① 写当前累计用量（NewAPI / Sub2API 都有，来自 list_keys 的 KeyMeta）
+            if let Err(e) = self.store.update_key_usage(
+                local_id,
+                meta.quota_used,
+                meta.quota_limit,
+                meta.currency.as_deref(),
+            ) {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "site",
+                    format!("写 key 用量失败: {e}"),
+                    serde_json::json!({ "site_id": site_id, "key_id": local_id }),
+                ));
+            }
+            // ② 日趋势（Sub2API 覆盖 fetch_key_daily_usage；NewAPI 默认返回空 Vec，零请求）
+            match adapter
+                .fetch_key_daily_usage(base_url, &session, &meta.remote_id)
+                .await
+            {
+                Ok(points) => {
+                    for p in &points {
+                        if let Err(e) = self.store.upsert_usage_sample(local_id, site_id, p) {
+                            self.log(observability::event_with_payload(
+                                Level::Warn,
+                                "site",
+                                format!("写用量采样失败: {e}"),
+                                serde_json::json!({ "site_id": site_id, "key_id": local_id }),
+                            ));
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    // 会话失效：标 needs_login 并停（下一把也会 401）。spec §7.4 会话失效例外。
+                    if is_auth_failure(&err) {
+                        self.on_auth_error(site_id, err);
+                        return;
+                    }
+                    // 其他失败：静默记 event，继续下一把（spec §7.4 失败静默不阻塞）。
+                    self.log(observability::event_with_payload(
+                        Level::Warn,
+                        "site",
+                        format!("采集 key 用量失败: {}", error_kind(&err)),
+                        serde_json::json!({ "site_id": site_id, "key_id": local_id }),
+                    ));
+                }
+            }
         }
     }
 
@@ -1660,6 +1772,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // M13-S1：裁剪用量日志，保留最近 90 天（P2-2）。
         let _ = self.store.prune_gateway_usage_log(90);
         let _ = self.store.prune_usage_snapshots(90);
+        // M14-S3：裁剪 per-key 用量采样，保留最近 90 天（与 gateway_usage_log / usage_snapshots 同口径）。
+        let _ = self.store.prune_usage_samples(90);
         let settings = self.settings()?;
         let sites = self.store.list_sites()?;
         let mut summary = RefreshSummary {
@@ -1831,6 +1945,57 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             }),
         ));
 
+        // M14-S1：模型清单采集（B-99 ①）。按节流，每轮最多 1 站，失败静默。
+        // 放在快照与通知之间：采集只更新 `site_facts[*].models`（路由表用），
+        // 不进 snapshot（notify 的 models 字段本轮仍 None，与既有行为一致）。
+        if settings.collect_models {
+            let now = unix_now_secs();
+            let policy = crate::notify::ModelsPolicy {
+                enabled: true,
+                min_interval_secs: settings.models_min_interval_secs,
+            };
+            for site in self.store.list_sites()? {
+                // 该站有没有可用 key（没有就跳过——采集要带 key）
+                let Some(row) = self.pick_gateway_key(site.id).ok().flatten() else {
+                    continue;
+                };
+                let Ok(secret) = self.secret_for_row(&row) else {
+                    continue;
+                };
+                // 节流判定（should_collect_models 是纯函数，已含时钟回拨与边界处理）
+                let last = self
+                    .site_facts
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&site.id).and_then(|o| o.models_collected_at));
+                if !crate::notify::should_collect_models(policy, last, now) {
+                    continue;
+                }
+                // 采集：每轮最多 1 站（M8-S1 §5.2），命中第一个该采的就采然后 break。
+                match crate::site::fetch_models(&self.transport, &site.base_url, &secret).await {
+                    Ok(fetched) => {
+                        if let Ok(mut map) = self.site_facts.lock() {
+                            let obs = map.entry(site.id).or_default();
+                            obs.models = crate::notify::merge_models(&obs.models, Some(&fetched));
+                            obs.models_collected_at = Some(now);
+                        }
+                    }
+                    Err(err) => {
+                        // 失败静默：只记 Debug 事件，不阻塞刷新、不清空已有 models
+                        self.log(observability::event_with_payload(
+                            Level::Debug,
+                            "app",
+                            format!(
+                                "模型清单采集失败: {}",
+                                crate::redact::scrub(&err.to_string())
+                            ),
+                            serde_json::json!({ "site_id": site.id }),
+                        ));
+                    }
+                }
+                break;
+            }
+        }
         self.dispatch_notifications(snapshots);
         Ok(summary)
     }
@@ -3088,8 +3253,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             api_key,
             site.display_name,
         );
-        // route / keys_by_ref 保持 single_upstream 的默认（空）：legacy 单上游路径用
-        // config.base_url / api_key（所选站点）。多站路由见 B-99。
+        // M14-S1：多站路由开关（B-99）。关时（默认）走 single_upstream——config.base_url
+        // / api_key 是所选站点，M8-S4 §6.5 换站语义逐字不变；开时用 build_gateway_route
+        // 填非空 route + keys_by_ref，网关按模型选路（多站聚合，FR-6 V1.1 可选）。
+        if self.settings()?.gateway_multi_site {
+            let (route, keys) = self.build_gateway_route()?;
+            config.route = route;
+            config.keys_by_ref = keys;
+        }
         // ③ 已回收集合：网关只**查**它，不新开取密钥路径。
         config.site_id = site_id;
         config.revoked_refs = Some(Arc::clone(&self.revoked_refs));
@@ -3293,8 +3464,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// **每个站点取哪一把 key**：取该站点**最新**的一条（`list_keys` 按 id 倒序无所谓，
     /// 这里显式按 id 取最大）。多把 key 的站点应当由用户自己决定用哪把——今天没有这个界面，
     /// 登记为限制（不是缺陷：站点的多把 key 在额度上等价，取最新那把是最不容易过期的）。
-    /// B-99 接线后启用（多站路由）。当前 gateway_config 用空 route（legacy 单上游，P1-4）。
-    #[allow(dead_code)]
+    /// B-99 接线后启用（M14-S1 接线）：`gateway_config` 在 `gateway_multi_site` 开关开时调用（多站路由）。
     fn build_gateway_route(
         &self,
     ) -> Result<(
@@ -3345,12 +3515,17 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             }
         }
 
-        Ok((crate::routing::build_route_table(&facts), keys))
+        // M14-S1：接 alias 表（B-110）。逐条喂 with_alias（M7-S1 冻结的消费点）。
+        let table = crate::routing::build_route_table(&facts);
+        let aliases = self.store.list_alias_map()?;
+        let table = aliases
+            .iter()
+            .fold(table, |t, (alias, real)| t.with_alias(alias, real));
+        Ok((table, keys))
     }
 
     /// 该站点用来出网的 key：**未回收**且未禁用/耗尽里 id 最大的那一条（最新的一把）。
-    /// B-99 接线后启用。当前不被调用（build_gateway_route 死代码，P1-4）。
-    #[allow(dead_code)]
+    /// B-99 接线后启用（M14-S1 接线）：被 `build_gateway_route` 与 `refresh_all` 采集段调用（取每站最新可用 key）。
     fn pick_gateway_key(&self, site_id: i64) -> Result<Option<crate::store::KeyRow>> {
         Ok(self
             .store

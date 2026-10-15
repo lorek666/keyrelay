@@ -17,8 +17,10 @@ import {
 } from "../lib/api";
 import ConfirmDialog from "../components/ConfirmDialog";
 import CapButton from "../components/CapButton";
+import { useTranslation, translate, getCurrentDict } from "../i18n";
 
 export default function Sites() {
+  const { t } = useTranslation();
   const qc = useQueryClient();
   const [baseUrl, setBaseUrl] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
@@ -38,7 +40,11 @@ export default function Sites() {
     mutationFn: detectSite,
     onSuccess: (fp) => {
       setError(null);
-      setNotice(`识别成功：${fp.displayName}（${fp.kind} ${fp.version ?? "未知版本"}）`);
+      setNotice(t("sites.notice.detected", {
+        name: fp.displayName,
+        kind: fp.kind,
+        version: fp.version ?? t("sites.notice.unknownVersion"),
+      }));
     },
     onError: (err: Error) => {
       setNotice(null);
@@ -50,7 +56,7 @@ export default function Sites() {
     mutationFn: addSite,
     onSuccess: async (site) => {
       setError(null);
-      setNotice(`已加入站点：${site.displayName}`);
+      setNotice(t("sites.notice.added", { name: site.displayName }));
       setBaseUrl("");
       await qc.invalidateQueries({ queryKey: ["sites"] });
       await qc.invalidateQueries({ queryKey: ["app-info"] });
@@ -71,7 +77,7 @@ export default function Sites() {
       }),
     onSuccess: async () => {
       setError(null);
-      setNotice(`已登录：${loginTarget?.displayName ?? ""}`);
+      setNotice(t("sites.notice.loggedIn", { name: loginTarget?.displayName ?? "" }));
       // 密码只在这一刻存在于内存里，用完立刻清掉
       setPassword("");
       setSecondFactor("");
@@ -107,7 +113,7 @@ export default function Sites() {
     onSuccess: () => {
       setError(null);
       setCaptchaOpened(true);
-      setNotice("已打开站点官方页面。请在窗口里由您自己完成登录与验证码，完成后回到这里点「我已过完，接上会话」。");
+      setNotice(t("sites.notice.opened"));
     },
     onError: (err: Error) => setError(err.message),
   });
@@ -117,7 +123,7 @@ export default function Sites() {
     mutationFn: (siteId: number) => captchaComplete(siteId),
     onSuccess: async () => {
       setError(null);
-      setNotice(`人机验证完成，会话已接上：${captchaSite?.displayName ?? ""}`);
+      setNotice(t("sites.notice.captchaDone", { name: captchaSite?.displayName ?? "" }));
       setCaptchaSite(null);
       setCaptchaOpened(false);
       // 与「登录成功」同一组失效：会话状态、远端/本地密钥、余额。
@@ -132,7 +138,7 @@ export default function Sites() {
   const cancelCaptcha = useMutation({
     mutationFn: (siteId: number) => captchaCancel(siteId),
     onSuccess: () => {
-      setNotice("已取消人工验证。需要时重新点「登录」即可再试一次。");
+      setNotice(t("sites.notice.cancelled"));
       setCaptchaSite(null);
       setCaptchaOpened(false);
     },
@@ -147,7 +153,7 @@ export default function Sites() {
     <section>
 
       <div className="card">
-        <h3>接入新站点</h3>
+        <h3>{t("sites.title")}</h3>
         <div className="row">
           <input
             className="input grow"
@@ -162,7 +168,7 @@ export default function Sites() {
             disabled={!baseUrl || detect.isPending}
             onClick={() => detect.mutate(baseUrl)}
           >
-            测试连接
+            {t("sites.btn.test")}
           </button>
           <button
             type="button"
@@ -170,12 +176,10 @@ export default function Sites() {
             disabled={!baseUrl || add.isPending}
             onClick={() => add.mutate(baseUrl)}
           >
-            <Plus size={14} aria-hidden /> 加入
+            <Plus size={14} aria-hidden /> {t("sites.btn.add")}
           </button>
         </div>
-        <p className="muted">
-          只会调用站点的公开状态接口做指纹识别；登录凭证不落库，只进系统钥匙串。
-        </p>
+        <p className="muted">{t("sites.hint.fingerprint")}</p>
       </div>
 
       {notice ? <p className="ok" role="status">{notice}</p> : null}
@@ -187,12 +191,8 @@ export default function Sites() {
 
       {captchaSite ? (
         <div className="card">
-          <h3>需要人机验证：{captchaSite.displayName}</h3>
-          <p className="muted">
-            该站点要求人机验证。KeyRelay 不绕过验证码——请点下面的按钮打开站点官方页面，
-            由您自己完成登录与验证；过完之后回到这里点「我已过完，接上会话」。
-            窗口里的页面是站点自己的页面，我们不会替您点击、也不会读取页面内容。
-          </p>
+          <h3>{t("sites.hint.captchaTitle", { name: captchaSite.displayName })}</h3>
+          <p className="muted">{t("sites.hint.captchaBody")}</p>
           <div className="row">
             <button
               type="button"
@@ -200,7 +200,7 @@ export default function Sites() {
               disabled={beginCaptcha.isPending}
               onClick={() => beginCaptcha.mutate(captchaSite.id)}
             >
-              打开官方页面过一次
+              {t("sites.btn.openOfficial")}
             </button>
             <button
               type="button"
@@ -208,7 +208,7 @@ export default function Sites() {
               disabled={!captchaOpened || finishCaptcha.isPending}
               onClick={() => finishCaptcha.mutate(captchaSite.id)}
             >
-              {finishCaptcha.isPending ? "接上会话中…" : "我已过完，接上会话"}
+              {finishCaptcha.isPending ? t("sites.btn.connecting") : t("sites.btn.finishCaptcha")}
             </button>
             <button
               type="button"
@@ -216,7 +216,7 @@ export default function Sites() {
               disabled={cancelCaptcha.isPending}
               onClick={() => cancelCaptcha.mutate(captchaSite.id)}
             >
-              取消
+              {t("common.cancel")}
             </button>
           </div>
         </div>
@@ -224,31 +224,31 @@ export default function Sites() {
 
       <div className="card">
         <div className="row row-between">
-          <h3>已接入（{sites.data?.length ?? 0}）</h3>
+          <h3>{t("sites.list.title", { count: sites.data?.length ?? 0 })}</h3>
           <button
             type="button"
             className="btn btn-ghost"
             onClick={() => sites.refetch()}
             disabled={sites.isFetching}
           >
-            <RefreshCw size={14} aria-hidden /> 刷新
+            <RefreshCw size={14} aria-hidden /> {t("common.refresh")}
           </button>
         </div>
 
-        {sites.isLoading ? <p className="muted">加载中…</p> : null}
+        {sites.isLoading ? <p className="muted">{t("common.loading")}</p> : null}
         {sites.data?.length === 0 ? (
-          <p className="muted">还没有站点。填一个中转站地址，点「测试连接」开始。</p>
+          <p className="muted">{t("sites.list.empty")}</p>
         ) : null}
 
         {sites.data?.length ? (
           <table className="table">
             <thead>
               <tr>
-                <th>名称</th>
-                <th>类型</th>
-                <th>地址</th>
-                <th>状态</th>
-                <th>余额</th>
+                <th>{t("sites.table.name")}</th>
+                <th>{t("sites.table.kind")}</th>
+                <th>{t("sites.table.url")}</th>
+                <th>{t("sites.table.status")}</th>
+                <th>{t("sites.table.balance")}</th>
                 <th />
               </tr>
             </thead>
@@ -274,8 +274,8 @@ export default function Sites() {
 
       <ConfirmDialog
         open={loginTarget !== null}
-        title={`登录 ${loginTarget?.displayName ?? ""}`}
-        confirmLabel={login.isPending ? "登录中…" : "登录"}
+        title={t("sites.loginDialog.title", { name: loginTarget?.displayName ?? "" })}
+        confirmLabel={login.isPending ? t("sites.loginDialog.confirming") : t("sites.loginDialog.confirm")}
         confirmDisabled={!username || !password || login.isPending}
         onCancel={() => {
           setPassword("");
@@ -284,10 +284,7 @@ export default function Sites() {
         }}
         onConfirm={() => login.mutate()}
       >
-        <p className="muted">
-          密码只用于本次登录请求；若站点启用了登录加密，会在本机完成加密后再发送。
-          凭证不会写入本地数据库。
-        </p>
+        <p className="muted">{t("sites.loginDialog.body")}</p>
         <label className="field">
           <span>{fieldHint.label}</span>
           <input
@@ -300,7 +297,7 @@ export default function Sites() {
           />
         </label>
         <label className="field">
-          <span>密码</span>
+          <span>{t("sites.loginDialog.password")}</span>
           <input
             className="input"
             type="password"
@@ -310,7 +307,7 @@ export default function Sites() {
           />
         </label>
         <label className="field">
-          <span>二次验证码（可选）</span>
+          <span>{t("sites.loginDialog.secondFactor")}</span>
           <input
             className="input"
             value={secondFactor}
@@ -327,12 +324,12 @@ export default function Sites() {
 function healthLabel(health: string): string {
   switch (health) {
     case "ok":
-      return "已登录";
+      return translate(getCurrentDict(), "common.health.ok");
     case "needs_login":
-      return "需要重新登录";
+      return translate(getCurrentDict(), "common.health.needsLogin");
     default:
       // `unknown` 或将来新增的取值：不谎报「已登录」
-      return "未登录";
+      return translate(getCurrentDict(), "common.health.unknown");
   }
 }
 
@@ -350,12 +347,12 @@ function loginFieldHint(field: SiteRow["loginField"]): {
   placeholder?: string;
 } {
   if (field === "email") {
-    return { label: "邮箱", placeholder: "name@example.com" };
+    return { label: translate(getCurrentDict(), "sites.loginField.email"), placeholder: "name@example.com" };
   }
   if (field === "username") {
-    return { label: "用户名" };
+    return { label: translate(getCurrentDict(), "sites.loginField.username") };
   }
-  return { label: "账号" };
+  return { label: translate(getCurrentDict(), "sites.loginField.account") };
 }
 
 /** 会话状态 → CSS 类名。未知取值落到 `unknown` 的样式，不伪装成正常。 */
@@ -371,6 +368,7 @@ function healthClass(health: string): string {
 }
 
 function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) {
+  const { t } = useTranslation();
   // 能力集为 false 的站点**连请求都不发**：后端也会提前拒绝（`Error::Unsupported`），
   // 但先发一次注定失败的请求只会让余额列闪一下「（需登录）」这种错的原因。
   const balance = useQuery({
@@ -381,15 +379,15 @@ function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) 
   });
 
   const balanceText = !site.capabilities.balance
-    ? "不可观测"
+    ? t("sites.balanceText.unobservable")
     : balance.isLoading
       ? "…"
       : balance.isError
         ? // 只有**确实是凭证问题**才说「（需登录）」（M8-S5B §6.9）。
           // 超时 / 5xx / 断网都说成「需登录」，用户会去重新登录一个根本不需要登录的站点。
           isAuthError(balance.error)
-          ? "（需登录）"
-          : "（查询失败）"
+          ? t("sites.balanceText.needLogin")
+          : t("sites.balanceText.queryFailed")
         : balance.data
           ? formatBalance(balance.data)
           : "—";
@@ -419,11 +417,11 @@ function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) 
             「不需要登录」之类的别的原因。文案与判断都来自 `capabilities`。 */}
         <CapButton
           allowed={site.capabilities.login}
-          reason="该站点类型不需要登录"
+          reason={t("sites.capReason.noLogin")}
           className="btn btn-ghost"
           onClick={onLogin}
         >
-          登录
+          {t("sites.btn.login")}
         </CapButton>
       </td>
     </tr>
@@ -438,7 +436,7 @@ function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) 
  * 以为这个站没钱了，也会让阈值告警看起来「已经触发过」（M7-S2 §6.5 硬要求 (a)）。
  */
 function formatBalance(balance: Balance): string {
-  if (!balance.known || balance.remaining === null) return "不可观测";
+  if (!balance.known || balance.remaining === null) return translate(getCurrentDict(), "sites.balanceText.unobservable");
   return `${balance.remaining.toFixed(2)} ${balance.currency}`;
 }
 
@@ -448,8 +446,8 @@ function balanceReason(
   balance?: Balance,
   error?: unknown,
 ): string | undefined {
-  if (!site.capabilities.balance) return "该站点类型不提供余额";
-  if (balance && !balance.known) return "站点这次没有返回可用的余额";
+  if (!site.capabilities.balance) return translate(getCurrentDict(), "sites.balanceReason.noCapability");
+  if (balance && !balance.known) return translate(getCurrentDict(), "sites.balanceReason.noUsable");
   // 查询失败时把**真实原因**放进 title（M8-S5B §6.9）：此前这里不处理错误，
   // 于是用户既看到错的文案（「需登录」），也看不到真正的原因。
   if (error instanceof Error) return error.message;

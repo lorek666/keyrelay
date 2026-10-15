@@ -395,7 +395,7 @@ fn parse_user_groups(data: &Value) -> Result<Vec<GroupInfo>> {
     Ok(out)
 }
 
-fn parse_key_meta(item: &Value) -> Result<Option<KeyMeta>> {
+fn parse_key_meta(item: &Value, quota_per_unit: i64) -> Result<Option<KeyMeta>> {
     // B-35：id 非法（非整数 / 0 / 负数）→ 整页失败，绝不静默跳过这一条
     // （静默跳过等于交付一份被悄悄截断的令牌列表）。
     let Some(remote_id) = normalize_id(item.get("id"))? else {
@@ -405,6 +405,32 @@ fn parse_key_meta(item: &Value) -> Result<Option<KeyMeta>> {
     let group = json_str(item, "/group")
         .filter(|g| !g.is_empty())
         .map(|g| g.to_string());
+    // M14-S3：NewAPI `list_keys` 列表项含 `used_quota` / `remain_quota` / `unlimited_quota`
+    //（M9-S6 §1）。整数 token 配额单位，`/ quota_per_unit` 换算成 USD（与 `balance()` 同口径）。
+    // `quota_per_unit` 是 `/api/user/self` 字段、`list_keys` 响应不返回，这里用适配器持有的值
+    //（`DEFAULT_QUOTA_PER_UNIT` 兜底，见 spec §11 差异⑤）。缺字段 ⇒ `None`（不写 0）。
+    let unit = quota_per_unit.max(1) as f64;
+    let quota_used = item
+        .get("used_quota")
+        .and_then(|v| v.as_i64())
+        .map(|q| q as f64 / unit);
+    let unlimited = item
+        .get("unlimited_quota")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let quota_limit = if unlimited {
+        None
+    } else {
+        item.get("remain_quota")
+            .and_then(|v| v.as_i64())
+            .map(|q| q as f64 / unit)
+    };
+    // 只在至少解析到一个用量字段时才标币种（避免给「全 None」的 key 一个误导性的 USD 标签）。
+    let currency = if quota_used.is_some() || quota_limit.is_some() {
+        Some("USD".to_string())
+    } else {
+        None
+    };
     Ok(Some(KeyMeta {
         remote_id,
         name,
@@ -418,6 +444,9 @@ fn parse_key_meta(item: &Value) -> Result<Option<KeyMeta>> {
             .get("accessed_time")
             .or_else(|| item.get("last_used_at"))
             .and_then(|v| v.as_i64()),
+        quota_used,
+        quota_limit,
+        currency,
     }))
 }
 
@@ -598,7 +627,7 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
             for item in &items {
                 // B-35：非法 id（非整数 / 0 / 负数）会让整页失败，只有「站点没给 id」
                 // 才跳过——静默跳过非法 id 等于交付一份被悄悄截断的令牌列表。
-                if let Some(meta) = parse_key_meta(item)? {
+                if let Some(meta) = parse_key_meta(item, self.quota_per_unit)? {
                     parsed.push(meta);
                 }
             }

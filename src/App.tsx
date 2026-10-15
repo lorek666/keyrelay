@@ -17,28 +17,49 @@ import History from "./pages/History";
 import SettingsPage from "./pages/Settings";
 import { appInfo, getSettings, runtimeMode } from "./lib/api";
 import { useApplyTheme } from "./lib/theme";
+import { I18nProvider, normalizeLang, useTranslation, type Lang } from "./i18n";
 
 // 侧栏分组（M11-S1 §2）：日常 / 资产 / 投递 / 系统。
 // `group` 只影响侧栏的归类与标题，不改页面组件、不改切换逻辑（本地 state 切换六个原页面）。
-const NAV_GROUPS = ["日常", "资产", "投递", "系统"] as const;
+// M14-S2：分组标签改成 i18n key，渲染时 `t(group)`。
+const NAV_GROUPS = [
+  "nav.group.daily",
+  "nav.group.asset",
+  "nav.group.delivery",
+  "nav.group.system",
+] as const;
 
 const PAGES = [
-  { id: "overview", label: "总览", icon: LayoutDashboard, group: "日常", render: () => <Overview /> },
-  { id: "sites", label: "站点", icon: Server, group: "资产", render: () => <Sites /> },
-  { id: "keys", label: "密钥", icon: KeyRound, group: "资产", render: () => <Keys /> },
-  { id: "agents", label: "Agent 投递", icon: Plug, group: "投递", render: () => <Agents /> },
-  { id: "history", label: "变更历史", icon: HistoryIcon, group: "日常", render: () => <History /> },
-  { id: "settings", label: "设置", icon: SettingsIcon, group: "系统", render: () => <SettingsPage /> },
+  { id: "overview", labelKey: "nav.overview", icon: LayoutDashboard, group: "nav.group.daily", render: () => <Overview /> },
+  { id: "sites", labelKey: "nav.sites", icon: Server, group: "nav.group.asset", render: () => <Sites /> },
+  { id: "keys", labelKey: "nav.keys", icon: KeyRound, group: "nav.group.asset", render: () => <Keys /> },
+  { id: "agents", labelKey: "nav.agents", icon: Plug, group: "nav.group.delivery", render: () => <Agents /> },
+  { id: "history", labelKey: "nav.history", icon: HistoryIcon, group: "nav.group.daily", render: () => <History /> },
+  { id: "settings", labelKey: "nav.settings", icon: SettingsIcon, group: "nav.group.system", render: () => <SettingsPage /> },
 ] as const;
 
 type PageId = (typeof PAGES)[number]["id"];
 
-export default function App() {
-  const [page, setPage] = useState<PageId>("overview");
-  const { data: info } = useQuery({ queryKey: ["app-info"], queryFn: appInfo });
+/**
+ * App：挂 `I18nProvider`。语言来自 `settings.language`（与主题同一 query），未知值回落 zh-CN。
+ * `initialDict` 由 `main.tsx` 预加载 zh-CN 传入，保证默认语言首屏不空（M14-S2 §9.2）。
+ */
+export default function App({ initialDict }: { initialDict?: Record<string, unknown> | null }) {
   // 与设置页共用 `["settings"]`：设置页保存后会失效这个键，主题随之立即生效（M9-S4 / F）
   const { data: settings } = useQuery({ queryKey: ["settings"], queryFn: getSettings });
   useApplyTheme(settings?.theme);
+  const lang: Lang = normalizeLang(settings?.language);
+  return (
+    <I18nProvider lang={lang} initialDict={initialDict}>
+      <AppInner />
+    </I18nProvider>
+  );
+}
+
+function AppInner() {
+  const { t } = useTranslation();
+  const [page, setPage] = useState<PageId>("overview");
+  const { data: info } = useQuery({ queryKey: ["app-info"], queryFn: appInfo });
   const current = PAGES.find((p) => p.id === page) ?? PAGES[0];
 
   return (
@@ -46,12 +67,12 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand">
           <KeyRound size={18} aria-hidden />
-          <span>KeyRelay</span>
+          <span>{t("nav.brand")}</span>
         </div>
         <nav>
           {NAV_GROUPS.map((group) => (
             <div className="nav-group" key={group}>
-              <p className="nav-group-label">{group}</p>
+              <p className="nav-group-label">{t(group)}</p>
               {PAGES.filter((item) => item.group === group).map((item) => {
                 const Icon = item.icon;
                 return (
@@ -62,7 +83,7 @@ export default function App() {
                     onClick={() => setPage(item.id)}
                   >
                     <Icon size={15} aria-hidden />
-                    <span>{item.label}</span>
+                    <span>{t(item.labelKey)}</span>
                   </button>
                 );
               })}
@@ -70,13 +91,13 @@ export default function App() {
           ))}
         </nav>
         {runtimeMode === "browser" ? (
-          <p className="sidebar-note">浏览器预览模式（示例数据）</p>
+          <p className="sidebar-note">{t("app.browserPreviewNote")}</p>
         ) : null}
       </aside>
 
       <main className="content">
         <header className="topbar">
-          <h1>{current.label}</h1>
+          <h1>{t(current.labelKey)}</h1>
           <span className="muted mono">
             {info ? `${info.name} ${info.version}` : ""}
           </span>
@@ -84,8 +105,7 @@ export default function App() {
 
         {info?.dbError ? (
           <p className="error" role="alert">
-            <AlertTriangle size={14} aria-hidden /> 本地数据库降级：{info.dbError}
-            （当前数据仅存内存，重启即丢失）
+            <AlertTriangle size={14} aria-hidden /> {t("app.dbError", { error: info.dbError })}
           </p>
         ) : null}
 

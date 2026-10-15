@@ -27,6 +27,10 @@ const KEY_BALANCE_THRESHOLD: &str = "balance_alert_threshold";
 const KEY_DRIFT_ON_START: &str = "drift_check_on_start";
 const KEY_GATEWAY_ENABLED: &str = "gateway_enabled";
 const KEY_GATEWAY_PORT: &str = "gateway_port";
+// M14-S1：多站路由 + 模型采集（B-99）
+const KEY_GATEWAY_MULTI_SITE: &str = "gateway_multi_site";
+const KEY_COLLECT_MODELS: &str = "collect_models";
+const KEY_MODELS_MIN_INTERVAL: &str = "models_min_interval_secs";
 const KEY_THEME: &str = "theme";
 const KEY_LANGUAGE: &str = "language";
 const KEY_PROXY_URL: &str = "proxy_url";
@@ -54,6 +58,15 @@ pub struct Settings {
     pub gateway_enabled: bool,
     /// 网关端口。只绑 `127.0.0.1`。
     pub gateway_port: u16,
+    /// 多站路由开关（M14-S1 / B-99）：关时 `gateway_config` 走 `single_upstream`
+    ///（M8-S4 §6.5 换站语义）；开时走 `build_gateway_route`（多站聚合，按模型选路）。
+    /// **默认 false**——PRD FR-6 多站聚合是 V1.1 可选，默认不破坏换站语义。
+    pub gateway_multi_site: bool,
+    /// 模型清单采集开关（M14-S1 / B-80）：**默认 false**。采集是每站每轮一次额外的
+    /// 带密钥请求（`GET /v1/models`），默认关；开启后按 `models_min_interval_secs` 节流。
+    pub collect_models: bool,
+    /// 模型采集最小间隔秒（M14-S1）：**默认 1800（30min）**。`0` = 不节流（仅测试用）。
+    pub models_min_interval_secs: u64,
 
     // ---- M6-S5：FR-9 界面与隐私 ----
     /// 主题：`system` / `light` / `dark`。
@@ -109,6 +122,10 @@ impl Default for Settings {
             // 网关会监听端口，默认关闭
             gateway_enabled: false,
             gateway_port: 8787,
+            // M14-S1：多站路由默认关（保住 M8-S4 换站语义）；采集默认关（不替用户打带密钥请求）
+            gateway_multi_site: false,
+            collect_models: false,
+            models_min_interval_secs: 1800,
 
             theme: "system".to_string(),
             language: "zh-CN".to_string(),
@@ -236,6 +253,9 @@ impl Settings {
             "drift_check_on_start": self.drift_check_on_start,
             "gateway_enabled": self.gateway_enabled,
             "gateway_port": self.gateway_port,
+            "gateway_multi_site": self.gateway_multi_site,
+            "collect_models": self.collect_models,
+            "models_min_interval_secs": self.models_min_interval_secs,
             "theme": self.theme,
             "language": self.language,
             "telemetry_enabled": self.telemetry_enabled,
@@ -320,6 +340,22 @@ impl Settings {
                         if port >= 1024 {
                             settings.gateway_port = port;
                         }
+                    }
+                }
+                // M14-S1：多站路由 + 模型采集
+                KEY_GATEWAY_MULTI_SITE => {
+                    if let Some(flag) = parse_bool(value) {
+                        settings.gateway_multi_site = flag;
+                    }
+                }
+                KEY_COLLECT_MODELS => {
+                    if let Some(flag) = parse_bool(value) {
+                        settings.collect_models = flag;
+                    }
+                }
+                KEY_MODELS_MIN_INTERVAL => {
+                    if let Ok(secs) = value.parse::<u64>() {
+                        settings.models_min_interval_secs = secs;
                     }
                 }
                 KEY_THEME => {
@@ -427,6 +463,13 @@ impl Settings {
             (KEY_DRIFT_ON_START, self.drift_check_on_start.to_string()),
             (KEY_GATEWAY_ENABLED, self.gateway_enabled.to_string()),
             (KEY_GATEWAY_PORT, self.gateway_port.to_string()),
+            // M14-S1：多站路由 + 模型采集
+            (KEY_GATEWAY_MULTI_SITE, self.gateway_multi_site.to_string()),
+            (KEY_COLLECT_MODELS, self.collect_models.to_string()),
+            (
+                KEY_MODELS_MIN_INTERVAL,
+                self.models_min_interval_secs.to_string(),
+            ),
             (KEY_THEME, self.theme.clone()),
             (KEY_LANGUAGE, self.language.clone()),
             (KEY_PROXY_URL, self.proxy_url.clone()),
@@ -465,12 +508,15 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 19] = [
+    pub const KEYS: [&'static str; 22] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
         KEY_GATEWAY_ENABLED,
         KEY_GATEWAY_PORT,
+        KEY_GATEWAY_MULTI_SITE,
+        KEY_COLLECT_MODELS,
+        KEY_MODELS_MIN_INTERVAL,
         KEY_THEME,
         KEY_LANGUAGE,
         KEY_PROXY_URL,
@@ -746,6 +792,9 @@ mod tests {
             drift_check_on_start: false,
             gateway_enabled: true,
             gateway_port: 9999,
+            gateway_multi_site: false,
+            collect_models: false,
+            models_min_interval_secs: 1800,
             theme: "dark".to_string(),
             language: "en-US".to_string(),
             proxy_url: "socks5://127.0.0.1:1080".to_string(),

@@ -377,3 +377,41 @@ async fn a_flaky_read_does_not_overwrite_the_persisted_gateway_token() {
     );
     assert!(service.gateway_token_persistent());
 }
+
+/// E1：换站零改动——site A → site B 切换，令牌逐字相同（B-105 端到端守卫）。
+///
+/// `the_token_survives_a_restart` 测的是**同站点** stop→start；本条测**异站点**切换，
+/// 钉住「换站」而不只是「重启」——这是 FR-5:158 的核心承诺。
+/// M14-S1 复核：token 持久化（M8-S4 §6.4）+ 网关投递（M8-S4 §6.2）已关闭 B-105，
+/// 本条是对「换站零改动」链路的端到端守卫。
+#[tokio::test]
+async fn token_survives_a_site_switch() {
+    let f = setup().await;
+    // 再建第二个站点 + key（同 service，同钥匙串）
+    let site_b = f
+        .service
+        .store()
+        .upsert_site("newapi", "https://relay-b.example.com", "B 站")
+        .unwrap();
+    let ref_b = secret_ref("key", 2, "secret");
+    let key_b = f
+        .service
+        .store()
+        .insert_key(site_b, "codex/b", &ref_b, Some("2"), None)
+        .unwrap();
+    f.vault.put(&ref_b, "sk-site-B-0123456789").unwrap();
+
+    // site A 启动网关
+    let first = f.service.gateway_config(f.site_id, f.key_id, 0).unwrap();
+    // 换站：site B 启动网关（令牌仍从同一把钥匙串读出）
+    let second = f.service.gateway_config(site_b, key_b, 0).unwrap();
+
+    assert_eq!(
+        first.token, second.token,
+        "换站（A → B）令牌必须逐字相同——FR-5:158 换站零改动"
+    );
+    assert!(
+        f.service.gateway_token_persistent(),
+        "令牌仍持久化（换站不触发重新生成）"
+    );
+}

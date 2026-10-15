@@ -203,3 +203,213 @@ fn keychain_backend_names_cover_both_platforms() {
         "keychain.rs 必须为其它平台提供兜底实现，否则那些平台编译不过"
     );
 }
+
+// ===========================================================================
+// M14-S5：Windows 分支注入式测试扩充（在 macOS 上验证 Windows 分支的构造与纯函数）
+//
+// 为什么这些测试能在 macOS 上跑：autostart 的 `*_on(target, ...)` 显式平台版本、
+// notify 的 `system_command`（`cfg!` 分派）都是「两个平台都编译」的代码路径，可注入 `AutostartTarget::WindowsRunKey`
+// / `NotifyPlatform::Windows` 直接断言 Windows 分支。proxy 的 `reg_query_value` 与
+// keychain 的 `describe` 在 `#[cfg(target_os = "windows")]` 块内或为私有 fn（macOS 不编译
+// / 调不到），退化为 source 断言；真机执行留 CI（B-66）。见 spec §6.1 / §7.1。
+
+#[test]
+fn autostart_windows_run_key_plan_is_well_formed() {
+    use keyrelay_core::autostart::{plan_enable_on, AutostartTarget};
+    use keyrelay_core::platform_env::{EnvPlan, RegHive, RUN_KEY};
+
+    // exe 用 POSIX 绝对路径：`Path::is_absolute()` 是宿主语义，macOS 上 `C:\...` 不判绝对
+    // （spec §13）；Windows 路径形态的 validate_exe 留 CI。本测验证 RegOp 四字段结构 +
+    // run_key_value 的「引号包裹 + --hidden」拼装（纯函数，与平台无关）。
+    let plan = plan_enable_on(
+        AutostartTarget::WindowsRunKey,
+        Path::new("/home/me"),
+        "dev.keyrelay.desktop",
+        Path::new("/Applications/KeyRelay.app/Contents/MacOS/keyrelay"),
+        true,
+    )
+    .expect("合法输入应产出计划");
+
+    let EnvPlan::Registry(ops) = plan else {
+        panic!("Windows 分支应产出 Registry 计划");
+    };
+    assert_eq!(ops.len(), 1, "Run 键只动一条值");
+    let op = &ops[0];
+    assert_eq!(op.hive, RegHive::CurrentUser, "HKCU 不需提权");
+    assert_eq!(op.key, RUN_KEY, "Run 键路径");
+    assert_eq!(op.name, "dev.keyrelay.desktop", "值名 = app_id");
+    let value = op.value.as_deref().expect("enable 应有 value");
+    assert!(
+        value.starts_with('"'),
+        "CreateProcess 规则：exe 路径必须加引号: {value}"
+    );
+    assert!(
+        value.ends_with("--hidden"),
+        "hidden=true 应追加 --hidden: {value}"
+    );
+}
+
+#[test]
+fn autostart_windows_disable_clears_value() {
+    use keyrelay_core::autostart::{plan_disable_on, AutostartTarget};
+    use keyrelay_core::platform_env::{EnvPlan, RegHive, RUN_KEY};
+
+    let plan = plan_disable_on(
+        AutostartTarget::WindowsRunKey,
+        Path::new("/home/me"),
+        "dev.keyrelay.desktop",
+    )
+    .expect("合法输入应产出计划");
+
+    let EnvPlan::Registry(ops) = plan else {
+        panic!("Windows 分支应产出 Registry 计划");
+    };
+    assert_eq!(ops.len(), 1);
+    let op = &ops[0];
+    assert_eq!(op.hive, RegHive::CurrentUser);
+    assert_eq!(op.key, RUN_KEY);
+    assert_eq!(op.name, "dev.keyrelay.desktop");
+    assert!(op.value.is_none(), "disable 应置 value=None（删除语义）");
+}
+
+#[test]
+fn autostart_windows_state_is_unknown_by_design() {
+    use keyrelay_core::autostart::{state_on, AutostartState, AutostartTarget};
+
+    // Windows 分支不执行 reg.exe（本模块不跑外部进程），state 恒 Unknown。
+    // 刻意如此：判不出来时保守报 Unknown，绝不把 Unknown 当 Enabled。
+    let state = state_on(
+        AutostartTarget::WindowsRunKey,
+        Path::new("/home/me"),
+        "dev.keyrelay.desktop",
+    )
+    .expect("合法输入应产出状态");
+    assert_eq!(state, AutostartState::Unknown);
+}
+
+#[test]
+fn autostart_windows_rejects_exe_with_quote() {
+    use keyrelay_core::autostart::{plan_enable_on, AutostartTarget};
+    use keyrelay_core::error::Error;
+
+    // Windows 路径不允许 `"`，且它会让 Run 键的值提前闭合。
+    let err = plan_enable_on(
+        AutostartTarget::WindowsRunKey,
+        Path::new("/home/me"),
+        "dev.keyrelay.desktop",
+        Path::new(r#"/usr/bin/a"b"#),
+        true,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Store(_)), "应为 Store 错误: {err:?}");
+    assert!(
+        err.to_string().contains("双引号"),
+        "文案要说明拒绝原因: {err}"
+    );
+}
+
+#[test]
+fn autostart_windows_rejects_relative_exe() {
+    use keyrelay_core::autostart::{plan_enable_on, AutostartTarget};
+    use keyrelay_core::error::Error;
+
+    let err = plan_enable_on(
+        AutostartTarget::WindowsRunKey,
+        Path::new("/home/me"),
+        "dev.keyrelay.desktop",
+        Path::new("relative/exe"),
+        true,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Store(_)));
+    assert!(
+        err.to_string().contains("绝对路径"),
+        "文案要说明拒绝原因: {err}"
+    );
+}
+
+#[test]
+fn notify_windows_toast_argv_has_no_profile_noninteractive_and_doubled_quotes() {
+    use keyrelay_core::notify::{system_command, Notification, NotifyKind, NotifyPlatform};
+
+    // system_command 是纯函数（cfg! 分派），macOS 上可注入 NotifyPlatform::Windows 断言
+    // Windows toast 的 argv。模块内测（system.rs）已有更细覆盖，本条是 platform_parity
+    // 跨文件守护：即使 system.rs 测试被误删，这里仍守住三标志 + 单引号翻倍。
+    let n = Notification {
+        kind: NotifyKind::NeedsLogin,
+        site_id: Some(1),
+        title: "it's".to_string(),
+        body: "ok".to_string(),
+        ts: 1,
+    };
+    let (program, args) = system_command(NotifyPlatform::Windows, &n).expect("Windows 有命令");
+    assert_eq!(program, "powershell");
+    assert_eq!(args[0], "-NoProfile", "不加载用户 profile: {args:?}");
+    assert_eq!(args[1], "-NonInteractive", "不进交互 REPL: {args:?}");
+    assert_eq!(args[2], "-Command", "走 -Command 执行 toast 脚本: {args:?}");
+    assert_eq!(args.len(), 4, "argv 个数稳定: {args:?}");
+    assert!(
+        args[3].contains("it''s"),
+        "ps_literal 单引号翻倍（不做变量插值）: {}",
+        args[3]
+    );
+}
+
+#[test]
+fn proxy_reg_query_argv_shape_is_stable() {
+    // reg_query_value 在 #[cfg(target_os = "windows")] 块内，macOS 不编译，
+    // 退化为 source 断言：argv 形状 + cfg 门 + 纯函数解析在场。真机执行留 CI（B-66）。
+    let src = fs::read_to_string(src_dir().join("proxy.rs")).expect("读 proxy.rs");
+    let production = production_part(&src);
+    assert!(
+        production.contains("Command::new(\"reg\")"),
+        "Windows 分支应跑 reg 进程"
+    );
+    assert!(
+        production.contains(".args([\"query\", key, \"/v\", name])"),
+        "reg query argv 形状稳定"
+    );
+    assert!(
+        production.contains("#[cfg(target_os = \"windows\")]"),
+        "reg 调用必须在 Windows cfg 块内（macOS 不编译）"
+    );
+    assert!(
+        production.contains("parse_reg_query_value"),
+        "输出解析走跨平台纯函数"
+    );
+}
+
+#[test]
+fn keychain_describe_exhaustive_branches() {
+    // describe 是私有 fn（集成测试调不到），退化为 source 断言：穷举 match arm 在场 +
+    // non_exhaustive 兜底在场。运行级「真喂 keyring::Error 变体验文案不回显密钥」在
+    // keychain.rs mod tests 的 describe_never_echoes_payload_bytes 已覆盖 BadEncoding/
+    // BadDataFormat；其余变体留 CI。见 spec §6.1 / §7.1。
+    let src = fs::read_to_string(src_dir().join("vault/keychain.rs")).expect("读 keychain.rs");
+    let production = production_part(&src);
+    assert!(production.contains("fn describe("), "describe 函数在场");
+    // 穷举 match arm：缺一个就说明新增了未兜底的 keyring::Error 变体
+    for arm in [
+        "NoEntry",
+        "NoStorageAccess",
+        "PlatformFailure",
+        "NoDefaultStore",
+        "NotSupportedByStore",
+        "BadEncoding",
+        "BadDataFormat",
+        "BadStoreFormat",
+        "TooLong",
+        "Invalid",
+        "Ambiguous",
+    ] {
+        assert!(
+            production.contains(arm),
+            "describe 缺少 {arm} 分支（keyring::Error 穷举不完整）"
+        );
+    }
+    // non_exhaustive 兜底文案在场（keyring::Error 是 #[non_exhaustive]）
+    assert!(
+        production.contains("系统钥匙串返回了未知错误"),
+        "describe 必须有 non_exhaustive 兜底分支"
+    );
+}

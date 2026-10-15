@@ -8,12 +8,14 @@ import {
   listKeys,
   listSites,
   listStoredKeys,
+  recentKeyUsage,
   revokeKey,
   rotateKey,
   rotationDue,
   rotationPlan,
   suggestKeyName,
   syncSiteKeys,
+  type KeyUsageSample,
   type RotationPlan,
   type RotationRun,
   type SiteRow,
@@ -21,6 +23,7 @@ import {
 } from "../lib/api";
 import ConfirmDialog from "../components/ConfirmDialog";
 import CapButton from "../components/CapButton";
+import { useTranslation, translate, getCurrentDict } from "../i18n";
 
 /**
  * 新建密钥时默认名里的 `agent-id` 段。
@@ -33,6 +36,7 @@ import CapButton from "../components/CapButton";
 const DEFAULT_AGENT_SEGMENT = "unassigned";
 
 export default function Keys() {
+  const { t } = useTranslation();
   const qc = useQueryClient();
   const sites = useQuery({ queryKey: ["sites"], queryFn: listSites });
   const [siteId, setSiteId] = useState<number | null>(null);
@@ -133,12 +137,9 @@ export default function Keys() {
       // 整体仍然是成功——把不可逆的成功报成失败会让用户去重试一次注定失败的删除，
       // 所以这里说的是「已回收，但本地状态没记上」。
       setNotice(
-        `已在站点侧回收「${revoking?.name ?? ""}」。本地记录被标成「已回收」并保留——` +
-          `站点上那把 key 已经没了，这个动作不可逆。` +
-          (report.localStatusUpdated
-            ? ""
-            : "注意：本地状态没能写上（原因见下），下次对账会再试。") +
-          (report.note ? `\n${report.note}` : ""),
+        t("keys.notice.revokedPre", { name: revoking?.name ?? "" }) +
+          (report.localStatusUpdated ? "" : t("keys.notice.revokedLocalFail")) +
+          (report.note ? t("keys.notice.revokedNote", { note: report.note }) : ""),
       );
       setRevokeAgreed(false);
       setRevoking(null);
@@ -211,7 +212,7 @@ export default function Keys() {
     onSuccess: async (key) => {
       setError(null);
       // 只显示掩码，明文从不出现在界面上
-      setNotice(`已创建 ${key.name}（${key.masked}），密钥已存入系统钥匙串`);
+      setNotice(t("keys.notice.created", { name: key.name, masked: key.masked }));
       setCreating(false);
       // 名字用完就还回去：否则下一次「新建密钥」会**沿用上一把的名字**，
       // 站点侧就出现两把同名 key——那恰好废掉了命名规范存在的理由
@@ -258,7 +259,7 @@ export default function Keys() {
     } catch (err) {
       // 生成建议名失败不是致命错误，但也不能静默填一个假名字——留空让他自己写
       if (!nameEditedRef.current) setName("");
-      setError(`没能生成默认名（${(err as Error).message}），请手动填写。`);
+      setError(t("keys.createDialog.nameError", { error: (err as Error).message }));
     } finally {
       setSuggesting(false);
     }
@@ -268,14 +269,14 @@ export default function Keys() {
     <section>
 
       {sites.data?.length === 0 ? (
-        <p className="muted">先去「站点」页接入一个中转站。</p>
+        <p className="muted">{t("keys.empty")}</p>
       ) : null}
 
       <div className="card">
         <div className="row row-between">
           <div className="row">
             <label className="field-inline">
-              <span>站点</span>
+              <span>{t("keys.siteSelect")}</span>
               <select
                 className="input"
                 value={activeSite ?? ""}
@@ -294,16 +295,16 @@ export default function Keys() {
               onClick={() => keys.refetch()}
               disabled={keys.isFetching}
             >
-              <RefreshCw size={14} aria-hidden /> 刷新
+              <RefreshCw size={14} aria-hidden /> {t("keys.btn.refresh")}
             </button>
           </div>
           <CapButton
             allowed={caps?.createKey ?? false}
-            reason={capReason(caps, "该站点类型不支持在站点侧建密钥")}
+            reason={capReason(caps, t("keys.capReason.unsupportedCreate"))}
             className="btn btn-primary"
             onClick={openCreateDialog}
           >
-            <Plus size={14} aria-hidden /> 新建密钥
+            <Plus size={14} aria-hidden /> {t("keys.btn.create")}
           </CapButton>
         </div>
 
@@ -313,17 +314,17 @@ export default function Keys() {
         {rotation.data && rotation.data.length > 0 ? (
           <div className="warnbox" role="status">
             <p className="warnline">
-              <AlertTriangle size={14} aria-hidden />有 {rotation.data.length}{" "}
-              把密钥已到轮换窗口。轮换是「新建 → 全量重注入 → 回收旧钥匙」三连，
-              <strong>中间任何一步失败都会立刻停下</strong>
-              ，不会留下「旧钥匙已回收但新钥匙没注入」的状态。
+              <AlertTriangle size={14} aria-hidden />
+              {t("keys.rotation.warnPre", { count: rotation.data.length })}
+              <strong>{t("keys.rotation.warnStrong")}</strong>
+              {t("keys.rotation.warnPost")}
             </p>
             <table className="table">
               <thead>
                 <tr>
-                  <th>名称</th>
-                  <th>到期时间</th>
-                  <th>操作</th>
+                  <th>{t("keys.table.name")}</th>
+                  <th>{t("keys.table.dueAt")}</th>
+                  <th>{t("keys.table.action")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -337,22 +338,20 @@ export default function Keys() {
                         allowed={rotationAllowed(capsFor(due.siteId))}
                         reason={capReason(
                           capsFor(due.siteId),
-                          "轮换需要建 / 读 / 回收三连，该类型缺其中一步",
+                          t("keys.capReason.rotationMissing"),
                         )}
                         busy={rotationPreview.isPending || rotationExecute.isPending}
                         className="btn btn-ghost"
                         onClick={() => rotationPreview.mutate(due.keyId)}
                       >
-                        <RotateCw size={13} aria-hidden /> 轮换…
+                        <RotateCw size={13} aria-hidden /> {t("keys.btn.rotate")}
                       </CapButton>
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
-            <p className="muted">
-              「轮换…」会先给出预览（会波及哪些投递目标），确认之后才动手。
-            </p>
+            <p className="muted">{t("keys.rotation.hint")}</p>
           </div>
         ) : null}
 
@@ -364,8 +363,8 @@ export default function Keys() {
             allowed={syncAllowed(caps)}
             reason={
               caps && !caps.listKeys
-                ? "该站点类型没有密钥列表端点"
-                : capReason(caps, "站点不提供明文回读")
+                ? t("keys.capReason.noListEndpoint")
+                : capReason(caps, t("keys.capReason.noReveal"))
             }
             busy={syncing}
             onClick={async () => {
@@ -375,21 +374,20 @@ export default function Keys() {
               setSyncing(true);
               try {
                 const s = await syncSiteKeys(activeSite);
-                const parts = [
-                  `站点侧 ${s.siteTotal} 把`,
-                  `本地已有 ${s.alreadyLocal}`,
-                  `新导入 ${s.imported}`,
-                ];
-                if (s.unreadable.length > 0) {
-                  // 「站点不提供明文回读」是 PRD §10 已登记的风险。必须说清楚，
-                  // 不能让用户以为「对齐成功了」。
-                  parts.push(
-                    `站点未给明文 ${s.unreadable.length} 把（${s.unreadable.join(
-                      ", ",
-                    )}），这些只能删掉重建`,
-                  );
-                }
-                setNotice(`密钥对齐完成：${parts.join(" / ")}。`);
+                setNotice(
+                  t("keys.sync.done", {
+                    siteTotal: s.siteTotal,
+                    alreadyLocal: s.alreadyLocal,
+                    imported: s.imported,
+                    unreadable:
+                      s.unreadable.length > 0
+                        ? t("keys.sync.unreadable", {
+                            count: s.unreadable.length,
+                            list: s.unreadable.join(", "),
+                          })
+                        : "",
+                  }),
+                );
                 await qc.invalidateQueries({ queryKey: ["stored-keys"] });
               } catch (err) {
                 setError((err as Error).message);
@@ -398,43 +396,39 @@ export default function Keys() {
               }
             }}
           >
-            <RefreshCw size={14} aria-hidden /> 对齐站点密钥
-            {syncing ? "…" : ""}
+            <RefreshCw size={14} aria-hidden /> {syncing ? t("keys.btn.syncing") : t("keys.btn.sync")}
           </CapButton>
           <span className="muted">
-            把站点侧已有密钥的明文取回本地钥匙串。明文**不会显示在这里**，
-            也不会经过 IPC——命令层至今没有任何一条命令返回过密钥明文。
+            {t("keys.sync.hintPre")}
+            <strong>{t("keys.sync.hintStrong")}</strong>
+            {t("keys.sync.hintPost")}
           </span>
         </div>
 
-        {keys.isLoading ? <p className="muted">加载中…</p> : null}
+        {keys.isLoading ? <p className="muted">{t("common.loading")}</p> : null}
         {keys.isError ? (
-          <p className="muted">读取失败：{(keys.error as Error).message}</p>
+          <p className="muted">{t("keys.emptyStates.keysError", { error: (keys.error as Error).message })}</p>
         ) : null}
         {keys.data?.length === 0 ? (
-          <p className="muted">
-            KeyRelay 本地还没有密钥。点「新建密钥」——新建成功后密钥会直接进系统钥匙串。
-          </p>
+          <p className="muted">{t("keys.emptyStates.noKeys")}</p>
         ) : null}
         {/* 两种空不能混成一句：「本地一把都没有」与「这个站下没有」处理方式不同 */}
         {keys.data?.length && siteKeys.length === 0 ? (
-          <p className="muted">
-            这个站点下还没有本地密钥（其他站点共 {keys.data.length} 把，切换上面的站点查看）。
-          </p>
+          <p className="muted">{t("keys.emptyStates.noSiteKeys", { count: keys.data.length })}</p>
         ) : null}
 
         {siteKeys.length ? (
           <table className="table">
             <thead>
               <tr>
-                <th>本地 id</th>
-                <th>名称</th>
-                <th>分组</th>
-                <th>远端 id</th>
-                <th>状态</th>
-                {/* 用量列：位置留给 usage-collector（WP4），本步不接数据（M11-S1 写域避让） */}
-                <th>用量</th>
-                <th>操作</th>
+                <th>{t("keys.table.localId")}</th>
+                <th>{t("keys.table.name")}</th>
+                <th>{t("keys.table.group")}</th>
+                <th>{t("keys.table.remoteId")}</th>
+                <th>{t("keys.table.status")}</th>
+                {/* M14-S3：用量列仅 keyUsage=true 时显示（spec §9）。数据来自 StoredKeyRow.quotaUsed/quotaLimit。 */}
+                {caps?.keyUsage && <th>{t("keys.table.usage")}</th>}
+                <th>{t("keys.table.action")}</th>
               </tr>
             </thead>
             <tbody>
@@ -459,8 +453,13 @@ export default function Keys() {
                         {statusLabel(key.status)}
                       </span>
                     </td>
-                    {/* 用量列占位：数据由 usage-collector（WP4）接入，本步留空（M11-S1 写域避让） */}
-                    <td><span className="muted">—</span></td>
+                    {/* M14-S3：用量列数据接入（spec §9）。caps?.keyUsage 决定显隐；近 30 天 tokens 仅 Sub2API 有数据。 */}
+                    {caps?.keyUsage && (
+                      <td>
+                        {formatKeyUsage(key.quotaUsed, key.quotaLimit, key.currency)}
+                        <KeyUsageCell keyId={key.id} />
+                      </td>
+                    )}
                     <td>
                       <CapButton
                         allowed={gate.allowed}
@@ -474,7 +473,7 @@ export default function Keys() {
                           setRevoking(key);
                         }}
                       >
-                        <Trash2 size={13} aria-hidden /> 回收
+                        <Trash2 size={13} aria-hidden /> {t("keys.btn.revoke")}
                       </CapButton>
                     </td>
                   </tr>
@@ -484,34 +483,28 @@ export default function Keys() {
           </table>
         ) : null}
 
-        <p className="muted">
-          密钥明文只存在于系统钥匙串里；后端**从不**把明文返回给界面。
-          投递时用的是上表的「本地 id」。
-        </p>
+        <p className="muted">{t("keys.footnote")}</p>
       </div>
 
       <div className="card">
-        <h3>站点上的令牌（只读对照）</h3>
+        <h3>{t("keys.remote.title")}</h3>
         {!(caps?.listKeys ?? false) ? (
-          <p className="muted">
-            该站点类型没有密钥列表端点，无法对照站点侧令牌（判断来自能力集）。
-          </p>
+          <p className="muted">{t("keys.remote.noListCap")}</p>
         ) : null}
-        {remote.isLoading ? <p className="muted">加载中…</p> : null}
+        {remote.isLoading ? <p className="muted">{t("common.loading")}</p> : null}
         {remote.isError ? (
-          <p className="muted">
-            读取失败（可能需要先登录）：{(remote.error as Error).message}
-          </p>
+          <p className="muted">{t("keys.remote.error", { error: (remote.error as Error).message })}</p>
         ) : null}
         {remote.data?.length ? (
           <table className="table">
             <thead>
               <tr>
-                <th>名称</th>
-                <th>分组</th>
-                <th>远端 id</th>
-                <th>状态</th>
-                <th>创建时间</th>
+                <th>{t("keys.table.name")}</th>
+                <th>{t("keys.table.group")}</th>
+                <th>{t("keys.table.remoteId")}</th>
+                <th>{t("keys.table.status")}</th>
+                {caps?.keyUsage && <th>{t("keys.table.usage")}</th>}
+                <th>{t("keys.table.createdAt")}</th>
               </tr>
             </thead>
             <tbody>
@@ -528,6 +521,9 @@ export default function Keys() {
                       {statusLabel(key.status)}
                     </span>
                   </td>
+                  {caps?.keyUsage && (
+                    <td>{formatKeyUsage(key.quotaUsed, key.quotaLimit, key.currency)}</td>
+                  )}
                   <td className="mono">{formatTs(key.createdAt)}</td>
                 </tr>
               ))}
@@ -538,18 +534,16 @@ export default function Keys() {
 
       <ConfirmDialog
         open={creating}
-        title="新建密钥"
-        confirmLabel={create.isPending ? "创建中…" : "创建"}
+        title={t("keys.createDialog.title")}
+        confirmLabel={create.isPending ? t("keys.createDialog.confirming") : t("keys.createDialog.confirm")}
         // `suggesting` 期间也禁用：否则可能在建议名到达之前就提交一个空名字
         confirmDisabled={!name || suggesting || create.isPending}
         onCancel={() => setCreating(false)}
         onConfirm={() => create.mutate()}
       >
-        <p className="muted">
-          新建成功后密钥会**直接写入系统钥匙串**，界面只显示末 4 位。请自行确认这把钥匙的用途。
-        </p>
+        <p className="muted">{t("keys.createDialog.body")}</p>
         <label className="field">
-          <span>名称</span>
+          <span>{t("keys.createDialog.nameLabel")}</span>
           <input
             className="input"
             value={name}
@@ -558,23 +552,22 @@ export default function Keys() {
               // 用户动过这个名字之后，就再也不用建议名覆盖他（§6.4）
               nameEditedRef.current = true;
             }}
-            placeholder={suggesting ? "正在生成默认名…" : "keyrelay/agent/yyyymmdd"}
+            placeholder={suggesting ? t("keys.createDialog.namePlaceholderSuggesting") : t("keys.createDialog.namePlaceholder")}
             spellCheck={false}
           />
         </label>
         <p className="muted">
-          默认名按 <span className="mono">app-id/agent-id/yyyymmdd</span> 生成，
-          日期用你本机的今天。它只是标签：可以改成任何你认得出的名字。
+          {t("keys.createDialog.nameHintPre")}<span className="mono">app-id/agent-id/yyyymmdd</span>{t("keys.createDialog.nameHintMid")}
         </p>
         <label className="field">
-          <span>分组（可选）</span>
+          <span>{t("keys.createDialog.groupLabel")}</span>
           <select
             className="input"
             value={group}
             onChange={(e) => setGroup(e.target.value)}
             disabled={groups.isLoading || !(caps?.groups ?? false)}
           >
-            <option value="">不指定（跟随站点默认）</option>
+            <option value="">{t("keys.createDialog.groupDefault")}</option>
             {(groups.data ?? []).map((option) => (
               <option key={option.name} value={option.name}>
                 {option.name} · {formatGroupRate(option.rate)}
@@ -583,30 +576,22 @@ export default function Keys() {
           </select>
         </label>
         {!(caps?.groups ?? false) ? (
-          <p className="muted">
-            该站点类型没有分组概念，将按站点默认分组创建（这个判断来自能力集，
-            不是按站点类型名硬编码的）。
-          </p>
+          <p className="muted">{t("keys.createDialog.groupNoCap")}</p>
         ) : null}
         {groups.isError ? (
-          <p className="muted">
-            读不到分组列表（{(groups.error as Error).message}），将按站点默认分组创建。
-          </p>
+          <p className="muted">{t("keys.createDialog.groupError", { error: (groups.error as Error).message })}</p>
         ) : null}
         {(groups.data ?? []).some(
           (option) => option.rate === null || !Number.isFinite(option.rate) || option.rate <= 0,
         ) ? (
-          <p className="muted">
-            站点对部分分组没有给出可用倍率，这些分组一律显示「倍率未知」——
-            <strong>不会用 1× 兜底</strong>，免得你按错误的成本预期选分组。
-          </p>
+          <p className="muted">{t("keys.createDialog.groupRateWarn")}</p>
         ) : null}
       </ConfirmDialog>
 
       <ConfirmDialog
         open={rotating !== null}
-        title="轮换密钥"
-        confirmLabel={rotationExecute.isPending ? "轮换中…" : "开始轮换"}
+        title={t("keys.rotationDialog.title")}
+        confirmLabel={rotationExecute.isPending ? t("keys.rotationDialog.confirming") : t("keys.rotationDialog.confirm")}
         confirmDisabled={
           rotationExecute.isPending ||
           rotationSuggesting ||
@@ -619,31 +604,31 @@ export default function Keys() {
         {rotating ? (
           <>
             <p className="muted">
-              将对「{rotating.keyName}」（本地 id {rotating.keyId}）执行固定顺序的三步：
+              {t("keys.rotationDialog.introPre", { name: rotating.keyName, id: rotating.keyId })}
             </p>
             <ol>
-              <li>在站点上新建一把密钥（明文直接进系统钥匙串）</li>
+              <li>{t("keys.rotationDialog.step1")}</li>
               <li>
-                把新密钥重新投递到{" "}
                 {rotating.channels.length === 0
-                  ? "全部投递目标（当前没有绑定，这一步是空操作）"
-                  : `${rotating.channels.length} 个目标：${rotating.channels.join("、")}`}
+                  ? t("keys.rotationDialog.step2All")
+                  : t("keys.rotationDialog.step2Some", {
+                      count: rotating.channels.length,
+                      channels: rotating.channels.join("、"),
+                    })}
               </li>
               <li>
                 {rotating.oldRemoteId
-                  ? `回收站点侧的旧密钥（远端 id ${rotating.oldRemoteId}）—— 这一步不可逆`
-                  : "旧密钥没有站点侧 id，这一步会被跳过（不是失败）"}
+                  ? t("keys.rotationDialog.step3Revoke", { id: rotating.oldRemoteId })
+                  : t("keys.rotationDialog.step3Skip")}
               </li>
             </ol>
             {rotating.unmappedTargets.length > 0 ? (
               <p className="error" role="alert">
-                {rotating.unmappedTargets.join("、")} 这些投递目标的通道无法识别，轮换会漏掉它们；
-                若继续并回收旧密钥，它们会永久停在旧密钥上。请先处理这些目标再轮换——
-                <strong>此操作已被禁止</strong>。
+                {t("keys.rotationDialog.unmappedError", { targets: rotating.unmappedTargets.join("、") })}
               </p>
             ) : null}
             <label className="field">
-              <span>新密钥的名称</span>
+              <span>{t("keys.rotationDialog.newNameLabel")}</span>
               <input
                 className="input"
                 value={rotationName}
@@ -662,9 +647,9 @@ export default function Keys() {
       */}
       <ConfirmDialog
         open={revoking !== null}
-        title="回收站点上的密钥"
+        title={t("keys.revokeDialog.title")}
         danger
-        confirmLabel={revoke.isPending ? "回收中…" : "确认回收"}
+        confirmLabel={revoke.isPending ? t("keys.revokeDialog.confirming") : t("keys.revokeDialog.confirm")}
         confirmDisabled={!revokeAgreed || revoke.isPending}
         onCancel={() => {
           setRevokeAgreed(false);
@@ -673,13 +658,16 @@ export default function Keys() {
         onConfirm={() => revoke.mutate()}
       >
         <p>
-          将在<strong>站点上</strong>回收「{revoking?.name ?? ""}」（远端 id{" "}
-          <span className="mono">{revoking?.remoteId ?? "—"}</span>）。
-          这把 key 在站点侧会<strong>立即失效</strong>，任何正在用它的人都将被拒。
+          {t("keys.revokeDialog.bodyPre", { name: revoking?.name ?? "" })}
+          <span className="mono">{revoking?.remoteId ?? "—"}</span>
+          {t("keys.revokeDialog.bodyMid")}
+          <strong>{t("keys.revokeDialog.bodyStrong")}</strong>
+          {t("keys.revokeDialog.bodyPost")}
         </p>
         <p className="muted">
-          本地记录<strong>不会</strong>被删除，只会被标成「已回收」——`bindings` 与漂移追溯靠它存活。
-          已经投递到 agent 配置里的旧值需要你自己重新投递覆盖。
+          {t("keys.revokeDialog.localKeepPre")}
+          <strong>{t("keys.revokeDialog.localKeepStrong")}</strong>
+          {t("keys.revokeDialog.localKeepPost")}
         </p>
         <label className="checkline">
           <input
@@ -687,9 +675,7 @@ export default function Keys() {
             checked={revokeAgreed}
             onChange={(e) => setRevokeAgreed(e.target.checked)}
           />
-          <span>
-            我确认要在站点上回收这把密钥，并明白它<strong>不可逆</strong>（站点侧无法恢复）
-          </span>
+          <span>{t("keys.revokeDialog.agree")}</span>
         </label>
       </ConfirmDialog>
     </section>
@@ -705,20 +691,24 @@ export default function Keys() {
 function renderRun(run: RotationRun) {
   const revokeText =
     run.revoke === "revoked"
-      ? "旧密钥已在站点侧回收。"
+      ? translate(getCurrentDict(), "keys.rotationResult.revokeRevoked")
       : run.revoke === "skippedNoRemoteId"
-        ? "旧密钥没有站点侧 id，已跳过回收——请到站点上手动确认它是否需要删除。"
+        ? translate(getCurrentDict(), "keys.rotationResult.revokeSkipped")
         : run.revoke === "failed"
-          ? `旧密钥回收失败：${run.revokeReason ?? "原因未知"}。它仍然有效，请重试或到站点上手动删除。`
-          : "旧密钥**未**回收（前一步失败就停下了）。旧密钥仍有效，可以直接继续使用。";
+          ? translate(getCurrentDict(), "keys.rotationResult.revokeFailed", {
+              reason: run.revokeReason ?? translate(getCurrentDict(), "keys.rotationResult.stoppedPost"),
+            })
+          : translate(getCurrentDict(), "keys.rotationResult.revokeNotAttempted");
 
   if (run.completed) {
     return (
       <>
         <p className="warnline">
           <AlertTriangle size={14} aria-hidden />
-          轮换已走完：新密钥 {run.newKeyMasked} 已投递到{" "}
-          {run.reinjected.length === 0 ? "0 个目标（原本就没有绑定）" : run.reinjected.join("、")}。
+          {translate(getCurrentDict(), "keys.rotationResult.completedPre", { masked: run.newKeyMasked })}
+          {run.reinjected.length === 0
+            ? translate(getCurrentDict(), "keys.rotationResult.completedNoTargets")
+            : translate(getCurrentDict(), "keys.rotationResult.completedTargets", { targets: run.reinjected.join("、") })}
         </p>
         <p className="muted">{revokeText}</p>
       </>
@@ -729,25 +719,35 @@ function renderRun(run: RotationRun) {
     <>
       <p className="warnline">
         <AlertTriangle size={14} aria-hidden />
-        <strong>轮换中途停下</strong>（停在「{STEP_LABELS[run.stoppedAt ?? ""] ?? run.stoppedAt}」）：
-        {run.stopReason ?? "原因未知"}。
+        <strong>{translate(getCurrentDict(), "keys.rotationResult.stoppedPre")}</strong>
+        {translate(getCurrentDict(), "keys.rotationResult.stoppedMid", { step: rotationStepLabel(run.stoppedAt ?? "") })}
+        {run.stopReason ?? translate(getCurrentDict(), "keys.rotationResult.stoppedPost")}。
       </p>
       <p className="muted">
-        新密钥 {run.newKeyMasked} 已创建并投递到{" "}
-        {run.reinjected.length === 0 ? "0 个目标" : run.reinjected.join("、")}。{revokeText}
+        {translate(getCurrentDict(), "keys.rotationResult.aftermathPre", { masked: run.newKeyMasked })}
+        {run.reinjected.length === 0
+          ? translate(getCurrentDict(), "keys.rotationResult.aftermathNoTargets")
+          : translate(getCurrentDict(), "keys.rotationResult.aftermathTargets", { targets: run.reinjected.join("、") })}
+        {revokeText}
       </p>
-      <p className="muted">
-        请先修复上面那个失败点，再决定重试；在那之前**不要**手动删除旧密钥。
-      </p>
+      <p className="muted">{translate(getCurrentDict(), "keys.rotationResult.fixHint")}</p>
     </>
   );
 }
 
-const STEP_LABELS: Record<string, string> = {
-  create_new: "新建密钥",
-  reinject_all: "全量重注入",
-  revoke_old: "回收旧密钥",
-};
+/** 轮换步骤标识 → 显示文案（取值来自后端 `RotationRun.stoppedAt`，未知值原样返回）。 */
+function rotationStepLabel(step: string): string {
+  switch (step) {
+    case "create_new":
+      return translate(getCurrentDict(), "keys.rotationStep.create_new");
+    case "reinject_all":
+      return translate(getCurrentDict(), "keys.rotationStep.reinject_all");
+    case "revoke_old":
+      return translate(getCurrentDict(), "keys.rotationStep.revoke_old");
+    default:
+      return step;
+  }
+}
 
 /**
  * 状态文案。**两套词表必须能区分**（M7-S4 / 冻结契约 7）：
@@ -758,27 +758,32 @@ const STEP_LABELS: Record<string, string> = {
  * 用同一个词显示这两件事，用户就不知道该去哪里恢复——一个是「我干的、不可逆」，
  * 另一个是「站点干的、可能能解禁」。
  */
-const STATUS_LABELS: Record<string, string> = {
-  enabled: "启用",
-  disabled: "站点禁用",
-  exhausted: "额度耗尽",
-  revoked: "已回收",
-  unknown: "未知",
-};
-
 function statusLabel(status: string): string {
   // 认不出的取值原样显示，不猜——猜错会让用户按错误的状态处理。
-  return STATUS_LABELS[status] ?? status;
+  switch (status) {
+    case "enabled":
+      return translate(getCurrentDict(), "keys.status.enabled");
+    case "disabled":
+      return translate(getCurrentDict(), "keys.status.disabled");
+    case "exhausted":
+      return translate(getCurrentDict(), "keys.status.exhausted");
+    case "revoked":
+      return translate(getCurrentDict(), "keys.status.revoked");
+    case "unknown":
+      return translate(getCurrentDict(), "keys.status.unknown");
+    default:
+      return status;
+  }
 }
 
 function statusHint(status: string): string {
   if (status === "revoked") {
-    return "本地状态：你已在站点侧回收它（不可逆）。本地记录保留，供溯源与漂移追溯。";
+    return translate(getCurrentDict(), "keys.statusHint.revoked");
   }
   if (status === "disabled") {
-    return "站点状态：站点自己禁用了这把令牌——与本产品无关。";
+    return translate(getCurrentDict(), "keys.statusHint.disabled");
   }
-  return `站点返回的原始状态：${status}`;
+  return translate(getCurrentDict(), "keys.statusHint.other", { status });
 }
 
 function statusTone(status: string): string {
@@ -812,7 +817,7 @@ function capReason(
   caps: SiteRow["capabilities"] | undefined,
   unsupported: string,
 ): string {
-  return caps ? unsupported : "先接入一个站点（或站点列表还没加载出来）";
+  return caps ? unsupported : translate(getCurrentDict(), "keys.capReason.noSite");
 }
 
 /**
@@ -824,15 +829,15 @@ function revokeGate(
   site: SiteRow | undefined,
   key: StoredKeyRow,
 ): { allowed: boolean; reason: string } {
-  if (!site) return { allowed: false, reason: "找不到这把密钥所属的站点记录" };
+  if (!site) return { allowed: false, reason: translate(getCurrentDict(), "keys.capReason.siteNotFound") };
   if (!site.capabilities.revokeKey) {
-    return { allowed: false, reason: "该站点类型不支持回收" };
+    return { allowed: false, reason: translate(getCurrentDict(), "keys.capReason.unsupportedRevoke") };
   }
   if (!key.remoteId) {
-    return { allowed: false, reason: "这把密钥没有站点侧 id，站点上定位不到它" };
+    return { allowed: false, reason: translate(getCurrentDict(), "keys.capReason.noRemoteId") };
   }
   if (key.status === "revoked") {
-    return { allowed: false, reason: "已经在站点侧回收过了（本地记录保留）" };
+    return { allowed: false, reason: translate(getCurrentDict(), "keys.capReason.alreadyRevoked") };
   }
   return { allowed: true, reason: "" };
 }
@@ -840,4 +845,45 @@ function revokeGate(
 function formatTs(ts?: number | null): string {
   if (!ts) return "—";
   return new Date(ts * 1000).toLocaleString();
+}
+
+/**
+ * 格式化一把 key 的当前累计用量（M14-S3 / spec §9）。
+ *
+ * - `quotaUsed == null` ⇒ `—`（「不知道」不当成 0，与 `Balance.known` 同纪律）；
+ * - `quotaLimit == null` ⇒ 「已用 X（不限）」（NewAPI `unlimited_quota` / Sub2API 无限额）；
+ * - 两者都有 ⇒ 「已用 X / 限额 Y」。
+ *
+ * 文案走 i18n（`keys.usage.*`），不硬编码中文。
+ */
+function formatKeyUsage(
+  quotaUsed: number | null | undefined,
+  quotaLimit: number | null | undefined,
+  currency: string | null | undefined,
+): string {
+  const dict = getCurrentDict();
+  if (quotaUsed == null) return translate(dict, "keys.usage.unknown");
+  const cur = currency ?? "";
+  if (quotaLimit == null) {
+    return translate(dict, "keys.usage.usedUnlimited", { used: quotaUsed, currency: cur });
+  }
+  return translate(dict, "keys.usage.usedOverLimit", { used: quotaUsed, limit: quotaLimit, currency: cur });
+}
+
+/**
+ * 近 30 天 tokens（M14-S3 / spec §9）：仅 Sub2API 站点有 `usage_samples` 数据。
+ *
+ * 独立组件（`useQuery` 不能在 `.map` 回调里调）——每行一个实例，按本地 `keyId` 查询。
+ * NewAPI 站点 `recentKeyUsage` 返回空数组 ⇒ 渲染 `null`（不显示 tokens 行）。
+ */
+function KeyUsageCell({ keyId }: { keyId: number }) {
+  const usage = useQuery({
+    queryKey: ["key-usage", keyId],
+    queryFn: () => recentKeyUsage(keyId),
+    staleTime: 30 * 60 * 1000,
+  });
+  const samples: KeyUsageSample[] = usage.data ?? [];
+  if (samples.length === 0) return null;
+  const sum = samples.reduce((acc, s) => acc + s.totalTokens, 0);
+  return <div className="muted">{translate(getCurrentDict(), "keys.usage.tokens30d", { tokens: sum })}</div>;
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keyrelay-core", "src-tauri"]
+members = ["crates/keyrelay-core", "crates/keyrelay-cli", "src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

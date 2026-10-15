@@ -1,0 +1,765 @@
+{
+  "common": {
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "refresh": "Refresh",
+    "loading": "Loading…",
+    "detecting": "Detecting…",
+    "retry": "Retry",
+    "delete": "Delete",
+    "stop": "Stop",
+    "enabled": "Enabled",
+    "health": {
+      "ok": "Signed in",
+      "needsLogin": "Re-login required",
+      "unknown": "Not signed in"
+    },
+    "rateUnknown": "Rate unknown",
+    "noUpdate": "No update available"
+  },
+  "nav": {
+    "brand": "KeyRelay",
+    "group": {
+      "daily": "Daily",
+      "asset": "Assets",
+      "delivery": "Delivery",
+      "system": "System"
+    },
+    "overview": "Overview",
+    "sites": "Sites",
+    "keys": "Keys",
+    "agents": "Agent Delivery",
+    "history": "Change History",
+    "settings": "Settings"
+  },
+  "app": {
+    "browserPreviewNote": "Browser preview mode (sample data)",
+    "dbError": "Local database degraded: {error} (data is in-memory only, lost on restart)"
+  },
+  "overview": {
+    "stat": {
+      "sites": "Sites",
+      "keys": "Local keys",
+      "consents": "Active consents",
+      "alerts": "Alerts",
+      "drift": "Config drift"
+    },
+    "runState": {
+      "title": "Runtime status",
+      "mode": "Mode",
+      "db": "Local database",
+      "version": "Version",
+      "vault": "Keychain",
+      "modeTauri": "Tauri (backend connected)",
+      "modeBrowser": "Browser preview (backend not connected)"
+    },
+    "btn": {
+      "refreshNow": "Refresh all sites now",
+      "refreshing": "Refreshing…"
+    },
+    "refreshResult": {
+      "base": "Succeeded {ok} / failed {failed} / keys {keys}",
+      "balanceAlerts": " / balance alerts on {count} sites",
+      "needsLogin": " / {count} sites need re-login"
+    },
+    "error": {
+      "refreshFailed": "Refresh failed: {error}",
+      "memoryVaultPre": "Currently using the in-memory keychain: ",
+      "memoryVaultPost": "keys won't enter the system keychain and are lost when the process exits. In a real run, this backend is a defect."
+    },
+    "warn": {
+      "browserPreviewPre": "Browser preview mode: all data is sample, writes won't take effect. To connect the real backend, use ",
+      "browserPreviewPost": "."
+    },
+    "needsLogin": {
+      "title": "Re-login required ({count})",
+      "hint": "Sessions on these sites have expired and are skipped during refresh—counted neither as success nor failure, so they don't appear in the failure count above. Re-login on the Sites page."
+    },
+    "drift": {
+      "title": "Delivery targets need attention ({count})",
+      "hint1Pre": "KeyRelay does not auto-overwrite external changes. To restore, re-deliver on the Agent Delivery page. Deleted targets (",
+      "hint1Mid": ") can also be rolled back on the Change History page to their pre-delivery content; modified (",
+      "hint1Post": ") rollback will be refused—rollback never overwrites others' changes.",
+      "hint2Pre": "Targets you rolled back yourself also appear here",
+      "hint2Post": ": after rollback the file no longer matches KeyRelay's last delivered content, so drift detection still flags it (the corresponding row on the Change History page is marked \"rolled back\"). Do not re-deliver in this case—that would undo your rollback; to stop KeyRelay from managing it, unbind the agent on the Agent Delivery page.",
+      "hint3Pre": "Targets marked ",
+      "hint3Mid1": " ",
+      "hint3Mid2": "file still exists",
+      "hint3Post": ", but is unreadable (permission or path-type issue). This is not \"deleted\"—check file permissions first; do not re-deliver blindly."
+    },
+    "alerts": {
+      "title": "Recent alerts"
+    },
+    "usage": {
+      "title": "Token usage",
+      "gateway24h": "Gateway forwarded (24h)",
+      "snapshot7d": "Site balance (7-day snapshots)",
+      "siteFallback": "Site {id}",
+      "tokens": "{site}: {total} tokens (in {prompt} / out {completion})",
+      "balance": "{site}: used {used} {currency} / remaining {remaining}{delta}",
+      "delta": " ({delta})"
+    }
+  },
+  "sites": {
+    "title": "Add a new site",
+    "btn": {
+      "test": "Test connection",
+      "add": "Add",
+      "login": "Sign in",
+      "openOfficial": "Open official page once",
+      "finishCaptcha": "Done, attach session",
+      "connecting": "Attaching session…"
+    },
+    "notice": {
+      "detected": "Detected: {name} ({kind} {version})",
+      "unknownVersion": "unknown version",
+      "added": "Site added: {name}",
+      "loggedIn": "Signed in: {name}",
+      "opened": "Official site page opened. Complete the login and captcha yourself in the window, then come back and click \"Done, attach session\".",
+      "captchaDone": "Captcha completed, session attached: {name}",
+      "cancelled": "Manual verification cancelled. Click \"Sign in\" again to retry."
+    },
+    "hint": {
+      "fingerprint": "Only the site's public status endpoint is called for fingerprinting; credentials are never persisted, only stored in the system keychain.",
+      "captchaTitle": "Captcha required: {name}",
+      "captchaBody": "This site requires a captcha. KeyRelay does not bypass captchas—click the button below to open the site's official page and complete the login and captcha yourself; then come back and click \"Done, attach session\". The page in the window is the site's own; we won't click or read it for you."
+    },
+    "list": {
+      "title": "Added ({count})",
+      "empty": "No sites yet. Enter a relay URL and click \"Test connection\" to start."
+    },
+    "table": {
+      "name": "Name",
+      "kind": "Type",
+      "url": "URL",
+      "status": "Status",
+      "balance": "Balance",
+      "action": ""
+    },
+    "balanceReason": {
+      "noCapability": "This site type doesn't expose balance",
+      "noUsable": "Site returned no usable balance this time"
+    },
+    "balanceText": {
+      "unobservable": "Not observable",
+      "needLogin": "(re-login)",
+      "queryFailed": "(query failed)"
+    },
+    "capReason": {
+      "noLogin": "This site type doesn't require sign-in"
+    },
+    "loginDialog": {
+      "title": "Sign in to {name}",
+      "confirming": "Signing in…",
+      "confirm": "Sign in",
+      "body": "The password is used only for this request; if the site encrypts credentials on login, encryption happens locally before sending. Credentials are never written to the local database.",
+      "accountLabel": "{label}",
+      "accountPlaceholderEmail": "name@example.com",
+      "password": "Password",
+      "secondFactor": "2FA code (optional)"
+    },
+    "loginField": {
+      "email": "Email",
+      "username": "Username",
+      "account": "Account"
+    }
+  },
+  "keys": {
+    "empty": "Add a relay site first on the Sites page.",
+    "btn": {
+      "refresh": "Refresh",
+      "create": "New key",
+      "sync": "Sync site keys",
+      "syncing": "Syncing site keys…",
+      "rotate": "Rotate…",
+      "revoke": "Revoke"
+    },
+    "sync": {
+      "hintPre": "Fetches the plaintext of existing site-side keys into the local keychain. Plaintext ",
+      "hintStrong": "is never shown here",
+      "hintPost": ", and never crosses IPC—no command in the layer has ever returned key plaintext.",
+      "done": "Key sync done: site-side {siteTotal} / already local {alreadyLocal} / newly imported {imported}{unreadable}.",
+      "unreadable": " / site gave no plaintext for {count} keys ({list}), these can only be deleted and recreated"
+    },
+    "rotation": {
+      "warnPre": "{count} keys have reached the rotation window. Rotation is a three-step \"create → reinject-all → revoke-old\", ",
+      "warnStrong": "if any step fails it stops immediately",
+      "warnPost": ", never leaving a state of \"old key revoked but new key not injected\".",
+      "hint": "\"Rotate…\" first shows a preview (which delivery targets are affected); it only acts after confirmation."
+    },
+    "table": {
+      "localId": "Local id",
+      "name": "Name",
+      "group": "Group",
+      "remoteId": "Remote id",
+      "status": "Status",
+      "usage": "Usage",
+      "action": "Action",
+      "dueAt": "Due at",
+      "createdAt": "Created"
+    },
+    "usage": {
+      "usedOverLimit": "Used {used} / {limit} {currency}",
+      "usedUnlimited": "Used {used} {currency} (unlimited)",
+      "unknown": "—",
+      "tokens30d": "30d {tokens} tokens"
+    },
+    "status": {
+      "enabled": "Enabled",
+      "disabled": "Site-disabled",
+      "exhausted": "Exhausted",
+      "revoked": "Revoked",
+      "unknown": "Unknown"
+    },
+    "statusHint": {
+      "revoked": "Local state: you revoked it on the site (irreversible). Local record kept for tracing and drift tracking.",
+      "disabled": "Site state: the site disabled this token—unrelated to this product.",
+      "other": "Raw status from site: {status}"
+    },
+    "remote": {
+      "title": "Tokens on the site (read-only)",
+      "noListCap": "This site type has no key-list endpoint, can't cross-check site-side tokens (per capability set).",
+      "loading": "Loading…",
+      "error": "Read failed (may need sign-in first): {error}"
+    },
+    "emptyStates": {
+      "loadingKeys": "Loading…",
+      "keysError": "Read failed: {error}",
+      "noKeys": "No local keys yet. Click \"New key\"—on success the key goes straight into the system keychain.",
+      "noSiteKeys": "No local keys under this site ({count} under other sites, switch above to see them)."
+    },
+    "footnote": "Key plaintext lives only in the system keychain; the backend never returns plaintext to the UI. Delivery uses the \"Local id\" above.",
+    "createDialog": {
+      "title": "New key",
+      "confirming": "Creating…",
+      "confirm": "Create",
+      "body": "On success the key is written directly to the system keychain; the UI shows only the last 4 digits. Confirm this key's purpose yourself.",
+      "nameLabel": "Name",
+      "namePlaceholderSuggesting": "Generating default name…",
+      "namePlaceholder": "keyrelay/agent/yyyymmdd",
+      "nameHintPre": "Default name follows ",
+      "nameHintMid": ", using your local today. It's just a label: rename it to anything you recognize.",
+      "groupLabel": "Group (optional)",
+      "groupDefault": "Unspecified (site default)",
+      "groupNoCap": "This site type has no group concept; the key is created in the site default (per capability set, not hardcoded by type name).",
+      "groupError": "Couldn't read group list ({error}); will create in the site default.",
+      "groupRateWarn": "Some groups have no usable rate from the site; they show \"Rate unknown\"—never fall back to 1×, so you don't pick a group on a wrong cost assumption.",
+      "nameError": "Couldn't generate a default name ({error}); please fill in manually."
+    },
+    "rotationDialog": {
+      "title": "Rotate key",
+      "confirming": "Rotating…",
+      "confirm": "Start rotation",
+      "introPre": "Will run a fixed three-step rotation on \"{name}\" (local id {id}):",
+      "step1": "Create a new key on the site (plaintext goes straight to the system keychain)",
+      "step2All": "Re-deliver the new key to all delivery targets (none bound now, this step is a no-op)",
+      "step2Some": "Re-deliver the new key to {count} targets: {channels}",
+      "step3Revoke": "Revoke the old key on the site (remote id {id})—irreversible",
+      "step3Skip": "Old key has no site-side id; this step is skipped (not a failure)",
+      "unmappedError": "Channels for targets {targets} can't be identified; rotation would miss them. If you proceed and revoke the old key, they'd be stuck on it forever. Fix these targets first—this action is blocked.",
+      "newNameLabel": "Name for the new key"
+    },
+    "rotationResult": {
+      "revokeRevoked": "Old key revoked on the site.",
+      "revokeSkipped": "Old key has no site-side id; revoke skipped—check manually on the site whether it needs deletion.",
+      "revokeFailed": "Old key revoke failed: {reason}. It's still valid; retry or delete it manually on the site.",
+      "revokeNotAttempted": "Old key not revoked (stopped on a prior failed step). It's still valid and usable.",
+      "completedPre": "Rotation completed: new key {masked} delivered to ",
+      "completedNoTargets": "0 targets (none bound originally).",
+      "completedTargets": "{targets}.",
+      "stoppedPre": "Rotation stopped midway",
+      "stoppedMid": " (at \"{step}\"): ",
+      "stoppedPost": "reason unknown",
+      "aftermathPre": "New key {masked} created and delivered to ",
+      "aftermathNoTargets": "0 targets.",
+      "aftermathTargets": "{targets}.",
+      "fixHint": "Fix the failure above first, then decide whether to retry; do not manually delete the old key before that."
+    },
+    "rotationStep": {
+      "create_new": "Create new key",
+      "revoke_old": "Revoke old key",
+      "reinject_all": "Reinject all"
+    },
+    "revokeDialog": {
+      "title": "Revoke key on site",
+      "confirming": "Revoking…",
+      "confirm": "Confirm revoke",
+      "bodyPre": "Will revoke \"{name}\" on the site (remote id ",
+      "bodyMid": "). This key ",
+      "bodyStrong": "fails immediately",
+      "bodyPost": " on the site; anyone still using it will be rejected.",
+      "localKeepPre": "The local record ",
+      "localKeepStrong": "is not",
+      "localKeepPost": " deleted—it's marked \"revoked\" and kept, since `bindings` and drift tracing depend on it. Old values already written to agent configs need to be re-delivered to overwrite.",
+      "agree": "I confirm revoking this key on the site and understand it's irreversible (site-side unrecoverable)"
+    },
+    "capReason": {
+      "unsupportedCreate": "This site type doesn't support creating keys on the site",
+      "noSite": "Add a site first (or the site list hasn't loaded)",
+      "rotationMissing": "Rotation needs create / read / revoke all three; this type is missing one",
+      "noListEndpoint": "This site type has no key-list endpoint",
+      "noReveal": "Site doesn't expose plaintext read-back",
+      "siteNotFound": "Can't find the site record for this key",
+      "unsupportedRevoke": "This site type doesn't support revocation",
+      "noRemoteId": "This key has no site-side id; the site can't locate it",
+      "alreadyRevoked": "Already revoked on the site (local record kept)"
+    },
+    "siteSelect": "Site",
+    "notice": {
+      "created": "Created {name} ({masked}); key stored in the system keychain",
+      "revokedPre": "Revoked \"{name}\" on the site. Local record is marked \"revoked\" and kept—the site-side key is gone; this is irreversible.",
+      "revokedLocalFail": "Note: local status wasn't written (see below); the next reconciliation will retry.",
+      "revokedNote": "\n{note}"
+    }
+  },
+  "agents": {
+    "intro": "Delivery writes a keychain key into the selected agent's config file. Every write requires consent first; a redacted diff is shown before writing.",
+    "select": {
+      "site": "Site",
+      "key": "Key",
+      "channel": "Channel",
+      "model": "Model",
+      "modelPlaceholder": "e.g. gpt-4o",
+      "keyPlaceholder": "(pick one)"
+    },
+    "gatewayMode": {
+      "label": "Point at local gateway: writes the gateway URL (/v1) and a local token, not the site key. To switch sites you only restart the gateway, no agent-side change. Requires the gateway to be running.",
+      "title": "Local gateway token (not the site key)",
+      "siteKey": "Site key",
+      "unknownMode": "Unknown delivery mode: {mode}"
+    },
+    "emptyKey": {
+      "noSiteKey": "No local keys under this site; create one on the Keys page first.",
+      "selectKey": "Pick a key first."
+    },
+    "plan": {
+      "title": "Delivery preview",
+      "agent": "Agent",
+      "target": "Target file",
+      "targetExists": "(exists)",
+      "targetNew": "(will create)",
+      "writeWhat": "Writing",
+      "willWrite": "Will write",
+      "restart": "Takes effect",
+      "consentGranted": "Granted",
+      "consentRevoked": "Revoked",
+      "consentMissing": "Not granted",
+      "diffTitle": "Diff preview (redacted)",
+      "noChange": "Config is already up to date; no change needed.",
+      "agree": "I consent to writing the above key into this agent's config (backup is taken before write; rollback is available)",
+      "generating": "Generating preview…"
+    },
+    "restartHint": {
+      "notNeeded": "Effective immediately: the agent re-reads this file on every run.",
+      "needed": "Requires restarting the agent to read the new config—it reads only on startup.",
+      "dependsOnNewSession": "Only for new sessions: already-running windows still see the old config (e.g. shell rc files).",
+      "unknown": "Unknown restart policy: {hint}"
+    },
+    "btn": {
+      "apply": "Deliver",
+      "revoke": "Revoke consent",
+      "rollback": "Roll back this delivery",
+      "unbind": "Unbind {agent}"
+    },
+    "lastDelivery": {
+      "title": "Last delivery",
+      "hint": "After leaving this page, the delivery is still available for rollback on the Change History page.",
+      "backup": " backup={path}"
+    },
+    "unmanaged": {
+      "title": "Unmanaged targets (read-only probe)",
+      "bodyPre": "These agent config targets are ",
+      "bodyStrong": "not written",
+      "bodyPost": " by this version: writing a key into a file the agent never reads is worse than not writing—you'd think delivery succeeded. Below is the actual probe result (read-only: no dirs created, nothing written).",
+      "error": "Probe failed: {error}",
+      "empty": "No known unmanaged targets in this version.",
+      "detected": "Detected",
+      "notDetected": "Not detected"
+    },
+    "consents": {
+      "title": "Recorded consents ({count})",
+      "empty": "No consent records yet.",
+      "table": {
+        "agent": "Agent",
+        "channel": "Channel",
+        "target": "Target",
+        "fields": "Fields",
+        "state": "State"
+      },
+      "revoked": "Revoked {ts}",
+      "valid": "Active · granted {ts}"
+    },
+    "unbind": {
+      "title": "Unbind",
+      "bodyPre": "Unbind only removes the KeyRelay↔agent-config binding; it ",
+      "bodyStrong": "does not",
+      "bodyPost": " touch the site-side key or delete the local key record—after unbind the target no longer appears in config drift, and history is still queryable.",
+      "agentLine": "agent = {agent}",
+      "defaultAgent": "the agent"
+    },
+    "unbindResult": {
+      "unbound": "Unbound {count} bindings this time.",
+      "noneUnbound": "No new bindings unbound this time.",
+      "alreadyUnbound": "Another {count} were already unbound.",
+      "revokedOk": "Revoked",
+      "revokedFail": "Revoke failed",
+      "localFail": "Deleted on the site (irreversible), but local status wasn't written.",
+      "siteLine": "Site #{siteId} · {remoteId}",
+      "localOnly": "(no site-side id locally)"
+    },
+    "confirmDialog": {
+      "applyTitle": "Confirm delivery",
+      "applyConfirmWriting": "Writing…",
+      "applyConfirm": "I consent, write",
+      "applyBodyPre": "About to write the key into ",
+      "applyBodyExists": "(file exists; only the keys below will change)",
+      "applyBodyNew": "(file doesn't exist; will create)",
+      "applyAgreePre": "I understand this writes to the above file with ",
+      "applyAgreeMid": " 0600 ",
+      "applyAgreePost": " permissions, and a backup is taken first."
+    },
+    "rollbackDialog": {
+      "title": "Roll back this delivery",
+      "confirming": "Rolling back…",
+      "confirm": "Roll back",
+      "body": "Restores the target file to its pre-delivery content (byte-by-byte compare). If the file was changed by another program since, rollback is refused rather than overwriting others' changes."
+    },
+    "revokeDialog": {
+      "title": "Revoke delivery consent",
+      "confirm": "Revoke",
+      "body": "After revoking you can't deliver to this channel again; already-written files aren't auto-restored. To restore content, roll back on the Change History page."
+    },
+    "unbindDialog": {
+      "title": "Unbind {agent}",
+      "confirming": "Processing…",
+      "confirm": "Unbind",
+      "bodyPre": "Unbind only removes the KeyRelay↔agent-config binding; it ",
+      "bodyStrong": "does not",
+      "bodyPost": " touch the site-side key. Written file content stays as-is; you can still roll back that delivery on the Change History page.",
+      "alsoRevokePre": "Also revoke the site-side key (",
+      "alsoRevokeStrong": "irreversible",
+      "alsoRevokePost": ": deleted on the site, programs using it elsewhere fail immediately)"
+    },
+    "notice": {
+      "delivered": "Delivered to {path} (change {journal}). {hint}",
+      "revoked": "Consent revoked. Written files won't auto-rollback—use the Change History page to restore.",
+      "rolledBack": "Rolled back {journal}. {aftermath}"
+    }
+  },
+  "history": {
+    "intro": "Every currently-effective delivery can be rolled back here (older, superseded history lists the most recent 100). All text in the event stream is redacted before writing to the database—no key plaintext appears here.",
+    "deliveries": {
+      "title": "Deliveries ({count})",
+      "empty": "No deliveries yet. Deliver once on the Agent Delivery page and it'll show up here.",
+      "error": "Read failed: {error}",
+      "table": {
+        "time": "Time",
+        "agent": "Agent",
+        "target": "Target file",
+        "key": "Key",
+        "status": "Status",
+        "action": "Action"
+      },
+      "rolledBack": "Rolled back",
+      "rolledBackReason": "This delivery was already rolled back",
+      "noJournal": "No change record",
+      "noJournalReason": "This delivery has no change record (old data); can't roll back",
+      "superseded": "Superseded by a later delivery",
+      "supersededReason": "A later delivery was made to the same file: roll back the newer one first to get back to this one",
+      "current": "Current",
+      "unbound": "Unbound",
+      "rollbackBtn": "Roll back…",
+      "hint": "Unbound deliveries can still be rolled back: unbind only stops tracking the file; the file content is untouched."
+    },
+    "events": {
+      "title": "Recent events ({count})",
+      "empty": "No events yet. Run a site detection or delivery and one will appear.",
+      "error": "Read failed: {error}",
+      "table": {
+        "time": "Time",
+        "level": "Level",
+        "source": "Source",
+        "message": "Message",
+        "payload": "Payload"
+      }
+    },
+    "rollbackDialog": {
+      "title": "Roll back this delivery",
+      "confirming": "Rolling back…",
+      "confirm": "Roll back",
+      "body": "Restores the target file to its pre-delivery content (byte-by-byte compare). If the file was changed by another program since, rollback is refused rather than overwriting others' changes.",
+      "backupHint": "Restore from this backup:",
+      "noBackupWarn": "This file was created by that delivery: rollback deletes it."
+    },
+    "notice": "Rolled back {target} (change {journal}). {aftermath}"
+  },
+  "settings": {
+    "intro": "All settings are stored locally in the database; nothing is uploaded.",
+    "loading": "Loading…",
+    "autorefresh": {
+      "title": "Auto refresh",
+      "body": "Off by default: KeyRelay does no scheduled networking for you. When on, it refreshes signed-in sites' balances and key lists on a timer; failures only log events and never break the loop.",
+      "off": "Off",
+      "min5": "5 min",
+      "min15": "15 min",
+      "hour1": "1 hour"
+    },
+    "balanceAlert": {
+      "title": "Balance alert",
+      "label": "Alert when balance drops below this (USD; 0 = off)"
+    },
+    "startupCheck": {
+      "title": "Startup check",
+      "label": "Check delivery targets for external changes on startup (local files only, no network)"
+    },
+    "ui": {
+      "title": "Interface",
+      "theme": "Theme",
+      "themeSystem": "Follow system",
+      "themeLight": "Light",
+      "themeDark": "Dark",
+      "language": "Language",
+      "languageZh": "简体中文",
+      "languageEn": "English",
+      "languageNote": "UI text switches with the language; text returned by the backend (events, errors, site names) stays in its original language (the backend isn't internationalized yet).",
+      "proxy": "Proxy",
+      "proxyAuto": "Auto",
+      "proxyManual": "Manual",
+      "proxyDirect": "Direct",
+      "proxyAutoDetectedPre": "Detected: ",
+      "proxyAutoDetectedMid": "(source: {source})",
+      "proxyAutoNone": "No system proxy detected; will connect directly.",
+      "proxyDetectBtn": "Re-detect",
+      "proxyDetecting": "Detecting…",
+      "proxyManualLabel": "Proxy URL (HTTP / SOCKS5)",
+      "proxyManualPlaceholder": "socks5://127.0.0.1:1080",
+      "proxyDirectNote": "No proxy used.",
+      "proxyHint": "Proxy takes effect on next app launch (gateway upstream on gateway restart). Proxy string validity is checked when a request is actually made: an invalid manual proxy errors directly; an invalid auto-detected proxy is skipped and falls back to direct (junk system values shouldn't keep the app from starting)."
+    },
+    "notify": {
+      "title": "Notifications",
+      "body": "Balance below threshold, expired sessions, key expiry, and config drift go through these channels. Notification bodies contain no keys and no raw site response text.",
+      "system": "System notification (macOS Notification Center / Windows Toast)",
+      "webhookUrl": "Webhook URL (empty = off)",
+      "webhookPlaceholder": "https://hooks.example.com/keyrelay",
+      "webhookTimeout": "Webhook timeout (seconds; max 60)",
+      "webhookHintPre": "If credentials are embedded in the URL (",
+      "webhookHintCode": "https://user:pass@…",
+      "webhookHintPost": "), they're stripped before writing to the event table and export bundle."
+    },
+    "rotation": {
+      "title": "Key rotation",
+      "body": "Reminds you to rotate before expiry. Rotation is a three-step op: create new key → reinject all → revoke old; if any step fails it stops, never leaving \"old key revoked but new key not injected\".",
+      "maxAge": "Rotation period (days; 0 = off)",
+      "warnBefore": "Warn before (days)",
+      "error": "Warn-before days can't exceed the rotation period."
+    },
+    "autostart": {
+      "title": "Persistence & autostart",
+      "closeToTray": "Hide to tray on close instead of quitting (when off, closing exits and background refresh stops too)",
+      "startHidden": "Don't show the main window on launch (equivalent to --hidden on the command line)",
+      "autostartLabelPre": "Launch on login (macOS writes a LaunchAgent, Windows writes a user-level startup entry). Takes effect on \"Save\"; autostart always passes ",
+      "autostartLabelCode": "--hidden",
+      "autostartLabelPost": "—its purpose is background refresh, and a popup would break that. If the tray is unavailable the window still shows, otherwise you'd have no way to bring it back.",
+      "actualState": "Actual state on system:",
+      "stateLoading": " reading…",
+      "stateError": " unreadable ({error})",
+      "mismatchPre": "Inconsistent with the toggle above:",
+      "mismatchPost": ". Click \"Save\" once to rewrite the system autostart entry per the toggle.",
+      "stateEnabled": "Installed and active",
+      "stateDisabled": "Not installed",
+      "stateUnknown": "Can't determine (autostart entry unreadable; possibly permission or path)",
+      "mismatchEnabled": "An autostart entry is installed but the toggle is off (turn off and save to remove)",
+      "mismatchDisabled": "No active autostart entry but the toggle is on (turn on and save to write it)"
+    },
+    "privacy": {
+      "title": "Privacy",
+      "telemetryPre": "Anonymous telemetry (off by default). This version only records the toggle; no data is sent—",
+      "telemetryStrong": "no server, no instrumentation code",
+      "telemetryPost": ".",
+      "autoUpdate": "Auto update (off by default). When on, checks once on startup; install still needs manual confirmation."
+    },
+    "updateTitle": "App updates",
+    "save": {
+      "btn": "Save",
+      "dirty": "Unsaved changes",
+      "ok": "Saved. Refresh-interval changes take effect on next launch.",
+      "autostartFail": "Settings saved, but login-autostart didn't sync: {error}",
+      "autostartMismatch": "Settings saved, but the actual autostart state is \"{state}\", inconsistent with the setting."
+    },
+    "validate": {
+      "refresh": "Refresh interval must be an integer between 0 and 86400 seconds (0 = off).",
+      "threshold": "Balance alert threshold must be a non-negative number up to 1000000 (0 = off).",
+      "port": "Gateway port must be an integer between 1 and 65535.",
+      "timeout": "Webhook timeout must be an integer between 1 and 60 seconds.",
+      "maxAge": "Rotation period must be an integer between 0 and 36500 days (0 = off).",
+      "warnBefore": "Warn-before days must be an integer between 0 and 36500.",
+      "warnGtMax": "Warn-before days can't exceed the rotation period (the thing to warn about has to happen within that period)."
+    },
+    "export": {
+      "title": "Export & backup",
+      "bodyPre": "Export includes sites, key metadata, consent records, and settings. ",
+      "bodyStrong": "The key body is not in the export",
+      "bodyPost": "—it lives only in the system keychain. So encryption protects metadata (site URLs, key names), not the key.",
+      "diagBodyPre": "\"Export diagnostics\" is another artifact for ",
+      "diagBodyStrong": "filing bugs",
+      "diagBodyPost": ": recent redacted events + a settings snapshot (no proxy or webhook values, only whether they're set) + version and library layout. It contains no key body, so there's no encrypted form.",
+      "passwordLabel": "Export password (empty = plaintext)",
+      "exportBtn": "Export config",
+      "exporting": "Exporting…",
+      "pruneBtn": "Prune old backups (keep latest 10)",
+      "pruning": "Pruning…",
+      "diagBtn": "Export diagnostics",
+      "result": "Exported to {path} ({encrypted}, {bytes} bytes)",
+      "resultUnregistered": ". Note: this file wasn't registered in the \"known exports\" table; redaction audit won't scan it—verify it contains no plaintext credentials yourself.",
+      "encrypted": "encrypted",
+      "plaintext": "plaintext",
+      "pruneResult": "Pruned {count} old backups (kept latest 10)",
+      "diagResult": "Diagnostics exported to {path} ({events} events, {bytes} bytes)",
+      "diagResultUnregistered": ". Note: this file wasn't registered in the \"known exports\" table; redaction audit won't scan it."
+    },
+    "keychain": {
+      "title": "Keychain entry cleanup",
+      "bodyPre": "Deletes all entries this product wrote to the ",
+      "bodyStrong": "system keychain",
+      "bodyPost": " (by local database reference, one by one—no enumeration: macOS would prompt for authorization). Once the secret is gone it's gone: the site-side key still exists, but the local plaintext is lost forever.",
+      "localKeepStrong": "The local record isn't deleted",
+      "localKeepPost": ": sites, key metadata, consent records, and change history are all kept; only the keychain entries they point to are gone (re-fetching a key restores them).",
+      "btn": "Clean up keychain entries",
+      "cleaning": "Cleaning…",
+      "dialogTitle": "Clean up keychain entries",
+      "confirm": "Confirm cleanup",
+      "dialogBodyPre": "Will delete this product's entries in the system keychain one by one. ",
+      "dialogBodyStrong": "Irreversible",
+      "dialogBodyPost": ": once gone, the local plaintext is unrecoverable; old values written to agent configs are unaffected (still in the files; re-deliver to overwrite).",
+      "dialogLocalKeep": "Local database records won't be deleted.",
+      "agree": "I confirm deleting the key entries in the keychain and understand they're unrecoverable",
+      "result": "Cleanup done: attempted {attempted} / removed {removed} / failed {failed}.",
+      "firstError": "First failure: {error}",
+      "failHint": "Failed entries remain in the keychain (a single failure doesn't abort the rest). Click again to retry; repeated failures usually mean keychain access was denied.",
+      "uninstallPre": "Uninstall note: macOS ",
+      "uninstallStrong1": "has no",
+      "uninstallMid": " uninstall hook, so the order is \"run cleanup here first, then delete the app\"—this product ",
+      "uninstallStrong2": "won't",
+      "uninstallPost": " (and can't) auto-clean when you delete the app."
+    },
+    "audit": {
+      "title": "Redaction audit",
+      "body": "Scans all this product's on-disk artifacts (database, WAL, backup dir, event table) for plaintext credentials. Only its own artifacts; not a full-disk scan.",
+      "btn": "Start scan",
+      "scanning": "Scanning…",
+      "eventTable": "event table"
+    },
+    "alias": {
+      "title": "Model alias mapping",
+      "body": "Maps the model name the agent uses to the site real model name. For example, the agent always uses gpt-5.6, which actually routes to the site gpt-5.6-2026. Unregistered model names are treated as identity (not rewritten). Aliases do not apply when multi-site routing is off.",
+      "agentModel": "Agent model",
+      "realModel": "Real model",
+      "adding": "Adding…",
+      "add": "Add / overwrite",
+      "empty": "No alias mappings yet."
+    }
+  },
+  "update": {
+    "checkBtn": "Check for updates",
+    "checking": "Checking…",
+    "latest": "You're on the latest version",
+    "recheck": "Check again",
+    "newVersion": "New version {version}",
+    "downloadBtn": "Download and install",
+    "downloading": "Downloading…",
+    "error": "Update check failed: {error}",
+    "confirm": "Update downloaded; relaunch the app to apply? Unsaved changes will be lost.",
+    "scrub": {
+      "network": "Can't reach the update server",
+      "signature": "Update package signature verification failed",
+      "default": "Update check failed; please retry later"
+    }
+  },
+  "gateway": {
+    "title": "Local gateway",
+    "bodyPre": "Point any OpenAI-compatible agent's base_url at",
+    "bodyMid": " http://127.0.0.1:{port}/v1 ",
+    "bodyPost": "—no key needs to go into their config. Listens only on loopback and requires the local token below.",
+    "allowLabel": "Allow starting the local gateway (off by default; this toggle only allows it—starting still needs the button below)",
+    "portLabel": "Port (1024–65535)",
+    "portDirtyHint": "Port changes need saving first and take effect on next gateway start.",
+    "status": {
+      "running": "Running",
+      "state": "State",
+      "url": "URL",
+      "upstream": "Upstream",
+      "token": "Local token",
+      "tokenStorage": "Token storage",
+      "persistent": "Stored in system keychain",
+      "temporary": "Temporary (keychain unavailable)—changes on restart"
+    },
+    "hint": "Put the URL and token into the agent's config; or on the Agent Delivery page check \"point at local gateway\" to have KeyRelay write it for you.",
+    "persistentHint": "The token lives in the system keychain and persists across restarts—so to switch sites you only restart the gateway, no agent-side change (its config has the gateway URL and this token).",
+    "temporaryHintPre": "This run uses a ",
+    "temporaryHintStrong": "temporary token",
+    "temporaryHintPost": ": the keychain is unavailable, so the token changes on restart and gateway-pointing channels need re-delivery. Old tokens already in agent configs fail immediately.",
+    "btn": {
+      "copy": "Copy token",
+      "rotate": "Regenerate token",
+      "rotating": "Rotating…",
+      "start": "Start gateway",
+      "starting": "Starting…"
+    },
+    "copied": "Copied to clipboard; may be captured by clipboard history (system or other apps). KeyRelay won't auto-clear the clipboard—that would fight your own copy operations.",
+    "rotatedWarn": "Token regenerated: the old one fails immediately; gateway-pointing channels need re-delivery, and agents need a restart to read the new config.",
+    "rotateConfirm": "Regenerate the gateway token? The old one fails immediately; gateway-pointing channels need one re-delivery.",
+    "stopBtn": "Stop gateway",
+    "startHint": {
+      "notEnabled": "Check the toggle above first.",
+      "noKey": "No local keys under this site; create one on the Keys page first."
+    },
+    "kv": {
+      "status": "State",
+      "url": "URL",
+      "upstream": "Upstream",
+      "token": "Local token",
+      "tokenStorage": "Token storage"
+    },
+    "batch": {
+      "btn": "Re-point delivered channels at the gateway…",
+      "notRunning": "Gateway isn't running: re-pointing needs the local token; start the gateway first.",
+      "title": "Pick channels to re-point at the gateway",
+      "bodyPre": "Lists only ",
+      "bodyStrong": "delivered and not unbound",
+      "bodyPost": " bindings. Each must be checked individually—no \"select all\", since each actually rewrites an agent's config file.",
+      "loading": "Reading bindings…",
+      "empty": "No delivered channels yet. Deliver one on the Agent Delivery page first.",
+      "unmappedPre": "Can't identify channel (",
+      "unmappedPost": ")—possibly written under another home; checking it will also fail with a reason",
+      "mapped": "{channel} · {path} · key #{keyId} · {site}",
+      "previewTitle": "Per-entry preview",
+      "previewRewrite": "Rewrites existing file",
+      "previewNew": "Creates new file",
+      "previewModePre": "Mode: ",
+      "previewModeGateway": "Point at local gateway",
+      "previewModeSite": "Point at site",
+      "previewWarnings": " · {count} warnings",
+      "previewError": "Preview failed: {error}",
+      "previewBtn": "Previewing…",
+      "previewBtnIdle": "Preview checked entries",
+      "applyBtn": "Processing…",
+      "applyBtnIdle": "Re-point checked",
+      "cancelBtn": "Cancel",
+      "hint": "A single failure doesn't abort the rest (e.g. target file locked by another process). Successfully re-pointed ones aren't rolled back—the goal is \"as many as possible\", not \"all or nothing\".",
+      "resultTitle": "Batch results",
+      "unmappedFull": "Can't identify channel (possibly written under another home)",
+      "unmappedApplyDetail": "Can't identify channel (possibly written under another home); handle it manually on the Agent Delivery page",
+      "appliedOk": "Re-pointed to gateway",
+      "unmappedStrong": "Can't identify channel"
+    },
+    "copyFail": "Copy failed ({error})—select the token text above manually."
+  },
+  "confirm": {
+    "cancel": "Cancel",
+    "confirm": "Confirm"
+  },
+  "rollback": {
+    "aftermath": "As long as {agent} is still bound, Overview keeps listing this target as \"needs attention\", and every Overview open logs another \"external change\" alert—the file no longer matches KeyRelay last delivered content; this is expected, do not re-deliver based on it (that would undo the rollback). When rotating this key the file is rewritten; it stays a candidate when batch re-pointing to the gateway. If this rollback restored the file to an earlier delivery different key: later rotating or revoking that earlier key will not rewrite this file—come back and deliver a still-valid key, or the agent stays on a revoked key. To stop KeyRelay from managing it, unbind {agent} on the Agent Delivery page."
+  }
+}

@@ -1,0 +1,765 @@
+{
+  "common": {
+    "cancel": "取消",
+    "confirm": "确认",
+    "refresh": "刷新",
+    "loading": "加载中…",
+    "detecting": "探测中…",
+    "retry": "重试",
+    "delete": "删除",
+    "stop": "停止",
+    "enabled": "启用",
+    "health": {
+      "ok": "已登录",
+      "needsLogin": "需要重新登录",
+      "unknown": "未登录"
+    },
+    "rateUnknown": "倍率未知",
+    "noUpdate": "没有可用的更新"
+  },
+  "nav": {
+    "brand": "KeyRelay",
+    "group": {
+      "daily": "日常",
+      "asset": "资产",
+      "delivery": "投递",
+      "system": "系统"
+    },
+    "overview": "总览",
+    "sites": "站点",
+    "keys": "密钥",
+    "agents": "Agent 投递",
+    "history": "变更历史",
+    "settings": "设置"
+  },
+  "app": {
+    "browserPreviewNote": "浏览器预览模式（示例数据）",
+    "dbError": "本地数据库降级：{error}（当前数据仅存内存，重启即丢失）"
+  },
+  "overview": {
+    "stat": {
+      "sites": "站点",
+      "keys": "本地密钥",
+      "consents": "有效同意",
+      "alerts": "告警事件",
+      "drift": "配置漂移"
+    },
+    "runState": {
+      "title": "运行状态",
+      "mode": "运行模式",
+      "db": "本地数据库",
+      "version": "版本",
+      "vault": "系统钥匙串",
+      "modeTauri": "Tauri（已连接后端）",
+      "modeBrowser": "浏览器预览（未连接后端）"
+    },
+    "btn": {
+      "refreshNow": "立即刷新全部站点",
+      "refreshing": "刷新中…"
+    },
+    "refreshResult": {
+      "base": "成功 {ok} / 失败 {failed} / 密钥 {keys}",
+      "balanceAlerts": " / 余额告警 {count} 个站点",
+      "needsLogin": " / 需要重新登录 {count} 个站点"
+    },
+    "error": {
+      "refreshFailed": "刷新失败：{error}",
+      "memoryVaultPre": "当前用的是内存钥匙串：",
+      "memoryVaultPost": "密钥不会进系统钥匙串，进程退出即丢失。真实运行里出现这个后端即为缺陷。"
+    },
+    "warn": {
+      "browserPreviewPre": "当前是浏览器预览模式：所有数据都是示例，写操作不会生效。要连真实后端请用 ",
+      "browserPreviewPost": "。"
+    },
+    "needsLogin": {
+      "title": "需要重新登录（{count}）",
+      "hint": "这些站点的会话已经失效，刷新时会被跳过——既不算成功也不算失败，所以不会出现在上面的「失败」计数里。请到「站点」页重新登录。"
+    },
+    "drift": {
+      "title": "投递目标需要处理（{count}）",
+      "hint1Pre": "KeyRelay 不会自动覆盖外部改动。要恢复请到「Agent 投递」页重新投递。被删掉的目标（",
+      "hint1Mid": "）也可以到「变更历史」页回滚那次投递，恢复成投递之前的内容；被外部改过的（",
+      "hint1Post": "）回滚会被拒绝——回滚不会覆盖别人的改动。",
+      "hint2Pre": "你自己回滚过的目标也会出现在这里",
+      "hint2Post": "：回滚后文件不再是 KeyRelay 最后一次投递写入的内容，漂移检测照样会报（「变更历史」页里对应那一行标着「已回滚」）。这种情况不要重新投递——那等于撤销回滚；不想再让 KeyRelay 管它，到「Agent 投递」页解绑对应的 agent。",
+      "hint3Pre": "标记为 ",
+      "hint3Mid1": " 的目标",
+      "hint3Mid2": "文件还在",
+      "hint3Post": "，只是读不到（权限或路径类型问题）。这不是「被删了」——请先检查文件权限，不要直接重新投递。"
+    },
+    "alerts": {
+      "title": "最近告警"
+    },
+    "usage": {
+      "title": "Token 消耗",
+      "gateway24h": "网关转发（24h）",
+      "snapshot7d": "站点余额（7天快照）",
+      "siteFallback": "站点{id}",
+      "tokens": "{site}: {total} tokens（输入 {prompt} / 输出 {completion}）",
+      "balance": "{site}: 已用 {used} {currency} / 剩余 {remaining}{delta}",
+      "delta": "（{delta}）"
+    }
+  },
+  "sites": {
+    "title": "接入新站点",
+    "btn": {
+      "test": "测试连接",
+      "add": "加入",
+      "login": "登录",
+      "openOfficial": "打开官方页面过一次",
+      "finishCaptcha": "我已过完，接上会话",
+      "connecting": "接上会话中…"
+    },
+    "notice": {
+      "detected": "识别成功：{name}（{kind} {version}）",
+      "unknownVersion": "未知版本",
+      "added": "已加入站点：{name}",
+      "loggedIn": "已登录：{name}",
+      "opened": "已打开站点官方页面。请在窗口里由您自己完成登录与验证码，完成后回到这里点「我已过完，接上会话」。",
+      "captchaDone": "人机验证完成，会话已接上：{name}",
+      "cancelled": "已取消人工验证。需要时重新点「登录」即可再试一次。"
+    },
+    "hint": {
+      "fingerprint": "只会调用站点的公开状态接口做指纹识别；登录凭证不落库，只进系统钥匙串。",
+      "captchaTitle": "需要人机验证：{name}",
+      "captchaBody": "该站点要求人机验证。KeyRelay 不绕过验证码——请点下面的按钮打开站点官方页面，由您自己完成登录与验证；过完之后回到这里点「我已过完，接上会话」。窗口里的页面是站点自己的页面，我们不会替您点击、也不会读取页面内容。"
+    },
+    "list": {
+      "title": "已接入（{count}）",
+      "empty": "还没有站点。填一个中转站地址，点「测试连接」开始。"
+    },
+    "table": {
+      "name": "名称",
+      "kind": "类型",
+      "url": "地址",
+      "status": "状态",
+      "balance": "余额",
+      "action": ""
+    },
+    "balanceReason": {
+      "noCapability": "该站点类型不提供余额",
+      "noUsable": "站点这次没有返回可用的余额"
+    },
+    "balanceText": {
+      "unobservable": "不可观测",
+      "needLogin": "（需登录）",
+      "queryFailed": "（查询失败）"
+    },
+    "capReason": {
+      "noLogin": "该站点类型不需要登录"
+    },
+    "loginDialog": {
+      "title": "登录 {name}",
+      "confirming": "登录中…",
+      "confirm": "登录",
+      "body": "密码只用于本次登录请求；若站点启用了登录加密，会在本机完成加密后再发送。凭证不会写入本地数据库。",
+      "accountLabel": "{label}",
+      "accountPlaceholderEmail": "name@example.com",
+      "password": "密码",
+      "secondFactor": "二次验证码（可选）"
+    },
+    "loginField": {
+      "email": "邮箱",
+      "username": "用户名",
+      "account": "账号"
+    }
+  },
+  "keys": {
+    "empty": "先去「站点」页接入一个中转站。",
+    "btn": {
+      "refresh": "刷新",
+      "create": "新建密钥",
+      "sync": "对齐站点密钥",
+      "syncing": "对齐站点密钥…",
+      "rotate": "轮换…",
+      "revoke": "回收"
+    },
+    "sync": {
+      "hintPre": "把站点侧已有密钥的明文取回本地钥匙串。明文",
+      "hintStrong": "不会显示在这里",
+      "hintPost": "，也不会经过 IPC——命令层至今没有任何一条命令返回过密钥明文。",
+      "done": "密钥对齐完成：站点侧 {siteTotal} 把 / 本地已有 {alreadyLocal} / 新导入 {imported}{unreadable}。",
+      "unreadable": " / 站点未给明文 {count} 把（{list}），这些只能删掉重建"
+    },
+    "rotation": {
+      "warnPre": "有 {count} 把密钥已到轮换窗口。轮换是「新建 → 全量重注入 → 回收旧钥匙」三连，",
+      "warnStrong": "中间任何一步失败都会立刻停下",
+      "warnPost": "，不会留下「旧钥匙已回收但新钥匙没注入」的状态。",
+      "hint": "「轮换…」会先给出预览（会波及哪些投递目标），确认之后才动手。"
+    },
+    "table": {
+      "localId": "本地 id",
+      "name": "名称",
+      "group": "分组",
+      "remoteId": "远端 id",
+      "status": "状态",
+      "usage": "用量",
+      "action": "操作",
+      "dueAt": "到期时间",
+      "createdAt": "创建时间"
+    },
+    "usage": {
+      "usedOverLimit": "已用 {used} / {limit} {currency}",
+      "usedUnlimited": "已用 {used} {currency}（不限）",
+      "unknown": "—",
+      "tokens30d": "近 30 天 {tokens} tokens"
+    },
+    "status": {
+      "enabled": "启用",
+      "disabled": "站点禁用",
+      "exhausted": "额度耗尽",
+      "revoked": "已回收",
+      "unknown": "未知"
+    },
+    "statusHint": {
+      "revoked": "本地状态：你已在站点侧回收它（不可逆）。本地记录保留，供溯源与漂移追溯。",
+      "disabled": "站点状态：站点自己禁用了这把令牌——与本产品无关。",
+      "other": "站点返回的原始状态：{status}"
+    },
+    "remote": {
+      "title": "站点上的令牌（只读对照）",
+      "noListCap": "该站点类型没有密钥列表端点，无法对照站点侧令牌（判断来自能力集）。",
+      "loading": "加载中…",
+      "error": "读取失败（可能需要先登录）：{error}"
+    },
+    "emptyStates": {
+      "loadingKeys": "加载中…",
+      "keysError": "读取失败：{error}",
+      "noKeys": "KeyRelay 本地还没有密钥。点「新建密钥」——新建成功后密钥会直接进系统钥匙串。",
+      "noSiteKeys": "这个站点下还没有本地密钥（其他站点共 {count} 把，切换上面的站点查看）。"
+    },
+    "footnote": "密钥明文只存在于系统钥匙串里；后端从不把明文返回给界面。投递时用的是上表的「本地 id」。",
+    "createDialog": {
+      "title": "新建密钥",
+      "confirming": "创建中…",
+      "confirm": "创建",
+      "body": "新建成功后密钥会直接写入系统钥匙串，界面只显示末 4 位。请自行确认这把钥匙的用途。",
+      "nameLabel": "名称",
+      "namePlaceholderSuggesting": "正在生成默认名…",
+      "namePlaceholder": "keyrelay/agent/yyyymmdd",
+      "nameHintPre": "默认名按 ",
+      "nameHintMid": " 生成，日期用你本机的今天。它只是标签：可以改成任何你认得出的名字。",
+      "groupLabel": "分组（可选）",
+      "groupDefault": "不指定（跟随站点默认）",
+      "groupNoCap": "该站点类型没有分组概念，将按站点默认分组创建（这个判断来自能力集，不是按站点类型名硬编码的）。",
+      "groupError": "读不到分组列表（{error}），将按站点默认分组创建。",
+      "groupRateWarn": "站点对部分分组没有给出可用倍率，这些分组一律显示「倍率未知」——不会用 1× 兜底，免得你按错误的成本预期选分组。",
+      "nameError": "没能生成默认名（{error}），请手动填写。"
+    },
+    "rotationDialog": {
+      "title": "轮换密钥",
+      "confirming": "轮换中…",
+      "confirm": "开始轮换",
+      "introPre": "将对「{name}」（本地 id {id}）执行固定顺序的三步：",
+      "step1": "在站点上新建一把密钥（明文直接进系统钥匙串）",
+      "step2All": "把新密钥重新投递到全部投递目标（当前没有绑定，这一步是空操作）",
+      "step2Some": "把新密钥重新投递到 {count} 个目标：{channels}",
+      "step3Revoke": "回收站点侧的旧密钥（远端 id {id}）—— 这一步不可逆",
+      "step3Skip": "旧密钥没有站点侧 id，这一步会被跳过（不是失败）",
+      "unmappedError": "{targets} 这些投递目标的通道无法识别，轮换会漏掉它们；若继续并回收旧密钥，它们会永久停在旧密钥上。请先处理这些目标再轮换——此操作已被禁止。",
+      "newNameLabel": "新密钥的名称"
+    },
+    "rotationResult": {
+      "revokeRevoked": "旧密钥已在站点侧回收。",
+      "revokeSkipped": "旧密钥没有站点侧 id，已跳过回收——请到站点上手动确认它是否需要删除。",
+      "revokeFailed": "旧密钥回收失败：{reason}。它仍然有效，请重试或到站点上手动删除。",
+      "revokeNotAttempted": "旧密钥未回收（前一步失败就停下了）。旧密钥仍有效，可以直接继续使用。",
+      "completedPre": "轮换已走完：新密钥 {masked} 已投递到 ",
+      "completedNoTargets": "0 个目标（原本就没有绑定）。",
+      "completedTargets": "{targets}。",
+      "stoppedPre": "轮换中途停下",
+      "stoppedMid": "（停在「{step}」）：",
+      "stoppedPost": "原因未知",
+      "aftermathPre": "新密钥 {masked} 已创建并投递到 ",
+      "aftermathNoTargets": "0 个目标。",
+      "aftermathTargets": "{targets}。",
+      "fixHint": "请先修复上面那个失败点，再决定重试；在那之前不要手动删除旧密钥。"
+    },
+    "rotationStep": {
+      "create_new": "新建密钥",
+      "revoke_old": "回收旧密钥",
+      "reinject_all": "全量重注入"
+    },
+    "revokeDialog": {
+      "title": "回收站点上的密钥",
+      "confirming": "回收中…",
+      "confirm": "确认回收",
+      "bodyPre": "将在站点上回收「{name}」（远端 id ",
+      "bodyMid": "）。这把 key 在站点侧会",
+      "bodyStrong": "立即失效",
+      "bodyPost": "，任何正在用它的人都将被拒。",
+      "localKeepPre": "本地记录",
+      "localKeepStrong": "不会",
+      "localKeepPost": "被删除，只会被标成「已回收」——`bindings` 与漂移追溯靠它存活。已经投递到 agent 配置里的旧值需要你自己重新投递覆盖。",
+      "agree": "我确认要在站点上回收这把密钥，并明白它不可逆（站点侧无法恢复）"
+    },
+    "capReason": {
+      "unsupportedCreate": "该站点类型不支持在站点侧建密钥",
+      "noSite": "先接入一个站点（或站点列表还没加载出来）",
+      "rotationMissing": "轮换需要建 / 读 / 回收三连，该类型缺其中一步",
+      "noListEndpoint": "该站点类型没有密钥列表端点",
+      "noReveal": "站点不提供明文回读",
+      "siteNotFound": "找不到这把密钥所属的站点记录",
+      "unsupportedRevoke": "该站点类型不支持回收",
+      "noRemoteId": "这把密钥没有站点侧 id，站点上定位不到它",
+      "alreadyRevoked": "已经在站点侧回收过了（本地记录保留）"
+    },
+    "siteSelect": "站点",
+    "notice": {
+      "created": "已创建 {name}（{masked}），密钥已存入系统钥匙串",
+      "revokedPre": "已在站点侧回收「{name}」。本地记录被标成「已回收」并保留——站点上那把 key 已经没了，这个动作不可逆。",
+      "revokedLocalFail": "注意：本地状态没能写上（原因见下），下次对账会再试。",
+      "revokedNote": "\n{note}"
+    }
+  },
+  "agents": {
+    "intro": "投递会把钥匙串里的密钥写进所选 agent 的配置文件。任何写入都必须先勾选同意；写入前会展示脱敏后的差异预览。",
+    "select": {
+      "site": "站点",
+      "key": "密钥",
+      "channel": "通道",
+      "model": "模型名",
+      "modelPlaceholder": "例如 gpt-4o",
+      "keyPlaceholder": "（选择一把）"
+    },
+    "gatewayMode": {
+      "label": "指向本地网关：写进去的是网关地址（/v1）与本地令牌，不是站点密钥。之后换站只要重启网关，agent 侧不用改。需要网关正在运行。",
+      "title": "本地网关令牌（不是站点密钥）",
+      "siteKey": "站点密钥",
+      "unknownMode": "未知的投递模式：{mode}"
+    },
+    "emptyKey": {
+      "noSiteKey": "该站点下还没有本地密钥，先去「密钥」页新建一把。",
+      "selectKey": "先选一把密钥。"
+    },
+    "plan": {
+      "title": "投递预览",
+      "agent": "Agent",
+      "target": "目标文件",
+      "targetExists": "（已存在）",
+      "targetNew": "（将新建）",
+      "writeWhat": "写入的是",
+      "willWrite": "将写入",
+      "restart": "生效方式",
+      "consentGranted": "已同意",
+      "consentRevoked": "已撤销",
+      "consentMissing": "未同意",
+      "diffTitle": "差异预览（已脱敏）",
+      "noChange": "配置已是最新，无需改动。",
+      "agree": "我同意把上述密钥写入该 agent 的配置（写入前会备份，可回滚）",
+      "generating": "生成预览…"
+    },
+    "restartHint": {
+      "notNeeded": "改完即生效：该 agent 每次运行都会重新读这个文件。",
+      "needed": "需要重启该 agent 才能读到新配置——它只在启动时读一次。",
+      "dependsOnNewSession": "只对新开的会话生效：已经在跑的窗口读到的还是旧配置（例如 shell rc 文件）。",
+      "unknown": "未知的生效策略：{hint}"
+    },
+    "btn": {
+      "apply": "投递",
+      "revoke": "撤销同意",
+      "rollback": "回滚这次投递",
+      "unbind": "解绑 {agent}"
+    },
+    "lastDelivery": {
+      "title": "上次投递",
+      "hint": "离开本页后，这次投递仍可以在「变更历史」页找到并回滚。",
+      "backup": "　备份={path}"
+    },
+    "unmanaged": {
+      "title": "不托管的落点（只读探测）",
+      "bodyPre": "这些 agent 的配置落点本版本",
+      "bodyStrong": "不写",
+      "bodyPost": "：往一个 agent 不会读的文件里写密钥，比不写更糟——你会以为投递成功了。下面是本机实际探测结果（只读：不创建目录、不写盘）。",
+      "error": "探测失败：{error}",
+      "empty": "本版本没有已知的不托管落点。",
+      "detected": "检测到",
+      "notDetected": "未检测到"
+    },
+    "consents": {
+      "title": "已记录的同意（{count}）",
+      "empty": "还没有任何同意记录。",
+      "table": {
+        "agent": "Agent",
+        "channel": "通道",
+        "target": "目标",
+        "fields": "键",
+        "state": "状态"
+      },
+      "revoked": "已撤销 {ts}",
+      "valid": "有效 · 同意于 {ts}"
+    },
+    "unbind": {
+      "title": "解绑",
+      "bodyPre": "解绑只解除 KeyRelay 与本机 agent 配置的绑定关系，",
+      "bodyStrong": "不会",
+      "bodyPost": "动站点侧那把 key，也不会删除本地的密钥记录——解绑之后该目标不再出现在「配置漂移」里，历史仍可查。",
+      "agentLine": "agent = {agent}",
+      "defaultAgent": "该 agent"
+    },
+    "unbindResult": {
+      "unbound": "本次解绑了 {count} 条绑定。",
+      "noneUnbound": "本次没有新解开任何绑定。",
+      "alreadyUnbound": "另有 {count} 条本来就是解绑状态。",
+      "revokedOk": "已回收",
+      "revokedFail": "回收失败",
+      "localFail": "站点侧已删除（不可逆），但本地状态没写上。",
+      "siteLine": "站点 #{siteId} · {remoteId}",
+      "localOnly": "（本地无站点侧 id）"
+    },
+    "confirmDialog": {
+      "applyTitle": "确认投递",
+      "applyConfirmWriting": "写入中…",
+      "applyConfirm": "我同意，写入",
+      "applyBodyPre": "即将把密钥写入 ",
+      "applyBodyExists": "（文件已存在，将只改动下列键）",
+      "applyBodyNew": "（文件不存在，将新建）",
+      "applyAgreePre": "我明白这会以",
+      "applyAgreeMid": " 0600 ",
+      "applyAgreePost": "权限写入上述文件，且会先留一份备份。"
+    },
+    "rollbackDialog": {
+      "title": "回滚这次投递",
+      "confirming": "回滚中…",
+      "confirm": "回滚",
+      "body": "会把目标文件还原到这次投递之前的内容（逐字节比对）。如果文件在那之后被别的程序改过，回滚会被拒绝，而不是覆盖掉别人的改动。"
+    },
+    "revokeDialog": {
+      "title": "撤销投递同意",
+      "confirm": "撤销",
+      "body": "撤销后无法再向该通道投递，已经写入的文件不会被自动还原。如需还原内容，请到「变更历史」页回滚。"
+    },
+    "unbindDialog": {
+      "title": "解绑 {agent}",
+      "confirming": "处理中…",
+      "confirm": "解绑",
+      "bodyPre": "解绑只解除 KeyRelay 与本机 agent 配置的绑定关系，",
+      "bodyStrong": "不会",
+      "bodyPost": "动站点侧那把 key。已写入的文件内容保持不变，之后仍可用「变更历史」页回滚那次投递。",
+      "alsoRevokePre": "同时回收站点侧的这把 key（",
+      "alsoRevokeStrong": "不可逆",
+      "alsoRevokePost": "：站点上删掉就没有了，正在别处使用它的程序会立刻失效）"
+    },
+    "notice": {
+      "delivered": "已投递到 {path}（变更 {journal}）。{hint}",
+      "revoked": "已撤销同意。已写入的文件不会被自动回滚——如需还原请用「变更历史」页。",
+      "rolledBack": "已回滚 {journal}。{aftermath}"
+    }
+  },
+  "history": {
+    "intro": "当前生效的每一次投递都可以在这里回滚（更早、已被覆盖的历史只列最近 100 次）。事件流里的所有文本在写入数据库前都经过脱敏——这里不会出现密钥明文。",
+    "deliveries": {
+      "title": "投递记录（{count}）",
+      "empty": "还没有投递过。到「Agent 投递」页投递一次，就会出现在这里。",
+      "error": "读取失败：{error}",
+      "table": {
+        "time": "时间",
+        "agent": "Agent",
+        "target": "目标文件",
+        "key": "密钥",
+        "status": "状态",
+        "action": "操作"
+      },
+      "rolledBack": "已回滚",
+      "rolledBackReason": "这次投递已经回滚过了",
+      "noJournal": "无变更记录",
+      "noJournalReason": "这次投递没有变更记录（老数据），无法回滚",
+      "superseded": "已被之后的投递覆盖",
+      "supersededReason": "同一文件之后又投递过：要回到这次之前，先回滚更新的那次",
+      "current": "当前生效",
+      "unbound": "已解绑",
+      "rollbackBtn": "回滚…",
+      "hint": "「已解绑」的投递照样可以回滚：解绑只是不再追踪那个文件，文件内容没动过。"
+    },
+    "events": {
+      "title": "最近事件（{count}）",
+      "empty": "还没有事件。做一次站点识别或投递就会出现在这里。",
+      "error": "读取失败：{error}",
+      "table": {
+        "time": "时间",
+        "level": "级别",
+        "source": "来源",
+        "message": "内容",
+        "payload": "载荷"
+      }
+    },
+    "rollbackDialog": {
+      "title": "回滚这次投递",
+      "confirming": "回滚中…",
+      "confirm": "回滚",
+      "body": "会把目标文件还原到这次投递之前的内容（逐字节比对）。如果文件在那之后被别的程序改过，回滚会被拒绝，而不是覆盖掉别人的改动。",
+      "backupHint": "用这份备份还原：",
+      "noBackupWarn": "这个文件是那次投递新建的：回滚会把它删掉。"
+    },
+    "notice": "已回滚 {target}（变更 {journal}）。{aftermath}"
+  },
+  "settings": {
+    "intro": "所有设置都存在本地数据库里，不上传任何地方。",
+    "loading": "加载中…",
+    "autorefresh": {
+      "title": "自动刷新",
+      "body": "默认关闭：KeyRelay 不会替你做任何定时联网。开启后会在后台按间隔刷新已登录站点的余额与密钥列表，失败只记事件、不打断循环。",
+      "off": "关闭",
+      "min5": "5 分钟",
+      "min15": "15 分钟",
+      "hour1": "1 小时"
+    },
+    "balanceAlert": {
+      "title": "余额告警",
+      "label": "余额低于该值时告警（USD，0 = 不告警）"
+    },
+    "startupCheck": {
+      "title": "启动检查",
+      "label": "启动时检查投递目标是否被外部改动（只读本地文件，不联网）"
+    },
+    "ui": {
+      "title": "界面",
+      "theme": "主题",
+      "themeSystem": "跟随系统",
+      "themeLight": "浅色",
+      "themeDark": "深色",
+      "language": "语言",
+      "languageZh": "简体中文",
+      "languageEn": "English",
+      "languageNote": "界面文案随语言切换；后端返回的事件、错误与站点名称仍为原文（后端尚未国际化）。",
+      "proxy": "代理",
+      "proxyAuto": "自动",
+      "proxyManual": "手动",
+      "proxyDirect": "直连",
+      "proxyAutoDetectedPre": "检测到：",
+      "proxyAutoDetectedMid": "（来源：{source}）",
+      "proxyAutoNone": "未检测到系统代理，将直连。",
+      "proxyDetectBtn": "重新检测",
+      "proxyDetecting": "检测中…",
+      "proxyManualLabel": "代理地址（HTTP / SOCKS5）",
+      "proxyManualPlaceholder": "socks5://127.0.0.1:1080",
+      "proxyDirectNote": "不使用任何代理。",
+      "proxyHint": "代理在下次启动应用时生效（网关上游在重启网关时生效）。代理串的合法性在真正发起请求时校验：手动模式下写法不合法会直接报错；自动模式下探测到的非法代理会被跳过并直连（系统配的垃圾值不应让应用起不来）。"
+    },
+    "notify": {
+      "title": "通知",
+      "body": "余额低于阈值、会话失效、密钥到期与配置漂移会走这里的渠道。通知正文不含密钥，也不含站点返回的原始文案。",
+      "system": "系统通知（macOS 通知中心 / Windows Toast）",
+      "webhookUrl": "Webhook 地址（留空 = 不启用）",
+      "webhookPlaceholder": "https://hooks.example.com/keyrelay",
+      "webhookTimeout": "Webhook 超时（秒，上限 60）",
+      "webhookHintPre": "地址里如果内嵌了凭证（",
+      "webhookHintCode": "https://user:pass@…",
+      "webhookHintPost": "），写进事件表与导出包之前会被剥掉。"
+    },
+    "rotation": {
+      "title": "密钥轮换",
+      "body": "到期前提醒你换一把新的。轮换是一次三连操作：新建 key → 全量重注入 → 回收旧 key；中间任何一步失败都会停下，不会留下「旧 key 已回收但新 key 没注入」的状态。",
+      "maxAge": "轮换周期（天，0 = 关闭提醒）",
+      "warnBefore": "提前提醒（天）",
+      "error": "提前提醒天数不能大于轮换周期。"
+    },
+    "autostart": {
+      "title": "常驻与自启",
+      "closeToTray": "关窗时隐藏到托盘而不是退出（关掉后关窗即退出，后台刷新也随之停止）",
+      "startHidden": "启动时不显示主窗口（等价于命令行加 --hidden）",
+      "autostartLabelPre": "登录时自动启动（macOS 写入 LaunchAgent，Windows 写入用户级启动项）。点「保存」时才会真正写盘；自启启动时一律带 ",
+      "autostartLabelCode": "--hidden",
+      "autostartLabelPost": "——自启的用途是后台刷新，弹窗会破坏它。托盘不可用时窗口仍会显示，否则你没有任何入口能把它调回来。",
+      "actualState": "系统里的实际状态：",
+      "stateLoading": " 读取中…",
+      "stateError": " 读不到（{error}）",
+      "mismatchPre": "与上面的开关不一致：",
+      "mismatchPost": "。点一次「保存」会按开关重写系统里的自启项。",
+      "stateEnabled": "已安装并生效",
+      "stateDisabled": "未安装",
+      "stateUnknown": "无法判定（读不到自启项，可能是权限或路径问题）",
+      "mismatchEnabled": "系统里已经装了自启项，但开关是关的（关掉开关并保存即可移除）",
+      "mismatchDisabled": "系统里没有生效的自启项，但开关是开的（打开开关并保存即可写入）"
+    },
+    "privacy": {
+      "title": "隐私",
+      "telemetryPre": "匿名遥测（默认关）。当前版本只记录这个开关，不发送任何数据——",
+      "telemetryStrong": "没有服务端，也没有埋点代码",
+      "telemetryPost": "。",
+      "autoUpdate": "自动更新（默认关）。打开后启动时自动检查一次，安装仍需手动确认。"
+    },
+    "updateTitle": "应用更新",
+    "save": {
+      "btn": "保存",
+      "dirty": "有未保存的修改",
+      "ok": "已保存。定时刷新间隔的变更在下次启动生效。",
+      "autostartFail": "设置已保存，但登录自启没能同步：{error}",
+      "autostartMismatch": "设置已保存，但登录自启的实际状态是「{state}」，与设置不一致。"
+    },
+    "validate": {
+      "refresh": "定时刷新间隔必须是 0 到 86400 之间的整数秒（0 = 关闭）。",
+      "threshold": "余额告警阈值必须是不超过 1000000 的非负数（0 = 不告警）。",
+      "port": "网关端口必须是 1 到 65535 之间的整数。",
+      "timeout": "Webhook 超时必须是 1 到 60 之间的整数秒。",
+      "maxAge": "轮换周期必须是 0 到 36500 之间的整数天（0 = 关闭提醒）。",
+      "warnBefore": "提前提醒天数必须是 0 到 36500 之间的整数。",
+      "warnGtMax": "提前提醒天数不能大于轮换周期（要提醒的事得先在那个周期内发生）。"
+    },
+    "export": {
+      "title": "导出与备份",
+      "bodyPre": "导出的是站点、密钥元数据、同意记录与设置。",
+      "bodyStrong": "密钥本体不在导出物里",
+      "bodyPost": "——它只存在于系统钥匙串。因此加密保护的是元数据（站点地址、密钥名称），不是密钥。",
+      "diagBodyPre": "「导出诊断包」是给",
+      "diagBodyStrong": "报障",
+      "diagBodyPost": "用的另一份产物：最近的事件（已脱敏）+ 设置快照（不含代理与 Webhook 的值，只标「配没配」）+ 版本与库结构。它不含密钥本体，所以没有加密形态。",
+      "passwordLabel": "导出密码（留空 = 明文导出）",
+      "exportBtn": "导出配置",
+      "exporting": "导出中…",
+      "pruneBtn": "清理历史备份（保留最近 10 个）",
+      "pruning": "清理中…",
+      "diagBtn": "导出诊断包",
+      "result": "已导出到 {path}（{encrypted}，{bytes} 字节）",
+      "resultUnregistered": "。注意：这个文件没能登记进「已知导出物」表，脱敏审计不会扫描它——请自行确认它里面没有明文凭证。",
+      "encrypted": "已加密",
+      "plaintext": "明文",
+      "pruneResult": "已清理 {count} 个历史备份（保留最近 10 个）",
+      "diagResult": "已导出诊断包到 {path}（{events} 条事件，{bytes} 字节）",
+      "diagResultUnregistered": "。注意：这个文件没能登记进「已知导出物」表，脱敏审计不会扫描它。"
+    },
+    "keychain": {
+      "title": "钥匙串条目清理",
+      "bodyPre": "删除本产品写进",
+      "bodyStrong": "系统钥匙串",
+      "bodyPost": "的全部条目（按本地数据库里的引用逐条删，不去枚举钥匙串——macOS 上枚举会弹授权）。秘密删掉之后取不回来：站点侧那把 key 还在，但本地再也没有它的明文。",
+      "localKeepStrong": "本地记录不会被删",
+      "localKeepPost": "：站点、密钥元数据、同意记录与变更历史都保留，只是它们指向的钥匙串条目不存在了（重新取一次密钥即可恢复）。",
+      "btn": "清理钥匙串条目",
+      "cleaning": "清理中…",
+      "dialogTitle": "清理钥匙串条目",
+      "confirm": "确认清理",
+      "dialogBodyPre": "会逐条删除本产品在系统钥匙串里的条目。",
+      "dialogBodyStrong": "不可逆",
+      "dialogBodyPost": "：删掉之后本地再也取不回那些密钥的明文，已投递到 agent 配置里的旧值不受影响（它们还在文件里，需要你自己重新投递覆盖）。",
+      "dialogLocalKeep": "本地数据库记录不会被删除。",
+      "agree": "我确认要删除钥匙串里的密钥条目，并明白它们不可恢复",
+      "result": "清理完成：尝试 {attempted} 条 / 删除 {removed} 条 / 失败 {failed} 条。",
+      "firstError": "第一条失败：{error}",
+      "failHint": "失败的条目仍然留在钥匙串里（单条失败不会中断其余清理）。可以再点一次重试；反复失败通常意味着系统钥匙串的访问权限被拒绝了。",
+      "uninstallPre": "卸载说明：macOS ",
+      "uninstallStrong1": "没有",
+      "uninstallMid": "卸载钩子，所以顺序是「先在这里跑一次清理，再删掉 App」——本产品",
+      "uninstallStrong2": "不会",
+      "uninstallPost": "（也无法）在你删除 App 时自动清理。"
+    },
+    "audit": {
+      "title": "脱敏审计",
+      "body": "扫描本产品的全部落盘产物（数据库、WAL、备份目录、事件表），确认没有明文凭证。只扫自己的产物，不做全盘扫描。",
+      "btn": "开始扫描",
+      "scanning": "扫描中…",
+      "eventTable": "事件表"
+    },
+    "alias": {
+      "title": "模型别名映射",
+      "body": "把 agent 侧用的模型名映射到站点真实模型名。例如 agent 固定用 gpt-5.6，实际路由到站点的 gpt-5.6-2026。未登记的模型名按恒等处理（不改写）。多站路由开关关闭时别名不生效。",
+      "agentModel": "agent 模型名",
+      "realModel": "真实模型名",
+      "adding": "添加中…",
+      "add": "添加 / 覆盖",
+      "empty": "还没有别名映射。"
+    }
+  },
+  "update": {
+    "checkBtn": "检查更新",
+    "checking": "检查中…",
+    "latest": "当前已是最新版本",
+    "recheck": "再检查一次",
+    "newVersion": "新版本 {version}",
+    "downloadBtn": "下载并安装",
+    "downloading": "下载中…",
+    "error": "更新检查失败：{error}",
+    "confirm": "更新已下载完成，即将重启应用以生效。未保存的修改会丢失，是否现在重启？",
+    "scrub": {
+      "network": "无法连接更新服务器",
+      "signature": "更新包签名校验失败",
+      "default": "更新检查失败，请稍后重试"
+    }
+  },
+  "gateway": {
+    "title": "本地网关",
+    "bodyPre": "让任何支持 OpenAI 兼容接口的 agent 把 base_url 指向",
+    "bodyMid": " http://127.0.0.1:{port}/v1 ",
+    "bodyPost": "即可——密钥不必写进它们的配置里。只监听回环地址，并且必须带下面的本地令牌。",
+    "allowLabel": "允许启动本地网关（默认关闭；这个开关只控制「允不允许」，真正启动要点下面的按钮）",
+    "portLabel": "端口（1024–65535）",
+    "portDirtyHint": "端口改动需要先保存设置，并在下次启动网关时生效。",
+    "status": {
+      "running": "运行中",
+      "state": "状态",
+      "url": "地址",
+      "upstream": "上游",
+      "token": "本地令牌",
+      "tokenStorage": "令牌存储",
+      "persistent": "已存入系统钥匙串",
+      "temporary": "临时（钥匙串不可用）——重启后会变"
+    },
+    "hint": "把地址与令牌填进 agent 的配置即可；也可以到「Agent 投递」页把通道勾上「指向本地网关」，让 KeyRelay 替你写。",
+    "persistentHint": "令牌存在系统钥匙串里，跨重启不变——所以换站时只要重启网关，agent 侧不用改（它的配置里写的是网关地址与这个令牌）。",
+    "temporaryHintPre": "这次用的是",
+    "temporaryHintStrong": "临时令牌",
+    "temporaryHintPost": "：钥匙串不可用，重启后令牌会变，届时指向网关的通道需要重新投递。已写入 agent 配置的旧令牌会立刻失效。",
+    "btn": {
+      "copy": "复制令牌",
+      "rotate": "重新生成令牌",
+      "rotating": "轮换中…",
+      "start": "启动网关",
+      "starting": "启动中…"
+    },
+    "copied": "已复制到剪贴板，可能被剪贴板历史记录（系统或其他应用）带走。KeyRelay 不会自动清空剪贴板——那会跟你自己的复制操作打架。",
+    "rotatedWarn": "已换新令牌：旧令牌立即失效，指向网关的通道需要重新投递一次，agent 需要重启才能读到新配置。",
+    "rotateConfirm": "重新生成网关令牌？旧令牌立即失效，指向网关的通道需要重新投递一次。",
+    "stopBtn": "停止网关",
+    "startHint": {
+      "notEnabled": "先勾选上面的开关。",
+      "noKey": "该站点下还没有本地密钥，先去「密钥」页新建一把。"
+    },
+    "kv": {
+      "status": "状态",
+      "url": "地址",
+      "upstream": "上游",
+      "token": "本地令牌",
+      "tokenStorage": "令牌存储"
+    },
+    "batch": {
+      "btn": "把已投递的通道批量改指网关…",
+      "notRunning": "网关没在运行：改指网关要读本地令牌，先启动网关。",
+      "title": "选择要改指网关的通道",
+      "bodyPre": "只会列出",
+      "bodyStrong": "已投递且没解绑",
+      "bodyPost": "的绑定。每条都要单独勾选——没有「全选」，因为每条都会真的改写一个 agent 的配置文件。",
+      "loading": "正在读绑定…",
+      "empty": "还没有任何已投递的通道。先去「Agent 投递」页投递一条。",
+      "unmappedPre": "无法识别通道（",
+      "unmappedPost": "）——可能是另一个 home 下写的，勾了也会失败并说明原因",
+      "mapped": "{channel} · {path} · key #{keyId} · {site}",
+      "previewTitle": "逐条预览",
+      "previewRewrite": "改写已存在的文件",
+      "previewNew": "新建文件",
+      "previewModePre": "模式：",
+      "previewModeGateway": "指向本地网关",
+      "previewModeSite": "指向站点",
+      "previewWarnings": " · 提示 {count} 条",
+      "previewError": "预览失败：{error}",
+      "previewBtn": "预览中…",
+      "previewBtnIdle": "预览勾选的条目",
+      "applyBtn": "处理中…",
+      "applyBtnIdle": "按勾选改指",
+      "cancelBtn": "取消",
+      "hint": "某一条失败不会中断其它条（例如目标文件正被别的程序占用）。已经改成功的那几强不会回滚——要的是「尽量都改掉」，不是「要么全成要么全不成」。",
+      "resultTitle": "批量结果",
+      "unmappedFull": "无法识别通道（可能是另一个 home 下写的）",
+      "unmappedApplyDetail": "无法识别通道（可能是另一个 home 下写的），请到「Agent 投递」页手工处理",
+      "appliedOk": "已改指网关",
+      "unmappedStrong": "无法识别通道"
+    },
+    "copyFail": "复制失败（{error}）——请手动选中上面的令牌文本。"
+  },
+  "confirm": {
+    "cancel": "取消",
+    "confirm": "确认"
+  },
+  "rollback": {
+    "aftermath": "只要 {agent} 还绑着，「总览」就会一直把这个目标列为「需要处理」，每打开一次总览还会记一条「外部改动」告警——文件已经不是 KeyRelay 最后一次投递写入的内容，这是预期的，不要据此重新投递（那等于撤销这次回滚）；轮换这把密钥时，这个文件会被重新写入；批量改指网关时它也仍在候选里。如果这次回滚把文件还原成了更早一次投递写下的另一把密钥：之后轮换或回收那把密钥时，KeyRelay 不会重写这个文件，做完要回来给它投递一把仍然有效的密钥，否则 agent 会留在一把已被回收的密钥上。不想再让 KeyRelay 管它，到「Agent 投递」页解绑 {agent}。"
+  }
+}

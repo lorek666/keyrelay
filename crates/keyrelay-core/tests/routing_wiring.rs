@@ -327,13 +327,82 @@ mod production_wiring {
         let built = source.matches("GatewayConfig::single_upstream(").count();
         assert_eq!(built, 1, "生产侧应当只有一处构造（当前 {built} 处）");
         // P1-4：single_upstream 下不装 route / keys_by_ref（空表 legacy）。
+        // M14-S1：多站开关开时装 route/keys_by_ref（接线后的预期，不再是「不装」）。
+        // single_upstream 默认（开关关）仍空 route——由 `gateway_config_uses_empty_route_under_single_upstream` 钉住。
         assert!(
-            !source.contains("config.route = route;"),
-            "P1-4：不再装 route（single_upstream，空表 legacy）"
+            source.contains("config.route = route;"),
+            "M14-S1：多站开关开时必须装 route"
         );
         assert!(
-            !source.contains("config.keys_by_ref = keys_by_ref;"),
-            "P1-4：不再装 keys_by_ref（空表 legacy）"
+            source.contains("config.keys_by_ref = keys;"),
+            "M14-S1：多站开关开时必须装 keys_by_ref"
+        );
+    }
+
+    // ============================================================ M14-S1：多站开关 + alias 接线（W9-W11）
+
+    /// W9：多站开关开时 `gateway_config` 的 `route` 非空、`keys_by_ref` 覆盖全部 `key_ref`。
+    #[tokio::test]
+    async fn multi_site_route_is_populated_when_enabled() {
+        let (_dir, service, site_a, key_a, _ref_a, _ref_b) = service_with_two_sites().await;
+        service
+            .store()
+            .set_setting("gateway_multi_site", "true")
+            .unwrap();
+        let config = service
+            .gateway_config(site_a, key_a, 0)
+            .expect("组装网关配置");
+        assert!(!config.route.is_empty(), "多站开关开时 route 非空");
+        // keys_by_ref 覆盖 route 里所有 key_ref（集合不变式，M8-S1 §10）
+        let candidates = config.route.all_candidates();
+        assert!(candidates.len() >= 2, "两个站点都进路由表");
+        for up in candidates {
+            assert!(
+                config.keys_by_ref.contains_key(up.key_ref.as_str()),
+                "key_ref {} 必须有明文（集合不变式）",
+                up.key_ref
+            );
+        }
+    }
+
+    /// W10：alias 表喂进 route（`resolve_model` 命中）。
+    #[tokio::test]
+    async fn alias_map_feeds_route_table() {
+        let (_dir, service, site_a, key_a, _ref_a, _ref_b) = service_with_two_sites().await;
+        service
+            .store()
+            .set_setting("gateway_multi_site", "true")
+            .unwrap();
+        service
+            .store()
+            .upsert_alias("agent-name", "real-model")
+            .unwrap();
+        let config = service
+            .gateway_config(site_a, key_a, 0)
+            .expect("组装网关配置");
+        assert_eq!(
+            config.route.resolve_model("agent-name"),
+            "real-model",
+            "alias 表喂进了 route"
+        );
+    }
+
+    /// W11：alias 表空时 `resolve_model` 恒等（不 panic、不报错）。
+    #[tokio::test]
+    async fn empty_alias_map_is_identity() {
+        let (_dir, service, site_a, key_a, _ref_a, _ref_b) = service_with_two_sites().await;
+        service
+            .store()
+            .set_setting("gateway_multi_site", "true")
+            .unwrap();
+        // 不插任何 alias
+        let config = service
+            .gateway_config(site_a, key_a, 0)
+            .expect("组装网关配置");
+        assert_eq!(
+            config.route.resolve_model("没登记的"),
+            "没登记的",
+            "空 alias 表 ⇒ 恒等"
         );
     }
 }

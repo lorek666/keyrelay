@@ -183,7 +183,7 @@ impl KeyStatus {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct KeyMeta {
     pub remote_id: String,
     pub name: String,
@@ -191,6 +191,33 @@ pub struct KeyMeta {
     pub status: KeyStatus,
     pub created_at: Option<i64>,
     pub last_used_at: Option<i64>,
+    /// 该 key 的当前累计已用（M14-S3 / PRD FR-3）。
+    ///
+    /// `None` = 站点没给或适配器没解析（「不知道」，**不是**「用 0」）。
+    /// NewAPI 取 `list_keys` 的 `used_quota / quota_per_unit`；Sub2API 取 `list_keys` 的 `quota_used`。
+    /// 与 [`Balance::known`] 同纪律：界面不得把 `None` 渲染成 `0.00`。
+    pub quota_used: Option<f64>,
+    /// 该 key 的限额（M14-S3）。
+    ///
+    /// NewAPI 取 `remain_quota / quota_per_unit`（`unlimited_quota=true` ⇒ `None`）；
+    /// Sub2API 取 `list_keys` 的 `quota`。`None` = 不限或未知。
+    pub quota_limit: Option<f64>,
+    /// `quota_used` / `quota_limit` 的币种（M14-S3）。NewAPI / Sub2API 均为 `"USD"`。
+    pub currency: Option<String>,
+}
+
+/// 一把 key 一天的用量（M14-S3，Sub2API `/api/v1/user/api-keys/:id/usage/daily` 的 items 元素）。
+///
+/// 字段名与 Sub2API 源码 `APIKeyDailyUsagePoint` 一致：`input_tokens` / `output_tokens`
+/// （非任务描述的 `tokens_in` / `tokens_out`——见 spec §11 差异②）。**不含密钥**。
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyDailyUsage {
+    pub date: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub cost: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -388,11 +415,83 @@ pub trait SiteAdapter: Send + Sync {
         let _ = (base_url, session, remote_ids);
         Err(Error::Unimplemented("该适配器未实现 reveal_keys".into()))
     }
+
+    /// 拉取一把 key 近 30 天的日用量（M14-S3 / PRD FR-3）。
+    ///
+    /// 站点契约：Sub2API `GET /api/v1/user/api-keys/:id/usage/daily?days=30`，items 元素
+    /// 是 `APIKeyDailyUsagePoint`（源码 `usage_log_types.go:210`）。
+    ///
+    /// **默认实现返回空 `Vec`**：没有 per-key 日趋势端点的站点类型（NewAPI / CustomOpenAi）
+    /// 不发请求、返回空，调用方据此跳过 `usage_samples` 写入。
+    ///
+    /// 这不是 `Error::Unimplemented`：NewAPI 的 `key_usage=true` 来自 `list_keys` 的当前累计用量
+    /// （写 `keys.quota_used`），它**本来就没有**日趋势端点——返回空是正常状态，不是「未实现」。
+    /// 与 [`SiteAdapter::reveal_keys`] 的默认 `Unimplemented` 区别在此：`reveal_keys` 是
+    /// `key_usage=true` 站点的必需能力，而日趋势是可选能力。
+    ///
+    /// 节流由调用方（`service::refresh_site`）负责：每 key 每轮最多一次、有界并发、失败静默。
+    async fn fetch_key_daily_usage(
+        &self,
+        base_url: &str,
+        session: &Session,
+        remote_id: &str,
+    ) -> Result<Vec<KeyDailyUsage>> {
+        let _ = (base_url, session, remote_id);
+        Ok(Vec::new())
+    }
 }
 
 /// 去掉尾部斜杠，避免拼出 `//api/...`
 pub(crate) fn normalize_base_url(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_string()
+}
+
+/// M14-S1：用一把站点 key 调 `GET {base_url}/v1/models`，返回 `data[].id` 列表（B-99 ①）。
+///
+/// **原样存**（不做大小写/别名归一——归一是 alias 表的职责，B-110）。
+/// 失败 ⇒ `Err`；调用方（`refresh_all`）静默丢弃并记 Debug 事件，不阻塞主流程。
+///
+/// # 为什么是独立函数而不是 `SiteAdapter` trait 方法
+///
+/// 采集是 OpenAI 兼容端点（`/v1/models`）的通用能力：NewAPI / Sub2API /
+/// custom-openai 都有这个端点。做成 trait 方法要动 `newapi.rs` / `sub2api.rs`
+/// （不在 M14-S1 写域）；独立函数复用 `custom_openai::detect` 的解析口径
+/// （`data` 数组 + `data[].id`），一处实现全站通用。
+///
+/// # 密钥咽喉
+///
+/// `api_key` 是明文，调用方负责从 `service::key_secret` 取（同一条咽喉，
+/// M8-S5A §2.2）。本函数只发一次请求，**不落库、不进日志、不进事件**。
+/// 失败文案过 [`map_http_error`] 的 `scrub`（站点原文可能回显密钥）。
+pub async fn fetch_models<T: crate::site::transport::HttpTransport>(
+    transport: &T,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<String>> {
+    let url = format!("{}/v1/models", normalize_base_url(base_url));
+    let req =
+        crate::site::transport::HttpRequest::new(crate::site::transport::Method::Get, url.clone())
+            .header("Authorization", format!("Bearer {api_key}"));
+    let resp = transport.request(req).await?;
+    if !(200..300).contains(&resp.status) {
+        return Err(map_http_error(
+            resp.status,
+            &resp.body,
+            resp.retry_after_secs(),
+        ));
+    }
+    let value = resp.json_value()?;
+    let Some(data) = value.get("data").and_then(|d| d.as_array()) else {
+        return Err(Error::Transport(format!(
+            "{} 返回的响应缺少 data 数组，不是 OpenAI /v1/models 形态",
+            display_url(&url)
+        )));
+    };
+    Ok(data
+        .iter()
+        .filter_map(|item| item.get("id").and_then(|i| i.as_str()))
+        .map(|s| s.to_string())
+        .collect())
 }
 
 /// 统一 HTTP 错误映射。适配器在拿到非 2xx 响应后必须调用本函数。
