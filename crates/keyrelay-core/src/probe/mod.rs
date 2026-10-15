@@ -115,7 +115,9 @@ fn parse_probe_response(resp: HttpResponse) -> Result<ProbeRun> {
         return Err(Error::Transport("检测服务正在维护，请稍后重试".into()));
     }
     if resp.status == 400 {
-        let body = resp.text_lossy();
+        // M1（独立复审）：400 body 原样透传会回显请求字段——bazaarlink 未保证不回显 apiKey，
+        // 过 `redact::scrub` 再拼进错误信息（与 reqwest 网络错误 `describe()` 的 scrub 同口径）。
+        let body = crate::redact::scrub(&resp.text_lossy());
         return Err(Error::Transport(format!(
             "检测请求被拒（目标 URL 无效或私有 / 参数不合法）: {body}"
         )));
@@ -138,8 +140,11 @@ fn parse_probe_response(resp: HttpResponse) -> Result<ProbeRun> {
 /// 从 bazaarlink 响应 JSON 取身份判定摘要。宽松反序列化：只强依赖 `runId`，
 /// 其余字段缺失返回 `None`/默认（schema 可能演变，文档明说 "may evolve"）。
 fn parse_probe_run(v: &Value) -> Result<ProbeRun> {
+    // L3（独立复审）：bazaarlink schema 可能演变成 snake_case（文档自陈 may evolve），
+    // 同时认 `runId` / `run_id`，避免 schema 一改就报「缺 runId」。
     let run_id = v
         .get("runId")
+        .or_else(|| v.get("run_id"))
         .and_then(|x| x.as_str())
         .ok_or_else(|| Error::Transport("probe 响应缺 runId".into()))?
         .to_string();
@@ -400,5 +405,33 @@ mod tests {
         let body: Value =
             serde_json::from_slice(&mock.nth_request(0).unwrap().body.unwrap()).unwrap();
         assert!(body.get("claimedModel").is_none() || body["claimedModel"].is_null());
+    }
+
+    #[tokio::test]
+    async fn run_probe_400_body_does_not_leak_api_key() {
+        // M1（独立复审）：400 body 若回显请求字段（含 apiKey），错误信息不得带明文。
+        let mock = MockTransport::new(vec![HttpResponse::new(
+            400,
+            br#"{"error":"invalid baseUrl","echoedApiKey":"sk-test-secret-leak"}"#.to_vec(),
+        )]);
+        let err = run_probe(&mock, &probe_req()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("sk-test-secret-leak"),
+            "400 body 不得回显 apiKey: {msg}"
+        );
+        assert!(msg.contains("检测请求被拒"));
+    }
+
+    #[tokio::test]
+    async fn run_probe_accepts_snake_case_run_id() {
+        // L3（独立复审）：schema 演变成 run_id（snake_case）也能解析。
+        let mock = MockTransport::new(vec![HttpResponse::json(
+            200,
+            json!({ "run_id": "r6", "status": "completed" }),
+        )
+        .unwrap()]);
+        let run = run_probe(&mock, &probe_req()).await.unwrap();
+        assert_eq!(run.run_id, "r6");
     }
 }

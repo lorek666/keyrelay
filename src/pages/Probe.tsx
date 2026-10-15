@@ -79,7 +79,7 @@ export default function Probe() {
           <select
             value={activeSiteId ?? ""}
             onChange={(e) => {
-              setSiteId(Number(e.target.value));
+              setSiteId(e.target.value ? Number(e.target.value) : null);
               setKeyId(null);
             }}
           >
@@ -94,7 +94,7 @@ export default function Probe() {
           <span>{t("probe.key")}</span>
           <select
             value={keyId ?? ""}
-            onChange={(e) => setKeyId(Number(e.target.value))}
+            onChange={(e) => setKeyId(e.target.value ? Number(e.target.value) : null)}
             disabled={siteKeys.length === 0}
           >
             <option value="">
