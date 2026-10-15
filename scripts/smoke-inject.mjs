@@ -36,7 +36,8 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -74,7 +75,8 @@ function missing(message) {
 
 function fail(message) {
   console.error(`✗ ${message}`);
-  cleanup();
+  // P2-18：运行中失败（投递/回滚没走完）⇒ 保留备份，原配置可能未还原。
+  cleanup(true);
   process.exit(1);
 }
 
@@ -88,12 +90,20 @@ function info(message) {
  * 必须挂在**每一条**提前退出的路上：备份是在前置检查里做的，而前置检查可能在第 ⑤ 条
  * 才失败——那时若不删，下一次跑会撞上「`<path>.smoke-backup` 已存在」而永远起不来
  * （实测：第一版就把备份留在 `~/.codex/` 里了）。`--keep` 只影响**跑完之后**的清理。
+ *
+ * P2-18 / DEBUG-REPORT-v3 §2-18：`preserveBackup = true` 时**保留**备份——用于运行中
+ * 失败（回滚没完成、SIGINT 中断）的路径。那时原配置还没还原，删备份 = 把用户真实的
+ * agent 配置（含密钥）永久丢失。前置失败（还没投递）仍删（`preserveBackup = false`）。
  */
 let backupPathRef = null;
-function cleanup() {
+function cleanup(preserveBackup = false) {
   if (backupPathRef && existsSync(backupPathRef)) {
-    rmSync(backupPathRef);
-    console.log(`  已清理本次留下的备份 ${backupPathRef}`);
+    if (preserveBackup) {
+      console.error(`  ⚠ 保留备份 ${backupPathRef}（原配置可能未还原，请手工比对后决定是否删除）`);
+    } else {
+      rmSync(backupPathRef);
+      console.log(`  已清理本次留下的备份 ${backupPathRef}`);
+    }
   }
 }
 
@@ -130,8 +140,17 @@ if (!key.startsWith("sk-") || key.length < 12) {
 }
 info("密钥: 已提供（不打印、不进命令行参数）");
 
-// ④ 目标配置不存在或可写；存在时先备份到 <path>.smoke-backup
-const home = process.env.KEYRELAY_SMOKE_HOME ?? process.env.HOME ?? resolve(here, "..");
+// ④ 目标配置不存在或可写；存在时先备份到 <path>.smoke-backup。
+//
+// P2-18：默认 home 不再是真实 `$HOME`——冒烟脚本会向 agent 配置写密钥、跑请求，
+// 对真实环境是破坏性的。显式 KEYRELAY_SMOKE_HOME 才允许指向真实目录（提示里写明）。
+const home =
+  process.env.KEYRELAY_SMOKE_HOME ??
+  resolve(tmpdir(), `keyrelay-smoke-${Date.now()}`);
+if (!existsSync(home)) {
+  mkdirSync(home, { recursive: true });
+}
+info(`home: ${home}${process.env.KEYRELAY_SMOKE_HOME ? "" : "（临时目录，未设 KEYRELAY_SMOKE_HOME）"}`);
 const configPath = resolve(home, target.config);
 const backupPath = `${configPath}.smoke-backup`;
 if (existsSync(backupPath)) {
@@ -139,13 +158,34 @@ if (existsSync(backupPath)) {
 }
 let hadConfig = false;
 if (existsSync(configPath)) {
-  writeFileSync(backupPath, readFileSync(configPath));
+  // P2-18：备份文件权限继承原文件（原配置通常 0600 且含真实密钥）——
+  // 不再是默认 0644（同机其他用户可读）。原文件权限读不到时保守用 0600。
+  let mode;
+  try {
+    mode = statSync(configPath).mode & 0o777;
+  } catch {
+    mode = 0o600;
+  }
+  writeFileSync(backupPath, readFileSync(configPath), { mode });
   backupPathRef = backupPath;
   hadConfig = true;
-  info(`已备份原配置 → ${backupPath}`);
+  info(`已备份原配置 → ${backupPath}（权限 ${mode.toString(8)}）`);
 } else {
   info(`目标配置不存在（将新建）: ${configPath}`);
 }
+
+// P2-18：SIGINT（Ctrl-C）时原配置可能已注入未回滚——与 fail() 同一条路：
+// 保留备份，让用户能手工还原；直接 exit 会跳过 cleanup。
+process.on("SIGINT", () => {
+  console.error("\n✗ 收到 SIGINT，中断冒烟");
+  cleanup(true);
+  process.exit(130);
+});
+process.on("SIGTERM", () => {
+  console.error("\n✗ 收到 SIGTERM，中断冒烟");
+  cleanup(true);
+  process.exit(143);
+});
 
 // ⑤ 投递 / 回滚的入口：本机**没有** KeyRelay 的 CLI（投递是 core 库函数，
 //    见文件头「从未完整跑过」的第 2 条）。明确报出来，不静默跳过。
