@@ -358,57 +358,39 @@ fn extract_items(value: &Value) -> Vec<Value> {
     }
 }
 
-/// 解析 `GET /api/token/auto-groups` 的 `data`（M6-S4 / PRD FR-2）。
+/// 解析 `GET /api/user/self/groups` 的 `data` 对象（M12-S1）。
 ///
-/// **真实形态**（本机 NewAPI 源码实测，见 M6-S4 spec §5.1）：
-/// `data = {"groups": ["default", "vip"], "max_count": 3}` —— 元素是**分组名字符串**，
-/// 站点不给倍率，因此 `rate = None`（章程 §4.4：「`rate` 取站点字段，缺省 `None`」）。
+/// 站点契约（NewAPI 上游源码 `controller/group.go` `GetUserGroups`）：
+/// `data = { "<分组名>": { "ratio": <number>, "desc": <string> } }`
 ///
-/// **兼容形态**（真实站点未观察到，登记为 spec D-6）：元素为对象
-/// `{"name": …, "rate"|"ratio": …, "description": …}`。只有对象形态才可能出现倍率字段，
-/// 故保留该分支并测试。
+/// - `ratio` 为正数 → `Some(rate)`；
+/// - `ratio` 为 `"auto"` 或非数字 → `None`（倍率未知，不兜底 1×）；
+/// - `desc` 为空字符串 → `None`。
 ///
-/// 形态判据与既有列表解析同口径：逐条跳过取不出名字的条目，但**数组非空却一条都取不出**
-/// 时报错——静默返回空列表等于告诉用户「站点没有可选分组」。
-fn parse_auto_groups(data: &Value) -> Result<Vec<GroupInfo>> {
-    let items = data
-        .get("groups")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| Error::Transport("分组响应缺少 data.groups 数组".into()))?;
+/// 兼容 `rate` 与 `ratio` 两个字段名（不同 fork 可能用不同的名字）。
+fn parse_user_groups(data: &Value) -> Result<Vec<GroupInfo>> {
+    let obj = data
+        .as_object()
+        .ok_or_else(|| Error::Transport("分组响应 data 不是对象".into()))?;
 
-    let mut out: Vec<GroupInfo> = Vec::with_capacity(items.len());
-    for item in items {
-        match item {
-            Value::String(name) if !name.is_empty() => out.push(GroupInfo {
-                name: name.clone(),
-                rate: None,
-                description: None,
-            }),
-            Value::Object(_) => {
-                let Some(name) = json_str(item, "/name").filter(|n| !n.is_empty()) else {
-                    continue;
-                };
-                out.push(GroupInfo {
-                    name: name.to_string(),
-                    // 倍率统一走 `parse_rate`（B-91）：负数 / NaN / ±inf / 非数字 ⇒ `None`，
-                    // `0` ⇒ `Some(0.0)`（免费分组必须保留）。字符串形态（`"2"`）也按同一张边界表。
-                    rate: item
-                        .get("rate")
-                        .or_else(|| item.get("ratio"))
-                        .and_then(parse_rate),
-                    description: json_str(item, "/description")
-                        .filter(|d| !d.is_empty())
-                        .map(|d| d.to_string()),
-                });
-            }
-            _ => {}
+    let mut out: Vec<GroupInfo> = Vec::with_capacity(obj.len());
+    for (name, info) in obj {
+        if name.is_empty() {
+            continue;
         }
-    }
-    if !items.is_empty() && out.is_empty() {
-        return Err(Error::Transport(format!(
-            "分组响应有 {} 条，但都取不出可用的分组名",
-            items.len()
-        )));
+        let rate = info
+            .get("ratio")
+            .or_else(|| info.get("rate"))
+            .and_then(parse_rate);
+        let description = json_str(info, "/desc")
+            .or_else(|| json_str(info, "/description"))
+            .filter(|d| !d.is_empty())
+            .map(|d| d.to_string());
+        out.push(GroupInfo {
+            name: name.clone(),
+            rate,
+            description,
+        });
     }
     Ok(out)
 }
@@ -825,9 +807,11 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
         })
     }
 
-    /// M6-S4 / PRD FR-2：`GET /api/token/auto-groups`。
+    /// M12-S1：`GET /api/user/self/groups`（替代旧的 `/api/token/auto-groups`）。
+    ///
+    /// 旧端点只返回分组名字符串数组、不含倍率；新端点返回用户可用的全部分组 + 倍率 + 描述。
     async fn available_groups(&self, base_url: &str, session: &Session) -> Result<Vec<GroupInfo>> {
-        let url = format!("{}/api/token/auto-groups", normalize_base_url(base_url));
+        let url = format!("{}/api/user/self/groups", normalize_base_url(base_url));
         let resp = self
             .transport
             .request(self.request(Method::Get, url, session))
@@ -840,7 +824,7 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
             )));
         }
         let value = Self::unwrap_success(&resp, "拉取分组")?;
-        parse_auto_groups(value.get("data").unwrap_or(&Value::Null))
+        parse_user_groups(value.get("data").unwrap_or(&Value::Null))
     }
 
     /// M6-S4 / PRD FR-2：`POST /api/token/batch/keys` 批量读明文。
@@ -897,5 +881,101 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
             )));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_user_groups_normal() {
+        let data = json!({
+            "default": {"ratio": 1, "desc": "默认分组"},
+            "vip": {"ratio": 0.5, "desc": "VIP 折扣"}
+        });
+        let groups = parse_user_groups(&data).unwrap();
+        assert_eq!(groups.len(), 2);
+        let default = groups.iter().find(|g| g.name == "default").unwrap();
+        assert_eq!(default.rate, Some(1.0));
+        assert_eq!(default.description.as_deref(), Some("默认分组"));
+        let vip = groups.iter().find(|g| g.name == "vip").unwrap();
+        assert_eq!(vip.rate, Some(0.5));
+        assert_eq!(vip.description.as_deref(), Some("VIP 折扣"));
+    }
+
+    #[test]
+    fn parse_user_groups_ratio_auto_is_none() {
+        let data = json!({
+            "auto": {"ratio": "auto", "desc": "自动分组"}
+        });
+        let groups = parse_user_groups(&data).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].rate, None);
+    }
+
+    #[test]
+    fn parse_user_groups_ratio_missing_is_none() {
+        let data = json!({
+            "default": {"desc": "默认分组"}
+        });
+        let groups = parse_user_groups(&data).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].rate, None);
+    }
+
+    #[test]
+    fn parse_user_groups_rate_field_fallback() {
+        // 兼容用 `rate` 而非 `ratio` 的 fork
+        let data = json!({
+            "svip": {"rate": 0.3, "desc": "超级 VIP"}
+        });
+        let groups = parse_user_groups(&data).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].rate, Some(0.3));
+    }
+
+    #[test]
+    fn parse_user_groups_desc_empty_is_none() {
+        let data = json!({
+            "default": {"ratio": 1, "desc": ""}
+        });
+        let groups = parse_user_groups(&data).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].description, None);
+    }
+
+    #[test]
+    fn parse_user_groups_desc_missing_is_none() {
+        let data = json!({
+            "default": {"ratio": 1}
+        });
+        let groups = parse_user_groups(&data).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].description, None);
+    }
+
+    #[test]
+    fn parse_user_groups_empty_object() {
+        let data = json!({});
+        let groups = parse_user_groups(&data).unwrap();
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn parse_user_groups_not_object_errors() {
+        let data = json!(["default", "vip"]);
+        assert!(parse_user_groups(&data).is_err());
+    }
+
+    #[test]
+    fn parse_user_groups_free_group_keeps_zero() {
+        let data = json!({
+            "free": {"ratio": 0, "desc": "免费分组"}
+        });
+        let groups = parse_user_groups(&data).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].rate, Some(0.0));
     }
 }
