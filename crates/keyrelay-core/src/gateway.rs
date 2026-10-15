@@ -604,7 +604,12 @@ fn unauthorized(message: &str) -> Response {
 }
 
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if presented_token(&headers).as_deref() != Some(state.config.token.as_str()) {
+    // P3-6 / 复审 F1：与 `proxy` 同口径走 `constant_time_eq`——health 同样长期有效，
+    // 同样可被计时侧信道探测令牌前缀，不该用 `!=` 提前返回。
+    if !constant_time_eq(
+        presented_token(&headers).as_deref(),
+        state.config.token.as_str(),
+    ) {
         return unauthorized("缺少或错误的本地令牌");
     }
     axum::Json(serde_json::json!({

@@ -896,3 +896,100 @@ async fn a_stalled_upstream_times_out_and_fails_over() {
         "成功尝试要上报延迟: {seen:?}"
     );
 }
+
+// ============================================================ /health 端点（复审 F1）
+
+/// 极简 HTTP 客户端：GET /health，令牌可选（测「缺失」「错误」「正确」三态）。
+///
+/// 不用 `read_to_end`：`/health` 由 axum 直接回，不走假上游，keep-alive 下连接不会 EOF，
+/// `read_to_end` 会一直阻塞。按 `Content-Length` 读够即返回，外加读超时兜底。
+fn http_get_health(url: &str, token: Option<&str>) -> (u16, String) {
+    let without_scheme = url.trim_start_matches("http://");
+    let mut stream = TcpStream::connect(without_scheme).expect("连接网关");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("设读超时");
+    let auth = match token {
+        Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        None => String::new(),
+    };
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: {without_scheme}\r\n{auth}Connection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).expect("发送请求");
+    stream.flush().ok();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let cl = text[..head_end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= head_end + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    let (_, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    (status, body.to_string())
+}
+
+/// `http_get_health` 的 async 包装：网关与测试共享 tokio runtime，阻塞读必须丢到
+/// `spawn_blocking`，否则 current_thread 下会把 axum 卡死（网关等线程让出、测试等响应）。
+async fn health_get(handle: &GatewayHandle, token: Option<&str>) -> (u16, String) {
+    let url = format!("http://{}", handle.addr);
+    let token = token.map(|t| t.to_string());
+    tokio::task::spawn_blocking(move || http_get_health(&url, token.as_deref()))
+        .await
+        .expect("阻塞任务")
+}
+
+/// 复审 F1 / P3-6：`/health` 端点也走 `constant_time_eq`，与 `/proxy` 同口径。
+/// 正确令牌放行（200 + `ok:true`），错误或缺失令牌一律 401——行为与 proxy 一致。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn health_endpoint_checks_token_like_proxy() {
+    let up = spawn_upstream_always(1, REF_A, "200 OK");
+    let (handle, token, _failures) = start_routed(&[(&up, 1.0)], BreakerPolicy::default()).await;
+
+    let (ok_status, ok_body) = health_get(&handle, Some(&token)).await;
+    assert_eq!(ok_status, 200, "正确令牌应放行 /health: {ok_body}");
+    assert!(
+        ok_body.contains("\"ok\":true"),
+        "body 应含 ok=true: {ok_body}"
+    );
+
+    let (wrong_status, _) = health_get(&handle, Some("wrong-token-shape")).await;
+    assert_eq!(wrong_status, 401, "错误令牌应拒 /health");
+
+    let (none_status, _) = health_get(&handle, None).await;
+    assert_eq!(none_status, 401, "缺失令牌应拒 /health");
+
+    handle.shutdown_and_wait().await;
+}
