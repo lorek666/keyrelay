@@ -140,6 +140,29 @@ CREATE TABLE IF NOT EXISTS exports(
   exported_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_bindings_target ON bindings(target_path);
+-- M13-S1：网关 token 用量日志（逐请求）。
+CREATE TABLE IF NOT EXISTS gateway_usage_log(
+  id INTEGER PRIMARY KEY,
+  ts INTEGER NOT NULL,
+  site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  model TEXT NOT NULL DEFAULT '',
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_gateway_usage_ts ON gateway_usage_log(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_usage_site ON gateway_usage_log(site_id, ts DESC);
+-- M13-S1：站点余额快照（每轮刷新时写一条）。
+CREATE TABLE IF NOT EXISTS usage_snapshots(
+  id INTEGER PRIMARY KEY,
+  site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  used REAL NOT NULL,
+  remaining REAL NOT NULL,
+  currency TEXT NOT NULL DEFAULT 'USD',
+  known INTEGER NOT NULL DEFAULT 1,
+  ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_snapshots_site ON usage_snapshots(site_id, ts DESC);
 "#;
 
 fn now_secs() -> i64 {
@@ -290,6 +313,30 @@ pub struct ExportRecord {
     pub encrypted: bool,
     pub bytes: i64,
     pub exported_at: i64,
+}
+
+/// 一次网关请求的 token 用量行（M13-S1）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayUsageRow {
+    pub id: i64,
+    pub ts: i64,
+    pub site_id: i64,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+/// 一个站点的余额快照行（M13-S1）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageSnapshotRow {
+    pub id: i64,
+    pub ts: i64,
+    pub site_id: i64,
+    pub used: f64,
+    pub remaining: f64,
+    pub currency: String,
+    pub known: bool,
 }
 
 pub struct Store {
@@ -1377,6 +1424,84 @@ impl Store {
             .map_err(|e| Error::Store(format!("查询导出记录失败: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Store(format!("读取导出行失败: {e}")))
+    }
+
+    /// M13-S1: insert gateway usage
+    pub fn insert_gateway_usage(
+        &self,
+        site_id: i64,
+        model: &str,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        total_tokens: i64,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![now_secs(), site_id, model, prompt_tokens, completion_tokens, total_tokens],
+        ).map_err(|e| Error::Store(format!("gateway usage insert: {e}")))?;
+        Ok(())
+    }
+
+    /// M13-S1: query recent gateway usage
+    pub fn recent_gateway_usage(&self, hours: i64) -> Result<Vec<GatewayUsageRow>> {
+        let cutoff = now_secs() - hours * 3600;
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT id, ts, site_id, model, prompt_tokens, completion_tokens, total_tokens FROM gateway_usage_log WHERE ts >= ?1 ORDER BY ts DESC LIMIT 1000").map_err(|e| Error::Store(format!("prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok(GatewayUsageRow {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    site_id: row.get(2)?,
+                    model: row.get(3)?,
+                    prompt_tokens: row.get(4)?,
+                    completion_tokens: row.get(5)?,
+                    total_tokens: row.get(6)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect: {e}")))
+    }
+
+    /// M13-S1: insert usage snapshot
+    pub fn insert_usage_snapshot(
+        &self,
+        site_id: i64,
+        used: f64,
+        remaining: f64,
+        currency: &str,
+        known: bool,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO usage_snapshots(site_id, used, remaining, currency, known, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![site_id, used, remaining, currency, i64::from(known), now_secs()],
+        ).map_err(|e| Error::Store(format!("snapshot insert: {e}")))?;
+        Ok(())
+    }
+
+    /// M13-S1: query recent usage snapshots
+    pub fn recent_usage_snapshots(&self, hours: i64) -> Result<Vec<UsageSnapshotRow>> {
+        let cutoff = now_secs() - hours * 3600;
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT id, ts, site_id, used, remaining, currency, known FROM usage_snapshots WHERE ts >= ?1 ORDER BY site_id ASC, ts DESC LIMIT 500").map_err(|e| Error::Store(format!("prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok(UsageSnapshotRow {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    site_id: row.get(2)?,
+                    used: row.get(3)?,
+                    remaining: row.get(4)?,
+                    currency: row.get(5)?,
+                    known: row.get::<_, i64>(6)? != 0,
+                })
+            })
+            .map_err(|e| Error::Store(format!("query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect: {e}")))
     }
 }
 

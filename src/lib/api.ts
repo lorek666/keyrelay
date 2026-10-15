@@ -917,6 +917,36 @@ export async function rollbackDelivery(journalId: string): Promise<void> {
   return invokeCommand<void>("rollback_delivery", { journalId });
 }
 
+export type GatewayUsageRow = {
+  id: number;
+  ts: number;
+  siteId: number;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+};
+
+export type UsageSnapshotRow = {
+  id: number;
+  ts: number;
+  siteId: number;
+  used: number;
+  remaining: number;
+  currency: string;
+  known: boolean;
+};
+
+export async function recentGatewayUsage(hours = 24): Promise<GatewayUsageRow[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<GatewayUsageRow[]>("recent_gateway_usage", { hours });
+}
+
+export async function recentUsageSnapshots(hours = 168): Promise<UsageSnapshotRow[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<UsageSnapshotRow[]>("recent_usage_snapshots", { hours });
+}
+
 export async function recentEvents(limit = 100): Promise<EventRow[]> {
   if (!hasTauri) return mock(MOCK_EVENTS);
   return invokeCommand<EventRow[]>("recent_events", { limit });

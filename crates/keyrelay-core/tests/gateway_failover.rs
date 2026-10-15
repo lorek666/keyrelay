@@ -157,6 +157,7 @@ async fn start_routed(
         upstream_timeout: UpstreamTimeout::default(),
         revoked_refs: None,
         on_observation: None,
+        on_usage: None,
         upstream_proxy: None,
         on_failure: Some(Arc::new(move |f| {
             if let Ok(mut log) = sink.lock() {
@@ -445,6 +446,7 @@ async fn failure_event_scrubs_a_key_shaped_model() {
             upstream_timeout: UpstreamTimeout::default(),
             revoked_refs: None,
             on_observation: None,
+            on_usage: None,
             upstream_proxy: None,
             on_failure: Some(Arc::new(move |f| {
                 if let Ok(mut log) = sink.lock() {
@@ -624,6 +626,7 @@ async fn start_routed_with(
                 log.push(f);
             }
         })),
+        on_usage: None,
     })
     .await
     .expect("网关应能启动");

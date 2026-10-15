@@ -8,6 +8,8 @@ import {
   listSites,
   listStoredKeys,
   recentEvents,
+  recentGatewayUsage,
+  recentUsageSnapshots,
   refreshAll,
   runtimeMode,
 } from "../lib/api";
@@ -18,6 +20,8 @@ export default function Overview() {
   const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
   const consents = useQuery({ queryKey: ["consents"], queryFn: listConsents });
   const events = useQuery({ queryKey: ["events"], queryFn: () => recentEvents(20) });
+  const gatewayUsage = useQuery({ queryKey: ["gateway-usage"], queryFn: () => recentGatewayUsage(24) });
+  const usageSnapshots = useQuery({ queryKey: ["usage-snapshots"], queryFn: () => recentUsageSnapshots(168) });
   const drift = useQuery({ queryKey: ["drift"], queryFn: driftReport });
 
   const refresh = useMutation({
@@ -213,6 +217,66 @@ export default function Overview() {
               </li>
             ))}
           </ul>
+        </div>
+      ) : null}
+      {gatewayUsage.data?.length || usageSnapshots.data?.length ? (
+        <div className="card">
+          <h3>Token 消耗</h3>
+          {(() => {
+            const usageBySite = new Map<number, { prompt: number; completion: number; total: number }>();
+            for (const row of gatewayUsage.data ?? []) {
+              const cur = usageBySite.get(row.siteId) ?? { prompt: 0, completion: 0, total: 0 };
+              cur.prompt += row.promptTokens;
+              cur.completion += row.completionTokens;
+              cur.total += row.totalTokens;
+              usageBySite.set(row.siteId, cur);
+            }
+            return (
+              <>
+                {gatewayUsage.data?.length ? (
+                  <dl className="kv">
+                    <dt>网关转发（24h）</dt>
+                    <dd className="mono">
+                      {Array.from(usageBySite.entries()).map(([siteId, v], i) => (
+                        <span key={siteId}>
+                          {i > 0 ? ' / ' : ''}
+                          站点{siteId}: {v.total.toLocaleString()} tokens
+                          （输入 {v.prompt.toLocaleString()} / 输出 {v.completion.toLocaleString()}）
+                        </span>
+                      ))}
+                    </dd>
+                  </dl>
+                ) : null}
+                {usageSnapshots.data?.length ? (
+                  <dl className="kv">
+                    <dt>站点余额（7天快照）</dt>
+                    <dd className="mono">
+                      {(() => {
+                        const bySite = new Map<number, typeof usageSnapshots.data>();
+                        for (const s of usageSnapshots.data) {
+                          if (!bySite.has(s.siteId)) bySite.set(s.siteId, []);
+                          bySite.get(s.siteId)!.push(s);
+                        }
+                        return Array.from(bySite.entries()).map(([siteId, snaps], i) => {
+                          const latest = snaps[0];
+                          const prev = snaps[1];
+                          const delta = prev ? latest.used - prev.used : null;
+                          return (
+                            <span key={siteId}>
+                              {i > 0 ? ' / ' : ''}
+                              站点{siteId}: 已用 {latest.used.toFixed(2)} {latest.currency}
+                              / 剩余 {latest.remaining.toFixed(2)}
+                              {delta !== null ? `（${delta > 0 ? "+" : ""}${delta.toFixed(2)}）` : ""}
+                            </span>
+                          );
+                        });
+                      })()}
+                    </dd>
+                  </dl>
+                ) : null}
+              </>
+            );
+          })()}
         </div>
       ) : null}
     </section>

@@ -910,6 +910,82 @@ pub fn recent_events(
         .map_err(|e| e.to_string())
 }
 
+// ============================================ Token 消耗统计（M13-S1）
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayUsageDto {
+    pub id: i64,
+    pub ts: i64,
+    pub site_id: i64,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSnapshotDto {
+    pub id: i64,
+    pub ts: i64,
+    pub site_id: i64,
+    pub used: f64,
+    pub remaining: f64,
+    pub currency: String,
+    pub known: bool,
+}
+
+#[tauri::command]
+pub fn recent_gateway_usage(
+    state: State<'_, AppState>,
+    hours: Option<i64>,
+) -> Result<Vec<GatewayUsageDto>, String> {
+    state
+        .service
+        .store()
+        .recent_gateway_usage(hours.unwrap_or(24))
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| GatewayUsageDto {
+                    id: row.id,
+                    ts: row.ts,
+                    site_id: row.site_id,
+                    model: row.model,
+                    prompt_tokens: row.prompt_tokens,
+                    completion_tokens: row.completion_tokens,
+                    total_tokens: row.total_tokens,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn recent_usage_snapshots(
+    state: State<'_, AppState>,
+    hours: Option<i64>,
+) -> Result<Vec<UsageSnapshotDto>, String> {
+    state
+        .service
+        .store()
+        .recent_usage_snapshots(hours.unwrap_or(168))
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| UsageSnapshotDto {
+                    id: row.id,
+                    ts: row.ts,
+                    site_id: row.site_id,
+                    used: row.used,
+                    remaining: row.remaining,
+                    currency: row.currency,
+                    known: row.known,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
 // ============================================ 漂移 / 设置 / 刷新（M3-S1）
 
 fn settings_from_dto(dto: &SettingsDto) -> keyrelay_core::settings::Settings {
