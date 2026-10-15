@@ -78,7 +78,7 @@ pub struct DetectedProxy {
 }
 
 impl DetectedProxy {
-    /// 脱敏后的 URL（给 UI 展示用）。含 userinfo 时只显示 `scheme://***@host:port`。
+    /// 脱敏后的 URL（给 UI 展示用）。含 userinfo 时完全丢弃，只显示 `scheme://host:port`。
     ///
     /// 前端**不拿原始 URL**：`mask_proxy` 在核心层完成，明文不过 IPC 边界。
     pub fn masked_url(&self) -> String {
@@ -98,21 +98,38 @@ impl std::fmt::Debug for DetectedProxy {
 
 // ============ 探测 ============
 
-/// 探测系统代理。不读 settings、不联网、不做校验（校验在 `resolve_proxy`）。
-/// 任一步失败 ⇒ `None`（不报错，auto 模式会因此直连）。
+/// 探测系统代理：收集所有候选（macOS scutil 三协议 / Windows 注册表三协议 / 环境变量六变量），
+/// 按优先级遍历，返回**首个合法**的（`validate_proxy_url` 通过）。全非法或无候选 ⇒ `None`。
 ///
-/// 顺序：macOS 系统设置 → Windows 注册表 → 环境变量。前一个探测到就返回，
-/// 不合并（一个主机只会用一条代理）。
+/// 不读 settings、不联网。IPC（`detect_system_proxy` 命令）与 `resolve_proxy` Auto 分支共用
+/// 此函数 ⇒ UI 展示的「检测到」即 auto 模式实际会使用的代理。
+///
+/// 「首个合法」而非「首个命中」：系统配的代理可能带 path/非法 scheme（垃圾值），auto 模式
+/// 跳过它继续找下一个候选，全非法才直连——系统是垃圾不该让 app 起不来（与 manual「非法即 Err」
+/// 的区别在于用户没有显式配置 auto 探测到的值）。
 pub fn detect_system_proxy() -> Option<DetectedProxy> {
+    pick_first_valid(collect_proxy_candidates())
+}
+
+/// 从候选列表中取首个合法的（`validate_proxy_url` 通过）。全非法或空 ⇒ `None`。
+/// auto 模式「跳过非法继续找下一个」的核心，抽出为纯函数便于确定性测试。
+fn pick_first_valid(candidates: Vec<DetectedProxy>) -> Option<DetectedProxy> {
+    candidates
+        .into_iter()
+        .find(|d| validate_proxy_url(&d.url).is_ok())
+}
+
+/// 收集所有探测候选，按优先级排序（平台优先于环境变量；平台内 HTTPS>HTTP>SOCKS；
+/// 环境变量内 `HTTPS_PROXY`>`https_proxy`>`HTTP_PROXY`>`http_proxy`>`ALL_PROXY`>`all_proxy`）。
+/// 不做校验——校验在 `pick_first_valid` 遍历时做。
+fn collect_proxy_candidates() -> Vec<DetectedProxy> {
+    let mut out = Vec::new();
     #[cfg(target_os = "macos")]
-    if let Some(d) = detect_macos_system() {
-        return Some(d);
-    }
+    out.extend(detect_macos_candidates());
     #[cfg(target_os = "windows")]
-    if let Some(d) = detect_windows_system() {
-        return Some(d);
-    }
-    env_proxy()
+    out.extend(detect_windows_candidates());
+    out.extend(env_proxy_candidates());
+    out
 }
 
 /// 按模式解析最终代理。transport 构造的唯一入口（S2 接线后）。
@@ -136,13 +153,9 @@ pub fn resolve_proxy(mode: ProxyMode, manual_url: &str) -> Result<Option<Detecte
             }))
         }
         ProxyMode::Auto => {
-            // 探测到的候选若非法（scheme 不在白名单 / 带 path），不静默直连也不崩：
-            // 跳过它继续找下一个候选；全非法 ⇒ 直连。与 manual 的「非法即 Err」的区别在于
-            // 用户没有显式配置 auto 探测到的值，系统是垃圾不该让 app 起不来。
-            match detect_system_proxy() {
-                Some(d) if validate_proxy_url(&d.url).is_ok() => Ok(Some(d)),
-                _ => Ok(None),
-            }
+            // detect_system_proxy 内部已遍历所有候选取首个合法的；全非法 ⇒ None（直连）。
+            // 与 manual「非法即 Err」的区别见 detect_system_proxy 文档。
+            Ok(detect_system_proxy())
         }
     }
 }
@@ -150,14 +163,18 @@ pub fn resolve_proxy(mode: ProxyMode, manual_url: &str) -> Result<Option<Detecte
 // ============ macOS：scutil --proxy ============
 
 #[cfg(target_os = "macos")]
-fn detect_macos_system() -> Option<DetectedProxy> {
-    let output = Command::new("scutil").arg("--proxy").output().ok()?;
+fn detect_macos_candidates() -> Vec<DetectedProxy> {
+    let Ok(output) = Command::new("scutil").arg("--proxy").output() else {
+        return Vec::new();
+    };
     let text = String::from_utf8_lossy(&output.stdout);
-    let url = parse_scutil_proxy(&text)?;
-    Some(DetectedProxy {
-        url,
-        source: ProxySource::MacSystem,
-    })
+    parse_scutil_proxy_all(&text)
+        .into_iter()
+        .map(|url| DetectedProxy {
+            url,
+            source: ProxySource::MacSystem,
+        })
+        .collect()
 }
 
 /// 解析 `scutil --proxy` 文本。纯函数，跨平台可测。
@@ -183,6 +200,30 @@ pub fn parse_scutil_proxy(text: &str) -> Option<String> {
         .or_else(|| pick("SOCKS", "socks5"))
 }
 
+/// 解析 `scutil --proxy`，返回所有启用的代理（按 HTTPS > HTTP > SOCKS 顺序）。
+/// 纯函数，跨平台可测。供 `detect_macos_candidates` 收集全部候选；
+/// `parse_scutil_proxy` 是其「取首个」的便捷视图。
+pub fn parse_scutil_proxy_all(text: &str) -> Vec<String> {
+    let kv = scutil_kv(text);
+    let mut out = Vec::new();
+    for (proto, scheme) in [("HTTPS", "http"), ("HTTP", "http"), ("SOCKS", "socks5")] {
+        if kv.get(&format!("{proto}Enable")).map(|v| v.as_str()) != Some("1") {
+            continue;
+        }
+        let Some(host) = kv.get(&format!("{proto}Proxy")) else {
+            continue;
+        };
+        let Some(port) = kv.get(&format!("{proto}Port")) else {
+            continue;
+        };
+        if host.is_empty() || port.is_empty() {
+            continue;
+        }
+        out.push(format!("{scheme}://{host}:{port}"));
+    }
+    out
+}
+
 /// `scutil --proxy` 行级 KV：`key : value`（分隔符是冒号，前后空白容忍）。
 fn scutil_kv(text: &str) -> std::collections::HashMap<String, String> {
     text.lines()
@@ -199,18 +240,26 @@ const WIN_INET_SETTINGS: &str =
     "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
 #[cfg(target_os = "windows")]
-fn detect_windows_system() -> Option<DetectedProxy> {
-    let enable_raw = reg_query_value(WIN_INET_SETTINGS, "ProxyEnable")?;
-    let enable = u32::from_str_radix(enable_raw.trim_start_matches("0x"), 16).ok()?;
+fn detect_windows_candidates() -> Vec<DetectedProxy> {
+    let Some(enable_raw) = reg_query_value(WIN_INET_SETTINGS, "ProxyEnable") else {
+        return Vec::new();
+    };
+    let Ok(enable) = u32::from_str_radix(enable_raw.trim_start_matches("0x"), 16) else {
+        return Vec::new();
+    };
     if enable != 1 {
-        return None;
+        return Vec::new();
     }
-    let server = reg_query_value(WIN_INET_SETTINGS, "ProxyServer")?;
-    let url = parse_windows_reg_proxy(&server)?;
-    Some(DetectedProxy {
-        url,
-        source: ProxySource::WindowsRegistry,
-    })
+    let Some(server) = reg_query_value(WIN_INET_SETTINGS, "ProxyServer") else {
+        return Vec::new();
+    };
+    parse_windows_reg_proxy_all(&server)
+        .into_iter()
+        .map(|url| DetectedProxy {
+            url,
+            source: ProxySource::WindowsRegistry,
+        })
+        .collect()
 }
 
 /// 跑 `reg query "KEY" /v NAME`，取值的字面量（DWORD 形如 `0x1`，SZ 原样）。
@@ -274,11 +323,36 @@ pub fn parse_windows_reg_proxy(server: &str) -> Option<String> {
     }
 }
 
+/// 解析 `ProxyServer`，返回所有按协议列出的代理（`https` > `http` > `socks` 顺序）。
+/// 纯函数，跨平台可测。`parse_windows_reg_proxy` 是其「取首个」的便捷视图。
+pub fn parse_windows_reg_proxy_all(server: &str) -> Vec<String> {
+    let server = server.trim();
+    if server.is_empty() {
+        return Vec::new();
+    }
+    if server.contains('=') {
+        let entries: std::collections::HashMap<&str, &str> = server
+            .split(';')
+            .filter_map(|e| e.split_once('='))
+            .map(|(k, v)| (k.trim(), v.trim()))
+            .collect();
+        let mut out = Vec::new();
+        for (key, scheme) in [("https", "http"), ("http", "http"), ("socks", "socks5")] {
+            if let Some(v) = entries.get(key) {
+                out.push(format!("{scheme}://{v}"));
+            }
+        }
+        out
+    } else {
+        vec![format!("http://{server}")]
+    }
+}
+
 // ============ 环境变量（全平台兜底） ============
 
 /// 读 `HTTPS_PROXY`/`https_proxy`/`HTTP_PROXY`/`http_proxy`/`ALL_PROXY`/`all_proxy`。
-/// 原样返回（校验在 `resolve_proxy`）。空值跳过。
-fn env_proxy() -> Option<DetectedProxy> {
+/// 原样收集所有非空值（校验在 `pick_first_valid` 遍历时做）。供 `collect_proxy_candidates`。
+fn env_proxy_candidates() -> Vec<DetectedProxy> {
     const NAMES: [(&str, ProxySource); 6] = [
         ("HTTPS_PROXY", ProxySource::EnvVar("HTTPS_PROXY")),
         ("https_proxy", ProxySource::EnvVar("https_proxy")),
@@ -287,18 +361,19 @@ fn env_proxy() -> Option<DetectedProxy> {
         ("ALL_PROXY", ProxySource::EnvVar("ALL_PROXY")),
         ("all_proxy", ProxySource::EnvVar("all_proxy")),
     ];
+    let mut out = Vec::new();
     for (name, source) in NAMES {
         if let Ok(value) = std::env::var(name) {
             let value = value.trim();
             if !value.is_empty() {
-                return Some(DetectedProxy {
+                out.push(DetectedProxy {
                     url: value.to_string(),
                     source,
                 });
             }
         }
     }
-    None
+    out
 }
 
 // ============ 校验与脱敏（从 transport_reqwest 迁入，供两边共用） ============
@@ -679,5 +754,131 @@ HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settin
             "应保留可诊断主机: {debug}"
         );
         assert!(debug.contains("HTTPS_PROXY"), "{debug}");
+    }
+
+    // ---- parse_scutil_proxy_all：收集全部启用协议（§6.1）----
+
+    #[test]
+    fn parse_scutil_proxy_all_returns_all_enabled_in_priority_order() {
+        let all = parse_scutil_proxy_all(SCUTIL_SAMPLE);
+        assert_eq!(
+            all,
+            vec![
+                "http://127.0.0.1:8443".to_string(),   // HTTPS
+                "http://127.0.0.1:8080".to_string(),   // HTTP
+                "socks5://127.0.0.1:1080".to_string(), // SOCKS
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_scutil_proxy_all_skips_disabled_protocols() {
+        let text = "\
+HTTPSEnable : 0
+HTTPEnable : 1
+HTTPProxy : 127.0.0.1
+HTTPPort : 8080
+SOCKSEnable : 0
+";
+        assert_eq!(
+            parse_scutil_proxy_all(text),
+            vec!["http://127.0.0.1:8080".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_scutil_proxy_all_empty_when_all_disabled() {
+        assert!(
+            parse_scutil_proxy_all("HTTPSEnable : 0\nHTTPEnable : 0\nSOCKSEnable : 0\n").is_empty()
+        );
+    }
+
+    // ---- parse_windows_reg_proxy_all：收集全部按协议代理 ----
+
+    #[test]
+    fn parse_windows_reg_proxy_all_per_protocol_in_priority_order() {
+        assert_eq!(
+            parse_windows_reg_proxy_all("http=h1:81;https=h2:82;socks=h3:83"),
+            vec![
+                "http://h2:82".to_string(),   // https 先
+                "http://h1:81".to_string(),   // http
+                "socks5://h3:83".to_string(), // socks
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_windows_reg_proxy_all_simple_form_yields_single() {
+        assert_eq!(
+            parse_windows_reg_proxy_all("127.0.0.1:8080"),
+            vec!["http://127.0.0.1:8080".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_windows_reg_proxy_all_empty_when_blank() {
+        assert!(parse_windows_reg_proxy_all("").is_empty());
+        assert!(parse_windows_reg_proxy_all("   ").is_empty());
+    }
+
+    // ---- pick_first_valid：auto「跳过非法继续找」的核心（P2-1 guard）----
+
+    #[test]
+    fn pick_first_valid_skips_invalid_and_returns_first_valid() {
+        // 模拟「HTTPS_PROXY 非法 + HTTP_PROXY 非法 + ALL_PROXY 合法」：
+        // auto 应跳过前两个非法候选，取第三个合法的，而非首个命中即直连。
+        let cands = vec![
+            DetectedProxy {
+                url: "file:///etc/passwd".into(),
+                source: ProxySource::EnvVar("HTTPS_PROXY"),
+            },
+            DetectedProxy {
+                url: "http://h:1/pac".into(),
+                source: ProxySource::EnvVar("HTTP_PROXY"),
+            },
+            DetectedProxy {
+                url: "socks5://127.0.0.1:1080".into(),
+                source: ProxySource::EnvVar("ALL_PROXY"),
+            },
+        ];
+        let picked = pick_first_valid(cands).expect("应跳过两个非法取第三个");
+        assert_eq!(picked.url, "socks5://127.0.0.1:1080");
+        assert_eq!(picked.source, ProxySource::EnvVar("ALL_PROXY"));
+    }
+
+    #[test]
+    fn pick_first_valid_none_when_all_invalid() {
+        let cands = vec![
+            DetectedProxy {
+                url: "file:///etc/passwd".into(),
+                source: ProxySource::EnvVar("HTTPS_PROXY"),
+            },
+            DetectedProxy {
+                url: "http://h:1/pac".into(),
+                source: ProxySource::EnvVar("HTTP_PROXY"),
+            },
+        ];
+        assert!(pick_first_valid(cands).is_none());
+    }
+
+    #[test]
+    fn pick_first_valid_none_when_empty() {
+        assert!(pick_first_valid(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn pick_first_valid_returns_first_when_all_valid() {
+        let cands = vec![
+            DetectedProxy {
+                url: "http://a:1".into(),
+                source: ProxySource::EnvVar("HTTPS_PROXY"),
+            },
+            DetectedProxy {
+                url: "http://b:2".into(),
+                source: ProxySource::EnvVar("HTTP_PROXY"),
+            },
+        ];
+        let picked = pick_first_valid(cands).expect("全合法应取首个");
+        assert_eq!(picked.url, "http://a:1");
     }
 }

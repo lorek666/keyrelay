@@ -1081,7 +1081,7 @@ export async function updateSettings(settings: Settings): Promise<Settings> {
 export type DetectedSystemProxy = {
   /** 来源：`macos-system` / `windows-registry` / 环境变量名 / `manual`；`null` = 未检测到 */
   source: string | null;
-  /** 脱敏后的 URL（含 userinfo 时只显示 `scheme://***@host:port`）；`null` = 未检测到 */
+  /** 脱敏后的 URL（含 userinfo 时完全丢弃，只显示 `scheme://host:port`）；`null` = 未检测到 */
   maskedUrl: string | null;
 };
 
