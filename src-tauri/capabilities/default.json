@@ -51,6 +51,8 @@
     "allow-gateway-rotate-token",
     "allow-captcha-begin",
     "allow-captcha-complete",
-    "allow-captcha-cancel"
+    "allow-captcha-cancel",
+    "updater:default",
+    "process:default"
   ]
 }

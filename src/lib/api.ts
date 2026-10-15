@@ -1431,3 +1431,56 @@ export async function setAutostart(enabled: boolean): Promise<Autostart> {
   }
   return invokeCommand<Autostart>("autostart_set", { enabled });
 }
+
+// ============================================================ 自动更新（M10-S1）
+
+export interface UpdateInfo {
+  version: string;
+  currentVersion: string;
+  date?: string;
+  body?: string;
+}
+
+/**
+ * 检查更新。返回 `null` = 当前已是最新版本。
+ *
+ * 网络错误、签名校验失败等会抛异常——调用方应 catch 并显示错误，
+ * 而不是当成「无更新」。
+ *
+ * 在浏览器（无 Tauri）环境下，mock 返回 `null`。
+ */
+export async function checkForUpdates(): Promise<UpdateInfo | null> {
+  if (!hasTauri) {
+    return mock(null);
+  }
+  const { check } = await import("@tauri-apps/plugin-updater");
+  const result = await check();
+  if (!result) return null;
+  return {
+    version: result.version,
+    currentVersion: result.currentVersion,
+    date: result.date,
+    body: result.body,
+  };
+}
+
+/**
+ * 下载并安装已检查到的更新。安装完成后重启应用。
+ *
+ * 必须先调用 `checkForUpdates()` 并拿到非 null 的结果——但本函数不持有那个
+ * 对象（JS 侧 `Update` 对象不可序列化），所以在 Tauri 环境下重新检查一次再下载。
+ * 两次检查之间的时间窗口很小（用户刚点了按钮），版本不会变。
+ */
+export async function downloadAndInstallUpdate(): Promise<void> {
+  if (!hasTauri) {
+    await mock(undefined);
+    return;
+  }
+  const { check } = await import("@tauri-apps/plugin-updater");
+  const result = await check();
+  if (!result) {
+    throw new Error("没有可用的更新");
+  }
+  await result.downloadAndInstall();
+  await import("@tauri-apps/plugin-process").then(({ relaunch }) => relaunch());
+}
