@@ -337,19 +337,40 @@ pub fn mask_webhook_url(url: &str) -> String {
 ///   （`carol:pw@host.example/x` ⇒ `***@host.example/x`）；
 /// - 没有 `@` ⇒ **逐字节不变**（`https://host/a@b` 不动：那个 `@` 在路径里，不是 userinfo）。
 pub fn mask_authority_userinfo(raw: &str) -> String {
-    let (prefix, authority_start) = match raw.find("://") {
-        Some(scheme_end) => (&raw[..scheme_end + 3], scheme_end + 3),
-        // 无 scheme：前缀为空，authority 从 0 开始（这就是「已知是 authority」的含义）。
-        None => ("", 0),
-    };
-    let rest = &raw[authority_start..];
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    let Some(at) = authority.rfind('@') else {
+    // 复审 F4：原实现只处理首个 `://`，多 URL 文本会把两 URL 间内容吃进首个
+    // authority、`rfind('@')` 取最后一个 @，塌缩成 `prefix://***@h_last`。改成循环，
+    // 每个 `scheme://authority` 独立掩。无 `://` 时走「整串即 authority」分支（transport
+    // 调用方会传 `user:pass@host` 这类无 scheme 的串，循环 find("://") 失败会原样返回，
+    // 丢失这层掩码——所以单独处理）。
+    if !raw.contains("://") {
+        let authority_end = raw.find(['/', '?', '#']).unwrap_or(raw.len());
+        let authority = &raw[..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            return format!("{MASK}{}", &raw[at..]);
+        }
         return raw.to_string();
-    };
-    // 从 `@` 起（含）原样保留：`@host…`。多掩的那部分只影响显示。
-    format!("{prefix}{MASK}{}", &rest[at..])
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(pos) = rest.find("://") {
+        let authority_start = pos + "://".len();
+        out.push_str(&rest[..authority_start]);
+        let tail = &rest[authority_start..];
+        // authority 止于 `/` `?` `#`（与整串 URL 口径一致）；**不**截 `"` `\` 空白——
+        // 这是本函数存在的理由（`scrub` 在 `"` 处截断会漏带引号密码 URL，见 P2-25）。
+        let authority_end = tail.find(['/', '?', '#']).unwrap_or(tail.len());
+        let authority = &tail[..authority_end];
+        match authority.rfind('@') {
+            Some(at) => {
+                out.push_str(MASK);
+                out.push_str(&authority[at..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &tail[authority_end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// [`scrub`] 的首尾两步：**文本里**每个 `scheme://userinfo@host` 的 userinfo 换成 [`MASK`]。
@@ -693,6 +714,45 @@ pub fn scrub_event_payload(payload: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mask_authority_userinfo_masks_a_single_url() {
+        // 基线：单 URL（有 scheme）仍正确掩。
+        let m = mask_authority_userinfo("https://alice:pw@hook.example.com/x");
+        assert!(m.contains("***@hook.example.com"), "{m}");
+        assert!(!m.contains("alice:pw"), "{m}");
+    }
+
+    #[test]
+    fn mask_authority_userinfo_masks_every_url_in_a_multi_url_text() {
+        // 复审 F4：原实现只处理首个 ://，多 URL 文本塌缩成 prefix://***@h_last，
+        // 首个 URL 的主机名被吞。循环后每个 URL 独立掩。
+        let m = mask_authority_userinfo("见 a://u1:p1@h1/x 和 b://u2:p2@h2/y");
+        assert!(m.contains("***@h1"), "首个 URL 应掩: {m}");
+        assert!(m.contains("***@h2"), "第二个 URL 也应掩: {m}");
+        assert!(!m.contains("u1:p1"), "u1:p1 不许明文: {m}");
+        assert!(!m.contains("u2:p2"), "u2:p2 不许明文: {m}");
+    }
+
+    #[test]
+    fn mask_authority_userinfo_masks_a_schemeless_authority() {
+        // 无 scheme（transport 调用方传 user:pass@host）：整串即 authority，仍掩。
+        let m = mask_authority_userinfo("alice:pw@hook.example.com");
+        assert!(m.contains("***@hook.example.com"), "{m}");
+        assert!(!m.contains("alice:pw"), "{m}");
+    }
+
+    #[test]
+    fn mask_authority_userinfo_leaves_text_without_userinfo_intact() {
+        assert_eq!(
+            mask_authority_userinfo("plain text no url"),
+            "plain text no url"
+        );
+        assert_eq!(
+            mask_authority_userinfo("https://hook.example.com/x"),
+            "https://hook.example.com/x"
+        );
+    }
 
     #[test]
     fn scrub_does_not_mask_prefix_lookalikes_inside_words() {
