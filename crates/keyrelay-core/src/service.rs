@@ -3189,14 +3189,29 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     ///
     /// 返回写出的条数（测试用）。
     pub fn drain_gateway_failures(&self) -> usize {
-        // P3-7 / §11.3：先取出本轮丢弃计数（swap 清零），落完事件后报出。
+        // P3-7 / §11.3 / 复审 F2：先 lock buffer，成功后再 swap 取丢弃计数——锁中毒时
+        // buffer 拿不到，但 dropped 计数仍要报出（原顺序先 swap 后 lock，锁中毒会清零
+        // 计数却不报出，永久丢失）。
+        let drained: Vec<BufferedGatewayFailure> = match self.gateway_failures.lock() {
+            Ok(mut buffer) => buffer.drain(..).collect(),
+            Err(_) => {
+                let dropped = self
+                    .gateway_failures_dropped
+                    .swap(0, std::sync::atomic::Ordering::Relaxed);
+                if dropped > 0 {
+                    self.log(observability::event_with_payload(
+                        Level::Warn,
+                        "gateway",
+                        format!("本轮因缓冲满丢弃 {dropped} 条网关失败事件（缓冲锁中毒，未落库）"),
+                        serde_json::json!({ "dropped": dropped }),
+                    ));
+                }
+                return 0;
+            }
+        };
         let dropped_this_round = self
             .gateway_failures_dropped
             .swap(0, std::sync::atomic::Ordering::Relaxed);
-        let drained: Vec<BufferedGatewayFailure> = match self.gateway_failures.lock() {
-            Ok(mut buffer) => buffer.drain(..).collect(),
-            Err(_) => return 0,
-        };
         for buffered in &drained {
             let failure = &buffered.failure;
             // `status == 0` 是哨兵（M8-S1 §9）：HTTP 里不存在 0，它表示
