@@ -12,7 +12,7 @@
 //!   `docs/specs/M7-S1-网关路由与故障切换.md` §5.1。
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// 一个可被路由到的上游。
@@ -270,6 +270,11 @@ impl Default for BreakerPolicy {
 pub struct Breaker {
     policy: BreakerPolicy,
     sites: HashMap<i64, Entry>,
+    /// P2-8 / DEBUG-REPORT-v3 §2-8：HalfOpen 探针已放出的站点。冷却一过所有并发
+    /// 请求都会看到 HalfOpen（`state` 只读不改），不限流就全部去试坏上游。第一个
+    /// 放进探针的请求在这里标记，其余看到标记即跳过，等探针结果回来
+    /// （`record_success` / `record_failure` 清除）。
+    probe_in_flight: HashSet<i64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -284,6 +289,7 @@ impl Breaker {
         Self {
             policy,
             sites: HashMap::new(),
+            probe_in_flight: HashSet::new(),
         }
     }
 
@@ -293,6 +299,8 @@ impl Breaker {
     ///
     /// `policy.threshold == 0` 的含义是「首次失败即打开」（`0 >= 0`），它不是一个「关闭熔断」的开关。
     pub fn record_failure(&mut self, site_id: i64, now: Instant) -> BreakerState {
+        // P2-8：探针结果回来（失败），清除「探针在飞」标记。
+        self.probe_in_flight.remove(&site_id);
         let entry = self.sites.entry(site_id).or_default();
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         if entry.consecutive_failures >= self.policy.threshold {
@@ -315,6 +323,8 @@ impl Breaker {
     /// 记一次成功：无论此前什么状态，一律回 `Closed` 并清零计数。
     pub fn record_success(&mut self, site_id: i64, _now: Instant) {
         self.sites.remove(&site_id);
+        // P2-8：探针成功，清除「探针在飞」标记。
+        self.probe_in_flight.remove(&site_id);
     }
 
     /// 只读查询，**不**改状态。`Open` 且冷却已过 ⇒ `HalfOpen`（允许一个探活请求）。
@@ -329,6 +339,19 @@ impl Breaker {
             }
             Some(_) => BreakerState::Open,
             None => BreakerState::Closed,
+        }
+    }
+
+    /// P2-8 / DEBUG-REPORT-v3 §2-8：HalfOpen 且本站点尚无探针在飞 ⇒ 标记并返回
+    /// `true`（本次调用方就是那个唯一的探针）；否则 `false`（已有探针在飞，或非
+    /// HalfOpen）。**会改状态**——与 [`Self::state`] 的只读不同：`state` 谁调都看到
+    /// HalfOpen，本方法只有第一个调用者拿到探针，其余并发请求看到标记即跳过，
+    /// 不会全部涌向坏上游。探针结果回来后由 `record_success` / `record_failure` 清除。
+    pub fn try_take_half_open_probe(&mut self, site_id: i64, now: Instant) -> bool {
+        if self.state(site_id, now) == BreakerState::HalfOpen {
+            self.probe_in_flight.insert(site_id)
+        } else {
+            false
         }
     }
 }
@@ -465,5 +488,51 @@ mod tests {
         assert_eq!(b.state(1, t0), BreakerState::Open);
         b.record_success(1, t0);
         assert_eq!(b.state(1, t0), BreakerState::Closed);
+    }
+
+    #[test]
+    fn try_take_half_open_probe_lets_only_one_probe_through() {
+        // P2-8 / DEBUG-REPORT-v3 §2-8：冷却一过所有并发请求都看到 HalfOpen（`state`
+        // 只读不改），不限流就全部涌向坏上游。`try_take_half_open_probe` 只让第一个
+        // 拿到探针，其余看到标记即跳过；探针结果回来后清除标记。
+        let mut b = Breaker::new(BreakerPolicy::default());
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            b.record_failure(1, t0);
+        }
+        let t1 = t0 + Duration::from_secs(61);
+        assert_eq!(b.state(1, t1), BreakerState::HalfOpen);
+
+        assert!(
+            b.try_take_half_open_probe(1, t1),
+            "第一个 HalfOpen 探针应被放行"
+        );
+        assert!(
+            !b.try_take_half_open_probe(1, t1),
+            "探针在飞时，第二个并发请求不得再放探针（P2-8）"
+        );
+
+        // 探针失败 ⇒ 清除标记 + 重新冷却；冷却过后可再放探针（标记已清）
+        b.record_failure(1, t1);
+        let t2 = t1 + Duration::from_secs(61);
+        assert_eq!(b.state(1, t2), BreakerState::HalfOpen);
+        assert!(
+            b.try_take_half_open_probe(1, t2),
+            "探针结果回来后标记清除，冷却过后可再放探针"
+        );
+    }
+
+    #[test]
+    fn try_take_half_open_probe_is_no_op_for_non_half_open() {
+        let mut b = Breaker::new(BreakerPolicy::default());
+        let t0 = Instant::now();
+        assert!(!b.try_take_half_open_probe(1, t0), "Closed 不放探针");
+        for _ in 0..3 {
+            b.record_failure(1, t0);
+        }
+        assert!(
+            !b.try_take_half_open_probe(1, t0),
+            "Open（冷却未过）不放探针"
+        );
     }
 }
