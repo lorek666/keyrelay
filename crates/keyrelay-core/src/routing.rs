@@ -296,8 +296,16 @@ impl Breaker {
         let entry = self.sites.entry(site_id).or_default();
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         if entry.consecutive_failures >= self.policy.threshold {
-            // 刷新冷却：`Open` 期间再次失败（探针失败）应从**这一次**重新计时。
-            entry.opened_at = Some(now);
+            // 只在「首次打开」或「冷却已过（HalfOpen 探针失败）」时设 `opened_at`。
+            // 已 `Open` 且冷却未过时**不**刷新 —— 否则请求间隔 < 冷却期时 `opened_at`
+            // 每次失败都被续期，冷却永远到不了期，网关永久 503（P1-3）。
+            let cooldown_passed = entry
+                .opened_at
+                .map(|t| now.saturating_duration_since(t) >= self.policy.cooldown)
+                .unwrap_or(true);
+            if cooldown_passed {
+                entry.opened_at = Some(now);
+            }
             BreakerState::Open
         } else {
             BreakerState::Closed
@@ -379,5 +387,83 @@ mod tests {
         let policy = BreakerPolicy::default();
         assert_eq!(policy.threshold, 3);
         assert_eq!(policy.cooldown, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn record_failure_opens_after_threshold() {
+        let mut b = Breaker::new(BreakerPolicy::default());
+        let t0 = Instant::now();
+        assert_eq!(b.record_failure(1, t0), BreakerState::Closed);
+        assert_eq!(b.record_failure(1, t0), BreakerState::Closed);
+        // 第三次达阈值 → Open，opened_at 设为 t0
+        assert_eq!(b.record_failure(1, t0), BreakerState::Open);
+        assert_eq!(b.state(1, t0), BreakerState::Open);
+    }
+
+    #[test]
+    fn record_failure_during_cooldown_does_not_refresh_opened_at() {
+        // P1-3 核心：Open 后冷却未过时再次失败，opened_at 不得续期。
+        // 旧实现每次失败都 opened_at=Some(now)，请求间隔 < 冷却期时冷却永不到期。
+        let mut b = Breaker::new(BreakerPolicy::default());
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            b.record_failure(1, t0);
+        }
+        // 冷却期内（t0+30s）再失败 —— opened_at 应保持 t0，不刷成 t0+30s
+        let t1 = t0 + Duration::from_secs(30);
+        b.record_failure(1, t1);
+        assert_eq!(b.state(1, t1), BreakerState::Open);
+        // t0+61s 冷却应到期 → HalfOpen。
+        // 若 opened_at 被续到 t1（旧 bug），则 t1+61s 才到期，t0+61s 仍 Open。
+        let t2 = t0 + Duration::from_secs(61);
+        assert_eq!(
+            b.state(1, t2),
+            BreakerState::HalfOpen,
+            "冷却应从首次打开算起，不被冷却期内的失败续期"
+        );
+    }
+
+    #[test]
+    fn state_transitions_to_half_open_after_cooldown() {
+        let mut b = Breaker::new(BreakerPolicy::default());
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            b.record_failure(1, t0);
+        }
+        assert_eq!(b.state(1, t0), BreakerState::Open);
+        assert_eq!(
+            b.state(1, t0 + Duration::from_secs(61)),
+            BreakerState::HalfOpen
+        );
+    }
+
+    #[test]
+    fn record_failure_after_cooldown_refreshes_opened_at() {
+        // HalfOpen 探针失败 → opened_at 重置（探针失败重新冷却，这是合理意图）
+        let mut b = Breaker::new(BreakerPolicy::default());
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            b.record_failure(1, t0);
+        }
+        let t1 = t0 + Duration::from_secs(61);
+        assert_eq!(b.state(1, t1), BreakerState::HalfOpen);
+        // 探针失败 —— opened_at 应刷到 t1
+        b.record_failure(1, t1);
+        let t2 = t1 + Duration::from_secs(30);
+        assert_eq!(b.state(1, t2), BreakerState::Open);
+        let t3 = t1 + Duration::from_secs(61);
+        assert_eq!(b.state(1, t3), BreakerState::HalfOpen);
+    }
+
+    #[test]
+    fn record_success_closes_breaker() {
+        let mut b = Breaker::new(BreakerPolicy::default());
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            b.record_failure(1, t0);
+        }
+        assert_eq!(b.state(1, t0), BreakerState::Open);
+        b.record_success(1, t0);
+        assert_eq!(b.state(1, t0), BreakerState::Closed);
     }
 }

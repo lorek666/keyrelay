@@ -30,7 +30,11 @@ pub struct AppState {
     /// 数据库打开失败时的原因（用于在 UI 上明确提示，而不是静默降级）
     pub db_error: Option<String>,
     /// 正在运行的本地网关（同一时刻只允许一个）。
-    pub gateway: std::sync::Mutex<Option<keyrelay_core::gateway::GatewayHandle>>,
+    ///
+    /// 存的是 [`commands::GatewayRunning`]（handle + 启动时绑定的 site_id / key_id），
+    /// 不是裸 `GatewayHandle`：P1-6 —— 令牌轮换要从这里读 site/key，而不是用可能
+    /// 被切页污染成默认值的命令参数。
+    pub gateway: std::sync::Mutex<Option<crate::commands::GatewayRunning>>,
     /// 把「停旧 → 绑新」整个序列串起来（M5-S5 / 关闭 B-64 的命令层那一半）。
     ///
     /// 必须是**异步**锁：`gateway_start` 里要 `await` `shutdown_and_wait()`，
@@ -336,6 +340,12 @@ pub fn run() {
             let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                 return;
             };
+            // 只对主窗口拦截关闭（隐藏到托盘）；验证码等辅助窗口允许关（P1-7）。
+            // 旧实现对所有窗口 prevent_close+hide，验证码窗口关闭后只是隐藏，
+            // 再打开时 set_focus 对不可见窗口是空操作 ⇒ 本次运行内再也打不开。
+            if window.label() != "main" {
+                return;
+            }
             let handle = window.app_handle();
             let tray_ok = handle
                 .try_state::<AppState>()

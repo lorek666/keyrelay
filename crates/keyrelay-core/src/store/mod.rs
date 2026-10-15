@@ -90,7 +90,10 @@ CREATE TABLE IF NOT EXISTS bindings(
   journal_id TEXT,
   -- M8-S4：解绑标记（FR-2:115）。**不删行**——漂移追溯与 journals 的溯源靠它存活。
   -- NULL = 仍然绑定。老库靠 `add_column_if_missing` 补上（见 `migrate()`）。
-  unbound_at INTEGER
+  unbound_at INTEGER,
+  -- P1-2：投递模式（"site" / "gateway"）。轮换按它走，不把网关模式改成站点模式。
+  -- 老库靠 `add_column_if_missing` 补，默认 "site"（既有行为）。
+  delivery_mode TEXT NOT NULL DEFAULT 'site'
 );
 CREATE TABLE IF NOT EXISTS journals(
   id TEXT PRIMARY KEY,
@@ -225,6 +228,8 @@ pub struct BindingRow {
     pub site_id: i64,
     /// 站点侧的令牌 id（回收要用它）。
     pub remote_id: Option<String>,
+    /// P1-2：投递模式（"site" / "gateway"）。轮换按它走。
+    pub delivery_mode: String,
 }
 
 /// 投递历史的一行（M9-S4）：一次投递 = 一条 `bindings` 行 + 它的 `journals` 行。
@@ -416,6 +421,13 @@ impl Store {
         // **必须先判存在**：不判的话第二次打开会因 `duplicate column name` 直接失败——
         // 而 `migrate()` 是每次打开都跑的。
         add_column_if_missing(&conn, "bindings", "unbound_at", "INTEGER")?;
+        // P1-2：投递模式（轮换按它走）。老库默认 "site"（既有行为）。
+        add_column_if_missing(
+            &conn,
+            "bindings",
+            "delivery_mode",
+            "TEXT NOT NULL DEFAULT 'site'",
+        )?;
 
         // 版本号仍然只在升级时写，保留它作为「将来需要非幂等迁移」的锚点。
         if version < SCHEMA_VERSION {
@@ -578,12 +590,13 @@ impl Store {
         key_id: i64,
         target_path: &str,
         journal_id: &str,
+        delivery_mode: &str,
     ) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO bindings(agent_id, key_id, target_path, applied_at, journal_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![agent_id, key_id, target_path, now_secs(), journal_id],
+            "INSERT INTO bindings(agent_id, key_id, target_path, applied_at, journal_id, delivery_mode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![agent_id, key_id, target_path, now_secs(), journal_id, delivery_mode],
         )
         .map_err(|e| Error::Store(format!("写入投递绑定失败: {e}")))?;
         Ok(())
@@ -747,7 +760,7 @@ impl Store {
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT b.id, b.agent_id, b.key_id, b.target_path, b.applied_at, b.unbound_at,
-                        k.site_id, k.remote_id
+                        k.site_id, k.remote_id, b.delivery_mode
                  FROM bindings b JOIN keys k ON k.id = b.key_id
                  WHERE {predicate}
                  ORDER BY b.id"
@@ -764,6 +777,7 @@ impl Store {
                     unbound_at: row.get(5)?,
                     site_id: row.get(6)?,
                     remote_id: row.get(7)?,
+                    delivery_mode: row.get(8)?,
                 })
             })
             .map_err(|e| Error::Store(format!("查询绑定失败: {e}")))?;
@@ -1364,6 +1378,52 @@ mod tests {
             .grant_consent("codex", "codex-auth-json", "/tmp/auth.json", &["k".into()])
             .expect("写入同意");
         assert_eq!(store.list_consents().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_binding_persists_delivery_mode() {
+        // P1-2：delivery_mode 写入 bindings，BindingRow 读回。
+        let dir = tempfile::tempdir().expect("临时目录");
+        let store = Store::open(&dir.path().join("keyrelay.db")).expect("建库");
+        let site_id = store
+            .upsert_site("newapi", "https://relay.example.com", "测试")
+            .unwrap();
+        let reference = crate::vault::secret_ref("key", 1, "secret");
+        let key_id = store
+            .insert_key(site_id, "codex/daily", &reference, Some("1"), None)
+            .unwrap();
+        store
+            .record_binding("codex", key_id, "/t", "j1", "gateway")
+            .unwrap();
+        store
+            .record_binding("codex", key_id, "/t", "j2", "site")
+            .unwrap();
+        let bindings = store.bindings_of_agent("codex").unwrap();
+        let modes: Vec<&str> = bindings.iter().map(|b| b.delivery_mode.as_str()).collect();
+        assert!(modes.contains(&"gateway"), "gateway 模式应记: {modes:?}");
+        assert!(modes.contains(&"site"), "site 模式应记: {modes:?}");
+    }
+
+    #[test]
+    fn delivery_mode_column_survives_reopen() {
+        // P1-2：migrate 的 add_column_if_missing 幂等——重新打开后 delivery_mode 列仍在，原值保留。
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("keyrelay.db");
+        {
+            let store = Store::open(&path).expect("建库");
+            let site_id = store.upsert_site("newapi", "https://x", "t").unwrap();
+            let reference = crate::vault::secret_ref("key", 1, "s");
+            let key_id = store
+                .insert_key(site_id, "n", &reference, Some("1"), None)
+                .unwrap();
+            store
+                .record_binding("codex", key_id, "/t", "j", "gateway")
+                .unwrap();
+        }
+        let store = Store::open(&path).expect("重新打开（migrate 幂等）");
+        let bindings = store.bindings_of_agent("codex").unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].delivery_mode, "gateway", "delivery_mode 应保留");
     }
 
     #[test]

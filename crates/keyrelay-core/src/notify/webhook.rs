@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::redact::{mask_url_userinfo_in_json, scrub, strip_url_userinfo};
+use crate::redact::{mask_url_userinfo_in_json, scrub};
 use crate::site::transport::{HttpRequest, HttpTransport, Method};
 use crate::site::transport_reqwest::{ReqwestTransport, TransportConfig};
 
@@ -187,19 +187,10 @@ fn is_http_url(url: &str) -> bool {
 
 /// 可安全回显的地址：`scheme://host[:port]`，**userinfo / path / query / fragment 一律丢掉**。
 ///
-/// 先过冻结口径的 [`strip_url_userinfo`]（剥 userinfo），再收窄到 authority：
-/// `transport_reqwest::mask_proxy` 的复核 N-1 已经确认 —— `@` 之后的 path / query / fragment
-/// 同样可能是秘密（`?token=…`），只剥 userinfo 不够。
+/// DRY（P1-10）：逻辑已上提到 [`crate::redact::mask_webhook_url`]，`service.rs` 事件 payload
+/// 也用它，保证两个出口（错误文案 + 事件表）同口径。
 fn safe_endpoint(url: &str) -> String {
-    let stripped = strip_url_userinfo(url);
-    let Some((scheme, rest)) = stripped.split_once("://") else {
-        return "<无 scheme>".to_string();
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.is_empty() {
-        return format!("{scheme}://<已隐藏>");
-    }
-    format!("{scheme}://{authority}")
+    crate::redact::mask_webhook_url(url)
 }
 
 /// 传输层错误的**种类**（只保留种类，不保留原文）。

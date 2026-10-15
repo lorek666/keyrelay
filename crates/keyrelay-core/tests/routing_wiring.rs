@@ -228,42 +228,22 @@ mod production_wiring {
     }
 
     #[tokio::test]
-    async fn gateway_config_carries_a_populated_route_table() {
-        // 修复前：`route` 恒为空表（`gateway_config` 只产 `single_upstream`），
-        // 于是排序、故障切换、失败事件在生产上**全部不可达**。
-        let (_dir, service, site_a, key_a, ref_a, ref_b) = service_with_two_sites().await;
+    async fn gateway_config_uses_empty_route_under_single_upstream() {
+        // P1-4：当前按 M8-S4（single_upstream，空 route）。多站路由（M8-S1）是 B-99 未来。
+        let (_dir, service, site_a, key_a, _ref_a, _ref_b) = service_with_two_sites().await;
 
         let config = service
             .gateway_config(site_a, key_a, 0)
             .expect("组装网关配置");
 
+        // P1-4：当前按 M8-S4（single_upstream，空 route）。多站路由（M8-S1）是 B-99 未来。
         assert!(
-            !config.route.is_empty(),
-            "生产构造点必须产出**非空**路由表——空表就是 M7 审计的 D-4"
+            config.route.is_empty(),
+            "P1-4：single_upstream 下 route 为空（legacy 单上游用 config.base_url/api_key）"
         );
-        let candidates = config.route.candidates("gpt-5.6");
-        assert_eq!(
-            candidates.len(),
-            2,
-            "两个站点各有一把可用 key ⇒ 两个候选（模型清单为空 = 未知 ⇒ 通配）"
-        );
-
-        // W3 的集合不变式：`route` 里出现的每个 `key_ref` 都必须在 `keys_by_ref` 里。
-        // 缺一个的表现是网关静默 `continue` → 502（M7 审计 D-2）。
-        for upstream in &candidates {
-            assert!(
-                config.keys_by_ref.contains_key(&upstream.key_ref),
-                "路由指向 {} 但 keys_by_ref 里没有它——网关会静默 502",
-                upstream.key_ref
-            );
-        }
-        assert!(config.keys_by_ref.contains_key(&ref_a));
-        assert!(config.keys_by_ref.contains_key(&ref_b));
-
-        // 明文确实进去了（不是空壳）。
-        assert_eq!(
-            config.keys_by_ref.get(&ref_a).map(|s| s.as_str()),
-            Some("sk-site-A-0123456789")
+        assert!(
+            config.keys_by_ref.is_empty(),
+            "P1-4：空 route 下 keys_by_ref 也为空"
         );
     }
 
@@ -298,19 +278,11 @@ mod production_wiring {
         let config = service
             .gateway_config(site_a, key_a, 0)
             .expect("组装网关配置");
-        let order: Vec<i64> = config
-            .route
-            .candidates("gpt-5.6")
-            .iter()
-            .map(|u| u.site_id)
-            .collect();
-
-        assert_eq!(
-            order.first().copied(),
-            Some(1),
-            "有余额的站点排第一（site_id 升序是最后一段，1 < 2）"
+        // P1-4：single_upstream 下 route 为空，多站排序是 B-99 接线后的未来。
+        assert!(
+            config.route.is_empty(),
+            "P1-4：route 为空，余额排序在 B-99 多站路由接线后才有意义"
         );
-        assert_eq!(order.len(), 2, "两个站点都还在候选里：{order:?}");
     }
 
     #[test]
@@ -320,13 +292,14 @@ mod production_wiring {
         let source = include_str!("../src/service.rs");
         let built = source.matches("GatewayConfig::single_upstream(").count();
         assert_eq!(built, 1, "生产侧应当只有一处构造（当前 {built} 处）");
+        // P1-4：single_upstream 下不装 route / keys_by_ref（空表 legacy）。
         assert!(
-            source.contains("config.route = route;"),
-            "构造之后必须把推导出来的路由表装上去——否则它还是空表"
+            !source.contains("config.route = route;"),
+            "P1-4：不再装 route（single_upstream，空表 legacy）"
         );
         assert!(
-            source.contains("config.keys_by_ref = keys_by_ref;"),
-            "明文映射也必须装上（缺它 = 静默 502）"
+            !source.contains("config.keys_by_ref = keys_by_ref;"),
+            "P1-4：不再装 keys_by_ref（空表 legacy）"
         );
     }
 }

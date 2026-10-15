@@ -138,11 +138,7 @@ impl<T: HttpTransport> Sub2Api<T> {
             HttpRequest::new(Method::Post, format!("{base}/api/v1/auth/login")).json_body(&body)?;
         let resp = self.transport.request(req).await?;
         if resp.status != 200 {
-            return Err(map_http_error(
-                resp.status,
-                &resp.body,
-                resp.retry_after_secs(),
-            ));
+            return Err(classify_non_200("登录", &resp));
         }
         Self::unwrap_data(&resp, "登录")
     }
@@ -154,11 +150,7 @@ impl<T: HttpTransport> Sub2Api<T> {
             .json_body(&body)?;
         let resp = self.transport.request(req).await?;
         if resp.status != 200 {
-            return Err(map_http_error(
-                resp.status,
-                &resp.body,
-                resp.retry_after_secs(),
-            ));
+            return Err(classify_non_200("二次验证", &resp));
         }
         Self::unwrap_data(&resp, "二次验证")
     }
@@ -181,6 +173,26 @@ fn classify_failure(op: &str, message: &str) -> Error {
         return Error::CaptchaRequired;
     }
     Error::AuthFailed(format!("{op}被站点拒绝（{scrubbed}）"))
+}
+
+/// 非 200 响应的错误归类：先尝试 `classify_failure`（识别 turnstile/TOTP），
+/// 否则 `map_http_error`。
+///
+/// **P1-9**：Sub2API 的 turnstile/TOTP 失败回 HTTP 400（`infraerrors.BadRequest`），
+/// 旧实现 `post_login`/`post_login_2fa` 非 200 一律 `map_http_error` ⇒ 400 → `Transport`，
+/// `classify_failure` 只在 HTTP 200（`unwrap_data`）时走得到 ⇒ 人工兜底窗口永不弹出。
+fn classify_non_200(op: &str, resp: &super::transport::HttpResponse) -> Error {
+    let value = resp.json_value().ok();
+    if let Some(msg) = value.as_ref().and_then(|v| json_str(v, "/message")) {
+        let classified = classify_failure(op, msg);
+        if matches!(
+            classified,
+            Error::CaptchaRequired | Error::SecondFactorRequired { .. }
+        ) {
+            return classified;
+        }
+    }
+    map_http_error(resp.status, &resp.body, resp.retry_after_secs())
 }
 
 /// 把 Sub2API 的 `status` 映射到本产品的 `KeyStatus`。
@@ -934,6 +946,53 @@ mod tests {
     fn classify_failure_scrubs_site_text() {
         let err = classify_failure("登录", "token sk-0123456789abcdef rejected");
         assert!(!err.to_string().contains("sk-0123456789abcdef"), "{err}");
+    }
+
+    #[test]
+    fn classify_non_200_maps_turnstile_400_to_captcha_required() {
+        // P1-9：Sub2API turnstile 失败回 HTTP 400，旧实现 map_http_error → Transport，
+        // classify_failure 只在 200 时走得到 ⇒ 人工兜底窗口永不弹出。
+        let resp = crate::site::transport::HttpResponse::new(
+            400,
+            br#"{"code":400,"message":"turnstile verification failed"}"#.to_vec(),
+        );
+        assert!(matches!(
+            classify_non_200("登录", &resp),
+            Error::CaptchaRequired
+        ));
+    }
+
+    #[test]
+    fn classify_non_200_maps_totp_400_to_second_factor() {
+        let resp = crate::site::transport::HttpResponse::new(
+            400,
+            br#"{"code":400,"message":"invalid totp code"}"#.to_vec(),
+        );
+        assert!(matches!(
+            classify_non_200("登录", &resp),
+            Error::SecondFactorRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_non_200_falls_back_to_transport_for_plain_400() {
+        let resp = crate::site::transport::HttpResponse::new(
+            400,
+            br#"{"code":400,"message":"bad request"}"#.to_vec(),
+        );
+        assert!(matches!(
+            classify_non_200("登录", &resp),
+            Error::Transport(_)
+        ));
+    }
+
+    #[test]
+    fn classify_non_200_handles_non_json_body() {
+        let resp = crate::site::transport::HttpResponse::new(400, b"not json".to_vec());
+        assert!(matches!(
+            classify_non_200("登录", &resp),
+            Error::Transport(_)
+        ));
     }
 
     #[test]

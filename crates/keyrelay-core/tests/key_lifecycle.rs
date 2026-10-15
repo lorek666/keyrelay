@@ -213,7 +213,7 @@ fn set_key_status_is_idempotent_and_last_write_wins() {
 fn deleting_a_key_row_cascades_away_its_binding_traceability() {
     let f = setup();
     f.store
-        .record_binding("codex", f.key_id, "/tmp/auth.json", "j1")
+        .record_binding("codex", f.key_id, "/tmp/auth.json", "j1", "site")
         .expect("写绑定");
     assert_eq!(
         f.store.binding_drift_rows().unwrap().len(),
@@ -244,7 +244,7 @@ fn deleting_a_key_row_cascades_away_its_binding_traceability() {
 fn marking_a_key_disabled_keeps_its_bindings() {
     let f = setup();
     f.store
-        .record_binding("codex", f.key_id, "/tmp/auth.json", "j1")
+        .record_binding("codex", f.key_id, "/tmp/auth.json", "j1", "site")
         .expect("写绑定");
 
     f.store
