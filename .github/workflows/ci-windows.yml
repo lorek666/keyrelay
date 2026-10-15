@@ -1,0 +1,70 @@
+name: ci-windows
+
+# M14-S5：Windows 运行级对等 CI。本机（macOS）跑不了，本 workflow 在 windows-latest 上
+# 首次给「Windows 编译 / 测试 / 打包 / 签名」一条可执行路径。对应 BACKLOG B-56 / B-66。
+# 语法校验见 docs/evidence/m14s5-windows-ci.md。
+
+on:
+  push:
+    branches: [main, "m14/**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CI: "true"
+  # 签名：secrets 未配置时为空串，签名 step 的 if 会跳过（不阻塞 CI）。
+  SIGNING_CERT: ${{ secrets.SIGNING_CERT }}
+  SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+
+permissions:
+  contents: read
+
+jobs:
+  gate-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v3
+        with:
+          version: "9"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc-${{ hashFiles('Cargo.lock') }}
+
+      - run: pnpm install --frozen-lockfile
+
+      # 六门禁（Windows 侧）
+      - run: cargo fmt --check --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --no-fail-fast
+      - run: pnpm build
+      - run: pnpm test
+      - run: node scripts/check-commands.mjs
+
+      # NSIS 打包（B-56）
+      - run: pnpm tauri build --target x86_64-pc-windows-msvc
+
+      # 条件签名（B-55）：secrets 未配置时跳过，不阻塞
+      - name: sign-nsis
+        if: ${{ env.SIGNING_CERT != '' }}
+        shell: pwsh
+        run: pwsh scripts/sign-windows.ps1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: keyrelay-windows-nsis
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: warn

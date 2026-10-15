@@ -1,0 +1,86 @@
+name: ci-macos
+
+# M14-S5：macOS 六门禁 CI + Universal Binary 构建占位。
+# build-universal job 产出 aarch64+x86_64 合并的 .app/.dmg 并断言 ≤30MB（PRD §5）。
+
+on:
+  push:
+    branches: [main, "m14/**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CI: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  gate-macos:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v3
+        with:
+          version: "9"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ hashFiles('Cargo.lock') }}
+
+      - run: pnpm install --frozen-lockfile
+
+      # 六门禁（macOS 侧）
+      - run: cargo fmt --check --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --no-fail-fast
+      - run: pnpm build
+      - run: pnpm test
+      - run: node scripts/check-commands.mjs
+
+  build-universal:
+    needs: gate-macos
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v3
+        with:
+          version: "9"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal-${{ hashFiles('Cargo.lock') }}
+
+      - run: pnpm install --frozen-lockfile
+
+      # Universal Binary：Tauri 的 universal-apple-darwin target 内部用 lipo 合并双架构。
+      # 脚本断言产物 ≤30MB（PRD §5），>30MB 退出 1 → job 红。
+      - run: bash scripts/build-universal.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keyrelay-macos-universal
+          path: |
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: warn
