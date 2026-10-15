@@ -576,6 +576,9 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     /// 随事件报出「本轮因缓冲满丢弃 N 条」——否则用户看到的失败是不完整的而没
     /// 任何提示。只记计数，不逐条记（D-6：逐条记会让「缓冲满」本身把事件表灌满）。
     gateway_failures_dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// M13-S1：网关 token 用量的内存缓冲（与  同形）。
+    /// 回调里只 push，在  时落库——网关回调不该做 IO。
+    gateway_usage_buffer: Arc<std::sync::Mutex<Vec<crate::gateway::GatewayUsage>>>,
     /// 网关**会话**代号（M8-S1 §11.1）。每次 `gateway_config` 递增一次，
     /// `gateway_stop` 再递增一次（= 作废当前会话）。
     ///
@@ -704,6 +707,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             notify: None,
             gateway_failures: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             gateway_failures_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            gateway_usage_buffer: Arc::new(std::sync::Mutex::new(Vec::new())),
             gateway_session: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             site_facts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             revoked_refs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -1523,6 +1527,16 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 map.entry(site.id).or_default().balance_usd =
                     if b.known { Some(b.remaining) } else { None };
             }
+            // M13-S1：known == true 时写一条余额快照
+            if b.known {
+                let _ = self.store.insert_usage_snapshot(
+                    site.id,
+                    b.used,
+                    b.remaining,
+                    &b.currency,
+                    true,
+                );
+            }
         }
         let keys = self.list_keys(site.id).await;
 
@@ -1556,6 +1570,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // 而下面的刷新要跑网络；先落库能让「网关为什么切换了上游」在事件面板里
         // 早于本轮的余额/漂移事件出现，读起来是因果顺序。
         self.drain_gateway_failures();
+        self.drain_gateway_usage();
         let settings = self.settings()?;
         let sites = self.store.list_sites()?;
         let mut summary = RefreshSummary {
@@ -3007,7 +3022,35 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 map.entry(obs.site_id).or_default().latency_ms = Some(obs.latency_ms);
             }
         }));
+
+        // M13-S1：token 用量出口。回调只 push 到内存缓冲，落库在 refresh_all。
+        let usage_buffer = Arc::clone(&self.gateway_usage_buffer);
+        config.on_usage = Some(Arc::new(move |usage: crate::gateway::GatewayUsage| {
+            if let Ok(mut buffer) = usage_buffer.lock() {
+                if buffer.len() >= 1024 {
+                    buffer.drain(0..512);
+                }
+                buffer.push(usage);
+            }
+        }));
         Ok(config)
+    }
+
+    /// M13-S1：把网关攒下的 token 用量落库。
+    pub fn drain_gateway_usage(&self) {
+        let drained: Vec<crate::gateway::GatewayUsage> = match self.gateway_usage_buffer.lock() {
+            Ok(mut buffer) => buffer.drain(..).collect(),
+            Err(_) => return,
+        };
+        for usage in &drained {
+            let _ = self.store.insert_gateway_usage(
+                usage.site_id,
+                &usage.model,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+            );
+        }
     }
 
     /// 网关本地令牌（M8-S4 §6.4）：**已持久化就用它，没有就生成一把并存起来**。
