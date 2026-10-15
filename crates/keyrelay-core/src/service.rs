@@ -3786,6 +3786,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         current_key_id: i64,
     ) -> Vec<String> {
         let mut out = Vec::new();
+        let mut seen_keys: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let Ok(rows) = self
             .store
             .bindings_of_target(&target_path.to_string_lossy())
@@ -3796,6 +3797,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .iter()
             .filter(|r| r.unbound_at.is_none() && r.key_id != current_key_id)
         {
+            // 复审 F5：同 key_id 多绑定（多 agent 共用一把 key 到同一 target）时去重，
+            // 避免重复读钥匙串——`key_secret` 是 IO + 解密，重复调用无意义，
+            // `diff_preview` 的 `replace_all` 对重复明文结果相同。
+            if !seen_keys.insert(row.key_id) {
+                continue;
+            }
             if let Ok(secret) = self.key_secret(row.key_id) {
                 if !secret.trim().is_empty() {
                     out.push(secret.to_string());
