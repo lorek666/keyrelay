@@ -398,8 +398,11 @@ if (frontOnlyAgent.length || frontOnlyChannels.length) {
       (frontOnlyAgent.length ? `  只有 AGENT_CHANNELS 有: ${frontOnlyAgent.join(", ")}\n` : ""),
   );
 } else {
+  // P3-17 / DEBUG-REPORT-v3 §3-17：文案只说 ③ 自己检查的（前端两张表 id 集合一致），
+  // 不提「与后端对账」——那是 ①② 的职责；①② fail 时这里打 ✓ 会变成「先 ✗ 后 ✓」
+  // 的误导顺序。
   ok(
-    `AGENT_CHANNELS 与后端对账一致（${agentTable.ids.length} 条通道 / ${agentTable.keys.length} 个 agent）`,
+    `CHANNELS 与 AGENT_CHANNELS 的 channel id 集合一致（${agentTable.ids.length} 条 / ${agentTable.keys.length} 个 agent）`,
   );
 }
 
