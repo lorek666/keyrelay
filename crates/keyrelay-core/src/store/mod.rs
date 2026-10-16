@@ -499,17 +499,23 @@ fn host_of_url(url: &str) -> String {
     }
 }
 
-/// 表里没有这一列时才 `ALTER TABLE` 加上它。
+/// SQLite 的「忙 / 锁」错误判定——按**错误码**而不是错误串。
 ///
-/// 为什么不能直接 `ALTER TABLE ... ADD COLUMN`：`migrate()` 每次打开都跑，
-/// 第二次会因 `duplicate column name` 失败。为什么也不能只靠 DDL：
-/// `CREATE TABLE IF NOT EXISTS` 对已存在的表是空操作，加列不会生效（M8-S4 §5.2）。
-fn add_column_if_missing(
-    conn: &rusqlite::Connection,
-    table: &str,
-    column: &str,
-    decl: &str,
-) -> Result<()> {
+/// 只给 [`Store::open`] 的 WAL 重试循环用：那个循环只该吞掉「别人正拿着锁」这一类，
+/// 磁盘满 / 权限 / 语法错必须原样冒泡。
+fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(
+                inner.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// 表里有没有这一列。
+fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_info({table})"))
         .map_err(|e| Error::Store(format!("读取表结构失败: {e}")))?;
@@ -518,14 +524,72 @@ fn add_column_if_missing(
         .map_err(|e| Error::Store(format!("读取表结构失败: {e}")))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::Store(format!("读取表结构失败: {e}")))?;
-    drop(stmt);
+    Ok(existing.iter().any(|name| name == column))
+}
 
-    if existing.iter().any(|name| name == column) {
+/// 直接 `ALTER TABLE ... ADD COLUMN`，**不做存在性判断**。
+///
+/// 只给 [`add_column_if_missing`] 与竞态测试用：把「判存在」与「加列」拆开，
+/// 竞态测试才能**确定性地**复现「判完存在之后、加列之前，别人先加上了」这个窗口。
+fn add_column_unchecked(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<()> {
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+        .map_err(|e| Error::Store(format!("为 {table} 增加 {column} 列失败: {e}")))
+}
+
+/// 表里没有这一列时才 `ALTER TABLE` 加上它。
+///
+/// 为什么不能直接 `ALTER TABLE ... ADD COLUMN`：`migrate()` 每次打开都跑，
+/// 第二次会因 `duplicate column name` 失败。为什么也不能只靠 DDL：
+/// `CREATE TABLE IF NOT EXISTS` 对已存在的表是空操作，加列不会生效（M8-S4 §5.2）。
+///
+/// **并发安全**（M16-S1 / P3-1）：进程内由 `migrate()` 持有的 `Mutex` 串行化 ✓；
+/// 跨**进程**（或跨连接）首次打开同一个老库时，两个连接可能都判「不存在」，
+/// 其中一个先加完 ⇒ 另一个的 `ALTER` 撞 `duplicate column name`。
+/// 处置：**失败后复验**——列确实在了 ⇒ 视为成功（幂等）；仍不在 ⇒ 原样冒泡
+/// （表不存在、语法错这类真错误**不许**被吞）。
+/// 注意判据是**复验结果**而不是错误串匹配：错误串是 SQLite 的实现细节，
+/// 而「列在不在」是我们要的事实。
+fn add_column_if_missing(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<()> {
+    add_column_if_missing_with(conn, table, column, decl, || {})
+}
+
+/// 与 [`add_column_if_missing`] 相同，但在**「查列」与「ALTER」之间**留一个窗口回调。
+///
+/// 存在的唯一理由：那条竞态（另一个连接在这个窗口里把列加上）**必须能被确定性复现**——
+/// 否则测试只能靠概率碰（报告实测 18/400），而概率型用例的「绿」不代表修复有效
+/// （实测：不留这个窗口时，把修复退回旧实现，用例照样绿 ⇒ 假绿）。
+/// 生产路径传空闭包，编译后无开销。
+fn add_column_if_missing_with(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+    window: impl FnOnce(),
+) -> Result<()> {
+    if column_exists(conn, table, column)? {
         return Ok(());
     }
-    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
-        .map_err(|e| Error::Store(format!("为 {table} 增加 {column} 列失败: {e}")))?;
-    Ok(())
+    window();
+    match add_column_unchecked(conn, table, column, decl) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if column_exists(conn, table, column)? {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 impl Store {
@@ -536,9 +600,36 @@ impl Store {
         }
         let conn =
             Connection::open(path).map_err(|e| Error::Store(format!("打开数据库失败: {e}")))?;
+        // **忙等超时**（M16-S1 / P3-1 的另一半）：并发首次打开同一个库时
+        // （多进程 / 多线程），建表与其它语句都要拿写锁——不设忙等的话，
+        // 另一个连接正在建表就会立刻 `database is locked`，`Store::open` 失败。
+        // 5s 覆盖「另一个进程正在跑 migrate」这段窗口，又不会让真死锁挂太久。
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| Error::Store(format!("设置忙等超时失败: {e}")))?;
         // 文件库必须真的跑在 WAL 上（并发读+写）。内存库不支持 WAL，只在 open_in_memory 分支跳过。
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| Error::Store(format!("切换 WAL 模式失败: {e}")))?;
+        //
+        // **这一步单独重试**：`PRAGMA journal_mode = WAL` 需要**独占锁**，而 SQLite 在
+        // 「改日志模式」这条路径上**不调用忙等处理器**（`SQLITE_BUSY` 立刻返回）⇒ 上面那个
+        // `busy_timeout` 对它无效。实测：4 线程并发首次打开同一个老库，20%~28% 命中
+        // `切换 WAL 模式失败: database is locked`（见
+        // `concurrent_first_upgrade_of_an_old_database_all_succeed`）。
+        // 判据用**错误码**（`DatabaseBusy` / `DatabaseLocked`）而不是错误串：
+        // 错误串是实现细节，别的错误（磁盘满、权限）**不许**被这个循环吞掉。
+        let mut wal_attempts = 0u32;
+        loop {
+            match conn.pragma_update(None, "journal_mode", "WAL") {
+                Ok(()) => break,
+                Err(err) if wal_attempts < 40 && is_sqlite_busy(&err) => {
+                    wal_attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(err) => {
+                    return Err(Error::Store(format!(
+                        "切换 WAL 模式失败（重试 {wal_attempts} 次后）: {err}"
+                    )))
+                }
+            }
+        }
         let store = Self::from_conn(conn)?;
         // 记下路径（`from_conn` 不关心路径）
         Ok(Self {
@@ -1293,8 +1384,20 @@ impl Store {
                  FROM bindings b
                  -- M8-S4：**已解绑的目标不再出现在漂移报告里**。文件已经不属于我们，
                  -- 继续报「配置已漂移」等于指挥用户去修一个我们不该管的文件。
-                 JOIN (SELECT target_path, MAX(id) AS mid FROM bindings
-                        WHERE unbound_at IS NULL GROUP BY target_path) latest
+                 --
+                 -- M16-S1（B-126 选项①）：**已回滚的那次投递也不再算数**——回滚把文件还原了，
+                 -- 那次投递不再是现状；继续拿它的 `after_sha256` 当期望值，会让一个已回滚的目标
+                 -- 永远显示漂移，并让 `rotation_targets` 把一把已经不在服务的 key 当成服务者。
+                 -- 「合格」的判定与 `delivery_history` 的 `superseded` **同源**：
+                 -- `COALESCE(status,'applied') <> 'rolled_back'`（没有 journal 行 = applied；
+                 -- 老库 `journal_id` 为空串时 join 出 NULL ⇒ 同样视为合格）。
+                 JOIN (SELECT b2.target_path, MAX(b2.id) AS mid
+                         FROM bindings b2
+                         LEFT JOIN journals j2
+                                ON j2.id = b2.journal_id || ':' || b2.target_path
+                        WHERE b2.unbound_at IS NULL
+                          AND COALESCE(j2.status, 'applied') <> 'rolled_back'
+                        GROUP BY b2.target_path) latest
                    ON b.id = latest.mid
                  JOIN keys k ON k.id = b.key_id
                  LEFT JOIN journals j ON j.id = b.journal_id || ':' || b.target_path
@@ -2139,6 +2242,97 @@ mod tests {
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         store.migrate().unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn add_column_is_race_safe_when_the_column_appears_concurrently() {
+        // **M16-S1 / P3-1 的确定性复现**（不靠概率）：
+        // 把「另一个连接在窗口里把列加上」钉死在「查列」与「ALTER」之间——
+        // 这正是两个进程首次打开同一个老库时必现的窗口。旧实现在最后一步
+        // 直接 `Err(duplicate column name)` ⇒ `Store::open` 失败（报告实测 18/400）。
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("race.db");
+
+        let conn_a = rusqlite::Connection::open(&path).expect("连接 A");
+        conn_a
+            .execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .expect("建表");
+        let conn_b = rusqlite::Connection::open(&path).expect("连接 B");
+
+        let mut raced = false;
+        let result = add_column_if_missing_with(&conn_a, "t", "extra", "INTEGER", || {
+            // 窗口：B（另一个连接）抢先把列加上并提交。A 的「查列」已经过去、还没 ALTER。
+            add_column_unchecked(&conn_b, "t", "extra", "INTEGER").expect("B 先加列");
+            raced = true;
+        });
+        assert!(
+            raced,
+            "夹具：窗口必须被走到（若没走到，说明「查列」那步就早返回了，这条用例没在测竞态）"
+        );
+        result.expect("并发下应视为成功（复验列已存在），而不是报 duplicate column");
+        assert!(column_exists(&conn_a, "t", "extra").unwrap());
+
+        // 幂等：再调一次仍然 Ok（这次走「列已存在」的早返回）
+        add_column_if_missing(&conn_a, "t", "extra", "INTEGER").expect("重复调用应幂等");
+    }
+
+    #[test]
+    fn add_column_still_reports_real_errors() {
+        // 反例保护：复验机制**不许**把真错误吞掉——表不存在时必须照旧 `Err`。
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        let err = add_column_if_missing(&conn, "no_such_table", "extra", "INTEGER")
+            .expect_err("表不存在应报错");
+        let text = err.to_string();
+        assert!(text.contains("no_such_table"), "错误里应带上表名: {text}");
+    }
+
+    #[test]
+    fn concurrent_first_upgrade_of_an_old_database_all_succeed() {
+        // 老库形态：`bindings` 表存在但缺 M8-S4 / P1-2 之后加的两列
+        // （`unbound_at` / `delivery_mode`）⇒ 每个打开者都会走一次 `add_column_if_missing`。
+        // N 个线程同时首次打开：全部应成功，列只加一次。
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("造老库");
+            conn.execute_batch(
+                "CREATE TABLE bindings(
+                   id INTEGER PRIMARY KEY,
+                   agent_id TEXT NOT NULL,
+                   key_id INTEGER NOT NULL,
+                   target_path TEXT NOT NULL,
+                   managed_json TEXT,
+                   applied_at INTEGER NOT NULL,
+                   journal_id TEXT
+                 );",
+            )
+            .expect("建老表");
+        }
+
+        const THREADS: usize = 4;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(&path).map(|_| ())
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let failures: Vec<String> = results
+            .iter()
+            .filter_map(|r| r.as_ref().err().map(|e| e.to_string()))
+            .collect();
+        assert!(failures.is_empty(), "并发首次升级不得失败: {failures:?}");
+
+        let store = Store::open(&path).expect("再开一次");
+        let conn = store.lock().unwrap();
+        assert!(column_exists(&conn, "bindings", "unbound_at").unwrap());
+        assert!(column_exists(&conn, "bindings", "delivery_mode").unwrap());
     }
 
     #[test]
