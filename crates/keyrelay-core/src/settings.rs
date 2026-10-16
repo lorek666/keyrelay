@@ -37,6 +37,7 @@ const KEY_PROXY_URL: &str = "proxy_url";
 const KEY_PROXY_MODE: &str = "proxy_mode";
 const KEY_TELEMETRY: &str = "telemetry_enabled";
 const KEY_AUTO_UPDATE: &str = "auto_update_enabled";
+const KEY_NOTIFY_ENABLED: &str = "notify_enabled";
 const KEY_NOTIFY_SYSTEM: &str = "notify_system_enabled";
 const KEY_NOTIFY_WEBHOOK: &str = "notify_webhook_url";
 const KEY_NOTIFY_TIMEOUT: &str = "notify_timeout_secs";
@@ -89,6 +90,16 @@ pub struct Settings {
     pub auto_update_enabled: bool,
 
     // ---- M6-S5：FR-3 通知 ----
+    /// **通知总开关**。默认**关**（M16-S9 / S5 复审 P1-1）。
+    ///
+    /// 与 [`Self::notify_system_enabled`] 的区别：那个是「系统通知这一路可用吗」（默认 `true`），
+    /// 本字段是「要不要跑通知派发」。关着时服务层**根本不装**通知状态
+    /// （`KeyRelayService::with_notify` 不被调用）⇒ 与「通知功能从未接线」的行为逐字相同：
+    /// 不评估规则、不落基线、不弹通知、不发 webhook。
+    ///
+    /// 为什么默认关：装上派发会在既有用户那里凭空开始弹通知（行为变更），
+    /// 而这属于产品决策——用户显式打开才生效。
+    pub notify_enabled: bool,
     /// 系统通知开关。默认开（PRD FR-3「系统通知（默认）」）。
     pub notify_system_enabled: bool,
     /// Webhook 地址。空 = 不启用。
@@ -137,6 +148,7 @@ impl Default for Settings {
             auto_update_enabled: false,
 
             // PRD FR-3：系统通知是默认渠道
+            notify_enabled: false,
             notify_system_enabled: true,
             notify_webhook_url: String::new(),
             notify_timeout_secs: 10,
@@ -260,6 +272,7 @@ impl Settings {
             "language": self.language,
             "telemetry_enabled": self.telemetry_enabled,
             "auto_update_enabled": self.auto_update_enabled,
+            "notify_enabled": self.notify_enabled,
             "notify_system_enabled": self.notify_system_enabled,
             "notify_timeout_secs": self.notify_timeout_secs,
             "rotation_max_age_days": self.rotation_max_age_days,
@@ -392,6 +405,11 @@ impl Settings {
                         settings.auto_update_enabled = flag;
                     }
                 }
+                KEY_NOTIFY_ENABLED => {
+                    if let Some(flag) = parse_bool(value) {
+                        settings.notify_enabled = flag;
+                    }
+                }
                 KEY_NOTIFY_SYSTEM => {
                     if let Some(flag) = parse_bool(value) {
                         settings.notify_system_enabled = flag;
@@ -476,6 +494,7 @@ impl Settings {
             (KEY_PROXY_MODE, self.proxy_mode.clone()),
             (KEY_TELEMETRY, self.telemetry_enabled.to_string()),
             (KEY_AUTO_UPDATE, self.auto_update_enabled.to_string()),
+            (KEY_NOTIFY_ENABLED, self.notify_enabled.to_string()),
             (KEY_NOTIFY_SYSTEM, self.notify_system_enabled.to_string()),
             (KEY_NOTIFY_WEBHOOK, self.notify_webhook_url.clone()),
             (KEY_NOTIFY_TIMEOUT, self.notify_timeout_secs.to_string()),
@@ -508,7 +527,7 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 22] = [
+    pub const KEYS: [&'static str; 23] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
@@ -523,6 +542,7 @@ impl Settings {
         KEY_PROXY_MODE,
         KEY_TELEMETRY,
         KEY_AUTO_UPDATE,
+        KEY_NOTIFY_ENABLED,
         KEY_NOTIFY_SYSTEM,
         KEY_NOTIFY_WEBHOOK,
         KEY_NOTIFY_TIMEOUT,
@@ -576,6 +596,10 @@ mod tests {
         assert!(s.proxy_url.is_empty(), "默认直连");
         assert!(!s.telemetry_enabled, "PRD §5：默认零遥测");
         assert!(!s.auto_update_enabled, "自动更新默认关");
+        assert!(
+            !s.notify_enabled,
+            "M16-S9：通知**总开关默认关**（装上派发不该改变既有用户行为）"
+        );
         assert!(s.notify_system_enabled, "PRD FR-3：系统通知是默认渠道");
         assert!(!s.webhook_enabled(), "没填地址就不启用 Webhook");
         assert_eq!(s.notify_timeout_secs, 10);
@@ -790,6 +814,7 @@ mod tests {
             refresh_interval_secs: 900,
             balance_alert_threshold: 3.5,
             drift_check_on_start: false,
+            notify_enabled: true,
             gateway_enabled: true,
             gateway_port: 9999,
             gateway_multi_site: false,
@@ -928,6 +953,7 @@ mod tests {
         // 新字段走同一套解析；默认值不一致的字段要单独钉：
         // `notify_system_enabled` / `close_to_tray` 默认 true，其余默认 false。
         let falsy = Settings::from_pairs(vec![
+            (KEY_NOTIFY_ENABLED, "OFF"),
             (KEY_NOTIFY_SYSTEM, "OFF"),
             (KEY_CLOSE_TO_TRAY, "off"),
             (KEY_TELEMETRY, "Off"),
@@ -935,6 +961,7 @@ mod tests {
             (KEY_START_HIDDEN, "OFF"),
             (KEY_AUTO_UPDATE, "OFF"),
         ]);
+        assert!(!falsy.notify_enabled, "总开关也要走同一套解析");
         assert!(!falsy.notify_system_enabled);
         assert!(!falsy.close_to_tray);
         assert!(!falsy.should_hide_on_close(true));
@@ -944,6 +971,7 @@ mod tests {
         assert!(!falsy.auto_update_enabled);
 
         let truthy = Settings::from_pairs(vec![
+            (KEY_NOTIFY_ENABLED, "On"),
             (KEY_NOTIFY_SYSTEM, "On"),
             (KEY_CLOSE_TO_TRAY, "On"),
             (KEY_TELEMETRY, "On"),
@@ -951,6 +979,7 @@ mod tests {
             (KEY_START_HIDDEN, "On"),
             (KEY_AUTO_UPDATE, "On"),
         ]);
+        assert!(truthy.notify_enabled, "总开关也要走同一套解析");
         assert!(truthy.notify_system_enabled);
         assert!(truthy.close_to_tray);
         assert!(truthy.should_hide_on_close(true));

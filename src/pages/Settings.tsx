@@ -723,10 +723,29 @@ export default function SettingsPage() {
           <div className="card">
             <h3>{t("settings.notify.title")}</h3>
             <p className="muted">{t("settings.notify.body")}</p>
+            {/*
+              M16-S9：总开关。**默认关** —— 关着时服务层不装通知状态（不评估、不落基线、
+              不弹通知、不发 webhook），与「通知功能从未接线」逐字相同。
+              关着时下面三项**禁用**而不是隐藏：让用户看得见「功能存在、但被总开关关掉了」。
+            */}
+            <label className="checkline">
+              <input
+                type="checkbox"
+                checked={draft.notifyEnabled}
+                onChange={(e) =>
+                  setDraft({ ...draft, notifyEnabled: e.target.checked })
+                }
+              />
+              <span>{t("settings.notify.enabled")}</span>
+            </label>
+            {!draft.notifyEnabled ? (
+              <p className="muted">{t("settings.notify.enabledHint")}</p>
+            ) : null}
             <label className="checkline">
               <input
                 type="checkbox"
                 checked={draft.notifySystemEnabled}
+                disabled={!draft.notifyEnabled}
                 onChange={(e) =>
                   setDraft({ ...draft, notifySystemEnabled: e.target.checked })
                 }
@@ -738,6 +757,7 @@ export default function SettingsPage() {
               <input
                 className="input"
                 type="text"
+                disabled={!draft.notifyEnabled}
                 placeholder={t("settings.notify.webhookPlaceholder")}
                 value={draft.notifyWebhookUrl}
                 onChange={(e) =>
@@ -750,6 +770,7 @@ export default function SettingsPage() {
               <input
                 className="input"
                 type="number"
+                disabled={!draft.notifyEnabled}
                 min={1}
                 max={60}
                 value={draft.notifyTimeoutSecs}
