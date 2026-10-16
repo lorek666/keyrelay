@@ -527,6 +527,8 @@ pub struct GatewayHandle {
     /// 服务任务。`shutdown_and_wait` 等它结束；`shutdown()` 只是把它丢掉
     /// （drop 一个 `JoinHandle` 是 **detach**，不会 abort 任务——既有调用点的行为因此不变）。
     finished: tokio::task::JoinHandle<()>,
+    /// 与 `AppState` 共享的「正在停止」标志（M16-S4 / P3-3）。
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for GatewayHandle {
@@ -544,7 +546,12 @@ impl GatewayHandle {
     }
 
     /// 停止网关并释放端口。幂等。
+    ///
+    /// **先置「正在停止」标志、再发信号**（M16-S4 / P3-3）：在途请求的下一次上游尝试
+    /// 会看到标志并拒绝发起，不再把任何密钥发出去。
     pub fn shutdown(self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = self.shutdown.send(());
     }
 
@@ -562,8 +569,13 @@ impl GatewayHandle {
     /// 信号之后就已经能重新绑定了。
     pub async fn shutdown_and_wait(self) {
         let GatewayHandle {
-            shutdown, finished, ..
+            shutdown,
+            finished,
+            stopping,
+            ..
         } = self;
+        // P3-3：置位在信号之前——顺序反了的话，在途请求可能在这两步之间发起新尝试。
+        stopping.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = shutdown.send(());
         let _ = finished.await;
     }
@@ -651,10 +663,14 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
         .build()
         .map_err(|e| Error::Transport(format!("构造网关的上游客户端失败: {e}")))?;
 
+    // P3-3：停止闸门。`AppState` 与 `GatewayHandle` 共享同一个标志——
+    // 句柄置位（停止信号发出之前），请求路径读取。
+    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = AppState {
         breaker: Arc::new(Mutex::new(Breaker::new(config.breaker.clone()))),
         config: config.clone(),
         upstream,
+        stopping: Arc::clone(&stopping),
     };
     let app = Router::new()
         .route("/health", any(health))
@@ -691,6 +707,7 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
         site_display_name: config.site_display_name,
         shutdown: tx,
         finished,
+        stopping,
     })
 }
 
@@ -703,6 +720,13 @@ struct AppState {
     /// 不能放进 `config`：axum 的 `State` 每个请求 clone 一份，
     /// 裸值会变成「每个请求各有一份熔断历史」——熔断永远不生效。
     breaker: Arc<Mutex<Breaker>>,
+    /// **正在停止**（M16-S4 / P3-3）：`shutdown()` / `shutdown_and_wait()` 在发出停止
+    /// 信号**之前**置位；在途请求的下一次上游尝试看到它就不再发（不再带出任何密钥）。
+    ///
+    /// 为什么需要：axum 的优雅停机只保证「不再 accept 新连接 + 等连接收尾」——
+    /// 已经进来的请求会继续跑完，包括**继续重放**到下一个上游。
+    /// 用户按下停止（往往紧接着就要轮换/回收密钥）时，不该还有请求把密钥发出去。
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 取出请求里的本地令牌。支持 `Authorization: Bearer` 与 `X-KeyRelay-Token`。
@@ -756,6 +780,26 @@ fn unauthorized(message: &str) -> Response {
         axum::Json(serde_json::json!({ "error": message })),
     )
         .into_response()
+}
+
+/// 网关**正在停止**时对「新的上游尝试」的统一拒绝（M16-S4 / P3-3）。
+///
+/// 为什么不是 502：这不是上游故障，是本地状态——文案必须说清，
+/// 否则用户会去查一个没问题的上游。为什么是 503：请求此刻确实无法完成，
+/// 但**重启网关后重试即可**（客户端按 5xx 处理即可）。
+fn stopping_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({
+            "error": "网关正在停止，不再向上游发起新请求；请重启网关后重试"
+        })),
+    )
+        .into_response()
+}
+
+/// 网关是否正在停止（P3-3）。
+fn is_stopping(state: &AppState) -> bool {
+    state.stopping.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -829,7 +873,13 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
 
     // ③ 空路由表 ⇒ 单上游时代的**逐字节相同**行为：不解析 body、不查 `keys_by_ref`、
     //    不查熔断、不写失败事件、只发一次请求。
+    //
+    //    M16-S4 / P3-3 的唯一增量：**停止信号已发出时一个字节都不发**。
+    //    这不是「上游失败」，是本地状态 ⇒ 不写事件、不改响应形态（只在停止期间生效）。
     if state.config.route.is_empty() {
+        if is_stopping(&state) {
+            return stopping_response();
+        }
         let url = format!("{}{}{}", state.config.base_url, path, query);
         let headers = upstream_headers(&state.config, &inbound, &state.config.api_key);
         return forward_to(&state, method, &url, headers, body).await;
@@ -904,6 +954,13 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     let mut last_error: Option<String> = None;
     let attempts = sendable.len();
     for (index, upstream) in sendable.iter().enumerate() {
+        // P3-3：**每一次上游尝试之前**都查停止闸门——信号可能在上一次尝试期间发出。
+        // 在途请求允许跑完**当前**这一次（无法安全中断一个已发出的请求），
+        // 但绝不再发起新的：那会把下一个站点的密钥也发出去，而用户按下停止
+        // 往往紧接着就要轮换/回收密钥。
+        if is_stopping(&state) {
+            return stopping_response();
+        }
         let is_last = index + 1 == attempts;
         // 这里 `unwrap` 不会 panic：`sendable` 就是按同一个判据过滤出来的。
         // 但仍然写 `let Some(..) else` ——「过滤」与「取用」共用同一个函数
