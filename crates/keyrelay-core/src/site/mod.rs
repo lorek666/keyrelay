@@ -29,10 +29,12 @@ use crate::error::{Error, Result};
 /// 顺序即 `SiteRegistry` 默认探测顺序的基础顺序（`registry.rs` 在其上只做
 /// 「`CustomOpenAiCompatible` 排最后」一条重排）。
 ///
-/// `parse` 仍手写（每个变体有多个别名写法），由
-/// `site::tests::every_kind_round_trips_through_parse` 对 `ALL` 逐项守护。
+/// **B-142（M16-S10）**：`parse` 也由本宏生成（每个变体可带若干别名写法）。
+/// 此前 `parse` 是手写 match + `_ => None`，只有
+/// `site::tests::every_kind_round_trips_through_parse` 这条**测试**强制；
+/// 纳入宏之后，新增变体**必然**带上它的规范写法，漏不掉（真编译期强制）。
 macro_rules! define_site_kinds {
-    ($( $(#[$meta:meta])* $variant:ident => $text:literal ),+ $(,)?) => {
+    ($( $(#[$meta:meta])* $variant:ident => $text:literal $(| $alias:literal)* ),+ $(,)?) => {
         #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
         pub enum SiteKind {
             $( $(#[$meta])* $variant ),+
@@ -49,6 +51,19 @@ macro_rules! define_site_kinds {
                     $( SiteKind::$variant => $text ),+
                 }
             }
+
+            /// 解析站点类型。**宽进严出**：接受每个变体的若干写法（大小写不敏感），
+            /// 但 [`Self::as_str`] 只输出**规范形态**——它会落进 `sites.kind` 列与事件表，
+            /// 必须是唯一的（M7-S2 spec §3.1 D-1）。
+            ///
+            /// 由 [`define_site_kinds!`] 生成（B-142）：`$text` 与别名都写在同一处，
+            /// 新增变体时不可能漏掉 `parse` 的臂。
+            pub fn parse(s: &str) -> Option<Self> {
+                match s.to_ascii_lowercase().as_str() {
+                    $( $text $(| $alias)* => Some(SiteKind::$variant), )+
+                    _ => None,
+                }
+            }
         }
     };
     // 计数：数组长度位置要一个 const 表达式，`<[()]>::len` 是 const fn。
@@ -59,27 +74,11 @@ macro_rules! define_site_kinds {
 }
 
 define_site_kinds! {
-    NewApi => "newapi",
-    Sub2Api => "sub2api",
+    NewApi => "newapi" | "new-api",
+    Sub2Api => "sub2api" | "sub2-api",
     /// 只读的 OpenAI 兼容端点（M7-S2 / PRD FR-1）：只有一个 `/v1/models` 可读，
     /// 没有令牌管理端点、没有余额与分组概念。能力见 [`capability::capabilities`]。
-    CustomOpenAiCompatible => "custom-openai-compatible",
-}
-
-impl SiteKind {
-    /// 解析站点类型。**宽进严出**：接受三个写法（大小写不敏感），但 [`Self::as_str`] 只输出
-    /// `"custom-openai-compatible"` 这一个规范形态——它会落进 `sites.kind` 列与事件表，
-    /// 必须是唯一的（M7-S2 spec §3.1 D-1）。
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "newapi" | "new-api" => Some(SiteKind::NewApi),
-            "sub2api" | "sub2-api" => Some(SiteKind::Sub2Api),
-            "custom-openai-compatible" | "custom-openai" | "openai-compatible" => {
-                Some(SiteKind::CustomOpenAiCompatible)
-            }
-            _ => None,
-        }
-    }
+    CustomOpenAiCompatible => "custom-openai-compatible" | "custom-openai" | "openai-compatible",
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -221,9 +221,11 @@ fn parse_probe_response(resp: HttpResponse) -> Result<ProbeRun> {
         return Err(Error::Transport("检测服务正在维护，请稍后重试".into()));
     }
     if resp.status == 400 {
-        // M1（独立复审）：400 body 原样透传会回显请求字段——bazaarlink 未保证不回显 apiKey，
-        // 过 `redact::scrub` 再拼进错误信息（与 reqwest 网络错误 `describe()` 的 scrub 同口径）。
-        let body = crate::redact::scrub(&resp.text_lossy());
+        // M1（独立复审）：400 body 原样透传会回显请求字段——bazaarlink 未保证不回显 apiKey。
+        // B-141：这里必须走**与三个出口同口径**的 `scrub_event_message`，不能只用 `scrub`——
+        // `scrub` 对「整串没有 `://`」的形态不敏感（`password=hunter2`、`Bearer <token>` 这类），
+        // 而这段文本会进错误信息、再进事件表。
+        let body = crate::redact::scrub_event_message(&resp.text_lossy());
         return Err(Error::Transport(format!(
             "检测请求被拒（目标 URL 无效或私有 / 参数不合法）: {body}"
         )));
