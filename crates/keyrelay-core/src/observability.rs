@@ -25,8 +25,14 @@ use crate::redact::scrub_event_message;
 /// `"probe"` 是 M15-S1 加的：模型检测（bazaarlink）的完成/失败事件同理，需要能单独
 /// 筛出（否则混在 `app` 里，用户按来源筛「检测」看不到）。独立复审 M4 发现
 /// `probe_model` 的 `source: "probe"` 不在白名单、被归一成 `app`——顺带修掉。
-pub const SOURCES: [&str; 8] = [
-    "app", "site", "key", "delivery", "vault", "store", "gateway", "probe",
+/// `"notify"` 是 M16-S9（S5 复审 P2-③）加的：通知派发路径上的两条 Warn 事件
+/// （编码被拒的降级、发送失败）此前把 source 写成 `"notify"`，但白名单里没有它 ⇒
+/// 被 `normalize_source` 静默归一成 `"app"`，与代码声称的来源不符、也无法按来源筛。
+/// 两条处置（加白名单 / 改成 `"app"`）里选**加白名单**：通知是「本产品主动发出去的东西」，
+/// 与「应用做了什么」是两类事实；归一成 `"app"` 会**丢掉**这个区分，而白名单的用途正是
+/// 枚举已知来源。代价是数组长度 8 → 9，行为对既有事件零影响（`"app"` 仍在白名单里）。
+pub const SOURCES: [&str; 9] = [
+    "app", "site", "key", "delivery", "vault", "store", "gateway", "probe", "notify",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
