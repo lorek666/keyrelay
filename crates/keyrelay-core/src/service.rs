@@ -129,6 +129,50 @@ fn is_auth_failure(err: &Error) -> bool {
     matches!(err, Error::AuthFailed(_))
 }
 
+/// 会话的过期信息（B-121 / FR-1:104「会话保持」）。
+///
+/// `expires_at` 来自 JWT 的 `exp`（Sub2API 的 `access_token`）；NewAPI 走 Cookie、
+/// 没有 JWT ⇒ [`KeyRelayService::session_expiry`] 返回 `None`（「不知道什么时候过期」，
+/// 不是「马上过期」）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionExpiry {
+    /// 过期时刻（unix 秒）。
+    pub expires_at: i64,
+    /// 距现在还有多少秒；**可能为负**（已过期，界面应提示重新登录）。
+    pub seconds_left: i64,
+}
+
+/// 从 JWT 里读 `exp`（B-121）。
+///
+/// **不校验签名**：`exp` 只用来判断「这条会话还要不要留着」（展示 + 恢复时跳过），
+/// 不承担任何鉴权职责——会话是否有效永远由站点侧的 401 决定（`mark_needs_login`）。
+///
+/// 非法输入（段数不对 / base64 解不开 / 不是 JSON / 没有 `exp` / `exp` 不是整数）
+/// ⇒ `None`，**不 panic**。
+fn jwt_exp(token: &str) -> Option<i64> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(payload))
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("exp").and_then(|exp| exp.as_i64())
+}
+
+/// 会话是否**已过期**（B-121）：只看 JWT 的 `exp`。
+///
+/// 没有 JWT（Cookie 会话）⇒ `false`（不算过期）：它的有效性由第一次请求的 401 判定，
+/// 那时 `mark_needs_login` 会删掉持久化条目。**不做时间上的兜底过期**——
+/// 持久化形态里没有保存时刻，硬编一个「30 天」会把仍有效的会话误删（登记为残余项）。
+fn session_is_expired(session: &Session, now: i64) -> bool {
+    session
+        .access_token
+        .as_deref()
+        .and_then(jwt_exp)
+        .is_some_and(|exp| exp <= now)
+}
+
 /// 能力门的统一出口（M7-S5）：站点类型**设计上**不支持某操作时返回 [`Error::Unsupported`]。
 ///
 /// 为什么要有它：适配器自己返回的 `Unsupported` 只能覆盖它实现的那几条路径，
@@ -646,6 +690,12 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     /// 只放相位、不放 cookie——cookie 在 [`SessionCache`]（同样只在内存）。
     /// **不入库**：重启后回到 `Idle` 是对的（等待中的窗口本来就不存在了）。
     captcha_phases: Mutex<HashMap<i64, CaptchaPhase>>,
+    /// `refresh_all` 的**跨调用互斥**（P3-27 / DEBUG-REPORT-v3 §3-27）。
+    ///
+    /// `MAX_REFRESH_CONCURRENCY` 只约束一次调用内部的在途数；前台节拍、后台任务与
+    /// 用户点「立即刷新」三者重叠时，在途峰值会翻倍（实测 8）。用 async-aware 的
+    /// `tokio::sync::Mutex` 串行化（不得用 `std::sync::Mutex` 跨 `.await`）。
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 /// 缓冲里的一条：**失败发生的时刻** + 失败本身。
@@ -767,6 +817,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             revoked_refs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             gateway_token_persistent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             captcha_phases: Mutex::new(HashMap::new()),
+            refresh_lock: tokio::sync::Mutex::new(()),
         };
         // M13-S1：启动时从钥匙串恢复持久化 session，重启免登。best-effort，不阻断启动。
         svc.restore_sessions();
@@ -797,6 +848,13 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             match self.vault_secret(&reference) {
                 Ok(Some(stored)) => {
                     if let Ok(session) = Session::from_stored(stored.as_str()) {
+                        // B-121：JWT 的 `exp` 已过 ⇒ **不恢复，并删掉条目**。
+                        // 恢复一个已知过期的会话只会让用户先看到「已登录」、再吃一次 401；
+                        // 直接删掉，让界面如实显示「未登录」。
+                        if session_is_expired(&session, unix_now_secs()) {
+                            let _ = self.vault.delete(&reference);
+                            continue;
+                        }
                         let _ = self.sessions.put(site.id, session);
                     }
                     // 反序列化失败：跳过（不删——下次 login 会覆盖；删了反而损失可能可用的会话）
@@ -805,6 +863,33 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 Err(_) => {}   // 钥匙串读失败：跳过，不阻断启动
             }
         }
+    }
+
+    /// 用户主动退出登录（B-113 的「退出即删」）。
+    ///
+    /// 清内存会话 + **删钥匙串条目**，并把站点健康状态从 `needs_login` 拉回 `unknown`
+    /// （用户是**主动**退出的，不是会话坏了——留着 `needs_login` 会让界面提示
+    /// 「需要重新登录」，那是错的）。
+    ///
+    /// 幂等：没登录过 / 条目已删 / 站点不存在都返回 `Ok(())`（`vault.delete` 幂等；
+    /// `set_site_health` 对不存在的站点报错，这里忽略——退出登录不该因为站点被删而失败）。
+    pub fn logout(&self, site_id: i64) -> Result<()> {
+        self.sessions.invalidate(site_id);
+        self.vault.delete(&self.session_ref(site_id))?;
+        let _ = self.store.set_site_health(site_id, "unknown");
+        Ok(())
+    }
+
+    /// 会话过期信息（B-121）：JWT `exp` ⇒ 精确；无 JWT（NewAPI 走 Cookie）⇒ `None`。
+    ///
+    /// **不实现 refresh**：过期只用于**展示**与「不再恢复」的判断；续期一律走重新登录。
+    pub fn session_expiry(&self, site_id: i64) -> Option<SessionExpiry> {
+        let token = self.sessions.get(site_id)?.access_token?;
+        let expires_at = jwt_exp(&token)?;
+        Some(SessionExpiry {
+            expires_at,
+            seconds_left: expires_at - unix_now_secs(),
+        })
     }
 
     /// 用户目录（注入落点、探测候选路径都相对于它）。
@@ -1892,6 +1977,16 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// （[`MAX_REFRESH_CONCURRENCY`] 个在途），站点内部仍是顺序的两步
     /// （余额 → 令牌）。收齐结果后按 id 升序记账，所以事件顺序与快照顺序不随并发漂移。
     pub async fn refresh_all(&self) -> Result<RefreshSummary> {
+        // P3-27 / DEBUG-REPORT-v3 §3-27：**跨调用的互斥**。
+        //
+        // `MAX_REFRESH_CONCURRENCY` 只约束**一次** `refresh_all` 内部的在途数；两次调用
+        // 重叠（前台 60s 节拍 + 用户点「立即刷新」+ 后台 30min 任务）时在途会翻倍到 8，
+        // 上游限流风险随之翻倍。这里用 `tokio::sync::Mutex` **串行化**（async-aware：
+        // 不得用 `std::sync::Mutex` 跨 `.await`，clippy `await_holding_lock`）。
+        //
+        // 语义选择：**排队**而不是「第二次直接跳过」——跳过会让用户点「立即刷新」时
+        // 什么都不发生（且拿到的汇总还是上一轮的），比等一会儿更让人困惑。
+        let _refresh_guard = self.refresh_lock.lock().await;
         // 先把网关攒下的失败落库（FR-5:160）。放在最前面：它们是**已经发生过**的事实，
         // 而下面的刷新要跑网络；先落库能让「网关为什么切换了上游」在事件面板里
         // 早于本轮的余额/漂移事件出现，读起来是因果顺序。
@@ -1974,20 +2069,37 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 }
                 _ => {
                     summary.sites_failed += 1;
-                    let failure = balance
-                        .as_ref()
-                        .and_then(|result| result.as_ref().err())
-                        .or_else(|| keys.as_ref().and_then(|result| result.as_ref().err()));
+                    // P3-28 / DEBUG-REPORT-v3 §3-28：**两个错误都要看**。
+                    //
+                    // 旧实现只取「第一个」错误（余额优先）来决定 `needs_login`，于是
+                    // 「余额 503（非认证类）+ 令牌列表 401（认证类）」这种组合会把认证失败
+                    // 吞掉：`on_auth_error` 已经把站点落库成「需要登录」，本轮汇总的
+                    // `needs_login` 却是空的 —— 用户当场看不到，得等下一轮。
+                    let balance_err = balance.as_ref().and_then(|result| result.as_ref().err());
+                    let keys_err = keys.as_ref().and_then(|result| result.as_ref().err());
+                    let errors: [Option<&Error>; 2] = [balance_err, keys_err];
+                    let auth_failure = errors
+                        .into_iter()
+                        .flatten()
+                        .find(|err| is_auth_failure(err));
+                    // 原因优先取认证失败（更可操作：用户该去重新登录），否则退回第一个错误。
+                    let failure = auth_failure.or(balance_err).or(keys_err);
                     let reason = failure.map(error_kind).unwrap_or("未知");
                     // 认证失败 = 会话已失效：`on_auth_error` 已经把它落库，
                     // 这里再带进本轮汇总，用户当场就能看到。
-                    if failure.is_some_and(is_auth_failure) {
+                    if auth_failure.is_some() {
                         summary.needs_login.push(outcome.site_id);
                     }
                     // 额度耗尽（HTTP 403 + 已知错误码）是**独立**于会话失效的一种状态：
                     // 会话是好的，只是没钱了。分开判定，否则用户会去重新登录一个
                     // 根本不需要登录的站点（PRD FR-3 的告警清单里两条并列）。
-                    quota_exceeded = matches!(failure, Some(Error::QuotaExhausted));
+                    //
+                    // 同样**两个错误都看**：`failure` 现在优先取认证失败，若只用它判额度，
+                    // 「余额 403 额度耗尽 + 令牌 401」会把额度信号丢掉（与 P3-28 同一类）。
+                    quota_exceeded = errors
+                        .into_iter()
+                        .flatten()
+                        .any(|err| matches!(err, Error::QuotaExhausted));
                     self.log(observability::event_with_payload(
                         Level::Warn,
                         "site",
@@ -2124,6 +2236,23 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 break;
             }
         }
+        // B-80 / DEBUG-REPORT-v3 §2-9：把**已采集过**的模型清单喂进快照。
+        //
+        // 采集本身在上面（M14-S1 的节流与开关，`should_collect_models`），本步只做**回填**：
+        // 此前 `SiteSnapshot.models` 恒 `None` ⇒ `ModelsChanged` 永不触发（B-80）。
+        //
+        // 语义（`rules.rs:56`）：`Some(list)` = 「最近一次采集到的清单」（可能是上一轮的——
+        // 节流期间不重采，但清单没变就是没变）；`None` = 该站点**从未**采集过。
+        // `Some(vec![])`（站点回了空列表）与 `None` 是两件事，不混。
+        if let Ok(map) = self.site_facts.lock() {
+            for snapshot in snapshots.iter_mut() {
+                if let Some(observation) = map.get(&snapshot.site_id) {
+                    if observation.models_collected_at.is_some() {
+                        snapshot.models = Some(observation.models.clone());
+                    }
+                }
+            }
+        }
         self.dispatch_notifications(snapshots);
         Ok(summary)
     }
@@ -2144,7 +2273,17 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let Some(state) = &self.notify else {
             return;
         };
-        let prev = state.last.lock().ok().and_then(|guard| guard.clone());
+        // B-81 / DEBUG-REPORT-v3 §2-10：基线**跨重启**。
+        //
+        // 内存里没有（进程刚起 / 首轮）时读**落库的**基线；落库的也没有 ⇒ `None`
+        // （退回首轮语义）。于是「进程重启」不再等价于「首轮语义」——坏状态不会在每次
+        // 启动时重报一遍（`notify/baseline.rs` 的编解码此前零调用点）。
+        let prev = state
+            .last
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .or_else(|| self.load_notify_baseline(unix_now_secs()));
         let now = unix_now_secs();
         let snapshot = crate::notify::Snapshot { sites: snapshots };
         // 基线：上一轮快照，**并给「本轮才出现的站点」补中性值**（M6-S5 接线决定，见 spec §6 D-4）。
@@ -2218,8 +2357,67 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         }
 
         if let Ok(mut guard) = state.last.lock() {
-            *guard = Some(snapshot);
+            *guard = Some(snapshot.clone());
         }
+        // B-81：把本轮快照落库当下一轮的基线（进程重启后仍可用）。
+        self.persist_notify_baseline(&snapshot, now);
+    }
+
+    /// 读**落库的**通知基线（B-81）。
+    ///
+    /// 损坏 / 版本不认识 / 超过 `BASELINE_MAX_AGE_SECS` ⇒ `None`（`decode_snapshot` 的口径：
+    /// 基线坏了不该阻断通知，退回「首轮语义」即可）。**不报错**。
+    fn load_notify_baseline(&self, now: i64) -> Option<crate::notify::Snapshot> {
+        let text = self
+            .store
+            .get_setting(crate::notify::BASELINE_SETTING_KEY)
+            .ok()
+            .flatten()?;
+        crate::notify::decode_snapshot(&text, now)
+    }
+
+    /// 把本轮快照落库当下一轮的基线（B-81）。
+    ///
+    /// `encode_snapshot` 返回 `None` = **拒绝编码**（文本里出现疑似密钥形态，fail-closed：
+    /// 宁可丢一轮基线也不把数据改坏后写库）⇒ 走**可见降级**：记一条 Warn 事件，
+    /// 基线保持上一份（或没有）。**不静默关闭**——用户能在事件表里看到「基线没存上」，
+    /// 而不是以为通知一切正常。
+    ///
+    /// **依赖**：道② 的 P2-26（脱敏前缀不看词边界）修好之前，`task-scheduler` 这类
+    /// 普通显示名就会让编码失败 —— 那正是本降级路径要覆盖的场景（不是静默失效）。
+    fn persist_notify_baseline(&self, snapshot: &crate::notify::Snapshot, now: i64) {
+        match crate::notify::encode_snapshot(snapshot, now) {
+            Some(text) => {
+                if let Err(err) = self
+                    .store
+                    .set_setting(crate::notify::BASELINE_SETTING_KEY, &text)
+                {
+                    self.log(observability::event_with_payload(
+                        Level::Warn,
+                        "notify",
+                        format!("通知基线落库失败: {err}"),
+                        serde_json::json!({}),
+                    ));
+                }
+            }
+            None => {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "notify",
+                    "通知基线未能保存（内容疑似含密钥形态，已按 fail-closed 跳过）；下一轮将按首轮语义评估",
+                    serde_json::json!({ "baseline_key": crate::notify::BASELINE_SETTING_KEY }),
+                ));
+            }
+        }
+    }
+
+    /// 落库的通知基线是否存在（B-81）。供命令层在设置页显示「基线状态」——前端那半归道⑦。
+    pub fn notify_baseline_present(&self) -> bool {
+        self.store
+            .get_setting(crate::notify::BASELINE_SETTING_KEY)
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     // ============================================ M6-S5 接线：FR-2 / FR-7
@@ -2554,7 +2752,9 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                     let base_url = delivery::gateway_base_url_for(&channel, &local_url);
                     let endpoint = delivery::GatewayEndpoint {
                         base_url,
-                        token: gateway_token.clone(),
+                        // P3-32 边界：`GatewayEndpoint.token` 是冻结的 `String`（非本包写域），
+                        // 这一处 `.to_string()` 是**必需**的唯一拷贝。
+                        token: gateway_token.to_string(),
                     };
                     self.apply_delivery_in(
                         new_key.id,
@@ -2692,12 +2892,25 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let session = self.session(site_id)?;
         let adapter = self.registry.adapter(kind);
         let groups = adapter.available_groups(&site.base_url, &session).await?;
-        // M8-S1 §5.4：倍率进观测缓存。取**第一个有倍率的分组**——`available_groups`
-        // 是用户触发的（FR-2 的下拉），观测只在用户看过分组之后才存在；未知就是未知。
+        // M8-S1 §5.4：倍率进观测缓存。`available_groups` 是用户触发的（FR-2 的下拉），
+        // 观测只在用户看过分组之后才存在。
+        //
+        // P2-12 / DEBUG-REPORT-v3 §2-12：倍率必须取**当前出网 key 所在分组**的倍率，
+        // 不是「第一个有倍率的分组」——后者会把 A 分组的倍率记到 B 分组的 key 上，
+        // 排序（`routing.rs` 的 `rate_missing` / 倍率升序）因此**看起来有依据而其实是错的**。
+        //
+        // 查不到（key 没有分组 / 分组不在列表里 / 该分组没有倍率）⇒ **置 `None`**（未知），
+        // 不回落、也不保留旧值：保留旧值会让上一次的 key 分组继续影响本轮的排序。
+        let key_group = self
+            .pick_gateway_key(site_id)
+            .ok()
+            .flatten()
+            .and_then(|row| row.group_name);
+        let rate = key_group
+            .and_then(|name| groups.iter().find(|group| group.name == name))
+            .and_then(|group| group.rate);
         if let Ok(mut map) = self.site_facts.lock() {
-            if let Some(rate) = groups.iter().find_map(|g| g.rate) {
-                map.entry(site_id).or_default().rate = Some(rate);
-            }
+            map.entry(site_id).or_default().rate = rate;
         }
         Ok(groups)
     }
@@ -3552,7 +3765,9 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
 
         let mut config = crate::gateway::GatewayConfig::single_upstream(
             port,
-            token,
+            // P3-32 边界：`GatewayConfig.token` 是冻结的 `String`（非本包写域），
+            // 这一处 `.to_string()` 是**必需**的唯一拷贝。
+            token.to_string(),
             site.base_url,
             api_key,
             site.display_name,
@@ -3688,9 +3903,15 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     ///
     /// 不返回 `Result`：这个方法**没有**失败态——它的失败全部表达为「临时令牌」。
     /// 唯一的例外是 `rotate_gateway_token`（显式轮换动作），那里写失败必须报错。
-    fn gateway_token(&self) -> (String, bool) {
+    /// 取网关本地令牌（`(令牌, 是否持久化)`）。
+    ///
+    /// **返回值是 [`zeroize::Zeroizing<String>`]**（P3-32 service 半 / DEBUG-REPORT-v3 §3-32）：
+    /// 旧实现返回裸 `String`，`vault_secret` 的 `Zeroizing` 在这里被 `.to_string()` 掉，
+    /// 明文副本不擦除。到 `GatewayConfig.token` / `GatewayEndpoint.token`（**冻结接口，
+    /// 非本包写域**）边界上仍剩**一处**必需拷贝，已在调用点标注。
+    fn gateway_token(&self) -> (zeroize::Zeroizing<String>, bool) {
         match self.vault_secret(GATEWAY_TOKEN_REF) {
-            Ok(Some(token)) if !token.trim().is_empty() => return (token.to_string(), true),
+            Ok(Some(token)) if !token.trim().is_empty() => return (token, true),
             // 存在但是空的（手工把条目清成空串）⇒ 当作没有：空令牌会让网关拒绝所有请求
             // （`config.token.trim().is_empty()` 那条硬门），比生成一把新的更糟。
             Ok(_) => {}
@@ -3706,13 +3927,13 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                     serde_json::json!({ "reason": crate::redact::scrub(&err.to_string()) }),
                 ));
                 let token = crate::gateway::generate_token();
-                return (token, false);
+                return (zeroize::Zeroizing::new(token), false);
             }
         }
         // Ok(None) 或空：钥匙串里确实没有 ⇒ 生成 + put（首次装配）
         let token = crate::gateway::generate_token();
         match self.vault.put(GATEWAY_TOKEN_REF, &token) {
-            Ok(()) => (token, true),
+            Ok(()) => (zeroize::Zeroizing::new(token), true),
             Err(err) => {
                 self.log(observability::event_with_payload(
                     Level::Warn,
@@ -3720,7 +3941,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                     "网关令牌没能存进钥匙串，本次用临时令牌（重启后会变）",
                     serde_json::json!({ "reason": crate::redact::scrub(&err.to_string()) }),
                 ));
-                (token, false)
+                (zeroize::Zeroizing::new(token), false)
             }
         }
     }
@@ -3751,7 +3972,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             Level::Info,
             "gateway",
             "已轮换网关本地令牌（指向网关的通道需要重新投递）",
-            serde_json::json!({ "secret_ref": GATEWAY_TOKEN_REF }),
+            // P3-8 / DEBUG-REPORT-v3 §3-8：**不写条目名**。
+            // `purge_keychain` 的口径是「钥匙串条目名不进事件表」（事件表会被导出与审计）；
+            // 这里只报「已持久化」这个事实，条目名本身没有诊断价值。
+            serde_json::json!({ "persistent": true }),
         ));
         Ok(())
     }
@@ -4583,6 +4807,29 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     #[doc(hidden)]
     pub fn key_secret_for_test(&self, key_id: i64) -> Result<zeroize::Zeroizing<String>> {
         self.key_secret(key_id)
+    }
+
+    /// 仅测试用：站点观测里的**倍率**（P2-12 的断言点：必须取 key 所在分组的倍率）。
+    #[doc(hidden)]
+    pub fn site_rate_for_test(&self, site_id: i64) -> Option<f64> {
+        self.site_facts
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&site_id).and_then(|observation| observation.rate))
+    }
+
+    /// 仅测试用：钥匙串里某条目**在不在**（B-113 的断言点）。走 `has`，不取明文。
+    #[doc(hidden)]
+    pub fn vault_has_for_test(&self, secret_ref: &str) -> Result<bool> {
+        self.vault.has(secret_ref)
+    }
+
+    /// 仅测试用：最近一次交给通知规则的快照（B-80 的断言点：`models` 必须来自采集）。
+    #[doc(hidden)]
+    pub fn notify_last_snapshot_for_test(&self) -> Option<crate::notify::Snapshot> {
+        self.notify
+            .as_ref()
+            .and_then(|state| state.last.lock().ok().and_then(|guard| guard.clone()))
     }
 
     /// 目标路径白名单：既要落在 `home` 之内，也要与**该通道声明的相对路径**逐字相等。
