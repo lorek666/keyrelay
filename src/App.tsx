@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -17,7 +17,7 @@ import Agents from "./pages/Agents";
 import History from "./pages/History";
 import SettingsPage from "./pages/Settings";
 import Probe from "./pages/Probe";
-import { appInfo, getSettings, runtimeMode } from "./lib/api";
+import { appInfo, getSettings, reportUiReady, runtimeMode } from "./lib/api";
 import { useApplyTheme } from "./lib/theme";
 import { I18nProvider, normalizeLang, useTranslation, type Lang } from "./i18n";
 
@@ -47,6 +47,9 @@ type PageId = (typeof PAGES)[number]["id"];
  * App：挂 `I18nProvider`。语言来自 `settings.language`（与主题同一 query），未知值回落 zh-CN。
  * `initialDict` 由 `main.tsx` 预加载 zh-CN 传入，保证默认语言首屏不空（M14-S2 §9.2）。
  */
+/** M16-S9 接线补丁：首屏就绪信号的一次性守卫（模块级，跨重挂载只报一次）。 */
+let uiReadyReported = false;
+
 export default function App({ initialDict }: { initialDict?: Record<string, unknown> | null }) {
   // 与设置页共用 `["settings"]`：设置页保存后会失效这个键，主题随之立即生效（M9-S4 / F）
   const { data: settings } = useQuery({ queryKey: ["settings"], queryFn: getSettings });
@@ -64,6 +67,14 @@ function AppInner() {
   const [page, setPage] = useState<PageId>("overview");
   const { data: info } = useQuery({ queryKey: ["app-info"], queryFn: appInfo });
   const current = PAGES.find((p) => p.id === page) ?? PAGES[0];
+
+  // M16-S9 接线补丁：首屏渲染完成后**一次性**回报「界面就绪」（M16-S7 的可观测判据）。
+  // 它是观测信号，**绝不能**影响界面 ⇒ 一次性守卫 + 吞掉失败。
+  useEffect(() => {
+    if (uiReadyReported) return;
+    uiReadyReported = true;
+    void reportUiReady().catch(() => {});
+  }, []);
 
   return (
     <div className="app">

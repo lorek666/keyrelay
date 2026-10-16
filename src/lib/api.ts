@@ -184,6 +184,13 @@ export type DeliveryPlan = {
    */
   mode: DeliveryMode;
   fields: DeliveryField[];
+  /**
+   * 这个通道写进去的字段里**有没有** endpoint（M16-S6a P2-3）。
+   *
+   * `false`（目前只有 Codex）⇒ 通道自己拼 endpoint，写进去的只有网关令牌/站点密钥；
+   * 界面必须据此说清「endpoint 不在本通道」，不能对所有通道都说「写进去的是网关地址」。
+   */
+  endpointInChannel: boolean;
   /** 已脱敏的 diff 预览 */
   preview: string;
   consent: ConsentState;
@@ -445,6 +452,22 @@ async function invokeCommand<T>(
   }
 }
 
+// ============================================================ 首屏就绪信号（M16-S9 接线补丁）
+
+/**
+ * 首屏渲染完成后回报一次「界面就绪」（M16-S7 的可观测判据）。
+ *
+ * 为什么需要它：macOS 的 AX 树里看不到 WebView 内部（`entire contents of window 1` = 0），
+ * 截图又不可靠（窗口存在 ≠ 被窗口服务器真正合成）⇒ 自动化没有任何可靠判据判断
+ * 「界面真的起来了」。后端把 unix 毫秒写进 `settings.ui_ready_at`，走查脚本轮询它即可
+ * 拿到**真正的端到端冷启动**，同时证明「前端确实调通过一次 IPC」。
+ *
+ * 它**不是**启动时自动写：必须由前端显式调用（否则证不到往返）。
+ */
+export async function reportUiReady(): Promise<void> {
+  await invokeCommand<void>("report_ui_ready");
+}
+
 // ============================================================ mock（浏览器预览）
 
 /** mock 用的能力集：与 `site/capability.rs` 的两行**逐格一致**（NewAPI/Sub2Api 同表）。 */
@@ -540,6 +563,8 @@ const MOCK_PLAN: DeliveryPlan = {
   targetPath: "/Users/you/.codex/auth.json",
   targetExists: true,
   mode: "site",
+  // codex-auth-json 是唯一「endpoint 不在本通道」的通道（M16-S6a P2-3）。
+  endpointInChannel: false,
   fields: [
     { key: "auth_mode", masked: "apikey" },
     { key: "OPENAI_API_KEY", masked: "…cdef" },
@@ -1370,6 +1395,14 @@ export type RotationRun = {
   stopReason: string | null;
   /** 三步是否都没中途失败。**不得只看它**：`skippedNoRemoteId` 也算完成。 */
   completed: boolean;
+  /**
+   * 轮换后是否**顺手重启了运行中的网关**（M16-S4 P2-7 / M16-S6a）。
+   *
+   * 轮换会回收站点侧旧 key：网关若还用旧 key_id 取明文，之后每次请求都只会 502，
+   * 直到手动重启。`false` 时看 `gatewayNote` 的原因（没在跑 / 在别的站点 / 重启失败）。
+   */
+  gatewayRestarted: boolean;
+  gatewayNote: string | null;
 };
 
 /** 执行轮换（FR-7「一键三连」）。破坏性操作，调用前必须走过 `rotationPlan` + 二次确认。 */
@@ -1384,6 +1417,8 @@ export async function rotateKey(keyId: number, name: string): Promise<RotationRu
       stoppedAt: null,
       stopReason: null,
       completed: true,
+      gatewayRestarted: false,
+      gatewayNote: null,
     });
   }
   return invokeCommand<RotationRun>("rotate_key", { keyId, name });
