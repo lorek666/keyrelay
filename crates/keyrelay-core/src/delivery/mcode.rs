@@ -300,7 +300,7 @@ agent:
         assert!(!err.to_string().contains("SECRET"), "{err}");
     }
 
-    // ============================ M14-S7：模型名 + context_window（MCode 用 context_window 而非 context_window）
+    // ============================ M14-S7：模型名 + context_window + max_tokens（MCode 用 context_window + max_tokens，不用 max_output）
 
     const MODEL: &str = "gpt-4o";
 
