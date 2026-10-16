@@ -18,7 +18,8 @@ import {
   type RestartHint,
   type UnbindOutcome,
 } from "../lib/api";
-import { rollbackAftermath } from "../lib/rollback";
+import { rollbackAftermath, rollbackAftermathTitle } from "../lib/rollback";
+import { maskRemovedValues, planWritesEndpoint } from "../lib/deliveryView";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { useTranslation, translate, getCurrentDict } from "../i18n";
 
@@ -70,7 +71,16 @@ export default function Agents() {
   const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
   // 密钥下拉只列所选站点的（M9-S4 / C）：此前站点下拉只是摆设——选了站点 A，
   // 密钥下拉里照样是全部站点的密钥，选项文字又不带站点，用户分不出投的是哪个站的 key。
-  const siteKeys = (keys.data ?? []).filter((k) => k.siteId === activeSite);
+  //
+  // 并**排除已回收的**（P3-11）：`revoked` 是本地状态「我把它在站点上删了」，
+  // 那把 key 在站点侧已经不存在；投递它只会得到一个 401。轮换之后默认选中它
+  // （id 最小的那把）正是 P1-6 的触发条件之一。
+  const siteKeys = (keys.data ?? []).filter(
+    (k) => k.siteId === activeSite && k.status !== "revoked",
+  );
+  const revokedHidden = (keys.data ?? []).filter(
+    (k) => k.siteId === activeSite && k.status === "revoked",
+  ).length;
 
   const [keyId, setKeyId] = useState<number | null>(null);
   const activeKey = keyId ?? null;
@@ -101,6 +111,8 @@ export default function Agents() {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastOutcome, setLastOutcome] = useState<DeliveryOutcome | null>(null);
+  /** 回滚后的三条后果（B-129 J：分条渲染，不再挤成一个长段落）。 */
+  const [rollbackLines, setRollbackLines] = useState<string[]>([]);
 
   // 投递模式（M8-S4 §6.2）：指向站点，还是指向本地网关。
   // 这是**投递参数**，不是新通道——通道集合不变，只换写进去的那两个值。
@@ -176,10 +188,12 @@ export default function Agents() {
   const rollback = useMutation({
     mutationFn: () => rollbackDelivery(lastOutcome!.journalId),
     onSuccess: async () => {
-      // 与历史页同一句（复审 P2-1）：此前这里只说了「已回滚」，对之后的漂移告警一个字都没提
+      // 与历史页同一组文案（复审 P2-1）：此前这里只说了「已回滚」，对之后的漂移告警一个字都没提。
+      // M16-S6b（B-129 J）：后果拆成**分条**渲染（见下方的 rollbackLines），不再挤成一个长段落。
       const agent =
         CHANNELS.find((c) => c.id === lastOutcome?.channel)?.agent ?? lastOutcome?.channel ?? "";
-      setNotice(t("agents.notice.rolledBack", { journal: lastOutcome?.journalId ?? "", aftermath: rollbackAftermath(agent) }));
+      setNotice(t("agents.notice.rolledBack", { journal: lastOutcome?.journalId ?? "" }));
+      setRollbackLines(agent ? rollbackAftermath(agent) : []);
       setLastOutcome(null);
       setConfirmingRollback(false);
       await qc.invalidateQueries({ queryKey: ["events"] });
@@ -222,6 +236,21 @@ export default function Agents() {
       <p className="muted">{t("agents.intro")}</p>
 
       {notice ? <p className="ok" role="status">{notice}</p> : null}
+
+      {/* 回滚之后的后果（B-129 J：分条）。三条互相独立：漂移会一直报、轮换/回收的行为、
+          以及「不想再管它就解绑」——挤成一段时用户读不完，而每一条都会改变他接下来做什么。 */}
+      {rollbackLines.length > 0 ? (
+        <div className="warnbox" role="status">
+          <p className="warnline">
+            <AlertTriangle size={14} aria-hidden /> {rollbackAftermathTitle()}
+          </p>
+          <ul className="list">
+            {rollbackLines.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
       {error ? (
         <p className="error" role="alert">
           <AlertTriangle size={14} aria-hidden /> {error}
@@ -267,6 +296,11 @@ export default function Agents() {
               ))}
             </select>
           </label>
+          {revokedHidden > 0 ? (
+            <span className="muted">
+              {t("agents.select.revokedHidden", { count: revokedHidden })}
+            </span>
+          ) : null}
           <label className="field-inline">
             <span>{t("agents.select.channel")}</span>
             <select
@@ -653,8 +687,22 @@ function PlanView({
         </div>
       ) : null}
 
+      {/* 网关模式下，有的通道**只写令牌、不写 endpoint**（P2-3 前端半）：
+          这种通道里打开「指向本地网关」时 agent 仍会请求站点，拿的是本地令牌 ⇒ 401。
+          判据来自计划里实际要写的字段名（`planWritesEndpoint`），不按通道名硬编码。 */}
+      {plan.mode === "gateway" && !planWritesEndpoint(plan.fields) ? (
+        <p className="warnline" role="alert">
+          <AlertTriangle size={14} aria-hidden /> {t("agents.plan.endpointOutOfScope")}
+        </p>
+      ) : null}
+
       <h4>{t("agents.plan.diffTitle")}</h4>
-      <pre className="diff">{plan.preview}</pre>
+      {/* 删除行的值侧掩掉（P2-5）：后端只对**已知的**密钥串做替换，旧站点密钥
+          形态未必落在 scrub 认得的集合里；渲染层先保证不把旧值显示出来。
+          `+` 行逐字节保留——那是「将要写进去什么」，掩掉等于掩盖改动。 */}
+      <pre className="diff">
+        {maskRemovedValues(plan.preview, t("agents.plan.removedValueMasked"))}
+      </pre>
 
       {noChange ? (
         <p className="muted">{t("agents.plan.noChange")}</p>

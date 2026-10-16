@@ -376,7 +376,8 @@
       "channel": "Channel",
       "model": "Model",
       "modelPlaceholder": "e.g. gpt-4o",
-      "keyPlaceholder": "(pick one)"
+      "keyPlaceholder": "(pick one)",
+      "revokedHidden": "{count} revoked key(s) hidden (they are gone on the site and must not be delivered again)"
     },
     "gatewayMode": {
       "label": "Point at local gateway: writes the gateway URL (/v1) and a local token, not the site key. To switch sites you only restart the gateway, no agent-side change. Requires the gateway to be running.",
@@ -397,10 +398,12 @@
       "writeWhat": "Writing",
       "willWrite": "Will write",
       "restart": "Takes effect",
+      "endpointOutOfScope": "Note: this channel does **not** write an endpoint — it only writes the token. The agent will still send requests to the site, but it holds the local gateway token, so the site will reject them (401). To route this agent through the gateway, change its own endpoint config (e.g. base_url in Codex's ~/.codex/config.toml).",
       "consentGranted": "Granted",
       "consentRevoked": "Revoked",
       "consentMissing": "Not granted",
       "diffTitle": "Diff preview (redacted)",
+      "removedValueMasked": "…(old value hidden)",
       "noChange": "Config is already up to date; no change needed.",
       "agree": "I consent to writing the above key into this agent's config (backup is taken before write; rollback is available)",
       "generating": "Generating preview…"
@@ -499,7 +502,7 @@
     "notice": {
       "delivered": "Delivered to {path} (change {journal}). {hint}",
       "revoked": "Consent revoked. Written files won't auto-rollback—use the Change History page to restore.",
-      "rolledBack": "Rolled back {journal}. {aftermath}"
+      "rolledBack": "Rolled back {journal}."
     }
   },
   "history": {
@@ -547,7 +550,7 @@
       "backupHint": "Restore from this backup:",
       "noBackupWarn": "This file was created by that delivery: rollback deletes it."
     },
-    "notice": "Rolled back {target} (change {journal}). {aftermath}"
+    "notice": "Rolled back {target} (change {journal})."
   },
   "settings": {
     "intro": "All settings are stored locally in the database; nothing is uploaded.",
@@ -739,6 +742,8 @@
     "bodyPost": "—no key needs to go into their config. Listens only on loopback and requires the local token below.",
     "allowLabel": "Allow starting the local gateway (off by default; this toggle only allows it—starting still needs the button below)",
     "portLabel": "Port (1024–65535)",
+    "multiSiteLabel": "Cross-site routing (multiple upstreams)",
+    "multiSiteHint": "When on, the gateway routes by **model name** across sites: aliases apply, candidates are ordered by balance health → rate → latency, and exhausted or repeatedly failing upstreams are removed and probed back after a cooldown. When off, the gateway uses only the single site chosen at start (same as before). **Off by default**—make sure every site has a usable key before enabling it.",
     "portDirtyHint": "Port changes need saving first and take effect on next gateway start.",
     "status": {
       "running": "Running",
@@ -787,8 +792,10 @@
       "loading": "Reading bindings…",
       "empty": "No delivered channels yet. Deliver one on the Agent Delivery page first.",
       "unmappedPre": "Can't identify channel (",
-      "unmappedPost": ")—possibly written under another home; checking it will also fail with a reason",
-      "mapped": "{channel} · {path} · key #{keyId} · {site}",
+      "unmappedPost": ")—this agent name is not in the known channel table (older version or hand-edited binding); checking it will also fail with a reason",
+      "mapped": "{channel} · {pathLabel}{path} · key #{keyId} · {site}",
+      "recordedPathLabel": "recorded path: ",
+      "actualPathLabel": "will actually write: ",
       "previewTitle": "Per-entry preview",
       "previewRewrite": "Rewrites existing file",
       "previewNew": "Creates new file",
@@ -816,6 +823,11 @@
     "confirm": "Confirm"
   },
   "rollback": {
-    "aftermath": "As long as {agent} is still bound, Overview keeps listing this target as \"needs attention\", and every Overview open logs another \"external change\" alert—the file no longer matches KeyRelay last delivered content; this is expected, do not re-deliver based on it (that would undo the rollback). When rotating this key the file is rewritten; it stays a candidate when batch re-pointing to the gateway. If this rollback restored the file to an earlier delivery different key: later rotating or revoking that earlier key will not rewrite this file—come back and deliver a still-valid key, or the agent stays on a revoked key. To stop KeyRelay from managing it, unbind {agent} on the Agent Delivery page."
+    "aftermath": {
+      "title": "Three things to know after a rollback (it restores the file, not the binding):",
+      "drift": "Overview keeps listing this target as \"needs attention\", and every Overview open logs another \"external change\" alert—the file no longer matches KeyRelay's last delivered content. This is expected; do not re-deliver because of it (that would undo the rollback).",
+      "rotation": "Rotating this key rewrites the file; it also stays a candidate when batch re-pointing to the gateway. If this rollback restored the file to a **different** key from an earlier delivery: later rotating or revoking that earlier key will not rewrite this file—come back and deliver a still-valid key, or the agent stays on a revoked key.",
+      "unbind": "To stop KeyRelay from managing it, unbind {agent} on the Agent Delivery page."
+    }
   }
 }
