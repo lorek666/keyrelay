@@ -2544,6 +2544,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         for binding in self.store.binding_drift_rows()? {
             // 只看「这个目标**现在**由这把 key 服务」的绑定：查询已经按
             // target_path 取了最新一条，所以这里筛掉的都是被别的 key 取代过的历史绑定。
+            //
+            // M16-S1（B-126 选项①）之后「最新」多了两个资格条件：**未解绑**且**未回滚**。
+            // 语义更准了：回滚过的投递不再主导「现状」——回滚 B 之后现状落回 A，
+            // 于是轮换 A 会带上这个目标（在此之前会漏掉它）。
             if binding.key_id != key_id {
                 continue;
             }
@@ -3772,6 +3776,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             api_key,
             site.display_name,
         );
+        // M16-S4 W-3：把 legacy 那把密钥的**引用**交给网关，它才能在密钥被回收后
+        // 拒绝继续使用（`legacy_key_ref: None` 时行为与今天逐字相同）。
+        // `row.secret_ref` 与 `api_key` 同源：`api_key` 就是从这个引用取出来的，
+        // 所以填它不会引入新的取密钥路径。
+        config.legacy_key_ref = Some(row.secret_ref.clone());
         // M14-S1：多站路由开关（B-99）。关时（默认）走 single_upstream——config.base_url
         // / api_key 是所选站点，M8-S4 §6.5 换站语义逐字不变；开时用 build_gateway_route
         // 填非空 route + keys_by_ref，网关按模型选路（多站聚合，FR-6 V1.1 可选）。
