@@ -134,7 +134,17 @@ fn sensitive_key_value_at(chars: &[char], i: usize) -> Option<(usize, usize, usi
     if !is_sensitive_key(&key) {
         return None;
     }
+    // P1（S2 复审）：JSON 形态 `"password":"x"` —— 键名与分隔符之间**允许一个 `"`**。
+    //
+    // 为什么这是**可判定**形态、不属于「裸口令不可判定」那一类：键名精确命中集合、
+    // 后面紧跟 `=`/`:`，中间只多了一个 JSON 的键引号。非法 JSON 载荷会走文本层兜底
+    // （`scrub_event_payload` 的 fallback），而文本层以前要求键名**紧贴**分隔符 ⇒
+    // `"password":"hunter2"` 不命中 ⇒ 首遍漏掩；等 URL 被掩掉、整串变成合法 JSON 之后，
+    // 第二遍才走结构化路径掩上 ⇒ 两遍不一致（复审 R2 实测）。
     let mut k = j;
+    if k < chars.len() && chars[k] == '"' {
+        k += 1;
+    }
     while k < chars.len() && chars[k] == ' ' {
         k += 1;
     }
@@ -143,6 +153,11 @@ fn sensitive_key_value_at(chars: &[char], i: usize) -> Option<(usize, usize, usi
     }
     k += 1;
     while k < chars.len() && chars[k] == ' ' {
+        k += 1;
+    }
+    // 值的**开引号**同样允许一个（`":"hunter2"`）；值的结束由 `"` 这个分隔符自然划出，
+    // 因此闭引号会留在原地（`"password":"***"` 结构不破）。
+    if k < chars.len() && chars[k] == '"' {
         k += 1;
     }
     if k >= chars.len() {
@@ -586,9 +601,50 @@ fn mask_scheme_less(span: &str, text_mode: bool, primary: bool) -> String {
         }
     };
     match found {
-        Some(at) => format!("{MASK}{}", &span[at..]),
+        Some(at) => {
+            // P2（S2 复审）：`email=a@b` —— 掩到 `@` 会把**键名一起吃掉**（`***@b`），
+            // 排障时看不出原来是什么字段。若同一个**无空白 token** 里、`@` 之前有
+            // `键名=`，掩码从 `=` 之后开始（键名保留，值照掩）。
+            // 只在同一 token 内生效：`见 x=1 与 u:p@h` 这种跨空白的形态不动（保持原行为）。
+            let mask_start = key_name_start_in_token(span, at).unwrap_or(0);
+            format!("{}{MASK}{}", &span[..mask_start], &span[at..])
+        }
         None => span.to_string(),
     }
+}
+
+/// `at`（一个 `@`）所在的**无空白 token** 里，`@` 之前最后一个 `键名=` 的值起点。
+///
+/// 返回 `Some(= 之后的位置)` 当且仅当：该 `=` 与 `@` 在同一个无空白 token 内，
+/// 且 `=` 前面紧邻一段非空键名字符（`[A-Za-z0-9_.-]`）。否则 `None`（保持「从 span 起点掩」）。
+fn key_name_start_in_token(span: &str, at: usize) -> Option<usize> {
+    let chars: Vec<char> = span.chars().collect();
+    let at_char = span[..at].chars().count();
+    // token 起点：`@` 往前第一个空白之后
+    let mut token_start = at_char;
+    while token_start > 0 && !chars[token_start - 1].is_whitespace() {
+        token_start -= 1;
+    }
+    // token 内 `@` 之前最后一个 `=`
+    let eq = (token_start..at_char).rev().find(|&k| chars[k] == '=')?;
+    // `=` 前面必须紧邻非空键名（否则 `=a@b` 这种没有键名的形态不动）
+    let mut key_start = eq;
+    while key_start > token_start
+        && (chars[key_start - 1].is_ascii_alphanumeric()
+            || matches!(chars[key_start - 1], '_' | '.' | '-'))
+    {
+        key_start -= 1;
+    }
+    if key_start == eq {
+        return None;
+    }
+    // 字节偏移（`at` 是字节索引，转回字节位置）
+    let byte = span
+        .char_indices()
+        .nth(eq + 1)
+        .map(|(b, _)| b)
+        .unwrap_or(span.len());
+    Some(byte)
 }
 
 /// 在 `tail`（`://` 之后，或一段无 scheme 的候选）里找 userinfo 的 `@` 位置。
@@ -934,7 +990,18 @@ pub fn serialize_scrubbed_event_payload(value: &serde_json::Value) -> Option<Str
 pub fn scrub_event_payload(payload: Option<&str>) -> Option<String> {
     let raw = payload?;
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return Some(scrub_event_message(raw));
+        // 非法 JSON：文本层兜底。**但兜底之后要再收敛一次**（P1 / S2 复审）：
+        // 文本层掩掉值里的引号/URL 之后，整串可能**变成合法 JSON**；那时如果不收敛，
+        // 第一遍给的是「带原格式的文本」、第二遍走结构化路径重新序列化 ⇒ 两遍不一致。
+        // 收敛用的就是第二遍会走的那条路径，因此两遍必然逐字节相同。
+        let text = scrub_event_message(raw);
+        return match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(mut value) => {
+                scrub_event_value(&mut value);
+                serialize_scrubbed_event_payload(&value).or(Some(text))
+            }
+            Err(_) => Some(text),
+        };
     };
     scrub_event_value(&mut value);
     match serialize_scrubbed_event_payload(&value) {
