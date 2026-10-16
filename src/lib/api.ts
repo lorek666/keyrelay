@@ -833,11 +833,17 @@ const AGENT_CHANNELS: Record<string, string> = {
 };
 
 /**
- * 一条 binding 属于哪条通道。猜不出来 ⇒ `null`（**不猜**）。
+ * 一条 binding 属于哪条通道。查不到 ⇒ `null`（**不猜**）。
  *
- * 猜不出来的真实原因：`targetPath` 是当年**另一个 home** 下写的
- * （用户改过 `KEYRELAY_HOME`），文件名对不上表里任何一条。
- * 这时界面显示「无法识别通道」并让用户手工去投递页处理，比猜一个错通道好。
+ * **只看 `agentId`，不看路径**（M16-S6b / P3-13 的事实更正）：此前这里的注释说
+ * 「猜不出来的原因是 targetPath 是另一个 home 下写的、文件名对不上表里任何一条」——
+ * 那句话是错的：本函数从不读 `targetPath`。真实的两种情形是：
+ *
+ * 1. `agentId` 不在 `AGENT_CHANNELS` 里（更早版本留下的、或手工改过的绑定）⇒ 这里返回 `null`；
+ * 2. 另一个 home 下写的绑定：`agentId` 照样能查到通道，于是界面**会**正常识别它，
+ *    但那条记录里的 `targetPath` 是旧 home 的路径，而这次改指写的是**当前 home** 的路径——
+ *    两个路径不一致，界面上必须分别标出来（`gateway.batch.recordedPathLabel` /
+ *    `actualPathLabel`），否则用户会以为写的就是记录里那个文件。
  */
 export function channelOfBinding(agentId: string): string | null {
   return AGENT_CHANNELS[agentId] ?? null;
@@ -1034,6 +1040,28 @@ export async function deleteAlias(alias: string): Promise<void> {
 export async function recentEvents(limit = 100): Promise<EventRow[]> {
   if (!hasTauri) return mock(MOCK_EVENTS);
   return invokeCommand<EventRow[]>("recent_events", { limit });
+}
+
+/**
+ * 让**原生窗口外框**跟随主题（B-127）。
+ *
+ * 为什么需要：`<html data-theme>` 只影响网页内容，窗口的标题栏与红绿灯由系统绘制；
+ * 不调这一步时，用户把界面切成浅色，外框仍是深色。
+ *
+ * 为什么放在这里：`check-commands.mjs` §3 规定**只有本文件**可以引用 `@tauri-apps/api`，
+ * 所以 `theme.ts` 只能调这个包装（它自己不 import）。
+ *
+ * `theme` 只接受 `"light"` / `"dark"`：调用方（`useApplyTheme`）已经把 `"system"`
+ * 解析成具体的一侧再传进来，因此这里不需要传 `null`。
+ * 需要的权限：`core:window:allow-set-theme`（见 `src-tauri/capabilities/default.json`）。
+ * 调用方**必须**吞掉失败——外框不跟随是观感问题，不该影响任何功能。
+ */
+export async function applyNativeWindowTheme(
+  theme: "light" | "dark",
+): Promise<void> {
+  if (!hasTauri) return;
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  await getCurrentWindow().setTheme(theme);
 }
 
 export async function gatewayStatus(): Promise<GatewayStatus> {

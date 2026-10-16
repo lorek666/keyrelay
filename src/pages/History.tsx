@@ -8,9 +8,10 @@ import {
   rollbackDelivery,
   type DeliveryRecord,
 } from "../lib/api";
-import { rollbackAftermath } from "../lib/rollback";
+import { rollbackAftermath, rollbackAftermathTitle } from "../lib/rollback";
 import CapButton from "../components/CapButton";
 import ConfirmDialog from "../components/ConfirmDialog";
+import Skeleton from "../components/Skeleton";
 import { useTranslation, translate, getCurrentDict } from "../i18n";
 
 const LEVEL_TONE: Record<string, string> = {
@@ -76,6 +77,8 @@ export default function History() {
   const [target, setTarget] = useState<DeliveryRecord | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 回滚后的三条后果（B-129 J：分条渲染）。 */
+  const [rollbackLines, setRollbackLines] = useState<string[]>([]);
 
   const rollback = useMutation({
     mutationFn: (row: DeliveryRecord) => rollbackDelivery(row.journalId),
@@ -91,9 +94,10 @@ export default function History() {
         t("history.notice", {
           target: row.targetPath,
           journal: row.journalId,
-          aftermath: bound ? rollbackAftermath(bound.agentId) : "",
         }),
       );
+      // M16-S6b（B-129 J）：后果分条渲染，不再塞进上面那一句里
+      setRollbackLines(bound ? rollbackAftermath(bound.agentId) : []);
       setTarget(null);
       await qc.invalidateQueries({ queryKey: ["deliveries"] });
       await qc.invalidateQueries({ queryKey: ["drift"] });
@@ -117,6 +121,20 @@ export default function History() {
       <p className="muted">{t("history.intro")}</p>
 
       {notice ? <p className="ok" role="status">{notice}</p> : null}
+
+      {/* 回滚之后的后果（B-129 J：分条）。与投递页共用同一组文案。 */}
+      {rollbackLines.length > 0 ? (
+        <div className="warnbox" role="status">
+          <p className="warnline">
+            <AlertTriangle size={14} aria-hidden /> {rollbackAftermathTitle()}
+          </p>
+          <ul className="list">
+            {rollbackLines.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
       {error ? (
         <p className="error" role="alert">
           <AlertTriangle size={14} aria-hidden /> {error}
@@ -136,7 +154,7 @@ export default function History() {
           </button>
         </div>
 
-        {deliveries.isLoading ? <p className="muted">{t("common.loading")}</p> : null}
+        {deliveries.isLoading ? <Skeleton rows={4} /> : null}
         {deliveries.isError ? (
           <p className="error" role="alert">
             {t("history.deliveries.error", { error: (deliveries.error as Error).message })}

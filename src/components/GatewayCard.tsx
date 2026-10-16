@@ -15,13 +15,17 @@ import {
   type ChannelBinding,
   type DeliveryPlan,
 } from "../lib/api";
+import { maskRemovedValues } from "../lib/deliveryView";
 import { useTranslation } from "../i18n";
 
 type Props = {
   enabled: boolean;
   port: number;
+  /** 跨站选路开关（M16-S6b：此前只有 DTO 字段，界面不可达）。 */
+  multiSite: boolean;
   onToggle: (enabled: boolean) => void;
   onPortChange: (port: number) => void;
+  onMultiSiteChange: (enabled: boolean) => void;
   /** 设置还没保存时提示用户先保存（端口要保存后才生效） */
   settingsDirty: boolean;
 };
@@ -36,8 +40,10 @@ type Props = {
 export default function GatewayCard({
   enabled,
   port,
+  multiSite,
   onToggle,
   onPortChange,
+  onMultiSiteChange,
   settingsDirty,
 }: Props) {
   const { t } = useTranslation();
@@ -258,6 +264,22 @@ export default function GatewayCard({
         <span>{t("gateway.allowLabel")}</span>
       </label>
 
+      {/*
+        跨站选路（M16-S6b 新增接线）：`settings.gateway_multi_site` 是 B-99/B-109/B-110
+        「按模型跨站选路 / 模型别名 / 上游摘除与冷却回归」的**唯一开关**，此前只有 DTO 字段、
+        没有任何控件 ⇒ 那三个功能对用户实际不可达。
+        **不改默认值**（默认仍是关）：改默认会破坏既有用户「只用一个站点」的逐字节语义。
+      */}
+      <label className="checkline">
+        <input
+          type="checkbox"
+          checked={multiSite}
+          onChange={(e) => onMultiSiteChange(e.target.checked)}
+        />
+        <span>{t("gateway.multiSiteLabel")}</span>
+      </label>
+      <p className="muted">{t("gateway.multiSiteHint")}</p>
+
       <label className="field">
         <span>{t("gateway.portLabel")}</span>
         <input
@@ -461,7 +483,16 @@ export default function GatewayCard({
                     </>
                   ) : (
                     <>
-                      {t("gateway.batch.mapped", { channel, path: binding.targetPath, keyId: binding.keyId, site: site ? ` · ${site.displayName}` : "" })}
+                      {/* 这里显示的是**绑定记录里的**路径（P3-13）。它可能与本次实际写入的
+                          路径不同（例如那条绑定是另一个 KEYRELAY_HOME 下写的），所以显式
+                          标成「记录时的路径」；实际写入路径在下面的逐条预览里给。 */}
+                      {t("gateway.batch.mapped", {
+                        channel,
+                        path: binding.targetPath,
+                        pathLabel: t("gateway.batch.recordedPathLabel"),
+                        keyId: binding.keyId,
+                        site: site ? ` · ${site.displayName}` : "",
+                      })}
                     </>
                   )}
                 </span>
@@ -475,7 +506,13 @@ export default function GatewayCard({
               {Object.entries(batchPreviews).map(([key, plan]) => (
                 <div key={key}>
                   <strong>{planOf(key).channel ?? t("gateway.batch.unmappedStrong")}</strong>{" "}
-                  <span className="mono">{planOf(key).targetPath}</span>
+                  {/* 这里是**本次实际写入**的路径（来自后端计划），与上面那一行的
+                      「记录时的路径」可能不同（P3-13）：绑定是当年另一个 KEYRELAY_HOME
+                      下写的时，两个路径就不一样。两个都标出来，用户才知道写的是哪个文件。 */}
+                  <span className="mono">
+                    {t("gateway.batch.actualPathLabel")}
+                    {planOf(key).targetPath}
+                  </span>
                   {typeof plan === "string" ? (
                     <p className="error" role="alert">
                       {t("gateway.batch.previewError", { error: plan })}
@@ -488,7 +525,10 @@ export default function GatewayCard({
                         <strong>{plan.mode === "gateway" ? t("gateway.batch.previewModeGateway") : t("gateway.batch.previewModeSite")}</strong>
                         {plan.warnings.length > 0 ? t("gateway.batch.previewWarnings", { count: plan.warnings.length }) : ""}
                       </p>
-                      <pre className="mono">{plan.preview}</pre>
+                      {/* 与投递页同一处理（P2-5）：删除行的旧值不渲染出来 */}
+                      <pre className="mono">
+                        {maskRemovedValues(plan.preview, t("agents.plan.removedValueMasked"))}
+                      </pre>
                     </>
                   )}
                 </div>

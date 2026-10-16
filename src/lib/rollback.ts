@@ -10,10 +10,22 @@ import { translate, getCurrentDict } from "../i18n";
  * 「现状」仍是被回滚的这次——轮换或回收那把更早的密钥时，这个文件不会被重写，agent 会留在一把已被回收的
  * 密钥上。这是 M3-S1 的既定语义（改不改由 B-126 决定）——在那之前，至少要把后果说全。
  *
- * 投递页与历史页两处回滚共用这一句：此前两处说法不一，投递页那处一个字都没提。
+ * 投递页与历史页两处回滚共用这一组文案：此前两处说法不一，投递页那处一个字都没提。
  *
- * M14-S2：文案抽成 i18n key `rollback.aftermath`（带 {agent} 插值）。
+ * M14-S2：文案抽成 i18n 键；**M16-S6b（B-129 J）**改成**分条**——三条各自独立
+ * （漂移 / 轮换与回收 / 解绑），返回数组由调用方渲染成 `<ul>`。分条不是排版偏好：
+ * 挤成一个约 330 字的绿色段落时用户读不完，而这里每一条都会真的改变他接下来该做什么。
  */
-export function rollbackAftermath(agentId: string): string {
-  return translate(getCurrentDict(), "rollback.aftermath", { agent: agentId });
+export function rollbackAftermath(agentId: string): string[] {
+  const dict = getCurrentDict();
+  return [
+    translate(dict, "rollback.aftermath.drift"),
+    translate(dict, "rollback.aftermath.rotation"),
+    translate(dict, "rollback.aftermath.unbind", { agent: agentId }),
+  ];
+}
+
+/** 这一组提示的小标题。 */
+export function rollbackAftermathTitle(): string {
+  return translate(getCurrentDict(), "rollback.aftermath.title");
 }
