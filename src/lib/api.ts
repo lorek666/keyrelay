@@ -1704,6 +1704,8 @@ export type ProbeRunRow = {
   bazaarlinkCreatedAt?: number | null;
   bazaarlinkCompletedAt?: number | null;
   recordedAt: number;
+  /** B-135：run 生命周期状态。老库行是 null（那一列后加，没记过状态）。 */
+  status?: string | null;
 };
 
 export async function listProbeRuns(limit?: number): Promise<ProbeRunRow[]> {

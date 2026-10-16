@@ -2425,6 +2425,8 @@ pub struct ProbeRunRowDto {
     bazaarlink_created_at: Option<i64>,
     bazaarlink_completed_at: Option<i64>,
     recorded_at: i64,
+    /// B-135：bazaarlink run 生命周期状态。老库行是 `null`（那一列 v6 才加，没记过状态）。
+    status: Option<String>,
 }
 
 impl From<keyrelay_core::store::ProbeRunRow> for ProbeRunRowDto {
@@ -2447,6 +2449,7 @@ impl From<keyrelay_core::store::ProbeRunRow> for ProbeRunRowDto {
             bazaarlink_created_at: r.bazaarlink_created_at,
             bazaarlink_completed_at: r.bazaarlink_completed_at,
             recorded_at: r.recorded_at,
+            status: r.status,
         }
     }
 }

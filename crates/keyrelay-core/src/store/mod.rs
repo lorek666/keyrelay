@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::inject::Journal;
 use crate::site::KeyStatus;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// 「已回收」——**本地**密钥生命周期状态（M7-S4 / FR-2）。
 ///
@@ -205,7 +205,12 @@ CREATE TABLE IF NOT EXISTS probe_runs(
   report_url TEXT,
   bazaarlink_created_at INTEGER,
   bazaarlink_completed_at INTEGER,
-  recorded_at INTEGER NOT NULL
+  recorded_at INTEGER NOT NULL,
+  -- B-135：bazaarlink run 生命周期状态（running/completed/failed/aborted）。
+  -- 放在**末尾**是刻意的：老库只能靠 `add_column_if_missing` 追加到末尾，
+  -- 写在中部会让「新建库」与「迁移库」的物理列序不一致。本项目所有读写都带显式列名，
+  -- 列序不影响行为——但不一致本身就是将来踩坑的种子。
+  status TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_probe_runs_recorded ON probe_runs(recorded_at DESC);
 "#;
@@ -428,6 +433,9 @@ pub struct ProbeRunRow {
     pub bazaarlink_created_at: Option<i64>,
     pub bazaarlink_completed_at: Option<i64>,
     pub recorded_at: i64,
+    /// B-135：bazaarlink run 生命周期状态。**老库的行是 `None`**——那一列是 v6 才加的，
+    /// 历史行没记过状态，不猜（`Some("running")` 与 `None` 是两个不同的信息）。
+    pub status: Option<String>,
 }
 
 impl ProbeRunRow {
@@ -450,6 +458,8 @@ impl ProbeRunRow {
             bazaarlink_created_at: row.get(14)?,
             bazaarlink_completed_at: row.get(15)?,
             recorded_at: row.get(16)?,
+            // 17 = 追加列（见 DDL 注释：新增列一律排在末尾，索引与 SELECT 同步）
+            status: row.get(17)?,
         })
     }
 }
@@ -594,6 +604,10 @@ impl Store {
             "delivery_mode",
             "TEXT NOT NULL DEFAULT 'site'",
         )?;
+        // B-135：probe_runs.status（bazaarlink run 生命周期，SCHEMA_VERSION 5 → 6）。
+        // 老行留 NULL 而**不回填**：「有 verdict ⇒ completed」是推断不是观测，
+        // 历史行当时到底跑没跑完没人知道——NULL 就是「没记过」，界面显示 "—"。
+        add_column_if_missing(&conn, "probe_runs", "status", "TEXT")?;
 
         // 版本号仍然只在升级时写，保留它作为「将来需要非幂等迁移」的锚点。
         if version < SCHEMA_VERSION {
@@ -1712,6 +1726,9 @@ impl Store {
 
     /// M15-S1：写入一次 probe 检测结果摘要。只存身份判定字段，
     /// **不存** items[].response / responseHeaders / startedByIp / userKey（敏感）。
+    ///
+    /// B-135：`status`（run 生命周期）也写进去——历史表靠它区分
+    /// 「跑完但没判定」与「没跑完」（两者 verdict 都是 NULL，只靠 verdict 分不开）。
     pub fn insert_probe_run(
         &self,
         site_id: i64,
@@ -1725,8 +1742,8 @@ impl Store {
             "INSERT INTO probe_runs
              (run_id, site_id, key_id, model_id, claimed_model, identity_status, verdict_status,
               true_family, true_model, spoof_method, confidence, warnings_count, report_url,
-              bazaarlink_created_at, bazaarlink_completed_at, recorded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              bazaarlink_created_at, bazaarlink_completed_at, recorded_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 run.run_id,
                 site_id,
@@ -1743,7 +1760,8 @@ impl Store {
                 run.report_url,
                 run.created_at,
                 run.completed_at,
-                now_secs()
+                now_secs(),
+                run.status
             ],
         )
         .map_err(|e| Error::Store(format!("insert probe run: {e}")))?;
@@ -1759,7 +1777,7 @@ impl Store {
                 "SELECT id, run_id, site_id, key_id, model_id, claimed_model, identity_status,
                         verdict_status, true_family, true_model, spoof_method, confidence,
                         warnings_count, report_url, bazaarlink_created_at,
-                        bazaarlink_completed_at, recorded_at
+                        bazaarlink_completed_at, recorded_at, status
                  FROM probe_runs ORDER BY recorded_at DESC LIMIT ?1",
             )
             .map_err(|e| Error::Store(format!("prepare list probe runs: {e}")))?;
@@ -1778,7 +1796,7 @@ impl Store {
                 "SELECT id, run_id, site_id, key_id, model_id, claimed_model, identity_status,
                         verdict_status, true_family, true_model, spoof_method, confidence,
                         warnings_count, report_url, bazaarlink_created_at,
-                        bazaarlink_completed_at, recorded_at
+                        bazaarlink_completed_at, recorded_at, status
                  FROM probe_runs WHERE id = ?1",
             )
             .map_err(|e| Error::Store(format!("prepare get probe run: {e}")))?;
@@ -1985,6 +2003,134 @@ mod tests {
         let bindings = store.bindings_of_agent("codex").unwrap();
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].delivery_mode, "gateway", "delivery_mode 应保留");
+    }
+
+    /// B-135 的 fixture：只填轮询/落库关心的三个字段，其余留空。
+    fn probe_run_fixture(run_id: &str, status: &str) -> crate::probe::ProbeRun {
+        crate::probe::ProbeRun {
+            run_id: run_id.into(),
+            status: status.into(),
+            identity_status: None,
+            verdict_status: None,
+            true_family: None,
+            true_model: None,
+            spoof_method: None,
+            confidence: None,
+            warnings_count: 0,
+            report_url: None,
+            created_at: None,
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn probe_runs_status_column_is_added_to_an_existing_database() {
+        // B-135（SCHEMA_VERSION 5 → 6）：**加列必须显式迁移**——DDL 里全是
+        // `CREATE TABLE IF NOT EXISTS`，对已存在的表是空操作，往建表语句里加列，
+        // 老库永远不会有那一列（这正是 `keys.status` / `bindings.delivery_mode` 那个形态）。
+        //
+        // 造一个 v5 老库：建库 → 写一行 → 去掉 status 列 → 版本号写回 5。
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("keyrelay.db");
+        let store = Store::open(&path).expect("建库");
+        let site_id = store
+            .upsert_site("newapi", "https://relay.example.com", "测试")
+            .expect("upsert_site");
+        let reference = crate::vault::secret_ref("key", 1, "secret");
+        let key_id = store
+            .insert_key(site_id, "probe-key", &reference, Some("1"), None)
+            .expect("insert_key");
+        store
+            .insert_probe_run(
+                site_id,
+                key_id,
+                "vendor/model",
+                None,
+                &probe_run_fixture("r-legacy", "completed"),
+            )
+            .expect("写入一行（v6 形态）");
+        drop(store);
+
+        {
+            let conn = rusqlite::Connection::open(&path).expect("直连库");
+            conn.execute_batch("ALTER TABLE probe_runs DROP COLUMN status;")
+                .expect("模拟 v5 老库（没有 status 列）");
+            conn.pragma_update(None, "user_version", 5)
+                .expect("版本号写回 5");
+        }
+
+        let store = Store::open(&path).expect("重新打开旧库");
+        assert_eq!(
+            store.schema_version().unwrap(),
+            SCHEMA_VERSION,
+            "版本号必须被抬到当前值"
+        );
+        {
+            let conn = rusqlite::Connection::open(&path).expect("直连库");
+            let has_status: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('probe_runs') WHERE name = 'status'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("查列");
+            assert_eq!(has_status, 1, "老库必须补出 status 列");
+        }
+
+        // 老行**不回填**：status 是 NULL（那一列是后加的，历史行没记过状态，不猜）。
+        let rows = store.list_probe_runs(10).expect("list_probe_runs");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].run_id, "r-legacy");
+        assert_eq!(rows[0].status, None, "历史行不得被推断成 completed");
+
+        // 补列后功能可用（不是只有列壳）：新写入能带状态读回
+        store
+            .insert_probe_run(
+                site_id,
+                key_id,
+                "vendor/model",
+                None,
+                &probe_run_fixture("r-new", "running"),
+            )
+            .expect("旧库补列后必须能写");
+        let rows = store.list_probe_runs(10).expect("list_probe_runs");
+        // 按 run_id 找，不看 rows[0]：两行 recorded_at 同秒，DESC 排序不保证先后。
+        let fresh = rows
+            .iter()
+            .find(|r| r.run_id == "r-new")
+            .expect("刚写入的行");
+        assert_eq!(fresh.status.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn probe_run_row_roundtrips_lifecycle_status() {
+        // B-135：`list` 与 `get` 都必须带回 status（两条 SELECT 的列序要一致）。
+        let store = Store::open_in_memory().unwrap();
+        let site_id = store
+            .upsert_site("newapi", "https://relay.example.com", "测试")
+            .unwrap();
+        let reference = crate::vault::secret_ref("key", 1, "secret");
+        let key_id = store
+            .insert_key(site_id, "probe-key", &reference, Some("1"), None)
+            .unwrap();
+        let id = store
+            .insert_probe_run(
+                site_id,
+                key_id,
+                "vendor/model",
+                Some("vendor/model"),
+                &probe_run_fixture("r-running", "running"),
+            )
+            .unwrap();
+
+        let row = store.get_probe_run(id).unwrap().expect("按 id 取回");
+        assert_eq!(row.status.as_deref(), Some("running"));
+        assert_eq!(row.verdict_status, None, "没跑完 ⇒ 无判定");
+        assert!(row.recorded_at > 0, "落库时间仍在");
+
+        let listed = store.list_probe_runs(10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status.as_deref(), Some("running"));
     }
 
     #[test]
