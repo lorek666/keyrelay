@@ -61,10 +61,12 @@ fn require(names: &[&str]) -> Option<Vec<String>> {
 }
 
 fn transport() -> ReqwestTransport {
-    let mut config = TransportConfig::default();
-    // 本机走 Clash 时 DNS 是 fake-IP，必须显式走代理（真机走查记录里的同一条坑）。
-    config.proxy = env_opt("KR_REAL_PROXY");
-    config.timeout = Duration::from_secs(60);
+    let config = TransportConfig {
+        // 本机走 Clash 时 DNS 是 fake-IP，必须显式走代理（真机走查记录里的同一条坑）。
+        proxy: env_opt("KR_REAL_PROXY"),
+        timeout: Duration::from_secs(60),
+        ..TransportConfig::default()
+    };
     ReqwestTransport::new(config).expect("构造真实传输层")
 }
 
