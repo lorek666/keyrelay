@@ -60,8 +60,10 @@
     "spoofMethod": "Spoof Method",
     "confidence": "Confidence",
     "warningsCount": "Warnings",
+    "runStatus": "Run status",
     "report": "Report",
     "verdict": {
+      "none": "No verdict",
       "clean_match": "Clean Match",
       "clean_match_family_only": "Family Match (submodel unsettled)",
       "clean_match_submodel_mismatch": "Family Match, Submodel Mismatch",

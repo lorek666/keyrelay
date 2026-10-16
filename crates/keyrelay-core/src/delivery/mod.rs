@@ -535,13 +535,31 @@ pub fn resolve_for_binding(
     provider_id: &str,
     model: Option<&str>,
 ) -> Result<Box<dyn DeliveryWriter>> {
-    // M14-S7：查模型元数据——内置表 + models.dev。
+    // M14-S7：查模型元数据。这里**只查内置表**（同步、不联网）——在线补全的结果由调用方
+    // 经 [`resolve_for_binding_with_meta`] 传进来（投递路径是同步的，不能在这里 `.await`）。
+    let meta = model.map(str::trim).and_then(model_meta::lookup);
+    resolve_for_binding_with_meta(channel, home, base_url, provider_id, model, meta)
+}
+
+/// 与 [`resolve_for_binding`] 相同，但 `meta` 由调用方给定。
+///
+/// 存在的理由：models.dev 在线补全是异步的（[`model_meta::OnlineMetaCache::lookup_online`]），
+/// 而投递路径是同步的。`KeyRelayService` 先预热缓存、再用
+/// [`model_meta::OnlineMetaCache::lookup_cached`] 取一份同步快照传进来，于是「在线查到的
+/// 参数」也能进投递，而同步路径一次网络都不发。
+pub fn resolve_for_binding_with_meta(
+    channel: DeliveryChannel,
+    home: &Path,
+    base_url: &str,
+    provider_id: &str,
+    model: Option<&str>,
+    meta: Option<model_meta::ModelMeta>,
+) -> Result<Box<dyn DeliveryWriter>> {
     // `None` 表示未命中（内置表 + models.dev 都没查到），不写参数行。
     let model_owned = model
         .map(str::trim)
         .filter(|m| !m.is_empty())
         .map(str::to_string);
-    let meta = model_owned.as_deref().and_then(model_meta::lookup);
 
     match channel {
         DeliveryChannel::CodexAuthJson => Ok(Box::new(codex_auth::CodexAuthWriter::new(home))),
@@ -692,6 +710,20 @@ pub fn resolve_for_gateway(
     provider_id: &str,
     model: Option<&str>,
 ) -> Result<Box<dyn DeliveryWriter>> {
+    let meta = model.map(str::trim).and_then(model_meta::lookup);
+    resolve_for_gateway_with_meta(channel, home, gateway, provider_id, model, meta)
+}
+
+/// 与 [`resolve_for_gateway`] 相同，但 `meta` 由调用方给定（理由同
+/// [`resolve_for_binding_with_meta`]）。
+pub fn resolve_for_gateway_with_meta(
+    channel: DeliveryChannel,
+    home: &Path,
+    gateway: &GatewayEndpoint,
+    provider_id: &str,
+    model: Option<&str>,
+    meta: Option<model_meta::ModelMeta>,
+) -> Result<Box<dyn DeliveryWriter>> {
     let target = home.join(channel.relative_target());
     if gateway.base_url.trim().is_empty() {
         return Err(Error::inject(target, "网关地址为空，拒绝写入"));
@@ -699,7 +731,7 @@ pub fn resolve_for_gateway(
     if gateway.token.trim().is_empty() {
         return Err(Error::inject(target, "网关令牌为空，拒绝写入"));
     }
-    resolve_for_binding(channel, home, &gateway.base_url, provider_id, model)
+    resolve_for_binding_with_meta(channel, home, &gateway.base_url, provider_id, model, meta)
 }
 
 /// 投递的**取值来源**（M8-S4 §6.2 / §6.6）。
@@ -753,12 +785,35 @@ pub fn resolve_for_source(
     provider_id: &str,
     model: Option<&str>,
 ) -> Result<Box<dyn DeliveryWriter>> {
+    let meta = model.map(str::trim).and_then(model_meta::lookup);
+    resolve_for_source_with_meta(
+        source,
+        channel,
+        home,
+        site_base_url,
+        provider_id,
+        model,
+        meta,
+    )
+}
+
+/// 与 [`resolve_for_source`] 相同，但 `meta` 由调用方给定（理由同
+/// [`resolve_for_binding_with_meta`]）——服务层用它把 models.dev 在线补全的结果带进投递。
+pub fn resolve_for_source_with_meta(
+    source: DeliverySource<'_>,
+    channel: DeliveryChannel,
+    home: &Path,
+    site_base_url: &str,
+    provider_id: &str,
+    model: Option<&str>,
+    meta: Option<model_meta::ModelMeta>,
+) -> Result<Box<dyn DeliveryWriter>> {
     match source {
         DeliverySource::Site => {
-            resolve_for_binding(channel, home, site_base_url, provider_id, model)
+            resolve_for_binding_with_meta(channel, home, site_base_url, provider_id, model, meta)
         }
         DeliverySource::Gateway(endpoint) => {
-            resolve_for_gateway(channel, home, endpoint, provider_id, model)
+            resolve_for_gateway_with_meta(channel, home, endpoint, provider_id, model, meta)
         }
     }
 }

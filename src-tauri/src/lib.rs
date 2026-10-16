@@ -108,6 +108,28 @@ fn build_probe_transport(proxy: Option<String>) -> ReqwestTransport {
     }
 }
 
+/// M14-S7 §4.2：models.dev 在线补全专用 transport。
+///
+/// 与站点 transport 的差异只有一点：**不套 `RetryingTransport`**。models.dev 是第三方
+/// 服务，重试策略会把「网络不通」放大成 3 次尝试 × 15s，而这笔开销挂在**投递预览**的
+/// 关键路径上。这里要的是「一次、短、失败就当没查到」——在线补全失败只退化成
+/// 「只写模型名」，绝不该让用户等 45 秒。
+///
+/// timeout 用 `TransportConfig::default()` 的 15s（spec §4.2 写的就是 15s）。
+fn build_meta_transport(proxy: Option<String>) -> ReqwestTransport {
+    let config = TransportConfig {
+        proxy,
+        ..TransportConfig::default()
+    };
+    match ReqwestTransport::new(config) {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("[keyrelay] 构造模型元数据传输层失败: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// 从 store 读 settings，按 `proxy_mode` 解析出最终代理 URL（M10-S2）。
 ///
 /// 站点适配器 transport 在启动时构造一次、不可变（与 B-54 同口径：代理变更需重启 app）。
@@ -177,9 +199,11 @@ fn state_with_config(
     // 不让 app 因此退出。
     let proxy = resolved_proxy_url(&store);
     let proxy_for_probe = proxy.clone();
+    let proxy_for_meta = proxy.clone();
     AppState {
         service: KeyRelayService::new(store, build_transport_with_proxy(proxy), config)
-            .with_probe_transport(build_probe_transport(proxy_for_probe)),
+            .with_probe_transport(build_probe_transport(proxy_for_probe))
+            .with_meta_transport(build_meta_transport(proxy_for_meta)),
         db_path,
         db_error,
         gateway: std::sync::Mutex::new(None),

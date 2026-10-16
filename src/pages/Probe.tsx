@@ -208,7 +208,7 @@ function VerdictCard({ run }: { run: ProbeRun }) {
     <div className={"verdict-card " + (ok ? "ok" : bad ? "bad" : "uncertain")}>
       <div className="verdict-head">
         <span className="verdict-status">
-          {verdictLabel(run.verdictStatus) || run.status}
+          {verdictLabel(run.verdictStatus)}
         </span>
         <span className="verdict-identity">
           {identityLabel(run.identityStatus)}
@@ -225,6 +225,8 @@ function VerdictCard({ run }: { run: ProbeRun }) {
         <dd>{run.confidence ?? "—"}</dd>
         <dt>{translate(d, "probe.warningsCount")}</dt>
         <dd>{run.warningsCount}</dd>
+        <dt>{translate(d, "probe.runStatus")}</dt>
+        <dd className="mono">{run.status}</dd>
         {run.reportUrl ? (
           <>
             <dt>{translate(d, "probe.report")}</dt>
@@ -244,12 +246,17 @@ function siteName(
   return s ? s.displayName || s.baseUrl : `#${id}`;
 }
 
+/**
+ * 判定标签。`null` 不是「没有文案」，而是一个**真实结果**：bazaarlink 跑完了但没给出
+ * 身份判定（真机实测：key 访问不了该模型时秒级返回 completed、无 identityAssessment）。
+ * 旧实现返回空串 ⇒ 历史表整列空白、结果卡退回显示生命周期词 `completed`，两者都像成功。
+ */
 function verdictLabel(status?: string | null): string {
-  if (!status) return "";
+  if (!status) return translate(getCurrentDict(), "probe.verdict.none");
   return translate(getCurrentDict(), `probe.verdict.${status}`);
 }
 
 function identityLabel(status?: string | null): string {
-  if (!status) return "";
+  if (!status) return "—";
   return translate(getCurrentDict(), `probe.identity.${status}`);
 }
