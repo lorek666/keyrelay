@@ -5297,4 +5297,124 @@ mod tests {
             "非 http(s) baseUrl 应 InvalidInput: {err:?}"
         );
     }
+
+    // ---- B-140 续：base_url 构造 / override 优先 / claimed_model 缺省 / key 不存在 ----
+
+    /// 用 `upsert_site` 直接插指定 `base_url` 的 site（绕过 add_site 指纹），
+    /// 让 mock 队列只放 probe 响应。返回 mock 句柄用于断言发给 bazaarlink 的请求体。
+    async fn probe_service_with_base_url(
+        site_base_url: &str,
+        tail: Vec<HttpResponse>,
+    ) -> (KeyRelayService<MockTransport>, i64, MockTransport) {
+        let store = Store::open_in_memory().expect("内存库");
+        let mock = MockTransport::new(tail);
+        let service = KeyRelayService::new(store, mock.clone(), test_config());
+        let site_id = service
+            .store
+            .upsert_site("newapi", site_base_url, "测试站")
+            .expect("upsert_site");
+        let reference = crate::vault::secret_ref("key", 1, "secret");
+        service
+            .vault
+            .put(&reference, "sk-test-secret-12345678")
+            .expect("vault.put");
+        let key_id = service
+            .store
+            .insert_key(site_id, "probe-key", &reference, Some("remote-1"), None)
+            .expect("insert_key");
+        (service, key_id, mock)
+    }
+
+    /// 解出 mock 收到的第 `n` 个请求体（JSON）。
+    fn request_body(mock: &MockTransport, n: usize) -> serde_json::Value {
+        let sent = mock.nth_request(n).expect("应有请求");
+        let body = sent.body.expect("probe 请求必有 body");
+        serde_json::from_slice(&body).expect("请求体是合法 JSON")
+    }
+
+    #[tokio::test]
+    async fn probe_model_default_base_url_appends_v1_when_missing() {
+        // site.base_url 不带 /v1 → 默认 baseUrl = site.base_url + /v1
+        let (service, key_id, mock) =
+            probe_service_with_base_url("https://relay.example.com", vec![probe_response()]).await;
+        service
+            .probe_model(key_id, "vendor/model".into(), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            request_body(&mock, 0)["baseUrl"],
+            "https://relay.example.com/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_model_default_base_url_does_not_double_v1() {
+        // site.base_url 已带 /v1 → 不重复追加（否则 baseUrl 变成 .../v1/v1）
+        let (service, key_id, mock) =
+            probe_service_with_base_url("https://relay.example.com/v1", vec![probe_response()])
+                .await;
+        service
+            .probe_model(key_id, "vendor/model".into(), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            request_body(&mock, 0)["baseUrl"],
+            "https://relay.example.com/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_model_base_url_override_takes_precedence() {
+        // base_url_override 合法 http(s) 时优先于站点默认 baseUrl
+        let (service, key_id, mock) =
+            probe_service_with_base_url("https://relay.example.com", vec![probe_response()]).await;
+        service
+            .probe_model(
+                key_id,
+                "vendor/model".into(),
+                None,
+                Some("https://override.example.com/v1".into()),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            request_body(&mock, 0)["baseUrl"],
+            "https://override.example.com/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_model_claimed_model_defaults_to_model_id() {
+        // claimed_model 缺省（None）→ 请求体 claimedModel = modelId（M15-S1 决策）
+        let (service, key_id, mock) =
+            probe_service_with_base_url("https://relay.example.com", vec![probe_response()]).await;
+        service
+            .probe_model(key_id, "vendor/gpt-4o".into(), None, None, true)
+            .await
+            .unwrap();
+        let body = request_body(&mock, 0);
+        assert_eq!(body["modelId"], "vendor/gpt-4o");
+        assert_eq!(body["claimedModel"], "vendor/gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn probe_model_missing_key_returns_not_found() {
+        // key_id 不存在 → NotFound（请求未发出）；mock 队列空，不该被消费
+        let (service, _key_id, mock) =
+            probe_service_with_base_url("https://relay.example.com", vec![]).await;
+        let err = service
+            .probe_model(999, "vendor/model".into(), None, None, true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(_)),
+            "key 不存在应 NotFound: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("999"),
+            "错误文案应点明哪个 key_id: {err}"
+        );
+        assert_eq!(mock.request_count(), 0, "key 不存在时不应发请求");
+    }
 }
