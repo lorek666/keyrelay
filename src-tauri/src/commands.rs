@@ -437,6 +437,9 @@ pub struct ExportArgs {
     password: Option<String>,
     /// 缺省写到 `~/.keyrelay/exports/keyrelay-export-<时间戳>.json`
     path: Option<String>,
+    /// M16-S6a §12 产品裁定：`export_bundle` **保留**「另存为到用户选定路径」这个特性，
+    /// 但目标**已存在**时必须显式确认——不传（或 `false`）⇒ 拒绝，绝不静默覆盖。
+    overwrite: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -1554,10 +1557,12 @@ pub fn export_bundle(
     state: State<'_, AppState>,
     args: ExportArgs,
 ) -> Result<ExportResultDto, String> {
-    let path = match args.path {
-        Some(path) if !path.trim().is_empty() => std::path::PathBuf::from(path),
-        _ => default_export_path("keyrelay-export"),
-    };
+    // M16-S6a §12：三条护栏（绝对路径 / 不跟随符号链接 / 已存在须显式确认）。
+    let path = resolve_bundle_path(
+        state.service.home(),
+        args.path.as_deref(),
+        args.overwrite.unwrap_or(false),
+    )?;
     state
         .service
         .export_to_file(&path, args.password.as_deref())
@@ -1575,15 +1580,6 @@ pub fn export_bundle(
 /// 抽出来是因为配置导出与诊断包**必须落在同一个目录**：两者都会被登记进
 /// 「已知导出物」表、都会被 `audit_redaction` 扫到，散在两个目录只会让用户
 /// 在报障时找错地方。
-fn default_export_path(prefix: &str) -> std::path::PathBuf {
-    default_export_path_in(&exports_dir(), prefix)
-}
-
-/// 诊断包/导出物的**允许目录**：`<home>/.keyrelay/exports`。
-fn exports_dir() -> std::path::PathBuf {
-    crate::home_dir().join(".keyrelay").join("exports")
-}
-
 fn default_export_path_in(dir: &std::path::Path, prefix: &str) -> std::path::PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1594,6 +1590,47 @@ fn default_export_path_in(dir: &std::path::Path, prefix: &str) -> std::path::Pat
 
 /// 诊断包导出文件名白名单前缀（P3-18）。
 const DIAGNOSTICS_FILE_PREFIX: &str = "keyrelay-diagnostics";
+
+/// `export_bundle` 的路径护栏（M16-S6a §12 的**产品裁定**）。
+///
+/// 裁定：备份包的「另存为到用户选定路径」是**产品特性**（用户显式选择），
+/// 不像诊断包那样必须锁在应用目录内 ⇒ **不收紧路径本身**，但加三条护栏：
+///
+/// 1. **绝对路径**：相对路径随 cwd 漂移——写到哪里取决于谁启动了进程（Finder / 终端 / 自启）。
+/// 2. **不跟随符号链接**：目标是链接时拒绝，否则等于允许写到链接指向的任何地方。
+/// 3. **已存在须显式确认**：`overwrite != true` 时拒绝，**绝不静默覆盖**用户的文件。
+fn resolve_bundle_path(
+    home: &std::path::Path,
+    requested: Option<&str>,
+    overwrite: bool,
+) -> Result<std::path::PathBuf, String> {
+    let Some(raw) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(default_export_path_in(
+            &home.join(".keyrelay").join("exports"),
+            "keyrelay-export",
+        ));
+    };
+
+    let path = std::path::Path::new(raw);
+    if !path.is_absolute() {
+        return Err(format!(
+            "备份包只能导出到**绝对路径**（相对路径会随工作目录漂移）；被拒路径：{raw}"
+        ));
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "备份包目标已存在且是符号链接（拒绝跟随）；被拒路径：{raw}"
+            ));
+        }
+    }
+    if path.exists() && !overwrite {
+        return Err(format!(
+            "目标已存在，未覆盖：{raw}。确认要覆盖它时请带 overwrite=true（界面应先让用户确认）"
+        ));
+    }
+    Ok(path.to_path_buf())
+}
 
 /// 诊断包导出的**路径收敛**（P3-18）。
 ///
@@ -3336,6 +3373,80 @@ mod tests {
             resolve_diagnostics_path(home.path(), Some(&path.display().to_string())).unwrap(),
             path
         );
+    }
+
+    // ---- M16-S6a §12：export_bundle 的三条护栏 ----
+
+    /// ① 相对路径被拒（绝对路径才不随 cwd 漂移）；② 缺省路径仍在导出目录内。
+    #[test]
+    fn bundle_requires_an_absolute_path_and_defaults_inside_the_exports_dir() {
+        let home = tempfile::tempdir().expect("临时 home");
+        let err = resolve_bundle_path(home.path(), Some("keyrelay-export.json"), false)
+            .expect_err("相对路径必须被拒");
+        assert!(err.contains("绝对路径"), "文案: {err}");
+
+        let default = resolve_bundle_path(home.path(), None, false).expect("缺省路径");
+        assert_eq!(
+            default.parent().unwrap(),
+            home.path().join(".keyrelay/exports")
+        );
+        assert!(default
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("keyrelay-export"));
+    }
+
+    /// ③ 已存在必须显式确认：不传 `overwrite` ⇒ 拒绝；`overwrite=true` ⇒ 放行。
+    ///
+    /// 这条是「不得静默覆盖用户文件」的**唯一**守护：没有它，`export_bundle` 会像修前那样
+    /// 直接盖掉目标（`service::export_to_file` 只做 `fs::write`）。
+    #[test]
+    fn bundle_refuses_to_overwrite_without_an_explicit_confirmation() {
+        let home = tempfile::tempdir().expect("临时 home");
+        let dir = tempfile::tempdir().expect("临时目录");
+        let target = dir.path().join("backup.json");
+        std::fs::write(&target, "old").expect("先放一个已存在的文件");
+
+        let err = resolve_bundle_path(home.path(), Some(&target.display().to_string()), false)
+            .expect_err("已存在且未确认 ⇒ 必须拒绝");
+        assert!(err.contains("目标已存在"), "文案: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "old",
+            "被拒时不得改动原文件"
+        );
+
+        assert_eq!(
+            resolve_bundle_path(home.path(), Some(&target.display().to_string()), true).unwrap(),
+            target,
+            "显式确认后放行"
+        );
+
+        // 正向对照：**不**存在的目标无需确认
+        let fresh = dir.path().join("fresh.json");
+        assert!(
+            resolve_bundle_path(home.path(), Some(&fresh.display().to_string()), false).is_ok()
+        );
+    }
+
+    /// ② 符号链接被拒（不跟随）。
+    #[test]
+    fn bundle_refuses_a_symlinked_target() {
+        let home = tempfile::tempdir().expect("临时 home");
+        let dir = tempfile::tempdir().expect("临时目录");
+        let real = dir.path().join("real.json");
+        std::fs::write(&real, "x").expect("写真实文件");
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.json");
+            std::os::unix::fs::symlink(&real, &link).expect("建符号链接");
+            let err = resolve_bundle_path(home.path(), Some(&link.display().to_string()), true)
+                .expect_err("符号链接必须被拒（哪怕显式确认）");
+            assert!(err.contains("符号链接"), "文案: {err}");
+        }
     }
 
     // ---- P2-7：轮换后是否重启网关 ----
