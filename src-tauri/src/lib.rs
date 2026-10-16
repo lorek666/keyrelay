@@ -212,6 +212,53 @@ enum OnlineModelMeta {
     Disabled,
 }
 
+/// 通知总开关的**设置键**（M16-S9 / S5 复审 P1-1）。
+///
+/// 为什么是裸 KV 而不是 `Settings` 的字段：`Settings` 里今天**没有**总开关
+/// （只有 `notify_system_enabled`，默认 `true`，那是「系统通知这一路可用吗」，
+/// 不是「要不要跑通知」）。`settings.rs` 属 core，本步的写域只到 `src-tauri`
+/// 加一处 `observability.rs`；所以总开关先落在 KV 上，**缺省即关**——
+/// 与今天「`with_notify` 从不被调用」的行为**逐字相同**。
+///
+/// 要做进 `Settings`（含界面开关）是一次独立改动：需要 `settings.rs` 的字段 +
+/// 白名单 + DTO + 设置页，登记在 spec §13。
+const NOTIFY_ENABLED_KEY: &str = "notify_enabled";
+
+/// 从设置构造 `NotifyConfig`；**总开关没开就返回 `None`**（⇒ 不调 `with_notify`）。
+///
+/// 判据（S5 复审 P1-1）：`with_notify` 零生产调用点 ⇒ `self.notify` 恒 `None` ⇒
+/// `dispatch_notifications` 在早退处返回 ⇒ **基线永不落库、`ModelsChanged` 永不触发**。
+/// 这条桥把「设置」接到「服务」上，同时保证默认关。
+fn build_notify_config(store: &Store) -> Option<keyrelay_core::notify::NotifyConfig> {
+    let enabled = store
+        .get_setting(NOTIFY_ENABLED_KEY)
+        .ok()
+        .flatten()
+        .is_some_and(|value| {
+            let v = value.trim();
+            v.eq_ignore_ascii_case("true") || v == "1"
+        });
+    if !enabled {
+        return None;
+    }
+    // 开关开着才读 `Settings`：读不出来（老库/损坏）就退回 `None`，不让 app 起不来。
+    let settings = keyrelay_core::settings::Settings::load_from_store(store).ok()?;
+    Some(keyrelay_core::notify::NotifyConfig {
+        system_enabled: settings.notify_system_enabled,
+        webhook_url: {
+            let url = settings.notify_webhook_url.trim();
+            if url.is_empty() {
+                None
+            } else {
+                Some(url.to_string())
+            }
+        },
+        // 阈值今天不在 `Settings` 里（同上）⇒ 保持 core 默认的「关」（`0.0`）。
+        balance_threshold: 0.0,
+        timeout: std::time::Duration::from_secs(settings.notify_timeout_secs),
+    })
+}
+
 fn state_with_config(
     store: Store,
     db_path: PathBuf,
@@ -230,8 +277,16 @@ fn state_with_config(
     let proxy = resolved_proxy_url(&store);
     let proxy_for_probe = proxy.clone();
     let proxy_for_meta = proxy.clone();
+    // M16-S9 / S5 复审 P1-1：通知装配。**必须在 `store` move 进 service 之前**读
+    // （`Store` 不是 `Clone`，与上面解析代理同一个理由）。
+    let notify = build_notify_config(&store);
     let service = KeyRelayService::new(store, build_transport_with_proxy(proxy), config)
         .with_probe_transport(build_probe_transport(proxy_for_probe));
+    // 总开关关着 ⇒ **不调** `with_notify`（`self.notify` 保持 `None`，与今天逐字相同）。
+    let service = match notify {
+        Some(config) => service.with_notify(config),
+        None => service,
+    };
     let service = match online_model_meta {
         OnlineModelMeta::Enabled => {
             service.with_meta_transport(build_meta_transport(proxy_for_meta))
@@ -269,6 +324,29 @@ pub fn init_state() -> AppState {
 }
 
 /// 测试用：纯内存状态，不触碰用户 `~/.keyrelay`。
+/// 测试用：内存库 + **预置设置**（`pairs` 先落 `settings` 表，再装配）。
+///
+/// 存在的理由（M16-S9 / S5 复审 P1-1）：通知总开关是在**装配时**读的
+/// （[`build_notify_config`]），所以「开关开着时装配真的把 `with_notify` 接上了」
+/// 只能在**构造之前**把设置写好才测得到——否则测试要么测不到装配，要么只能测
+/// 「服务层机制」（那正是复审用来发现本缺陷时缺的那一环）。
+pub fn init_state_in_memory_with_settings(pairs: &[(&str, &str)]) -> AppState {
+    match Store::open_in_memory() {
+        Ok(store) => {
+            for (key, value) in pairs {
+                if let Err(err) = store.set_setting(key, value) {
+                    eprintln!("[keyrelay] 预置设置失败 {key}: {err}");
+                }
+            }
+            state_in_memory(store, PathBuf::from(":memory:"))
+        }
+        Err(fatal) => {
+            eprintln!("[keyrelay] 内存库不可用: {fatal}");
+            std::process::exit(1);
+        }
+    }
+}
+
 pub fn init_state_in_memory() -> AppState {
     match Store::open_in_memory() {
         Ok(store) => state_in_memory(store, PathBuf::from(":memory:")),
