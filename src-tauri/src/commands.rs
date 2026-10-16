@@ -641,7 +641,7 @@ fn parse_channel(raw: &str) -> Result<keyrelay_core::delivery::DeliveryChannel, 
 }
 
 #[tauri::command]
-pub fn delivery_plan(
+pub async fn delivery_plan(
     state: State<'_, AppState>,
     args: DeliveryArgs,
 ) -> Result<DeliveryPlanDto, String> {
@@ -659,6 +659,9 @@ pub fn delivery_plan(
         Some(endpoint) => keyrelay_core::delivery::DeliverySource::Gateway(endpoint),
         None => keyrelay_core::delivery::DeliverySource::Site,
     };
+    // M14-S7 §4.2：先把「内置表没覆盖的模型」的在线参数预热进缓存，再走同步的 plan。
+    // best-effort：网络失败/超时只是没有参数行，预览照常出（失败不阻断投递）。
+    let _ = state.service.warm_model_meta(args.model.as_deref()).await;
     state
         .service
         .delivery_plan_in(args.key_id, channel, args.model.as_deref(), source)
@@ -784,7 +787,7 @@ pub fn list_channel_bindings<R: tauri::Runtime>(
 }
 
 #[tauri::command]
-pub fn apply_delivery(
+pub async fn apply_delivery(
     state: State<'_, AppState>,
     args: DeliveryArgs,
 ) -> Result<DeliveryOutcomeDto, String> {
@@ -800,6 +803,9 @@ pub fn apply_delivery(
         Some(endpoint) => keyrelay_core::delivery::DeliverySource::Gateway(endpoint),
         None => keyrelay_core::delivery::DeliverySource::Site,
     };
+    // M14-S7 §4.2：同 `delivery_plan`——直接投递（没先预览）时也要拿到在线参数。
+    // 缓存已在预览时预热过，这里通常是一次纯读；best-effort，失败不阻断。
+    let _ = state.service.warm_model_meta(args.model.as_deref()).await;
     state
         .service
         .apply_delivery_in(args.key_id, channel, args.model.as_deref(), source)

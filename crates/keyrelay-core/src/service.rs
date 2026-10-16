@@ -560,6 +560,16 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     /// `ReqwestTransport`（timeout 120s、不套 retry），避免 sync probe 被 15s 总超时砍断、
     /// 以及 429 被 `RetryingTransport` 自动重试 3 次（Retry-After 被 cap 到 5s，白打 + 等 10s）。
     probe_transport: Option<crate::site::transport_reqwest::ReqwestTransport>,
+    /// M14-S7 §4.2：models.dev 在线补全专用 transport（独立 timeout 15s、不套 retry）。
+    ///
+    /// `None`（默认）时 `warm_model_meta` fallback 到 `self.transport`——测试用
+    /// `MockTransport` 走这条路径。生产装配由壳层 `with_meta_transport` 注入。
+    meta_transport: Option<crate::site::transport_reqwest::ReqwestTransport>,
+    /// M14-S7 §4.2：models.dev 目录缓存（进程内 1 小时 TTL）。
+    ///
+    /// 投递路径是同步的（不能 `.await`），所以「异步预热 → 同步读快照」两步走：
+    /// `warm_model_meta` 填这份缓存，`meta_for` 在 `prepare_delivery` 里读。
+    meta_cache: crate::model_meta::OnlineMetaCache,
     store: Store,
     sessions: SessionCache,
     vault: Arc<dyn Vault>,
@@ -719,6 +729,10 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             // 默认 None：测试不调 `with_probe_transport` 时 fallback 到 `self.transport`（Mock），
             // 让 probe_model 的集成测试能用 Mock 预置响应（M4）。
             probe_transport: None,
+            // 默认 None：测试不调 `with_meta_transport` 时 fallback 到 `self.transport`（Mock）。
+            meta_transport: None,
+            // 默认空缓存：冷缓存 ⇒ 同步读拿不到在线参数（不联网），语义与「没查到」一致。
+            meta_cache: crate::model_meta::OnlineMetaCache::new(),
             store,
             sessions: SessionCache::new(),
             vault: config.vault,
@@ -809,6 +823,59 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     ) -> Self {
         self.probe_transport = Some(probe_transport);
         self
+    }
+
+    /// M14-S7 §4.2：注入 models.dev 在线补全专用 transport（独立 timeout 15s、不套 retry）。
+    ///
+    /// 为什么不复用站点 transport：models.dev 是**第三方**服务，`RetryingTransport` 会把
+    /// 「网络不通」放大成 3 次尝试 × 15s，挂在投递预览的关键路径上。这里要的是
+    /// 「一次、短、失败就当没查到」（spec §4.2：网络失败/超时返回 `None`，不影响投递）。
+    ///
+    /// 不调用 = `meta_transport` 保持 `None`，`warm_model_meta` fallback 到 `self.transport`
+    /// ——测试用 `MockTransport` 走这条路径，零改动现有测试。
+    pub fn with_meta_transport(
+        mut self,
+        meta_transport: crate::site::transport_reqwest::ReqwestTransport,
+    ) -> Self {
+        self.meta_transport = Some(meta_transport);
+        self
+    }
+
+    /// M14-S7 §4.2：预热模型元数据在线补全缓存（best-effort）。
+    ///
+    /// 内置表命中 ⇒ 直接返回、**不联网**；未命中 ⇒ 查 models.dev（缓存过期时才真拉）。
+    /// 任何失败都返回 `None`——这是增强项，失败必须退化成「只写模型名」，绝不报错。
+    ///
+    /// 投递路径是同步的，所以「预热 → 同步读」两步走：本函数填缓存，
+    /// [`Self::meta_for`] 读缓存（见 `prepare_delivery`）。
+    pub async fn warm_model_meta(
+        &self,
+        model: Option<&str>,
+    ) -> Option<crate::model_meta::ModelMeta> {
+        let model = model.map(str::trim).filter(|m| !m.is_empty())?;
+        let resolved = match &self.meta_transport {
+            Some(transport) => self.meta_cache.lookup_online(transport, model).await,
+            None => self.meta_cache.lookup_online(&self.transport, model).await,
+        };
+        if resolved.is_none() {
+            // 只记模型名与结果，不记任何密钥/响应正文。Debug 级：这是增强路径，
+            // 未命中是常态（内置表没覆盖的长尾模型 + 网络不可用），不该刷 warn。
+            self.log(observability::event_with_payload(
+                Level::Debug,
+                "delivery",
+                "模型元数据未命中（只写模型名，不写上下文/输出参数）",
+                serde_json::json!({ "model": model }),
+            ));
+        }
+        resolved
+    }
+
+    /// 同步读模型元数据：内置表 → 已缓存的 models.dev 结果。**不联网**。
+    fn meta_for(&self, model: Option<&str>) -> Option<crate::model_meta::ModelMeta> {
+        model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .and_then(|m| self.meta_cache.lookup_cached(m))
     }
 
     /// 钥匙串后端标识（诊断用；`"memory"` 出现在生产装配里即为缺陷）。
@@ -3004,18 +3071,39 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             ));
         }
         // 事件只 log 元数据，不 log apiKey / 响应正文
-        self.log(observability::event_with_payload(
-            Level::Info,
-            "probe",
-            "模型检测完成",
-            serde_json::json!({
-                "site_id": row.site_id,
-                "key_id": key_id,
-                "run_id": run.run_id,
-                "verdict": run.verdict_status,
-                "identity": run.identity_status,
-            }),
-        ));
+        //
+        // F1（独立检查）：`run_probe` 是**一次性** POST（`sync=true`），没有客户端轮询兜底。
+        // bazaarlink 对「key 访问不了该模型」这类情况会**秒级返回 completed 但不带
+        // identityAssessment**（真机实测 4 次：420–663ms、verdict 全空）。旧实现无条件记
+        // info「模型检测完成」+ 落一条 verdict 全空的行——失败被伪装成成功，事件流与历史表
+        // 都看不出区别。现在按「有没有拿到判定」分流：拿到 → info「完成」；
+        // 没拿到 → warn「未得出判定」（**仍落库**：run_id / report_url 是真实的，报告能点开）。
+        self.log(match run.verdict_status {
+            Some(_) => observability::event_with_payload(
+                Level::Info,
+                "probe",
+                "模型检测完成",
+                serde_json::json!({
+                    "site_id": row.site_id,
+                    "key_id": key_id,
+                    "run_id": run.run_id,
+                    "verdict": run.verdict_status,
+                    "identity": run.identity_status,
+                }),
+            ),
+            None => observability::event_with_payload(
+                Level::Warn,
+                "probe",
+                "模型检测未得出判定",
+                serde_json::json!({
+                    "site_id": row.site_id,
+                    "key_id": key_id,
+                    "run_id": run.run_id,
+                    "status": run.status,
+                    "identity": run.identity_status,
+                }),
+            ),
+        });
         Ok(run)
     }
 
@@ -4290,13 +4378,18 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // （网关模式下**不**用站点 base_url——那正是「换站零改动」的全部内容，
         //  但站点行仍然要读：`key_id` 必须属于一个存在的站点）。
         let site = self.site(row.site_id)?;
-        delivery::resolve_for_source(
+        // M14-S7 §4.2：带上「内置表 + 已缓存的 models.dev 结果」的同步快照。
+        // 在线拉取由命令层在调用投递前 `await warm_model_meta(...)` 完成（best-effort）；
+        // 这里只读缓存，**一次网络都不发**（同步函数）。
+        let meta = self.meta_for(model);
+        delivery::resolve_for_source_with_meta(
             source,
             channel,
             &self.home,
             &site.base_url,
             delivery::opencode::OpenCodeWriter::DEFAULT_PROVIDER_ID,
             model,
+            meta,
         )
     }
 
@@ -5279,6 +5372,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_model_without_verdict_logs_warn_not_completed() {
+        // F1：`run_probe` 是一次性 POST（sync=true），bazaarlink 对「key 访问不了该模型」
+        // 会**秒级返回 200 + completed 但不带 identityAssessment**（真机实测 4 次：
+        // 420–663ms、verdict 全空）。旧实现无条件记 info「模型检测完成」并落一行 verdict
+        // 全空 —— 失败被伪装成成功。本测试钉住分流：无判定 ⇒ warn，且不得出现「完成」。
+        let no_verdict = HttpResponse::json(
+            200,
+            json!({
+                "runId": "r-probe-2",
+                "status": "completed",
+                "reportUrl": "/api/probe/report/r-probe-2",
+                "createdAt": 1_700_000_000_000i64,
+                "completedAt": 1_700_000_000_420i64,
+            }),
+        )
+        .expect("构造无判定响应");
+        let (service, key_id) = probe_service(vec![no_verdict]).await;
+        let run = service
+            .probe_model(key_id, "vendor/model".into(), None, None, true)
+            .await
+            .expect("HTTP 200 仍是 Ok（不是传输错误）");
+        assert_eq!(
+            run.verdict_status, None,
+            "无 identityAssessment ⇒ verdict 为空"
+        );
+
+        let events = service.recent_events(100).expect("recent_events");
+        let probe_events: Vec<_> = events.iter().filter(|e| e.source == "probe").collect();
+        assert!(
+            probe_events
+                .iter()
+                .any(|e| e.level == "warn" && e.message.contains("未得出判定")),
+            "无判定应写 warn「未得出判定」: {probe_events:?}"
+        );
+        assert!(
+            !probe_events
+                .iter()
+                .any(|e| e.message.contains("模型检测完成")),
+            "无判定不得记 info「模型检测完成」: {probe_events:?}"
+        );
+        for ev in &probe_events {
+            let text = format!("{} {}", ev.message, ev.payload.as_deref().unwrap_or(""));
+            assert!(
+                !text.contains("sk-test-secret-12345678"),
+                "无判定事件泄漏 apiKey: {text}"
+            );
+        }
+
+        // 仍落库：run_id / report_url 是真实的（报告能点开），只是没有判定
+        let rows = service.store.list_probe_runs(10).expect("list_probe_runs");
+        assert_eq!(rows.len(), 1, "无判定也要留一条历史（不是静默丢弃）");
+        assert_eq!(rows[0].verdict_status, None);
+        assert_eq!(
+            rows[0].report_url.as_deref(),
+            Some("/api/probe/report/r-probe-2")
+        );
+    }
+
+    #[tokio::test]
     async fn probe_model_rejects_non_http_base_url_override() {
         // L2：base_url_override 非 http(s) → InvalidInput（请求未发出）
         let (service, key_id) = probe_service(vec![]).await;
@@ -5416,5 +5568,87 @@ mod tests {
             "错误文案应点明哪个 key_id: {err}"
         );
         assert_eq!(mock.request_count(), 0, "key 不存在时不应发请求");
+    }
+
+    // ============================================ M14-S7 §4.2：models.dev 在线补全接线
+
+    #[tokio::test]
+    async fn warm_model_meta_brings_online_params_into_delivery_plan() {
+        // 在线补全的结果要能进**同步**的投递路径：内置表没有 `acme-long-context`，
+        // 只能靠 models.dev 目录；而 `delivery_plan_*` 是同步函数，不能 `.await`。
+        let catalog = HttpResponse::json(
+            200,
+            json!({
+                "acme": { "models": {
+                    "acme-long-context": {"limit": {"context": 123_456, "output": 7_890}}
+                }}
+            }),
+        )
+        .expect("构造 models.dev 目录响应");
+        let (service, key_id, mock) =
+            probe_service_with_base_url("https://relay.example.com", vec![catalog]).await;
+
+        // 预热前：冷缓存 ⇒ 只有模型名，没有参数行；而且**一次网络都不发**
+        let cold = service
+            .delivery_plan_with_model(key_id, DeliveryChannel::Hermes, Some("acme-long-context"))
+            .expect("投递预览");
+        assert!(
+            !cold.fields.iter().any(|f| f.key == "context_length"),
+            "冷缓存不该凭空写出参数: {:?}",
+            cold.fields
+        );
+        assert_eq!(mock.request_count(), 0, "同步的投递路径永不联网");
+
+        // 预热：查 models.dev 并落缓存
+        let meta = service
+            .warm_model_meta(Some("acme-long-context"))
+            .await
+            .expect("在线命中");
+        assert_eq!(meta.context_window, 123_456);
+        assert_eq!(meta.max_output_tokens, 7_890);
+        assert_eq!(mock.request_count(), 1, "预热只发这一次请求");
+
+        // 预热后：同一个同步调用带上参数，且**不再发请求**
+        let warm = service
+            .delivery_plan_with_model(key_id, DeliveryChannel::Hermes, Some("acme-long-context"))
+            .expect("投递预览");
+        assert!(
+            warm.fields
+                .iter()
+                .any(|f| f.key == "context_length" && f.masked == "123456"),
+            "预热后应写出 context_length: {:?}",
+            warm.fields
+        );
+        assert_eq!(mock.request_count(), 1, "同步路径永不联网（缓存命中）");
+    }
+
+    #[tokio::test]
+    async fn warm_model_meta_is_best_effort_when_offline() {
+        // 网络失败 ⇒ None（不是错误），投递预览照常出——只是没有参数行。
+        let (service, key_id, mock) =
+            probe_service_with_base_url("https://relay.example.com", vec![]).await;
+        mock.push_error(Error::Transport("网络不可达".into()));
+
+        assert!(service
+            .warm_model_meta(Some("acme-unknown"))
+            .await
+            .is_none());
+        let plan = service
+            .delivery_plan_with_model(key_id, DeliveryChannel::Hermes, Some("acme-unknown"))
+            .expect("在线补全失败不得阻断投递预览");
+        assert!(
+            !plan.fields.iter().any(|f| f.key == "context_length"),
+            "查不到参数就只写模型名: {:?}",
+            plan.fields
+        );
+        // 内置表命中的模型不联网，也不受网络故障影响
+        assert_eq!(
+            service
+                .warm_model_meta(Some("gpt-4o"))
+                .await
+                .map(|m| m.context_window),
+            Some(128_000),
+            "内置命中与网络无关"
+        );
     }
 }

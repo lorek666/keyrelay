@@ -60,8 +60,10 @@
     "spoofMethod": "欺骗手法",
     "confidence": "置信度",
     "warningsCount": "警告数",
+    "runStatus": "运行状态",
     "report": "报告",
     "verdict": {
+      "none": "未得出判定",
       "clean_match": "完全匹配",
       "clean_match_family_only": "家族匹配（子模型未定）",
       "clean_match_submodel_mismatch": "家族匹配但子模型不符",

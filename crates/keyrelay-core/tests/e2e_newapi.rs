@@ -323,21 +323,45 @@ async fn full_flow_against_fake_newapi_site() {
     assert_eq!(balance.used, 1.0);
 
     // ⑦ 服务端看到的请求序列与关键约束
+    //
+    // 假站点绑的是 `127.0.0.1:0`（临时端口），本机任何 stray 客户端都可能打进来：
+    // 实测过一次外部 `GET /`（并发跑两轮 `cargo test --workspace` 时命中，隔离复跑
+    // 不复现；仓库里没有任何代码路径会发 `GET /`）。所以这里**先按本次链路关心的
+    // 路径过滤**，再断言**相对顺序**——不把「第一条」钉成绝对下标，否则一条无关的
+    // 本地连接就能把整条 e2e 打红。
+    const KNOWN_PREFIXES: [&str; 6] = [
+        "GET /api/status",
+        "GET /api/user/login/encryption-key",
+        "POST /api/user/login",
+        "POST /api/token/",
+        "GET /api/token/",
+        "GET /api/user/self",
+    ];
     let requests = site.requests.lock().unwrap().clone();
-    let lines: Vec<String> = requests
+    let all_lines: Vec<String> = requests
         .iter()
         .map(|r| r.lines().next().unwrap_or_default().to_string())
         .collect();
+    let lines: Vec<&str> = all_lines
+        .iter()
+        .map(String::as_str)
+        .filter(|line| KNOWN_PREFIXES.iter().any(|p| line.starts_with(p)))
+        .collect();
 
+    // 登录链路的先后依赖是**真实契约**（没识别就不知道往哪登录、没拿到站点公钥就
+    // 没法加密密码），所以前三条按序断言；其余只断言出现过。
     assert_eq!(lines[0], "GET /api/status HTTP/1.1");
     assert_eq!(lines[1], "GET /api/user/login/encryption-key HTTP/1.1");
     assert_eq!(lines[2], "POST /api/user/login HTTP/1.1");
-    assert!(lines.contains(&"POST /api/token/ HTTP/1.1".to_string()));
-    assert!(lines.contains(&"POST /api/token/1/key HTTP/1.1".to_string()));
-    assert!(lines.contains(&"GET /api/user/self HTTP/1.1".to_string()));
+    assert!(lines.contains(&"POST /api/token/ HTTP/1.1"));
+    assert!(lines.contains(&"POST /api/token/1/key HTTP/1.1"));
+    assert!(lines.contains(&"GET /api/user/self HTTP/1.1"));
 
-    // 登录请求体必须是密文，绝不出现明文密码
-    let login_raw = &requests[2];
+    // 登录请求体必须是密文，绝不出现明文密码（按请求行定位，不按绝对下标）
+    let login_raw = requests
+        .iter()
+        .find(|r| r.starts_with("POST /api/user/login HTTP/1.1"))
+        .expect("有登录请求");
     assert!(
         !login_raw.contains(PASSWORD),
         "登录请求不得出现明文密码: {login_raw}"
