@@ -129,8 +129,40 @@ impl std::fmt::Debug for CaptchaChallenge {
 ///
 /// **只用于显示**：不改变任何请求用的 URL（请求仍用原始 `base_url`）。
 /// 宁可多掩：掩错了只影响显示，漏掩是泄漏。
+///
+/// M16-S3 P3-22：`mask_authority_userinfo` 的 authority 止于 `/` `?` `#`，
+/// 因此**口令里含未编码的分隔符**时它找不到 `@`：
+/// `https://u:pa/ss@host` ⇒ authority 是 `u:pa` ⇒ 不掩 ⇒ 明文口令进文案。
+/// 这里补一道站点侧兜底：结果里**仍含 `@`** 且该 `@` 之前出现过 `:`（userinfo 的形态）
+/// ⇒ 把最后一个 `@` 之前整段掩成 `***`（多掩只影响显示）。
+/// 根因在 `redact.rs`（道② 写域），本条只是站点侧的纵深防御。
 pub(crate) fn display_url(raw: &str) -> String {
-    crate::redact::mask_authority_userinfo(raw)
+    let masked = crate::redact::mask_authority_userinfo(raw);
+    let Some(at) = masked.rfind('@') else {
+        return masked;
+    };
+    let head = &masked[..at];
+    // `***@host`（已经掩过）不再处理：`head` 里没有 `:` 之外的可掩内容。
+    if head.contains("***") {
+        return masked;
+    }
+    // 只掩 authority 那一段（`://` 之后到 `@`），保留 scheme 与 host 供排障。
+    let authority_start = masked.find("://").map(|i| i + 3).unwrap_or(0);
+    let tail = &masked[authority_start..];
+    let head_end = tail.find(['/', '?', '#']).unwrap_or(tail.len());
+    // 判据**必须窄**：只有「authority 段里出现过 `:`（`user:pass` 的形态）」才兜底。
+    // 否则 `https://host/a@b`（路径里的 `@`，不是 userinfo）会被误掩成 `https://***@b`
+    // ——那是既有测试 `display_url_masks_only_the_userinfo` 明确禁止的过度掩码
+    // （把 host 一起掩掉会毁掉排障能力）。
+    if !tail[..head_end].contains(':') {
+        return masked;
+    }
+    format!(
+        "{}{}{}",
+        &masked[..authority_start],
+        crate::redact::MASK,
+        &masked[at..]
+    )
 }
 
 /// 会话凭证。**禁止** derive Debug 泄露 cookie/token，故手写 `Debug`。
@@ -511,11 +543,35 @@ pub async fn fetch_models<T: crate::site::transport::HttpTransport>(
         .collect())
 }
 
+/// 站点原文进错误文案前的**统一处理**（M16-S3 P3-19）。
+///
+/// 站点回的是**外部输入**，它可能：
+/// ① 极长（实测有回 200KB 原文的）⇒ 整段进错误文案会把界面/日志撑爆；
+/// ② 含控制字符（`ESC` / RLO / CRLF）⇒ 能伪造多行日志、翻转显示方向；
+/// ③ 回显凭据（站点自己的日志、风控提示）⇒ 过 [`crate::redact::scrub`]。
+///
+/// 三条按顺序做：先剥控制字符（否则截断可能把多字节控制序列切一半）、
+/// 再截断（按 `char` 计数，不切坏 UTF-8）、最后 scrub。
+///
+/// 注意：`scrub` 的**形态表**（裸 JWT、`password=` 明文）在 `redact.rs`（道② 写域），
+/// 本函数只负责站点侧这一层的长度与字符集收口。
+pub(crate) const MAX_SITE_MESSAGE_CHARS: usize = 512;
+
+pub(crate) fn site_text_for_error(message: &str) -> String {
+    let cleaned: String = message.chars().filter(|c| !c.is_control()).collect();
+    let total = cleaned.chars().count();
+    let mut out: String = cleaned.chars().take(MAX_SITE_MESSAGE_CHARS).collect();
+    if total > MAX_SITE_MESSAGE_CHARS {
+        out.push_str(&format!("…（站点原文共 {total} 字符，已截断）"));
+    }
+    crate::redact::scrub(&out)
+}
+
 /// 统一 HTTP 错误映射。适配器在拿到非 2xx 响应后必须调用本函数。
 ///
 /// **密钥红线（M6-S6 / 关闭 B-75）**：站点返回的 `message` 是**外部输入**，可能回显密钥
 /// （站点自己的日志文案、风控提示、回显请求体等）。它在被拼进 [`Error`] 之前一律过
-/// [`crate::redact::scrub`]。
+/// [`site_text_for_error`]（剥控制字符 + 截断 + [`crate::redact::scrub`]，M16-S3 P3-19）。
 ///
 /// 为什么把脱敏放在这里而不是逐个调用点：本函数是**全部适配器**把非 2xx 响应变成
 /// `Error` 的唯一咽喉，改一处即覆盖现存 14 个裸调用点与 4 个已包 `scrub_error` 的调用点，
@@ -531,7 +587,7 @@ pub fn map_http_error(status: u16, body: &[u8], retry_after_secs: Option<u64>) -
         .to_string();
     // 只对**站点原文**脱敏：下面的兜底文案是本产品自己的字面量，不经过这里，因此逐字不变。
     // `scrub` 幂等（`redact.rs` 文档），与调用点上的 `scrub_error` 叠加无副作用。
-    let message = crate::redact::scrub(
+    let message = site_text_for_error(
         parsed
             .as_ref()
             .and_then(|v| {
@@ -730,6 +786,70 @@ mod tests {
         let text = format!("{c:?}");
         assert!(!text.contains("hunter2"));
         assert!(text.contains("me@example.com"));
+    }
+
+    // ============================================================ M16-S3 P3-19 / P3-22
+
+    #[test]
+    fn site_text_for_error_truncates_and_strips_control_chars() {
+        // ① 200KB 原文：错误文案必须有长度上界
+        let huge = "x".repeat(200_000);
+        let out = site_text_for_error(&huge);
+        assert!(
+            out.chars().count() < MAX_SITE_MESSAGE_CHARS + 64,
+            "截断后长度 {} 应有上界",
+            out.chars().count()
+        );
+        assert!(out.contains("已截断"), "{out}");
+        // ② 控制字符（ESC / RLO / CRLF）必须剥掉：它们能伪造多行日志、翻转显示方向
+        let nasty = "boom\u{1b}[31m\u{202e}evil\r\nsecond line";
+        let out = site_text_for_error(nasty);
+        assert!(!out.chars().any(|c| c.is_control()), "{out:?}");
+        assert!(out.contains("boom"), "{out:?}");
+        // ③ scrub 仍然生效（凭据形态）
+        let out = site_text_for_error("key sk-abcdefgh12345678 无效");
+        assert!(!out.contains("sk-abcdefgh12345678"), "{out}");
+    }
+
+    #[test]
+    fn map_http_error_truncates_a_huge_site_message() {
+        let body = serde_json::json!({"message": "x".repeat(200_000)}).to_string();
+        let err = map_http_error(400, body.as_bytes(), None);
+        let text = err.to_string();
+        assert!(
+            text.chars().count() < 2_000,
+            "站点原文整段进文案了（{} 字符）",
+            text.chars().count()
+        );
+        // 控制字符不进文案
+        let body = serde_json::json!({"message": "a\u{202e}b\r\nc"}).to_string();
+        let text = map_http_error(400, body.as_bytes(), None).to_string();
+        assert!(!text.chars().any(|c| c.is_control()), "{text:?}");
+    }
+
+    #[test]
+    fn display_url_falls_back_when_the_password_contains_a_delimiter() {
+        // P3-22：口令含未编码的 `/` `?` `#` 时 `mask_authority_userinfo` 找不到 `@`
+        // （authority 提前终止）⇒ 站点侧兜底整段掩掉 authority。
+        for (raw, expected) in [
+            ("https://u:pa/ss@host", "https://***@host"),
+            ("https://u:p?w@host", "https://***@host"),
+            ("https://u:p#w@host", "https://***@host"),
+            // 已掩过的形态不重复处理
+            ("https://alice:pw@host", "https://***@host"),
+            // 无 userinfo ⇒ 逐字不变
+            ("https://plain.example.com", "https://plain.example.com"),
+            (
+                "https://plain.example.com/a@b",
+                "https://plain.example.com/a@b",
+            ),
+        ] {
+            assert_eq!(display_url(raw), expected, "输入 {raw}");
+        }
+        // 无 scheme + query 里带 URL：内层 userinfo 掩住，外层 host 保留
+        let masked = display_url("host:8080/x?next=https://u:p@h2");
+        assert!(!masked.contains("u:p"), "{masked}");
+        assert!(masked.contains("host:8080"), "host 要留着供排障: {masked}");
     }
 
     #[test]

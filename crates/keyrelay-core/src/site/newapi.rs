@@ -294,10 +294,11 @@ fn safe_path_segment(id: &str) -> Result<&str> {
 
 /// 带操作上下文的失败归类。
 ///
-/// 站点原文先过 `redact::scrub`（BACKLOG B-36：`AuthFailed` 直接携带站点原文，
-/// 若站点把密钥回显在错误文案里就会原样外流）。
+/// 站点原文先过 [`super::site_text_for_error`]（剥控制字符 + 截断 + `redact::scrub`；
+/// BACKLOG B-36：`AuthFailed` 直接携带站点原文，若站点把密钥回显在错误文案里就会原样外流。
+/// M16-S3 P3-19 补上长度与字符集两道）。
 fn classify_failure(op: &str, message: &str) -> Error {
-    let scrubbed = crate::redact::scrub(message);
+    let scrubbed = super::site_text_for_error(message);
     match classify_login_message(&scrubbed) {
         Error::AuthFailed(detail) => Error::AuthFailed(format!("{op}被站点拒绝（{detail}）")),
         // 验证码 / 二次验证与操作无关，保持原样

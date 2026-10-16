@@ -207,8 +207,13 @@ pub fn step(phase: CaptchaPhase, event: CaptchaEvent) -> CaptchaPhase {
     use CaptchaPhase as P;
     match (phase, event) {
         // T1：登录被要求人机验证 ⇒ 进人工态（**登录流程不报错结束**）。
-        // `challenge.site_id` 与事件里的站点不一致时视为 `LoginFailed`（防御：宁可退回
-        // 空闲态让用户重试，也不要把「另一个站点的挑战」挂到这个站点上）。
+        //
+        // M16-S3 P3-23（口径订正）：这里**没有**任何 `site_id` 一致性校验，也做不到——
+        // `CaptchaEvent::LoginRejected` 只带 `challenge`，不带「当前站点」，
+        // 生产路径到不了「比较两者」这一步。原先的注释声称「不一致时视为 `LoginFailed`」，
+        // 与事实不符（DEBUG-REPORT-v3 §3-23）。相位里的 `site_id` 是**展示用**的
+        // （界面显示「哪个站点在等人机验证」）；要防「挑战挂错站点」得由调用方在构造
+        // 事件时保证（`commands.rs` 的 `captcha_begin` 按站点建 challenge）。
         (P::Idle, E::LoginRejected { challenge }) => P::AwaitingHuman {
             site_id: challenge.site_id,
             challenge,
