@@ -33,6 +33,7 @@ pub const COMMANDS: &[&str] = &[
     "detect_system_proxy",
     "refresh_all",
     "audit_redaction",
+    "report_ui_ready",
     "gateway_status",
     "gateway_start",
     "gateway_stop",

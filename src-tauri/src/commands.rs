@@ -1438,14 +1438,13 @@ pub async fn gateway_rotate_token(
         let run = guard.as_ref().ok_or_else(|| "网关已不在运行".to_string())?;
         // args 一致性校验：前端传来的 site/key 必须与启动时一致，否则拒绝，
         // 避免「以为在轮换 A 站令牌、实际切到 B 站」。
-        if let Some(args) = args {
-            if args.site_id != run.site_id || args.key_id != run.key_id {
-                return Err(format!(
-                    "轮换令牌不切换站点/密钥：网关运行在站点 #{} 密钥 #{}，但参数指向站点 #{} 密钥 #{}",
-                    run.site_id, run.key_id, args.site_id, args.key_id
-                ));
-            }
-        }
+        //
+        // P2-14：这一步**必须**在 `rotate_gateway_token` **之前**（下面第 1466 行那条注释
+        // 写的就是这个顺序）。抽成纯函数是为了让「先校验后换令牌」这条可被单测钉住。
+        rotation_args_are_consistent(
+            (run.site_id, run.key_id),
+            args.map(|args| (args.site_id, args.key_id)),
+        )?;
         (run.site_id, run.key_id)
     };
 
@@ -1475,7 +1474,7 @@ pub async fn gateway_rotate_token(
     let config = state
         .service
         .gateway_config(site_id, key_id, port)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("令牌已换，但新令牌无法用于网关（网关仍用旧令牌运行，请重启网关）：{e}"))?;
 
     // take + stop + start（用运行态的 site_id/key_id，与启动时相同）。
     let run = state
@@ -1565,14 +1564,101 @@ pub fn export_bundle(
 /// 「已知导出物」表、都会被 `audit_redaction` 扫到，散在两个目录只会让用户
 /// 在报障时找错地方。
 fn default_export_path(prefix: &str) -> std::path::PathBuf {
+    default_export_path_in(&exports_dir(), prefix)
+}
+
+/// 诊断包/导出物的**允许目录**：`<home>/.keyrelay/exports`。
+fn exports_dir() -> std::path::PathBuf {
+    crate::home_dir().join(".keyrelay").join("exports")
+}
+
+fn default_export_path_in(dir: &std::path::Path, prefix: &str) -> std::path::PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    crate::home_dir()
-        .join(".keyrelay")
-        .join("exports")
-        .join(format!("{prefix}-{stamp}.json"))
+    dir.join(format!("{prefix}-{stamp}.json"))
+}
+
+/// 诊断包导出文件名白名单前缀（P3-18）。
+const DIAGNOSTICS_FILE_PREFIX: &str = "keyrelay-diagnostics";
+
+/// 诊断包导出的**路径收敛**（P3-18）。
+///
+/// 背景：`export_diagnostics` 的 IPC `path` 参数此前是**任意路径**——它可以静默覆盖
+/// `~/.zshrc` 这类文件，也会跟随符号链接写到别处。诊断包是**用户主动导出**的东西，
+/// 它没有理由写到导出目录之外。
+///
+/// 允许两种形态：
+/// ① `requested` 为空 ⇒ 默认路径 `<dir>/keyrelay-diagnostics-<stamp>.json`；
+/// ② 给了路径 ⇒ 必须落在**导出目录内**、文件名以 `keyrelay-diagnostics` 开头、
+///    以 `.json` 结尾，且**不得**含 `..`；目标已存在且是**符号链接**时拒绝（不跟随）。
+///
+/// 拒绝时返回可读原因（含被拒路径原文）：**不静默改成默认路径**——静默改道会让调用方
+/// 以为文件写到了自己指定的地方，而实际上没有。
+fn resolve_diagnostics_path(
+    home: &std::path::Path,
+    requested: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
+    let dir = home.join(".keyrelay").join("exports");
+    let Some(raw) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(default_export_path_in(&dir, DIAGNOSTICS_FILE_PREFIX));
+    };
+
+    // ① `..` 一律拒绝（不归一——归一之后就没法告诉用户「你写的路径越界了」）
+    let raw_path = std::path::Path::new(raw);
+    if raw_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "诊断包只能导出到 {} 内的 {DIAGNOSTICS_FILE_PREFIX}-*.json；被拒路径：{raw}（不允许 `..`）",
+            dir.display()
+        ));
+    }
+
+    // ② 相对路径按导出目录解析；绝对路径必须**就在**导出目录里
+    let candidate = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        dir.join(raw_path)
+    };
+
+    // ③ 父目录必须与导出目录是同一个（目录已存在时用 `canonicalize` 消除符号链接差异；
+    //    目录还不存在时按字面比较——`create_dir_all` 之后就是它）
+    let parent = candidate.parent().unwrap_or(std::path::Path::new(""));
+    let same_dir = match (parent.canonicalize(), dir.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => parent == dir,
+    };
+    if !same_dir {
+        return Err(format!(
+            "诊断包只能导出到 {} 内；被拒路径：{raw}",
+            dir.display()
+        ));
+    }
+
+    // ④ 文件名白名单：前缀 + `.json`
+    let name = candidate
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if !name.starts_with(DIAGNOSTICS_FILE_PREFIX) || !name.ends_with(".json") {
+        return Err(format!(
+            "诊断包文件名必须是 {DIAGNOSTICS_FILE_PREFIX}-*.json；被拒路径：{raw}"
+        ));
+    }
+
+    // ⑤ 目标已存在且是符号链接 ⇒ 拒绝（不跟随；否则等于允许写到链接指向的任何地方）
+    if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "诊断包目标已存在且是符号链接（拒绝跟随）；被拒路径：{raw}"
+            ));
+        }
+    }
+
+    Ok(candidate)
 }
 
 /// 导出诊断包（FR-9:196）。**脱敏后的**事件表 + 白名单设置快照 + 版本信息。
@@ -1585,10 +1671,8 @@ pub fn export_diagnostics(
     state: State<'_, AppState>,
     args: DiagnosticsArgs,
 ) -> Result<DiagnosticsResultDto, String> {
-    let path = match args.path {
-        Some(path) if !path.trim().is_empty() => std::path::PathBuf::from(path),
-        _ => default_export_path("keyrelay-diagnostics"),
-    };
+    // P3-18：`path` 不再是任意路径——收敛到导出目录 + 文件名白名单（越界一律拒绝）。
+    let path = resolve_diagnostics_path(&crate::home_dir(), args.path.as_deref())?;
     state
         .service
         .export_diagnostics_to_file(&path, args.limit.unwrap_or(DEFAULT_DIAGNOSTIC_EVENTS))
@@ -1610,6 +1694,35 @@ pub fn prune_backups(
         .service
         .prune_backups(args.keep)
         .map(|removed| PruneResultDto { removed })
+        .map_err(|e| e.to_string())
+}
+
+/// 界面「起来了」的一次**显式**上报（M16-S6a 追加项）。
+///
+/// # 为什么需要这条命令
+///
+/// GUI 真机走查（M16-S7）实测：macOS 的 AX 树里看不到 WebView 内部
+/// （`entire contents of window 1` = 0），截图又不稳定 ⇒ 自动化**没有任何可靠判据**
+/// 判断「界面真的起来了」。有了这条之后：
+/// ① 走查脚本轮询临时库里的 `ui_ready_at` 就能得到**真正的端到端冷启动**时间；
+/// ② B-15「invoke 真实往返」从「AX 看不到 ⇒ 不可证」变成「`ui_ready_at` 有值 ⇒ 前端确实
+///    调通过一次 IPC」。
+///
+/// # 为什么必须由**前端显式调用**
+///
+/// 后端自己写等于什么都没证明（那只说明进程起来了）。**不**在启动路径里自动写。
+///
+/// 幂等：重复调用覆盖时间戳（前端每次进入就绪态都会调一次）。
+#[tauri::command]
+pub fn report_ui_ready(state: State<'_, AppState>) -> Result<(), String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    state
+        .service
+        .store()
+        .set_setting("ui_ready_at", &now_ms.to_string())
         .map_err(|e| e.to_string())
 }
 
@@ -1824,6 +1937,13 @@ pub struct RotationRunDto {
     /// 三步是否都没中途失败。**界面不得只看它**——`skippedNoRemoteId` 也算完成，
     /// 但那是「本来就没得回收」，必须单独说明。
     completed: bool,
+    /// P2-7：轮换后网关是否**已用新密钥重启**。
+    ///
+    /// `false` 有三种情形，用 `gatewayNote` 区分：① 网关本来没在跑（最常见，`None`）；
+    /// ② 网关跑在**别的**站点上（note 说明）；③ 重启失败（note 说明「网关已停，请手动启动」）。
+    gateway_restarted: bool,
+    /// 与 `gateway_restarted` 配对的原因（已脱敏）。`None` = 无需说明。
+    gateway_note: Option<String>,
 }
 
 /// 执行轮换（FR-7，PRD §176 的「一键三连」）。
@@ -1837,6 +1957,10 @@ pub async fn rotate_key(
     key_id: i64,
     name: String,
 ) -> Result<RotationRunDto, String> {
+    // P2-7（跨文件半）：与 gateway_start / gateway_stop / gateway_rotate_token 串行——
+    // 「停旧 → 绑新」不能与它们的序列交错（同一把 `gateway_op`）。
+    let _op = state.gateway_op.lock().await;
+
     let run = state
         .service
         .rotate_key(key_id, keyrelay_core::site::KeySpec::named(name))
@@ -1852,6 +1976,24 @@ pub async fn rotate_key(
             ("failed".to_string(), Some(reason.clone()))
         }
     };
+
+    // P2-7：轮换把站点侧那把旧 key 回收了，运行中的网关若还用**旧 key_id** 取明文，
+    // 之后每一次请求都只会 502，直到用户手动重启网关。这里照 `gateway_rotate_token`
+    // 的做法，用**新 key_id** 重建 config 并重启。
+    //
+    // 失败**不**把整次轮换报成失败：轮换的三步已经成功、密钥已经换过；报成失败会诱导
+    // 用户重试，而重试会再建一把 key。改为在 DTO 里带 `gatewayRestarted=false` + 原因。
+    let (gateway_restarted, gateway_note) =
+        match restart_gateway_after_rotation(&state, key_id, run.new_key.id).await {
+            Ok(RotationGatewayRestart::Restarted) => (true, None),
+            Ok(RotationGatewayRestart::NotRunning) => (false, None),
+            Ok(RotationGatewayRestart::OtherSite) => (
+                false,
+                Some("网关正在别的站点上运行，未重启（轮换不影响它）".to_string()),
+            ),
+            Err(note) => (false, Some(note)),
+        };
+
     Ok(RotationRunDto {
         new_key_id: run.new_key.id,
         new_key_masked: run.new_key.masked.clone(),
@@ -1861,7 +2003,106 @@ pub async fn rotate_key(
         stopped_at: run.stopped_at.map(|step| step.as_str().to_string()),
         stop_reason: run.stop_reason.clone(),
         completed: run.completed(),
+        gateway_restarted,
+        gateway_note,
     })
+}
+
+/// P2-14 的**判据**（纯函数，单独可测）：`gateway_rotate_token` 的 `args` 与运行态是否一致。
+///
+/// - `args = None`（前端没传）⇒ 放行：令牌轮换的语义是「不换站、不换密钥」，
+///   运行态就是唯一事实来源（P1-6）。
+/// - `args = Some(_)` 且与运行态不符 ⇒ 拒绝。**这一步必须在换令牌之前**——
+///   换完再拒会让「令牌已换、网关还在用旧令牌」，用户看到的是永久的 401/502。
+fn rotation_args_are_consistent(
+    running: (i64, i64),
+    args: Option<(i64, i64)>,
+) -> Result<(), String> {
+    match args {
+        Some((site_id, key_id)) if (site_id, key_id) != running => Err(format!(
+            "轮换令牌不切换站点/密钥：网关运行在站点 #{} 密钥 #{}，但参数指向站点 #{} 密钥 #{}",
+            running.0, running.1, site_id, key_id
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// 轮换后网关重启的三种结局。
+enum RotationGatewayRestart {    /// 网关没在跑（最常见）——什么都不做。
+    NotRunning,
+    /// 网关跑在**别的**站点上——不动它（不把网关悄悄切到被轮换的站点）。
+    OtherSite,
+    /// 已用新 key_id 重启。
+    Restarted,
+}
+
+/// P2-7 的**判据**（纯函数，单独可测）：该不该为这次轮换重启网关。
+///
+/// 两个条件都必需：① 网关在跑；② 它跑的正是**被轮换那把 key 所属的站点**。
+/// 只判①会把网关切到别的站点；只判②会在网关没跑时白起一个。
+fn should_restart_gateway_after_rotation(running_site: Option<i64>, key_site: Option<i64>) -> bool {
+    matches!((running_site, key_site), (Some(a), Some(b)) if a == b)
+}
+
+/// P2-7 的执行体：take + stop + drain + end_session + 用 `new_key_id` 重建 config + start。
+///
+/// `Err(note)` 表示「轮换成功但网关没起来」——note 是给用户看的原因（已脱敏）。
+async fn restart_gateway_after_rotation(
+    state: &AppState,
+    rotated_key_id: i64,
+    new_key_id: i64,
+) -> Result<RotationGatewayRestart, String> {
+    let running = match state.gateway.lock() {
+        Ok(guard) => guard.as_ref().map(|run| (run.site_id, run.key_id)),
+        Err(_) => return Err("网关状态锁失效（需要重启应用）".to_string()),
+    };
+    let Some((site_id, _running_key_id)) = running else {
+        return Ok(RotationGatewayRestart::NotRunning);
+    };
+
+    // 被轮换的 key 属于哪个站点：用 `stored_keys()` 的现成结果，不新开查询路径。
+    let key_site = state
+        .service
+        .stored_keys()
+        .ok()
+        .and_then(|rows| rows.into_iter().find(|row| row.id == rotated_key_id))
+        .map(|row| row.site_id);
+    if !should_restart_gateway_after_rotation(Some(site_id), key_site) {
+        return Ok(RotationGatewayRestart::OtherSite);
+    }
+
+    // 先构造 config（新 key_id）——它失败时网关**还没停**，用户手上的东西不受影响。
+    let port = state
+        .service
+        .settings()
+        .map_err(|e| e.to_string())?
+        .gateway_port;
+    let config = state
+        .service
+        .gateway_config(site_id, new_key_id, port)
+        .map_err(|e| format!("轮换已成功，但新密钥无法用于网关（网关未动）：{e}"))?;
+
+    // take + stop + drain + end_session（与 gateway_rotate_token 同款序列）
+    let run = match state.gateway.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => None,
+    }
+    .ok_or_else(|| "网关已不在运行（轮换已完成）".to_string())?;
+    stop_gateway(run.handle).await;
+    state.service.drain_gateway_failures();
+    state.service.end_gateway_session();
+
+    let handle = keyrelay_core::gateway::start(config)
+        .await
+        .map_err(|e| format!("轮换已成功，但网关重启失败（网关已停，请手动启动）：{e}"))?;
+    if let Ok(mut guard) = state.gateway.lock() {
+        *guard = Some(GatewayRunning {
+            handle,
+            site_id,
+            key_id: new_key_id,
+        });
+    }
+    Ok(RotationGatewayRestart::Restarted)
 }
 
 #[derive(Serialize)]
@@ -2195,6 +2436,9 @@ pub async fn captcha_begin<R: tauri::Runtime>(
     state: State<'_, AppState>,
     site_id: i64,
 ) -> Result<CaptchaChallengeDto, String> {
+    // P3-15：与 captcha_complete / captcha_cancel 串行（三个命令共用 `captcha_op`）
+    let _op = state.captcha_op.lock().await;
+
     // ① 相位必须是「等待人工验证」——不在人工态时明确拒绝，而不是打开一个空白窗口
     let challenge = state
         .service
@@ -2265,11 +2509,13 @@ pub async fn captcha_complete<R: tauri::Runtime>(
     state: State<'_, AppState>,
     site_id: i64,
 ) -> Result<(), String> {
+    // P3-15：整段（读相位 → 抓 cookie → 提交）都在锁内。修前这里没有锁，
+    // 用户可以在「接上会话中」点取消（`captcha_cancel` 是另一个命令），
+    // 于是取消与提交交错：要么取消被覆盖，要么会话在取消之后被接上。
+    let _op = state.captcha_op.lock().await;
+
     // ① 相位必须是「等待人工验证」（T7：不在人工态的提交一律拒绝，不建会话）
-    if !matches!(
-        state.service.captcha_phase(site_id),
-        keyrelay_core::site::captcha::CaptchaPhase::AwaitingHuman { .. }
-    ) {
+    if !captcha_submit_is_allowed(&state.service.captcha_phase(site_id)) {
         return Err("该站点当前不在等待人工验证：请先在「站点」页重新发起登录。".to_string());
     }
 
@@ -2309,6 +2555,16 @@ pub async fn captcha_complete<R: tauri::Runtime>(
         .collect();
 
     // ⑤ 校验 + 接上会话；失败时窗口**留着**、相位留在人工态，用户可以重试
+    //
+    // P3-15 的双保险：抓 cookie 这一步跨了 `await`（窗口是另一个线程），提交之前**再查一次**
+    // 相位。锁已经把命令层的并发入口串起来了，这里再查一次是为了防「锁之外的相位变化」
+    // （例如将来有人加了别的写入点）——不在人工态就拒绝，且**不关窗**（窗口留给用户看）。
+    if !captcha_submit_is_allowed(&state.service.captcha_phase(site_id)) {
+        return Err(
+            "该站点当前已不在等待人工验证（可能已被取消）：本次提交已忽略，窗口保持打开。"
+                .to_string(),
+        );
+    }
     state
         .service
         .complete_captcha(site_id, pairs)
@@ -2326,11 +2582,27 @@ pub async fn captcha_cancel<R: tauri::Runtime>(
     state: State<'_, AppState>,
     site_id: i64,
 ) -> Result<(), String> {
+    // P3-15：与 captcha_begin / captcha_complete 串行。取不到锁就一直等——「取消」是
+    // 幂等的（service 层不在人工态时是 no-op），排队执行不会产生副作用。
+    let _op = state.captcha_op.lock().await;
+
     state.service.cancel_captcha(site_id);
     if let Some(window) = app.get_webview_window(&captcha_window_label(site_id)) {
         let _ = window.destroy();
     }
     Ok(())
+}
+
+/// P3-15 的**判据**（纯函数，单独可测）：当前相位是否允许提交人工验证的结果。
+///
+/// 只有 `AwaitingHuman` 允许：`Idle`（没在等人 / 已被取消 / 已提交过）一律拒绝。
+/// 抽成函数是为了让「取消之后不能再提交」这条**可被单测钉住**——内联的 `matches!`
+/// 只有读代码才能验证。
+fn captcha_submit_is_allowed(phase: &keyrelay_core::site::captcha::CaptchaPhase) -> bool {
+    matches!(
+        phase,
+        keyrelay_core::site::captcha::CaptchaPhase::AwaitingHuman { .. }
+    )
 }
 
 // ---- M15-S1：模型检测（bazaarlink probe）----
@@ -2937,5 +3209,150 @@ mod tests {
             Some("[::1]")
         );
         assert_eq!(site_host_of("https://").as_deref(), None);
+    }
+
+    // ---- P3-18：诊断包导出路径收敛 ----
+
+    /// T1：不传路径 ⇒ 默认落在导出目录内、文件名符合白名单。
+    #[test]
+    fn diagnostics_default_path_is_inside_the_exports_dir() {
+        let home = tempfile::tempdir().expect("临时 home");
+        let path = resolve_diagnostics_path(home.path(), None).expect("默认路径必须可用");
+        assert_eq!(path.parent().unwrap(), home.path().join(".keyrelay/exports"));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("keyrelay-diagnostics"), "文件名: {name}");
+        assert!(name.ends_with(".json"), "文件名: {name}");
+    }
+
+    /// T2：四类越界**逐条**被拒（目录外 / 文件名不符 / `..` / 符号链接）。
+    ///
+    /// 这条是 P3-18 的**证伪**：修前这四类都会被 `export_diagnostics_to_file` 真的写下去
+    /// （`create_dir_all` + `fs::write`，见 `service.rs:4380-4384`）。
+    #[test]
+    fn diagnostics_rejects_every_out_of_bounds_path() {
+        let home = tempfile::tempdir().expect("临时 home");
+        let exports = home.path().join(".keyrelay/exports");
+        std::fs::create_dir_all(&exports).expect("建导出目录");
+
+        // ① 目录外（绝对路径）：`~/.zshrc` 与 `/tmp/...` 都在这类
+        for outside in [
+            home.path().join(".zshrc"),
+            std::env::temp_dir().join("kr-s6a-outside.json"),
+        ] {
+            let err = resolve_diagnostics_path(home.path(), Some(&outside.display().to_string()))
+                .expect_err("目录外路径必须被拒");
+            assert!(err.contains("只能导出到"), "文案: {err}");
+        }
+
+        // ② 文件名不符（目录对、名字不对）
+        let wrong_name = exports.join("other.json");
+        assert!(
+            resolve_diagnostics_path(home.path(), Some(&wrong_name.display().to_string())).is_err(),
+            "非白名单文件名必须被拒"
+        );
+
+        // ③ `..`（哪怕最终落在导出目录里也拒——归一之后就说不清用户到底想写哪儿）
+        let dotted = exports.join("../exports/keyrelay-diagnostics-1.json");
+        let err = resolve_diagnostics_path(home.path(), Some(&dotted.display().to_string()))
+            .expect_err("含 `..` 必须被拒");
+        assert!(err.contains(".."), "文案: {err}");
+
+        // ④ 符号链接：目标已存在且是链接 ⇒ 拒绝跟随
+        #[cfg(unix)]
+        {
+            let link = exports.join("keyrelay-diagnostics-link.json");
+            std::os::unix::fs::symlink(home.path().join(".zshrc"), &link).expect("建符号链接");
+            let err = resolve_diagnostics_path(home.path(), Some(&link.display().to_string()))
+                .expect_err("符号链接必须被拒");
+            assert!(err.contains("符号链接"), "文案: {err}");
+        }
+    }
+
+    /// T3：正向对照——白名单内的路径**必须通过**（防「一律拒绝」的假修复）。
+    #[test]
+    fn diagnostics_accepts_whitelisted_paths() {
+        let home = tempfile::tempdir().expect("临时 home");
+        let exports = home.path().join(".keyrelay/exports");
+
+        // 绝对路径 + 白名单文件名
+        let ok = exports.join("keyrelay-diagnostics-1.json");
+        assert_eq!(
+            resolve_diagnostics_path(home.path(), Some(&ok.display().to_string())).unwrap(),
+            ok
+        );
+
+        // 相对路径（按导出目录解析）
+        assert_eq!(
+            resolve_diagnostics_path(home.path(), Some("keyrelay-diagnostics-2.json")).unwrap(),
+            exports.join("keyrelay-diagnostics-2.json")
+        );
+
+        // 空白串等同「没传」
+        assert_eq!(
+            resolve_diagnostics_path(home.path(), Some("   ")).unwrap(),
+            resolve_diagnostics_path(home.path(), None).unwrap()
+        );
+    }
+
+    /// T4：已有**普通文件**时不得被误判成符号链接（否则等于禁掉覆盖写）。
+    #[test]
+    fn diagnostics_allows_overwriting_a_regular_file() {
+        let home = tempfile::tempdir().expect("临时 home");
+        let exports = home.path().join(".keyrelay/exports");
+        std::fs::create_dir_all(&exports).expect("建导出目录");
+        let path = exports.join("keyrelay-diagnostics-3.json");
+        std::fs::write(&path, "{}").expect("先放一个普通文件");
+        assert_eq!(
+            resolve_diagnostics_path(home.path(), Some(&path.display().to_string())).unwrap(),
+            path
+        );
+    }
+
+    // ---- P2-7：轮换后是否重启网关 ----
+
+    /// T6：只有「网关在跑 **且** 跑的正是被轮换 key 的站点」才重启。
+    ///
+    /// 三个负例各防一种错：没跑却去重启（白起一个）、跑在别的站点却重启（把网关切走）、
+    /// key 查不到站点（不确定时不动）。
+    #[test]
+    fn gateway_restart_decision_requires_the_same_site() {
+        assert!(should_restart_gateway_after_rotation(Some(7), Some(7)));
+        assert!(!should_restart_gateway_after_rotation(None, Some(7)));
+        assert!(!should_restart_gateway_after_rotation(Some(7), Some(8)));
+        assert!(!should_restart_gateway_after_rotation(Some(7), None));
+    }
+
+    // ---- P2-14：令牌轮换的参数一致性 ----
+
+    /// T7：参数不符 ⇒ 拒绝；没传 ⇒ 放行（运行态是唯一事实来源）。
+    ///
+    /// 这条钉的是**判据**；「校验发生在换令牌之前」由 `gateway_rotate_token` 的调用顺序保证
+    /// （见该函数里 `rotation_args_are_consistent(...)` 与 `rotate_gateway_token()` 的先后）。
+    #[test]
+    fn rotation_args_must_match_the_running_gateway() {
+        assert!(rotation_args_are_consistent((3, 9), None).is_ok());
+        assert!(rotation_args_are_consistent((3, 9), Some((3, 9))).is_ok());
+        let err = rotation_args_are_consistent((3, 9), Some((4, 9))).expect_err("站点不符必须拒绝");
+        assert!(err.contains("不切换站点"), "文案: {err}");
+        assert!(rotation_args_are_consistent((3, 9), Some((3, 8))).is_err());
+    }
+
+    // ---- P3-15：人工验证的相位守卫 ----
+
+    /// T8：只有 `AwaitingHuman` 允许提交；`Idle`（含「已被取消」）一律拒绝。
+    #[test]
+    fn captcha_submit_requires_the_awaiting_human_phase() {
+        use keyrelay_core::site::captcha::CaptchaPhase;
+        use keyrelay_core::site::CaptchaChallenge;
+        let awaiting = CaptchaPhase::AwaitingHuman {
+            site_id: 1,
+            challenge: CaptchaChallenge {
+                site_id: 1,
+                url: "https://relay.example.com/login".to_string(),
+            },
+        };
+        assert!(captcha_submit_is_allowed(&awaiting));
+        // 取消之后相位回 `Idle` ⇒ 提交必须被拒（修前这条竞态会让会话被接上）
+        assert!(!captcha_submit_is_allowed(&CaptchaPhase::Idle));
     }
 }
