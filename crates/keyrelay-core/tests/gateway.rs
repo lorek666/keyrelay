@@ -676,3 +676,121 @@ async fn empty_route_table_keeps_legacy_behaviour() {
     );
     assert!(raw.contains("0.50"), "数值形态不得被重序列化改写: {raw}");
 }
+
+// ============================================================ M16-S4：legacy 路径的已回收守卫
+
+/// 起一个 legacy（空路由表）网关，并可控地设置「已回收集合」与失败事件出口。
+async fn start_legacy_with_guard(
+    upstream: &FakeUpstream,
+    legacy_key_ref: Option<&str>,
+    revoked: Option<&[&str]>,
+) -> (
+    GatewayHandle,
+    String,
+    Arc<Mutex<Vec<keyrelay_core::gateway::GatewayFailure>>>,
+) {
+    let token = generate_token();
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&failures);
+    let mut config = GatewayConfig::single_upstream(
+        0,
+        token.clone(),
+        upstream.base_url.clone(),
+        zeroize::Zeroizing::new(SITE_KEY.to_string()),
+        "假站点".to_string(),
+    );
+    config.site_id = 7;
+    config.legacy_key_ref = legacy_key_ref.map(str::to_string);
+    config.revoked_refs = revoked.map(|refs| {
+        Arc::new(Mutex::new(refs.iter().map(|r| (*r).to_string()).collect()))
+    });
+    config.on_failure = Some(Arc::new(move |f| {
+        if let Ok(mut log) = sink.lock() {
+            log.push(f);
+        }
+    }));
+    let handle = start(config).await.expect("网关应能启动");
+    (handle, token, failures)
+}
+
+/// P3-4 + P2-7 + B-111：legacy 路径的密钥**已被回收**时，拒绝转发并留一条事件。
+///
+/// 为什么必须有这条：M8-S4 起密钥可以「一键轮换」，而运行中的网关手里是旧密钥的**快照**；
+/// 轮换后旧 key 在站点侧已删、本地被标成已回收，网关却还在用它 —— 用户看到的
+/// 是一个没有解释的 401/502。事件把「为什么」与「怎么办」写清楚。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_legacy_key_is_refused_and_reported() {
+    let upstream = spawn_fake_upstream();
+    let (handle, token, failures) = start_legacy_with_guard(
+        &upstream,
+        Some("kr/key/9/secret"),
+        Some(&["kr/key/9/secret"]),
+    )
+    .await;
+    let url = handle.local_url();
+
+    let (status, body) = tokio::task::spawn_blocking({
+        let url = url.clone();
+        let token = token.clone();
+        move || http_post(&url, &token, "/v1/chat/completions", "{}")
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(status, 503, "已回收的密钥必须被拒绝（不再发出去）: {body}");
+    assert!(
+        body.contains("已被回收"),
+        "文案要说清原因与出路（重启网关）: {body}"
+    );
+    assert_eq!(
+        upstream.seen.lock().unwrap().len(),
+        0,
+        "**一个字节都不该发给上游**（旧实现会继续用那把已回收的密钥）"
+    );
+
+    let log = failures.lock().unwrap().clone();
+    assert_eq!(log.len(), 1, "必须留一条事件（B-111 的唯一例外）: {log:?}");
+    assert_eq!(log[0].site_id, 7, "事件带 site_id");
+    assert_eq!(
+        log[0].status, 0,
+        "「没发出去」没有 HTTP 状态码 ⇒ 用 0 这个哨兵（编 503 会让事件说谎）"
+    );
+    assert!(
+        log[0].reason.contains("已被回收") && log[0].reason.contains("重启"),
+        "reason 要同时给出原因与出路: {}",
+        log[0].reason
+    );
+
+    handle.shutdown_and_wait().await;
+}
+
+/// B-111 的反向对照：legacy 路径的**上游失败**仍然不产生事件（M7 D-1 保持）。
+///
+/// 与上一条合起来才是完整口径：**配置类**失败（密钥已回收）写事件，
+/// **上游类**失败（状态码 / 传输错误）不写——空表路径在这一维度上逐字节不变。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_upstream_failures_still_write_no_event() {
+    let upstream = spawn_fake_upstream();
+    // `legacy_key_ref` 给一个**没有**被回收的引用 ⇒ 守卫不触发，走原路径
+    let (handle, token, failures) =
+        start_legacy_with_guard(&upstream, Some("kr/key/9/secret"), None).await;
+    let url = handle.local_url();
+
+    // `/v1/boom` 在假上游里恒回 429（上游类失败）
+    let (status, _) = tokio::task::spawn_blocking({
+        let url = url.clone();
+        let token = token.clone();
+        move || http_post(&url, &token, "/v1/boom", "{}")
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(status, 429, "上游状态码原样透传");
+    assert_eq!(upstream.seen.lock().unwrap().len(), 1, "应当发出去一次");
+    assert!(
+        failures.lock().unwrap().is_empty(),
+        "legacy 路径的上游失败**不得**产生事件（M7 D-1：空表路径与单上游时代逐字节相同）"
+    );
+
+    handle.shutdown_and_wait().await;
+}

@@ -368,6 +368,16 @@ pub struct GatewayConfig {
     /// `proxy::resolve_proxy`）。网关每次 `start()` 都重读最新 settings，因此代理变更
     /// **重启网关即生效**（站点适配器 transport 仍需重启 app）。
     pub upstream_proxy: Option<String>,
+    /// **legacy（空路由表）路径那把密钥的引用**（M16-S4 / P3-4）。
+    ///
+    /// 为什么需要它：legacy 路径只有 `api_key` 明文，没有引用 ⇒ 无法查 [`Self::revoked_refs`]
+    /// （M8-S1 §12.4 的守卫只覆盖多上游路径）。填了之后 legacy 路径会拒绝使用已回收的密钥，
+    /// 并把「为什么 / 怎么办」写进失败事件——这正是 P2-7（一键轮换后运行中的网关仍用旧密钥）
+    /// 在网关侧的显式语义。
+    ///
+    /// `None` = 不校验（[`GatewayConfig::single_upstream`] 的默认 ⇒ 既有调用方行为逐字不变）。
+    /// **由 `service.rs::gateway_config` 填充**（M16-S4 spec §12 W-3，道⑤/Lead 合并期打）。
+    pub legacy_key_ref: Option<String>,
 }
 
 /// 上游请求的两段超时。
@@ -515,6 +525,10 @@ impl GatewayConfig {
             on_observation: None,
             on_usage: None,
             upstream_proxy: None,
+            // P3-4：构造器不知道引用（签名逐字不变，M7-S0 §3.1 冻结）。
+            // `None` ⇒ legacy 路径的已回收守卫不生效，行为与改动前逐字相同；
+            // 服务层要启用它，就构造完再赋值（spec §12 W-3）。
+            legacy_key_ref: None,
         }
     }
 }
@@ -908,6 +922,46 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     if state.config.route.is_empty() {
         if is_stopping(&state) {
             return stopping_response();
+        }
+        // P3-4 / P2-7 / B-111：legacy 路径手里是**启动那一刻的密钥快照**。
+        // M8-S4 起密钥可以「一键轮换」，轮换后旧 key 在站点侧已删、在本地被标成
+        // 已回收，而运行中的网关还在用它 —— 用户看到的是一个没有解释的 401/502。
+        //
+        // 所以：引用被标记为已回收 ⇒ **拒绝转发**，并留一条 `status = 0` 的事件，
+        // 把「为什么」与「怎么办」写清楚（重启网关才会读到新密钥）。
+        // 这是 D-1「空表路径不产生失败事件」的**唯一例外**，而且是**配置类**失败：
+        // 上游失败那一维度仍然逐字节不变（见 `legacy_upstream_failures_still_write_no_event`）。
+        //
+        // `legacy_key_ref` 为 `None`（既有调用方 / `single_upstream`）⇒ 不校验，行为不变。
+        if let Some(reference) = state.config.legacy_key_ref.as_deref() {
+            let revoked = state
+                .config
+                .revoked_refs
+                .as_ref()
+                .map(|refs| {
+                    refs.lock()
+                        .map(|set| set.contains(reference))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if revoked {
+                let model = model_from_body(&body).unwrap_or_default();
+                report_event_only(
+                    &state,
+                    state.config.site_id,
+                    0,
+                    &model,
+                    "该密钥已被回收（可能刚做过一键轮换）；网关需要重启才会用上新密钥",
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({
+                        "error": "这把密钥已被回收（可能刚做过一键轮换）；\
+                                  请重启网关，让它读到新密钥"
+                    })),
+                )
+                    .into_response();
+            }
         }
         let url = format!("{}{}{}", state.config.base_url, path, query);
         let headers = upstream_headers(&state.config, &inbound, &state.config.api_key);
@@ -1342,6 +1396,14 @@ fn report_failure(
     if let Ok(mut guard) = state.breaker.lock() {
         guard.record_failure(site_id, now);
     }
+    report_event_only(state, site_id, status, model, reason);
+}
+
+/// 只上报事件，**不喂熔断**（M16-S4 / P3-4）。
+///
+/// 用于**配置类**失败（例如 legacy 路径的密钥已被回收）：它不是上游故障，
+/// 喂熔断会让「熔断」这个信号失去意义（下一次启动的熔断状态会被一次本地配置问题污染）。
+fn report_event_only(state: &AppState, site_id: i64, status: u16, model: &str, reason: &str) {
     if let Some(sink) = &state.config.on_failure {
         sink(GatewayFailure {
             site_id,
