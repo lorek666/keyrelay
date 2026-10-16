@@ -131,7 +131,10 @@ async fn start_routed(
     upstreams: &[(&FakeUpstream, f64)],
     breaker: BreakerPolicy,
 ) -> (GatewayHandle, String, Failures) {
-    let ups: Vec<Upstream> = upstreams.iter().map(|(u, rate)| u.upstream(*rate)).collect();
+    let ups: Vec<Upstream> = upstreams
+        .iter()
+        .map(|(u, rate)| u.upstream(*rate))
+        .collect();
     let keys: Vec<(&str, &str)> = upstreams
         .iter()
         .map(|(u, _)| {
@@ -139,14 +142,8 @@ async fn start_routed(
             (u.key_ref.as_str(), plain)
         })
         .collect();
-    let (handle, token, failures, _) = start_routed_full(
-        ups,
-        breaker,
-        UpstreamTimeout::default(),
-        None,
-        keys,
-    )
-    .await;
+    let (handle, token, failures, _) =
+        start_routed_full(ups, breaker, UpstreamTimeout::default(), None, keys).await;
     (handle, token, failures)
 }
 
@@ -238,10 +235,7 @@ fn dead_upstream(site_id: i64, key_ref: &str, rate: f64) -> Upstream {
 #[tokio::test]
 async fn route_and_keys_by_ref_must_agree() {
     /// 按「keys 里填哪些引用 / revoked 里标哪些」构造一份路由配置。
-    fn config_with(
-        keys: &[&str],
-        revoked: &[&str],
-    ) -> GatewayConfig {
+    fn config_with(keys: &[&str], revoked: &[&str]) -> GatewayConfig {
         let mut map = std::collections::HashMap::new();
         for r in keys {
             let plain = if *r == REF_A { KEY_A } else { KEY_B };
@@ -394,7 +388,11 @@ async fn a_503_response_is_not_replayed() {
 
     assert_eq!(status, 503, "503 必须原样返回（不再重放到第二个上游）");
     assert_eq!(a.request_count(), 1, "首选上游应当被试过一次");
-    assert_eq!(b.request_count(), 0, "**第二个上游一次都不该被请求**（P2-13）");
+    assert_eq!(
+        b.request_count(),
+        0,
+        "**第二个上游一次都不该被请求**（P2-13）"
+    );
     {
         let events = failures.lock().unwrap();
         assert_eq!(events.len(), 1, "仍要记一条失败事件（可观测性不变）");
@@ -664,10 +662,7 @@ async fn all_connect_failures_still_return_502_with_the_last_reason() {
     // 「候选耗尽」在新口径下只剩这一条路径：**所有候选都是连接层失败**。
     // 客户端拿到 502 + 最后一次的真实原因（P3-5 的既有保证）。
     let (handle, token, failures, _observations) = start_routed_full(
-        vec![
-            dead_upstream(1, REF_A, 0.1),
-            dead_upstream(2, REF_B, 1.0),
-        ],
+        vec![dead_upstream(1, REF_A, 0.1), dead_upstream(2, REF_B, 1.0)],
         long_cooldown(),
         UpstreamTimeout::default(),
         None,
@@ -883,7 +878,10 @@ async fn start_routed_with(
     revoked: Option<Vec<String>>,
     keys: Vec<(&str, &str)>,
 ) -> (GatewayHandle, String, Failures, Observations) {
-    let ups: Vec<Upstream> = upstreams.iter().map(|(u, rate)| u.upstream(*rate)).collect();
+    let ups: Vec<Upstream> = upstreams
+        .iter()
+        .map(|(u, rate)| u.upstream(*rate))
+        .collect();
     start_routed_full(ups, breaker, timeout, revoked, keys).await
 }
 
