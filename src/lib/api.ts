@@ -287,6 +287,14 @@ export type Settings = {
   /** 默认关。当前只记录意愿，未接更新服务器。 */
   autoUpdateEnabled: boolean;
   // ---- M6-S5：FR-3 通知 ----
+  /**
+   * 通知**总开关**。默认**关**（M16-S9）。
+   *
+   * 关着时服务层**根本不装**通知状态（不评估规则、不落基线、不弹通知、不发 webhook），
+   * 与「通知功能从未接线」的行为逐字相同——所以升级到本版本不会凭空开始弹通知。
+   * 与 `notifySystemEnabled` 的区别：那个是「系统通知这一路可用吗」（默认开）。
+   */
+  notifyEnabled: boolean;
   /** 系统通知。默认开。 */
   notifySystemEnabled: boolean;
   /** 空 = 不启用 Webhook。 */
@@ -1229,6 +1237,7 @@ let mockSettings: Settings = {
   proxyMode: "auto",
   telemetryEnabled: false,
   autoUpdateEnabled: false,
+  notifyEnabled: false,
   notifySystemEnabled: true,
   notifyWebhookUrl: "",
   notifyTimeoutSecs: 10,

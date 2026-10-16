@@ -596,6 +596,8 @@
       "proxyHint": "Proxy takes effect on next app launch (gateway upstream on gateway restart). Proxy string validity is checked when a request is actually made: an invalid manual proxy errors directly; an invalid auto-detected proxy is skipped and falls back to direct (junk system values shouldn't keep the app from starting)."
     },
     "notify": {
+      "enabled": "Enable notifications (master switch)",
+      "enabledHint": "While the master switch is off, the three options below have no effect: the service does not evaluate rules, persist a baseline, or send anything.",
       "title": "Notifications",
       "body": "Balance below threshold, expired sessions, key expiry, and config drift go through these channels. Notification bodies contain no keys and no raw site response text.",
       "system": "System notification (macOS Notification Center / Windows Toast)",
