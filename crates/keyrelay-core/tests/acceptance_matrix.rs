@@ -1376,4 +1376,46 @@ fn reading_channel_bindings_does_not_touch_the_database() {
         settings, 0,
         "读绑定不得写 settings（例如记一个「读取时间」）"
     );
+
+    // ---- M16-S3 P3-30：把只读守护扩到**服务层** ----
+    //
+    // 上面钉的是存储层的纯 SELECT。真正的数据源是 `service.channel_bindings()`
+    // （`service.rs`）——它现在只是转发，但**没有任何东西拦着**下一个人在那里
+    // 「顺手记一条事件」（DEBUG-REPORT-v3 §3-30 的变异：加一行写事件，全绿）。
+    // 这里把同一个库交给服务，调一次真实的服务层入口，再复扫全部表的行数。
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    let service = KeyRelayService::new(
+        Store::open(&db).expect("交给服务的库"),
+        MockTransport::new(vec![]),
+        ServiceConfig::in_memory(home),
+    );
+    let rows = service.channel_bindings().expect("服务层读绑定");
+    assert_eq!(rows.len(), 1, "服务层应返回那条未解绑的绑定");
+    assert_eq!(rows[0].agent_id, "codex");
+
+    let count_after = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+            .expect("计数查询")
+    };
+    assert_eq!(
+        count_after("SELECT COUNT(*) FROM bindings"),
+        1,
+        "服务层读取不得改动 bindings"
+    );
+    assert_eq!(
+        count_after("SELECT COUNT(*) FROM events"),
+        0,
+        "服务层读取不得写事件表（服务层最自然的隐式写就是 log 一条）"
+    );
+    assert_eq!(
+        count_after("SELECT COUNT(*) FROM settings"),
+        0,
+        "服务层读取不得写 settings"
+    );
+    assert_eq!(
+        count_after("SELECT COUNT(*) FROM keys"),
+        1,
+        "服务层读取不得改动 keys"
+    );
 }
