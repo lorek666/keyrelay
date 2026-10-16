@@ -97,6 +97,21 @@ impl RouteTable {
     pub fn all_candidates(&self) -> Vec<&Upstream> {
         ordered(self.upstreams.iter())
     }
+
+    /// 表里出现过的全部 `key_ref`（**去重**，按首次出现顺序）。
+    ///
+    /// 用途（M16-S4 / P3-9）：`gateway::start()` 的集合不变式——
+    /// 「`route` 里的每个 `key_ref` 都必须在 `keys_by_ref` 或 `revoked_refs` 里」。
+    /// 不满足时构造方多半是忘了填密钥映射，症状却是「每个上游都跳过 → 502」，
+    /// 根因看不见（M7 审计 D-2）。在启动时就报错比等到第一个请求好。
+    pub fn key_refs(&self) -> Vec<&str> {
+        let mut seen = std::collections::HashSet::new();
+        self.upstreams
+            .iter()
+            .map(|u| u.key_ref.as_str())
+            .filter(|r| seen.insert(*r))
+            .collect()
+    }
 }
 
 /// 一个站点能服务哪些模型 + 它的成本 / 健康度（**路由表的输入**）。
