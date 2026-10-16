@@ -560,14 +560,12 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     /// `ReqwestTransport`（timeout 120s、不套 retry），避免 sync probe 被 15s 总超时砍断、
     /// 以及 429 被 `RetryingTransport` 自动重试 3 次（Retry-After 被 cap 到 5s，白打 + 等 10s）。
     probe_transport: Option<crate::site::transport_reqwest::ReqwestTransport>,
-    /// M14-S7 §4.2：models.dev 在线补全专用 transport（独立 timeout 15s、不套 retry）。
-    ///
     /// M14-S7 §4.2：models.dev 在线补全专用传输层（独立 timeout 15s、不套 retry）。
     ///
     /// **必须显式注入**（[`Self::with_meta_transport`]）：`None` ⇒ `warm_model_meta` 直接
     /// 返回 `None`，一次网络都不发。这是**结构保证**而不是自觉：投递命令会在预览时预热
-    /// 元数据，若默认回退到站点 transport，测试装配就会真的去打 models.dev
-    /// （本机实测：`tests/commands.rs` 因此从 2.8s 涨到 10.9s，并拖垮同轮其它网络用例）。
+    /// 元数据，若默认回退到站点 transport，测试装配（用真实 `ReqwestTransport`）就会真的
+    /// 去打 models.dev——违反「测试不许联网」。
     ///
     /// 存成 `Box<dyn HttpTransport>` 而不是具体类型：生产注入 `ReqwestTransport`，
     /// 核心测试注入 `MockTransport`，两边走同一条代码路径。
