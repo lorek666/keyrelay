@@ -212,6 +212,13 @@ pub struct DeliveryPlanDto {
     consent: String,
     consent_granted_at: Option<i64>,
     consent_revoked_at: Option<i64>,
+    /// P2-3（后端半）：这个通道的**落点文件里有没有 endpoint**。
+    ///
+    /// `false` ⇒ 切到网关模式时它**只换了令牌、没换地址**（Codex 的 endpoint 在
+    /// `~/.codex/config.toml`，不在 `auth.json` 里）⇒ 界面必须提示用户去改那个文件，
+    /// 否则 Codex 会把本地令牌发到站点、拿回 401。
+    /// 判据来自 `delivery::channel_carries_endpoint`（与 writer 装配表同源）。
+    endpoint_in_channel: bool,
     /// 提示项（**不是错误**）。当前只有一条来源：同目录下存在「同主名、不同扩展名」
     /// 的兄弟文件，可能被 agent 优先读取，从而让本次投递静默不生效（BACKLOG B-76）。
     warnings: Vec<String>,
@@ -696,6 +703,9 @@ pub async fn delivery_plan(
                 consent_revoked_at: revoked_at,
                 warnings,
                 restart_hint: restart_hint_str(keyrelay_core::delivery::restart_hint(plan.channel)),
+                endpoint_in_channel: keyrelay_core::delivery::channel_carries_endpoint(
+                    plan.channel,
+                ),
             }
         })
         .map_err(|e| e.to_string())
@@ -1474,7 +1484,9 @@ pub async fn gateway_rotate_token(
     let config = state
         .service
         .gateway_config(site_id, key_id, port)
-        .map_err(|e| format!("令牌已换，但新令牌无法用于网关（网关仍用旧令牌运行，请重启网关）：{e}"))?;
+        .map_err(|e| {
+            format!("令牌已换，但新令牌无法用于网关（网关仍用旧令牌运行，请重启网关）：{e}")
+        })?;
 
     // take + stop + start（用运行态的 site_id/key_id，与启动时相同）。
     let run = state
@@ -1672,7 +1684,10 @@ pub fn export_diagnostics(
     args: DiagnosticsArgs,
 ) -> Result<DiagnosticsResultDto, String> {
     // P3-18：`path` 不再是任意路径——收敛到导出目录 + 文件名白名单（越界一律拒绝）。
-    let path = resolve_diagnostics_path(&crate::home_dir(), args.path.as_deref())?;
+    //
+    // 允许目录取**服务自己的 home**（生产 = `home_dir()`，测试 = 每个 app 独立的临时目录）：
+    // 与 `ServiceConfig.home` 同源，测试因此不必碰真实 `~/.keyrelay`。
+    let path = resolve_diagnostics_path(state.service.home(), args.path.as_deref())?;
     state
         .service
         .export_diagnostics_to_file(&path, args.limit.unwrap_or(DEFAULT_DIAGNOSTIC_EVENTS))
@@ -2028,7 +2043,8 @@ fn rotation_args_are_consistent(
 }
 
 /// 轮换后网关重启的三种结局。
-enum RotationGatewayRestart {    /// 网关没在跑（最常见）——什么都不做。
+enum RotationGatewayRestart {
+    /// 网关没在跑（最常见）——什么都不做。
     NotRunning,
     /// 网关跑在**别的**站点上——不动它（不把网关悄悄切到被轮换的站点）。
     OtherSite,
@@ -2998,6 +3014,11 @@ mod tests {
             restart_hint: restart_hint_str(keyrelay_core::delivery::restart_hint(
                 keyrelay_core::delivery::DeliveryChannel::CodexAuthJson,
             )),
+            // M16-S6a / P2-3：Codex 的 `auth.json` 里**没有** endpoint（改指网关时只换令牌不换地址）。
+            // 取真实值而不是字面量——事实表变了这条会跟着变。
+            endpoint_in_channel: keyrelay_core::delivery::channel_carries_endpoint(
+                keyrelay_core::delivery::DeliveryChannel::CodexAuthJson,
+            ),
         };
         let value = to_value(&plan);
         assert_eq!(value["agentId"], "codex");
@@ -3010,6 +3031,12 @@ mod tests {
         assert_eq!(value["consentGrantedAt"], Value::Null);
         assert_eq!(value["warnings"][0], "同目录下还有 auth.jsonc。");
         assert_eq!(value["restartHint"], "needed", "codex 的配置进程启动时才读");
+        // M16-S6a / P2-3：Codex 的落点文件里没有 endpoint ⇒ 线上字段必须是 `false`
+        // （界面据此提示「改指网关后还要去改 config.toml 里的地址」）。
+        assert_eq!(
+            value["endpointInChannel"], false,
+            "codex-auth-json 的 auth.json 里没有 endpoint"
+        );
         assert!(value.get("target_path").is_none(), "不得出现 snake_case");
 
         // M7-S5：**每个**通道都必须给出一个非空提示——新增通道时穷举 match 会编译失败，
@@ -3218,7 +3245,10 @@ mod tests {
     fn diagnostics_default_path_is_inside_the_exports_dir() {
         let home = tempfile::tempdir().expect("临时 home");
         let path = resolve_diagnostics_path(home.path(), None).expect("默认路径必须可用");
-        assert_eq!(path.parent().unwrap(), home.path().join(".keyrelay/exports"));
+        assert_eq!(
+            path.parent().unwrap(),
+            home.path().join(".keyrelay/exports")
+        );
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with("keyrelay-diagnostics"), "文件名: {name}");
         assert!(name.ends_with(".json"), "文件名: {name}");
