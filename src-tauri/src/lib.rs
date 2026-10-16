@@ -165,6 +165,7 @@ fn state_from_store(store: Store, db_path: PathBuf, db_error: Option<String>) ->
         db_path,
         db_error,
         ServiceConfig::production(home_dir()),
+        OnlineModelMeta::Enabled,
     )
 }
 
@@ -180,7 +181,25 @@ fn state_in_memory(store: Store, db_path: PathBuf) -> AppState {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let tmp = std::env::temp_dir().join(format!("keyrelay-test-{}-{seq}", std::process::id()));
-    state_with_config(store, db_path, None, ServiceConfig::in_memory(tmp))
+    state_with_config(
+        store,
+        db_path,
+        None,
+        ServiceConfig::in_memory(tmp),
+        OnlineModelMeta::Disabled,
+    )
+}
+
+/// 是否给服务装配「models.dev 在线补全」的传输层（M14-S7 §4.2）。
+///
+/// 生产要装：用户在投递页填模型名时要能在线补上下文/输出参数。
+/// **测试装配不装**：投递命令会在预览时预热模型元数据，装了真传输层就会真的去打
+/// models.dev（实测把 `tests/commands.rs` 从 2.8s 拖到 10.9s，并连带影响同轮其它网络用例）。
+/// 用枚举而不是 `bool` 是为了让两个调用点自解释。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnlineModelMeta {
+    Enabled,
+    Disabled,
 }
 
 fn state_with_config(
@@ -188,6 +207,7 @@ fn state_with_config(
     db_path: PathBuf,
     db_error: Option<String>,
     config: ServiceConfig,
+    online_model_meta: OnlineModelMeta,
 ) -> AppState {
     // 钥匙串可用性只在启动时探测一次并明确告警；不可用时投递相关能力会各自失败，
     // **不会**静默换成内存实现（ADR-0002）。
@@ -200,10 +220,16 @@ fn state_with_config(
     let proxy = resolved_proxy_url(&store);
     let proxy_for_probe = proxy.clone();
     let proxy_for_meta = proxy.clone();
+    let service = KeyRelayService::new(store, build_transport_with_proxy(proxy), config)
+        .with_probe_transport(build_probe_transport(proxy_for_probe));
+    let service = match online_model_meta {
+        OnlineModelMeta::Enabled => {
+            service.with_meta_transport(build_meta_transport(proxy_for_meta))
+        }
+        OnlineModelMeta::Disabled => service,
+    };
     AppState {
-        service: KeyRelayService::new(store, build_transport_with_proxy(proxy), config)
-            .with_probe_transport(build_probe_transport(proxy_for_probe))
-            .with_meta_transport(build_meta_transport(proxy_for_meta)),
+        service,
         db_path,
         db_error,
         gateway: std::sync::Mutex::new(None),

@@ -562,9 +562,16 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     probe_transport: Option<crate::site::transport_reqwest::ReqwestTransport>,
     /// M14-S7 §4.2：models.dev 在线补全专用 transport（独立 timeout 15s、不套 retry）。
     ///
-    /// `None`（默认）时 `warm_model_meta` fallback 到 `self.transport`——测试用
-    /// `MockTransport` 走这条路径。生产装配由壳层 `with_meta_transport` 注入。
-    meta_transport: Option<crate::site::transport_reqwest::ReqwestTransport>,
+    /// M14-S7 §4.2：models.dev 在线补全专用传输层（独立 timeout 15s、不套 retry）。
+    ///
+    /// **必须显式注入**（[`Self::with_meta_transport`]）：`None` ⇒ `warm_model_meta` 直接
+    /// 返回 `None`，一次网络都不发。这是**结构保证**而不是自觉：投递命令会在预览时预热
+    /// 元数据，若默认回退到站点 transport，测试装配就会真的去打 models.dev
+    /// （本机实测：`tests/commands.rs` 因此从 2.8s 涨到 10.9s，并拖垮同轮其它网络用例）。
+    ///
+    /// 存成 `Box<dyn HttpTransport>` 而不是具体类型：生产注入 `ReqwestTransport`，
+    /// 核心测试注入 `MockTransport`，两边走同一条代码路径。
+    meta_transport: Option<Box<dyn crate::site::transport::HttpTransport>>,
     /// M14-S7 §4.2：models.dev 目录缓存（进程内 1 小时 TTL）。
     ///
     /// 投递路径是同步的（不能 `.await`），所以「异步预热 → 同步读快照」两步走：
@@ -729,7 +736,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             // 默认 None：测试不调 `with_probe_transport` 时 fallback 到 `self.transport`（Mock），
             // 让 probe_model 的集成测试能用 Mock 预置响应（M4）。
             probe_transport: None,
-            // 默认 None：测试不调 `with_meta_transport` 时 fallback 到 `self.transport`（Mock）。
+            // 默认 None：**不做在线补全**。生产由壳层 `with_meta_transport` 注入；
+            // 测试装配不注入 ⇒ 结构上不可能联网。
             meta_transport: None,
             // 默认空缓存：冷缓存 ⇒ 同步读拿不到在线参数（不联网），语义与「没查到」一致。
             meta_cache: crate::model_meta::OnlineMetaCache::new(),
@@ -825,19 +833,19 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         self
     }
 
-    /// M14-S7 §4.2：注入 models.dev 在线补全专用 transport（独立 timeout 15s、不套 retry）。
+    /// M14-S7 §4.2：注入 models.dev 在线补全专用传输层（独立 timeout 15s、不套 retry）。
     ///
     /// 为什么不复用站点 transport：models.dev 是**第三方**服务，`RetryingTransport` 会把
     /// 「网络不通」放大成 3 次尝试 × 15s，挂在投递预览的关键路径上。这里要的是
     /// 「一次、短、失败就当没查到」（spec §4.2：网络失败/超时返回 `None`，不影响投递）。
     ///
-    /// 不调用 = `meta_transport` 保持 `None`，`warm_model_meta` fallback 到 `self.transport`
-    /// ——测试用 `MockTransport` 走这条路径，零改动现有测试。
+    /// **不注入 ⇒ 不做在线补全**（不联网、不猜）。生产装配由壳层 `init_state` 注入；
+    /// 测试装配（`init_state_in_memory`）故意不注入。
     pub fn with_meta_transport(
         mut self,
-        meta_transport: crate::site::transport_reqwest::ReqwestTransport,
+        meta_transport: impl crate::site::transport::HttpTransport + 'static,
     ) -> Self {
-        self.meta_transport = Some(meta_transport);
+        self.meta_transport = Some(Box::new(meta_transport));
         self
     }
 
@@ -853,10 +861,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         model: Option<&str>,
     ) -> Option<crate::model_meta::ModelMeta> {
         let model = model.map(str::trim).filter(|m| !m.is_empty())?;
-        let resolved = match &self.meta_transport {
-            Some(transport) => self.meta_cache.lookup_online(transport, model).await,
-            None => self.meta_cache.lookup_online(&self.transport, model).await,
+        let Some(transport) = self.meta_transport.as_deref() else {
+            // 没注入在线传输层 ⇒ 不做在线补全。测试装配走这条路径：一次网络都不发。
+            return None;
         };
+        let resolved = self.meta_cache.lookup_online(transport, model).await;
         if resolved.is_none() {
             // 只记模型名与结果，不记任何密钥/响应正文。Debug 级：这是增强路径，
             // 未命中是常态（内置表没覆盖的长尾模型 + 网络不可用），不该刷 warn。
@@ -5572,6 +5581,60 @@ mod tests {
 
     // ============================================ M14-S7 §4.2：models.dev 在线补全接线
 
+    /// 与 `probe_service_with_base_url` 相同，但把同一个 mock 也装成**在线补全传输层**
+    /// （M14-S7 §4.2 的在线路径）。
+    async fn service_with_meta_transport(
+        site_base_url: &str,
+        tail: Vec<HttpResponse>,
+    ) -> (KeyRelayService<MockTransport>, i64, MockTransport) {
+        let store = Store::open_in_memory().expect("内存库");
+        let mock = MockTransport::new(tail);
+        let service = KeyRelayService::new(store, mock.clone(), test_config())
+            .with_meta_transport(mock.clone());
+        let site_id = service
+            .store
+            .upsert_site("newapi", site_base_url, "测试站")
+            .expect("upsert_site");
+        let reference = crate::vault::secret_ref("key", 1, "secret");
+        service
+            .vault
+            .put(&reference, "sk-test-secret-12345678")
+            .expect("vault.put");
+        let key_id = service
+            .store
+            .insert_key(site_id, "meta-key", &reference, Some("remote-1"), None)
+            .expect("insert_key");
+        (service, key_id, mock)
+    }
+
+    #[tokio::test]
+    async fn warm_model_meta_does_nothing_without_an_injected_transport() {
+        // **结构保证**：没注入在线传输层 ⇒ 一次网络都不发（测试装配走这条）。
+        let (service, key_id, mock) =
+            probe_service_with_base_url("https://relay.example.com", vec![]).await;
+        assert!(
+            service
+                .warm_model_meta(Some("acme-unknown"))
+                .await
+                .is_none(),
+            "没注入传输层就不该做在线补全"
+        );
+        assert_eq!(mock.request_count(), 0, "一次网络都不发");
+
+        // 但内置表命中的模型仍然在同步路径上写出参数（离线可用，与注入无关）
+        let plan = service
+            .delivery_plan_with_model(key_id, DeliveryChannel::Hermes, Some("gpt-4o"))
+            .expect("投递预览");
+        assert!(
+            plan.fields
+                .iter()
+                .any(|f| f.key == "context_length" && f.masked == "128000"),
+            "内置表命中应写出 context_length: {:?}",
+            plan.fields
+        );
+        assert_eq!(mock.request_count(), 0, "内置表命中也不联网");
+    }
+
     #[tokio::test]
     async fn warm_model_meta_brings_online_params_into_delivery_plan() {
         // 在线补全的结果要能进**同步**的投递路径：内置表没有 `acme-long-context`，
@@ -5586,7 +5649,7 @@ mod tests {
         )
         .expect("构造 models.dev 目录响应");
         let (service, key_id, mock) =
-            probe_service_with_base_url("https://relay.example.com", vec![catalog]).await;
+            service_with_meta_transport("https://relay.example.com", vec![catalog]).await;
 
         // 预热前：冷缓存 ⇒ 只有模型名，没有参数行；而且**一次网络都不发**
         let cold = service
@@ -5626,7 +5689,7 @@ mod tests {
     async fn warm_model_meta_is_best_effort_when_offline() {
         // 网络失败 ⇒ None（不是错误），投递预览照常出——只是没有参数行。
         let (service, key_id, mock) =
-            probe_service_with_base_url("https://relay.example.com", vec![]).await;
+            service_with_meta_transport("https://relay.example.com", vec![]).await;
         mock.push_error(Error::Transport("网络不可达".into()));
 
         assert!(service
