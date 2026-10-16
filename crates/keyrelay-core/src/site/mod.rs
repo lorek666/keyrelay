@@ -17,39 +17,56 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum SiteKind {
-    NewApi,
-    Sub2Api,
+/// 用**一份清单**生成 `SiteKind`、[`SiteKind::ALL`] 与 [`SiteKind::as_str`]（B-119 / M16-S3 P2-21）。
+///
+/// 为什么必须是宏：M8-S6 的「`ALL` 手写数组 + 测试手列清单对账」能被绕过——加一个变体、
+/// 照编译器要求在别处的穷举 `match` 里补一条臂、`ALL` 不动，两边长度都还是 3 ⇒ 全绿；
+/// 而 `probe_order` 从 `ALL` 派生 ⇒ 新适配器**永远不被探测**（M8-S6 独立复审实测复现）。
+/// 只要「变体清单」与「`ALL`」是两份能各自漂移的文本，就总能绕过。
+///
+/// 这里把三处收敛成**同一个清单**：新增适配器 = 在下面的宏调用里加一行 ⇒ 枚举、`ALL`、
+/// `as_str` 同时更新，「加了变体却忘了加 `ALL`」这个中间态**不存在**。
+/// 顺序即 `SiteRegistry` 默认探测顺序的基础顺序（`registry.rs` 在其上只做
+/// 「`CustomOpenAiCompatible` 排最后」一条重排）。
+///
+/// `parse` 仍手写（每个变体有多个别名写法），由
+/// `site::tests::every_kind_round_trips_through_parse` 对 `ALL` 逐项守护。
+macro_rules! define_site_kinds {
+    ($( $(#[$meta:meta])* $variant:ident => $text:literal ),+ $(,)?) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+        pub enum SiteKind {
+            $( $(#[$meta])* $variant ),+
+        }
+
+        impl SiteKind {
+            /// 全部变体（顺序即探测顺序的基础顺序）。由 [`define_site_kinds!`] 生成 ⇒
+            /// 新增变体时它自动跟着变，不存在「漏加」。
+            pub const ALL: [SiteKind; define_site_kinds!(@count $($variant),+)] =
+                [$( SiteKind::$variant ),+];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $( SiteKind::$variant => $text ),+
+                }
+            }
+        }
+    };
+    // 计数：数组长度位置要一个 const 表达式，`<[()]>::len` 是 const fn。
+    (@count $($variant:ident),+) => {
+        <[()]>::len(&[$( define_site_kinds!(@unit $variant) ),+])
+    };
+    (@unit $variant:ident) => { () };
+}
+
+define_site_kinds! {
+    NewApi => "newapi",
+    Sub2Api => "sub2api",
     /// 只读的 OpenAI 兼容端点（M7-S2 / PRD FR-1）：只有一个 `/v1/models` 可读，
     /// 没有令牌管理端点、没有余额与分组概念。能力见 [`capability::capabilities`]。
-    CustomOpenAiCompatible,
+    CustomOpenAiCompatible => "custom-openai-compatible",
 }
 
 impl SiteKind {
-    /// 全部变体（B-119 / M8-S6）。
-    ///
-    /// **新增变体时必须加进来**：`SiteKind::ALL` 的长度写在类型 `[SiteKind; N]` 里，
-    /// 而 `site::tests::site_kind_all_covers_every_variant` 手列了一份变体清单并与
-    /// `ALL.len()` 对账 ⇒ 漏加则那条测试**编译失败**（不是运行失败），失败信息直接说清
-    /// 「该改哪」。这与 `DeliveryChannel::ALL`（M6-S0 §9.1）是同一个手法。
-    ///
-    /// 顺序即 `SiteRegistry` 的默认探测顺序的**基础顺序**（`registry.rs` 在它之上只做
-    /// 「`CustomOpenAiCompatible` 排最后」这一条重排）。
-    pub const ALL: [SiteKind; 3] = [
-        SiteKind::NewApi,
-        SiteKind::Sub2Api,
-        SiteKind::CustomOpenAiCompatible,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SiteKind::NewApi => "newapi",
-            SiteKind::Sub2Api => "sub2api",
-            SiteKind::CustomOpenAiCompatible => "custom-openai-compatible",
-        }
-    }
-
     /// 解析站点类型。**宽进严出**：接受三个写法（大小写不敏感），但 [`Self::as_str`] 只输出
     /// `"custom-openai-compatible"` 这一个规范形态——它会落进 `sites.kind` 列与事件表，
     /// 必须是唯一的（M7-S2 spec §3.1 D-1）。
@@ -112,8 +129,40 @@ impl std::fmt::Debug for CaptchaChallenge {
 ///
 /// **只用于显示**：不改变任何请求用的 URL（请求仍用原始 `base_url`）。
 /// 宁可多掩：掩错了只影响显示，漏掩是泄漏。
+///
+/// M16-S3 P3-22：`mask_authority_userinfo` 的 authority 止于 `/` `?` `#`，
+/// 因此**口令里含未编码的分隔符**时它找不到 `@`：
+/// `https://u:pa/ss@host` ⇒ authority 是 `u:pa` ⇒ 不掩 ⇒ 明文口令进文案。
+/// 这里补一道站点侧兜底：结果里**仍含 `@`** 且该 `@` 之前出现过 `:`（userinfo 的形态）
+/// ⇒ 把最后一个 `@` 之前整段掩成 `***`（多掩只影响显示）。
+/// 根因在 `redact.rs`（道② 写域），本条只是站点侧的纵深防御。
 pub(crate) fn display_url(raw: &str) -> String {
-    crate::redact::mask_authority_userinfo(raw)
+    let masked = crate::redact::mask_authority_userinfo(raw);
+    let Some(at) = masked.rfind('@') else {
+        return masked;
+    };
+    let head = &masked[..at];
+    // `***@host`（已经掩过）不再处理：`head` 里没有 `:` 之外的可掩内容。
+    if head.contains("***") {
+        return masked;
+    }
+    // 只掩 authority 那一段（`://` 之后到 `@`），保留 scheme 与 host 供排障。
+    let authority_start = masked.find("://").map(|i| i + 3).unwrap_or(0);
+    let tail = &masked[authority_start..];
+    let head_end = tail.find(['/', '?', '#']).unwrap_or(tail.len());
+    // 判据**必须窄**：只有「authority 段里出现过 `:`（`user:pass` 的形态）」才兜底。
+    // 否则 `https://host/a@b`（路径里的 `@`，不是 userinfo）会被误掩成 `https://***@b`
+    // ——那是既有测试 `display_url_masks_only_the_userinfo` 明确禁止的过度掩码
+    // （把 host 一起掩掉会毁掉排障能力）。
+    if !tail[..head_end].contains(':') {
+        return masked;
+    }
+    format!(
+        "{}{}{}",
+        &masked[..authority_start],
+        crate::redact::MASK,
+        &masked[at..]
+    )
 }
 
 /// 会话凭证。**禁止** derive Debug 泄露 cookie/token，故手写 `Debug`。
@@ -494,11 +543,35 @@ pub async fn fetch_models<T: crate::site::transport::HttpTransport>(
         .collect())
 }
 
+/// 站点原文进错误文案前的**统一处理**（M16-S3 P3-19）。
+///
+/// 站点回的是**外部输入**，它可能：
+/// ① 极长（实测有回 200KB 原文的）⇒ 整段进错误文案会把界面/日志撑爆；
+/// ② 含控制字符（`ESC` / RLO / CRLF）⇒ 能伪造多行日志、翻转显示方向；
+/// ③ 回显凭据（站点自己的日志、风控提示）⇒ 过 [`crate::redact::scrub`]。
+///
+/// 三条按顺序做：先剥控制字符（否则截断可能把多字节控制序列切一半）、
+/// 再截断（按 `char` 计数，不切坏 UTF-8）、最后 scrub。
+///
+/// 注意：`scrub` 的**形态表**（裸 JWT、`password=` 明文）在 `redact.rs`（道② 写域），
+/// 本函数只负责站点侧这一层的长度与字符集收口。
+pub(crate) const MAX_SITE_MESSAGE_CHARS: usize = 512;
+
+pub(crate) fn site_text_for_error(message: &str) -> String {
+    let cleaned: String = message.chars().filter(|c| !c.is_control()).collect();
+    let total = cleaned.chars().count();
+    let mut out: String = cleaned.chars().take(MAX_SITE_MESSAGE_CHARS).collect();
+    if total > MAX_SITE_MESSAGE_CHARS {
+        out.push_str(&format!("…（站点原文共 {total} 字符，已截断）"));
+    }
+    crate::redact::scrub(&out)
+}
+
 /// 统一 HTTP 错误映射。适配器在拿到非 2xx 响应后必须调用本函数。
 ///
 /// **密钥红线（M6-S6 / 关闭 B-75）**：站点返回的 `message` 是**外部输入**，可能回显密钥
 /// （站点自己的日志文案、风控提示、回显请求体等）。它在被拼进 [`Error`] 之前一律过
-/// [`crate::redact::scrub`]。
+/// [`site_text_for_error`]（剥控制字符 + 截断 + [`crate::redact::scrub`]，M16-S3 P3-19）。
 ///
 /// 为什么把脱敏放在这里而不是逐个调用点：本函数是**全部适配器**把非 2xx 响应变成
 /// `Error` 的唯一咽喉，改一处即覆盖现存 14 个裸调用点与 4 个已包 `scrub_error` 的调用点，
@@ -514,7 +587,7 @@ pub fn map_http_error(status: u16, body: &[u8], retry_after_secs: Option<u64>) -
         .to_string();
     // 只对**站点原文**脱敏：下面的兜底文案是本产品自己的字面量，不经过这里，因此逐字不变。
     // `scrub` 幂等（`redact.rs` 文档），与调用点上的 `scrub_error` 叠加无副作用。
-    let message = crate::redact::scrub(
+    let message = site_text_for_error(
         parsed
             .as_ref()
             .and_then(|v| {
@@ -634,47 +707,29 @@ mod tests {
 
     #[test]
     fn site_kind_all_covers_every_variant() {
-        // B-119 / M8-S6：把「每个变体都在 ALL 里」变成**编译期**失败。
+        // B-119 / M8-S6 / M16-S3 P2-21。
         //
-        // 为什么用穷举 match 而不是「数组字面量 + assert_eq!(len)」：后者只在
-        // **改了 ALL 的长度**时才红；新增一个变体却忘了把它加进 ALL 时，
-        // `variants.len() == 3 == ALL.len()` 照过——M8-S6 独立复审 P1-1 实测复现过
-        // （加了变体、补全编译器强制的 match 臂、唯独不动 ALL ⇒ 这条测试**通过**）。
-        // 而 `probe_order` 是从 ALL 派生的 ⇒ 那个新适配器会**永远不被探测**，
-        // 且没有任何东西会红。
+        // 强制**不在**这条测试里：`ALL` 由 `define_site_kinds!` 从唯一清单生成，
+        // 新增变体必然同时出现在 `ALL` 里 ⇒「加了变体却忘了加 ALL」这个中间态不存在，
+        // 编译期就不可能出现（M8-S6 那条「测试里手列清单 + 穷举 match」的写法可以被
+        // 「补一条同样写法的臂」绕过，见 DEBUG-REPORT-v3 P2-21）。
         //
-        // 穷举 match（**没有 `_` 臂**）强制的是另一件事：新增变体时这个 match 编不过，
-        // 人就被迫回来——而回来就要面对「ALL 要不要加它」这个问题。
-        // 每个臂返回 `true` 表示「这个变体已确认在 ALL 里」。
-        // P2-21 / DEBUG-REPORT-v3 §2-21：原来的 `for kind in ALL` 只遍历 ALL 里的变体——
-        // 新增变体忘了加进 ALL 时，循环不碰它，补一条「同样写法」的 match 臂就能全绿，
-        // 新变体永远不被探测。改成**每个变体单独 assert**：穷举 match（无 `_` 臂）强制
-        // 新增变体时编译失败、迫使回来补臂；臂本身是 assert，补臂就要面对「它在 ALL 里吗」。
-        // 仍非完美（Rust 无变体数反射，补臂不补 assert 仍能绕过），但比「循环只看 ALL」严。
-        assert!(
-            SiteKind::ALL.contains(&SiteKind::NewApi),
-            "NewApi 不在 ALL 里"
-        );
-        assert!(
-            SiteKind::ALL.contains(&SiteKind::Sub2Api),
-            "Sub2Api 不在 ALL 里"
-        );
-        assert!(
-            SiteKind::ALL.contains(&SiteKind::CustomOpenAiCompatible),
-            "CustomOpenAiCompatible 不在 ALL 里"
-        );
-        // 穷举 match（无 `_` 臂）：新增变体时编译失败，迫使回来面对 ALL。
-        let _force_exhaustive = |kind: SiteKind| match kind {
-            SiteKind::NewApi => (),
-            SiteKind::Sub2Api => (),
-            SiteKind::CustomOpenAiCompatible => (),
-        };
-        // 运行期兜底：ALL 里出现重复项 / as_str 撞名（不靠编译期能发现的退化）。
-        assert_eq!(
-            SiteKind::ALL.len(),
-            3,
-            "SiteKind::ALL 的长度变了：新增变体时必须同步改这条测试的穷举 match（B-119）"
-        );
+        // 这条测试守的是**生成之后**的性质（运行期）：
+        // ① `ALL` 里没有重复项；② `as_str` 两两不同（撞名会让 `sites.kind` 列无法区分）；
+        // ③ 每个变体的 `as_str` 都能被 `parse` 解回来（`parse` 是手写的，
+        //    新增变体若忘了补 `parse` 臂，这条会红——它是 `parse` 的守护）。
+        let mut seen: Vec<SiteKind> = Vec::new();
+        for kind in SiteKind::ALL {
+            assert!(!seen.contains(&kind), "SiteKind::ALL 里有重复项: {kind:?}");
+            seen.push(kind);
+            assert_eq!(
+                SiteKind::parse(kind.as_str()),
+                Some(kind),
+                "{kind:?} 的 as_str（{}）无法被 parse 解回来——新增变体时必须补 parse 臂",
+                kind.as_str()
+            );
+        }
+        assert_eq!(seen.len(), SiteKind::ALL.len(), "ALL 长度与遍历结果不一致");
         // `as_str` 逐个不同：ALL 里有两个变体撞名会让 `sites.kind` 列无法区分
         let mut names: Vec<&str> = SiteKind::ALL.iter().map(|k| k.as_str()).collect();
         names.sort_unstable();
@@ -685,6 +740,32 @@ mod tests {
             before,
             "SiteKind::ALL 里有重名的 as_str: {names:?}"
         );
+    }
+
+    /// `parse` 的别名表与 `ALL` 一致：**每个变体至少有一个别名能解析**，
+    /// 且解析结果一定在 `ALL` 里（`parse` 返回的变体不可能不在 `ALL` 里——
+    /// 它由宏生成，这里把它钉成可执行的）。
+    #[test]
+    fn every_kind_round_trips_through_parse() {
+        for kind in SiteKind::ALL {
+            let text = kind.as_str();
+            assert_eq!(
+                SiteKind::parse(text),
+                Some(kind),
+                "{text} 应解析回 {kind:?}"
+            );
+            // 大小写不敏感（`parse` 的既有契约）
+            assert_eq!(SiteKind::parse(&text.to_ascii_uppercase()), Some(kind));
+        }
+        // 不在 ALL 里的写法不应解析出任何变体（`parse` 不能凭空造变体）
+        for bogus in ["", "newapi2", "sub2api-x", "custom", "openai"] {
+            if let Some(kind) = SiteKind::parse(bogus) {
+                assert!(
+                    SiteKind::ALL.contains(&kind),
+                    "parse({bogus:?}) 造出了不在 ALL 里的变体 {kind:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -705,6 +786,70 @@ mod tests {
         let text = format!("{c:?}");
         assert!(!text.contains("hunter2"));
         assert!(text.contains("me@example.com"));
+    }
+
+    // ============================================================ M16-S3 P3-19 / P3-22
+
+    #[test]
+    fn site_text_for_error_truncates_and_strips_control_chars() {
+        // ① 200KB 原文：错误文案必须有长度上界
+        let huge = "x".repeat(200_000);
+        let out = site_text_for_error(&huge);
+        assert!(
+            out.chars().count() < MAX_SITE_MESSAGE_CHARS + 64,
+            "截断后长度 {} 应有上界",
+            out.chars().count()
+        );
+        assert!(out.contains("已截断"), "{out}");
+        // ② 控制字符（ESC / RLO / CRLF）必须剥掉：它们能伪造多行日志、翻转显示方向
+        let nasty = "boom\u{1b}[31m\u{202e}evil\r\nsecond line";
+        let out = site_text_for_error(nasty);
+        assert!(!out.chars().any(|c| c.is_control()), "{out:?}");
+        assert!(out.contains("boom"), "{out:?}");
+        // ③ scrub 仍然生效（凭据形态）
+        let out = site_text_for_error("key sk-abcdefgh12345678 无效");
+        assert!(!out.contains("sk-abcdefgh12345678"), "{out}");
+    }
+
+    #[test]
+    fn map_http_error_truncates_a_huge_site_message() {
+        let body = serde_json::json!({"message": "x".repeat(200_000)}).to_string();
+        let err = map_http_error(400, body.as_bytes(), None);
+        let text = err.to_string();
+        assert!(
+            text.chars().count() < 2_000,
+            "站点原文整段进文案了（{} 字符）",
+            text.chars().count()
+        );
+        // 控制字符不进文案
+        let body = serde_json::json!({"message": "a\u{202e}b\r\nc"}).to_string();
+        let text = map_http_error(400, body.as_bytes(), None).to_string();
+        assert!(!text.chars().any(|c| c.is_control()), "{text:?}");
+    }
+
+    #[test]
+    fn display_url_falls_back_when_the_password_contains_a_delimiter() {
+        // P3-22：口令含未编码的 `/` `?` `#` 时 `mask_authority_userinfo` 找不到 `@`
+        // （authority 提前终止）⇒ 站点侧兜底整段掩掉 authority。
+        for (raw, expected) in [
+            ("https://u:pa/ss@host", "https://***@host"),
+            ("https://u:p?w@host", "https://***@host"),
+            ("https://u:p#w@host", "https://***@host"),
+            // 已掩过的形态不重复处理
+            ("https://alice:pw@host", "https://***@host"),
+            // 无 userinfo ⇒ 逐字不变
+            ("https://plain.example.com", "https://plain.example.com"),
+            (
+                "https://plain.example.com/a@b",
+                "https://plain.example.com/a@b",
+            ),
+        ] {
+            assert_eq!(display_url(raw), expected, "输入 {raw}");
+        }
+        // 无 scheme + query 里带 URL：内层 userinfo 掩住，外层 host 保留
+        let masked = display_url("host:8080/x?next=https://u:p@h2");
+        assert!(!masked.contains("u:p"), "{masked}");
+        assert!(masked.contains("host:8080"), "host 要留着供排障: {masked}");
     }
 
     #[test]

@@ -81,6 +81,8 @@ struct Fixture {
     home: PathBuf,
     db_path: PathBuf,
     service: KeyRelayService<MockTransport>,
+    /// 队列句柄：需要额外响应的用例（如 A-3 的 `add_site` 驱动）自己 push。
+    mock: MockTransport,
     key_id: i64,
 }
 
@@ -117,6 +119,7 @@ fn setup() -> Fixture {
         home,
         db_path,
         service,
+        mock,
         key_id,
     }
 }
@@ -323,8 +326,8 @@ fn inject_rollback_roundtrip_is_byte_identical() {
 ///
 /// 四条出口 = 事件表 / webhook 报文 / 导出包 / 诊断导出。错误串那条由
 /// `M8-S2` 的 `detect_failure_never_echoes_userinfo` 一族覆盖，这里不重复。
-#[test]
-fn no_secret_shape_in_any_exit() {
+#[tokio::test]
+async fn no_secret_shape_in_any_exit() {
     use keyrelay_core::redact::contains_secret;
 
     let f = setup();
@@ -336,9 +339,52 @@ fn no_secret_shape_in_any_exit() {
         .apply_delivery(f.key_id, DeliveryChannel::CodexAuthJson)
         .expect("注入");
 
+    // M16-S3 P3-29：**喂真密钥形态的输入**。
+    //
+    // 改前这条用例的 ①④ 两项是空跑：事件表里只有 `apply_delivery` 产生的事件
+    // （文案里没有任何密钥形态）⇒ `!contains_secret(...)` 恒真，去掉事件写入口脱敏
+    // 与诊断包脱敏也照样全绿（DEBUG-REPORT-v3 §3-29 的变异）。
+    //
+    // 驱动方式：走**真实写入路径** `add_site` —— 它把 `base_url` 写进事件 payload
+    // （`service.rs` 的 `event_with_payload`，即事件写入口）。三个 base_url 的 userinfo
+    // 各带一种密钥形态（`sk-` / `nap-` / 32 位 hex）。假站点按 path 路由，userinfo
+    // 不影响 `/api/status` 命中 ⇒ 三次都能真的写出一条事件。
+    let secrets = [
+        format!("https://alice:{SECRET}@relay.example.com"),
+        "https://bob:nap-abcdefgh12345678@relay.example.com".to_string(),
+        format!("https://carol:{PAT}@relay.example.com"),
+    ];
+    // 队列式 mock：每次 `add_site` 的探测（NewApi 先试）各消耗一条 `/api/status` 响应。
+    for _ in 0..secrets.len() {
+        f.mock.push(
+            HttpResponse::json(
+                200,
+                json!({"success": true, "data": {"version": "v0.9.1", "quota_per_unit": 500_000, "system_name": "假站点"}}),
+            )
+            .expect("构造响应"),
+        );
+    }
+    for base in &secrets {
+        f.service
+            .add_site(base)
+            .await
+            .unwrap_or_else(|e| panic!("{base} 应能接入（假站点按 path 路由）: {e}"));
+    }
+
     // ① 事件表：整表扫（message + payload），另开一个连接复扫落库文件
     let events = f.service.recent_events(500).expect("读事件");
     assert!(!events.is_empty(), "事件表必须非空，否则这条是空断言");
+    // **驱动证明**：脱敏后的 base_url 必须真的出现在事件里（`***@relay.example.com`）。
+    // 没有这一条，将来某个重构把事件去掉，这条用例又会变回空跑而没人发现。
+    let joined: String = events
+        .iter()
+        .map(|e| format!("{} {}", e.message, e.payload.clone().unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("***@relay.example.com"),
+        "三条含 userinfo 的 base_url 应各写出一条事件（且 userinfo 已被掩）: {joined}"
+    );
     for event in &events {
         assert!(
             !contains_secret(&event.message),
@@ -406,11 +452,55 @@ fn no_secret_shape_in_any_exit() {
         "导出包泄漏 URL 凭据: {exported}"
     );
 
-    // ④ 诊断导出
+    // ④ 诊断导出：必须真的带上那三条事件（驱动证明），且不含密钥形态
     let diagnostics = f.service.export_diagnostics(50).expect("诊断导出");
+    assert!(
+        diagnostics.contains("***@relay.example.com"),
+        "诊断导出应包含上面那三条事件（否则这一项是空跑）: {diagnostics}"
+    );
     assert!(
         !contains_secret(&diagnostics),
         "诊断导出泄漏: {diagnostics}"
+    );
+}
+
+/// M16-S3 P3-29（④ 的**读取层**）：诊断包必须在读取时自己脱敏，即使库里是**老行**
+/// （写入口脱敏上线之前写进去、原样带密钥形态的行）。
+///
+/// 与 `no_secret_shape_in_any_exit` 的分工：那条走真实写入路径（验证写入口脱敏）；
+/// 这条用 `Store::insert_event` **故意绕过写入口**造老行，验证
+/// `export_diagnostics` 自己那一层（`scrub_event_payload`）还在。
+/// 两者合起来：写入口与读取层各有一条能红的用例。
+#[test]
+fn diagnostics_scrubs_legacy_event_rows_at_read_time() {
+    use keyrelay_core::observability::{Event, Level};
+
+    let f = setup();
+    let store = Store::open(&f.db_path).expect("复开库");
+    let legacy = Event {
+        ts: NOW,
+        level: Level::Warn,
+        source: "site".to_string(),
+        message: format!("取密钥失败 {SECRET}"),
+        payload: Some(format!(
+            r#"{{"base_url":"https://alice:{SECRET}@relay.example.com"}}"#
+        )),
+    };
+    store.insert_event(&legacy).expect("写老行");
+    assert_eq!(
+        store.count_events_with_secrets().expect("扫库"),
+        1,
+        "夹具必须真的造出一行含密钥形态的老数据（否则这条是空跑）"
+    );
+
+    let diagnostics = f.service.export_diagnostics(50).expect("诊断导出");
+    assert!(
+        diagnostics.contains("relay.example.com"),
+        "诊断包应带上那条老事件（驱动证明）: {diagnostics}"
+    );
+    assert!(
+        !keyrelay_core::redact::contains_secret(&diagnostics),
+        "诊断包必须自己在读取时脱敏（老行）: {diagnostics}"
     );
 }
 
@@ -1375,5 +1465,47 @@ fn reading_channel_bindings_does_not_touch_the_database() {
     assert_eq!(
         settings, 0,
         "读绑定不得写 settings（例如记一个「读取时间」）"
+    );
+
+    // ---- M16-S3 P3-30：把只读守护扩到**服务层** ----
+    //
+    // 上面钉的是存储层的纯 SELECT。真正的数据源是 `service.channel_bindings()`
+    // （`service.rs`）——它现在只是转发，但**没有任何东西拦着**下一个人在那里
+    // 「顺手记一条事件」（DEBUG-REPORT-v3 §3-30 的变异：加一行写事件，全绿）。
+    // 这里把同一个库交给服务，调一次真实的服务层入口，再复扫全部表的行数。
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    let service = KeyRelayService::new(
+        Store::open(&db).expect("交给服务的库"),
+        MockTransport::new(vec![]),
+        ServiceConfig::in_memory(home),
+    );
+    let rows = service.channel_bindings().expect("服务层读绑定");
+    assert_eq!(rows.len(), 1, "服务层应返回那条未解绑的绑定");
+    assert_eq!(rows[0].agent_id, "codex");
+
+    let count_after = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+            .expect("计数查询")
+    };
+    assert_eq!(
+        count_after("SELECT COUNT(*) FROM bindings"),
+        1,
+        "服务层读取不得改动 bindings"
+    );
+    assert_eq!(
+        count_after("SELECT COUNT(*) FROM events"),
+        0,
+        "服务层读取不得写事件表（服务层最自然的隐式写就是 log 一条）"
+    );
+    assert_eq!(
+        count_after("SELECT COUNT(*) FROM settings"),
+        0,
+        "服务层读取不得写 settings"
+    );
+    assert_eq!(
+        count_after("SELECT COUNT(*) FROM keys"),
+        1,
+        "服务层读取不得改动 keys"
     );
 }
