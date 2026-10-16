@@ -2327,6 +2327,148 @@ pub async fn captcha_cancel<R: tauri::Runtime>(
     Ok(())
 }
 
+// ---- M15-S1：模型检测（bazaarlink probe）----
+
+/// probe 检测结果（返回前端）。只含身份判定摘要，不含 items[].response 等敏感字段。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeRunDto {
+    run_id: String,
+    status: String,
+    identity_status: Option<String>,
+    verdict_status: Option<String>,
+    true_family: Option<String>,
+    true_model: Option<String>,
+    spoof_method: Option<String>,
+    confidence: Option<String>,
+    warnings_count: u32,
+    report_url: Option<String>,
+    created_at: Option<i64>,
+    completed_at: Option<i64>,
+}
+
+impl From<keyrelay_core::probe::ProbeRun> for ProbeRunDto {
+    fn from(r: keyrelay_core::probe::ProbeRun) -> Self {
+        Self {
+            run_id: r.run_id,
+            status: r.status,
+            identity_status: r.identity_status,
+            verdict_status: r.verdict_status,
+            true_family: r.true_family,
+            true_model: r.true_model,
+            spoof_method: r.spoof_method,
+            confidence: r.confidence,
+            warnings_count: r.warnings_count,
+            report_url: r.report_url,
+            created_at: r.created_at,
+            completed_at: r.completed_at,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeArgs {
+    pub key_id: i64,
+    pub model_id: String,
+    pub claimed_model: Option<String>,
+    pub base_url_override: Option<String>,
+    pub confirm: bool,
+}
+
+/// 模型检测（M15-S1）。**apiKey 发给第三方 bazaarlink.ai**——`confirm` 必须为 true。
+#[tauri::command]
+pub async fn probe_run(state: State<'_, AppState>, args: ProbeArgs) -> Result<ProbeRunDto, String> {
+    if !args.confirm {
+        return Err(
+            "模型检测需要二次确认：会把该站点的 API key 发送给第三方 bazaarlink.ai".to_string(),
+        );
+    }
+    state
+        .service
+        .probe_model(
+            args.key_id,
+            args.model_id,
+            args.claimed_model,
+            args.base_url_override,
+            args.confirm,
+        )
+        .await
+        .map(ProbeRunDto::from)
+        .map_err(|e| e.to_string())
+}
+
+/// 检测历史记录（返回前端）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeRunRowDto {
+    id: i64,
+    run_id: String,
+    site_id: i64,
+    key_id: i64,
+    model_id: String,
+    claimed_model: Option<String>,
+    identity_status: Option<String>,
+    verdict_status: Option<String>,
+    true_family: Option<String>,
+    true_model: Option<String>,
+    spoof_method: Option<String>,
+    confidence: Option<String>,
+    warnings_count: u32,
+    report_url: Option<String>,
+    bazaarlink_created_at: Option<i64>,
+    bazaarlink_completed_at: Option<i64>,
+    recorded_at: i64,
+}
+
+impl From<keyrelay_core::store::ProbeRunRow> for ProbeRunRowDto {
+    fn from(r: keyrelay_core::store::ProbeRunRow) -> Self {
+        Self {
+            id: r.id,
+            run_id: r.run_id,
+            site_id: r.site_id,
+            key_id: r.key_id,
+            model_id: r.model_id,
+            claimed_model: r.claimed_model,
+            identity_status: r.identity_status,
+            verdict_status: r.verdict_status,
+            true_family: r.true_family,
+            true_model: r.true_model,
+            spoof_method: r.spoof_method,
+            confidence: r.confidence,
+            warnings_count: r.warnings_count,
+            report_url: r.report_url,
+            bazaarlink_created_at: r.bazaarlink_created_at,
+            bazaarlink_completed_at: r.bazaarlink_completed_at,
+            recorded_at: r.recorded_at,
+        }
+    }
+}
+
+#[tauri::command]
+pub fn list_probe_runs(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<ProbeRunRowDto>, String> {
+    state
+        .service
+        .list_probe_runs(limit.unwrap_or(50))
+        .map(|rows| rows.into_iter().map(ProbeRunRowDto::from).collect())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_probe_run(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<Option<ProbeRunRowDto>, String> {
+    state
+        .service
+        .get_probe_run(id)
+        .map(|opt| opt.map(ProbeRunRowDto::from))
+        .map_err(|e| e.to_string())
+}
+
 /// 落盘一份环境/自启计划。
 ///
 /// Windows 形态（`EnvPlan::Registry`）走 `reg.exe`，**不经 shell**——值里的空格、

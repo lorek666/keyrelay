@@ -86,6 +86,28 @@ fn build_transport_with_proxy(proxy: Option<String>) -> AppTransport {
     }
 }
 
+/// M15-S1 复审 H1+M2：probe 专用 transport。
+///
+/// 与站点 transport 的两点差异：
+/// - **timeout 120s**（站点是 15s）：bazaarlink `sync=true` 要等服务端跑完多轮推理对比，
+///   15s 几乎必然超时——用户拿不到结果还白扣 30/IP/hour 配额。
+/// - **不套 `RetryingTransport`**：429 由 probe 层自己映射成 `RateLimited` 告诉用户，
+///   不该被站点重试策略抢着重试（Retry-After 被 cap 到 5s，白打 + 等 10s）。
+fn build_probe_transport(proxy: Option<String>) -> ReqwestTransport {
+    let config = TransportConfig {
+        timeout: std::time::Duration::from_secs(120),
+        proxy,
+        ..TransportConfig::default()
+    };
+    match ReqwestTransport::new(config) {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("[keyrelay] 构造 probe 传输层失败: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// 从 store 读 settings，按 `proxy_mode` 解析出最终代理 URL（M10-S2）。
 ///
 /// 站点适配器 transport 在启动时构造一次、不可变（与 B-54 同口径：代理变更需重启 app）。
@@ -154,8 +176,10 @@ fn state_with_config(
     // 顺序不能反。代理非法时 resolved_proxy_url 已 eprintln 告警并返回 None（直连），
     // 不让 app 因此退出。
     let proxy = resolved_proxy_url(&store);
+    let proxy_for_probe = proxy.clone();
     AppState {
-        service: KeyRelayService::new(store, build_transport_with_proxy(proxy), config),
+        service: KeyRelayService::new(store, build_transport_with_proxy(proxy), config)
+            .with_probe_transport(build_probe_transport(proxy_for_probe)),
         db_path,
         db_error,
         gateway: std::sync::Mutex::new(None),
@@ -263,7 +287,11 @@ pub fn configure_with_state<R: tauri::Runtime>(
             // M14-S1：模型别名映射（B-110）
             commands::list_alias_map,
             commands::upsert_alias,
-            commands::delete_alias
+            commands::delete_alias,
+            // M15-S1：模型检测（bazaarlink probe）
+            commands::probe_run,
+            commands::list_probe_runs,
+            commands::get_probe_run
         ])
 }
 

@@ -27,11 +27,13 @@ use crate::inject::Patch;
 pub struct GeminiCliWriter {
     path: PathBuf,
     base_url: String,
+    model: Option<String>,
 }
 
 impl GeminiCliWriter {
     pub const FIELD_API_KEY: &'static str = "GEMINI_API_KEY";
     pub const FIELD_BASE_URL: &'static str = "GOOGLE_GEMINI_BASE_URL";
+    pub const FIELD_MODEL: &'static str = "GEMINI_MODEL";
 
     /// `home` 显式传入（不读 `HOME`），便于测试重定向到临时目录。
     pub fn new(home: &Path, base_url: &str) -> Self {
@@ -42,7 +44,17 @@ impl GeminiCliWriter {
         Self {
             path: path.into(),
             base_url: base_url.to_string(),
+            model: None,
         }
+    }
+
+    pub fn with_model(home: &Path, base_url: &str, model: Option<&str>) -> Self {
+        let mut w = Self::new(home, base_url);
+        w.model = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        w
     }
 
     pub fn path(&self) -> &Path {
@@ -50,7 +62,7 @@ impl GeminiCliWriter {
     }
 
     /// 生成写入后的完整文本。`api_key` 会出现在返回值里——调用方不得打印。
-    fn build_after(&self, before: &str, api_key: &str) -> Result<String> {
+    fn build_after(&self, before: &str, api_key: &str, model: &Option<String>) -> Result<String> {
         if api_key.trim().is_empty() {
             return Err(Error::inject(&self.path, "密钥为空，拒绝写入"));
         }
@@ -66,6 +78,9 @@ impl GeminiCliWriter {
             vec![(Self::FIELD_API_KEY, render_value(api_key))];
         if !self.base_url.is_empty() {
             assignments.push((Self::FIELD_BASE_URL, render_value(&self.base_url)));
+        }
+        if let Some(m) = model {
+            assignments.push((Self::FIELD_MODEL, render_value(m)));
         }
 
         // `removed` 收集「重复的受管行」下标，`appended` 收集需要新起一行的键。
@@ -169,6 +184,9 @@ impl DeliveryWriter for GeminiCliWriter {
         if !self.base_url.is_empty() {
             names.push(Self::FIELD_BASE_URL.to_string());
         }
+        if self.model.is_some() {
+            names.push(Self::FIELD_MODEL.to_string());
+        }
         names
     }
 
@@ -177,12 +195,15 @@ impl DeliveryWriter for GeminiCliWriter {
         if !self.base_url.is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
+        if let Some(m) = &self.model {
+            fields.push(literal_field(Self::FIELD_MODEL, m));
+        }
         fields
     }
 
     fn plan(&self, api_key: &str) -> Result<Patch> {
         let before = read_text_or_empty(&self.path)?;
-        let after = self.build_after(&before, api_key)?;
+        let after = self.build_after(&before, api_key, &self.model)?;
         Ok(Patch::secret_bearing(self.path.clone(), before, after))
     }
 }

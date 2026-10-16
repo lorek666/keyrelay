@@ -1634,3 +1634,84 @@ export async function relaunchApp(): Promise<void> {
   }
   await import("@tauri-apps/plugin-process").then(({ relaunch }) => relaunch());
 }
+
+// ============================================================ M15-S1：模型检测（bazaarlink probe）
+
+/** probe 检测结果（只含身份判定摘要，不含 items[].response 等敏感字段）。 */
+export type ProbeRun = {
+  runId: string;
+  status: string;
+  identityStatus?: string | null;
+  verdictStatus?: string | null;
+  trueFamily?: string | null;
+  trueModel?: string | null;
+  spoofMethod?: string | null;
+  confidence?: string | null;
+  warningsCount: number;
+  reportUrl?: string | null;
+  createdAt?: number | null;
+  completedAt?: number | null;
+};
+
+export type ProbeArgs = {
+  keyId: number;
+  modelId: string;
+  claimedModel?: string | null;
+  baseUrlOverride?: string | null;
+  confirm: boolean;
+};
+
+/**
+ * 模型检测（M15-S1）：把站点 key 发给 bazaarlink.ai 检测模型真伪。
+ *
+ * **apiKey 发给第三方 bazaarlink.ai**——`confirm` 必须为 true。UI 必须明示这一点。
+ */
+export async function probeRun(args: ProbeArgs): Promise<ProbeRun> {
+  if (!hasTauri) {
+    return mock({
+      runId: "mock-run-1",
+      status: "completed",
+      identityStatus: "match",
+      verdictStatus: "clean_match",
+      trueFamily: "openai",
+      trueModel: "gpt-4o",
+      spoofMethod: null,
+      confidence: "high",
+      warningsCount: 0,
+      reportUrl: "/api/probe/report/mock-1",
+      createdAt: 1700000000,
+      completedAt: 1700000060,
+    });
+  }
+  return invokeCommand<ProbeRun>("probe_run", { args });
+}
+
+export type ProbeRunRow = {
+  id: number;
+  runId: string;
+  siteId: number;
+  keyId: number;
+  modelId: string;
+  claimedModel?: string | null;
+  identityStatus?: string | null;
+  verdictStatus?: string | null;
+  trueFamily?: string | null;
+  trueModel?: string | null;
+  spoofMethod?: string | null;
+  confidence?: string | null;
+  warningsCount: number;
+  reportUrl?: string | null;
+  bazaarlinkCreatedAt?: number | null;
+  bazaarlinkCompletedAt?: number | null;
+  recordedAt: number;
+};
+
+export async function listProbeRuns(limit?: number): Promise<ProbeRunRow[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<ProbeRunRow[]>("list_probe_runs", { limit: limit ?? null });
+}
+
+export async function getProbeRun(id: number): Promise<ProbeRunRow | null> {
+  if (!hasTauri) return mock(null);
+  return invokeCommand<ProbeRunRow | null>("get_probe_run", { id });
+}

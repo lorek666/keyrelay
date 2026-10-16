@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::inject::Patch;
+use crate::model_meta;
 use crate::redact::mask_secret;
 
 /// 投递通道：一个通道 = 一个 agent 的一种配置落点。
@@ -534,11 +535,19 @@ pub fn resolve_for_binding(
     provider_id: &str,
     model: Option<&str>,
 ) -> Result<Box<dyn DeliveryWriter>> {
+    // M14-S7：查模型元数据——内置表 + models.dev。
+    // `None` 表示未命中（内置表 + models.dev 都没查到），不写参数行。
+    let model_owned = model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
+    let meta = model_owned.as_deref().and_then(model_meta::lookup);
+
     match channel {
         DeliveryChannel::CodexAuthJson => Ok(Box::new(codex_auth::CodexAuthWriter::new(home))),
-        DeliveryChannel::ClaudeCodeSettings => {
-            Ok(Box::new(claude_code::ClaudeCodeWriter::new(home, base_url)))
-        }
+        DeliveryChannel::ClaudeCodeSettings => Ok(Box::new(
+            claude_code::ClaudeCodeWriter::with_model(home, base_url, model_owned.as_deref()),
+        )),
         DeliveryChannel::OpenCode | DeliveryChannel::OpenCodeJsonc => {
             if provider_id.trim().is_empty() {
                 return Err(Error::inject(
@@ -551,31 +560,87 @@ pub fn resolve_for_binding(
                 channel,
                 provider_id,
                 base_url,
-                model,
+                model_owned.as_deref(),
+                meta,
             )))
         }
-        DeliveryChannel::GeminiCli => {
-            Ok(Box::new(gemini_cli::GeminiCliWriter::new(home, base_url)))
-        }
+        DeliveryChannel::GeminiCli => Ok(Box::new(gemini_cli::GeminiCliWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+        ))),
         DeliveryChannel::ClaudeDesktop => Ok(Box::new(claude_desktop::ClaudeDesktopWriter::new(
             home, base_url,
         ))),
-        DeliveryChannel::GrokBuild => {
-            Ok(Box::new(grok_build::GrokBuildWriter::new(home, base_url)))
-        }
-        DeliveryChannel::OpenClaw => Ok(Box::new(openclaw::OpenClawWriter::new(home, base_url))),
-        DeliveryChannel::Hermes => Ok(Box::new(hermes::HermesWriter::new(home, base_url))),
-        DeliveryChannel::MCode => Ok(Box::new(mcode::MCodeWriter::new(home, base_url))),
-        DeliveryChannel::Pi => Ok(Box::new(pi::PiWriter::new(home, base_url))),
-        DeliveryChannel::Cursor => Ok(Box::new(cursor::CursorWriter::new(home, base_url))),
-        DeliveryChannel::Cline => Ok(Box::new(cline::ClineWriter::new(home, base_url))),
-        DeliveryChannel::QwenCode => Ok(Box::new(qwen_code::QwenCodeWriter::new(home, base_url))),
-        DeliveryChannel::DeepSeek => Ok(Box::new(deepseek::DeepSeekWriter::new(home, base_url))),
-        DeliveryChannel::Trae => Ok(Box::new(trae::TraeWriter::new(home, base_url))),
-        DeliveryChannel::MiMoCode => Ok(Box::new(mimo_code::MiMoCodeWriter::new(home, base_url))),
-        DeliveryChannel::ClineDesktop => Ok(Box::new(cline_desktop::ClineDesktopWriter::new(
-            home, base_url,
+        DeliveryChannel::GrokBuild => Ok(Box::new(grok_build::GrokBuildWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
         ))),
+        DeliveryChannel::OpenClaw => Ok(Box::new(openclaw::OpenClawWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::Hermes => Ok(Box::new(hermes::HermesWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::MCode => Ok(Box::new(mcode::MCodeWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::Pi => Ok(Box::new(pi::PiWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::Cursor => Ok(Box::new(cursor::CursorWriter::new(home, base_url))),
+        DeliveryChannel::Cline => Ok(Box::new(cline::ClineWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::QwenCode => Ok(Box::new(qwen_code::QwenCodeWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::DeepSeek => Ok(Box::new(deepseek::DeepSeekWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::Trae => Ok(Box::new(trae::TraeWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::MiMoCode => Ok(Box::new(mimo_code::MiMoCodeWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::ClineDesktop => {
+            Ok(Box::new(cline_desktop::ClineDesktopWriter::with_model(
+                home,
+                base_url,
+                model_owned.as_deref(),
+                meta,
+            )))
+        }
         DeliveryChannel::DeepSeekHarness => Ok(Box::new(dsh::DshWriter::new(home, base_url))),
     }
 }

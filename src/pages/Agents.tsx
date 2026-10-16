@@ -76,10 +76,12 @@ export default function Agents() {
   const activeKey = keyId ?? null;
   const [channel, setChannel] = useState(CHANNELS[0].id);
 
-  // 模型名：当前没有通道在界面层强制要求模型名（OpenCode 可选填）。
+  // 模型名：M14-S7 — 16 条通道能写模型名（+ 参数），3 条不能。
+  // 不支持模型名的通道：claude-desktop / cursor / dsh（配置文件不含模型字段）。
   // 这是**输入框显不显示**的界面判断，不是能力判断：要不要、缺了怎么办由后端决定并报错说明。
   // 防抖后再进查询键——每次预览都要读一次钥匙串，不该每敲一个字读一次。
-  const needsModel = false;
+  const NO_MODEL_CHANNELS = new Set(["claude-desktop", "cursor", "dsh", "codex-auth-json"]);
+  const needsModel = !NO_MODEL_CHANNELS.has(channel);
   // 当前通道所属的 agent（解绑按 agent 做，不是按通道）。
   // `channel` 只可能来自 `CHANNELS`（初始值与下拉都在其中），所以这里的兜底不可达；
   // 用空串而不是 `!`：解绑命令对空 agent_id 只会返回 `{0, 0}`（幂等零报告），不会误伤。

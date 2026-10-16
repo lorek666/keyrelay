@@ -69,4 +69,8 @@ pub const COMMANDS: &[&str] = &[
     "list_alias_map",
     "upsert_alias",
     "delete_alias",
+    // M15-S1：模型检测（bazaarlink probe）
+    "probe_run",
+    "list_probe_runs",
+    "get_probe_run",
 ];
