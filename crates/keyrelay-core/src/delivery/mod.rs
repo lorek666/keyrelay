@@ -242,6 +242,20 @@ impl DeliveryChannel {
 
 /// 投递后该 agent 是否需要重启才能读到新配置（PRD FR-4:137 / 章程 R-11：**只标注，不重启**）。
 ///
+/// P2-3（后端半）：该通道的**落点文件里是否含 endpoint**。
+///
+/// `false` ⇒ 切到网关模式时这个通道**只换了令牌、没换地址**：界面必须提示用户去改另一个
+/// 文件（Codex 的 endpoint 在 `~/.codex/config.toml`，不在 `auth.json` 里），否则 agent 会把
+/// 本地令牌发到站点、拿回 401。
+///
+/// 判据与 `resolve` / `resolve_for_gateway` 的装配表**同源**：Codex 的 writer 只吃 `home`
+/// （`CodexAuthWriter::new(home)`），其余通道都吃 `base_url`（`*Writer::with_model(home,
+/// base_url, …)`）。新增通道时，如果新 writer 不吃 `base_url`，这里要同步加进去——
+/// 有单测钉住当前这张表。
+pub fn channel_carries_endpoint(channel: DeliveryChannel) -> bool {
+    !matches!(channel, DeliveryChannel::CodexAuthJson)
+}
+
 /// 纯函数、无 IO。UI **必须**调用它取文案，不得在界面里硬编码判断——否则新增通道时又会漏一处。
 pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
     match channel {
@@ -1425,6 +1439,23 @@ mod tests {
     fn diff_ignores_trailing_newline_only_difference() {
         let (tag, line) = diff_lines("a\n", "a").into_iter().next().unwrap();
         assert_eq!((tag, line.as_str()), (' ', "a"));
+    }
+
+    /// P2-3：只有 Codex 的落点文件不含 endpoint（其余通道都吃 `base_url`）。
+    ///
+    /// 这条钉住的是**事实表**：新增一个「只吃 home、不吃 base_url」的 writer 时，
+    /// 这里会红——提醒作者把它加进 `channel_carries_endpoint` 的例外集，
+    /// 否则界面会以为「换了令牌就等于换了地址」，而 Codex 那类通道会 401。
+    #[test]
+    fn only_codex_auth_json_lacks_an_endpoint_in_its_target_file() {
+        for channel in DeliveryChannel::ALL {
+            let carries = channel_carries_endpoint(channel);
+            if channel == DeliveryChannel::CodexAuthJson {
+                assert!(!carries, "Codex 的 auth.json 里没有 endpoint");
+            } else {
+                assert!(carries, "{} 的落点文件里应当有 endpoint", channel.as_str());
+            }
+        }
     }
 
     #[test]

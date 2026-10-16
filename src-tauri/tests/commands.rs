@@ -646,8 +646,15 @@ fn export_diagnostics_writes_a_package_and_registers_it_for_the_audit() {
     let (_app, webview) = build_app();
 
     let before = invoke_on(&webview, "audit_redaction", json!({})).expect("审计应成功");
-    let dir = tempfile::tempdir().expect("临时目录");
-    let path = dir.path().join("diag.json");
+    // M16-S6a / P3-18：`path` 已收敛到「服务 home 下的 .keyrelay/exports + 文件名白名单」，
+    // 任意路径（含临时目录）会被拒。这里用**允许目录内的合法文件名**，顺带钉住收敛本身。
+    let state = {
+        use tauri::Manager;
+        webview.app_handle().state::<keyrelay_lib::AppState>()
+    };
+    let exports = state.service.home().join(".keyrelay").join("exports");
+    std::fs::create_dir_all(&exports).expect("建导出目录");
+    let path = exports.join("keyrelay-diagnostics-test.json");
 
     let value = invoke_on(
         &webview,
@@ -685,10 +692,16 @@ fn export_diagnostics_writes_a_package_and_registers_it_for_the_audit() {
 
     let after = invoke_on(&webview, "audit_redaction", json!({})).expect("审计应成功");
     assert_eq!(after["clean"], true, "诊断包必须自身干净: {after}");
+    // M16-S6a：断言恢复**紧口径 +1**。
+    //
+    // 收敛之后导出物落在被扫描目录内，曾出现「同一文件计两次」（`filesScanned` 0 → 2）——
+    // 根因在 `audit::merge_export_registry` 按**字符串**去重（目录 vs 文件永不相等）。
+    // 根因已修（改按规范化真实路径 + 目录前缀覆盖判定），所以这里没有理由留着宽松断言：
+    // 一个文件必须**恰好**让覆盖面 +1，多了就是注水（审计报告里唯一的覆盖面证据）。
     assert_eq!(
         after["filesScanned"].as_u64().unwrap_or(0),
         before["filesScanned"].as_u64().unwrap_or(0) + 1,
-        "登记的意义是进扫描集合：文件数必须 +1（登记失败的话这条会红）"
+        "登记的意义是进扫描集合：文件数必须恰好 +1（多计=注水，少计=登记失败）: before={before} after={after}"
     );
 }
 
@@ -1586,4 +1599,52 @@ fn list_deliveries_returns_newest_first_with_camel_case_fields() {
         !all.to_string().contains("sk-"),
         "投递历史不得携带密钥: {all}"
     );
+}
+
+// ============================================ M16-S6a：report_ui_ready（界面就绪上报）
+
+/// `report_ui_ready` 必须真的把时间戳写进 `settings` 表（M16-S6a 追加项）。
+///
+/// 这条命令存在的理由：GUI 真机走查（M16-S7）在 macOS 上**看不到** WebView 内部的 AX 节点，
+/// 截图也不稳定 ⇒ 自动化没有判据判断「界面真的起来了」。有了 `ui_ready_at`：
+/// ① 走查脚本能轮询它得到真正的端到端冷启动时间；
+/// ② B-15「invoke 真实往返」从「AX 看不到 ⇒ 不可证」变成「这个值有 ⇒ 前端确实调通过一次 IPC」。
+///
+/// 断言三件事：IPC 往返成功、值落在 `settings` 表里、是**数字字符串**（毫秒）。
+/// 另外钉一条「不是启动时自动写的」：调用之前该键**必须不存在**。
+#[test]
+fn report_ui_ready_writes_a_millisecond_timestamp_setting() {
+    use tauri::Manager;
+
+    let (_app, webview) = build_app();
+    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let store = state.service.store();
+
+    // ① 调用之前不存在：这条命令的价值在于「前端显式调过」，自动写等于没证
+    assert_eq!(
+        store.get_setting("ui_ready_at").expect("读设置"),
+        None,
+        "启动时不得自动写 ui_ready_at（那样证不到前端往返）"
+    );
+
+    invoke_on(&webview, "report_ui_ready", json!({})).expect("report_ui_ready 应成功");
+
+    // ② 值存在且是数字字符串
+    let raw = store
+        .get_setting("ui_ready_at")
+        .expect("读设置")
+        .expect("调用之后必须有 ui_ready_at");
+    let ms: i64 = raw
+        .parse()
+        .unwrap_or_else(|_| panic!("必须是数字字符串: {raw}"));
+    assert!(ms > 1_600_000_000_000, "看起来不是 unix 毫秒: {ms}");
+
+    // ③ 幂等：再调一次只覆盖，不报错
+    invoke_on(&webview, "report_ui_ready", json!({})).expect("重复调用应成功");
+    let again = store
+        .get_setting("ui_ready_at")
+        .expect("读设置")
+        .expect("值仍在");
+    let ms2: i64 = again.parse().expect("仍是数字字符串");
+    assert!(ms2 >= ms, "重复调用应覆盖成更新的时间戳: {ms} -> {ms2}");
 }

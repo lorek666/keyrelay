@@ -31,6 +31,7 @@
     "allow-detect-system-proxy",
     "allow-refresh-all",
     "allow-audit-redaction",
+    "allow-report-ui-ready",
     "allow-gateway-status",
     "allow-gateway-start",
     "allow-gateway-stop",
