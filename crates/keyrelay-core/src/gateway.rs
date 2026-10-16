@@ -925,46 +925,51 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                     latency_ms,
                     !should_failover(status),
                 );
+                let replayable = status_allows_replay(status);
                 if should_failover(status) {
                     // §3.5-1：`opened_at` 必须是**失败发生**的时刻，不是请求开始的时刻。
                     // 用请求开始时刻的话，一次比冷却期还慢的失败（524 ≈ 100s > 冷却 60s）
                     // 记下的那一刻冷却就已经「过期」⇒ 这个上游**永远熔断不了**；
                     // 即使不慢，有效冷却也被缩短了「本次请求耗时」那么多。
-                    report_failure(
-                        &state,
-                        upstream.site_id,
-                        status,
-                        &event_model,
-                        &format!("上游返回可切换状态码 HTTP {status}"),
-                        Instant::now(),
-                    );
-                    if !is_last {
-                        continue; // 丢掉这个响应，试下一个
-                    }
+                    let reason = if replayable {
+                        format!("上游返回 HTTP {status}（限流：未进入处理，已切下一个候选）")
+                    } else {
+                        format!("上游返回 HTTP {status}（可能已计费，按 P2-13 不重放）")
+                    };
+                    report_failure(&state, upstream.site_id, status, &event_model, &reason, Instant::now());
                 } else {
                     record_success(&state, upstream.site_id, Instant::now());
                 }
-                // 不可切换的状态、或已经是最后一个候选 ⇒ **如实返回上游的响应**
-                // （包括它的状态码，不做 500 兜底）。
+                // M16-S4 / P2-13：**只有 429 才重放**（上游明确没处理这个请求）。
+                // 其余状态码——含 5xx / 524 / 504 这类可能已经计费的——一律**原样返回**：
+                // 重复计费不可逆，可用性由「熔断 → 下一个请求换上游」承接。
+                // 不可切换的状态、或已经是最后一个候选 ⇒ 同样如实返回（不做 500 兜底）。
+                if replayable && !is_last {
+                    continue; // 丢掉这个 429，试下一个
+                }
                 return into_upstream_response(&state, response, upstream.site_id, &event_model);
             }
-            Err(message) => {
+            Err(failure) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 observe(&state, upstream.site_id, latency_ms, false);
-                // 传输层失败没有 HTTP 状态码：按 502 记（与 legacy 路径的错误码一致）并切下一个。
-                report_failure(
-                    &state,
-                    upstream.site_id,
-                    502,
-                    &event_model,
-                    &format!(
-                        "传输层失败（连不上 / 超时）: {}",
+                let replayable = failure.is_replayable();
+                let message = failure.message().to_string();
+                // 传输层失败没有 HTTP 状态码：按 502 记（与 legacy 路径的错误码一致）。
+                // 文案必须说清**为什么**这次能/不能重放——这是计费决策的现场记录（P2-13）。
+                let reason = if replayable {
+                    format!(
+                        "传输层失败（连接层，请求未送达；已切下一个候选）: {}",
                         crate::redact::scrub(&message)
-                    ),
-                    Instant::now(),
-                );
+                    )
+                } else {
+                    format!(
+                        "传输层失败（请求可能已送达，按 P2-13 不重放）: {}",
+                        crate::redact::scrub(&message)
+                    )
+                };
+                report_failure(&state, upstream.site_id, 502, &event_model, &reason, Instant::now());
                 last_error = Some(message);
-                if is_last {
+                if !replayable || is_last {
                     break;
                 }
             }
@@ -1073,14 +1078,16 @@ fn upstream_headers(config: &GatewayConfig, inbound: &HeaderMap, key: &str) -> H
     headers
 }
 
-/// 发一次请求。`Err(人话原因)` 表示**传输层**失败（连不上 / TLS / 超时）——没有 HTTP 状态码。
+/// 发一次请求。`Err` 表示失败，且**已经分类**成「可重放 / 不可重放」（P2-13）——
+/// 分类必须在**这里**做：只有 `reqwest::Error` 才知道失败发生在连接阶段还是响应阶段，
+/// 上层拿到的只是一个字符串。
 async fn send_once(
     state: &AppState,
     method: axum::http::Method,
     url: &str,
     headers: HeaderMap,
     body: bytes::Bytes,
-) -> std::result::Result<reqwest::Response, String> {
+) -> std::result::Result<reqwest::Response, AttemptFailure> {
     state
         .upstream
         .request(method, url)
@@ -1088,10 +1095,14 @@ async fn send_once(
         .body(body)
         .send()
         .await
-        .map_err(|e| format!("转发到上游失败: {e}"))
+        .map_err(|e| classify_send_error(&e))
 }
 
 /// 单上游（legacy）转发：只发一次，错误按既有形态返回。
+///
+/// M16-S4：`send_once` 现在返回**分类后**的失败。legacy 路径**没有下一个候选**，
+/// 所以分类不影响这里的行为（两个分支都返回 502 + 同一段文案），
+/// 只是把错误消息取出来——**响应形态与改动前逐字节相同**。
 async fn forward_to(
     state: &AppState,
     method: axum::http::Method,
@@ -1102,9 +1113,9 @@ async fn forward_to(
     let model = model_from_body(&body).unwrap_or_default();
     match send_once(state, method, url, headers, body).await {
         Ok(response) => into_upstream_response(state, response, state.config.site_id, &model),
-        Err(message) => (
+        Err(failure) => (
             StatusCode::BAD_GATEWAY,
-            axum::Json(serde_json::json!({ "error": message })),
+            axum::Json(serde_json::json!({ "error": failure.message() })),
         )
             .into_response(),
     }
@@ -1260,6 +1271,59 @@ fn report_failure(
             reason: crate::redact::scrub(reason),
         });
     }
+}
+
+/// 一次上游尝试的失败，按「上游是否**可能已经接受**了请求」分类（M16-S4 / P2-13）。
+///
+/// 这是**计费安全**的分类，不是错误类型的分类——它只回答一个问题：
+/// 这次失败**能不能**把同一个请求再发给下一个上游而不产生重复计费。
+///
+/// - [`AttemptFailure::NotAccepted`]：连接层失败（DNS / TCP / TLS / 连接超时）。
+///   请求连会话都没建立起来，上游不可能处理它 ⇒ **重放安全**。
+/// - [`AttemptFailure::Ambiguous`]：其余（读超时、响应途中被重置、请求构造失败…）。
+///   请求可能已经送达并被处理（上游超时后仍可能跑完计费）⇒ **不重放**。
+enum AttemptFailure {
+    NotAccepted(String),
+    Ambiguous(String),
+}
+
+impl AttemptFailure {
+    fn message(&self) -> &str {
+        match self {
+            AttemptFailure::NotAccepted(message) | AttemptFailure::Ambiguous(message) => message,
+        }
+    }
+
+    /// 这次失败能不能重放到下一个上游。
+    fn is_replayable(&self) -> bool {
+        matches!(self, AttemptFailure::NotAccepted(_))
+    }
+}
+
+/// 把 `reqwest` 的发送错误分成「上游没收到请求」与「无法判定」（P2-13）。
+///
+/// `is_connect()` 覆盖连接阶段的失败：DNS 解析、TCP 握手、TLS 握手，以及
+/// `connect_timeout` 超时——这些情况下请求体一个字节都没进上游的处理流程。
+/// 读超时（`read_timeout`，即「已连上但等不到响应头」）**不**算：那说明请求已经送出去了。
+fn classify_send_error(e: &reqwest::Error) -> AttemptFailure {
+    let message = format!("转发到上游失败: {e}");
+    if e.is_connect() {
+        AttemptFailure::NotAccepted(message)
+    } else {
+        AttemptFailure::Ambiguous(message)
+    }
+}
+
+/// 收到响应码之后还能不能重放（M16-S4 / P2-13 的裁定）。
+///
+/// **只有 429** 算「上游明确没处理这个请求」：限流是在进入模型处理**之前**被拒的，
+/// 重放不产生计费，也保住了 FR-5:160 的可见行为（用户看到换了站继续跑）。
+///
+/// 其余 5xx（含 524 / 504 这类**上游可能已经跑完并计费**的超时）一律不重放：
+/// 重复计费不可逆，而可用性由「熔断 → 下一个请求换上游」承接。
+/// 4xx 里除 429 外本来就 `should_failover == false`，走不到这里。
+fn status_allows_replay(status: u16) -> bool {
+    status == 429
 }
 
 /// 从请求体里**尽力**取出 `model`。取不到返回 `None`，不报错——
@@ -2085,5 +2149,100 @@ mod tests {
         let second = capped.next().await;
         assert!(second.is_some(), "第二个 chunk 超限应产生错误");
         assert!(second.unwrap().is_err());
+    }
+
+    // ---------- M16-S4 / P2-13：重放安全性的分类 ----------
+
+    /// `status_allows_replay`：**只有 429** 算「上游没处理这个请求」。
+    ///
+    /// 这一格是计费决策的判据，逐值钉死：5xx（含 524 / 504 这类可能已经跑完计费的超时）
+    /// 一律不许重放；429 是限流，发生在处理之前。
+    #[test]
+    fn only_429_allows_replay_after_a_status_code() {
+        assert!(status_allows_replay(429), "429 = 限流，未进入处理 ⇒ 可重放");
+        for status in [
+            400u16, 401, 402, 403, 404, 408, 422, 499, 500, 502, 503, 504, 520, 524, 529,
+        ] {
+            assert!(
+                !status_allows_replay(status),
+                "{status} 可能已计费（或本就不该切换）⇒ 不许重放"
+            );
+        }
+    }
+
+    /// 连接被拒（端口没人听）⇒ `is_connect()` ⇒ **可重放**。
+    ///
+    /// 用 `127.0.0.1:1`：必然拒绝连接，不需要网络，也不会碰到任何真实站点。
+    #[tokio::test]
+    async fn a_refused_connection_is_classified_as_not_accepted() {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .build()
+            .expect("构造客户端");
+        let err = client
+            .get("http://127.0.0.1:1/v1/models")
+            .send()
+            .await
+            .expect_err("127.0.0.1:1 上不该有服务");
+        assert!(
+            err.is_connect(),
+            "前提：连接被拒时 reqwest 必须报 connect 错误（否则本分类的前提不成立）: {err:?}"
+        );
+        let failure = classify_send_error(&err);
+        assert!(
+            failure.is_replayable(),
+            "连接层失败 ⇒ 请求未送达 ⇒ 必须可重放: {:?}",
+            failure.message()
+        );
+    }
+
+    /// 读超时（连上了、请求发出去了、等不到响应头）⇒ **不可重放**。
+    ///
+    /// 这是最容易写错的一格：`is_timeout()` 对连接超时与读超时**都为真**，
+    /// 所以判据必须是 `is_connect()`，不是 `is_timeout()`。
+    #[tokio::test]
+    async fn a_read_timeout_is_classified_as_ambiguous() {
+        // 一个只 accept、永不回包的假上游（本地回环，不联网）
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("绑定假上游");
+        let addr = listener.local_addr().expect("读地址");
+        let hold = tokio::spawn(async move {
+            // 保持连接打开、不回任何字节；测试结束任务被 abort
+            let mut sockets = Vec::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                sockets.push(socket);
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .read_timeout(Duration::from_millis(150))
+            .build()
+            .expect("构造客户端");
+        let err = client
+            .get(format!("http://{addr}/v1/models"))
+            .send()
+            .await
+            .expect_err("假上游不回包 ⇒ 必须读超时");
+        assert!(
+            err.is_timeout(),
+            "前提：这一格必须是超时错误: {err:?}"
+        );
+        assert!(
+            !err.is_connect(),
+            "前提：读超时**不是** connect 错误（否则这条用例证不到东西）: {err:?}"
+        );
+        let failure = classify_send_error(&err);
+        assert!(
+            !failure.is_replayable(),
+            "请求可能已经送达并被处理 ⇒ 不许重放: {:?}",
+            failure.message()
+        );
+
+        hold.abort();
     }
 }
