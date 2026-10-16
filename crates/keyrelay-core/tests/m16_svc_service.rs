@@ -410,13 +410,19 @@ async fn session_expiry_reads_jwt_exp() {
 }
 
 #[tokio::test]
-async fn session_expiry_is_none_for_tokens_without_exp() {
+async fn jwt_exp_handles_malformed_tokens() {
     for token in [
         "not-a-jwt",
         "only-one-segment",
         "a.b.c",
         // 合法 base64 但不是 JSON
         "a.bm90LWpzb24.c",
+        // 空串 / 两段 / 段内非法 base64 / JSON 里没有 exp / exp 不是整数
+        "",
+        "a.b",
+        "a.!!!not-base64!!!.c",
+        "a.eyJzdWIiOiI3In0.c",
+        "a.eyJleHAiOiJub3QtYS1udW1iZXIifQ.c",
     ] {
         let f = fixture(vec![login_response(token)]);
         f.service
@@ -606,5 +612,281 @@ async fn notify_baseline_refusal_is_visible_not_silent() {
             .iter()
             .any(|e| e.message.contains("通知基线未能保存")),
         "B-81：编码失败必须**可见**（Warn 事件），不得静默关闭"
+    );
+}
+
+// ============================================================ 复审 P1-2 补的测试（把已有行为钉住）
+
+/// P2-16 服务半：同 `(agent_id, key_id, target_path)` 的重投只留**最新一行**。
+#[tokio::test]
+async fn channel_bindings_dedups_reapplied_targets() {
+    let f = fixture(vec![]);
+    let store = Store::open(&f.db_path).expect("开库");
+    for journal in ["j-1", "j-2", "j-3"] {
+        store
+            .record_binding(
+                "claude-code",
+                f.key_id,
+                "/home/u/.claude/settings.json",
+                journal,
+                "site",
+            )
+            .expect("记绑定");
+    }
+    let rows = f.service.channel_bindings().expect("绑定列表");
+    assert_eq!(
+        rows.len(),
+        1,
+        "P2-16：同一目标的重复投递只应留一行（实际 {rows:?}）"
+    );
+}
+
+/// P3-26：一轮刷新里的事件必须按 **site_id 升序** 落库（不是按完成顺序）。
+#[tokio::test]
+async fn refresh_events_are_ordered_by_site_id() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let db_path = dir.path().join("k.db");
+    let vault = Arc::new(MemoryVault::new());
+    let store = Store::open(&db_path).expect("库");
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        let id = store
+            .upsert_site("sub2api", &format!("https://s{n}.example.com"), "站")
+            .expect("站点");
+        vault
+            .put(
+                &keyrelay_core::vault::secret_ref("site", id, "session"),
+                &format!(
+                    r#"{{"cookies":[],"access_token":"{}","user_id":"1"}}"#,
+                    jwt_with_exp(9_999_999_999)
+                ),
+            )
+            .expect("会话");
+        ids.push(id);
+    }
+    // 三个站点全部失败（余额 503）⇒ 每站一条「刷新站点失败」事件，用来验顺序。
+    let service = KeyRelayService::new(
+        store,
+        MockTransport::new(vec![
+            HttpResponse::new(503, b"down".to_vec()),
+            HttpResponse::new(503, b"down".to_vec()),
+            HttpResponse::new(503, b"down".to_vec()),
+        ]),
+        ServiceConfig {
+            vault: Arc::clone(&vault) as Arc<dyn Vault>,
+            home: home.clone(),
+            backup_dir: dir.path().join("backups"),
+        },
+    );
+    service.restore_sessions();
+    service.refresh_all().await.expect("刷新");
+
+    let events = Store::open(&db_path)
+        .expect("开库")
+        .list_events(200)
+        .expect("事件");
+    let seen: Vec<i64> = events
+        .iter()
+        .filter(|e| e.message.starts_with("刷新站点失败"))
+        .filter_map(|e| e.payload.as_deref())
+        .filter_map(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        .filter_map(|v| v.get("site_id").and_then(|s| s.as_i64()))
+        .collect();
+    // `list_events` 是 **id 降序**（最新在前）⇒ 反转后才是「落库顺序」。
+    let written: Vec<i64> = seen.iter().rev().copied().collect();
+    let mut sorted = written.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        written, sorted,
+        "P3-26：事件必须按 site_id 升序落库（落库顺序 = list_events 的反转）"
+    );
+    assert_eq!(written.len(), 3, "三个站点各一条失败事件");
+}
+
+/// 自定义传输层：记录**并发在途峰值**，每次请求停留一小会儿（让重叠真的发生）。
+#[derive(Clone)]
+struct CountingTransport {
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountingTransport {
+    fn new() -> Self {
+        Self {
+            inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl keyrelay_core::site::transport::HttpTransport for CountingTransport {
+    async fn request(
+        &self,
+        req: keyrelay_core::site::transport::HttpRequest,
+    ) -> Result<HttpResponse> {
+        use std::sync::atomic::Ordering;
+        let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
+        if req.url.contains("/keys") {
+            Ok(json_ok(json!({"code": 0, "data": []})))
+        } else {
+            Ok(json_ok(
+                json!({"code": 0, "data": {"balance": 100.0, "total_recharged": 100.0}}),
+            ))
+        }
+    }
+}
+
+/// P3-27：两次 `refresh_all` 重叠时，在途峰值**不得**超过 `MAX_REFRESH_CONCURRENCY`。
+#[tokio::test]
+async fn overlapping_refresh_all_calls_serialize() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let db_path = dir.path().join("k.db");
+    let vault = Arc::new(MemoryVault::new());
+    let store = Store::open(&db_path).expect("库");
+    // 8 个站点：不加互斥时两次重叠调用会把在途推到 8。
+    for n in 0..8 {
+        let id = store
+            .upsert_site("sub2api", &format!("https://s{n}.example.com"), "站")
+            .expect("站点");
+        vault
+            .put(
+                &keyrelay_core::vault::secret_ref("site", id, "session"),
+                &format!(
+                    r#"{{"cookies":[],"access_token":"{}","user_id":"1"}}"#,
+                    jwt_with_exp(9_999_999_999)
+                ),
+            )
+            .expect("会话");
+    }
+    let transport = CountingTransport::new();
+    let service = KeyRelayService::new(
+        store,
+        transport.clone(),
+        ServiceConfig {
+            vault: Arc::clone(&vault) as Arc<dyn Vault>,
+            home: home.clone(),
+            backup_dir: dir.path().join("backups"),
+        },
+    );
+    service.restore_sessions();
+    let (a, b) = tokio::join!(service.refresh_all(), service.refresh_all());
+    a.expect("第一轮");
+    b.expect("第二轮");
+
+    let peak = transport.peak.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        peak <= keyrelay_core::service::MAX_REFRESH_CONCURRENCY,
+        "P3-27：在途峰值 {peak} 不得超过 {}",
+        keyrelay_core::service::MAX_REFRESH_CONCURRENCY
+    );
+}
+
+/// B-81：基线**跨实例**（同库新实例）可见 —— 即已落库，不是只在内存里。
+#[tokio::test]
+async fn notify_baseline_persists_across_instances() {
+    let f = fixture(vec![
+        login_response(&jwt_with_exp(9_999_999_999)),
+        sub2api_ok(json!({"balance": 100.0, "total_recharged": 100.0})),
+        sub2api_ok(json!([])),
+    ]);
+    f.service
+        .login(f.site_id, Credentials::new("me@example.com", "pw-12345678"))
+        .await
+        .expect("登录");
+    let first = f.service.with_notify(keyrelay_core::notify::NotifyConfig {
+        system_enabled: false,
+        webhook_url: None,
+        balance_threshold: 0.0,
+        timeout: std::time::Duration::from_secs(5),
+    });
+    first.refresh_all().await.expect("第一实例刷新");
+
+    let second = KeyRelayService::new(
+        Store::open(&f.db_path).expect("开库"),
+        MockTransport::new(vec![]),
+        ServiceConfig {
+            vault: Arc::new(MemoryVault::new()),
+            home: f.home.clone(),
+            backup_dir: f.home.join("backups"),
+        },
+    );
+    assert!(
+        second.notify_baseline_present(),
+        "B-81：新实例（同库）应当能看到已落库的基线"
+    );
+}
+
+/// B-113 红线：会话凭证**只**进钥匙串 —— 库文件字节 / 事件 / 诊断导出都不得出现它。
+#[tokio::test]
+async fn session_is_persisted_to_the_vault_only() {
+    const MARKER: &str = "TOKEN-MARKER-M16S5-DO-NOT-PERSIST";
+    let f = fixture(vec![login_response(MARKER)]);
+    f.service
+        .login(f.site_id, Credentials::new("me@example.com", "pw-12345678"))
+        .await
+        .expect("登录");
+    let reference = keyrelay_core::vault::secret_ref("site", f.site_id, "session");
+    assert!(
+        f.service.vault_has_for_test(&reference).expect("查钥匙串"),
+        "B-113：会话应当在钥匙串里"
+    );
+
+    // ① 库文件字节（含 WAL / SHM）
+    for suffix in ["", "-wal", "-shm"] {
+        let path = std::path::PathBuf::from(format!("{}{suffix}", f.db_path.display()));
+        if let Ok(bytes) = std::fs::read(&path) {
+            assert!(
+                !bytes.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
+                "B-113 红线：{} 里出现了会话凭证",
+                path.display()
+            );
+        }
+    }
+    // ② 事件表
+    let events = events_of(&f);
+    for event in &events {
+        let text = format!(
+            "{}{}",
+            event.message,
+            event.payload.clone().unwrap_or_default()
+        );
+        assert!(!text.contains(MARKER), "B-113 红线：事件里出现了会话凭证");
+    }
+    // ③ 诊断导出
+    if let Ok(dump) = f.service.export_diagnostics(200) {
+        assert!(
+            !format!("{dump:?}").contains(MARKER),
+            "B-113 红线：诊断导出里出现了会话凭证"
+        );
+    }
+}
+
+/// B-113：认证失败（站点 401）⇒ 删掉钥匙串里的持久化会话（下次启动不再恢复一个坏会话）。
+#[tokio::test]
+async fn auth_failure_deletes_the_persisted_session() {
+    let f = fixture(vec![
+        login_response(&jwt_with_exp(9_999_999_999)),
+        HttpResponse::new(401, br#"{"code":401,"message":"invalid token"}"#.to_vec()),
+        HttpResponse::new(401, br#"{"code":401,"message":"invalid token"}"#.to_vec()),
+    ]);
+    f.service
+        .login(f.site_id, Credentials::new("me@example.com", "pw-12345678"))
+        .await
+        .expect("登录");
+    let reference = keyrelay_core::vault::secret_ref("site", f.site_id, "session");
+    assert!(f.service.vault_has_for_test(&reference).expect("查"));
+
+    f.service.refresh_all().await.expect("刷新");
+    assert!(
+        !f.service.vault_has_for_test(&reference).expect("查"),
+        "B-113：站点侧失效后必须删掉持久化会话"
     );
 }
