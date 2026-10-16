@@ -27,6 +27,7 @@ use super::json_text::{object_entry, parse_object, read_text_or_empty, JsonStyle
 use super::{literal_field, masked_field, DeliveryChannel, DeliveryField, DeliveryWriter};
 use crate::error::{Error, Result};
 use crate::inject::Patch;
+use crate::model_meta::ModelMeta;
 
 pub struct OpenCodeWriter {
     path: PathBuf,
@@ -39,6 +40,8 @@ pub struct OpenCodeWriter {
     base_url: String,
     /// `None` = 不写、也不动已有的 `model` 键。
     model: Option<String>,
+    /// 模型参数（context_window / max_output）。`None` = 不写参数行。
+    meta: Option<ModelMeta>,
 }
 
 impl OpenCodeWriter {
@@ -65,6 +68,24 @@ impl OpenCodeWriter {
         )
     }
 
+    /// M14-S7：带模型元数据的构造。
+    pub fn with_meta(
+        home: &Path,
+        provider_id: &str,
+        base_url: &str,
+        model: Option<&str>,
+        meta: Option<ModelMeta>,
+    ) -> Self {
+        Self::with_path_and_meta(
+            home.join(".config").join("opencode").join("opencode.json"),
+            DeliveryChannel::OpenCode,
+            provider_id,
+            base_url,
+            model,
+            meta,
+        )
+    }
+
     pub fn with_path(
         path: impl Into<PathBuf>,
         provider_id: &str,
@@ -77,7 +98,22 @@ impl OpenCodeWriter {
             provider_id,
             base_url,
             model,
+            None,
         )
+    }
+
+    /// M14-S7：带 meta 的 `with_path`。
+    pub fn with_path_and_meta(
+        path: impl Into<PathBuf>,
+        channel: DeliveryChannel,
+        provider_id: &str,
+        base_url: &str,
+        model: Option<&str>,
+        meta: Option<ModelMeta>,
+    ) -> Self {
+        let mut w = Self::with_path_and_channel(path, channel, provider_id, base_url, model, None);
+        w.meta = meta;
+        w
     }
 
     /// M7-S3：**内容与 `OpenCode` 完全相同**，只是落点与通道标识不同（`.jsonc`）。
@@ -90,6 +126,7 @@ impl OpenCodeWriter {
         provider_id: &str,
         base_url: &str,
         model: Option<&str>,
+        meta: Option<ModelMeta>,
     ) -> Self {
         debug_assert!(
             matches!(
@@ -103,11 +140,11 @@ impl OpenCodeWriter {
             channel,
             provider_id: provider_id.to_string(),
             base_url: base_url.to_string(),
-            // 全空白的 model 与「没给 model」等价：写一个空字符串只会让 OpenCode 选不出模型。
             model: model
                 .map(str::trim)
                 .filter(|m| !m.is_empty())
                 .map(str::to_string),
+            meta,
         }
     }
 
@@ -182,6 +219,23 @@ impl OpenCodeWriter {
 
         if let Some(model) = &self.model {
             root.insert(Self::FIELD_MODEL.to_string(), Value::String(model.clone()));
+        }
+
+        // M14-S7：写入模型参数到 provider.<id>.models.<id>.limit.{context,output}
+        if let Some(meta) = self.meta {
+            let providers = object_entry(&mut root, Self::PROVIDER_KEY, &self.path)?;
+            let provider = object_entry(providers, &self.provider_id, &self.path)?;
+            let models = object_entry(provider, "models", &self.path)?;
+            let model_entry = object_entry(models, &self.provider_id, &self.path)?;
+            let limit = object_entry(model_entry, "limit", &self.path)?;
+            limit.insert(
+                "context".to_string(),
+                Value::Number(serde_json::Number::from(meta.context_window)),
+            );
+            limit.insert(
+                "output".to_string(),
+                Value::Number(serde_json::Number::from(meta.max_output_tokens)),
+            );
         }
 
         style.serialize(&root)

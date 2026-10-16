@@ -10,6 +10,7 @@ use super::json_text::read_text_or_empty;
 use super::{literal_field, masked_field, DeliveryChannel, DeliveryField, DeliveryWriter};
 use crate::error::{Error, Result};
 use crate::inject::Patch;
+use crate::model_meta::ModelMeta;
 
 pub const BLOCK_BEGIN: &str = "# >>> keyrelay >>>";
 pub const BLOCK_END: &str = "# <<< keyrelay <<<";
@@ -17,11 +18,15 @@ pub const BLOCK_END: &str = "# <<< keyrelay <<<";
 pub struct HermesWriter {
     path: PathBuf,
     base_url: String,
+    model: Option<String>,
+    meta: Option<ModelMeta>,
 }
 
 impl HermesWriter {
     pub const FIELD_API_KEY: &'static str = "api_key";
     pub const FIELD_BASE_URL: &'static str = "base_url";
+    pub const FIELD_MODEL: &'static str = "model";
+    pub const FIELD_CONTEXT_LENGTH: &'static str = "context_length";
 
     pub fn new(home: &Path, base_url: &str) -> Self {
         Self::with_path(home.join(".hermes").join("config.yaml"), base_url)
@@ -31,7 +36,24 @@ impl HermesWriter {
         Self {
             path: path.into(),
             base_url: base_url.to_string(),
+            model: None,
+            meta: None,
         }
+    }
+
+    pub fn with_model(
+        home: &Path,
+        base_url: &str,
+        model: Option<&str>,
+        meta: Option<ModelMeta>,
+    ) -> Self {
+        let mut w = Self::new(home, base_url);
+        w.model = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        w.meta = meta;
+        w
     }
 
     pub fn path(&self) -> &Path {
@@ -53,6 +75,12 @@ impl DeliveryWriter for HermesWriter {
         if !self.base_url.is_empty() {
             names.push(Self::FIELD_BASE_URL.to_string());
         }
+        if self.model.is_some() {
+            names.push(Self::FIELD_MODEL.to_string());
+            if self.meta.is_some() {
+                names.push(Self::FIELD_CONTEXT_LENGTH.to_string());
+            }
+        }
         names
     }
 
@@ -61,24 +89,46 @@ impl DeliveryWriter for HermesWriter {
         if !self.base_url.is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
+        if let Some(m) = &self.model {
+            fields.push(literal_field(Self::FIELD_MODEL, m));
+            if let Some(meta) = self.meta {
+                fields.push(literal_field(
+                    Self::FIELD_CONTEXT_LENGTH,
+                    meta.context_window.to_string(),
+                ));
+            }
+        }
         fields
     }
 
     fn plan(&self, api_key: &str) -> Result<Patch> {
         let before = read_text_or_empty(&self.path)?;
-        let after = build_after(&before, api_key, &self.base_url, &self.path)?;
+        let after = build_after(
+            &before,
+            api_key,
+            &self.base_url,
+            &self.model,
+            self.meta,
+            &self.path,
+        )?;
         Ok(Patch::secret_bearing(self.path.clone(), before, after))
     }
 }
 
-fn build_after(before: &str, api_key: &str, base_url: &str, path: &Path) -> Result<String> {
+fn build_after(
+    before: &str,
+    api_key: &str,
+    base_url: &str,
+    model: &Option<String>,
+    meta: Option<ModelMeta>,
+    path: &Path,
+) -> Result<String> {
     if api_key.trim().is_empty() {
         return Err(Error::inject(path, "密钥为空，拒绝写入"));
     }
 
-    let block = build_block(api_key, base_url);
+    let block = build_block(api_key, base_url, model, meta);
 
-    // 如果已有标记块，替换
     if let Some(begin_pos) = before.find(BLOCK_BEGIN) {
         if let Some(end_pos) = before[begin_pos..].find(BLOCK_END) {
             let absolute_end = begin_pos + end_pos + BLOCK_END.len();
@@ -95,7 +145,6 @@ fn build_after(before: &str, api_key: &str, base_url: &str, path: &Path) -> Resu
         }
     }
 
-    // 没有标记块，追加到文件末尾
     let mut result = String::with_capacity(before.len() + block.len() + 1);
     result.push_str(before);
     if !before.is_empty() && !before.ends_with('\n') {
@@ -105,7 +154,12 @@ fn build_after(before: &str, api_key: &str, base_url: &str, path: &Path) -> Resu
     Ok(result)
 }
 
-fn build_block(api_key: &str, base_url: &str) -> String {
+fn build_block(
+    api_key: &str,
+    base_url: &str,
+    model: &Option<String>,
+    meta: Option<ModelMeta>,
+) -> String {
     let mut block = String::new();
     block.push_str(BLOCK_BEGIN);
     block.push('\n');
@@ -116,6 +170,16 @@ fn build_block(api_key: &str, base_url: &str) -> String {
         block.push_str("base_url: ");
         block.push_str(base_url);
         block.push('\n');
+    }
+    if let Some(m) = model {
+        block.push_str("model: ");
+        block.push_str(m);
+        block.push('\n');
+        if let Some(meta) = meta {
+            block.push_str("context_length: ");
+            block.push_str(&meta.context_window.to_string());
+            block.push('\n');
+        }
     }
     block.push_str(BLOCK_END);
     block.push('\n');
@@ -198,7 +262,6 @@ agent:
         std::fs::write(writer_in(dir.path(), "").path(), &before).unwrap();
         let patch = writer_in(dir.path(), "").plan(SECRET).unwrap();
 
-        // 旧 base_url 在标记块里被替换，但新块不含 base_url
         assert!(patch.after.contains(SECRET));
         assert!(!patch.after.contains("https://keep.com"));
     }
@@ -226,5 +289,78 @@ agent:
         let dir = tmp();
         let err = writer_in(dir.path(), BASE).plan("").unwrap_err();
         assert!(!err.to_string().contains("SECRET"), "{err}");
+    }
+
+    // ============================ M14-S7：模型名 + context_length（Hermes 用 context_length 而非 context_window）
+
+    const MODEL: &str = "gpt-4o";
+
+    fn writer_with_model(dir: &Path) -> HermesWriter {
+        let w = HermesWriter::with_model(dir, BASE, Some(MODEL), crate::model_meta::lookup(MODEL));
+        std::fs::create_dir_all(w.path().parent().unwrap()).ok();
+        w
+    }
+
+    #[test]
+    fn writes_model_and_context_length() {
+        let dir = tmp();
+        let patch = writer_with_model(dir.path()).plan(SECRET).unwrap();
+        assert!(patch.after.contains("model: gpt-4o"));
+        assert!(patch.after.contains("context_length: 128000"));
+        // Hermes 不写 max_output
+        assert!(!patch.after.contains("max_output"));
+        assert!(!patch.after.contains("max_tokens"));
+    }
+
+    #[test]
+    fn model_plan_is_idempotent() {
+        let dir = tmp();
+        let first = writer_with_model(dir.path()).plan(SECRET).unwrap();
+        std::fs::write(writer_with_model(dir.path()).path(), &first.after).unwrap();
+        let second = writer_with_model(dir.path()).plan(SECRET).unwrap();
+        assert_eq!(second.after, first.after);
+    }
+
+    #[test]
+    fn model_replaces_existing_values() {
+        let dir = tmp();
+        let before = format!(
+            "{}\napi_key: sk-old\nmodel: old-model\ncontext_length: 999\n{}\n",
+            BLOCK_BEGIN, BLOCK_END
+        );
+        std::fs::write(writer_with_model(dir.path()).path(), &before).unwrap();
+        let patch = writer_with_model(dir.path()).plan(SECRET).unwrap();
+        assert!(patch.after.contains("model: gpt-4o"));
+        assert!(patch.after.contains("context_length: 128000"));
+        assert!(!patch.after.contains("old-model"));
+        assert!(!patch.after.contains("999"));
+    }
+
+    #[test]
+    fn model_without_meta_writes_only_name() {
+        let dir = tmp();
+        let writer = HermesWriter::with_model(dir.path(), BASE, Some("unknown"), None);
+        let patch = writer.plan(SECRET).unwrap();
+        assert!(patch.after.contains("model: unknown"));
+        assert!(!patch.after.contains("context_length"));
+    }
+
+    #[test]
+    fn no_model_preserves_existing_block_model() {
+        // 不传 model 时，标记块里不应出现 model 行（原行为）
+        let dir = tmp();
+        let patch = writer_in(dir.path(), BASE).plan(SECRET).unwrap();
+        assert!(!patch.after.contains("model: "));
+        assert!(!patch.after.contains("context_length"));
+    }
+
+    #[test]
+    fn mutation_lookup_returns_none_no_meta_lines() {
+        // 变异验证：如果 lookup 返回 None，block 里不应该有 context_length 行
+        let dir = tmp();
+        let writer = HermesWriter::with_model(dir.path(), BASE, Some("gpt-4o"), None);
+        let patch = writer.plan(SECRET).unwrap();
+        assert!(patch.after.contains("model: gpt-4o"));
+        assert!(!patch.after.contains("context_length"));
     }
 }

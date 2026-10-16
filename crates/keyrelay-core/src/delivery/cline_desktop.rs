@@ -15,10 +15,13 @@ use super::json_text::{parse_object, read_text_or_empty, JsonStyle};
 use super::{literal_field, masked_field, DeliveryChannel, DeliveryField, DeliveryWriter};
 use crate::error::{Error, Result};
 use crate::inject::Patch;
+use crate::model_meta::ModelMeta;
 
 pub struct ClineDesktopWriter {
     path: PathBuf,
     base_url: String,
+    model: Option<String>,
+    meta: Option<ModelMeta>,
 }
 
 impl ClineDesktopWriter {
@@ -27,6 +30,9 @@ impl ClineDesktopWriter {
     pub const FIELD_PROVIDER: &'static str = "provider";
     pub const FIELD_UPDATED_AT: &'static str = "updatedAt";
     pub const FIELD_TOKEN_SOURCE: &'static str = "tokenSource";
+    pub const FIELD_MODEL_ID: &'static str = "modelId";
+    pub const FIELD_CONTEXT_WINDOW: &'static str = "contextWindow";
+    pub const FIELD_MAX_TOKENS: &'static str = "maxTokens";
     const PROVIDER_ID: &'static str = "keyrelay";
     const PROVIDERS_KEY: &'static str = "providers";
     const SETTINGS_KEY: &'static str = "settings";
@@ -45,7 +51,24 @@ impl ClineDesktopWriter {
         Self {
             path: path.into(),
             base_url: base_url.to_string(),
+            model: None,
+            meta: None,
         }
+    }
+
+    pub fn with_model(
+        home: &Path,
+        base_url: &str,
+        model: Option<&str>,
+        meta: Option<ModelMeta>,
+    ) -> Self {
+        let mut w = Self::new(home, base_url);
+        w.model = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        w.meta = meta;
+        w
     }
 
     pub fn path(&self) -> &Path {
@@ -77,6 +100,28 @@ impl DeliveryWriter for ClineDesktopWriter {
                 Self::FIELD_BASE_URL
             ));
         }
+        if self.model.is_some() {
+            names.push(format!(
+                "{}.{}.{}",
+                Self::PROVIDERS_KEY,
+                Self::PROVIDER_ID,
+                Self::FIELD_MODEL_ID
+            ));
+            if self.meta.is_some() {
+                names.push(format!(
+                    "{}.{}.{}",
+                    Self::PROVIDERS_KEY,
+                    Self::PROVIDER_ID,
+                    Self::FIELD_CONTEXT_WINDOW
+                ));
+                names.push(format!(
+                    "{}.{}.{}",
+                    Self::PROVIDERS_KEY,
+                    Self::PROVIDER_ID,
+                    Self::FIELD_MAX_TOKENS
+                ));
+            }
+        }
         names
     }
 
@@ -85,17 +130,44 @@ impl DeliveryWriter for ClineDesktopWriter {
         if !self.base_url.is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
+        if let Some(m) = &self.model {
+            fields.push(literal_field(Self::FIELD_MODEL_ID, m));
+            if let Some(meta) = self.meta {
+                fields.push(literal_field(
+                    Self::FIELD_CONTEXT_WINDOW,
+                    meta.context_window.to_string(),
+                ));
+                fields.push(literal_field(
+                    Self::FIELD_MAX_TOKENS,
+                    meta.max_output_tokens.to_string(),
+                ));
+            }
+        }
         fields
     }
 
     fn plan(&self, api_key: &str) -> Result<Patch> {
         let before = read_text_or_empty(&self.path)?;
-        let after = build_after(&before, api_key, &self.base_url, &self.path)?;
+        let after = build_after(
+            &before,
+            api_key,
+            &self.base_url,
+            &self.model,
+            self.meta,
+            &self.path,
+        )?;
         Ok(Patch::secret_bearing(self.path.clone(), before, after))
     }
 }
 
-fn build_after(before: &str, api_key: &str, base_url: &str, path: &Path) -> Result<String> {
+fn build_after(
+    before: &str,
+    api_key: &str,
+    base_url: &str,
+    model: &Option<String>,
+    meta: Option<ModelMeta>,
+    path: &Path,
+) -> Result<String> {
     if api_key.trim().is_empty() {
         return Err(Error::inject(path, "密钥为空，拒绝写入"));
     }
@@ -124,6 +196,22 @@ fn build_after(before: &str, api_key: &str, base_url: &str, path: &Path) -> Resu
             ClineDesktopWriter::FIELD_BASE_URL.to_string(),
             Value::String(base_url.to_string()),
         );
+    }
+    if let Some(m) = model {
+        settings.insert(
+            ClineDesktopWriter::FIELD_MODEL_ID.to_string(),
+            Value::String(m.clone()),
+        );
+        if let Some(meta) = meta {
+            settings.insert(
+                ClineDesktopWriter::FIELD_CONTEXT_WINDOW.to_string(),
+                Value::Number(serde_json::Number::from(meta.context_window)),
+            );
+            settings.insert(
+                ClineDesktopWriter::FIELD_MAX_TOKENS.to_string(),
+                Value::Number(serde_json::Number::from(meta.max_output_tokens)),
+            );
+        }
     }
 
     // 如果已有 keyrelay 条目且 settings 相同，不更新 updatedAt（幂等）

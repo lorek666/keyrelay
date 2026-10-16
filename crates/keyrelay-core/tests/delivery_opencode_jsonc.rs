@@ -25,6 +25,7 @@ fn jsonc_in(dir: &Path, base_url: &str, model: Option<&str>) -> OpenCodeWriter {
         PROVIDER,
         base_url,
         model,
+        None,
     )
 }
 
@@ -35,6 +36,7 @@ fn json_in(dir: &Path, base_url: &str, model: Option<&str>) -> OpenCodeWriter {
         PROVIDER,
         base_url,
         model,
+        None,
     )
 }
 

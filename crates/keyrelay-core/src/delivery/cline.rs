@@ -10,15 +10,21 @@ use super::json_text::{parse_object, read_text_or_empty, JsonStyle};
 use super::{literal_field, masked_field, DeliveryChannel, DeliveryField, DeliveryWriter};
 use crate::error::{Error, Result};
 use crate::inject::Patch;
+use crate::model_meta::ModelMeta;
 
 pub struct ClineWriter {
     path: PathBuf,
     base_url: String,
+    model: Option<String>,
+    meta: Option<ModelMeta>,
 }
 
 impl ClineWriter {
     pub const FIELD_API_KEY: &'static str = "apiKey";
     pub const FIELD_BASE_URL: &'static str = "baseUrl";
+    pub const FIELD_MODEL: &'static str = "model";
+    pub const FIELD_CONTEXT_WINDOW: &'static str = "contextWindow";
+    pub const FIELD_MAX_TOKENS: &'static str = "maxTokens";
     const PROVIDER_ID: &'static str = "keyrelay";
     const PROVIDERS_KEY: &'static str = "providers";
 
@@ -30,7 +36,24 @@ impl ClineWriter {
         Self {
             path: path.into(),
             base_url: base_url.to_string(),
+            model: None,
+            meta: None,
         }
+    }
+
+    pub fn with_model(
+        home: &Path,
+        base_url: &str,
+        model: Option<&str>,
+        meta: Option<ModelMeta>,
+    ) -> Self {
+        let mut w = Self::new(home, base_url);
+        w.model = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        w.meta = meta;
+        w
     }
 
     pub fn path(&self) -> &Path {
@@ -100,6 +123,25 @@ impl DeliveryWriter for ClineWriter {
                 Self::FIELD_BASE_URL
             ));
         }
+        if self.model.is_some() {
+            names.push(format!(
+                "{}.{}",
+                ClineWriter::PROVIDERS_KEY,
+                Self::FIELD_MODEL
+            ));
+            if self.meta.is_some() {
+                names.push(format!(
+                    "{}.{}",
+                    ClineWriter::PROVIDERS_KEY,
+                    Self::FIELD_CONTEXT_WINDOW
+                ));
+                names.push(format!(
+                    "{}.{}",
+                    ClineWriter::PROVIDERS_KEY,
+                    Self::FIELD_MAX_TOKENS
+                ));
+            }
+        }
         names
     }
 
@@ -108,17 +150,44 @@ impl DeliveryWriter for ClineWriter {
         if !self.base_url.is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
+        if let Some(m) = &self.model {
+            fields.push(literal_field(Self::FIELD_MODEL, m));
+            if let Some(meta) = self.meta {
+                fields.push(literal_field(
+                    Self::FIELD_CONTEXT_WINDOW,
+                    meta.context_window.to_string(),
+                ));
+                fields.push(literal_field(
+                    Self::FIELD_MAX_TOKENS,
+                    meta.max_output_tokens.to_string(),
+                ));
+            }
+        }
         fields
     }
 
     fn plan(&self, api_key: &str) -> Result<Patch> {
         let before = read_text_or_empty(&self.path)?;
-        let after = build_after(&before, api_key, &self.base_url, &self.path)?;
+        let after = build_after(
+            &before,
+            api_key,
+            &self.base_url,
+            &self.model,
+            self.meta,
+            &self.path,
+        )?;
         Ok(Patch::secret_bearing(self.path.clone(), before, after))
     }
 }
 
-fn build_after(before: &str, api_key: &str, base_url: &str, path: &Path) -> Result<String> {
+fn build_after(
+    before: &str,
+    api_key: &str,
+    base_url: &str,
+    model: &Option<String>,
+    meta: Option<ModelMeta>,
+    path: &Path,
+) -> Result<String> {
     if api_key.trim().is_empty() {
         return Err(Error::inject(path, "密钥为空，拒绝写入"));
     }
@@ -147,6 +216,22 @@ fn build_after(before: &str, api_key: &str, base_url: &str, path: &Path) -> Resu
                     Value::String(base_url.to_string()),
                 );
             }
+            if let Some(m) = model {
+                obj.insert(
+                    ClineWriter::FIELD_MODEL.to_string(),
+                    Value::String(m.clone()),
+                );
+                if let Some(meta) = meta {
+                    obj.insert(
+                        ClineWriter::FIELD_CONTEXT_WINDOW.to_string(),
+                        Value::Number(serde_json::Number::from(meta.context_window)),
+                    );
+                    obj.insert(
+                        ClineWriter::FIELD_MAX_TOKENS.to_string(),
+                        Value::Number(serde_json::Number::from(meta.max_output_tokens)),
+                    );
+                }
+            }
         }
     } else {
         let mut obj = serde_json::Map::new();
@@ -163,6 +248,22 @@ fn build_after(before: &str, api_key: &str, base_url: &str, path: &Path) -> Resu
                 ClineWriter::FIELD_BASE_URL.to_string(),
                 Value::String(base_url.to_string()),
             );
+        }
+        if let Some(m) = model {
+            obj.insert(
+                ClineWriter::FIELD_MODEL.to_string(),
+                Value::String(m.clone()),
+            );
+            if let Some(meta) = meta {
+                obj.insert(
+                    ClineWriter::FIELD_CONTEXT_WINDOW.to_string(),
+                    Value::Number(serde_json::Number::from(meta.context_window)),
+                );
+                obj.insert(
+                    ClineWriter::FIELD_MAX_TOKENS.to_string(),
+                    Value::Number(serde_json::Number::from(meta.max_output_tokens)),
+                );
+            }
         }
         arr.push(Value::Object(obj));
     }
@@ -239,5 +340,66 @@ mod tests {
         std::fs::write(writer_in(dir.path(), BASE).path(), &first.after).unwrap();
         let second = writer_in(dir.path(), BASE).plan(SECRET).unwrap();
         assert_eq!(second.after, first.after);
+    }
+
+    // ============================ M14-S7
+    const MODEL: &str = "gpt-4o";
+    fn writer_with_model(dir: &Path) -> ClineWriter {
+        let w = ClineWriter::with_model(dir, BASE, Some(MODEL), crate::model_meta::lookup(MODEL));
+        std::fs::create_dir_all(w.path().parent().unwrap()).ok();
+        w
+    }
+
+    #[test]
+    fn writes_model_and_meta() {
+        let dir = tmp();
+        let patch = writer_with_model(dir.path()).plan(SECRET).unwrap();
+        let v: Value = serde_json::from_str(&patch.after).unwrap();
+        let kr = &v["providers"][0];
+        assert_eq!(kr["model"], MODEL);
+        assert_eq!(kr["contextWindow"], 128000);
+        assert_eq!(kr["maxTokens"], 16384);
+    }
+
+    #[test]
+    fn model_plan_is_idempotent() {
+        let dir = tmp();
+        let first = writer_with_model(dir.path()).plan(SECRET).unwrap();
+        std::fs::write(writer_with_model(dir.path()).path(), &first.after).unwrap();
+        let second = writer_with_model(dir.path()).plan(SECRET).unwrap();
+        assert_eq!(second.after, first.after);
+    }
+
+    #[test]
+    fn model_replaces_existing() {
+        let dir = tmp();
+        let before = r#"{"providers":[{"id":"keyrelay","apiKey":"sk-old","model":"old","contextWindow":1,"maxTokens":1}]}"#;
+        std::fs::write(writer_with_model(dir.path()).path(), before).unwrap();
+        let patch = writer_with_model(dir.path()).plan(SECRET).unwrap();
+        let v: Value = serde_json::from_str(&patch.after).unwrap();
+        let kr = &v["providers"][0];
+        assert_eq!(kr["model"], MODEL);
+        assert_eq!(kr["contextWindow"], 128000);
+    }
+
+    #[test]
+    fn model_without_meta_only_name() {
+        let dir = tmp();
+        let writer = ClineWriter::with_model(dir.path(), BASE, Some("unknown"), None);
+        let patch = writer.plan(SECRET).unwrap();
+        let v: Value = serde_json::from_str(&patch.after).unwrap();
+        let kr = &v["providers"][0];
+        assert_eq!(kr["model"], "unknown");
+        assert!(kr.get("contextWindow").is_none());
+    }
+
+    #[test]
+    fn no_model_preserves_existing() {
+        let dir = tmp();
+        let before = r#"{"providers":[{"id":"keyrelay","apiKey":"sk-old","model":"user"}]}"#;
+        std::fs::write(writer_in(dir.path(), BASE).path(), before).unwrap();
+        let patch = writer_in(dir.path(), BASE).plan(SECRET).unwrap();
+        let v: Value = serde_json::from_str(&patch.after).unwrap();
+        assert_eq!(v["providers"][0]["model"], "user");
     }
 }
