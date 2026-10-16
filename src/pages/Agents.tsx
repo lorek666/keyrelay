@@ -19,7 +19,7 @@ import {
   type UnbindOutcome,
 } from "../lib/api";
 import { rollbackAftermath, rollbackAftermathTitle } from "../lib/rollback";
-import { maskRemovedValues, planWritesEndpoint } from "../lib/deliveryView";
+import { maskRemovedValues, shouldWarnEndpointOutOfScope } from "../lib/deliveryView";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { useTranslation, translate, getCurrentDict } from "../i18n";
 
@@ -689,8 +689,10 @@ function PlanView({
 
       {/* 网关模式下，有的通道**只写令牌、不写 endpoint**（P2-3 前端半）：
           这种通道里打开「指向本地网关」时 agent 仍会请求站点，拿的是本地令牌 ⇒ 401。
-          判据来自计划里实际要写的字段名（`planWritesEndpoint`），不按通道名硬编码。 */}
-      {plan.mode === "gateway" && !planWritesEndpoint(plan.fields) ? (
+          判据**只来自后端字段** `plan.endpointInChannel`（与 writer 装配表同源）——
+          前端不再按字段名推导，也不判任何通道特例（S6b 复审 P2-1：两套机制会分叉，
+          症状是「提示错了」而不是报错）。 */}
+      {shouldWarnEndpointOutOfScope(plan.mode, plan.endpointInChannel) ? (
         <p className="warnline" role="alert">
           <AlertTriangle size={14} aria-hidden /> {t("agents.plan.endpointOutOfScope")}
         </p>

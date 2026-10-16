@@ -1,43 +1,31 @@
 import { describe, it, expect } from "vitest";
-import { maskRemovedValues, planWritesEndpoint } from "../lib/deliveryView";
-import type { DeliveryField } from "../lib/api";
+import { maskRemovedValues, shouldWarnEndpointOutOfScope } from "../lib/deliveryView";
+import * as deliveryView from "../lib/deliveryView";
 
-const field = (key: string): DeliveryField => ({ key, masked: "…abcd" });
 const PH = "…（旧值已隐去）";
 
-describe("planWritesEndpoint（P2-3 前端半的判据）", () => {
-  it("认得所有 endpoint 形态的字段名（后端 19 条通道实际用到的）", () => {
-    for (const key of [
-      "base_url",
-      "baseUrl",
-      "baseURL",
-      "OPENAI_BASE_URL",
-      "ANTHROPIC_BASE_URL",
-      "GOOGLE_GEMINI_BASE_URL",
-      "apiBase",
-      "endpoint",
-    ]) {
-      expect(planWritesEndpoint([field(key)]), key).toBe(true);
-    }
+describe("shouldWarnEndpointOutOfScope（P2-3 前端半：判据只来自后端字段）", () => {
+  it("网关模式 + 后端说该通道不写 endpoint ⇒ 提示", () => {
+    expect(shouldWarnEndpointOutOfScope("gateway", false)).toBe(true);
   });
 
-  it("不写 endpoint 的通道判为 false（codex-auth-json / dsh 的真实字段）", () => {
-    // codex：~/.codex/auth.json 只有这两个键
-    expect(planWritesEndpoint([field("auth_mode"), field("OPENAI_API_KEY")])).toBe(false);
-    // dsh：只有一把 key
-    expect(planWritesEndpoint([field("KEYRELAY_API_KEY")])).toBe(false);
-    expect(planWritesEndpoint([])).toBe(false);
+  it("反例：后端说该通道**写** endpoint ⇒ 不提示（不该提示的通道不提示）", () => {
+    expect(shouldWarnEndpointOutOfScope("gateway", true)).toBe(false);
   });
 
-  it("字段名里的其它词不会误判（例如 contextWindow / model）", () => {
-    expect(
-      planWritesEndpoint([
-        field("api_key"),
-        field("model"),
-        field("context_window"),
-        field("maxTokens"),
-      ]),
-    ).toBe(false);
+  it("站点模式下一律不提示（那时不存在「写的是网关地址」这件事）", () => {
+    expect(shouldWarnEndpointOutOfScope("site", false)).toBe(false);
+    expect(shouldWarnEndpointOutOfScope("site", true)).toBe(false);
+  });
+
+  it("字段缺失（旧二进制）⇒ 不提示：宁可不提示，也不给一条可能错的提示", () => {
+    expect(shouldWarnEndpointOutOfScope("gateway", undefined)).toBe(false);
+  });
+
+  it("判据**不含**任何按字段名推导的逻辑（旧实现的形态必须已经不存在）", () => {
+    // 这条是防回归：曾经的 `planWritesEndpoint(fields)` 按 base_url/endpoint 正则猜；
+    // 若有人把它加回来当兜底，两套机制又会分叉。这里直接断言模块不再导出它。
+    expect(Object.keys(deliveryView)).not.toContain("planWritesEndpoint");
   });
 });
 
