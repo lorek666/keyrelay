@@ -895,6 +895,11 @@ impl HttpTransport for FakeSite {
 /// 这里断言的是「六个步骤一个不少、顺序正确、密钥落到钥匙串而不是库里」。
 #[tokio::test]
 async fn g1_end_to_end_within_budget() {
+    // G1 夹具的登录密码。**必须够长且唯一**——它会被拿去 ~336KB 的库文件里做子串搜索，
+    // 2 字符的 `pw` 会**碰巧命中**：实测 400 次里有 3 次（0.75%）WAL 字节里正好凑出 `pw`
+    // （随机 salt / 帧校验和附近，上下文全是二进制垃圾，不是被写进去的密码）。
+    // 那正是这条用例 2026-10-16 在整包跑里随机红一次的原因（BACKLOG B-137）。
+    const G1_PASSWORD: &str = "pw-g1-matrix-4f7a2b";
     let dir = tempfile::tempdir().expect("临时目录");
     let home = dir.path().join("home");
     fs::create_dir_all(&home).expect("home");
@@ -914,7 +919,7 @@ async fn g1_end_to_end_within_budget() {
 
     // ② 登录（本夹具走「未启用登录加密」分支；RSA 加密登录由 e2e_newapi.rs 覆盖）
     service
-        .login(summary.id, Credentials::new("me", "pw"))
+        .login(summary.id, Credentials::new("me", G1_PASSWORD))
         .await
         .expect("登录");
 
@@ -1001,8 +1006,8 @@ async fn g1_end_to_end_within_budget() {
             path.display()
         );
         assert!(
-            !text.contains("pw"),
-            "数据库文件含登录密码: {}",
+            !text.contains(G1_PASSWORD),
+            "数据库文件 {} 含登录密码",
             path.display()
         );
     }
