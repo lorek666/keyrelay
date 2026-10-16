@@ -241,7 +241,7 @@ async fn login_maps_rate_limit_and_auth_failures() {
 
 /// M9-S1：400 必须把站点原文带出来。
 ///
-/// 真实复现（`api.example.com`）：用户名 `testuser`（非邮箱）登录 →
+/// 真实复现（`api.example.com`）：用户名 `USER_PLACEHOLDER`（非邮箱）登录 →
 /// HTTP 400 + `{"code":400,"message":"Invalid request: Key: 'LoginRequest.Email'
 /// Error:Field validation for 'Email' failed on the 'email' tag"}`。
 /// 早先 `map_http_error` 没有 400 分支，落到「未预期的状态码 400」兜底支——
@@ -255,7 +255,7 @@ async fn login_400_carries_the_site_message() {
     )]);
     let adapter = Sub2Api::new(transport);
     let err = adapter
-        .login(BASE, Credentials::new("testuser", "pw-12345678"))
+        .login(BASE, Credentials::new("USER_PLACEHOLDER", "pw-12345678"))
         .await
         .unwrap_err();
 

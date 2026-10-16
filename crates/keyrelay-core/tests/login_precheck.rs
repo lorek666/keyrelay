@@ -87,7 +87,7 @@ fn newapi_login_ok() -> Vec<HttpResponse> {
             200,
             json!({"success": true, "message": "",
                    "data": {"id": 207, "access_token": "tok-newapi",
-                            "user": {"id": 207, "username": "testuser"}}}),
+                            "user": {"id": 207, "username": "USER_PLACEHOLDER"}}}),
         )
         .expect("构造响应"),
     ]
@@ -101,10 +101,10 @@ fn body_of(req: &keyrelay_core::site::transport::HttpRequest) -> Value {
 #[tokio::test]
 async fn a_non_email_account_is_rejected_before_any_request_is_sent() {
     for bad in [
-        "testuser",     // 真实站点实测被拒的那个值（B-120 的原始症状）
-        "  testuser  ", // trim 之后仍不是邮箱
-        "testuser@qq",  // 域名没有点
-        "testuser@",    // 域名为空
+        "USER_PLACEHOLDER",     // 真实站点实测被拒的那个值（B-120 的原始症状）
+        "  USER_PLACEHOLDER  ", // trim 之后仍不是邮箱
+        "USER_PLACEHOLDER@qq",  // 域名没有点
+        "USER_PLACEHOLDER@",    // 域名为空
         "@qq.com",      // 本地部为空
     ] {
         let f = setup(SUB2API);
@@ -152,10 +152,10 @@ async fn an_email_shaped_account_reaches_the_adapter() {
     );
 }
 
-/// **反向断言**：NewAPI 就是用户名登录——同一个 `testuser` 在这里**必须**放行。
+/// **反向断言**：NewAPI 就是用户名登录——同一个 `USER_PLACEHOLDER` 在这里**必须**放行。
 ///
 /// 这条证明预检是**按站点类型**走的，不是「凡不是邮箱就拦」。真实站点
-/// `newapi.example.com` 就是用 `testuser` 登录成功的（M9-S1 证据 §2）。
+/// `newapi.example.com` 就是用 `USER_PLACEHOLDER` 登录成功的（M9-S1 证据 §2）。
 #[tokio::test]
 async fn a_username_still_reaches_a_newapi_site() {
     let f = setup(NEWAPI);
@@ -164,7 +164,7 @@ async fn a_username_still_reaches_a_newapi_site() {
     }
 
     f.service
-        .login(f.site_id, creds("testuser"))
+        .login(f.site_id, creds("USER_PLACEHOLDER"))
         .await
         .expect("NewAPI 的账号栏不限形态，不得被邮箱判据拦住");
 
@@ -185,7 +185,7 @@ async fn a_site_without_login_still_reports_unsupported() {
     let f = setup(CUSTOM);
     let err = f
         .service
-        .login(f.site_id, creds("testuser"))
+        .login(f.site_id, creds("USER_PLACEHOLDER"))
         .await
         .expect_err("没有登录流程的站点类型必须被能力门拒掉");
 

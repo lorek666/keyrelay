@@ -8,7 +8,7 @@
     "build": "tsc --noEmit --project tsconfig.build.json && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "node scripts/check-commands.mjs && node scripts/check-i18n.mjs && vitest run",
+    "test": "node scripts/check-commands.mjs && node scripts/check-i18n.mjs && node scripts/check-no-real-credentials.mjs && vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
