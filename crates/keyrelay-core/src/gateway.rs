@@ -1195,6 +1195,20 @@ fn observe(state: &AppState, site_id: i64, latency_ms: u64, ok: bool) {
     }
 }
 
+/// 构造发往上游的 `Authorization` 值。
+///
+/// **返回类型是 `Zeroizing<String>`**（M16-S4 / P3-32）：`format!` 出来的是一份
+/// 不会被擦除的明文副本，而它每次请求都要造一次。用 `Zeroizing` 包住，
+/// `HeaderValue::from_str` 复制完之后，临时串在 drop 时清零。
+///
+/// **边界（不得声称更多）**：`HeaderValue` 内部那一份拷贝属于 reqwest/hyper 的所有权，
+/// 纯 Rust 层擦不掉——与 M7-S5 D-2「只覆盖我们持有的所有权」同口径。
+/// 返回值刻意做成 `Zeroizing` 而不是 `String`：类型本身就是守卫，
+/// 谁把它改回裸 `String`，`the_bearer_value_is_zeroizing` 会编译失败。
+fn bearer_value(key: &str) -> Zeroizing<String> {
+    Zeroizing::new(format!("Bearer {key}"))
+}
+
 /// 重建发往上游的请求头：**丢掉**调用方的 `Authorization`，换成该上游的站点密钥；
 /// 另外把「值里带着本地令牌」的头也丢掉——不管它叫什么名字，本地令牌都不许发给上游
 /// （M4-S2 复审 P2-2 的双头形态）。
@@ -1210,9 +1224,10 @@ fn upstream_headers(config: &GatewayConfig, inbound: &HeaderMap, key: &str) -> H
         }
         headers.insert(name.clone(), value.clone());
     }
+    let bearer = bearer_value(key);
     headers.insert(
         HeaderName::from_static("authorization"),
-        HeaderValue::from_str(&format!("Bearer {key}"))
+        HeaderValue::from_str(bearer.as_str())
             .unwrap_or_else(|_| HeaderValue::from_static("Bearer ")),
     );
     headers
@@ -2069,6 +2084,7 @@ mod tests {
             site_display_name: "已停的站点".into(),
             shutdown: tx,
             finished,
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         handle.shutdown_and_wait().await;
     }
@@ -2185,6 +2201,16 @@ mod tests {
             !text.contains("占用"),
             "非 AddrInUse 不许说「被占用」（B-64 的误导文案就是它）: {text}"
         );
+    }
+
+    /// M16-S4 / P3-32（网关半）：`Bearer <key>` 的临时串必须是 `Zeroizing`。
+    ///
+    /// 这条测试的价值在**类型**：`bearer_value` 的返回类型一旦被改回裸 `String`，
+    /// 下面的 `let value: Zeroizing<String>` 就编译不过——比 grep 源码更硬。
+    #[test]
+    fn the_bearer_value_is_zeroizing() {
+        let value: Zeroizing<String> = bearer_value("sk-unit-test-0123456789");
+        assert_eq!(value.as_str(), "Bearer sk-unit-test-0123456789");
     }
 
     /// 类型级检查：命令层（M5-S5）要在 `#[tauri::command] async fn` 里 await 它，
