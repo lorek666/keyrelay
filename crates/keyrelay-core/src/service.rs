@@ -553,6 +553,13 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     /// `transport()` getter 要动 `site/registry.rs`（不在写域）。`T: Clone`，clone 成本
     /// 是 `Arc` 级别（MockTransport / reqwest transport 都是 `Arc` 包裹）。
     transport: T,
+    /// M15-S1 复审 H1+M2：probe 专用 transport（独立 timeout，不套 `RetryingTransport`）。
+    ///
+    /// `None`（默认）时 `probe_model` fallback 到 `self.transport`——测试用 `MockTransport`
+    /// 走这条路径（M4 集成测试可 mock）。生产装配由壳层 `with_probe_transport` 注入一个
+    /// `ReqwestTransport`（timeout 120s、不套 retry），避免 sync probe 被 15s 总超时砍断、
+    /// 以及 429 被 `RetryingTransport` 自动重试 3 次（Retry-After 被 cap 到 5s，白打 + 等 10s）。
+    probe_transport: Option<crate::site::transport_reqwest::ReqwestTransport>,
     store: Store,
     sessions: SessionCache,
     vault: Arc<dyn Vault>,
@@ -709,6 +716,9 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let svc = Self {
             registry: SiteRegistry::new(transport.clone()),
             transport,
+            // 默认 None：测试不调 `with_probe_transport` 时 fallback 到 `self.transport`（Mock），
+            // 让 probe_model 的集成测试能用 Mock 预置响应（M4）。
+            probe_transport: None,
             store,
             sessions: SessionCache::new(),
             vault: config.vault,
@@ -781,6 +791,23 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             config,
             last: std::sync::Mutex::new(None),
         });
+        self
+    }
+
+    /// M15-S1 复审 H1+M2：注入 probe 专用 transport。
+    ///
+    /// 生产装配由壳层调用，传入一个**不套 `RetryingTransport`**、timeout 足够长（120s）的
+    /// `ReqwestTransport`：bazaarlink `sync=true` 要等服务端跑完多轮推理对比，远超站点
+    /// transport 的 15s 总超时；429 也不该被站点重试策略抢着重试（probe 层自己映射成
+    /// `RateLimited` 告诉用户）。
+    ///
+    /// 不调用 = `probe_transport` 保持 `None`，`probe_model` fallback 到 `self.transport`
+    /// ——测试用 `MockTransport` 走这条路径，零改动现有测试。
+    pub fn with_probe_transport(
+        mut self,
+        probe_transport: crate::site::transport_reqwest::ReqwestTransport,
+    ) -> Self {
+        self.probe_transport = Some(probe_transport);
         self
     }
 
@@ -2875,6 +2902,131 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             }
             Err(err) => Err(self.on_auth_error(site_id, err)),
         }
+    }
+
+    /// M15-S1：模型检测（bazaarlink probe）——检测目标模型端点是否真的是它声称的模型。
+    ///
+    /// **apiKey 发给第三方 bazaarlink.ai**——这是新的明文外流路径（既有明文只发给目标
+    /// 中转站做投递/网关）。`confirm` 必须为 `true`，否则 `Error::InvalidInput`（请求未发出）。
+    ///
+    /// 复用 `key_secret`（唯一明文出口 `vault_secret`，M8-S1 守卫）取站点 key 明文，
+    /// 不新开 `vault.get`。`base_url` 默认 = 站点 base_url + `/v1`（已有 `/v1` 不重复），
+    /// `base_url_override` 优先。`claimed_model` 缺省时填 `model_id`（M15-S1 决策）。
+    ///
+    /// 检测结果摘要落 `probe_runs` 表（best-effort：落库失败只 warn，不 mask 检测成功）；
+    /// **不落** `items[].response` / `responseHeaders` / `startedByIp` / `userKey`（敏感）。
+    /// 事件只 log 元数据（site_id / key_id / modelId / verdict），**不 log apiKey**。
+    pub async fn probe_model(
+        &self,
+        key_id: i64,
+        model_id: String,
+        claimed_model: Option<String>,
+        base_url_override: Option<String>,
+        confirm: bool,
+    ) -> Result<crate::probe::ProbeRun> {
+        if !confirm {
+            return Err(Error::InvalidInput(
+                "模型检测需要明确确认：会把该站点的 API key 发送给第三方 bazaarlink.ai".into(),
+            ));
+        }
+        let row = self
+            .store
+            .get_key(key_id)?
+            .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
+        let site = self.site(row.site_id)?;
+        let make_default_base = |base: &str| {
+            let b = base.trim_end_matches('/');
+            if b.ends_with("/v1") {
+                b.to_string()
+            } else {
+                format!("{b}/v1")
+            }
+        };
+        // L2（独立复审）：base_url_override 非空时校验 http(s) scheme，
+        // 避免 "not-a-url" / "ftp://..." 原样发 bazaarlink → 400（本地无 SSRF，纯 UX）。
+        let base_url = match base_url_override.map(|o| o.trim().to_string()) {
+            Some(o) if o.is_empty() => make_default_base(&site.base_url),
+            Some(o) if !(o.starts_with("http://") || o.starts_with("https://")) => {
+                return Err(Error::InvalidInput(format!(
+                    "baseUrl 必须是 http(s) URL: {o}"
+                )));
+            }
+            Some(o) => o,
+            None => make_default_base(&site.base_url),
+        };
+        let api_key = self.key_secret(key_id)?;
+        let claimed = claimed_model.unwrap_or_else(|| model_id.clone());
+        let model_id_for_store = model_id.clone();
+        let req = crate::probe::ProbeRequest {
+            base_url,
+            api_key,
+            model_id,
+            claimed_model: Some(claimed),
+            sync: true,
+        };
+        // H1+M2（独立复审）：优先用 probe_transport（独立 timeout 120s、不套 retry）；
+        // None 时 fallback 到 self.transport（测试 Mock 路径，M4 可 mock）。
+        let run = match &self.probe_transport {
+            Some(pt) => crate::probe::run_probe(pt, &req).await,
+            None => crate::probe::run_probe(&self.transport, &req).await,
+        };
+        let run = match run {
+            Ok(r) => r,
+            Err(err) => {
+                // M3（独立复审）：失败也写一条 warn 事件（scrub 错误信息），让事件流能追溯检测失败。
+                // 不落 probe_runs（无 run_id，历史表只记检测结果）；失败原因进事件流，apiKey 绝不进。
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "probe",
+                    format!("模型检测失败: {}", crate::redact::scrub(&err.to_string())),
+                    serde_json::json!({
+                        "site_id": row.site_id,
+                        "key_id": key_id,
+                        "model_id": model_id_for_store,
+                    }),
+                ));
+                return Err(err);
+            }
+        };
+        // 持久化摘要（best-effort：落库失败只 warn，不 mask 检测成功）
+        if let Err(err) = self.store.insert_probe_run(
+            row.site_id,
+            key_id,
+            &model_id_for_store,
+            req.claimed_model.as_deref(),
+            &run,
+        ) {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "store",
+                format!("检测历史落库失败: {}", crate::redact::scrub(&err.to_string())),
+                serde_json::json!({ "site_id": row.site_id, "key_id": key_id, "run_id": run.run_id }),
+            ));
+        }
+        // 事件只 log 元数据，不 log apiKey / 响应正文
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "probe",
+            "模型检测完成",
+            serde_json::json!({
+                "site_id": row.site_id,
+                "key_id": key_id,
+                "run_id": run.run_id,
+                "verdict": run.verdict_status,
+                "identity": run.identity_status,
+            }),
+        ));
+        Ok(run)
+    }
+
+    /// M15-S1：最近 `limit` 条检测历史（按 `recorded_at` 降序）。
+    pub fn list_probe_runs(&self, limit: usize) -> Result<Vec<crate::store::ProbeRunRow>> {
+        self.store.list_probe_runs(limit)
+    }
+
+    /// M15-S1：按本地 id 取单条检测记录。
+    pub fn get_probe_run(&self, id: i64) -> Result<Option<crate::store::ProbeRunRow>> {
+        self.store.get_probe_run(id)
     }
 
     /// 回收站点上的某把令牌，并把本地记录标成**已回收**（B-82 的独立路径）。
@@ -5000,5 +5152,269 @@ mod tests {
             !refs.contains(&reference),
             "site has 失败时 session_ref 该被跳过: {refs:?}"
         );
+    }
+
+    // ============================================ M15-S1 复审 M4：probe_model 集成测试
+
+    fn probe_response() -> HttpResponse {
+        HttpResponse::json(
+            200,
+            json!({
+                "runId": "r-probe-1",
+                "status": "completed",
+                "identityAssessment": {
+                    "status": "match",
+                    "verdict": {"status": "clean_match", "trueFamily": "openai", "trueModel": "gpt-4o"}
+                },
+                "warnings": []
+            }),
+        )
+        .expect("构造 probe 响应")
+    }
+
+    /// 构造一个已插好 site + key 的 service；`tail` 是 add_site 指纹之后的 mock 响应。
+    /// 不调 `with_probe_transport` ⇒ `probe_transport=None` ⇒ `probe_model` fallback 到
+    /// `self.transport`（Mock），让 M4 能 mock 测 confirm/落库/event 安全断言。
+    async fn probe_service(tail: Vec<HttpResponse>) -> (KeyRelayService<MockTransport>, i64) {
+        let mut responses = vec![status_response()];
+        responses.extend(tail);
+        let store = Store::open_in_memory().expect("内存库");
+        let service = KeyRelayService::new(store, MockTransport::new(responses), test_config());
+        let site = service
+            .add_site("https://relay.example.com")
+            .await
+            .expect("add_site");
+        let reference = crate::vault::secret_ref("key", 1, "secret");
+        service
+            .vault
+            .put(&reference, "sk-test-secret-12345678")
+            .expect("vault.put");
+        let key_id = service
+            .store
+            .insert_key(site.id, "probe-key", &reference, Some("remote-1"), None)
+            .expect("insert_key");
+        (service, key_id)
+    }
+
+    #[tokio::test]
+    async fn probe_model_confirm_false_returns_invalid_input_without_request() {
+        // confirm=false → InvalidInput（请求未发出）；mock 队列只剩指纹，不该被 probe 消费。
+        let (service, _key_id) = probe_service(vec![]).await;
+        let err = service
+            .probe_model(1, "vendor/model".into(), None, None, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput(_)),
+            "confirm=false 必须 InvalidInput: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("bazaarlink"),
+            "错误文案要点明 apiKey 外流方向: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_model_success_persists_row_and_event_has_no_api_key() {
+        let (service, key_id) = probe_service(vec![probe_response()]).await;
+        let run = service
+            .probe_model(key_id, "vendor/model".into(), None, None, true)
+            .await
+            .expect("probe 成功");
+        assert_eq!(run.run_id, "r-probe-1");
+
+        // 落库一行（敏感字段不入库——只校 runId/verdict）
+        let rows = service.store.list_probe_runs(10).expect("list_probe_runs");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].run_id, "r-probe-1");
+        assert_eq!(rows[0].verdict_status.as_deref(), Some("clean_match"));
+
+        // 事件 source=="probe"（M4：确认 source 没被归一成 app）+ payload 不含 apiKey
+        let events = service.recent_events(100).expect("recent_events");
+        let probe_events: Vec<_> = events.iter().filter(|e| e.source == "probe").collect();
+        assert!(!probe_events.is_empty(), "应有 source=probe 的事件");
+        for ev in &probe_events {
+            let text = format!("{} {}", ev.message, ev.payload.as_deref().unwrap_or(""));
+            assert!(
+                !text.contains("sk-test-secret-12345678"),
+                "probe 事件泄漏 apiKey: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_model_failure_logs_warn_event_without_api_key() {
+        // mock 预置 400（body 含 apiKey 回显）——验证 M1 scrub + M3 warn event 不泄漏。
+        let bad = HttpResponse::new(400, br#"{"echoed":"sk-test-secret-12345678"}"#.to_vec());
+        let (service, key_id) = probe_service(vec![bad]).await;
+        let err = service
+            .probe_model(key_id, "vendor/model".into(), None, None, true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Transport(_)),
+            "400 应映射成 Transport: {err:?}"
+        );
+
+        // M3：失败写 warn 事件，source=probe，message/payload 不含 apiKey
+        let events = service.recent_events(100).expect("recent_events");
+        let warn_probe: Vec<_> = events
+            .iter()
+            .filter(|e| e.source == "probe" && e.level == "warn")
+            .collect();
+        assert!(
+            !warn_probe.is_empty(),
+            "失败应写 source=probe level=warn 事件"
+        );
+        for ev in &warn_probe {
+            let text = format!("{} {}", ev.message, ev.payload.as_deref().unwrap_or(""));
+            assert!(
+                !text.contains("sk-test-secret-12345678"),
+                "失败事件泄漏 apiKey: {text}"
+            );
+        }
+        // 失败不落 probe_runs（无 run_id，历史表只记检测结果）
+        let rows = service.store.list_probe_runs(10).expect("list_probe_runs");
+        assert!(rows.is_empty(), "失败不该落 probe_runs: {rows:?}");
+    }
+
+    #[tokio::test]
+    async fn probe_model_rejects_non_http_base_url_override() {
+        // L2：base_url_override 非 http(s) → InvalidInput（请求未发出）
+        let (service, key_id) = probe_service(vec![]).await;
+        let err = service
+            .probe_model(
+                key_id,
+                "vendor/model".into(),
+                None,
+                Some("ftp://evil.example".into()),
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput(_)),
+            "非 http(s) baseUrl 应 InvalidInput: {err:?}"
+        );
+    }
+
+    // ---- B-140 续：base_url 构造 / override 优先 / claimed_model 缺省 / key 不存在 ----
+
+    /// 用 `upsert_site` 直接插指定 `base_url` 的 site（绕过 add_site 指纹），
+    /// 让 mock 队列只放 probe 响应。返回 mock 句柄用于断言发给 bazaarlink 的请求体。
+    async fn probe_service_with_base_url(
+        site_base_url: &str,
+        tail: Vec<HttpResponse>,
+    ) -> (KeyRelayService<MockTransport>, i64, MockTransport) {
+        let store = Store::open_in_memory().expect("内存库");
+        let mock = MockTransport::new(tail);
+        let service = KeyRelayService::new(store, mock.clone(), test_config());
+        let site_id = service
+            .store
+            .upsert_site("newapi", site_base_url, "测试站")
+            .expect("upsert_site");
+        let reference = crate::vault::secret_ref("key", 1, "secret");
+        service
+            .vault
+            .put(&reference, "sk-test-secret-12345678")
+            .expect("vault.put");
+        let key_id = service
+            .store
+            .insert_key(site_id, "probe-key", &reference, Some("remote-1"), None)
+            .expect("insert_key");
+        (service, key_id, mock)
+    }
+
+    /// 解出 mock 收到的第 `n` 个请求体（JSON）。
+    fn request_body(mock: &MockTransport, n: usize) -> serde_json::Value {
+        let sent = mock.nth_request(n).expect("应有请求");
+        let body = sent.body.expect("probe 请求必有 body");
+        serde_json::from_slice(&body).expect("请求体是合法 JSON")
+    }
+
+    #[tokio::test]
+    async fn probe_model_default_base_url_appends_v1_when_missing() {
+        // site.base_url 不带 /v1 → 默认 baseUrl = site.base_url + /v1
+        let (service, key_id, mock) =
+            probe_service_with_base_url("https://relay.example.com", vec![probe_response()]).await;
+        service
+            .probe_model(key_id, "vendor/model".into(), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            request_body(&mock, 0)["baseUrl"],
+            "https://relay.example.com/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_model_default_base_url_does_not_double_v1() {
+        // site.base_url 已带 /v1 → 不重复追加（否则 baseUrl 变成 .../v1/v1）
+        let (service, key_id, mock) =
+            probe_service_with_base_url("https://relay.example.com/v1", vec![probe_response()])
+                .await;
+        service
+            .probe_model(key_id, "vendor/model".into(), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            request_body(&mock, 0)["baseUrl"],
+            "https://relay.example.com/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_model_base_url_override_takes_precedence() {
+        // base_url_override 合法 http(s) 时优先于站点默认 baseUrl
+        let (service, key_id, mock) =
+            probe_service_with_base_url("https://relay.example.com", vec![probe_response()]).await;
+        service
+            .probe_model(
+                key_id,
+                "vendor/model".into(),
+                None,
+                Some("https://override.example.com/v1".into()),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            request_body(&mock, 0)["baseUrl"],
+            "https://override.example.com/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_model_claimed_model_defaults_to_model_id() {
+        // claimed_model 缺省（None）→ 请求体 claimedModel = modelId（M15-S1 决策）
+        let (service, key_id, mock) =
+            probe_service_with_base_url("https://relay.example.com", vec![probe_response()]).await;
+        service
+            .probe_model(key_id, "vendor/gpt-4o".into(), None, None, true)
+            .await
+            .unwrap();
+        let body = request_body(&mock, 0);
+        assert_eq!(body["modelId"], "vendor/gpt-4o");
+        assert_eq!(body["claimedModel"], "vendor/gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn probe_model_missing_key_returns_not_found() {
+        // key_id 不存在 → NotFound（请求未发出）；mock 队列空，不该被消费
+        let (service, _key_id, mock) =
+            probe_service_with_base_url("https://relay.example.com", vec![]).await;
+        let err = service
+            .probe_model(999, "vendor/model".into(), None, None, true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(_)),
+            "key 不存在应 NotFound: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("999"),
+            "错误文案应点明哪个 key_id: {err}"
+        );
+        assert_eq!(mock.request_count(), 0, "key 不存在时不应发请求");
     }
 }

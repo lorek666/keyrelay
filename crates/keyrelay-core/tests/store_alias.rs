@@ -9,7 +9,7 @@ fn fresh() -> Store {
     Store::open_in_memory().expect("内存库")
 }
 
-/// S1：v3 库打开后 `model_aliases` 表存在、老数据零丢失、`schema_version() == 4`、二次 `open` 不报错。
+/// S1：v3 库打开后 `model_aliases` 表存在、老数据零丢失、`schema_version() == 5`、二次 `open` 不报错。
 #[test]
 fn v3_database_gets_alias_table_and_keeps_rows() {
     let dir = tempfile::tempdir().expect("临时目录");
@@ -34,7 +34,7 @@ fn v3_database_gets_alias_table_and_keeps_rows() {
 
     // open 触发 migrate：补建 model_aliases + 升版本到 4。
     let store = Store::open(&path).expect("open v3");
-    assert_eq!(store.schema_version().unwrap(), 4, "迁移到 v4");
+    assert_eq!(store.schema_version().unwrap(), 5, "迁移到 v5");
     // 老数据零丢失
     let sites = store.list_sites().expect("list_sites");
     assert_eq!(sites.len(), 1, "老数据零丢失");
@@ -48,7 +48,7 @@ fn v3_database_gets_alias_table_and_keeps_rows() {
     // 二次 open 幂等：不报 duplicate / 不丢数据
     drop(store);
     let again = Store::open(&path).expect("二次 open");
-    assert_eq!(again.schema_version().unwrap(), 4);
+    assert_eq!(again.schema_version().unwrap(), 5);
     assert_eq!(again.list_sites().unwrap().len(), 1);
 }
 

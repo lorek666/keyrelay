@@ -17,8 +17,12 @@ use crate::redact::scrub;
 /// `normalize_source` 会把认不出的来源归一到 `"app"`，于是「网关为什么切换了上游」
 /// 会混在应用事件里，按来源过滤就找不到它。加进白名单而不是改用 `"app"`，
 /// 是因为这条事件需要能**单独被筛出来**：它是「请求失败」而不是「应用做了什么」。
-pub const SOURCES: [&str; 7] = [
-    "app", "site", "key", "delivery", "vault", "store", "gateway",
+///
+/// `"probe"` 是 M15-S1 加的：模型检测（bazaarlink）的完成/失败事件同理，需要能单独
+/// 筛出（否则混在 `app` 里，用户按来源筛「检测」看不到）。独立复审 M4 发现
+/// `probe_model` 的 `source: "probe"` 不在白名单、被归一成 `app`——顺带修掉。
+pub const SOURCES: [&str; 8] = [
+    "app", "site", "key", "delivery", "vault", "store", "gateway", "probe",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

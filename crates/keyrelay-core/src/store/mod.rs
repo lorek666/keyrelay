@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::inject::Journal;
 use crate::site::KeyStatus;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// 「已回收」——**本地**密钥生命周期状态（M7-S4 / FR-2）。
 ///
@@ -186,6 +186,28 @@ CREATE TABLE IF NOT EXISTS usage_samples(
   UNIQUE(key_id, date)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_samples_key ON usage_samples(key_id, date DESC);
+-- M15-S1：模型检测历史（bazaarlink probe）。只存身份判定摘要，
+-- **不存** items[].response / responseHeaders / startedByIp / userKey（敏感，见 probe/mod.rs）。
+CREATE TABLE IF NOT EXISTS probe_runs(
+  id INTEGER PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  key_id INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
+  model_id TEXT NOT NULL,
+  claimed_model TEXT,
+  identity_status TEXT,
+  verdict_status TEXT,
+  true_family TEXT,
+  true_model TEXT,
+  spoof_method TEXT,
+  confidence TEXT,
+  warnings_count INTEGER NOT NULL DEFAULT 0,
+  report_url TEXT,
+  bazaarlink_created_at INTEGER,
+  bazaarlink_completed_at INTEGER,
+  recorded_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_probe_runs_recorded ON probe_runs(recorded_at DESC);
 "#;
 
 fn now_secs() -> i64 {
@@ -381,6 +403,55 @@ pub struct UsageSampleRow {
     pub total_tokens: i64,
     pub cost: f64,
     pub sampled_at: i64,
+}
+
+/// M15-S1：一次 probe 检测的本地记录（`probe_runs` 表的一行）。
+///
+/// **不含敏感字段**——`items[].response` / `responseHeaders` / `startedByIp` / `userKey`
+/// 在写入时就被丢弃（`insert_probe_run` 只接 `ProbeRun` 摘要）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeRunRow {
+    pub id: i64,
+    pub run_id: String,
+    pub site_id: i64,
+    pub key_id: i64,
+    pub model_id: String,
+    pub claimed_model: Option<String>,
+    pub identity_status: Option<String>,
+    pub verdict_status: Option<String>,
+    pub true_family: Option<String>,
+    pub true_model: Option<String>,
+    pub spoof_method: Option<String>,
+    pub confidence: Option<String>,
+    pub warnings_count: u32,
+    pub report_url: Option<String>,
+    pub bazaarlink_created_at: Option<i64>,
+    pub bazaarlink_completed_at: Option<i64>,
+    pub recorded_at: i64,
+}
+
+impl ProbeRunRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            run_id: row.get(1)?,
+            site_id: row.get(2)?,
+            key_id: row.get(3)?,
+            model_id: row.get(4)?,
+            claimed_model: row.get(5)?,
+            identity_status: row.get(6)?,
+            verdict_status: row.get(7)?,
+            true_family: row.get(8)?,
+            true_model: row.get(9)?,
+            spoof_method: row.get(10)?,
+            confidence: row.get(11)?,
+            warnings_count: row.get::<_, i64>(12)? as u32,
+            report_url: row.get(13)?,
+            bazaarlink_created_at: row.get(14)?,
+            bazaarlink_completed_at: row.get(15)?,
+            recorded_at: row.get(16)?,
+        })
+    }
 }
 
 pub struct Store {
@@ -1635,6 +1706,88 @@ impl Store {
         conn.execute("DELETE FROM model_aliases WHERE alias = ?1", params![alias])
             .map_err(|e| Error::Store(format!("delete alias: {e}")))?;
         Ok(())
+    }
+
+    // ---- M15-S1：模型检测历史（probe_runs）----
+
+    /// M15-S1：写入一次 probe 检测结果摘要。只存身份判定字段，
+    /// **不存** items[].response / responseHeaders / startedByIp / userKey（敏感）。
+    pub fn insert_probe_run(
+        &self,
+        site_id: i64,
+        key_id: i64,
+        model_id: &str,
+        claimed_model: Option<&str>,
+        run: &crate::probe::ProbeRun,
+    ) -> Result<i64> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO probe_runs
+             (run_id, site_id, key_id, model_id, claimed_model, identity_status, verdict_status,
+              true_family, true_model, spoof_method, confidence, warnings_count, report_url,
+              bazaarlink_created_at, bazaarlink_completed_at, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                run.run_id,
+                site_id,
+                key_id,
+                model_id,
+                claimed_model,
+                run.identity_status,
+                run.verdict_status,
+                run.true_family,
+                run.true_model,
+                run.spoof_method,
+                run.confidence,
+                run.warnings_count,
+                run.report_url,
+                run.created_at,
+                run.completed_at,
+                now_secs()
+            ],
+        )
+        .map_err(|e| Error::Store(format!("insert probe run: {e}")))?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// M15-S1：最近 `limit` 条检测历史，按 `recorded_at` 降序（最新在前）。上限 200。
+    pub fn list_probe_runs(&self, limit: usize) -> Result<Vec<ProbeRunRow>> {
+        let limit = limit.min(200) as i64;
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, run_id, site_id, key_id, model_id, claimed_model, identity_status,
+                        verdict_status, true_family, true_model, spoof_method, confidence,
+                        warnings_count, report_url, bazaarlink_created_at,
+                        bazaarlink_completed_at, recorded_at
+                 FROM probe_runs ORDER BY recorded_at DESC LIMIT ?1",
+            )
+            .map_err(|e| Error::Store(format!("prepare list probe runs: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit], ProbeRunRow::from_row)
+            .map_err(|e| Error::Store(format!("query probe runs: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect probe runs: {e}")))
+    }
+
+    /// M15-S1：按本地 id 取单条检测记录。
+    pub fn get_probe_run(&self, id: i64) -> Result<Option<ProbeRunRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, run_id, site_id, key_id, model_id, claimed_model, identity_status,
+                        verdict_status, true_family, true_model, spoof_method, confidence,
+                        warnings_count, report_url, bazaarlink_created_at,
+                        bazaarlink_completed_at, recorded_at
+                 FROM probe_runs WHERE id = ?1",
+            )
+            .map_err(|e| Error::Store(format!("prepare get probe run: {e}")))?;
+        let mut rows = stmt
+            .query_map(params![id], ProbeRunRow::from_row)
+            .map_err(|e| Error::Store(format!("query probe run: {e}")))?;
+        rows.next()
+            .transpose()
+            .map_err(|e| Error::Store(format!("probe run row: {e}")))
     }
 
     /// M14-S3：写入 / 覆盖一把 key 一天的用量采样（Sub2API `usage/daily`）。

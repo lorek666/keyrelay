@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   AlertTriangle,
+  FlaskConical,
   History as HistoryIcon,
   KeyRound,
   LayoutDashboard,
@@ -15,6 +16,7 @@ import Keys from "./pages/Keys";
 import Agents from "./pages/Agents";
 import History from "./pages/History";
 import SettingsPage from "./pages/Settings";
+import Probe from "./pages/Probe";
 import { appInfo, getSettings, runtimeMode } from "./lib/api";
 import { useApplyTheme } from "./lib/theme";
 import { I18nProvider, normalizeLang, useTranslation, type Lang } from "./i18n";
@@ -33,6 +35,7 @@ const PAGES = [
   { id: "overview", labelKey: "nav.overview", icon: LayoutDashboard, group: "nav.group.daily", render: () => <Overview /> },
   { id: "sites", labelKey: "nav.sites", icon: Server, group: "nav.group.asset", render: () => <Sites /> },
   { id: "keys", labelKey: "nav.keys", icon: KeyRound, group: "nav.group.asset", render: () => <Keys /> },
+  { id: "probe", labelKey: "nav.probe", icon: FlaskConical, group: "nav.group.asset", render: () => <Probe /> },
   { id: "agents", labelKey: "nav.agents", icon: Plug, group: "nav.group.delivery", render: () => <Agents /> },
   { id: "history", labelKey: "nav.history", icon: HistoryIcon, group: "nav.group.daily", render: () => <History /> },
   { id: "settings", labelKey: "nav.settings", icon: SettingsIcon, group: "nav.group.system", render: () => <SettingsPage /> },
