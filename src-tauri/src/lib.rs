@@ -43,6 +43,16 @@ pub struct AppState {
     /// 而 `std::sync::MutexGuard` 不能跨 `await`（不是 `Send`）。
     /// 用 std 锁只在取 `Option` 时上锁，等于没修 —— 两个并发启动仍会各自 bind。
     pub gateway_op: tokio::sync::Mutex<()>,
+    /// 把人工验证的三个命令（`captcha_begin` / `captcha_complete` / `captcha_cancel`）串起来
+    /// （P3-15）。
+    ///
+    /// 修前的问题：`captcha_complete` 要抓一次 WebView cookie（毫秒级，但**跨 await**），
+    /// 期间 `captcha_cancel` 可以把相位打回 `Idle`——于是「用户点了取消，会话却接上了」，
+    /// 或者反过来「取消被提交覆盖」。相位在 `service.rs` 里是「读一次、写一次」两把锁，
+    /// 而命令层是**唯一的并发入口**：把它串行化就消除了这条竞态。
+    ///
+    /// 与 `gateway_op` 同款（必须是异步锁：要跨 `await` 持有）。
+    pub captcha_op: tokio::sync::Mutex<()>,
     /// 托盘图标是否真的建起来了（M6-S5）。
     ///
     /// 这个标志位决定「能不能隐藏窗口」：托盘不可用时隐藏窗口会把应用变成
@@ -234,6 +244,7 @@ fn state_with_config(
         db_error,
         gateway: std::sync::Mutex::new(None),
         gateway_op: tokio::sync::Mutex::new(()),
+        captcha_op: tokio::sync::Mutex::new(()),
         // 真实结果由 `setup` 里的 `tray::build` 覆盖；测试里永远保持 false
         tray_available: std::sync::atomic::AtomicBool::new(false),
     }
@@ -302,6 +313,7 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::detect_system_proxy,
             commands::refresh_all,
             commands::audit_redaction,
+            commands::report_ui_ready,
             commands::gateway_status,
             commands::gateway_start,
             commands::gateway_stop,
