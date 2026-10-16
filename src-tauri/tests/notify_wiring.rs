@@ -5,8 +5,8 @@
 //! 而 spec §9 写的是「未接线：无」。
 //!
 //! 这组测试钉三件事：
-//! 1. **开关开着时装配真的接上了**（`init_state_in_memory_with_settings` 预置 `notify_enabled`）
-//!    ⇒ 一轮 `refresh_all` 之后基线**落库**；
+//! 1. **开关开着时装配真的接上了**（`init_state_in_memory_with_settings` 预置
+//!    `Settings::notify_enabled` 对应的设置键）⇒ 一轮 `refresh_all` 之后基线**落库**；
 //! 2. **开关缺省（关）时与今天逐字相同** ⇒ 不落库（既有用户行为零变化）；
 //! 3. **基线跨实例可见**（B-81 的判据，对齐复审探针 `rev_b81_baseline_survives_a_new_instance`）。
 //!
@@ -15,6 +15,9 @@
 use keyrelay_core::notify::BASELINE_SETTING_KEY;
 
 /// 开关开着 ⇒ 装配把 `with_notify` 接上 ⇒ `refresh_all` 之后基线落库。
+///
+/// 开关走的是 **`Settings::notify_enabled`**（M16-S9 第二步：它不再是独立的 KV 兜底路径，
+/// 而是设置结构体自己的字段；测试预置的就是它读的那个键 ⇒ 单一事实来源）。
 ///
 /// `notify_system_enabled=false` + 无 webhook ⇒ 只跑 `evaluate` 与基线落库，
 /// **不构造任何通知器**（不会真的弹系统通知、也不会发网络请求）。
