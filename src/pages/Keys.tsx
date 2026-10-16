@@ -22,6 +22,7 @@ import {
   type StoredKeyRow,
 } from "../lib/api";
 import ConfirmDialog from "../components/ConfirmDialog";
+import Skeleton from "../components/Skeleton";
 import CapButton from "../components/CapButton";
 import { useTranslation, translate, getCurrentDict } from "../i18n";
 
@@ -405,7 +406,7 @@ export default function Keys() {
           </span>
         </div>
 
-        {keys.isLoading ? <p className="muted">{t("common.loading")}</p> : null}
+        {keys.isLoading ? <Skeleton rows={3} /> : null}
         {keys.isError ? (
           <p className="muted">{t("keys.emptyStates.keysError", { error: (keys.error as Error).message })}</p>
         ) : null}

@@ -918,8 +918,12 @@ export default function SettingsPage() {
           <GatewayCard
             enabled={draft.gatewayEnabled}
             port={draft.gatewayPort}
+            multiSite={draft.gatewayMultiSite}
             onToggle={(enabled) => setDraft({ ...draft, gatewayEnabled: enabled })}
             onPortChange={(port) => setDraft({ ...draft, gatewayPort: port })}
+            onMultiSiteChange={(multiSite) =>
+              setDraft({ ...draft, gatewayMultiSite: multiSite })
+            }
             settingsDirty={dirty}
           />
 

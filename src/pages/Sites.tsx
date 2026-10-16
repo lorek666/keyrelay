@@ -16,6 +16,7 @@ import {
   type SiteRow,
 } from "../lib/api";
 import ConfirmDialog from "../components/ConfirmDialog";
+import Skeleton from "../components/Skeleton";
 import CapButton from "../components/CapButton";
 import { useTranslation, translate, getCurrentDict } from "../i18n";
 
@@ -235,7 +236,7 @@ export default function Sites() {
           </button>
         </div>
 
-        {sites.isLoading ? <p className="muted">{t("common.loading")}</p> : null}
+        {sites.isLoading ? <Skeleton rows={3} /> : null}
         {sites.data?.length === 0 ? (
           <p className="muted">{t("sites.list.empty")}</p>
         ) : null}
