@@ -1039,6 +1039,74 @@ async fn a_revoked_only_candidate_reports_why_it_was_skipped() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_in_flight_during_stop_never_reaches_the_next_upstream() {
+    // P3-3 / DEBUG-REPORT-v3 §3-3：stop 返回后，在途请求的下一次尝试**仍然**会把
+    // 下一个站点的密钥发出去。修法：句柄在发停止信号**之前**置「正在停止」标志，
+    // 请求路径在**每次上游尝试之前**查它。
+    //
+    // 构造：A 延迟 300ms 才回 429（429 是可重放的那一类，所以「没有闸门」时它一定会
+    // 切到 B——这正是这条用例能红的原因）；B 恒 200。等 A 真的收到请求之后再 stop，
+    // 于是停止信号落在「A 已收到、B 还没发」的窗口里。
+    let a = spawn_upstream_delayed(
+        1,
+        REF_A,
+        "429 Too Many Requests",
+        Duration::from_millis(300),
+    );
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let (handle, token, _failures, _observations) = start_routed_with(
+        &[(&a, 1.0), (&b, 2.0)],
+        long_cooldown(),
+        UpstreamTimeout::default(),
+        None,
+        vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+    )
+    .await;
+
+    let url = format!("http://{}", handle.addr);
+    let token_for_task = token.clone();
+    let request = tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
+            http_post(
+                &url,
+                &token_for_task,
+                "/v1/chat/completions",
+                &body_with_model(),
+            )
+        })
+        .await
+        .expect("阻塞任务")
+    });
+
+    // 等 A 真的收到请求（不要用固定 sleep 猜时序）
+    for _ in 0..200 {
+        if a.request_count() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(a.request_count(), 1, "前提：首选上游必须先收到这次请求");
+
+    // 停止（`shutdown()` 只发信号、不等——正是最容易漏的那条路径）
+    handle.shutdown();
+
+    let (status, body) = request.await.expect("请求任务");
+    assert_eq!(
+        status, 503,
+        "停止期间的下一次尝试必须被闸门拒绝（而不是把 429 重放给 B）: {body}"
+    );
+    assert!(
+        body.contains("网关正在停止"),
+        "文案要说清是本地状态、不是上游故障: {body}"
+    );
+    assert_eq!(
+        b.request_count(),
+        0,
+        "**第二个上游一次都不该被请求**——停止之后不许再带出任何密钥（P3-3）"
+    );
+}
+
 #[tokio::test]
 async fn a_stalled_upstream_times_out_and_is_not_replayed() {
     // §3.5-2（DEBUG 报告 §2.2）：上游客户端原来**没有任何超时**——上游接了连接却不回应时，
