@@ -546,3 +546,65 @@ async fn snapshot_models_come_from_the_collection() {
         "B-80：快照的 models 必须来自采集结果（不是 None）"
     );
 }
+
+/// B-81 的**可见降级**路径：基线编码失败（fail-closed）时不得静默 ——
+/// 必须有 Warn 事件，且基线状态仍是「没有」。
+///
+/// 触发器必须是**真的密钥形态**（词边界处的 `sk-` + 32 位十六进制）；
+/// `task-scheduler` 这类「词中间的 sk-」已被 P2-26 的边界规则修好，不再触发（道② 的改动已在本基线）。
+#[tokio::test]
+async fn notify_baseline_refusal_is_visible_not_silent() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let store = Store::open(&dir.path().join("k.db")).expect("库");
+    let secret_shaped_name = format!("站点 sk-{}", "0123456789abcdef0123456789abcdef");
+    let site_id = store
+        .upsert_site("sub2api", "https://sub.example.com", &secret_shaped_name)
+        .expect("站点");
+    let vault = Arc::new(MemoryVault::new());
+    vault
+        .put(
+            &keyrelay_core::vault::secret_ref("site", site_id, "session"),
+            &format!(
+                r#"{{"cookies":[],"access_token":"{}","user_id":"1"}}"#,
+                jwt_with_exp(9_999_999_999)
+            ),
+        )
+        .expect("写会话");
+    let service = KeyRelayService::new(
+        store,
+        MockTransport::new(vec![
+            sub2api_ok(json!({"balance": 100.0, "total_recharged": 100.0})),
+            sub2api_ok(json!([])),
+        ]),
+        ServiceConfig {
+            vault: Arc::clone(&vault) as Arc<dyn Vault>,
+            home: home.clone(),
+            backup_dir: dir.path().join("backups"),
+        },
+    );
+    service.restore_sessions();
+    let service = service.with_notify(keyrelay_core::notify::NotifyConfig {
+        system_enabled: false,
+        webhook_url: None,
+        balance_threshold: 0.0,
+        timeout: std::time::Duration::from_secs(5),
+    });
+    service.refresh_all().await.expect("刷新");
+
+    assert!(
+        !service.notify_baseline_present(),
+        "编码被拒 ⇒ 不该有基线（fail-closed）"
+    );
+    let events = Store::open(&dir.path().join("k.db"))
+        .expect("开库")
+        .list_events(200)
+        .expect("事件");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message.contains("通知基线未能保存")),
+        "B-81：编码失败必须**可见**（Warn 事件），不得静默关闭"
+    );
+}
