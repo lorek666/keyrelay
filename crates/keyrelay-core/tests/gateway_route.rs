@@ -26,6 +26,30 @@ fn ids(candidates: &[&Upstream]) -> Vec<i64> {
     candidates.iter().map(|u| u.site_id).collect()
 }
 
+// ============================================================ M16-S4 / P3-9：key_refs
+
+/// `RouteTable::key_refs()`：去重 + 保持首次出现顺序。
+///
+/// 用途是 `gateway::start()` 的集合不变式（route ⊆ keys_by_ref ∪ revoked_refs）——
+/// 重复的引用不该被数两次（报错文案里的「几个上游」得是真数）。
+#[test]
+fn key_refs_is_deduped_and_ordered() {
+    let mut a = up(1, Some(1.0), Some(1.0), None);
+    let mut b = up(2, Some(2.0), Some(1.0), None);
+    let c = up(3, Some(3.0), Some(1.0), None);
+    // 三个上游、两个不同的 key_ref（A 与 B 共用一个）
+    a.key_ref = "kr/key/shared/secret".to_string();
+    b.key_ref = "kr/key/shared/secret".to_string();
+
+    let table = RouteTable::new(vec![a, b, c]);
+    assert_eq!(
+        table.key_refs(),
+        vec!["kr/key/shared/secret", "kr/key/3/secret"],
+        "去重且保持首次出现顺序"
+    );
+    assert!(RouteTable::default().key_refs().is_empty(), "空表 ⇒ 空列表");
+}
+
 // ============================================================ 排序
 
 #[test]
