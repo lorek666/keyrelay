@@ -124,25 +124,52 @@ impl FakeUpstream {
 }
 
 type Failures = Arc<Mutex<Vec<GatewayFailure>>>;
+type Observations = Arc<Mutex<Vec<keyrelay_core::gateway::UpstreamObservation>>>;
 
 /// 起一个**路由模式**的网关。`rate` 决定排序：小的排前面（首选）。
 async fn start_routed(
     upstreams: &[(&FakeUpstream, f64)],
     breaker: BreakerPolicy,
 ) -> (GatewayHandle, String, Failures) {
-    let route = RouteTable::new(
-        upstreams
-            .iter()
-            .map(|(u, rate)| u.upstream(*rate))
-            .collect(),
-    );
-    let mut keys = std::collections::HashMap::new();
-    for (u, _) in upstreams {
-        let plain = if u.key_ref == REF_A { KEY_A } else { KEY_B };
-        keys.insert(u.key_ref.clone(), Zeroizing::new(plain.to_string()));
+    let ups: Vec<Upstream> = upstreams.iter().map(|(u, rate)| u.upstream(*rate)).collect();
+    let keys: Vec<(&str, &str)> = upstreams
+        .iter()
+        .map(|(u, _)| {
+            let plain = if u.key_ref == REF_A { KEY_A } else { KEY_B };
+            (u.key_ref.as_str(), plain)
+        })
+        .collect();
+    let (handle, token, failures, _) = start_routed_full(
+        ups,
+        breaker,
+        UpstreamTimeout::default(),
+        None,
+        keys,
+    )
+    .await;
+    (handle, token, failures)
+}
+
+/// 唯一的配置构造点：候选由调用方直接给（`Upstream` 值），其余参数显式传入。
+///
+/// 为什么要有它（M16-S4 / P2-13）：**「连接层失败」的候选没有假上游进程**——
+/// 它就是一个没人听的端口，用 `&FakeUpstream` 表达不出来。
+async fn start_routed_full(
+    upstreams: Vec<Upstream>,
+    breaker: BreakerPolicy,
+    timeout: UpstreamTimeout,
+    revoked: Option<Vec<String>>,
+    keys: Vec<(&str, &str)>,
+) -> (GatewayHandle, String, Failures, Observations) {
+    let route = RouteTable::new(upstreams);
+    let mut map = std::collections::HashMap::new();
+    for (r, plain) in keys {
+        map.insert(r.to_string(), Zeroizing::new(plain.to_string()));
     }
     let failures: Failures = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&failures);
+    let observations: Observations = Arc::new(Mutex::new(Vec::new()));
+    let obs_sink = Arc::clone(&observations);
 
     let handle = start(GatewayConfig {
         port: 0,
@@ -154,23 +181,54 @@ async fn start_routed(
         site_display_name: "路由模式".to_string(),
         route,
         breaker,
-        keys_by_ref: keys,
-        upstream_timeout: UpstreamTimeout::default(),
-        revoked_refs: None,
-        on_observation: None,
-        on_usage: None,
+        keys_by_ref: map,
+        upstream_timeout: timeout,
+        revoked_refs: revoked.map(|refs| {
+            Arc::new(Mutex::new(
+                refs.into_iter().collect::<std::collections::HashSet<_>>(),
+            ))
+        }),
+        on_observation: Some(Arc::new(move |o| {
+            if let Ok(mut log) = obs_sink.lock() {
+                log.push(o);
+            }
+        })),
         upstream_proxy: None,
         on_failure: Some(Arc::new(move |f| {
             if let Ok(mut log) = sink.lock() {
                 log.push(f);
             }
         })),
+        on_usage: None,
     })
     .await
     .expect("网关应能启动");
 
     let token = handle.token.clone();
-    (handle, token, failures)
+    (handle, token, failures, observations)
+}
+
+/// 一个**没人听**的端口：连接必然被拒（`is_connect()` ⇒ P2-13 里「可重放」的那一类）。
+///
+/// 用一个刚释放的临时端口而不是固定端口号（`127.0.0.1:1` 在不同平台/沙箱里行为不一）。
+fn dead_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("占一个临时端口");
+    let port = listener.local_addr().expect("读端口").port();
+    drop(listener);
+    port
+}
+
+/// 「连不上」的上游：候选里有它，但它不会收到任何请求。
+fn dead_upstream(site_id: i64, key_ref: &str, rate: f64) -> Upstream {
+    Upstream {
+        site_id,
+        base_url: format!("http://127.0.0.1:{}", dead_port()),
+        key_ref: key_ref.to_string(),
+        models: vec![MODEL.to_string()],
+        rate: Some(rate),
+        balance_usd: Some(10.0),
+        latency_ms: Some(10),
+    }
 }
 
 /// 极简 HTTP 客户端：POST + JSON body。
@@ -252,18 +310,134 @@ fn long_cooldown() -> BreakerPolicy {
 // ============================================================ 用例
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn failover_on_503_reaches_the_second_upstream() {
-    // A 恒 503（倍率更低 ⇒ 首选），B 恒 200
+async fn a_503_response_is_not_replayed() {
+    // M16-S4 / P2-13（旧用例 `failover_on_503_reaches_the_second_upstream`）：
+    //   旧断言：A 恒 503 ⇒ 切到 B，客户端拿到 200，A/B 各被请求 1 次。
+    //   新断言：503 **原样返回**，B **一次都不被请求**，仍记一条失败事件。
+    //   为什么：5xx 是「上游已开始处理但失败」的区间（524/504 明确是超时类），
+    //   重放到另一个站点会让用户在两处各付一次钱，而重复计费不可逆。
+    //   可用性由熔断承接：下一个请求会跳过被熔断的 A（见 breaker 那条用例）。
     let a = spawn_upstream_always(1, REF_A, "503 Service Unavailable");
     let b = spawn_upstream_always(2, REF_B, "200 OK");
-    let (handle, token, _failures) = start_routed(&[(&a, 0.1), (&b, 1.0)], long_cooldown()).await;
+    let (handle, token, failures) = start_routed(&[(&a, 0.1), (&b, 1.0)], long_cooldown()).await;
+
+    let (status, _) = post(&handle, &token, &chat_body()).await;
+
+    assert_eq!(status, 503, "503 必须原样返回（不再重放到第二个上游）");
+    assert_eq!(a.request_count(), 1, "首选上游应当被试过一次");
+    assert_eq!(b.request_count(), 0, "**第二个上游一次都不该被请求**（P2-13）");
+    {
+        let events = failures.lock().unwrap();
+        assert_eq!(events.len(), 1, "仍要记一条失败事件（可观测性不变）");
+        assert_eq!(events[0].site_id, 1);
+        assert_eq!(events[0].status, 503);
+        assert!(
+            events[0].reason.contains("不重放"),
+            "reason 要写明计费口径: {}",
+            events[0].reason
+        );
+    }
+
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_429_is_replayed_to_the_next_upstream() {
+    // Lead 2026-10-16 的最终口径：429 是**限流**——上游在进入模型处理之前就拒了，
+    // 重放不产生计费，所以它和连接层失败一样允许同请求内切换（FR-5:160 的可见行为不变）。
+    let a = spawn_upstream_always(1, REF_A, "429 Too Many Requests");
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let (handle, token, failures) = start_routed(&[(&a, 0.1), (&b, 1.0)], long_cooldown()).await;
 
     let (status, body) = post(&handle, &token, &chat_body()).await;
 
-    assert_eq!(status, 200, "应当切到第二个上游并拿到 200");
-    assert!(body.contains("site2"), "响应应当来自第二个上游: {body}");
-    assert_eq!(a.request_count(), 1, "首选上游应当被试过一次");
+    assert_eq!(status, 200, "429 应当切到第二个上游: {body}");
+    assert!(body.contains("site2"), "{body}");
+    assert_eq!(a.request_count(), 1);
+    assert_eq!(b.request_count(), 1);
+    {
+        let events = failures.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, 429);
+        assert!(
+            events[0].reason.contains("限流"),
+            "reason 要写明 429 是限流（未进入处理）: {}",
+            events[0].reason
+        );
+    }
+
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connect_failure_is_replayed_to_the_next_upstream() {
+    // P2-13 允许重放的**另一类**：连接层失败。请求连会话都没建立 ⇒ 上游不可能处理它。
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let (handle, token, failures, _observations) = start_routed_full(
+        vec![dead_upstream(1, REF_A, 0.1), b.upstream(1.0)],
+        long_cooldown(),
+        UpstreamTimeout::default(),
+        None,
+        vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+    )
+    .await;
+
+    let (status, body) = post(&handle, &token, &chat_body()).await;
+
+    assert_eq!(status, 200, "连接层失败必须切到第二个上游: {body}");
+    assert!(body.contains("site2"), "{body}");
     assert_eq!(b.request_count(), 1, "第二个上游应当被请求一次");
+    {
+        let events = failures.lock().unwrap();
+        assert_eq!(events.len(), 1, "切走的那次失败也要记事件");
+        assert_eq!(events[0].site_id, 1);
+        assert_eq!(events[0].status, 502, "连接层失败没有状态码 ⇒ 按 502 记");
+        assert!(
+            events[0].reason.contains("连接层"),
+            "reason 要说明这是可重放的那一类: {}",
+            events[0].reason
+        );
+    }
+
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_timeout_is_not_replayed() {
+    // 最容易写错的一格：读超时（连上了、请求发出去了、等不到响应头）**不是** connect 错误，
+    // 所以判据必须是 `is_connect()` 而不是 `is_timeout()`。上游可能已经跑完并计费 ⇒ 不重放。
+    let stalled = spawn_stalled_upstream(1, REF_A);
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let timeout = UpstreamTimeout {
+        connect: Duration::from_millis(500),
+        read: Duration::from_millis(200),
+    };
+    let (handle, token, failures, _observations) = start_routed_full(
+        vec![stalled.upstream(0.1), b.upstream(1.0)],
+        long_cooldown(),
+        timeout,
+        None,
+        vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+    )
+    .await;
+
+    let (status, _) = post(&handle, &token, &chat_body()).await;
+
+    assert_eq!(status, 502, "读超时按 502 如实返回");
+    assert_eq!(
+        b.request_count(),
+        0,
+        "**第二个上游一次都不该被请求**（读超时可能已计费 ⇒ 不重放）"
+    );
+    {
+        let events = failures.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].reason.contains("不重放"),
+            "reason 要写明「可能已送达」: {}",
+            events[0].reason
+        );
+    }
 
     handle.shutdown_and_wait().await;
 }
@@ -273,15 +447,24 @@ async fn a_bodyless_get_request_also_fails_over() {
     // P2-9 / B-98 / DEBUG-REPORT-v3 §2-9：GET /v1/models 无 body，旧实现只用
     // preferred() 的单个候选——首选挂了就 502，不切别的上游。现在用 all_candidates()，
     // 无 body 请求也走故障切换循环。
-    let a = spawn_upstream_always(1, REF_A, "503 Service Unavailable");
+    //
+    // M16-S4 / P2-13 之后能触发切换的只剩「连接层失败」与 429，所以本用例的故障源
+    // 从「503」换成「连不上的端口」——**测的东西没变**（无 body 也走切换循环），
+    // 只是换了一个在计费口径下合法的触发方式。
     let b = spawn_upstream_always(2, REF_B, "200 OK");
-    let (handle, token, _failures) = start_routed(&[(&a, 0.1), (&b, 1.0)], long_cooldown()).await;
+    let (handle, token, _failures, _observations) = start_routed_full(
+        vec![dead_upstream(1, REF_A, 0.1), b.upstream(1.0)],
+        long_cooldown(),
+        UpstreamTimeout::default(),
+        None,
+        vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+    )
+    .await;
 
     let (status, body) = get(&handle, &token, "/v1/models").await;
 
     assert_eq!(status, 200, "无 body 请求也应当切到第二个上游: {body}");
     assert!(body.contains("site2"), "响应应当来自第二个上游: {body}");
-    assert_eq!(a.request_count(), 1, "首选上游应当被试过一次");
     assert_eq!(b.request_count(), 1, "第二个上游应当被请求一次");
 
     handle.shutdown_and_wait().await;
@@ -314,6 +497,9 @@ async fn no_failover_on_401_so_an_invalid_key_is_not_masked_as_an_upstream_fault
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn breaker_opens_after_threshold_and_skips_the_upstream() {
+    // M16-S4 / P2-13 之后「同一个请求内」不再因 503 切换，所以喂熔断改成
+    // **N 个独立请求**：每个请求都如实返回 503（旧断言是前两次返回 200，因为当时会切到 B）。
+    // 第 3 个请求时 A 已 Open ⇒ 被跳过、直接走 B——这正是 P2-13 承诺的可用性替代路径。
     let a = spawn_upstream_always(1, REF_A, "503 Service Unavailable");
     let b = spawn_upstream_always(2, REF_B, "200 OK");
     let policy = BreakerPolicy {
@@ -322,26 +508,40 @@ async fn breaker_opens_after_threshold_and_skips_the_upstream() {
     };
     let (handle, token, _failures) = start_routed(&[(&a, 0.1), (&b, 1.0)], policy).await;
 
-    // 第 1、2 次：A 失败 → 切换（第 2 次之后 A 达到阈值进入 Open）
-    assert_eq!(post(&handle, &token, &chat_body()).await.0, 200);
-    assert_eq!(post(&handle, &token, &chat_body()).await.0, 200);
+    // 第 1、2 次：A 是首选且未熔断 ⇒ 每次都试 A，503 原样返回（不重放）
+    assert_eq!(post(&handle, &token, &chat_body()).await.0, 503);
+    assert_eq!(post(&handle, &token, &chat_body()).await.0, 503);
     assert_eq!(a.request_count(), 2, "阈值内应当每次都试 A");
+    assert_eq!(b.request_count(), 0, "503 不重放 ⇒ B 一次都不该被请求");
 
     // 第 3 次：A 已 Open ⇒ 应当**跳过**它，直接走 B
     assert_eq!(post(&handle, &token, &chat_body()).await.0, 200);
     assert_eq!(a.request_count(), 2, "熔断打开后不该再打 A");
-    assert_eq!(b.request_count(), 3);
+    assert_eq!(b.request_count(), 1, "第 3 个请求由 B 承接");
 
     handle.shutdown_and_wait().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failure_event_carries_only_metadata() {
-    let a = spawn_upstream_always(1, REF_A, "503 Service Unavailable");
+    // M16-S4 / P2-13：故障源从「503」换成「连不上的端口」——这条用例测的是**事件形状**
+    // （只有元数据、不带密钥/prompt），与故障种类无关；换成连接层失败后它仍然测同一件事，
+    // 而且这是新口径下**唯一**会「切走并记事件」的那一类。
     let b = spawn_upstream_always(2, REF_B, "200 OK");
-    let (handle, token, failures) = start_routed(&[(&a, 0.1), (&b, 1.0)], long_cooldown()).await;
+    let (handle, token, failures, _observations) = start_routed_full(
+        vec![dead_upstream(1, REF_A, 0.1), b.upstream(1.0)],
+        long_cooldown(),
+        UpstreamTimeout::default(),
+        None,
+        vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+    )
+    .await;
 
-    assert_eq!(post(&handle, &token, &chat_body()).await.0, 200);
+    assert_eq!(
+        post(&handle, &token, &chat_body()).await.0,
+        200,
+        "连接层失败应当切到第二个上游"
+    );
 
     // 断言全部在**同步块**里做完：`std::sync::MutexGuard` 绝不跨 `.await` 持有。
     // 跨 await 持锁在单线程 runtime 上会自锁，在多线程 runtime 上只是**碰巧**能过——
@@ -351,10 +551,10 @@ async fn failure_event_carries_only_metadata() {
         assert_eq!(events.len(), 1, "一次失败切换应当只写一条事件");
         let event = &events[0];
         assert_eq!(event.site_id, 1);
-        assert_eq!(event.status, 503);
+        assert_eq!(event.status, 502, "连接层失败没有状态码 ⇒ 按 502 记");
         assert_eq!(event.model, MODEL, "记的是**调用方请求的那个**模型名");
 
-        // 结构上装不下别的东西（`GatewayFailure` 恰好三个公开字段），内容上也不许混进密钥
+        // 结构上装不下别的东西（`GatewayFailure` 的字段是白名单），内容上也不许混进密钥
         let text = format!("{event:?}");
         assert!(!text.contains(KEY_A), "{text}");
         assert!(!text.contains(KEY_B), "{text}");
@@ -367,22 +567,53 @@ async fn failure_event_carries_only_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn exhausted_candidates_return_the_last_status() {
-    // 两个上游都 503 ⇒ 客户端拿到 503（不是 500/502 兜底）
+async fn the_first_response_wins_and_is_returned_as_is() {
+    // M16-S4 / P2-13（旧用例 `exhausted_candidates_return_the_last_status`）：
+    //   旧断言：两个上游都 503 ⇒ 「切到最后一个候选」再返回它的 503（B 被请求 1 次、两条事件）。
+    //   新断言：**第一个响应就是终局** ⇒ 返回首选 A 的 503，B 不被请求，只记一条事件。
+    //   为什么：503 可能已经计费；「候选耗尽」这个状态在新口径下只可能由**连接层失败**造成。
     let a = spawn_upstream_always(1, REF_A, "503 Service Unavailable");
     let b = spawn_upstream_always(2, REF_B, "503 Service Unavailable");
     let (handle, token, failures) = start_routed(&[(&a, 0.1), (&b, 1.0)], long_cooldown()).await;
 
     let (status, body) = post(&handle, &token, &chat_body()).await;
 
-    assert_eq!(status, 503, "候选耗尽时应当如实返回最后一个上游的状态码");
+    assert_eq!(status, 503, "如实返回首选上游的状态码（不做 500/502 兜底）");
     assert!(
-        body.contains("site2"),
-        "返回的应当是**最后一个**上游的响应: {body}"
+        body.contains("site1"),
+        "返回的应当是**第一个**上游的响应: {body}"
     );
     assert_eq!(a.request_count(), 1);
-    assert_eq!(b.request_count(), 1);
-    assert_eq!(failures.lock().unwrap().len(), 2, "两次失败各记一条");
+    assert_eq!(b.request_count(), 0, "第二个上游不该被请求（P2-13）");
+    assert_eq!(failures.lock().unwrap().len(), 1, "只记一条事件");
+
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_connect_failures_still_return_502_with_the_last_reason() {
+    // 「候选耗尽」在新口径下只剩这一条路径：**所有候选都是连接层失败**。
+    // 客户端拿到 502 + 最后一次的真实原因（P3-5 的既有保证）。
+    let (handle, token, failures, _observations) = start_routed_full(
+        vec![
+            dead_upstream(1, REF_A, 0.1),
+            dead_upstream(2, REF_B, 1.0),
+        ],
+        long_cooldown(),
+        UpstreamTimeout::default(),
+        None,
+        vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+    )
+    .await;
+
+    let (status, body) = post(&handle, &token, &chat_body()).await;
+
+    assert_eq!(status, 502, "两个候选都连不上 ⇒ 502");
+    assert!(
+        body.contains("转发到上游失败"),
+        "文案要带真实原因（不是空错误）: {body}"
+    );
+    assert_eq!(failures.lock().unwrap().len(), 2, "两次失败各记一条事件");
 
     handle.shutdown_and_wait().await;
 }
@@ -417,13 +648,13 @@ async fn unknown_model_404s_instead_of_falling_back() {
 async fn failure_event_scrubs_a_key_shaped_model() {
     const KEY_SHAPED: &str = "sk-PROBE-LEAK-0123456789abcdef";
 
-    /// 起一个「只服务 `models` 里那些名字」的两上游网关（A 恒 503、B 恒 200）。
+    /// 起一个「只服务 `models` 里那些名字」的两上游网关
+    /// （A = 连不上的端口、B 恒 200 —— M16-S4 / P2-13 之后「切走」只能由连接层失败触发）。
     async fn start_with_models(
         models: Vec<String>,
-    ) -> (GatewayHandle, String, Failures, FakeUpstream, FakeUpstream) {
-        let a = spawn_upstream_always(1, REF_A, "503 Service Unavailable");
+    ) -> (GatewayHandle, String, Failures, FakeUpstream) {
         let b = spawn_upstream_always(2, REF_B, "200 OK");
-        let mut up_a = a.upstream(0.1);
+        let mut up_a = dead_upstream(1, REF_A, 0.1);
         up_a.models = models.clone();
         let mut up_b = b.upstream(1.0);
         up_b.models = models;
@@ -459,11 +690,11 @@ async fn failure_event_scrubs_a_key_shaped_model() {
         .await
         .expect("网关应能启动");
         let token = handle.token.clone();
-        (handle, token, failures, a, b)
+        (handle, token, failures, b)
     }
 
     // ---- ① 密钥形状的模型名：必须被打码 ----
-    let (handle, token, failures, a, _b) = start_with_models(vec![KEY_SHAPED.to_string()]).await;
+    let (handle, token, failures, _b) = start_with_models(vec![KEY_SHAPED.to_string()]).await;
     let body = format!(r#"{{"model":"{KEY_SHAPED}","messages":[]}}"#);
     assert_eq!(
         post(&handle, &token, &body).await.0,
@@ -482,13 +713,13 @@ async fn failure_event_scrubs_a_key_shaped_model() {
         assert!(!model.contains("0123456789abcdef"), "实际: {model}");
         assert_eq!(model, "sk-***", "打码形态应当是 scrub 的标准掩码");
         // 事件里其余字段不受影响
-        assert_eq!(events[0].site_id, a.site_id);
-        assert_eq!(events[0].status, 503);
+        assert_eq!(events[0].site_id, 1);
+        assert_eq!(events[0].status, 502, "连接层失败没有状态码 ⇒ 按 502 记");
     }
     handle.shutdown_and_wait().await;
 
     // ---- ② 正常模型名：逐字保留，可用信息没被整条吃掉 ----
-    let (handle, token, failures, _a, _b) = start_with_models(vec![MODEL.to_string()]).await;
+    let (handle, token, failures, _b) = start_with_models(vec![MODEL.to_string()]).await;
     assert_eq!(post(&handle, &token, &chat_body()).await.0, 200);
     {
         let events = failures.lock().unwrap();
@@ -581,61 +812,9 @@ async fn start_routed_with(
     timeout: UpstreamTimeout,
     revoked: Option<Vec<String>>,
     keys: Vec<(&str, &str)>,
-) -> (
-    GatewayHandle,
-    String,
-    Failures,
-    Arc<Mutex<Vec<keyrelay_core::gateway::UpstreamObservation>>>,
-) {
-    let route = RouteTable::new(
-        upstreams
-            .iter()
-            .map(|(u, rate)| u.upstream(*rate))
-            .collect(),
-    );
-    let mut map = std::collections::HashMap::new();
-    for (r, plain) in keys {
-        map.insert(r.to_string(), Zeroizing::new(plain.to_string()));
-    }
-    let failures: Failures = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&failures);
-    let observations = Arc::new(Mutex::new(Vec::new()));
-    let obs_sink = Arc::clone(&observations);
-
-    let handle = start(GatewayConfig {
-        port: 0,
-        token: generate_token(),
-        site_id: 0,
-        base_url: String::new(),
-        api_key: zeroize::Zeroizing::new(String::new()),
-        site_display_name: "路由模式".to_string(),
-        route,
-        breaker,
-        keys_by_ref: map,
-        upstream_timeout: timeout,
-        revoked_refs: revoked.map(|refs| {
-            Arc::new(Mutex::new(
-                refs.into_iter().collect::<std::collections::HashSet<_>>(),
-            ))
-        }),
-        on_observation: Some(Arc::new(move |o| {
-            if let Ok(mut log) = obs_sink.lock() {
-                log.push(o);
-            }
-        })),
-        upstream_proxy: None,
-        on_failure: Some(Arc::new(move |f| {
-            if let Ok(mut log) = sink.lock() {
-                log.push(f);
-            }
-        })),
-        on_usage: None,
-    })
-    .await
-    .expect("网关应能启动");
-
-    let token = handle.token.clone();
-    (handle, token, failures, observations)
+) -> (GatewayHandle, String, Failures, Observations) {
+    let ups: Vec<Upstream> = upstreams.iter().map(|(u, rate)| u.upstream(*rate)).collect();
+    start_routed_full(ups, breaker, timeout, revoked, keys).await
 }
 
 fn body_with_model() -> String {
@@ -666,9 +845,11 @@ async fn breaker_opens_even_when_the_failure_is_slower_than_the_cooldown() {
     )
     .await;
 
-    for _ in 0..5 {
+    for (index, expected) in [503u16, 503, 503, 200, 200].into_iter().enumerate() {
         let (status, _) = post(&handle, &token, &body_with_model()).await;
-        assert_eq!(status, 200, "B 应当接住每一次请求");
+        // M16-S4 / P2-13：前 3 次 A 是首选且未熔断 ⇒ 503 **原样返回**（旧断言是 200，
+        // 因为当时 503 会切到 B）；第 4、5 次 A 已 Open ⇒ 被跳过、由 B 接住（200）。
+        assert_eq!(status, expected, "第 {} 次请求的状态码", index + 1);
     }
     handle.shutdown_and_wait().await;
 
@@ -859,10 +1040,13 @@ async fn a_revoked_only_candidate_reports_why_it_was_skipped() {
 }
 
 #[tokio::test]
-async fn a_stalled_upstream_times_out_and_fails_over() {
-    // §3.5-2（DEBUG 报告 §2.2）：上游客户端原来**没有任何超时**——
-    // 上游接了连接却不回应时，请求永远挂着，既不切下一个候选，也不喂熔断。
-    // 实测：卡 8.5s、B 收到 0 次、失败事件 0 条。
+async fn a_stalled_upstream_times_out_and_is_not_replayed() {
+    // §3.5-2（DEBUG 报告 §2.2）：上游客户端原来**没有任何超时**——上游接了连接却不回应时，
+    // 请求永远挂着，既不判死也不喂熔断（实测：卡 8.5s、失败事件 0 条）。
+    //
+    // M16-S4 / P2-13：读超时**不重放**（请求已经送出去了，上游可能已经跑完并计费），
+    // 所以这条用例的期望从「切到 B 拿到 200」改成「按 502 如实返回、B 一次都不被请求」；
+    // 「超时判死」这个被测性质没变——判死的证据是「请求在上界内返回 + 事件 + 熔断 + 观测」。
     let stalled = spawn_stalled_upstream(1, REF_A);
     let b = spawn_upstream_always(2, REF_B, "200 OK");
 
@@ -873,7 +1057,7 @@ async fn a_stalled_upstream_times_out_and_fails_over() {
             cooldown: Duration::from_secs(60),
         },
         // 测试把 read 调小到 200ms 来复现判据。**这不代表生产上切换很快**：
-        // 默认是 300s（BACKLOG B-112 已登记为未标定常量）。
+        // 生产默认是 240s（M9-S5 用真实上游标定过，见 `UpstreamTimeout::default`）。
         UpstreamTimeout {
             connect: Duration::from_millis(200),
             read: Duration::from_millis(200),
@@ -883,26 +1067,37 @@ async fn a_stalled_upstream_times_out_and_fails_over() {
     )
     .await;
 
+    let started = std::time::Instant::now();
     let (status, _) = post(&handle, &token, &body_with_model()).await;
+    let elapsed = started.elapsed();
     handle.shutdown_and_wait().await;
 
-    assert_eq!(status, 200, "卡住的上游必须被超时判死，切到 B");
-    assert_eq!(b.request_count(), 1, "B 应当收到请求（修复前收到 0 次）");
+    assert_eq!(status, 502, "读超时按 502 如实返回（不再重放到 B）");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "卡住的上游必须被 read 超时判死，而不是让请求挂着（实测 {elapsed:?}）"
+    );
+    assert_eq!(
+        b.request_count(),
+        0,
+        "**第二个上游一次都不该被请求**（读超时可能已计费 ⇒ 不重放）"
+    );
     let log = failures.lock().expect("锁").clone();
     assert!(
-        log.iter().any(|f| f.site_id == 1),
-        "超时也是一次失败，必须喂熔断并产生事件（修复前 0 条）: {log:?}"
+        log.iter()
+            .any(|f| f.site_id == 1 && f.reason.contains("不重放")),
+        "超时也是一次失败，必须喂熔断并产生事件，且写明不重放的理由: {log:?}"
     );
 
-    // §5.3：观测出口只把**成功**的延迟记进 last-value，但两条都要上报。
+    // §5.3：观测出口只把**成功**的延迟记进 last-value，但失败的尝试也要上报。
     let seen = obs.lock().expect("锁").clone();
     assert!(
         seen.iter().any(|o| o.site_id == 1 && !o.ok),
         "失败尝试也要上报观测（由服务侧决定不采信）: {seen:?}"
     );
     assert!(
-        seen.iter().any(|o| o.site_id == 2 && o.ok),
-        "成功尝试要上报延迟: {seen:?}"
+        !seen.iter().any(|o| o.site_id == 2),
+        "B 没被请求过，就不该有它的观测（P2-13 之后这里不再有成功观测）: {seen:?}"
     );
 }
 
