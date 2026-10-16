@@ -24,7 +24,19 @@ function fail(message) {
   process.exitCode = 1;
 }
 
+/**
+ * 打印一项通过。
+ *
+ * **一旦已经失败过就不再打印 ✓**（P3-17 / DEBUG-REPORT-v3 §3-17）：此前 5b 节会出现
+ * 「先 ✗ 后 ✓」的日志，读起来像「前面那个 ✗ 只是提示」。日志必须单调：
+ * 通过的项打在前面，从第一处 ✗ 起连续输出失败，不再穿插 ✓。
+ */
+let suppressedOk = 0;
 function ok(message) {
+  if (process.exitCode) {
+    suppressedOk += 1;
+    return;
+  }
   console.log(`✓ ${message}`);
 }
 
@@ -399,14 +411,482 @@ if (frontOnlyAgent.length || frontOnlyChannels.length) {
   );
 } else {
   // P3-17 / DEBUG-REPORT-v3 §3-17：文案只说 ③ 自己检查的（前端两张表 id 集合一致），
-  // 不提「与后端对账」——那是 ①② 的职责；①② fail 时这里打 ✓ 会变成「先 ✗ 后 ✓」
-  // 的误导顺序。
+  // 不提「与后端对账」——那是 ①② 的职责。
   ok(
     `CHANNELS 与 AGENT_CHANNELS 的 channel id 集合一致（${agentTable.ids.length} 条 / ${agentTable.keys.length} 个 agent）`,
   );
 }
 
+// ============================================ 6. 通道 ↔ agent 的**配对**（P2-17 G4/G5）
+//
+// 为什么 id 集合相等还不够：两张表各自与后端比的是**集合**，把
+// `AGENT_CHANNELS["codex"]` 从 `codex-auth-json` 改成 `claude-code-settings`
+// （或把 `CHANNELS` 里某条的 `agent` 写错）时，三个集合一字未变 ⇒ 全绿通过。
+// 而后果是实打实的：`channelOfBinding("codex")` 会返回错的通道，批量改指把
+// **另一个 agent 的落点**当成 codex 的目标；解绑也会按错的 agent 找绑定。
+// 所以必须比**配对**，不是比集合。
+
+/** 后端 `(channel, agent)` 的配对表：`as_str()` 与 `agent_id()` 的臂按变体名对齐。 */
+function parseRustChannelAgentPairs() {
+  const source = stripComments(
+    readFileSync(join(root, "crates/keyrelay-core/src/delivery/mod.rs"), "utf8"),
+  );
+  const armsOf = (fnName) => {
+    const fn = source.match(new RegExp(`pub fn ${fnName}\\(self\\)[\\s\\S]*?\\n    \\}`));
+    if (!fn) throw new Error(`在 delivery/mod.rs 里找不到 ${fnName}() 函数`);
+    const arms = new Map();
+    for (const m of fn[0].matchAll(/DeliveryChannel::(\w+)\s*=>\s*"([a-z0-9-]+)"/g)) {
+      arms.set(m[1], m[2]);
+    }
+    if (arms.size === 0) {
+      throw new Error(`${fnName}() 里没解析到任何臂——解析器坏了，不能当成通过`);
+    }
+    return arms;
+  };
+  const channels = armsOf("as_str");
+  const agents = armsOf("agent_id");
+  if (channels.size !== agents.size) {
+    throw new Error(
+      `as_str() 有 ${channels.size} 条臂、agent_id() 有 ${agents.size} 条臂——两边不同步`,
+    );
+  }
+  const pairs = [];
+  for (const [variant, channel] of channels) {
+    const agent = agents.get(variant);
+    if (!agent) {
+      throw new Error(`as_str() 有 ${variant} 而 agent_id() 没有——两边臂不同步`);
+    }
+    pairs.push({ variant, channel, agent });
+  }
+  return pairs;
+}
+
+/** `AGENT_CHANNELS` 的**映射**（agent → channel）；集合形态由 5b 节另测。 */
+function parseTsAgentChannelMap() {
+  const source = stripComments(
+    readFileSync(join(root, "src/lib/api.ts"), "utf8"),
+  );
+  const block = source.match(/const AGENT_CHANNELS[^=]*=\s*\{([\s\S]*?)\n\};/);
+  if (!block) throw new Error("在 api.ts 里找不到 AGENT_CHANNELS 表");
+  const map = new Map();
+  for (const m of block[1].matchAll(/^\s{2}["']?([a-z0-9-]+)["']?\s*:\s*"([a-z0-9-]+)"/gm)) {
+    map.set(m[1], m[2]);
+  }
+  if (map.size === 0) {
+    throw new Error("AGENT_CHANNELS 里没解析到任何配对——解析器坏了，不能当成通过");
+  }
+  return map;
+}
+
+/** `Agents.tsx` 的 `CHANNELS` 条目 → `(channel, agent)` 配对。 */
+function parseTsChannelPairs() {
+  const source = stripComments(
+    readFileSync(join(root, "src/pages/Agents.tsx"), "utf8"),
+  );
+  const block = source.match(/const CHANNELS\s*=\s*\[([\s\S]*?)\];/);
+  if (!block) throw new Error("在 Agents.tsx 里找不到 CHANNELS 数组");
+  const pairs = [];
+  for (const m of block[1].matchAll(
+    /id:\s*"([a-z0-9-]+)",\s*label:\s*"[^"]*",\s*agent:\s*"([a-z0-9-]+)"/g,
+  )) {
+    pairs.push({ channel: m[1], agent: m[2] });
+  }
+  if (pairs.length === 0) {
+    throw new Error("CHANNELS 里没解析到任何 (id, agent) 配对——解析器坏了，不能当成通过");
+  }
+  return pairs;
+}
+
+const rustPairs = parseRustChannelAgentPairs();
+const tsAgentMap = parseTsAgentChannelMap();
+const tsChannelPairs = parseTsChannelPairs();
+
+{
+  const problems = [];
+  // ① 后端每一对，前端两张表都要有**同一对**
+  for (const { channel, agent } of rustPairs) {
+    const inAgentTable = tsAgentMap.get(agent);
+    if (inAgentTable !== channel) {
+      problems.push(
+        `  AGENT_CHANNELS["${agent}"] = ${inAgentTable ? `"${inAgentTable}"` : "（缺）"}，` +
+          `后端是 "${channel}"`,
+      );
+    }
+    const entry = tsChannelPairs.find((p) => p.channel === channel);
+    if (!entry) {
+      problems.push(`  CHANNELS 里缺通道 "${channel}"`);
+    } else if (entry.agent !== agent) {
+      problems.push(
+        `  CHANNELS 里 "${channel}" 的 agent 是 "${entry.agent}"，后端是 "${agent}"`,
+      );
+    }
+  }
+  // ② 前端多出来的配对也要报（反向）
+  const rustByChannel = new Map(rustPairs.map((p) => [p.channel, p.agent]));
+  for (const [agent, channel] of tsAgentMap) {
+    if (!rustByChannel.has(channel)) {
+      problems.push(`  AGENT_CHANNELS["${agent}"] = "${channel}"：后端没有这个通道`);
+    }
+  }
+  for (const { channel, agent } of tsChannelPairs) {
+    const expected = rustByChannel.get(channel);
+    if (expected === undefined) {
+      problems.push(`  CHANNELS 里有后端不认识的通道 "${channel}"`);
+    }
+  }
+  if (problems.length) {
+    fail(
+      `通道 ↔ agent 的**配对**与后端不一致（P2-17 G4/G5）：\n${problems.join("\n")}\n` +
+        `  后端配对来自 delivery/mod.rs 的 as_str() × agent_id()（${rustPairs.length} 对）；` +
+        `  前端来自 api.ts 的 AGENT_CHANNELS 与 Agents.tsx 的 CHANNELS`,
+    );
+  } else {
+    ok(`通道 ↔ agent 配对两边一致（${rustPairs.length} 对）`);
+  }
+}
+
+// ============================================ 7. generate_handler! 注册（P2-17 G6）
+//
+// `COMMANDS` 是给权限生成物与命令表用的；真正决定「这条命令能不能被 invoke」
+// 的是 `lib.rs` 里的 `tauri::generate_handler![…]`。漏注册时：
+// 命令表、capabilities、autogenerated 权限文件、api.ts 调用点**全都一致**，
+// 前端点下去只得到「command not found」——而没有任何东西会红。
+
+function parseGenerateHandler() {
+  const source = stripComments(
+    readFileSync(join(root, "src-tauri/src/lib.rs"), "utf8"),
+  );
+  const block = source.match(/generate_handler!\[([\s\S]*?)\]/);
+  if (!block) {
+    throw new Error(
+      "在 src-tauri/src/lib.rs 里找不到 generate_handler![…]——解析器坏了，不能当成通过",
+    );
+  }
+  const names = [...block[1].matchAll(/commands::([a-z_][a-z0-9_]*)/g)].map((m) => m[1]);
+  if (names.length === 0) {
+    throw new Error("generate_handler![…] 里没解析到任何 commands::X——不能当成通过");
+  }
+  return names;
+}
+
+{
+  const registered = parseGenerateHandler();
+  const notRegistered = rust.filter((c) => !registered.includes(c));
+  const notInTable = registered.filter((c) => !rust.includes(c));
+  if (notRegistered.length || notInTable.length) {
+    fail(
+      `generate_handler! 与 COMMANDS 不一致（P2-17 G6）：\n` +
+        (notRegistered.length
+          ? `  在 COMMANDS 里但没注册（前端点下去只会得到 command not found）: ${notRegistered.join(", ")}\n`
+          : "") +
+        (notInTable.length
+          ? `  注册了但不在 COMMANDS 里（权限文件与 capabilities 都覆盖不到它）: ${notInTable.join(", ")}\n`
+          : "") +
+        `  注册表在 src-tauri/src/lib.rs 的 generate_handler![…]`,
+    );
+  } else {
+    ok(`generate_handler! 注册与 COMMANDS 一致（${registered.length} 条）`);
+  }
+}
+
+// ============================================ 8. 命令参数名（P2-17 G7）
+//
+// Tauri 2 按**参数名**把 JS 传的对象反序列化进命令的形参。把 `siteId` 写成
+// `site_id`（或拼错一个字母）时，命令表 / capabilities / 权限文件 / 调用点仍然
+// 四边一致 ⇒ 全绿，而运行时是「missing required key siteId」。
+// 所以要对账**每条命令的形参名（camelCase）**与**调用点传的键**。
+
+/** Rust 命令的形参名（去掉 Tauri 注入的 `state` / `app` 等），camelCase。 */
+function parseRustCommandParams() {
+  const source = stripComments(
+    readFileSync(join(root, "src-tauri/src/commands.rs"), "utf8"),
+  );
+  const INJECTED = /^(State|AppHandle|Window|WebviewWindow|Webview)\b/;
+  const map = new Map();
+  // 泛型参数也要吃掉：`pub async fn detect_site<R: tauri::Runtime>(…)`
+  for (const m of source.matchAll(
+    /pub (?:async )?fn (\w+)(?:<[^>]*>)?\s*\(([\s\S]*?)\)\s*(?:->|\{)/g,
+  )) {
+    const [, name, raw] = m;
+    const params = [];
+    let depth = 0;
+    let current = "";
+    for (const ch of raw) {
+      if (ch === "<" || ch === "(" || ch === "[") depth += 1;
+      else if (ch === ">" || ch === ")" || ch === "]") depth -= 1;
+      if (ch === "," && depth === 0) {
+        params.push(current);
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+    if (current.trim()) params.push(current);
+    const names = [];
+    for (const p of params) {
+      const idx = p.indexOf(":");
+      if (idx === -1) continue;
+      const pname = p.slice(0, idx).trim();
+      const ptype = p.slice(idx + 1).trim();
+      if (!pname || INJECTED.test(ptype)) continue;
+      names.push(pname.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase()));
+    }
+    map.set(name, names);
+  }
+  if (map.size === 0) {
+    throw new Error("在 commands.rs 里没解析到任何命令签名——解析器坏了，不能当成通过");
+  }
+  return map;
+}
+
+/** `api.ts` 里每个 `invokeCommand("cmd", { … })` 的键集合。 */
+function parseTsInvokeArgs() {
+  const source = stripComments(
+    readFileSync(join(root, "src/lib/api.ts"), "utf8"),
+  );
+  const map = new Map();
+  for (const m of source.matchAll(
+    /invokeCommand(?:<[^>]*>)?\(\s*"([a-z_]+)"\s*(?:,\s*\{([^}]*)\})?\s*\)/g,
+  )) {
+    const [, cmd, obj] = m;
+    const keys = (obj ?? "")
+      .split(",")
+      .map((part) => part.split(":")[0].trim())
+      .filter(Boolean);
+    map.set(cmd, keys);
+  }
+  if (map.size === 0) {
+    throw new Error("在 api.ts 里没解析到任何 invokeCommand 调用——解析器坏了，不能当成通过");
+  }
+  return map;
+}
+
+{
+  const rustParams = parseRustCommandParams();
+  const tsArgs = parseTsInvokeArgs();
+  const problems = [];
+  for (const [cmd, keys] of tsArgs) {
+    const expected = rustParams.get(cmd);
+    if (expected === undefined) {
+      // 命令名本身的对账在第 1 节；这里只报「解析不到签名」这种异常
+      problems.push(`  ${cmd}: 在 commands.rs 里找不到同名命令签名（解析器或命名不同步）`);
+      continue;
+    }
+    const missing = expected.filter((p) => !keys.includes(p));
+    const extra = keys.filter((k) => !expected.includes(k));
+    if (missing.length) {
+      problems.push(`  ${cmd}: 调用点少了参数 ${missing.join(", ")}（后端形参是 ${expected.join(", ") || "无"}）`);
+    }
+    if (extra.length) {
+      problems.push(
+        `  ${cmd}: 调用点多传了 ${extra.join(", ")}（后端形参是 ${expected.join(", ") || "无"}；` +
+          `形参名必须 camelCase，写成 snake_case 时 Tauri 反序列化会失败）`,
+      );
+    }
+  }
+  if (problems.length) {
+    fail(`命令参数名与后端形参不一致（P2-17 G7）：\n${problems.join("\n")}`);
+  } else {
+    ok(`命令参数名与后端形参一致（${tsArgs.size} 条调用点）`);
+  }
+}
+
+// ============================================ 9. DTO 字段名与取值对账（B-122）
+//
+// 这条守护治的是「Rust 改了字段名/取值，TS 类型没跟着改」：两者都不会让任何
+// 现有检查变红（`tsc` 只看 TS 侧，cargo 只看 Rust 侧），而界面上表现为
+// 「字段永远是 undefined」「开关永远不生效」。
+//
+// 判据：
+// - 每个 Rust camelCase DTO 要么在 TS 侧有同名类型（`XxxDto` → `Xxx`），要么在
+//   `DTO_NO_TS` 里**逐条声明**（声明本身就是一次可见的改动）；
+// - 配对的字段名集合必须**严格相等**（多一个少一个都红）；
+// - 取值集合（`restart_hint_str` / `autostart_state` 的 match 臂）与 TS 联合字面量相等。
+
+/** `XxxDto` 在前端叫别的名字的例外（显式声明，加一行即一次可见改动）。 */
+const DTO_ALIASES = {
+  KeychainPurgeDto: "KeychainPurgeReport",
+  KeyMetaDto: "KeyRow",
+  StoredKeyRowDto: "StoredKeyRow",
+  DeliveryHistoryDto: "DeliveryRecord",
+  GatewayUsageDto: "GatewayUsageRow",
+  UsageSnapshotDto: "UsageSnapshotRow",
+  DetectProxyDto: "DetectedSystemProxy",
+  KeySyncDto: "KeySyncSummary",
+  SiteSummaryDto: "SiteRow",
+  ConsentDto: "ConsentRow",
+  EventDto: "EventRow",
+};
+
+/**
+ * 后端有、前端**故意**没有对应类型的 DTO（逐条给理由）。
+ * 加进来的代价是这一条不再受守护，所以理由必须成立。
+ */
+const DTO_NO_TS = {
+  DiagnosticsArgs: "前端只传 limit 一个字面量，没有对应类型（见 api.ts 的 exportDiagnostics）",
+  DiagnosticsResultDto: "诊断包是文件导出，界面只显示路径与字节数",
+  DeliveryArgs: "有 TS 类型（DeliveryArgs），但字段名与 Rust 不同：前端传 { keyId, channel, model, mode } 包成 args",
+  UpdateSettingsArgs: "前端直接传 Settings 类型（Rust 侧包一层 { settings }）",
+  GatewayStartArgs: "前端传 { siteId, keyId }，Rust 侧包成 GatewayStartArgs",
+  ExportArgs: "前端传 { password }，Rust 侧包成 ExportArgs",
+  PruneArgs: "前端传 { keep }，Rust 侧包成 PruneArgs",
+  ProbeArgs: "探针页是诊断工具，字段随探针变化，不逐字对账",
+  GatewayUsageDto: "已由 DTO_ALIASES 映射到 GatewayUsageRow",
+  UsageSnapshotDto: "已由 DTO_ALIASES 映射到 UsageSnapshotRow",
+  DetectProxyDto: "已由 DTO_ALIASES 映射到 DetectedSystemProxy",
+  KeySyncDto: "已由 DTO_ALIASES 映射到 KeySyncSummary",
+  KeychainPurgeDto: "已由 DTO_ALIASES 映射到 KeychainPurgeReport",
+  KeyMetaDto: "已由 DTO_ALIASES 映射到 KeyRow",
+  StoredKeyRowDto: "已由 DTO_ALIASES 映射到 StoredKeyRow",
+  DeliveryHistoryDto: "已由 DTO_ALIASES 映射到 DeliveryRecord",
+};
+
+function parseRustCamelDtos() {
+  const source = stripComments(
+    readFileSync(join(root, "src-tauri/src/commands.rs"), "utf8"),
+  );
+  const map = new Map();
+  const re =
+    /#\[serde\(rename_all = "camelCase"\)\]\s*\n(?:#\[[^\]]*\]\s*\n)*pub struct (\w+)\s*\{([\s\S]*?)\n\}/g;
+  for (const m of source.matchAll(re)) {
+    const [, name, body] = m;
+    const fields = [...body.matchAll(/^\s*(?:pub )?([a-z_][a-z0-9_]*)\s*:/gm)].map((x) =>
+      x[1].replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase()),
+    );
+    map.set(name, new Set(fields));
+  }
+  if (map.size === 0) {
+    throw new Error("在 commands.rs 里没解析到任何 camelCase DTO——解析器坏了，不能当成通过");
+  }
+  return map;
+}
+
+/** TS 类型 → 顶层键集合。手写扫描器是为了正确处理**嵌套对象**（正则会把内层键也算进来）。 */
+function parseTsTypes() {
+  const source = stripComments(
+    readFileSync(join(root, "src/lib/api.ts"), "utf8"),
+  );
+  const map = new Map();
+  const re = /export type (\w+) = \{/g;
+  let m;
+  while ((m = re.exec(source)) !== null) {
+    const name = m[1];
+    let depth = 1;
+    let i = re.lastIndex;
+    let body = "";
+    while (i < source.length && depth > 0) {
+      const ch = source[i];
+      if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+      body += ch;
+      i += 1;
+    }
+    // 顶层键：深度 0 的 `key?:` —— 用同一套括号计数扫一遍。
+    // 先把 `;` 换成换行，否则单行类型（`{ alias: string; realModel: string }`）
+    // 只会数到第一个键（实测漏过 AliasEntry.realModel）。
+    const keys = [];
+    let d = 0;
+    for (const line of body.replace(/;/g, ";\n").split("\n")) {
+      const trimmed = line.trim();
+      if (d === 0) {
+        const km = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\??\s*:/);
+        if (km) keys.push(km[1]);
+      }
+      for (const ch of line) {
+        if (ch === "{" || ch === "(" || ch === "[") d += 1;
+        else if (ch === "}" || ch === ")" || ch === "]") d -= 1;
+      }
+    }
+    map.set(name, new Set(keys));
+  }
+  if (map.size === 0) {
+    throw new Error("在 api.ts 里没解析到任何 export type——解析器坏了，不能当成通过");
+  }
+  return map;
+}
+
+/** Rust 侧 `match` 臂的字面量（用于取值集合对账）。 */
+function rustMatchLiterals(fnName, file) {
+  const source = stripComments(readFileSync(join(root, file), "utf8"));
+  const fn = source.match(new RegExp(`fn ${fnName}\\([\\s\\S]*?\\n\\}`));
+  if (!fn) throw new Error(`找不到 ${fnName}()`);
+  const literals = [...fn[0].matchAll(/=>\s*"([A-Za-z0-9_-]+)"/g)].map((m) => m[1]);
+  if (literals.length === 0) {
+    throw new Error(`${fnName}() 里没解析到字面量——不能当成通过`);
+  }
+  return literals;
+}
+
+/** TS 联合字面量（`export type X = "a" | "b";`）。 */
+function tsUnionLiterals(typeName) {
+  const source = stripComments(readFileSync(join(root, "src/lib/api.ts"), "utf8"));
+  const m = source.match(new RegExp(`export type ${typeName} =([^;]+);`));
+  if (!m) throw new Error(`在 api.ts 里找不到 ${typeName} 联合类型`);
+  const literals = [...m[1].matchAll(/"([A-Za-z0-9_-]+)"/g)].map((x) => x[1]);
+  if (literals.length === 0) throw new Error(`${typeName} 里没解析到字面量——不能当成通过`);
+  return literals;
+}
+
+{
+  const rustDtos = parseRustCamelDtos();
+  const tsTypes = parseTsTypes();
+  const problems = [];
+  const undeclared = [];
+  for (const [dto, rustFields] of rustDtos) {
+    const base = dto.replace(/Dto$/, "");
+    const tsName =
+      DTO_ALIASES[dto] ?? (tsTypes.has(base) ? base : undefined);
+    if (!tsName) {
+      if (!DTO_NO_TS[dto]) undeclared.push(dto);
+      continue;
+    }
+    const tsFields = tsTypes.get(tsName);
+    if (!tsFields) {
+      problems.push(`  ${dto} ↔ ${tsName}：api.ts 里没有这个类型`);
+      continue;
+    }
+    const missingInTs = [...rustFields].filter((f) => !tsFields.has(f));
+    const extraInTs = [...tsFields].filter((f) => !rustFields.has(f));
+    if (missingInTs.length) {
+      problems.push(`  ${dto} ↔ ${tsName}：TS 缺字段 ${missingInTs.join(", ")}`);
+    }
+    if (extraInTs.length) {
+      problems.push(`  ${dto} ↔ ${tsName}：TS 多字段 ${extraInTs.join(", ")}`);
+    }
+  }
+  if (undeclared.length) {
+    problems.push(
+      `  以下 DTO 既没有同名 TS 类型、也没有在 DTO_NO_TS 里声明：${undeclared.join(", ")}\n` +
+        `  （新增 DTO 时请在脚本里加一行——声明本身是可见的改动）`,
+    );
+  }
+  // 取值集合
+  const valuePairs = [
+    ["restart_hint_str", "src-tauri/src/commands.rs", "RestartHint"],
+  ];
+  for (const [fnName, file, tsName] of valuePairs) {
+    const rustValues = rustMatchLiterals(fnName, file).sort();
+    const tsValues = tsUnionLiterals(tsName).sort();
+    if (rustValues.join("|") !== tsValues.join("|")) {
+      problems.push(
+        `  ${fnName}() 的取值 [${rustValues.join(", ")}] ≠ ${tsName} 的取值 [${tsValues.join(", ")}]`,
+      );
+    }
+  }
+  if (problems.length) {
+    fail(`DTO 字段名 / 取值在 Rust ↔ TS 之间不一致（B-122）：\n${problems.join("\n")}`);
+  } else {
+    ok(`DTO 字段名与取值两边一致（${rustDtos.size} 个 camelCase DTO）`);
+  }
+}
+
 if (process.exitCode) {
+  if (suppressedOk > 0) {
+    console.error(`\n（已跳过 ${suppressedOk} 项 ✓ 输出：前面有失败，本次整体未通过。）`);
+  }
   console.error("\n命令一致性检查未通过。");
 } else {
   console.log("\n命令一致性检查通过。");
