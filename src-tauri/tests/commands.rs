@@ -692,19 +692,16 @@ fn export_diagnostics_writes_a_package_and_registers_it_for_the_audit() {
 
     let after = invoke_on(&webview, "audit_redaction", json!({})).expect("审计应成功");
     assert_eq!(after["clean"], true, "诊断包必须自身干净: {after}");
-    // M16-S6a / P3-18：断言从**精确 +1** 放宽为 **≥ +1**。
+    // M16-S6a：断言恢复**紧口径 +1**。
     //
-    // 原因：收敛之后导出物落在**被扫描的目录**里（`<home>/.keyrelay/exports`，审计由
-    // `backup_dir.parent()/exports` 推出同一个目录），于是同一个文件会被计两次——
-    // 一次来自目录遍历、一次来自「已知导出物」登记表（`merge_export_registry` 的并集去重
-    // 只比较**路径完全相等**，而遍历给出的是目录本身，挡不住这件事）。
-    // 实测：本用例里 `before = 0`、`after = 2`（一个文件）。
-    //
-    // 这条双计是**审计侧的既有问题**（`audit.rs` 不在本包写域），已登记在 spec §9；
-    // 这里保留「≥ +1」以保证**原意图**（文件必须进扫描集合，登记失败仍然会红）。
-    assert!(
-        after["filesScanned"].as_u64().unwrap_or(0) > before["filesScanned"].as_u64().unwrap_or(0),
-        "登记的意义是进扫描集合：文件数必须增加（登记失败的话这条会红）: before={before} after={after}"
+    // 收敛之后导出物落在被扫描目录内，曾出现「同一文件计两次」（`filesScanned` 0 → 2）——
+    // 根因在 `audit::merge_export_registry` 按**字符串**去重（目录 vs 文件永不相等）。
+    // 根因已修（改按规范化真实路径 + 目录前缀覆盖判定），所以这里没有理由留着宽松断言：
+    // 一个文件必须**恰好**让覆盖面 +1，多了就是注水（审计报告里唯一的覆盖面证据）。
+    assert_eq!(
+        after["filesScanned"].as_u64().unwrap_or(0),
+        before["filesScanned"].as_u64().unwrap_or(0) + 1,
+        "登记的意义是进扫描集合：文件数必须恰好 +1（多计=注水，少计=登记失败）: before={before} after={after}"
     );
 }
 
