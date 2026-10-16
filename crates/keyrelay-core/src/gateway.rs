@@ -1076,7 +1076,14 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                     } else {
                         format!("上游返回 HTTP {status}（可能已计费，按 P2-13 不重放）")
                     };
-                    report_failure(&state, upstream.site_id, status, &event_model, &reason, Instant::now());
+                    report_failure(
+                        &state,
+                        upstream.site_id,
+                        status,
+                        &event_model,
+                        &reason,
+                        Instant::now(),
+                    );
                 } else {
                     record_success(&state, upstream.site_id, Instant::now());
                 }
@@ -1107,7 +1114,14 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                         crate::redact::scrub(&message)
                     )
                 };
-                report_failure(&state, upstream.site_id, 502, &event_model, &reason, Instant::now());
+                report_failure(
+                    &state,
+                    upstream.site_id,
+                    502,
+                    &event_model,
+                    &reason,
+                    Instant::now(),
+                );
                 last_error = Some(message);
                 if !replayable || is_last {
                     break;
@@ -2402,10 +2416,7 @@ mod tests {
             .send()
             .await
             .expect_err("假上游不回包 ⇒ 必须读超时");
-        assert!(
-            err.is_timeout(),
-            "前提：这一格必须是超时错误: {err:?}"
-        );
+        assert!(err.is_timeout(), "前提：这一格必须是超时错误: {err:?}");
         assert!(
             !err.is_connect(),
             "前提：读超时**不是** connect 错误（否则这条用例证不到东西）: {err:?}"

@@ -701,9 +701,8 @@ async fn start_legacy_with_guard(
     );
     config.site_id = 7;
     config.legacy_key_ref = legacy_key_ref.map(str::to_string);
-    config.revoked_refs = revoked.map(|refs| {
-        Arc::new(Mutex::new(refs.iter().map(|r| (*r).to_string()).collect()))
-    });
+    config.revoked_refs =
+        revoked.map(|refs| Arc::new(Mutex::new(refs.iter().map(|r| (*r).to_string()).collect())));
     config.on_failure = Some(Arc::new(move |f| {
         if let Ok(mut log) = sink.lock() {
             log.push(f);

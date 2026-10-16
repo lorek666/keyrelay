@@ -47,10 +47,7 @@ fn key_refs_is_deduped_and_ordered() {
         vec!["kr/key/shared/secret", "kr/key/3/secret"],
         "去重且保持首次出现顺序"
     );
-    assert!(
-        RouteTable::default().key_refs().is_empty(),
-        "空表 ⇒ 空列表"
-    );
+    assert!(RouteTable::default().key_refs().is_empty(), "空表 ⇒ 空列表");
 }
 
 // ============================================================ 排序
