@@ -17,13 +17,173 @@ fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '+' | '/')
 }
 
+fn is_base64url_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
+}
+
+/// 裸 JWT（P3-19）：`eyJ` 开头的三段 base64url，用 `.` 分隔。
+///
+/// 为什么需要单独一条：JWT 不是 `sk-` / `nap-` 前缀，也不是 ≥32 位纯 hex
+/// （base64url 含 `-` `_`，而且被 `.` 打断），现有三条规则**一条都不认** ——
+/// 站点 400 正文里回显的 token 会原样进错误文案与事件表（DEBUG-REPORT-v3 §3-19）。
+///
+/// 判据（宁可多掩）：`eyJ` + 第一段 ≥8 + `.` + ≥4 + `.` + ≥4，全部是 base64url 字符。
+/// `eyJ` 是 `{"` 的 base64 前缀，正常文本里几乎不会出现；真出现也只是多掩一段**显示**。
+fn mask_jwt_tokens(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        match jwt_end_at(&chars, i) {
+            Some(end) => {
+                out.push_str(MASK);
+                i = end;
+            }
+            None => {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `i` 处是一个裸 JWT 的起点吗？是则返回它的结束下标（不含）。
+fn jwt_end_at(chars: &[char], i: usize) -> Option<usize> {
+    if i + 3 > chars.len() || chars[i] != 'e' || chars[i + 1] != 'y' || chars[i + 2] != 'J' {
+        return None;
+    }
+    let mut j = i + 3;
+    for segment in 0..3 {
+        let start = j;
+        while j < chars.len() && is_base64url_char(chars[j]) {
+            j += 1;
+        }
+        let min = if segment == 0 { 8 } else { 4 };
+        if j - start < min {
+            return None;
+        }
+        if segment < 2 {
+            if j < chars.len() && chars[j] == '.' {
+                j += 1;
+            } else {
+                return None;
+            }
+        }
+    }
+    Some(j)
+}
+
+/// 值的分隔符：到这些字符为止（`password=hunter2&user=x` ⇒ 值只取 `hunter2`）。
+fn is_value_delimiter(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '&' | ';' | ',' | '"' | '\'' | '<' | '>' | '`' | '\\' | ')' | ']' | '}' | '/'
+        )
+}
+
+/// 文本形态的「敏感键 = 值」（P3-19：`password=hunter2`、`token: abc`、`pwd=…`）。
+///
+/// 与 [`scrub_payload`] 的键名规则**同源**（[`SENSITIVE_KEYS`]），但作用于**自由文本**：
+/// 站点 400 正文里回显的表单/查询串就是这种形态，而 JSON 键名规则认不出它。
+///
+/// 键名要求词边界（与 P2-26 同口径：前一个输出字符是字母数字 ⇒ 是词中间，不认），
+/// 键名与分隔符之间允许空格，分隔符是 `=` 或 `:`。
+///
+/// **不做**的事（明确边界）：没有键名的**裸口令**（`hunter2` 单独出现）不可判定 ——
+/// 任何「看起来像口令」的启发式都会把正常文本吃成 `***`。见 spec §9 风险 8。
+fn mask_sensitive_key_values(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        // 词边界：前一个输出字符是**词内字符**（字母数字 / `_` / `-`）⇒ 说明在词中间。
+        // 这里比前缀规则的判据多算 `_` 与 `-`：`OPENAI_API_KEY=…` 里的 `API_KEY`
+        // 不是独立键名（`OPENAI_API_KEY` 归一化后是 `openaiapikey`，不在命中集合里），
+        // 只按字母数字判会把 `API_KEY` 单独认出来、把 `sk-…` 掩成 `***`（既有用例抓过）。
+        let at_word_start = !out
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+        if at_word_start {
+            if let Some((key_end, value_start, value_end)) = sensitive_key_value_at(&chars, i) {
+                out.extend(chars[i..key_end].iter());
+                out.extend(chars[key_end..value_start].iter());
+                out.push_str(MASK);
+                i = value_end;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// `i` 处是 `敏感键<空格?><=|:><空格?>值` 吗？返回 `(键结束, 值开始, 值结束)`。
+fn sensitive_key_value_at(chars: &[char], i: usize) -> Option<(usize, usize, usize)> {
+    let mut j = i;
+    while j < chars.len() && (chars[j].is_ascii_alphanumeric() || matches!(chars[j], '_' | '-')) {
+        j += 1;
+    }
+    if j == i {
+        return None;
+    }
+    let key: String = chars[i..j].iter().collect();
+    if !is_sensitive_key(&key) {
+        return None;
+    }
+    let mut k = j;
+    while k < chars.len() && chars[k] == ' ' {
+        k += 1;
+    }
+    if k >= chars.len() || !matches!(chars[k], '=' | ':') {
+        return None;
+    }
+    k += 1;
+    while k < chars.len() && chars[k] == ' ' {
+        k += 1;
+    }
+    if k >= chars.len() {
+        return None;
+    }
+    let value_start = k;
+    let mut v = k;
+    while v < chars.len() && !is_value_delimiter(chars[v]) {
+        v += 1;
+    }
+    if v == value_start {
+        return None;
+    }
+    // `Authorization: Bearer <token>` —— 值是**方案名**，不是凭证本身。
+    // 这里必须让路：掩掉 `Bearer` 反而会把后面的 token 留在原地（前缀规则 `Bearer `
+    // 本来就是干这个的，有既有用例钉着 `Authorization: Bearer ***`）。
+    let value: String = chars[value_start..v].iter().collect();
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "bearer" | "basic" | "digest"
+    ) {
+        return None;
+    }
+    Some((j, value_start, v))
+}
+
 /// 把输入串里的凭证替换为掩码，其余内容原样保留。
 ///
 /// 该函数是幂等的：对已脱敏的文本再次调用结果不变。
+///
+/// 顺序（每一层都在**前一层产物**上跑，四层各自幂等）：
+/// 1. URL userinfo（文本层）；
+/// 2. 裸 JWT（P3-19：站点 400 正文里回显的 `eyJ….….…`）；
+/// 3. `敏感键=值` / `敏感键: 值` 的**文本**形态（P3-19：表单式回显的明文口令）；
+/// 4. 前缀型密钥 / ≥32 位 hex。
 pub fn scrub(input: &str) -> String {
     // URL 规则在**原文**上先跑一遍：前缀规则的 token 字符含 `/`，会把外层路径连同内层 URL 的
     // scheme 一起吞掉，吞完之后内层的 `://` 就不在了（第二次复核 R-1）。
     let input = &mask_url_userinfo(input);
+    // P3-19：裸 JWT 与 `password=…` 这类**文本形态**的明文口令（报告 §3-19：scrub 不认它们）
+    let input = &mask_sensitive_key_values(&mask_jwt_tokens(input));
     let mut out = String::with_capacity(input.len());
     let bytes: Vec<char> = input.chars().collect();
     let mut i = 0usize;
@@ -321,6 +481,161 @@ pub fn mask_webhook_url(url: &str) -> String {
     format!("{scheme}://{authority}")
 }
 
+/// authority 段的结束位置：**终止符**与**内嵌的下一个 `://`** 取更早者，都没有则到串尾。
+///
+/// 为什么要单独认内嵌 `://`（P2-24 形态①）：`https://a.example.comhttps://u:p@h/x` 里
+/// 第一个 URL 没有路径，只按 `/` 找 authority 会停在第二个 URL 的 `//` 上，把它的 `://`
+/// 一起吃掉 —— 之后串里再没有 `://`，第二个 URL 永远不被认出，userinfo 原样留下
+/// （缩放模糊矩阵实测：这类形态两层都漏 18/72）。收口在 `://` 之前，循环下一轮就能从它重新开始。
+///
+/// `text_mode`：文本层的 authority 还要止于空白与 `"` `<` `>` `` ` `` `\`（JSON 里的
+/// `"https://u:p@h"` 不能把结尾引号吃进 authority）；结构化层知道值在哪儿结束，
+/// 不需要这些终止符（引号、空格在口令里是合法的，见 P2-25）。
+fn authority_end(tail: &str, text_mode: bool) -> usize {
+    let by_scheme = tail.find("://").unwrap_or(tail.len());
+    let by_stop = if text_mode {
+        tail.find(|c: char| {
+            matches!(c, '/' | '?' | '#' | '"' | '<' | '>' | '`' | '\\') || c.is_whitespace()
+        })
+        .unwrap_or(tail.len())
+    } else {
+        tail.find(['/', '?', '#']).unwrap_or(tail.len())
+    };
+    by_scheme.min(by_stop)
+}
+
+/// 文本层与结构化层**共用**的 URL userinfo 掩蔽循环：唯一差别是 `text_mode` 的终止符集合。
+///
+/// 两层同源（M16-S2 收敛）：以前两层各写一份循环，形态① 的收口只改一处就会让两层分叉 ——
+/// 而「两层结果必须一致」正是 P2-24 的判据。
+///
+/// **不再对 scheme 做任何校验**（P2-24 形态② 与形态① 的交汇点）：以前结构化层要求
+/// 「scheme 以字母开头」，`1https://u:p@h`（粘连）与 `…comhttps://u:p@h`（前一个 URL 不带
+/// 路径时 scheme 被吃进上一个 authority）这两种形态都会被短路掉，于是**结构化层比文本层
+/// 掩得少**。掩码只在 authority 里确实有 `@` 时才发生，因此「去掉校验」不会误伤普通文本
+/// （代价见下）。
+///
+/// 每个 `://` **之前**那一段也会过一遍 [`mask_scheme_less`]：站点地址允许无 scheme 录入，
+/// `carol:pw@host/path?next=https://…` 里第一段自己就带 userinfo（P3-22 第二种形态）。
+///
+/// 循环每一步都保证前进（`end == 0` 时显式吃掉一个 `://`），否则 `a://://u:p@h` 这类
+/// 输入会让 `rest` 不变而死循环。
+fn mask_urls(input: &str, text_mode: bool) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(pos) = rest.find("://") {
+        // `://` 之前那一段也过一遍：它可能本身就是**无 scheme 的地址**
+        // （`carol:pw@host/path?next=https://…`），不能原样推出去（P3-22 第二种形态）。
+        out.push_str(&mask_scheme_less(&rest[..pos], text_mode, true));
+        let authority_start = pos + "://".len();
+        out.push_str(&rest[pos..authority_start]);
+        let tail = &rest[authority_start..];
+        match userinfo_end(tail, text_mode) {
+            Some(at) => {
+                // 掩掉 userinfo（R1 延长时连中间那段一起掩），主机段原样推出，
+                // 从 authority 结束处继续扫（后面可能还有下一个 URL）。
+                // `at` 可能落在 authority 之外（R1），所以取 `max` 保证切片合法且前进。
+                let end = authority_end(tail, text_mode).max(at + 1);
+                out.push_str(MASK);
+                out.push_str(&tail[at..end]);
+                rest = &tail[end..];
+            }
+            None => {
+                let end = authority_end(tail, text_mode);
+                if end == 0 {
+                    // authority 立刻又被一个 `://` 截住（`a://://u:p@h`）：先把这一个 `://`
+                    // 吐出去，从它之后继续。少了这一步 `rest` 不变，循环不前进。
+                    rest = tail;
+                    continue;
+                }
+                out.push_str(&tail[..end]);
+                rest = &tail[end..];
+            }
+        }
+    }
+    // 整串已经不含 `://` 了：文本层在这里只跑 R1（「不猜 userinfo」的契约）。
+    out.push_str(&mask_scheme_less(rest, text_mode, !text_mode));
+    out
+}
+
+/// 一段**无 scheme 的地址**里的 userinfo ⇒ 换成 [`MASK`]。
+///
+/// 站点地址允许无 scheme 录入（`carol:pw@host`、`host:8080/path`），transport 调用方也会把
+/// `user:pass@host` 这类串直接丢进来；`mask_urls` 的循环只认 `://`，因此这些段要单独过。
+///
+/// 两个开关是**正交**的：
+/// - `text_mode`：终止符集合（文本层还止于空白/引号）；
+/// - `primary`：是否允许**主规则**（候选段里有 `@` 就掩）。文本层的契约是「**整串**没有
+///   `://` 就不猜 userinfo」——`user:pass@host`、`someone@example.com`、`mailto:…` 一律不动
+///   （有既有用例钉着），所以整串那一趟只跑 R1；但**一个已经含 `://` 的串**里，
+///   `://` 之前那段（`carol:pw@host/path?next=https://…`）是地址的一部分，主规则照跑。
+fn mask_scheme_less(span: &str, text_mode: bool, primary: bool) -> String {
+    let end = authority_end(span, text_mode);
+    let candidate = &span[..end];
+    // **字符串化的 JSON** 不当地址处理：`{"url":"…@…"}` 这种文本会被
+    // `mask_url_userinfo_in_json` 在整行上再跑一遍（诊断包就有一处），按地址口径掩会把
+    // 结构吃掉（`***@relay.example.com"}`）——它的结构由调用方逐字段处理，不该在这里动。
+    // 只挡**以 `{` / `[` 开头**的候选：`carol:p"w@host`（口令里有引号）必须照掩。
+    let looks_like_json = candidate.trim_start().starts_with(['{', '[']);
+    let found = if looks_like_json {
+        None
+    } else {
+        match candidate.rfind('@') {
+            Some(at) if primary => Some(at),
+            _ => extended_userinfo_end(span, end, text_mode),
+        }
+    };
+    match found {
+        Some(at) => format!("{MASK}{}", &span[at..]),
+        None => span.to_string(),
+    }
+}
+
+/// 在 `tail`（`://` 之后，或一段无 scheme 的候选）里找 userinfo 的 `@` 位置。
+///
+/// - 候选段（[`authority_end`] 划出的那一截）里有 `@` ⇒ 取**最后一个** `@`（`a@b:pw@host`
+///   不能漏，这是既有口径）；
+/// - 候选段里没有 `@`，但同一个 token 后面有（R1 / P3-22 第一种形态：口令里有**未编码**的
+///   `/` `?` `#`）⇒ 延长到那个 `@`（见 [`extended_userinfo_end`]）。
+fn userinfo_end(tail: &str, text_mode: bool) -> Option<usize> {
+    let end = authority_end(tail, text_mode);
+    if let Some(at) = tail[..end].rfind('@') {
+        return Some(at);
+    }
+    extended_userinfo_end(tail, end, text_mode)
+}
+
+/// R1（P3-22 第一种形态）：口令里有**未编码**的 `/` `?` `#`，于是 authority 候选段里没有
+/// `@`、`@` 落在候选段之外（`carol:p/ss@host`）。按 URL 语法 authority 真的在 `/` 处结束，
+/// 但那是畸形输入，口令会原样显示 —— 宁可多掩。
+///
+/// 判据**收窄**到四条，避免把正常 URL/普通文本误掩（都有既有用例钉着）：
+/// 1. 候选段里**没有** `@`（有 `@` 是主规则的活，`user:pass@host` 因此不受影响）；
+/// 2. 候选段里出现过 `:`（userinfo 分隔符）——`https://host/a@b` 的候选段是 `host`，没有 `:`；
+/// 3. 最后一个 `:` 之后**不是纯数字**（排除端口）——`https://host:8080/a@b` 不动；
+/// 4. 延长段的搜索窗口：文本层止于空白/引号（一句普通的话 `错误: 路径 /tmp/a@b` 不会被吃）；
+///    结构化层看到的是**一整段值**，可以一直往后找 —— 否则
+///    `站点地址 carol:p/ss@host 不可用` 这种「散文 + 无 scheme 地址」会漏。
+fn extended_userinfo_end(tail: &str, end: usize, text_mode: bool) -> Option<usize> {
+    let candidate = &tail[..end];
+    if candidate.contains('@') {
+        return None;
+    }
+    let lookahead_end = if text_mode {
+        tail.find(|c: char| c.is_whitespace() || matches!(c, '"' | '<' | '>' | '`' | '\\'))
+            .unwrap_or(tail.len())
+    } else {
+        tail.len()
+    };
+    let at = tail[..lookahead_end].rfind('@')?;
+    let colon = candidate.rfind(':')?;
+    let after_colon = &candidate[colon + 1..];
+    if after_colon.is_empty() || after_colon.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(at)
+}
+
 /// [`strip_url_userinfo`] 的**掩蔽**版：authority 里的 userinfo 换成 [`MASK`]。
 ///
 /// 与 [`strip_url_userinfo`] 的分工（M8-S2 §7.2 O-1 裁决）：
@@ -343,34 +658,14 @@ pub fn mask_authority_userinfo(raw: &str) -> String {
     // 调用方会传 `user:pass@host` 这类无 scheme 的串，循环 find("://") 失败会原样返回，
     // 丢失这层掩码——所以单独处理）。
     if !raw.contains("://") {
-        let authority_end = raw.find(['/', '?', '#']).unwrap_or(raw.len());
-        let authority = &raw[..authority_end];
-        if let Some(at) = authority.rfind('@') {
-            return format!("{MASK}{}", &raw[at..]);
-        }
-        return raw.to_string();
+        // 无 scheme 的地址（`carol:pw@host`、`host:8080/path`）走同一条实现：
+        // P3-22 的第一种形态（口令里带未编码的 `/` `?` `#`）就落在这一支里。
+        return mask_scheme_less(raw, false, true);
     }
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw;
-    while let Some(pos) = rest.find("://") {
-        let authority_start = pos + "://".len();
-        out.push_str(&rest[..authority_start]);
-        let tail = &rest[authority_start..];
-        // authority 止于 `/` `?` `#`（与整串 URL 口径一致）；**不**截 `"` `\` 空白——
-        // 这是本函数存在的理由（`scrub` 在 `"` 处截断会漏带引号密码 URL，见 P2-25）。
-        let authority_end = tail.find(['/', '?', '#']).unwrap_or(tail.len());
-        let authority = &tail[..authority_end];
-        match authority.rfind('@') {
-            Some(at) => {
-                out.push_str(MASK);
-                out.push_str(&authority[at..]);
-            }
-            None => out.push_str(authority),
-        }
-        rest = &tail[authority_end..];
-    }
-    out.push_str(rest);
-    out
+    // 有 `://` 时与结构化层走**同一条实现**：authority 止于 `/` `?` `#` 与内嵌的下一个
+    // `://`，**不**截 `"` `\` 空白 —— 那正是本函数存在的理由（`scrub` 在 `"` 处截断会漏
+    // 带引号密码的 URL，见 P2-25）。
+    mask_urls(raw, false)
 }
 
 /// [`scrub`] 的首尾两步：**文本里**每个 `scheme://userinfo@host` 的 userinfo 换成 [`MASK`]。
@@ -385,78 +680,33 @@ pub fn mask_authority_userinfo(raw: &str) -> String {
 /// 解析后原样保留，截断就会把 `p'w@host` 切成没有 `@` 的片段而整段放行（独立复审 P2-1）。
 /// 代价是相邻文本里的 `@` 偶尔被多掩一段——只影响显示，不泄漏。
 ///
-/// 结构化值里**整个值就是 URL** 的字符串另走 [`mask_whole_url_userinfo`]：那里知道值在
-/// 哪儿结束，不需要靠上面这些字符去猜。
+/// 结构化值里**值内任意位置**的 URL 另走 [`mask_any_url_userinfo`]：那里知道值在哪儿结束，
+/// 不需要靠上面这些终止符去猜。两层同源（[`mask_urls`]），只有终止符集合不同。
 ///
 /// 为什么放在 `scrub` 里而不是各调用点（B-63 只剥了导出的 `sites[].base_url`）：
 /// 事件 payload 原样记着 `base_url`，按调用点剥就一定会漏一处；`scrub` 是
 /// 事件 / 通知 / 错误的共同咽喉点。没有 `://` 的形态（`user@host`、邮箱）**不猜**。
 fn mask_url_userinfo(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(pos) = rest.find("://") {
-        let authority_start = pos + "://".len();
-        out.push_str(&rest[..authority_start]);
-        let tail = &rest[authority_start..];
-        let authority_end = tail
-            .find(|c: char| {
-                matches!(c, '/' | '?' | '#' | '"' | '<' | '>' | '`' | '\\') || c.is_whitespace()
-            })
-            .unwrap_or(tail.len());
-        let authority = &tail[..authority_end];
-        match authority.rfind('@') {
-            Some(at) => {
-                out.push_str(MASK);
-                out.push_str(&authority[at..]);
-            }
-            None => out.push_str(authority),
-        }
-        rest = &tail[authority_end..];
-    }
-    out.push_str(rest);
-    out
+    mask_urls(input, true)
 }
 
-/// **整个值就是一个 URL**（`scheme://` 开头）时，按整串 URL 的口径把 userinfo 换成 [`MASK`]：
-/// authority 只止于 `/` `?` `#`（与 [`strip_url_userinfo`] 同口径），密码里的引号、空白、
-/// 尖括号、反斜杠都算在 authority 之内。不是这种形态 ⇒ 原样返回。
-///
-/// 只用于**已知边界**的值（JSON 字符串值）；任意文本仍走 [`mask_url_userinfo`]。
-fn mask_whole_url_userinfo(value: &str) -> String {
-    let Some(scheme_end) = value.find("://") else {
-        return value.to_string();
-    };
-    let scheme = &value[..scheme_end];
-    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-    if !is_scheme {
-        return value.to_string();
-    }
-    let authority_start = scheme_end + "://".len();
-    let rest = &value[authority_start..];
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    match rest[..authority_end].rfind('@') {
-        Some(at) => format!("{}{MASK}{}", &value[..authority_start], &rest[at..]),
-        None => value.to_string(),
-    }
-}
-
-/// **值内任意位置**的 `scheme://user:pass@host` ⇒ 把 userinfo 换成 [`MASK`]。
+/// **结构化层**的 URL userinfo 掩蔽：值内**任意位置**的 `scheme://user:pass@host`
+/// ⇒ 把 userinfo 换成 [`MASK`]。
 ///
 /// 与 [`mask_url_userinfo`]（文本层）的关键差别：authority 的终止符**只有**
-/// `/` `?` `#` 与**值结尾**——密码里的引号、反斜杠、空白、尖括号、反引号**都算在
-/// authority 之内**。这正是文本层做不到的那一角：
+/// `/` `?` `#`、**内嵌的下一个 `://`** 与**值结尾**——密码里的引号、反斜杠、空白、
+/// 尖括号、反引号**都算在 authority 之内**。这正是文本层做不到的那一角：
 ///
 /// ```text
 /// 值：见 https://alice:p"w@hook.example.com/x 已失效
-/// 文本层：authority 在 `\` 处被截断 ⇒ 找不到 `@` ⇒ 原样放行（两层全漏）
+/// 文本层：authority 在 `"` 处被截断 ⇒ 找不到 `@` ⇒ 原样放行（两层全漏）
 /// 本函数：authority 一路读到 `/` ⇒ 掩成 https://***@hook.example.com/x
 /// ```
 ///
-/// scheme 判定是**往前回溯**的：`://` 前面那几个字符才是 scheme（`见 https` 这种
-/// 「前缀文本 + scheme」必须认出来，否则句内 URL 永远掩不到——第一版就栽在这里）。
+/// **不再要求 scheme 以字母开头**（P2-24 形态②）：`1https://u:p@h` 这种「scheme 前紧贴
+/// 数字 / `.` / `-` / `+`」的形态以前会被 scheme 校验短路。校验本来只为「别把普通文本
+/// 当 URL」，而下面的掩码只在 authority 里**确实有 `@`** 时才发生 —— 保留校验只会漏掩，
+/// 去掉它才与文本层同口径（两层同源，见 [`mask_urls`]）。
 ///
 /// **代价（明确记录）**：不校验 `://` 后面是不是真的一个 authority。一句正常的话里
 /// 出现 `foo://bar@baz` 也会被掩成 `foo://***@baz`。方向取「宁可多掩」——
@@ -464,56 +714,7 @@ fn mask_whole_url_userinfo(value: &str) -> String {
 ///
 /// 幂等：掩出来的 `***@host` 再跑一遍，`@` 仍在 authority 内 ⇒ 结果不变。
 fn mask_any_url_userinfo(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(pos) = rest.find("://") {
-        // scheme 从 `://` 往前回溯：只认「紧贴 `://` 的那一段 scheme 字符」。
-        // 前面还有别的字符（`见 https`）时，那些字符属于**正文**，原样留在 `out` 里。
-        let mut scheme_start = pos;
-        while scheme_start > 0 {
-            let c = rest[..scheme_start]
-                .chars()
-                .next_back()
-                .expect("scheme_start > 0 ⇒ 前面有字符");
-            if c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.') {
-                scheme_start -= c.len_utf8();
-            } else {
-                break;
-            }
-        }
-        let scheme = &rest[scheme_start..pos];
-        let is_scheme = !scheme.is_empty()
-            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-
-        if !is_scheme {
-            // 不是 scheme：把 `://` 原样吐出，从它之后继续找（`a1://b://c@d` 要能掩到第二个）
-            let skip = pos + "://".len();
-            out.push_str(&rest[..skip]);
-            rest = &rest[skip..];
-            continue;
-        }
-
-        let authority_start = pos + "://".len();
-        // scheme 之前的正文原样保留
-        out.push_str(&rest[..scheme_start]);
-        out.push_str(&rest[scheme_start..authority_start]);
-        let tail = &rest[authority_start..];
-        let authority_end = tail.find(['/', '?', '#']).unwrap_or(tail.len());
-        let authority = &tail[..authority_end];
-        match authority.rfind('@') {
-            Some(at) => {
-                out.push_str(MASK);
-                out.push_str(&authority[at..]);
-            }
-            None => out.push_str(authority),
-        }
-        rest = &tail[authority_end..];
-    }
-    out.push_str(rest);
-    out
+    mask_urls(value, false)
 }
 
 /// 结构化载荷里每个字符串值过 [`mask_any_url_userinfo`]（递归进容器）。
@@ -637,7 +838,7 @@ fn is_sensitive_key(key: &str) -> bool {
 }
 
 /// 递归脱敏一个 JSON 值：对象按键名判命中，数组逐元素递归，字符串值先过
-/// [`mask_whole_url_userinfo`]（整个值是 URL 时）再过 [`scrub`]。
+/// [`mask_any_url_userinfo`]（值内任意位置的 URL）再过 [`scrub`]。
 fn scrub_json_value(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -650,9 +851,7 @@ fn scrub_json_value(value: &mut serde_json::Value) {
                     }
                     // 命中键的标量值整体换成 MASK（含 null / 数字 / 布尔：不保留类型）
                     _ if sensitive => *child = serde_json::Value::String(MASK.to_string()),
-                    serde_json::Value::String(text) => {
-                        *text = scrub(&mask_whole_url_userinfo(text))
-                    }
+                    serde_json::Value::String(text) => *text = scrub(&mask_any_url_userinfo(text)),
                     _ => {}
                 }
             }
@@ -662,7 +861,7 @@ fn scrub_json_value(value: &mut serde_json::Value) {
                 scrub_json_value(item);
             }
         }
-        serde_json::Value::String(text) => *text = scrub(&mask_whole_url_userinfo(text)),
+        serde_json::Value::String(text) => *text = scrub(&mask_any_url_userinfo(text)),
         _ => {}
     }
 }
@@ -689,26 +888,60 @@ pub fn scrub_payload(payload: Option<&str>) -> Option<String> {
     }
 }
 
-/// **事件文本的统一出口**：`scrub` + 钥匙串引用脱敏。
+/// **事件文本的统一出口**：三个出口（事件写入 / 诊断包 / 配置导出 / 老行清洗）都调它。
 ///
-/// 存在的理由（M5-S1 复审 P2-1）：配置导出（`export::sanitize_bundle`）与
-/// 诊断导出（`service::export_diagnostics`）原来是**各自手抄**同一串组合的。
-/// 手抄出来的「同源」只是注释承诺，实测已经分叉 —— 而且分叉方式很隐蔽：
-/// 配置侧在**装配处**先做了一次**文本级** `scrub`，一个 34 位数字会被
-/// 「≥32 位 hex」规则打成 `***`，于是 `{"remaining":123…}` 变成 `{"remaining":***}`
-/// ——**已经不是合法 JSON**；结构化的 `scrub_payload` 再拿到它只能走「解析失败」
-/// 的兜底分支，而诊断侧拿到的是原始串、能正常解析。同一份事件，两条出口输出不同。
+/// 存在的理由（M5-S1 复审 P2-1）：配置导出与诊断导出原来是**各自手抄**同一串组合的，
+/// 「同源」只是注释承诺。M16-S2 又把**写入路径**并了进来 —— 在此之前写入路径自己做
+/// `mask_authority_userinfo(scrub(..))`：比出口多了「带引号口令」那一层、却少了引用形态，
+/// 于是同一份输入在事件表与导出物里长得不一样（P2-25）。
 ///
-/// 所以：**先结构化、再文本**，而且只有这一个实现。
+/// 组合顺序固定（三层各管一段，互不吞并）：
+/// 1. `scrub`：前缀型密钥 / ≥32 位 hex / 文本层 URL userinfo；
+/// 2. `scrub_reference_tokens`：`kr/<scope>/<id>/<field>` → `kr/***`；
+/// 3. `mask_authority_userinfo`：authority 只止于 `/` `?` `#`，**不**止于引号/空白 ——
+///    补上 `scrub` 在 `"` 处截断而漏掉的带引号口令 URL（P2-25 的原始症状）。
+///
+/// 幂等：三层各自幂等，且第 3 层的产物（`***@host`）再喂给第 1 层仍是 `***@host`。
 pub fn scrub_event_message(message: &str) -> String {
-    scrub_reference_tokens(&scrub(message))
+    mask_authority_userinfo(&scrub_reference_tokens(&scrub(message)))
 }
 
-/// **事件 payload 的统一出口**。见 [`scrub_event_message`] 的说明。
+/// **事件载荷（Value 层）的统一出口**：结构化 URL 层 + 按键名脱敏。
 ///
+/// 写入路径手里已经有 `Value`，直接调它（不必序列化后再解析）；出口侧拿到的是文本，
+/// 走 [`scrub_event_payload`]。两条路径的输出**逐字节一致**（有测试钉住）。
+pub fn scrub_event_value(value: &mut serde_json::Value) {
+    // 顺序要紧：先按「值内任意位置」的 URL 口径掩 userinfo（引号/空格透明），
+    // 再按键名与文本规则走一遍。反过来会让带引号口令的值在 `scrub` 的 `"` 处截断而漏掉。
+    mask_url_userinfo_in_json(value);
+    scrub_json_value(value);
+}
+
+/// 已脱敏的 `Value` → 事件 payload 文本：序列化 + 引用形态。
+///
+/// 单独抽出来是为了让**写入路径**（手里是 `Value`）与 [`scrub_event_payload`]
+/// （手里是文本）共用同一段收尾，不再各写一遍。
+pub fn serialize_scrubbed_event_payload(value: &serde_json::Value) -> Option<String> {
+    serde_json::to_string(value)
+        .ok()
+        .map(|text| scrub_reference_tokens(&text))
+}
+
+/// **事件 payload（文本层）的统一出口**。见 [`scrub_event_message`] 的说明。
+///
+/// 非 JSON 输入退化为 [`scrub_event_message`]（与 message 同口径）；`None` → `None`。
 /// 幂等：第一遍产出的是 serde 重新序列化的**合法 JSON**，第二遍能正常解析。
 pub fn scrub_event_payload(payload: Option<&str>) -> Option<String> {
-    scrub_payload(payload).map(|text| scrub_reference_tokens(&text))
+    let raw = payload?;
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Some(scrub_event_message(raw));
+    };
+    scrub_event_value(&mut value);
+    match serialize_scrubbed_event_payload(&value) {
+        Some(text) => Some(text),
+        // 理论上不可达（`Value` 一定能序列化）。真出问题也绝不能返回原串。
+        None => Some(scrub_event_message(raw)),
+    }
 }
 
 #[cfg(test)]
@@ -1119,7 +1352,6 @@ mod tests {
         for clean in [
             "正常一句话，没有 URL",
             "https://relay.example.com/v1/chat?x=1#frag",
-            "a1://b://c@d 两个冒号",
             "",
             // `@` 在 query / fragment 里，不是 userinfo（与 strip_url_userinfo 同口径）
             "https://relay.example.com/v1?email=a@b.com",
@@ -1131,6 +1363,35 @@ mod tests {
         assert_eq!(
             json_masked("详见 https://bob@relay.example.com/y 无密码"),
             "详见 https://***@relay.example.com/y 无密码"
+        );
+    }
+
+    /// **口径变更登记（M16-S2）**：`a1://b://c@d 两个冒号` 以前在结构化层**不掩**
+    /// （见 git 历史里的同名用例），现在掩成 `a1://b://***@d 两个冒号`。
+    ///
+    /// 为什么改：
+    /// 1. 这个形态与 P2-24 形态① 在第二个 `://` 处**结构完全相同** ——
+    ///    `https://a.example.comhttps://carol:pw@h/x` 修好之后，`a1://b://c@d` 必然
+    ///    落到同一条分支上。要让它不掩，就得给结构化层加一道「`://` 前必须有 scheme」
+    ///    的门槛，而那道门槛正是让形态① 在结构化层继续漏掩的原因（实测：加门槛后
+    ///    `json_masked("…comhttps://carol:pw@h/x")` 原样放行）。两者不可兼得。
+    /// 2. 旧断言钉的是**两层不一致**：文本层（`scrub`）从来就掩这一段，只有结构化层
+    ///    因为 scheme 校验而放过它。本道的判据是两层同口径。
+    /// 3. 产品取向是「宁可多掩」（掩错只影响显示，漏掩不可撤销）—— 与
+    ///    `mask_authority_userinfo` 的既有注释一致。
+    ///
+    /// 代价：句子里出现「`://` 后面紧跟 `user@host`」这种**非 URL** 片段时会被多掩一段。
+    /// 反例（普通文本、干净 URL、`@` 在 query 里）仍逐条钉在上面那条测试里。
+    #[test]
+    fn json_layer_now_masks_a_scheme_less_fragment_after_a_cut_authority() {
+        assert_eq!(
+            json_masked("a1://b://c@d 两个冒号"),
+            "a1://b://***@d 两个冒号"
+        );
+        // 与文本层同口径（这才是本道的判据）
+        assert_eq!(
+            scrub("a1://b://c@d 两个冒号"),
+            json_masked("a1://b://c@d 两个冒号")
         );
     }
 
@@ -1499,10 +1760,95 @@ mod tests {
 
     #[test]
     fn sensitive_keys_includes_webhook() {
-        // P1-10：webhook 键名按敏感键脱敏（纵深防御，防别的出口把 webhook URL 原样进 JSON）
+        // P1-10：webhook 键名按敏感键脱敏（纵深防御，防别的出口把 webhook 原样进 JSON）
         assert!(is_sensitive_key("webhook"));
         assert!(is_sensitive_key("Webhook"));
         assert!(is_sensitive_key("web-hook"));
         assert!(is_sensitive_key("WEBHOOK"));
+    }
+
+    // ---------------------------------------------- M16-S2：P2-24 / P2-25 / 三出口
+
+    #[test]
+    fn authority_scan_stops_at_an_embedded_scheme() {
+        // P2-24 形态①：第一个 URL 不带路径时，authority 以前会吃掉第二个 URL 的 `://`，
+        // 于是第二个 URL 的 userinfo 原样留下。两层都要掩。
+        let input = "https://a.example.comhttps://carol:s3cretpw@relay.example.com/x";
+        assert_eq!(
+            scrub(input),
+            "https://a.example.comhttps://***@relay.example.com/x"
+        );
+        assert_eq!(
+            json_masked(input),
+            "https://a.example.comhttps://***@relay.example.com/x"
+        );
+    }
+
+    #[test]
+    fn structured_layer_accepts_a_glued_scheme() {
+        // P2-24 形态②：`starts_with(字母)` 那半删掉之后，粘连形态也要掩（以前结构化层短路）
+        for glue in ["1", ".", "-", "+", "v1.2-"] {
+            let input = format!("{glue}https://carol:s3cretpw@relay.example.com/x");
+            let masked = json_masked(&input);
+            assert!(
+                masked.contains("***@relay.example.com"),
+                "glue={glue:?} 的结构化层必须掩: {masked}"
+            );
+        }
+    }
+
+    #[test]
+    fn event_message_exit_is_the_three_exit_composition() {
+        // 三出口共用这一个实现：`scrub` → 引用形态 → authority 层
+        let input = "见 https://carol:p\"ass@relay.example.com/x 与 kr/key/1/secret";
+        let out = scrub_event_message(input);
+        assert!(out.contains("***@relay.example.com"), "{out}");
+        assert!(!out.contains("carol:p"), "{out}");
+        assert!(out.contains("kr/***"), "{out}");
+        assert!(!out.contains("kr/key/1/secret"), "{out}");
+        // 幂等
+        assert_eq!(scrub_event_message(&out), out);
+    }
+
+    #[test]
+    fn event_value_and_event_payload_agree_byte_for_byte() {
+        // 写入路径（手里是 Value）与出口（手里是文本）必须逐字节一致
+        let raw = r#"{"url":"见 https://carol:p\"ass@relay.example.com/x","password":"hunter2","key_id":7}"#;
+        let from_text = scrub_event_payload(Some(raw)).expect("文本路径");
+        let mut value: serde_json::Value = serde_json::from_str(raw).expect("合法 JSON");
+        scrub_event_value(&mut value);
+        let from_value = serialize_scrubbed_event_payload(&value).expect("Value 路径");
+        assert_eq!(from_text, from_value);
+        assert!(from_text.contains("***@relay.example.com"), "{from_text}");
+        assert!(from_text.contains(r#""password":"***""#), "{from_text}");
+        assert!(from_text.contains(r#""key_id":7"#), "{from_text}");
+    }
+
+    #[test]
+    fn event_payload_falls_back_to_the_message_exit_for_non_json() {
+        let raw = "不是 JSON，但有 https://carol:p\"ass@relay.example.com/x";
+        assert_eq!(
+            scrub_event_payload(Some(raw)),
+            Some(scrub_event_message(raw)),
+            "非 JSON 必须与 message 同口径"
+        );
+        assert_eq!(scrub_event_payload(None), None);
+    }
+
+    #[test]
+    fn event_exits_leave_reverse_cases_untouched() {
+        for clean in [
+            "Model gpt-4: 不支持",
+            "站点 task-scheduler 与 desk-assistant 都正常",
+            "https://relay.example.com/v1?email=a@b.com",
+        ] {
+            assert_eq!(scrub_event_message(clean), clean, "「{clean}」不该被改动");
+        }
+        let payload = r#"{"key_id":7,"remaining":1.5,"bytes":12,"path":"/tmp/x.json"}"#;
+        assert_eq!(
+            scrub_event_payload(Some(payload)).as_deref(),
+            Some(payload),
+            "「不得命中」的键不能被误伤"
+        );
     }
 }

@@ -2,14 +2,18 @@
 //!
 //! 设计约束（BACKLOG B-11 / B-31 / B-36）：
 //! - 本模块是 `events` 表的**唯一**写入方；其它模块不得直接 `INSERT INTO events`。
-//! - `message` 与 `payload` 在**构造时**就过 [`crate::redact::scrub`]，构造后无法再改。
-//! - `payload` 先序列化成 JSON 文本再整体脱敏，因此**嵌套深层**的密钥也会被替换。
+//! - `message` 与 `payload` 在**构造时**就过 `redact` 的统一出口
+//!   （[`crate::redact::scrub_event_message`] / [`crate::redact::scrub_event_value`]），构造后无法再改。
+//! - 出口与**诊断包 / 配置导出**是同一套实现（M16-S2 三出口一致性）：同一份输入在
+//!   事件表、诊断包、配置导出里的脱敏结果逐字节一致。
+//! - `payload` 先按键名与结构化 URL 规则脱敏、再序列化并补引用形态，因此**嵌套深层**的
+//!   密钥与 `kr/...` 引用都会被替换。
 //! - 密钥本体永远不会进入事件：投递路径只记录 `journal_id` / `target_path` 这类元数据。
 
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::redact::scrub;
+use crate::redact::scrub_event_message;
 
 /// `source` 的约定取值（同时用于 UI 过滤）。
 ///
@@ -60,9 +64,9 @@ pub struct Event {
     pub ts: i64,
     pub level: Level,
     pub source: String,
-    /// 已过 `scrub`
+    /// 已过 [`crate::redact::scrub_event_message`]
     pub message: String,
-    /// 已过 `scrub` 的 JSON 文本；`None` 表示无载荷
+    /// 已过 [`crate::redact::scrub_event_value`] 的 JSON 文本；`None` 表示无载荷
     pub payload: Option<String>,
 }
 
@@ -87,36 +91,36 @@ fn now_secs() -> i64 {
 }
 
 /// 唯一入口（无载荷）。
+///
+/// 脱敏走 [`crate::redact::scrub_event_message`] —— 与诊断包 / 配置导出**同一个实现**
+/// （M16-S2 三出口一致性）。在此之前这里自己手搓 `mask_authority_userinfo(scrub(..))`：
+/// 比出口多了「带引号口令」那一层、却少了引用形态，于是同一份输入在事件表与导出物里
+/// 长得不一样（P2-25）。
 pub fn event(level: Level, source: &str, message: impl AsRef<str>) -> Event {
-    let scrubbed = scrub(message.as_ref());
     Event {
         ts: now_secs(),
         level,
         source: normalize_source(source),
-        // P2-25 / DEBUG-REPORT-v3 §2-25：message 再过一遍 mask_authority_userinfo——
-        // scrub 的 mask_url_userinfo 为 JSON 文本安全把 `"` 当 authority 终止符，
-        // 自由文本里「带引号密码的 URL」会在 `"` 处截断、找不到 `@` ⇒ 原样落库。
-        // mask_authority_userinfo 不把引号当终止符，能掩住。宁可多掩（email 本地部分
-        // 也会被掩成 `***@host`）——漏一个密码的代价不可撤销。
-        message: crate::redact::mask_authority_userinfo(&scrubbed),
+        message: scrub_event_message(message.as_ref()),
         payload: None,
     }
 }
 
-/// 唯一入口（带载荷）。载荷整体序列化后过 `scrub`，嵌套深层的密钥同样会被替换。
+/// 唯一入口（带载荷）。
 ///
-/// 序列化**之前**先把「整个值就是 URL」的字符串按 URL 口径掩掉 userinfo：序列化后的
-/// 文本里，密码中的 `"` 已变成 `\"`，文本规则找不到 authority 的真实边界（独立复审 P2-1）。
+/// 载荷走 [`crate::redact::scrub_event_value`] + [`crate::redact::serialize_scrubbed_event_payload`]：
+/// 前者是「结构化 URL 层 + 按键名脱敏」，后者是「序列化 + 引用形态」。
+/// 出口侧（诊断包 / 配置导出）拿到文本后走 `scrub_event_payload`，两条路径输出逐字节一致。
 pub fn event_with_payload(
     level: Level,
     source: &str,
     message: impl AsRef<str>,
     mut payload: Value,
 ) -> Event {
-    crate::redact::mask_url_userinfo_in_json(&mut payload);
+    crate::redact::scrub_event_value(&mut payload);
     let mut e = event(level, source, message);
     // `serde_json::to_string` 对 `Value` 不会失败；失败时退化为不带载荷而不是 panic。
-    e.payload = serde_json::to_string(&payload).ok().map(|s| scrub(&s));
+    e.payload = crate::redact::serialize_scrubbed_event_payload(&payload);
     e
 }
 
@@ -211,5 +215,29 @@ mod tests {
     fn keeps_normal_text_intact() {
         let e = event(Level::Info, "site", "站点已识别: newapi 测试站点");
         assert_eq!(e.message, "站点已识别: newapi 测试站点");
+    }
+
+    #[test]
+    fn write_path_is_the_same_implementation_as_the_export_exits() {
+        // M16-S2 三出口一致性：写入路径与出口必须**同一个函数**，不是「长得像」
+        let message = "登录失败：见 https://carol:p\"ass@relay.example.com/x";
+        let e = event(Level::Info, "site", message);
+        assert_eq!(
+            e.message,
+            crate::redact::scrub_event_message(message),
+            "message 的写入路径必须与诊断包/配置导出同一实现"
+        );
+
+        let payload = json!({ "password": "hunter2", "ref": "kr/key/1/secret", "key_id": 7 });
+        let with_payload = event_with_payload(Level::Info, "site", "带载荷", payload.clone());
+        assert_eq!(
+            with_payload.payload,
+            crate::redact::scrub_event_payload(Some(&payload.to_string())),
+            "payload 的写入路径必须与出口逐字节一致"
+        );
+        let text = with_payload.payload.expect("有载荷");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("kr/key/1/secret"), "{text}");
+        assert!(text.contains(r#""key_id":7"#), "{text}");
     }
 }
