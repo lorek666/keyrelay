@@ -229,21 +229,21 @@ mod production_wiring {
 
     #[tokio::test]
     async fn gateway_config_uses_empty_route_under_single_upstream() {
-        // P1-4：当前按 M8-S4（single_upstream，空 route）。多站路由（M8-S1）是 B-99 未来。
+        // W8：gateway_multi_site 默认关时走 single_upstream（M8-S4 §6.5 换站语义），route 为空。
         let (_dir, service, site_a, key_a, _ref_a, _ref_b) = service_with_two_sites().await;
 
         let config = service
             .gateway_config(site_a, key_a, 0)
             .expect("组装网关配置");
 
-        // P1-4：当前按 M8-S4（single_upstream，空 route）。多站路由（M8-S1）是 B-99 未来。
+        // 开关关时 route / keys_by_ref 为空（single_upstream 用 config.base_url / api_key）。
         assert!(
             config.route.is_empty(),
-            "P1-4：single_upstream 下 route 为空（legacy 单上游用 config.base_url/api_key）"
+            "gateway_multi_site 关时 route 为空（single_upstream 用 config.base_url/api_key）"
         );
         assert!(
             config.keys_by_ref.is_empty(),
-            "P1-4：空 route 下 keys_by_ref 也为空"
+            "空 route 下 keys_by_ref 也为空"
         );
     }
 
