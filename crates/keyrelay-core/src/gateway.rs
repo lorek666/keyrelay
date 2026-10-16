@@ -368,6 +368,16 @@ pub struct GatewayConfig {
     /// `proxy::resolve_proxy`）。网关每次 `start()` 都重读最新 settings，因此代理变更
     /// **重启网关即生效**（站点适配器 transport 仍需重启 app）。
     pub upstream_proxy: Option<String>,
+    /// **legacy（空路由表）路径那把密钥的引用**（M16-S4 / P3-4）。
+    ///
+    /// 为什么需要它：legacy 路径只有 `api_key` 明文，没有引用 ⇒ 无法查 [`Self::revoked_refs`]
+    /// （M8-S1 §12.4 的守卫只覆盖多上游路径）。填了之后 legacy 路径会拒绝使用已回收的密钥，
+    /// 并把「为什么 / 怎么办」写进失败事件——这正是 P2-7（一键轮换后运行中的网关仍用旧密钥）
+    /// 在网关侧的显式语义。
+    ///
+    /// `None` = 不校验（[`GatewayConfig::single_upstream`] 的默认 ⇒ 既有调用方行为逐字不变）。
+    /// **由 `service.rs::gateway_config` 填充**（M16-S4 spec §12 W-3，道⑤/Lead 合并期打）。
+    pub legacy_key_ref: Option<String>,
 }
 
 /// 上游请求的两段超时。
@@ -515,6 +525,10 @@ impl GatewayConfig {
             on_observation: None,
             on_usage: None,
             upstream_proxy: None,
+            // P3-4：构造器不知道引用（签名逐字不变，M7-S0 §3.1 冻结）。
+            // `None` ⇒ legacy 路径的已回收守卫不生效，行为与改动前逐字相同；
+            // 服务层要启用它，就构造完再赋值（spec §12 W-3）。
+            legacy_key_ref: None,
         }
     }
 }
@@ -527,6 +541,8 @@ pub struct GatewayHandle {
     /// 服务任务。`shutdown_and_wait` 等它结束；`shutdown()` 只是把它丢掉
     /// （drop 一个 `JoinHandle` 是 **detach**，不会 abort 任务——既有调用点的行为因此不变）。
     finished: tokio::task::JoinHandle<()>,
+    /// 与 `AppState` 共享的「正在停止」标志（M16-S4 / P3-3）。
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for GatewayHandle {
@@ -544,7 +560,12 @@ impl GatewayHandle {
     }
 
     /// 停止网关并释放端口。幂等。
+    ///
+    /// **先置「正在停止」标志、再发信号**（M16-S4 / P3-3）：在途请求的下一次上游尝试
+    /// 会看到标志并拒绝发起，不再把任何密钥发出去。
     pub fn shutdown(self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = self.shutdown.send(());
     }
 
@@ -562,8 +583,13 @@ impl GatewayHandle {
     /// 信号之后就已经能重新绑定了。
     pub async fn shutdown_and_wait(self) {
         let GatewayHandle {
-            shutdown, finished, ..
+            shutdown,
+            finished,
+            stopping,
+            ..
         } = self;
+        // P3-3：置位在信号之前——顺序反了的话，在途请求可能在这两步之间发起新尝试。
+        stopping.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = shutdown.send(());
         let _ = finished.await;
     }
@@ -627,6 +653,35 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
     if config.token.trim().is_empty() {
         return Err(Error::Store("网关的本地令牌为空".into()));
     }
+    // P3-9 / M8-S1 §10 第 3 条（W3 的集合不变式）：`route` 里的每个 `key_ref`
+    // 都必须能落到一把**可用**的明文上——在 `keys_by_ref` 里，或者被显式标记为已回收
+    // （已回收是合法状态：那正是「不再使用它」的表达）。
+    //
+    // 为什么放在 `start()` 而不是构造方：构造点不止一处（`single_upstream`、服务层的
+    // `build_gateway_route`、测试、将来的调用方），把守卫放在**所有构造点的下游**才不会漏。
+    // 不满足时的症状本来是「每个上游都跳过 → 502」，根因（忘填密钥映射）看不见。
+    //
+    // 文案**不打印 `key_ref` 原文**：引用本身是线索（M7-S0 §4.3 的红线），只说数量。
+    {
+        let revoked_set: std::collections::HashSet<String> = config
+            .revoked_refs
+            .as_ref()
+            .and_then(|refs| refs.lock().ok().map(|set| set.clone()))
+            .unwrap_or_default();
+        let missing: Vec<&str> = config
+            .route
+            .key_refs()
+            .into_iter()
+            .filter(|r| !config.keys_by_ref.contains_key(*r) && !revoked_set.contains(*r))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::Store(format!(
+                "网关启动被拒绝：路由表里有 {} 个上游的密钥既不在 keys_by_ref 里、\
+                 也没有被标记为已回收——构造方忘了填密钥映射（在第一个请求上会表现成 502）",
+                missing.len()
+            )));
+        }
+    }
 
     let mut builder = reqwest::Client::builder()
         // §3.5-2：上游**必须**有超时。没有它，一个接了连接却不回应的上游会让请求永远挂着，
@@ -651,10 +706,14 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
         .build()
         .map_err(|e| Error::Transport(format!("构造网关的上游客户端失败: {e}")))?;
 
+    // P3-3：停止闸门。`AppState` 与 `GatewayHandle` 共享同一个标志——
+    // 句柄置位（停止信号发出之前），请求路径读取。
+    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = AppState {
         breaker: Arc::new(Mutex::new(Breaker::new(config.breaker.clone()))),
         config: config.clone(),
         upstream,
+        stopping: Arc::clone(&stopping),
     };
     let app = Router::new()
         .route("/health", any(health))
@@ -691,6 +750,7 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
         site_display_name: config.site_display_name,
         shutdown: tx,
         finished,
+        stopping,
     })
 }
 
@@ -703,6 +763,13 @@ struct AppState {
     /// 不能放进 `config`：axum 的 `State` 每个请求 clone 一份，
     /// 裸值会变成「每个请求各有一份熔断历史」——熔断永远不生效。
     breaker: Arc<Mutex<Breaker>>,
+    /// **正在停止**（M16-S4 / P3-3）：`shutdown()` / `shutdown_and_wait()` 在发出停止
+    /// 信号**之前**置位；在途请求的下一次上游尝试看到它就不再发（不再带出任何密钥）。
+    ///
+    /// 为什么需要：axum 的优雅停机只保证「不再 accept 新连接 + 等连接收尾」——
+    /// 已经进来的请求会继续跑完，包括**继续重放**到下一个上游。
+    /// 用户按下停止（往往紧接着就要轮换/回收密钥）时，不该还有请求把密钥发出去。
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 取出请求里的本地令牌。支持 `Authorization: Bearer` 与 `X-KeyRelay-Token`。
@@ -756,6 +823,26 @@ fn unauthorized(message: &str) -> Response {
         axum::Json(serde_json::json!({ "error": message })),
     )
         .into_response()
+}
+
+/// 网关**正在停止**时对「新的上游尝试」的统一拒绝（M16-S4 / P3-3）。
+///
+/// 为什么不是 502：这不是上游故障，是本地状态——文案必须说清，
+/// 否则用户会去查一个没问题的上游。为什么是 503：请求此刻确实无法完成，
+/// 但**重启网关后重试即可**（客户端按 5xx 处理即可）。
+fn stopping_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({
+            "error": "网关正在停止，不再向上游发起新请求；请重启网关后重试"
+        })),
+    )
+        .into_response()
+}
+
+/// 网关是否正在停止（P3-3）。
+fn is_stopping(state: &AppState) -> bool {
+    state.stopping.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -829,7 +916,53 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
 
     // ③ 空路由表 ⇒ 单上游时代的**逐字节相同**行为：不解析 body、不查 `keys_by_ref`、
     //    不查熔断、不写失败事件、只发一次请求。
+    //
+    //    M16-S4 / P3-3 的唯一增量：**停止信号已发出时一个字节都不发**。
+    //    这不是「上游失败」，是本地状态 ⇒ 不写事件、不改响应形态（只在停止期间生效）。
     if state.config.route.is_empty() {
+        if is_stopping(&state) {
+            return stopping_response();
+        }
+        // P3-4 / P2-7 / B-111：legacy 路径手里是**启动那一刻的密钥快照**。
+        // M8-S4 起密钥可以「一键轮换」，轮换后旧 key 在站点侧已删、在本地被标成
+        // 已回收，而运行中的网关还在用它 —— 用户看到的是一个没有解释的 401/502。
+        //
+        // 所以：引用被标记为已回收 ⇒ **拒绝转发**，并留一条 `status = 0` 的事件，
+        // 把「为什么」与「怎么办」写清楚（重启网关才会读到新密钥）。
+        // 这是 D-1「空表路径不产生失败事件」的**唯一例外**，而且是**配置类**失败：
+        // 上游失败那一维度仍然逐字节不变（见 `legacy_upstream_failures_still_write_no_event`）。
+        //
+        // `legacy_key_ref` 为 `None`（既有调用方 / `single_upstream`）⇒ 不校验，行为不变。
+        if let Some(reference) = state.config.legacy_key_ref.as_deref() {
+            let revoked = state
+                .config
+                .revoked_refs
+                .as_ref()
+                .map(|refs| {
+                    refs.lock()
+                        .map(|set| set.contains(reference))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if revoked {
+                let model = model_from_body(&body).unwrap_or_default();
+                report_event_only(
+                    &state,
+                    state.config.site_id,
+                    0,
+                    &model,
+                    "该密钥已被回收（可能刚做过一键轮换）；网关需要重启才会用上新密钥",
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({
+                        "error": "这把密钥已被回收（可能刚做过一键轮换）；\
+                                  请重启网关，让它读到新密钥"
+                    })),
+                )
+                    .into_response();
+            }
+        }
         let url = format!("{}{}{}", state.config.base_url, path, query);
         let headers = upstream_headers(&state.config, &inbound, &state.config.api_key);
         return forward_to(&state, method, &url, headers, body).await;
@@ -904,6 +1037,13 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     let mut last_error: Option<String> = None;
     let attempts = sendable.len();
     for (index, upstream) in sendable.iter().enumerate() {
+        // P3-3：**每一次上游尝试之前**都查停止闸门——信号可能在上一次尝试期间发出。
+        // 在途请求允许跑完**当前**这一次（无法安全中断一个已发出的请求），
+        // 但绝不再发起新的：那会把下一个站点的密钥也发出去，而用户按下停止
+        // 往往紧接着就要轮换/回收密钥。
+        if is_stopping(&state) {
+            return stopping_response();
+        }
         let is_last = index + 1 == attempts;
         // 这里 `unwrap` 不会 panic：`sendable` 就是按同一个判据过滤出来的。
         // 但仍然写 `let Some(..) else` ——「过滤」与「取用」共用同一个函数
@@ -925,46 +1065,65 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                     latency_ms,
                     !should_failover(status),
                 );
+                let replayable = status_allows_replay(status);
                 if should_failover(status) {
                     // §3.5-1：`opened_at` 必须是**失败发生**的时刻，不是请求开始的时刻。
                     // 用请求开始时刻的话，一次比冷却期还慢的失败（524 ≈ 100s > 冷却 60s）
                     // 记下的那一刻冷却就已经「过期」⇒ 这个上游**永远熔断不了**；
                     // 即使不慢，有效冷却也被缩短了「本次请求耗时」那么多。
+                    let reason = if replayable {
+                        format!("上游返回 HTTP {status}（限流：未进入处理，已切下一个候选）")
+                    } else {
+                        format!("上游返回 HTTP {status}（可能已计费，按 P2-13 不重放）")
+                    };
                     report_failure(
                         &state,
                         upstream.site_id,
                         status,
                         &event_model,
-                        &format!("上游返回可切换状态码 HTTP {status}"),
+                        &reason,
                         Instant::now(),
                     );
-                    if !is_last {
-                        continue; // 丢掉这个响应，试下一个
-                    }
                 } else {
                     record_success(&state, upstream.site_id, Instant::now());
                 }
-                // 不可切换的状态、或已经是最后一个候选 ⇒ **如实返回上游的响应**
-                // （包括它的状态码，不做 500 兜底）。
+                // M16-S4 / P2-13：**只有 429 才重放**（上游明确没处理这个请求）。
+                // 其余状态码——含 5xx / 524 / 504 这类可能已经计费的——一律**原样返回**：
+                // 重复计费不可逆，可用性由「熔断 → 下一个请求换上游」承接。
+                // 不可切换的状态、或已经是最后一个候选 ⇒ 同样如实返回（不做 500 兜底）。
+                if replayable && !is_last {
+                    continue; // 丢掉这个 429，试下一个
+                }
                 return into_upstream_response(&state, response, upstream.site_id, &event_model);
             }
-            Err(message) => {
+            Err(failure) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 observe(&state, upstream.site_id, latency_ms, false);
-                // 传输层失败没有 HTTP 状态码：按 502 记（与 legacy 路径的错误码一致）并切下一个。
+                let replayable = failure.is_replayable();
+                let message = failure.message().to_string();
+                // 传输层失败没有 HTTP 状态码：按 502 记（与 legacy 路径的错误码一致）。
+                // 文案必须说清**为什么**这次能/不能重放——这是计费决策的现场记录（P2-13）。
+                let reason = if replayable {
+                    format!(
+                        "传输层失败（连接层，请求未送达；已切下一个候选）: {}",
+                        crate::redact::scrub(&message)
+                    )
+                } else {
+                    format!(
+                        "传输层失败（请求可能已送达，按 P2-13 不重放）: {}",
+                        crate::redact::scrub(&message)
+                    )
+                };
                 report_failure(
                     &state,
                     upstream.site_id,
                     502,
                     &event_model,
-                    &format!(
-                        "传输层失败（连不上 / 超时）: {}",
-                        crate::redact::scrub(&message)
-                    ),
+                    &reason,
                     Instant::now(),
                 );
                 last_error = Some(message);
-                if is_last {
+                if !replayable || is_last {
                     break;
                 }
             }
@@ -1050,6 +1209,20 @@ fn observe(state: &AppState, site_id: i64, latency_ms: u64, ok: bool) {
     }
 }
 
+/// 构造发往上游的 `Authorization` 值。
+///
+/// **返回类型是 `Zeroizing<String>`**（M16-S4 / P3-32）：`format!` 出来的是一份
+/// 不会被擦除的明文副本，而它每次请求都要造一次。用 `Zeroizing` 包住，
+/// `HeaderValue::from_str` 复制完之后，临时串在 drop 时清零。
+///
+/// **边界（不得声称更多）**：`HeaderValue` 内部那一份拷贝属于 reqwest/hyper 的所有权，
+/// 纯 Rust 层擦不掉——与 M7-S5 D-2「只覆盖我们持有的所有权」同口径。
+/// 返回值刻意做成 `Zeroizing` 而不是 `String`：类型本身就是守卫，
+/// 谁把它改回裸 `String`，`the_bearer_value_is_zeroizing` 会编译失败。
+fn bearer_value(key: &str) -> Zeroizing<String> {
+    Zeroizing::new(format!("Bearer {key}"))
+}
+
 /// 重建发往上游的请求头：**丢掉**调用方的 `Authorization`，换成该上游的站点密钥；
 /// 另外把「值里带着本地令牌」的头也丢掉——不管它叫什么名字，本地令牌都不许发给上游
 /// （M4-S2 复审 P2-2 的双头形态）。
@@ -1065,22 +1238,25 @@ fn upstream_headers(config: &GatewayConfig, inbound: &HeaderMap, key: &str) -> H
         }
         headers.insert(name.clone(), value.clone());
     }
+    let bearer = bearer_value(key);
     headers.insert(
         HeaderName::from_static("authorization"),
-        HeaderValue::from_str(&format!("Bearer {key}"))
+        HeaderValue::from_str(bearer.as_str())
             .unwrap_or_else(|_| HeaderValue::from_static("Bearer ")),
     );
     headers
 }
 
-/// 发一次请求。`Err(人话原因)` 表示**传输层**失败（连不上 / TLS / 超时）——没有 HTTP 状态码。
+/// 发一次请求。`Err` 表示失败，且**已经分类**成「可重放 / 不可重放」（P2-13）——
+/// 分类必须在**这里**做：只有 `reqwest::Error` 才知道失败发生在连接阶段还是响应阶段，
+/// 上层拿到的只是一个字符串。
 async fn send_once(
     state: &AppState,
     method: axum::http::Method,
     url: &str,
     headers: HeaderMap,
     body: bytes::Bytes,
-) -> std::result::Result<reqwest::Response, String> {
+) -> std::result::Result<reqwest::Response, AttemptFailure> {
     state
         .upstream
         .request(method, url)
@@ -1088,10 +1264,14 @@ async fn send_once(
         .body(body)
         .send()
         .await
-        .map_err(|e| format!("转发到上游失败: {e}"))
+        .map_err(|e| classify_send_error(&e))
 }
 
 /// 单上游（legacy）转发：只发一次，错误按既有形态返回。
+///
+/// M16-S4：`send_once` 现在返回**分类后**的失败。legacy 路径**没有下一个候选**，
+/// 所以分类不影响这里的行为（两个分支都返回 502 + 同一段文案），
+/// 只是把错误消息取出来——**响应形态与改动前逐字节相同**。
 async fn forward_to(
     state: &AppState,
     method: axum::http::Method,
@@ -1102,9 +1282,9 @@ async fn forward_to(
     let model = model_from_body(&body).unwrap_or_default();
     match send_once(state, method, url, headers, body).await {
         Ok(response) => into_upstream_response(state, response, state.config.site_id, &model),
-        Err(message) => (
+        Err(failure) => (
             StatusCode::BAD_GATEWAY,
-            axum::Json(serde_json::json!({ "error": message })),
+            axum::Json(serde_json::json!({ "error": failure.message() })),
         )
             .into_response(),
     }
@@ -1245,6 +1425,14 @@ fn report_failure(
     if let Ok(mut guard) = state.breaker.lock() {
         guard.record_failure(site_id, now);
     }
+    report_event_only(state, site_id, status, model, reason);
+}
+
+/// 只上报事件，**不喂熔断**（M16-S4 / P3-4）。
+///
+/// 用于**配置类**失败（例如 legacy 路径的密钥已被回收）：它不是上游故障，
+/// 喂熔断会让「熔断」这个信号失去意义（下一次启动的熔断状态会被一次本地配置问题污染）。
+fn report_event_only(state: &AppState, site_id: i64, status: u16, model: &str, reason: &str) {
     if let Some(sink) = &state.config.on_failure {
         sink(GatewayFailure {
             site_id,
@@ -1260,6 +1448,59 @@ fn report_failure(
             reason: crate::redact::scrub(reason),
         });
     }
+}
+
+/// 一次上游尝试的失败，按「上游是否**可能已经接受**了请求」分类（M16-S4 / P2-13）。
+///
+/// 这是**计费安全**的分类，不是错误类型的分类——它只回答一个问题：
+/// 这次失败**能不能**把同一个请求再发给下一个上游而不产生重复计费。
+///
+/// - [`AttemptFailure::NotAccepted`]：连接层失败（DNS / TCP / TLS / 连接超时）。
+///   请求连会话都没建立起来，上游不可能处理它 ⇒ **重放安全**。
+/// - [`AttemptFailure::Ambiguous`]：其余（读超时、响应途中被重置、请求构造失败…）。
+///   请求可能已经送达并被处理（上游超时后仍可能跑完计费）⇒ **不重放**。
+enum AttemptFailure {
+    NotAccepted(String),
+    Ambiguous(String),
+}
+
+impl AttemptFailure {
+    fn message(&self) -> &str {
+        match self {
+            AttemptFailure::NotAccepted(message) | AttemptFailure::Ambiguous(message) => message,
+        }
+    }
+
+    /// 这次失败能不能重放到下一个上游。
+    fn is_replayable(&self) -> bool {
+        matches!(self, AttemptFailure::NotAccepted(_))
+    }
+}
+
+/// 把 `reqwest` 的发送错误分成「上游没收到请求」与「无法判定」（P2-13）。
+///
+/// `is_connect()` 覆盖连接阶段的失败：DNS 解析、TCP 握手、TLS 握手，以及
+/// `connect_timeout` 超时——这些情况下请求体一个字节都没进上游的处理流程。
+/// 读超时（`read_timeout`，即「已连上但等不到响应头」）**不**算：那说明请求已经送出去了。
+fn classify_send_error(e: &reqwest::Error) -> AttemptFailure {
+    let message = format!("转发到上游失败: {e}");
+    if e.is_connect() {
+        AttemptFailure::NotAccepted(message)
+    } else {
+        AttemptFailure::Ambiguous(message)
+    }
+}
+
+/// 收到响应码之后还能不能重放（M16-S4 / P2-13 的裁定）。
+///
+/// **只有 429** 算「上游明确没处理这个请求」：限流是在进入模型处理**之前**被拒的，
+/// 重放不产生计费，也保住了 FR-5:160 的可见行为（用户看到换了站继续跑）。
+///
+/// 其余 5xx（含 524 / 504 这类**上游可能已经跑完并计费**的超时）一律不重放：
+/// 重复计费不可逆，而可用性由「熔断 → 下一个请求换上游」承接。
+/// 4xx 里除 429 外本来就 `should_failover == false`，走不到这里。
+fn status_allows_replay(status: u16) -> bool {
+    status == 429
 }
 
 /// 从请求体里**尽力**取出 `model`。取不到返回 `None`，不报错——
@@ -1857,6 +2098,7 @@ mod tests {
             site_display_name: "已停的站点".into(),
             shutdown: tx,
             finished,
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         handle.shutdown_and_wait().await;
     }
@@ -1975,6 +2217,16 @@ mod tests {
         );
     }
 
+    /// M16-S4 / P3-32（网关半）：`Bearer <key>` 的临时串必须是 `Zeroizing`。
+    ///
+    /// 这条测试的价值在**类型**：`bearer_value` 的返回类型一旦被改回裸 `String`，
+    /// 下面的 `let value: Zeroizing<String>` 就编译不过——比 grep 源码更硬。
+    #[test]
+    fn the_bearer_value_is_zeroizing() {
+        let value: Zeroizing<String> = bearer_value("sk-unit-test-0123456789");
+        assert_eq!(value.as_str(), "Bearer sk-unit-test-0123456789");
+    }
+
     /// 类型级检查：命令层（M5-S5）要在 `#[tauri::command] async fn` 里 await 它，
     /// 不是 `Send` 就编译不过。本测试不做任何运行期断言。
     #[test]
@@ -2085,5 +2337,97 @@ mod tests {
         let second = capped.next().await;
         assert!(second.is_some(), "第二个 chunk 超限应产生错误");
         assert!(second.unwrap().is_err());
+    }
+
+    // ---------- M16-S4 / P2-13：重放安全性的分类 ----------
+
+    /// `status_allows_replay`：**只有 429** 算「上游没处理这个请求」。
+    ///
+    /// 这一格是计费决策的判据，逐值钉死：5xx（含 524 / 504 这类可能已经跑完计费的超时）
+    /// 一律不许重放；429 是限流，发生在处理之前。
+    #[test]
+    fn only_429_allows_replay_after_a_status_code() {
+        assert!(status_allows_replay(429), "429 = 限流，未进入处理 ⇒ 可重放");
+        for status in [
+            400u16, 401, 402, 403, 404, 408, 422, 499, 500, 502, 503, 504, 520, 524, 529,
+        ] {
+            assert!(
+                !status_allows_replay(status),
+                "{status} 可能已计费（或本就不该切换）⇒ 不许重放"
+            );
+        }
+    }
+
+    /// 连接被拒（端口没人听）⇒ `is_connect()` ⇒ **可重放**。
+    ///
+    /// 用 `127.0.0.1:1`：必然拒绝连接，不需要网络，也不会碰到任何真实站点。
+    #[tokio::test]
+    async fn a_refused_connection_is_classified_as_not_accepted() {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .build()
+            .expect("构造客户端");
+        let err = client
+            .get("http://127.0.0.1:1/v1/models")
+            .send()
+            .await
+            .expect_err("127.0.0.1:1 上不该有服务");
+        assert!(
+            err.is_connect(),
+            "前提：连接被拒时 reqwest 必须报 connect 错误（否则本分类的前提不成立）: {err:?}"
+        );
+        let failure = classify_send_error(&err);
+        assert!(
+            failure.is_replayable(),
+            "连接层失败 ⇒ 请求未送达 ⇒ 必须可重放: {:?}",
+            failure.message()
+        );
+    }
+
+    /// 读超时（连上了、请求发出去了、等不到响应头）⇒ **不可重放**。
+    ///
+    /// 这是最容易写错的一格：`is_timeout()` 对连接超时与读超时**都为真**，
+    /// 所以判据必须是 `is_connect()`，不是 `is_timeout()`。
+    #[tokio::test]
+    async fn a_read_timeout_is_classified_as_ambiguous() {
+        // 一个只 accept、永不回包的假上游（本地回环，不联网）
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("绑定假上游");
+        let addr = listener.local_addr().expect("读地址");
+        let hold = tokio::spawn(async move {
+            // 保持连接打开、不回任何字节；测试结束任务被 abort
+            let mut sockets = Vec::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                sockets.push(socket);
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .read_timeout(Duration::from_millis(150))
+            .build()
+            .expect("构造客户端");
+        let err = client
+            .get(format!("http://{addr}/v1/models"))
+            .send()
+            .await
+            .expect_err("假上游不回包 ⇒ 必须读超时");
+        assert!(err.is_timeout(), "前提：这一格必须是超时错误: {err:?}");
+        assert!(
+            !err.is_connect(),
+            "前提：读超时**不是** connect 错误（否则这条用例证不到东西）: {err:?}"
+        );
+        let failure = classify_send_error(&err);
+        assert!(
+            !failure.is_replayable(),
+            "请求可能已经送达并被处理 ⇒ 不许重放: {:?}",
+            failure.message()
+        );
+
+        hold.abort();
     }
 }
