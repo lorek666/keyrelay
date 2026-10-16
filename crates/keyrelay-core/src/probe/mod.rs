@@ -10,16 +10,57 @@
 //! - 调用只 log 元数据（site_id / key_id / modelId），**不 log apiKey**；
 //! - 响应里 `items[].response` / `responseHeaders` / `startedByIp` / `userKey` 视为敏感，
 //!   `ProbeRun` 只取身份判定摘要，**不持久化**这些敏感字段。
+//!
+//! # 两条请求路径
+//!
+//! 1. [`run_probe`]：POST `sync=true`（M15-S1 主路径）；
+//! 2. [`poll_probe_run`]：POST 返回**非终态**时的补查兜底（B-134），best-effort、
+//!    永不把一次成功的检测变成失败。
+
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
+use crate::site::retry::Sleeper;
 use crate::site::transport::{HttpRequest, HttpResponse, HttpTransport, Method};
 
-/// bazaarlink probe 端点（POST 启动 / GET 轮询）。M15-S1 只用同步 POST。
+/// bazaarlink probe 端点（POST 启动）。`sync=true` 时服务端等跑完再回。
 const PROBE_ENDPOINT: &str = "https://bazaarlink.ai/api/probe/run";
+
+/// bazaarlink run 状态查询端点前缀：`GET <prefix><runId>`（B-134 轮询兜底）。
+///
+/// 真机标定（2026-10-16）：
+/// - `GET https://bazaarlink.ai/api/probe/run/kr-nonexistent-probe-id` ⇒ `404 {"error":"Run not found"}`
+/// - `GET https://bazaarlink.ai/api/probe/run`（不带 runId）⇒ `405`
+///
+/// 即路由 `/api/probe/run/<runId>` 存在且接受 GET（集合路由只接受 POST）。
+const PROBE_RUN_ENDPOINT_PREFIX: &str = "https://bazaarlink.ai/api/probe/run/";
+
+/// 轮询兜底参数（B-134）。
+///
+/// `sync=true` 的 POST 若返回**非终态**（`running` 等），补查 `GET /api/probe/run/<runId>`
+/// 直到拿到终态或次数用尽。默认 6 次 × 5s ⇒ 最多多等 30s：
+/// 同步窗口内都没跑完的检测，再等 30s 是「值得多等」与「别把界面挂住」之间的折中。
+/// `max_attempts = 0` ⇒ 关闭轮询兜底（回到 M15-S1 的一次性 POST 行为）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PollPolicy {
+    /// 补查次数上限（不含 POST 本身）。
+    pub max_attempts: u32,
+    /// 两次补查之间的等待。走注入的 [`Sleeper`]，测试里不真睡。
+    pub interval: Duration,
+}
+
+impl Default for PollPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 6,
+            interval: Duration::from_secs(5),
+        }
+    }
+}
 
 /// probe 请求。`api_key` 是明文，手写 `Debug` 不泄漏。
 ///
@@ -92,13 +133,78 @@ pub struct ProbeRun {
 ///
 /// 复用传入的 `HttpTransport`——生产用 `ReqwestTransport`，测试用 `MockTransport`。
 /// 限流（429）读 `Retry-After` 头；502/503/400/403 映射成可读错误。
-pub async fn run_probe<T: HttpTransport + Clone + 'static>(
+///
+/// `T: ?Sized` 是为了让调用方能把 `&dyn HttpTransport` 传进来（服务层要在
+/// 「probe 专用 transport」与「默认 transport」之间二选一，见 `Service::probe_model`）。
+pub async fn run_probe<T: HttpTransport + ?Sized>(
     transport: &T,
     req: &ProbeRequest,
 ) -> Result<ProbeRun> {
     let http = HttpRequest::new(Method::Post, PROBE_ENDPOINT).json_body(&req.to_json())?;
     let resp = transport.request(http).await?;
     parse_probe_response(resp)
+}
+
+/// `GET /api/probe/run/<runId>`：查一次 run 的当前状态（轮询兜底用）。
+///
+/// 状态码映射与 POST 同口径（429/502/503/400/403/其它非 2xx）。run 不存在或已过期时
+/// bazaarlink 回 `404 {"error":"Run not found"}`，落进「其它非 2xx」那条分支。
+pub async fn fetch_probe_run<T: HttpTransport + ?Sized>(
+    transport: &T,
+    run_id: &str,
+) -> Result<ProbeRun> {
+    let url = format!("{PROBE_RUN_ENDPOINT_PREFIX}{run_id}");
+    let resp = transport
+        .request(HttpRequest::new(Method::Get, url))
+        .await?;
+    parse_probe_response(resp)
+}
+
+/// run 仍在跑。只认**明说在跑**的词。
+///
+/// 反向（终态）不写成一张表：`completed` / `failed` / `aborted` 与「词表外的任何值」
+/// 对轮询决策是同一个答案——不补查。写成两张表反而会让人以为「终态」在别处有分支。
+fn is_running_status(status: &str) -> bool {
+    matches!(status, "running" | "queued" | "pending" | "in_progress")
+}
+
+/// 是否需要轮询补查：**只在 bazaarlink 明说还在跑**、且这次没拿到判定时才补查。
+///
+/// 两种「不该补查」都是实测过的真实形态，不能靠猜：
+/// - `completed` + 无判定：key 访问不了该模型时 POST 秒级（420–663ms）返回这个形态
+///   ——**已是终态**，再问多少次都是同一个答案，补查只会白等 30s（B-134 真机记录）；
+/// - `status` 缺失（解析成 `"unknown"`）：没有依据认定它还会变，不拿 30s 赌。
+pub fn needs_poll(run: &ProbeRun) -> bool {
+    run.verdict_status.is_none() && is_running_status(&run.status)
+}
+
+/// 轮询兜底：把一个**非终态**的 run 追到终态（best-effort）。
+///
+/// 返回 `(最新一次拿到的 run, 成功补查次数)`。三条停止条件：拿到终态或判定、
+/// 次数用尽、补查请求失败（保留上一次的结果）。
+///
+/// **永不返回 `Err`**：POST 的结果才是判定来源，补查只是多给一次机会——补查失败
+/// 不能把一次成功的检测变成失败。失败原因在这里吞掉，调用方按 `polled` 记事件。
+pub async fn poll_probe_run<T: HttpTransport + ?Sized>(
+    transport: &T,
+    first: ProbeRun,
+    policy: PollPolicy,
+    sleeper: &dyn Sleeper,
+) -> (ProbeRun, u32) {
+    let mut run = first;
+    let mut polled = 0u32;
+    // 先睡再查：POST 刚返回，立刻重查大概率还是同一个 `running`。
+    while polled < policy.max_attempts && needs_poll(&run) {
+        sleeper.sleep(policy.interval).await;
+        match fetch_probe_run(transport, &run.run_id).await {
+            Ok(next) => {
+                polled += 1;
+                run = next;
+            }
+            Err(_) => break,
+        }
+    }
+    (run, polled)
 }
 
 fn parse_probe_response(resp: HttpResponse) -> Result<ProbeRun> {
@@ -210,6 +316,7 @@ fn parse_probe_run(v: &Value) -> Result<ProbeRun> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::site::retry::RecordingSleeper;
     use crate::site::transport::MockTransport;
 
     fn probe_req() -> ProbeRequest {
@@ -220,6 +327,33 @@ mod tests {
             claimed_model: Some("vendor/model".into()),
             sync: true,
         }
+    }
+
+    /// 非终态响应：`sync=true` 的 POST 没等到跑完就返回（轮询兜底的触发形态）。
+    fn running_response() -> HttpResponse {
+        HttpResponse::json(200, json!({ "runId": "r-poll", "status": "running" })).unwrap()
+    }
+
+    /// 终态响应：跑完了，带判定。
+    fn completed_with_verdict() -> HttpResponse {
+        HttpResponse::json(
+            200,
+            json!({
+                "runId": "r-poll",
+                "status": "completed",
+                "identityAssessment": {
+                    "status": "mismatch",
+                    "verdict": {
+                        "status": "clean_match_submodel_mismatch",
+                        "trueFamily": "zhipu",
+                        "trueModel": "glm-5.2",
+                        "confidence": "high"
+                    }
+                },
+                "warnings": []
+            }),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -433,5 +567,121 @@ mod tests {
         .unwrap()]);
         let run = run_probe(&mock, &probe_req()).await.unwrap();
         assert_eq!(run.run_id, "r6");
+    }
+
+    // ---- B-134：轮询兜底 ----
+
+    /// 轮询兜底的起点：POST 返回非终态、无判定。
+    fn running_run() -> ProbeRun {
+        ProbeRun {
+            run_id: "r-poll".into(),
+            status: "running".into(),
+            identity_status: None,
+            verdict_status: None,
+            true_family: None,
+            true_model: None,
+            spoof_method: None,
+            confidence: None,
+            warnings_count: 0,
+            report_url: None,
+            created_at: None,
+            completed_at: None,
+        }
+    }
+
+    fn poll_policy(max_attempts: u32) -> PollPolicy {
+        PollPolicy {
+            max_attempts,
+            interval: Duration::from_secs(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_probe_run_gets_the_run_scoped_url() {
+        // 真机标定过的路由形态：GET /api/probe/run/<runId>（集合路由只收 POST）。
+        let mock = MockTransport::new(vec![completed_with_verdict()]);
+        let run = fetch_probe_run(&mock, "r-poll").await.unwrap();
+        assert_eq!(
+            run.verdict_status.as_deref(),
+            Some("clean_match_submodel_mismatch")
+        );
+        let sent = mock.nth_request(0).unwrap();
+        assert_eq!(sent.method, Method::Get);
+        assert_eq!(sent.url, "https://bazaarlink.ai/api/probe/run/r-poll");
+    }
+
+    #[test]
+    fn needs_poll_only_when_the_run_is_still_running_without_a_verdict() {
+        let mut run = running_run();
+        assert!(needs_poll(&run), "running 且无判定 ⇒ 补查");
+
+        // 真机形态（B-134 实测 420–663ms）：已终态、无判定 ⇒ 不补查。
+        run.status = "completed".into();
+        assert!(!needs_poll(&run), "completed 无判定是终态，补查只会白等");
+
+        // status 缺失时解析成 "unknown" ⇒ 不拿 30s 赌。
+        run.status = "unknown".into();
+        assert!(!needs_poll(&run), "unknown 无依据认定还会变，不补查");
+
+        // 有判定 ⇒ 无论什么状态都不补查。
+        run.status = "running".into();
+        run.verdict_status = Some("ambiguous".into());
+        assert!(!needs_poll(&run), "已有判定 ⇒ 不补查");
+    }
+
+    #[tokio::test]
+    async fn poll_probe_run_stops_as_soon_as_the_run_finishes() {
+        let mock = MockTransport::new(vec![completed_with_verdict()]);
+        let sleeper = RecordingSleeper::default();
+        let (run, polled) = poll_probe_run(&mock, running_run(), poll_policy(3), &sleeper).await;
+        assert_eq!(polled, 1, "第一次补查就拿到终态");
+        assert_eq!(run.status, "completed");
+        assert_eq!(
+            run.verdict_status.as_deref(),
+            Some("clean_match_submodel_mismatch")
+        );
+        assert_eq!(run.true_model.as_deref(), Some("glm-5.2"));
+        assert_eq!(sleeper.calls(), vec![Duration::from_secs(1)]);
+        assert_eq!(mock.request_count(), 1, "拿到终态后不得再补查");
+    }
+
+    #[tokio::test]
+    async fn poll_probe_run_gives_up_after_max_attempts() {
+        let mock = MockTransport::new(vec![
+            running_response(),
+            running_response(),
+            running_response(),
+        ]);
+        let sleeper = RecordingSleeper::default();
+        let (run, polled) = poll_probe_run(&mock, running_run(), poll_policy(3), &sleeper).await;
+        assert_eq!(polled, 3, "用满次数上限");
+        assert_eq!(run.status, "running");
+        assert_eq!(run.verdict_status, None);
+        assert_eq!(sleeper.calls().len(), 3, "每次补查前都等一个 interval");
+        assert_eq!(mock.request_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn poll_probe_run_keeps_the_post_result_when_a_poll_fails() {
+        // 补查失败（404/5xx/传输错误）⇒ 保留 POST 的结果，且**不再打**第二次。
+        let mock = MockTransport::new(vec![HttpResponse::new(500, b"boom".to_vec())]);
+        let sleeper = RecordingSleeper::default();
+        let (run, polled) = poll_probe_run(&mock, running_run(), poll_policy(3), &sleeper).await;
+        assert_eq!(polled, 0, "失败的补查不计入成功次数");
+        assert_eq!(run.status, "running", "保留 POST 结果");
+        assert_eq!(run.run_id, "r-poll");
+        assert_eq!(mock.request_count(), 1, "补查失败即停，不刷接口");
+    }
+
+    #[tokio::test]
+    async fn poll_probe_run_with_zero_attempts_makes_no_request() {
+        // `max_attempts = 0` ⇒ 关闭兜底，退回一次性 POST 行为。
+        let mock = MockTransport::new(vec![]);
+        let sleeper = RecordingSleeper::default();
+        let (run, polled) = poll_probe_run(&mock, running_run(), poll_policy(0), &sleeper).await;
+        assert_eq!(polled, 0);
+        assert_eq!(run.status, "running");
+        assert_eq!(mock.request_count(), 0);
+        assert!(sleeper.calls().is_empty());
     }
 }

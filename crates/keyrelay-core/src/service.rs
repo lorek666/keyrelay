@@ -560,6 +560,15 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     /// `ReqwestTransport`（timeout 120s、不套 retry），避免 sync probe 被 15s 总超时砍断、
     /// 以及 429 被 `RetryingTransport` 自动重试 3 次（Retry-After 被 cap 到 5s，白打 + 等 10s）。
     probe_transport: Option<crate::site::transport_reqwest::ReqwestTransport>,
+    /// B-134：probe 轮询兜底参数（`sync=true` 的 POST 返回非终态时才用）。
+    ///
+    /// 默认 [`crate::probe::PollPolicy::default`]（6 次 × 5s）。`max_attempts = 0` 即关闭兜底。
+    probe_poll: crate::probe::PollPolicy,
+    /// B-134：轮询等待实现。生产 `TokioSleeper`，测试注入 `RecordingSleeper`（不真睡）。
+    ///
+    /// 与 `site::retry` 共用同一个 [`crate::site::retry::Sleeper`] 抽象——不新造一套
+    /// 「可注入的等待」，测试里也就没有第二个假时钟要实现。
+    probe_sleeper: Arc<dyn crate::site::retry::Sleeper>,
     /// M14-S7 §4.2：models.dev 在线补全专用传输层（独立 timeout 15s、不套 retry）。
     ///
     /// **必须显式注入**（[`Self::with_meta_transport`]）：`None` ⇒ `warm_model_meta` 直接
@@ -734,6 +743,9 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             // 默认 None：测试不调 `with_probe_transport` 时 fallback 到 `self.transport`（Mock），
             // 让 probe_model 的集成测试能用 Mock 预置响应（M4）。
             probe_transport: None,
+            // B-134：默认开着轮询兜底（6 次 × 5s），但只对「bazaarlink 明说还在跑」的 run 生效。
+            probe_poll: crate::probe::PollPolicy::default(),
+            probe_sleeper: Arc::new(crate::site::retry::TokioSleeper),
             // 默认 None：**不做在线补全**。生产由壳层 `with_meta_transport` 注入；
             // 测试装配不注入 ⇒ 结构上不可能联网。
             meta_transport: None,
@@ -828,6 +840,21 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         probe_transport: crate::site::transport_reqwest::ReqwestTransport,
     ) -> Self {
         self.probe_transport = Some(probe_transport);
+        self
+    }
+
+    /// B-134：注入 probe 轮询兜底的参数与等待实现。
+    ///
+    /// 生产不调用（默认 `PollPolicy::default()` + `TokioSleeper`）；测试调用是为了
+    /// **不真睡**——`max_attempts` 与 `interval` 一起注入，测试就能断言
+    /// 「补查了几次、每次等了多久」，而不是靠 `sleep` 把测试拖慢 30s。
+    pub fn with_probe_poll(
+        mut self,
+        policy: crate::probe::PollPolicy,
+        sleeper: Arc<dyn crate::site::retry::Sleeper>,
+    ) -> Self {
+        self.probe_poll = policy;
+        self.probe_sleeper = sleeper;
         self
     }
 
@@ -2990,6 +3017,9 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 检测结果摘要落 `probe_runs` 表（best-effort：落库失败只 warn，不 mask 检测成功）；
     /// **不落** `items[].response` / `responseHeaders` / `startedByIp` / `userKey`（敏感）。
     /// 事件只 log 元数据（site_id / key_id / modelId / verdict），**不 log apiKey**。
+    ///
+    /// B-134：POST 返回非终态时按 [`crate::probe::PollPolicy`] 补查（best-effort，
+    /// 补查失败不影响本次结果）；拿到终态后按「有没有判定」分流记事件（见 F1 分支）。
     pub async fn probe_model(
         &self,
         key_id: i64,
@@ -3040,11 +3070,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         };
         // H1+M2（独立复审）：优先用 probe_transport（独立 timeout 120s、不套 retry）；
         // None 时 fallback 到 self.transport（测试 Mock 路径，M4 可 mock）。
-        let run = match &self.probe_transport {
-            Some(pt) => crate::probe::run_probe(pt, &req).await,
-            None => crate::probe::run_probe(&self.transport, &req).await,
+        // 收成 `&dyn` 是为了 POST 与轮询补查走**同一条**选择逻辑，不把二选一写两遍。
+        let transport: &dyn HttpTransport = match &self.probe_transport {
+            Some(pt) => pt,
+            None => &self.transport,
         };
-        let run = match run {
+        let run = match crate::probe::run_probe(transport, &req).await {
             Ok(r) => r,
             Err(err) => {
                 // M3（独立复审）：失败也写一条 warn 事件（scrub 错误信息），让事件流能追溯检测失败。
@@ -3061,6 +3092,32 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 ));
                 return Err(err);
             }
+        };
+        // B-134：POST 返回**非终态**（bazaarlink 明说还在跑）时补查一次机会。
+        // `needs_poll` 为假（终态 / 已有判定 / 状态未知）⇒ 一次请求都不发。
+        let run = if crate::probe::needs_poll(&run) {
+            let (run, polled) =
+                crate::probe::poll_probe_run(transport, run, self.probe_poll, &*self.probe_sleeper)
+                    .await;
+            if polled > 0 {
+                // 只记元数据：补查成功几次、最终状态、有没有判定（apiKey / 响应正文都不进）。
+                self.log(observability::event_with_payload(
+                    Level::Debug,
+                    "probe",
+                    "模型检测轮询补查完成",
+                    serde_json::json!({
+                        "site_id": row.site_id,
+                        "key_id": key_id,
+                        "run_id": run.run_id,
+                        "status": run.status,
+                        "polled": polled,
+                        "has_verdict": run.verdict_status.is_some(),
+                    }),
+                ));
+            }
+            run
+        } else {
+            run
         };
         // 持久化摘要（best-effort：落库失败只 warn，不 mask 检测成功）
         if let Err(err) = self.store.insert_probe_run(
@@ -5276,10 +5333,35 @@ mod tests {
     /// 不调 `with_probe_transport` ⇒ `probe_transport=None` ⇒ `probe_model` fallback 到
     /// `self.transport`（Mock），让 M4 能 mock 测 confirm/落库/event 安全断言。
     async fn probe_service(tail: Vec<HttpResponse>) -> (KeyRelayService<MockTransport>, i64) {
+        let (service, key_id, _mock, _sleeper) = probe_service_with_mock(tail).await;
+        (service, key_id)
+    }
+
+    /// 同 `probe_service`，但把 mock 与 sleeper 也交回给测试——用于断言
+    /// 「发了几次请求、走的哪个方法」「轮询前等了多久」。
+    ///
+    /// **总是注入 `RecordingSleeper`**：B-134 之后 probe 可能进入轮询，
+    /// 测试里绝不真睡——一条误判成「还在跑」的用例否则会把套件拖满 30s。
+    async fn probe_service_with_mock(
+        tail: Vec<HttpResponse>,
+    ) -> (
+        KeyRelayService<MockTransport>,
+        i64,
+        MockTransport,
+        Arc<crate::site::retry::RecordingSleeper>,
+    ) {
         let mut responses = vec![status_response()];
         responses.extend(tail);
         let store = Store::open_in_memory().expect("内存库");
-        let service = KeyRelayService::new(store, MockTransport::new(responses), test_config());
+        let mock = MockTransport::new(responses);
+        let sleeper = Arc::new(crate::site::retry::RecordingSleeper::default());
+        let service = KeyRelayService::new(store, mock.clone(), test_config()).with_probe_poll(
+            crate::probe::PollPolicy {
+                max_attempts: 3,
+                interval: std::time::Duration::from_secs(1),
+            },
+            sleeper.clone(),
+        );
         let site = service
             .add_site("https://relay.example.com")
             .await
@@ -5293,7 +5375,7 @@ mod tests {
             .store
             .insert_key(site.id, "probe-key", &reference, Some("remote-1"), None)
             .expect("insert_key");
-        (service, key_id)
+        (service, key_id, mock, sleeper)
     }
 
     #[tokio::test]
@@ -5395,7 +5477,7 @@ mod tests {
             }),
         )
         .expect("构造无判定响应");
-        let (service, key_id) = probe_service(vec![no_verdict]).await;
+        let (service, key_id, mock, _sleeper) = probe_service_with_mock(vec![no_verdict]).await;
         let run = service
             .probe_model(key_id, "vendor/model".into(), None, None, true)
             .await
@@ -5403,6 +5485,14 @@ mod tests {
         assert_eq!(
             run.verdict_status, None,
             "无 identityAssessment ⇒ verdict 为空"
+        );
+        // B-134：`completed` 是终态——不得进入轮询（否则白等 30s 才拿到同一个答案）。
+        // 请求数 = add_site 指纹 1 + probe POST 1，多一次都说明补查被误触发。
+        assert_eq!(
+            mock.request_count(),
+            2,
+            "completed 无判定是终态，不得补查: {}",
+            mock.request_count()
         );
 
         let events = service.recent_events(100).expect("recent_events");
@@ -5435,6 +5525,118 @@ mod tests {
             rows[0].report_url.as_deref(),
             Some("/api/probe/report/r-probe-2")
         );
+    }
+
+    #[tokio::test]
+    async fn probe_model_polls_until_the_verdict_arrives() {
+        // B-134：`sync=true` 的 POST 没等到跑完（bazaarlink 回 `running`）时补查一次机会。
+        // 真机依据：POST 侧的超时窗口是固定的，而检测要跑多轮推理对比（真机实测一次
+        // 49.8s）——非终态返回是真会发生的形态，不是假想。
+        let running = HttpResponse::json(200, json!({ "runId": "r-poll", "status": "running" }))
+            .expect("构造 running 响应");
+        let finished = HttpResponse::json(
+            200,
+            json!({
+                "runId": "r-poll",
+                "status": "completed",
+                "identityAssessment": {
+                    "status": "mismatch",
+                    "verdict": {
+                        "status": "clean_match_submodel_mismatch",
+                        "trueFamily": "zhipu",
+                        "trueModel": "glm-5.2",
+                        "confidence": "high"
+                    }
+                },
+                "reportUrl": "/api/probe/report/r-poll",
+                "warnings": []
+            }),
+        )
+        .expect("构造 completed 响应");
+        let (service, key_id, mock, sleeper) =
+            probe_service_with_mock(vec![running, finished]).await;
+
+        let run = service
+            .probe_model(key_id, "glm-5.3".into(), None, None, true)
+            .await
+            .expect("probe 成功");
+
+        assert_eq!(
+            run.verdict_status.as_deref(),
+            Some("clean_match_submodel_mismatch"),
+            "补查必须把判定带回来"
+        );
+        assert_eq!(run.true_model.as_deref(), Some("glm-5.2"));
+        assert_eq!(run.status, "completed");
+        // 请求数 = 指纹 1 + POST 1 + 补查 1
+        assert_eq!(mock.request_count(), 3, "补查只发一次就够");
+        let poll = mock.nth_request(2).expect("第三次请求是补查");
+        assert_eq!(poll.method, crate::site::transport::Method::Get);
+        assert_eq!(poll.url, "https://bazaarlink.ai/api/probe/run/r-poll");
+        assert_eq!(
+            sleeper.calls(),
+            vec![std::time::Duration::from_secs(1)],
+            "补查前等一个 interval（测试里不真睡）"
+        );
+
+        // 落库的是**补查后**的结果，不是 POST 那个半成品
+        let rows = service.store.list_probe_runs(10).expect("list_probe_runs");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].verdict_status.as_deref(),
+            Some("clean_match_submodel_mismatch")
+        );
+        assert_eq!(rows[0].true_model.as_deref(), Some("glm-5.2"));
+
+        // 有判定 ⇒ info「模型检测完成」，且补查事件不含 apiKey
+        let events = service.recent_events(100).expect("recent_events");
+        let probe_events: Vec<_> = events.iter().filter(|e| e.source == "probe").collect();
+        assert!(
+            probe_events
+                .iter()
+                .any(|e| e.level == "info" && e.message.contains("模型检测完成")),
+            "拿到判定应记 info「模型检测完成」: {probe_events:?}"
+        );
+        assert!(
+            probe_events
+                .iter()
+                .any(|e| e.message.contains("轮询补查完成")),
+            "补查应留一条事件（含次数与最终状态）: {probe_events:?}"
+        );
+        for ev in &probe_events {
+            let text = format!("{} {}", ev.message, ev.payload.as_deref().unwrap_or(""));
+            assert!(
+                !text.contains("sk-test-secret-12345678"),
+                "补查事件泄漏 apiKey: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_model_keeps_the_result_when_the_poll_never_finishes() {
+        // 补查用尽次数仍是 `running` ⇒ 保留 POST 结果并落库（不是报错、不是丢记录）。
+        let running = || {
+            HttpResponse::json(200, json!({ "runId": "r-poll", "status": "running" }))
+                .expect("构造 running 响应")
+        };
+        let (service, key_id, mock, sleeper) =
+            probe_service_with_mock(vec![running(), running(), running(), running()]).await;
+
+        let run = service
+            .probe_model(key_id, "glm-5.3".into(), None, None, true)
+            .await
+            .expect("补查没结果也不算失败");
+
+        assert_eq!(run.status, "running");
+        assert_eq!(run.verdict_status, None);
+        // 指纹 1 + POST 1 + 补查 3（`probe_service_with_mock` 的 max_attempts）
+        assert_eq!(mock.request_count(), 5, "补查次数上限必须被尊重");
+        assert_eq!(sleeper.calls().len(), 3);
+
+        let rows = service.store.list_probe_runs(10).expect("list_probe_runs");
+        assert_eq!(rows.len(), 1, "没跑完也要留一条历史");
+        assert_eq!(rows[0].status.as_deref(), Some("running"));
+        assert_eq!(rows[0].verdict_status, None);
     }
 
     #[tokio::test]

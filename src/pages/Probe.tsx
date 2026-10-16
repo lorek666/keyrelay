@@ -177,6 +177,7 @@ export default function Probe() {
                 <th>{t("probe.colSite")}</th>
                 <th>{t("probe.colModel")}</th>
                 <th>{t("probe.colVerdict")}</th>
+                <th>{t("probe.colStatus")}</th>
                 <th>{t("probe.colTrueModel")}</th>
                 <th>{t("probe.colConfidence")}</th>
               </tr>
@@ -188,6 +189,7 @@ export default function Probe() {
                   <td>{siteName(sites.data, r.siteId)}</td>
                   <td className="mono">{r.modelId}</td>
                   <td>{verdictLabel(r.verdictStatus)}</td>
+                  <td>{runStatusLabel(r.status)}</td>
                   <td className="mono">{r.trueModel ?? "—"}</td>
                   <td>{r.confidence ?? "—"}</td>
                 </tr>
@@ -226,7 +228,7 @@ function VerdictCard({ run }: { run: ProbeRun }) {
         <dt>{translate(d, "probe.warningsCount")}</dt>
         <dd>{run.warningsCount}</dd>
         <dt>{translate(d, "probe.runStatus")}</dt>
-        <dd className="mono">{run.status}</dd>
+        <dd>{runStatusLabel(run.status)}</dd>
         {run.reportUrl ? (
           <>
             <dt>{translate(d, "probe.report")}</dt>
@@ -259,4 +261,22 @@ function verdictLabel(status?: string | null): string {
 function identityLabel(status?: string | null): string {
   if (!status) return "—";
   return translate(getCurrentDict(), `probe.identity.${status}`);
+}
+
+/**
+ * run 生命周期标签（B-135）。
+ *
+ * 这一列是为了让历史表能分开两种「判定为空」：
+ * - `completed` + 判定空 = **跑完了但没给判定**（key 访问不了该模型）；
+ * - `running` + 判定空 = **没跑完**（轮询兜底也用尽次数了）。
+ * 只靠 verdict 一列，两者长得一模一样。
+ *
+ * `null` = 老库的行（status 列是 v6 才加的，没记过状态）——显示 "—"，不猜。
+ */
+function runStatusLabel(status?: string | null): string {
+  if (!status) return "—";
+  const key = `probe.status.${status}`;
+  const label = translate(getCurrentDict(), key);
+  // 词表外的状态原样显示（bazaarlink schema 自陈 may evolve）
+  return label === key ? status : label;
 }

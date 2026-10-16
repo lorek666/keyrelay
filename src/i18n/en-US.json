@@ -53,6 +53,7 @@
     "colSite": "Site",
     "colModel": "Model",
     "colVerdict": "Verdict",
+    "colStatus": "Run status",
     "colTrueModel": "True Model",
     "colConfidence": "Confidence",
     "trueFamily": "True Family",
@@ -78,6 +79,13 @@
       "mismatch": "Contradicts claim",
       "uncertain": "Uncertain",
       "insufficient_data": "Insufficient data"
+    },
+    "status": {
+      "running": "Running",
+      "completed": "Completed",
+      "failed": "Failed",
+      "aborted": "Aborted",
+      "unknown": "Unknown status"
     }
   },
   "app": {
