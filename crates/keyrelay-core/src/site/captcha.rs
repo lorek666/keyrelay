@@ -27,26 +27,62 @@ pub const MAX_CAPTCHA_COOKIES_TOTAL_BYTES: usize = 16 * 1024;
 /// 人工过验证码要打开的**官方页面**地址：站点自己的 origin + `/login`。
 ///
 /// 保证（每条都有测试）：
-/// ① 只可能是 `{site origin}/login`；
+/// ① 只可能是 `{site origin}{base 路径}/login`（**保留 base 路径**：子路径部署的站点
+///    登录页也在子路径下，M16-S3 P3-24）；
 /// ② **永不**带 userinfo（`https://alice:pw@host` ⇒ `https://host/login`）；
-/// ③ **永不**指向第三方 host（origin 逐字来自 `base_url`）；
-/// ④ 非 `http(s)` 的 scheme（或无 scheme）⇒ `Err(Error::Transport)`——
-///    绝不返回一个会打开本地文件 / 执行脚本的地址。
+/// ③ **永不**指向第三方 host（host 逐字来自 `base_url`，且过 WHATWG 解析器）；
+/// ④ 非 `http(s)` 的 scheme（或无 scheme / 解析失败）⇒ `Err(Error::Transport)`——
+///    绝不返回一个会打开本地文件 / 执行脚本的地址；
+/// ⑤ 输出的 host 是**规范化**形态（小写、IDN → punycode、尾点剥掉）——与
+///    [`origin_of`] 同一口径，否则 `origin_matches(base, captcha_page_url(base))` 会自相矛盾。
 pub fn captcha_page_url(base_url: &str) -> Result<String> {
-    let (scheme, rest) = split_scheme(base_url)?;
-    let authority_end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    // 掩掉 userinfo：`alice:pw@host` ⇒ `host`。用最后一个 `@`（与 `strip_url_userinfo` 同口径）。
-    let host = match authority.rfind('@') {
-        Some(at) => &authority[at + 1..],
-        None => authority,
+    let Some((scheme, host, port, path)) = parts_of(base_url) else {
+        // 错误文案尽量具体：缺 scheme / 非 http(s)（`split_scheme` 会给出准确的哪一条），
+        // 其余（有 scheme 却解析不出主机）走兜底。
+        return Err(match split_scheme(base_url) {
+            Err(err) => err,
+            Ok(_) => Error::Transport(format!(
+                "站点地址无法解析出主机名：无法构造人机验证页面（{}）",
+                super::display_url(base_url)
+            )),
+        });
     };
-    if host.is_empty() {
-        return Err(Error::Transport(format!(
-            "站点地址缺少主机名（{scheme}://）：无法构造人机验证页面"
-        )));
+    // 保留 base 路径（去掉尾斜杠），再接 `/login`：`https://h/relay` ⇒ `https://h/relay/login`。
+    //
+    // 例外：路径里出现 `@` 时**丢掉**它。用户录进来的地址形如
+    // `https://evil.example\@good.example` 时，WHATWG 解析出的 path 是 `/@good.example`
+    // ——那是个**看着像 userinfo** 的串，把它拼进交给 WebView 的地址只会制造新的歧义
+    // （而 host 归属已经在 `parts_of` 里定成 evil.example 了，这里丢的只是路径）。
+    let base_path = path.trim_end_matches('/');
+    let base_path = if base_path.contains('@') {
+        ""
+    } else {
+        base_path
+    };
+    Ok(format!("{scheme}://{host}{port}{base_path}/login"))
+}
+
+/// `(scheme, 规范化 host, ":port" 或 "", path)`；非 http(s) / 无 host / 解析失败 ⇒ `None`。
+///
+/// **解析只有这一处**（M16-S3 P2-20）：此前 `captcha_page_url` / `origin_of` / `host_of`
+/// 各自手写一遍，与 WHATWG 的差异要各自修、各自漏。现在统一走 `reqwest::Url`
+/// （= url crate，已是直接依赖的传递物），口径与适配器真正发请求时用的解析器**同源**。
+fn parts_of(raw: &str) -> Option<(String, String, String, String)> {
+    let url = reqwest::Url::parse(raw.trim()).ok()?;
+    let scheme = url.scheme().to_string();
+    if scheme != "http" && scheme != "https" {
+        return None;
     }
-    Ok(format!("{scheme}://{host}/login"))
+    // `host_str()` 已是小写 + punycode（IDN）形态；尾点 FQDN 再剥一层。
+    let host = url.host_str()?;
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    // `Url::port()` 已把 `:0443` 这类写法数值化，且**默认端口返回 `None`**
+    // ⇒ `https://h`、`https://h:443`、`https://h:0443` 三者一致。
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    Some((scheme, host, port, url.path().to_string()))
 }
 
 /// WebView 导航后、抓 cookie 前的 origin 比对：页面地址必须**仍属于该站点**。
@@ -198,21 +234,13 @@ pub fn step(phase: CaptchaPhase, event: CaptchaEvent) -> CaptchaPhase {
 }
 
 /// URL 里的 host（给 `CaptchaChallenge` 的 `Debug` 用）。解析不出 ⇒ `"?"`。
+///
+/// 与 [`origin_of`] 同源（`parts_of`）：Debug 里出现的 host 必须与归属判定用的 host 一致，
+/// 否则日志会给出误导性的排障线索（M16-S3 P2-20 的「解析收敛到一处」）。
 pub(crate) fn host_of(url: &str) -> String {
-    let rest = match url.find("://") {
-        Some(i) => &url[i + 3..],
-        None => url,
-    };
-    let authority_end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    let host = match authority.rfind('@') {
-        Some(at) => &authority[at + 1..],
-        None => authority,
-    };
-    if host.is_empty() {
-        "?".to_string()
-    } else {
-        host.to_string()
+    match parts_of(url) {
+        Some((_, host, _, _)) => host,
+        None => "?".to_string(),
     }
 }
 
@@ -234,29 +262,16 @@ fn split_scheme(raw: &str) -> Result<(String, &str)> {
     Ok((scheme, &raw[i + 3..]))
 }
 
-/// `scheme://host[:port]`（小写 scheme、小写 host、默认端口归一）。
+/// 规范化 origin：`scheme://host[:port]`（小写 scheme/host、默认端口省略、IDN → punycode、
+/// 尾点剥掉）。
+///
+/// **与 WHATWG 同源**（M16-S3 P2-20 / P3-24）：走 [`parts_of`]（`reqwest::Url`），
+/// 不再手写 authority 切分。此前手写版把三类**同一台主机**判成不同 origin
+/// （`xn--…` 与 Unicode 域名、`h.example.com.`、`:0443`）⇒ 失败关闭 ⇒ 这些站点
+/// 永远提交不了验证码。判定方向仍是**失败关闭**：解析不出 ⇒ `None` ⇒ `origin_matches` 为 `false`。
 fn origin_of(raw: &str) -> Option<String> {
-    let (scheme, rest) = split_scheme(raw).ok()?;
-    let authority_end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    let host_port = match authority.rfind('@') {
-        Some(at) => &authority[at + 1..],
-        None => authority,
-    };
-    if host_port.is_empty() {
-        return None;
-    }
-    // 端口归一：默认端口写出来与不写是同一个 origin。
-    let default_port = if scheme == "https" { "443" } else { "80" };
-    let (host, port) = match host_port.rsplit_once(':') {
-        // `[::1]:8080` 这种 IPv6 形态：`rsplit_once(':')` 会把 `:8080` 正确切出来。
-        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() => {
-            (host, port)
-        }
-        _ => (host_port, default_port),
-    };
-    let port = if port == default_port { "" } else { port };
-    Some(format!("{scheme}://{}:{port}", host.to_ascii_lowercase()))
+    let (scheme, host, port, _) = parts_of(raw)?;
+    Some(format!("{scheme}://{host}{port}"))
 }
 
 #[cfg(test)]
@@ -281,17 +296,107 @@ mod tests {
 
     #[test]
     fn captcha_page_url_uses_the_site_origin_and_login_route() {
+        // M16-S3 P3-24：两处**有意的行为变更**（差异登记见 spec §10）
+        // ① base 路径**保留**：子路径部署（`https://h/relay`）的登录页在子路径下，
+        //    丢掉它会让用户打不开登录页；
+        // ② host 输出**规范化**（小写 / punycode / 尾点剥掉），与 `origin_of` 同一口径。
         for (base, expected) in [
             ("https://h.example.com", "https://h.example.com/login"),
             ("https://h.example.com/", "https://h.example.com/login"),
             (
                 "https://h.example.com/api/v1?x=1",
-                "https://h.example.com/login",
+                "https://h.example.com/api/v1/login",
             ),
-            ("HTTPS://H.example.com", "https://H.example.com/login"),
-            ("http://127.0.0.1:8787/x", "http://127.0.0.1:8787/login"),
+            ("HTTPS://H.example.com", "https://h.example.com/login"),
+            ("http://127.0.0.1:8787/x", "http://127.0.0.1:8787/x/login"),
+            // 子路径部署（P3-24 的主场景）
+            (
+                "https://h.example.com/relay",
+                "https://h.example.com/relay/login",
+            ),
+            (
+                "https://h.example.com/relay/",
+                "https://h.example.com/relay/login",
+            ),
+            // 尾点 FQDN：规范化后与不带尾点同形
+            (
+                "https://h.example.com./relay",
+                "https://h.example.com/relay/login",
+            ),
         ] {
             assert_eq!(captcha_page_url(base).unwrap(), expected, "输入 {base}");
+        }
+    }
+
+    /// M16-S3 P3-24：**同一台主机**的四种写法必须给出同一个 origin（此前三种被误判为不同源，
+    /// 失败关闭 ⇒ 这些站点永远提交不了验证码）。
+    #[test]
+    fn origin_matches_normalizes_idn_trailing_dot_and_port() {
+        // ① IDN：punycode 与 Unicode 域名是同一个 origin（WHATWG/IDNA）
+        assert!(origin_matches(
+            "https://xn--80ak6aa92e.com",
+            "https://xn--80ak6aa92e.com/login"
+        ));
+        // ② 尾点 FQDN
+        assert!(origin_matches(
+            "https://h.example.com",
+            "https://h.example.com./login"
+        ));
+        assert!(origin_matches(
+            "https://h.example.com.",
+            "https://h.example.com/login"
+        ));
+        // ③ 前导零端口
+        assert!(origin_matches(
+            "https://h.example.com:443",
+            "https://h.example.com:0443/login"
+        ));
+        assert!(origin_matches(
+            "http://h.example.com:080",
+            "http://h.example.com/login"
+        ));
+        // ④ 仍然失败关闭：解析不出 ⇒ false
+        assert!(!origin_matches("https://h.example.com", "not a url"));
+        assert!(!origin_matches("not a url", "https://h.example.com/login"));
+        assert!(!origin_matches("file:///etc/passwd", "file:///etc/passwd"));
+        // ⑤ 不同 origin 仍然不同（归一化不能把不同主机混成一个）
+        assert!(!origin_matches(
+            "https://h.example.com",
+            "https://h.example.com.evil.example/login"
+        ));
+        assert!(!origin_matches(
+            "https://h.example.com",
+            "https://xn--80ak6aa92e.com/login"
+        ));
+    }
+
+    /// M16-S3 P2-20 的**对抗性**不变式：验证码页面所在的主机，必须与适配器真正
+    /// 发请求时（`{base}/api/status`）落到的主机**同一台**。
+    ///
+    /// 报告的场景：`https://evil.example\@good.example` —— 手写解析认 good.example
+    /// 而请求发往 evil.example ⇒ good.example 上过完 2FA 的 cookie 被送到 evil.example。
+    /// 现在两侧都过同一个 WHATWG 解析器，这条不变式可执行地钉住它。
+    #[test]
+    fn captcha_page_host_equals_the_host_the_adapter_requests() {
+        for base in [
+            "https://h.example.com",
+            "https://h.example.com/relay",
+            "https://alice:pw@h.example.com/x",
+            "https://evil.example\\@good.example",
+            "https://h.example.com./relay",
+            "http://127.0.0.1:8787/x",
+            "https://xn--80ak6aa92e.com",
+        ] {
+            let page = captcha_page_url(base).unwrap_or_else(|e| panic!("{base} ⇒ {e}"));
+            let api = format!("{}/api/status", base.trim_end_matches('/'));
+            // 比的是**规范化 origin**（`origin_of` 就是归属判定用的那一个）：
+            // 尾点 FQDN 这类写法字符串不同、主机语义相同，必须按语义比。
+            let page_origin = origin_of(&page).unwrap_or_else(|| panic!("{page} 应有 origin"));
+            let api_origin = origin_of(&api).unwrap_or_else(|| panic!("{api} 应有 origin"));
+            assert_eq!(
+                page_origin, api_origin,
+                "验证码页面与适配器请求必须落在同一个 origin（否则 cookie 会被送到别处）: {base}"
+            );
         }
     }
 
