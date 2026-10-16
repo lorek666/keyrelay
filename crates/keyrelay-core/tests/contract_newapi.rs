@@ -119,7 +119,7 @@ async fn login_captures_body_access_token_when_no_cookie_is_set() {
                 "data": {
                     "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.placeholder.sig",
                     "token_type": "Bearer",
-                    "user": {"id": 207, "username": "testuser", "quota": 0}
+                    "user": {"id": 207, "username": "USER_PLACEHOLDER", "quota": 0}
                 }
             }),
         ),
@@ -127,7 +127,7 @@ async fn login_captures_body_access_token_when_no_cookie_is_set() {
     let adapter = NewApi::new(transport);
 
     let session = adapter
-        .login(BASE, Credentials::new("testuser", "pw"))
+        .login(BASE, Credentials::new("USER_PLACEHOLDER", "pw"))
         .await
         .unwrap();
 

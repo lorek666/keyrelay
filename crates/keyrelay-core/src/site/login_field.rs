@@ -14,9 +14,9 @@
 //! - **Sub2API 只认邮箱**：本地上游源码 `internal/handler/auth_handler.go:77-83`
 //!   —— `Email string` 带 ``binding:"required,email"``；登录服务
 //!   `internal/service/auth_service.go:535` 只按邮箱查用户（`userRepo.GetByEmail`），
-//!   **没有用户名登录这条路径**。真实站点 `api.example.com` 实测：用户名 `testuser`
+//!   **没有用户名登录这条路径**。真实站点 `api.example.com` 实测：用户名 `USER_PLACEHOLDER`
 //!   → HTTP 400 `Field validation for 'Email' failed on the 'email' tag`（M9-S1 证据 §3）。
-//! - **NewAPI 认用户名**：`newapi.example.com` 实测 `testuser` 登录成功（M9-S1 证据 §2）。
+//! - **NewAPI 认用户名**：`newapi.example.com` 实测 `USER_PLACEHOLDER` 登录成功（M9-S1 证据 §2）。
 //!
 //! 纯函数：无 IO、无网络、不读环境变量、不读时钟。
 
@@ -186,14 +186,14 @@ mod tests {
         for bad in [
             "",                   // ① 空串
             "   ",                // ① 空白
-            "testuser",           // ② 没有 @（真实站点实测被拒的那个值）
-            " testuser ",         // ② trim 之后仍没有 @
-            "testuser qq",        // ② 空格不算 @
-            "testuser@",          // ④ 域名为空
+            "USER_PLACEHOLDER",           // ② 没有 @（真实站点实测被拒的那个值）
+            " USER_PLACEHOLDER ",         // ② trim 之后仍没有 @
+            "USER_PLACEHOLDER qq",        // ② 空格不算 @
+            "USER_PLACEHOLDER@",          // ④ 域名为空
             "@qq.com",            // ③ 本地部为空
             "@",                  // ③④
-            "testuser@qq",        // ⑤ 域名没有点
-            "testuser@localhost", // ⑤ 同上（站点正则也要求有点）
+            "USER_PLACEHOLDER@qq",        // ⑤ 域名没有点
+            "USER_PLACEHOLDER@localhost", // ⑤ 同上（站点正则也要求有点）
         ] {
             let err = LoginField::Email
                 .precheck(bad)
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn username_precheck_never_blocks() {
         for value in [
-            "testuser",
+            "USER_PLACEHOLDER",
             "",
             "   ",
             "用户",
