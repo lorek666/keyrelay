@@ -890,3 +890,64 @@ async fn auth_failure_deletes_the_persisted_session() {
         "B-113：站点侧失效后必须删掉持久化会话"
     );
 }
+
+// ============================================================ B-155（M16-S10 ②）
+
+/// **B-155 ②**（原 §7 名 `rotation_reports_local_status_not_updated`，本增量**改名**）：
+/// 站点侧删成功、**本地 `keys.status` 写失败** ⇒ `revoked == true` 且
+/// `local_status_updated == false`。轮换收尾据此报「站点侧已删、本地未写成 revoked」，
+/// 而不是纯「已回收」（否则用户以为本地也清了）。
+///
+/// **为什么改名**：拥有 `local_status_updated` 字段、能被确定断言的是 `revoke_key`；
+/// 轮换层只是把它转述成文案（那句文案仍由读码覆盖，见 spec §11）。原名会把断言引向
+/// 快乐路径（`true`），与名字不符。
+///
+/// **诱导方式（确定性，不靠概率/时序）**：SQLite 触发器只让 `keys` 表的 UPDATE 失败
+/// （`RAISE(ABORT, …)`）——`journals` / `bindings` / `events` 照常可写 ⇒ 精确命中该分支。
+#[tokio::test]
+async fn revoke_key_reports_local_status_not_updated_when_the_keys_update_fails() {
+    let f = fixture(vec![
+        login_response(&jwt_with_exp(9_999_999_999)),
+        HttpResponse::new(204, Vec::new()), // 第一次 DELETE /api/v1/keys/1
+        HttpResponse::new(204, Vec::new()), // 第二次（去掉触发器后的反向验证）
+    ]);
+    f.service
+        .login(f.site_id, Credentials::new("me@example.com", "pw-12345678"))
+        .await
+        .expect("登录");
+
+    // 只挡 keys 表的 UPDATE（其它表照常可写）
+    let conn = rusqlite::Connection::open(&f.db_path).expect("注入连接");
+    conn.execute_batch(
+        "CREATE TRIGGER block_key_status BEFORE UPDATE ON keys
+         BEGIN SELECT RAISE(ABORT, 'blocked by M16-S10 test'); END;",
+    )
+    .expect("建触发器");
+    drop(conn);
+
+    let report = f
+        .service
+        .revoke_key(f.site_id, "1")
+        .await
+        .expect("站点侧已删 ⇒ 整体仍是 Ok（本地没记上不改变「站点上那把已经没了」）");
+    assert!(report.revoked, "站点侧必须确认删除: {report:?}");
+    assert!(
+        !report.local_status_updated,
+        "本地写状态被挡住 ⇒ 必须如实报 false（调用方据此提示「本地未写成 revoked」）: {report:?}"
+    );
+
+    // 反向：去掉触发器后同一条路必须能写上 ⇒ 证明上面的 false 是触发器造成的
+    let conn = rusqlite::Connection::open(&f.db_path).expect("再开");
+    conn.execute_batch("DROP TRIGGER block_key_status")
+        .expect("删触发器");
+    drop(conn);
+    let report = f
+        .service
+        .revoke_key(f.site_id, "1")
+        .await
+        .expect("第二次回收");
+    assert!(
+        report.local_status_updated,
+        "没有触发器时必须写上 revoked: {report:?}"
+    );
+}
