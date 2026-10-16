@@ -642,21 +642,81 @@ function parseRustCommandParams() {
   return map;
 }
 
-/** `api.ts` 里每个 `invokeCommand("cmd", { … })` 的键集合。 */
+/**
+ * `api.ts` 里每个 `invokeCommand("cmd", { … })` 的键集合。
+ *
+ * **M16-S6b 复审 P1-1 的修法**：旧实现用一条正则
+ * `invokeCommand(?:<…>)?\(\s*"cmd"\s*(?:,\s*\{([^}]*)\})?\s*\)`，它有两种静默跳过：
+ * ① 多行收尾（`,\n  })`）；② **嵌套花括号**（`{ args: { keep } }` —— `[^}]*` 在第一个 `}` 就停）。
+ * 实测 57 个调用点里只解析到 50 个，而汇总行只报「解析到多少」，**不报总数** ⇒ 读者无从发现缺口。
+ * 现在改成「扫描 + 花括号配对」，并加**计数自证**：调用点总数与解析数不等就红。
+ */
 function parseTsInvokeArgs() {
   const source = stripComments(
     readFileSync(join(root, "src/lib/api.ts"), "utf8"),
   );
   const map = new Map();
-  for (const m of source.matchAll(
-    /invokeCommand(?:<[^>]*>)?\(\s*"([a-z_]+)"\s*(?:,\s*\{([^}]*)\})?\s*\)/g,
-  )) {
-    const [, cmd, obj] = m;
-    const keys = (obj ?? "")
-      .split(",")
-      .map((part) => part.split(":")[0].trim())
-      .filter(Boolean);
+  let calls = 0;
+
+  /** 顶层逗号切分（忽略嵌套 `{}`/`[]`/`()` 里的逗号）。 */
+  const topLevelParts = (body) => {
+    const parts = [];
+    let depth = 0;
+    let current = "";
+    for (const ch of body) {
+      if (ch === "{" || ch === "[" || ch === "(") depth += 1;
+      else if (ch === "}" || ch === "]" || ch === ")") depth -= 1;
+      if (ch === "," && depth === 0) {
+        parts.push(current);
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+    if (current.trim()) parts.push(current);
+    return parts;
+  };
+
+  const re = /invokeCommand(?:<[^>]*>)?\(\s*"([a-z_]+)"/g;
+  let m;
+  while ((m = re.exec(source)) !== null) {
+    calls += 1;
+    const cmd = m[1];
+    let i = re.lastIndex;
+    while (i < source.length && /\s/.test(source[i])) i += 1;
+    let keys = [];
+    if (source[i] === ",") {
+      i += 1;
+      while (i < source.length && /\s/.test(source[i])) i += 1;
+      if (source[i] === "{") {
+        // 花括号配对扫到匹配的 `}`：多行与嵌套都吃得下
+        let depth = 0;
+        const start = i;
+        for (; i < source.length; i += 1) {
+          if (source[i] === "{") depth += 1;
+          else if (source[i] === "}") {
+            depth -= 1;
+            if (depth === 0) break;
+          }
+        }
+        keys = topLevelParts(source.slice(start + 1, i))
+          .map((part) => part.split(":")[0].trim())
+          .filter(Boolean);
+      }
+    }
     map.set(cmd, keys);
+  }
+
+  // 计数自证：调用点总数必须与解析数相等（把「静默漏」变成「显式红」）
+  const occurrences = [...source.matchAll(/invokeCommand/g)].length;
+  const declarations = [...source.matchAll(/function\s+invokeCommand/g)].length;
+  const expected = occurrences - declarations;
+  if (calls !== expected) {
+    throw new Error(
+      `invokeCommand 调用点总数与解析数不一致：文件里有 ${expected} 个调用点，` +
+        `只解析到 ${calls} 个（差 ${expected - calls}）。` +
+        `有调用点没被参数名守护覆盖——修解析器，不要放过。`,
+    );
   }
   if (map.size === 0) {
     throw new Error("在 api.ts 里没解析到任何 invokeCommand 调用——解析器坏了，不能当成通过");
