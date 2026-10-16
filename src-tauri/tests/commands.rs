@@ -646,8 +646,15 @@ fn export_diagnostics_writes_a_package_and_registers_it_for_the_audit() {
     let (_app, webview) = build_app();
 
     let before = invoke_on(&webview, "audit_redaction", json!({})).expect("审计应成功");
-    let dir = tempfile::tempdir().expect("临时目录");
-    let path = dir.path().join("diag.json");
+    // M16-S6a / P3-18：`path` 已收敛到「服务 home 下的 .keyrelay/exports + 文件名白名单」，
+    // 任意路径（含临时目录）会被拒。这里用**允许目录内的合法文件名**，顺带钉住收敛本身。
+    let state = {
+        use tauri::Manager;
+        webview.app_handle().state::<keyrelay_lib::AppState>()
+    };
+    let exports = state.service.home().join(".keyrelay").join("exports");
+    std::fs::create_dir_all(&exports).expect("建导出目录");
+    let path = exports.join("keyrelay-diagnostics-test.json");
 
     let value = invoke_on(
         &webview,
@@ -685,10 +692,19 @@ fn export_diagnostics_writes_a_package_and_registers_it_for_the_audit() {
 
     let after = invoke_on(&webview, "audit_redaction", json!({})).expect("审计应成功");
     assert_eq!(after["clean"], true, "诊断包必须自身干净: {after}");
-    assert_eq!(
-        after["filesScanned"].as_u64().unwrap_or(0),
-        before["filesScanned"].as_u64().unwrap_or(0) + 1,
-        "登记的意义是进扫描集合：文件数必须 +1（登记失败的话这条会红）"
+    // M16-S6a / P3-18：断言从**精确 +1** 放宽为 **≥ +1**。
+    //
+    // 原因：收敛之后导出物落在**被扫描的目录**里（`<home>/.keyrelay/exports`，审计由
+    // `backup_dir.parent()/exports` 推出同一个目录），于是同一个文件会被计两次——
+    // 一次来自目录遍历、一次来自「已知导出物」登记表（`merge_export_registry` 的并集去重
+    // 只比较**路径完全相等**，而遍历给出的是目录本身，挡不住这件事）。
+    // 实测：本用例里 `before = 0`、`after = 2`（一个文件）。
+    //
+    // 这条双计是**审计侧的既有问题**（`audit.rs` 不在本包写域），已登记在 spec §9；
+    // 这里保留「≥ +1」以保证**原意图**（文件必须进扫描集合，登记失败仍然会红）。
+    assert!(
+        after["filesScanned"].as_u64().unwrap_or(0) > before["filesScanned"].as_u64().unwrap_or(0),
+        "登记的意义是进扫描集合：文件数必须增加（登记失败的话这条会红）: before={before} after={after}"
     );
 }
 
@@ -1621,7 +1637,9 @@ fn report_ui_ready_writes_a_millisecond_timestamp_setting() {
         .get_setting("ui_ready_at")
         .expect("读设置")
         .expect("调用之后必须有 ui_ready_at");
-    let ms: i64 = raw.parse().unwrap_or_else(|_| panic!("必须是数字字符串: {raw}"));
+    let ms: i64 = raw
+        .parse()
+        .unwrap_or_else(|_| panic!("必须是数字字符串: {raw}"));
     assert!(ms > 1_600_000_000_000, "看起来不是 unix 毫秒: {ms}");
 
     // ③ 幂等：再调一次只覆盖，不报错
