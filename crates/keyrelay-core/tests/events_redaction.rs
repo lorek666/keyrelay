@@ -255,29 +255,44 @@ fn diagnostic_export_includes_vault_backend_for_support() {
 ///   cargo test -p keyrelay-core --test events_redaction scrub_legacy_event_rows -- --ignored --nocapture
 /// $ sqlite3 ~/.keyrelay/keyrelay.db "SELECT count(*) FROM events;"
 /// ```
-/// `KEYRELAY_DB` 指向哪个库就改哪个库；**缺省仍是临时目录**（自检形态不变）。
-/// **跑之前一定先备份** `<db>` 与 `<db>-wal` / `<db>-shm`（WAL 模式下缺一个都不完整）。
+/// **三态**（M16-S1 / P2-23：真实库模式下**不造夹具行、不做数量断言、不 panic、默认不写**）：
+///
+/// ```console
+/// # ① 自检（缺省）：临时库 + 夹具 + 全部断言
+/// $ cargo test -p keyrelay-core --test events_redaction scrub_legacy_event_rows -- --ignored --nocapture
+///
+/// # ② 真实库**干跑**：只列出会改哪些行，一个字节都不写
+/// $ KEYRELAY_DB=~/.keyrelay/keyrelay.db \
+///     cargo test -p keyrelay-core --test events_redaction scrub_legacy_event_rows -- --ignored --nocapture
+///
+/// # ③ 真实库**实改**（先备份 <db> 与 <db>-wal / <db>-shm！）
+/// $ KEYRELAY_DB=~/.keyrelay/keyrelay.db KEYRELAY_DB_APPLY=1 \
+///     cargo test -p keyrelay-core --test events_redaction scrub_legacy_event_rows -- --ignored --nocapture
+/// ```
+///
+/// `KEYRELAY_DB` 指向哪个库就作用在哪个库；**缺省仍是临时目录**（自检形态不变）。
+/// 实改必须显式 `KEYRELAY_DB_APPLY=1` —— 不可逆动作不提供「无参数即执行」的形态。
 #[tokio::test]
-#[ignore = "一次性数据修复：跑之前先备份数据库；它逐行改写 message / payload"]
+#[ignore = "一次性数据修复：默认干跑；实改要 KEYRELAY_DB_APPLY=1，且先备份数据库"]
 async fn scrub_legacy_event_rows() {
     use keyrelay_core::observability::{Event, Level};
     use keyrelay_core::store::Store;
 
-    // `KEYRELAY_DB` 指向真实库时就地修（P2-3）；否则用临时库自检。
+    // `KEYRELAY_DB` 指向真实库 ⇒ 走真实库模式（干跑 / 实改）；否则用临时库自检。
+    // **两条路彻底分开**（M16-S1 / P2-23）：真实库模式不造夹具行、不做数量断言、
+    // 不 panic —— 旧形态把夹具断言带进真实库，于是「库里有真实泄漏」时先 panic、
+    // 「干净库」时又先不可逆改写 `kr/...` 再报失败。
     let dir = tempfile::tempdir().expect("临时目录");
-    let (db, _keep) = match std::env::var("KEYRELAY_DB") {
-        Ok(path) if !path.trim().is_empty() => {
-            let path = std::path::PathBuf::from(path);
-            println!("目标库（真实）: {}", path.display());
-            println!("  （若还没备份，现在 Ctrl-C：要连 <db>-wal / <db>-shm 一起备份）");
-            (path, dir)
-        }
-        _ => {
-            let path = dir.path().join("legacy.db");
-            println!("目标库（临时自检）: {}", path.display());
-            (path, dir)
-        }
-    };
+    let target = std::env::var("KEYRELAY_DB")
+        .ok()
+        .filter(|path| !path.trim().is_empty());
+    if let Some(path) = target {
+        real_db_mode(std::path::Path::new(&path));
+        return;
+    }
+
+    let db = dir.path().join("legacy.db");
+    println!("目标库（临时自检）: {}", db.display());
     let store = Store::open(&db).expect("文件库");
 
     // 造两行「老形态」。`Event` 的字段是 pub，所以可以直接拼一个**未脱敏**的行，
@@ -329,4 +344,194 @@ async fn scrub_legacy_event_rows() {
         "其它字段该原样: {payload}"
     );
     println!("复核通过：message / payload 均已掩码，其它字段原样");
+}
+
+/// **真实库模式**（干跑 / 实改）：不造夹具行、不做数量断言、**不 panic**。
+///
+/// 干跑是缺省：先列出「哪些行会被改写、命中 message 还是 payload」，确认后加
+/// `KEYRELAY_DB_APPLY=1` 才写。任何异常（打开失败 / 读取失败 / 改写中断）都只打印，
+/// 不 panic —— 用户是在**自己的真实库**上跑这个工具，工具崩掉不能留下半改状态还报错。
+fn real_db_mode(path: &Path) {
+    println!("目标库（真实）: {}", path.display());
+    let store = match Store::open(path) {
+        Ok(store) => store,
+        Err(err) => {
+            println!("打开失败，未写入任何字节: {err}");
+            return;
+        }
+    };
+
+    let planned = plan_legacy_scrub(&store);
+
+    if !apply_requested() {
+        println!(
+            "【干跑】以上是**计划**，未写入任何字节。确认后加 `KEYRELAY_DB_APPLY=1` 重跑；\
+             跑之前先备份 <db> 与 <db>-wal / <db>-shm（WAL 模式下缺一个都不完整）。"
+        );
+        return;
+    }
+
+    println!("【实改】开始逐行改写（不可逆）……");
+    match store.scrub_legacy_events() {
+        Ok(written) => println!("已改写 {written} 行（计划 {planned} 行）"),
+        Err(err) => println!("改写中断: {err}（已改写的行不会回滚；库仍可用）"),
+    }
+    match store.count_events_with_secrets() {
+        Ok(after) => println!("复扫：{after} 行仍含密钥形态"),
+        Err(err) => println!("复扫失败: {err}"),
+    }
+}
+
+/// 实改是否被显式请求（`KEYRELAY_DB_APPLY=1`）。
+fn apply_requested() -> bool {
+    matches!(
+        std::env::var("KEYRELAY_DB_APPLY").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    )
+}
+
+/// **干跑**：只打印「哪些行会被改写、命中的是 message 还是 payload」，一个字节都不写。
+/// 返回计划改写的行数。
+///
+/// 用与 [`Store::scrub_legacy_events`] **同一对规则函数**（`redact::scrub_event_message` /
+/// `scrub_event_payload`）判定 ⇒「计划」与「实改」不会分叉。
+fn plan_legacy_scrub(store: &Store) -> usize {
+    let rows = match store.list_all_events() {
+        Ok(rows) => rows,
+        Err(err) => {
+            println!("读取事件失败: {err}");
+            return 0;
+        }
+    };
+    let mut planned = 0usize;
+    for row in &rows {
+        let new_message = keyrelay_core::redact::scrub_event_message(&row.message);
+        let new_payload = keyrelay_core::redact::scrub_event_payload(row.payload.as_deref());
+        let message_changed = new_message != row.message;
+        let payload_changed = new_payload.as_deref() != row.payload.as_deref();
+        if message_changed || payload_changed {
+            planned += 1;
+            println!(
+                "  行 #{} 将改写（message: {} / payload: {}）",
+                row.id,
+                if message_changed { "是" } else { "否" },
+                if payload_changed { "是" } else { "否" }
+            );
+        }
+    }
+    println!(
+        "【计划】共 {planned} 行将被改写（事件总行数 {}）",
+        rows.len()
+    );
+    planned
+}
+
+/// 造一个「真实库形态」的库：一行**真泄漏** + 一行**正常事件**（只带钥匙串引用）。
+fn real_like_db(dir: &Path) -> (Store, PathBuf) {
+    use keyrelay_core::observability::{Event, Level};
+
+    let path = dir.join("real.db");
+    let store = Store::open(&path).expect("文件库");
+    // 真泄漏：message 里带密钥明文（M8 之前的历史形态）
+    store
+        .insert_event(&Event {
+            ts: 1_700_000_000,
+            level: Level::Warn,
+            source: "site".to_string(),
+            message: format!("取密钥失败 {SECRET}"),
+            payload: Some(format!(r#"{{"note":"{SECRET}","key_id":1}}"#)),
+        })
+        .expect("写泄漏行");
+    // 正常事件：只带钥匙串引用 `kr/<scope>/<id>/<field>`，不是密钥明文
+    store
+        .insert_event(&Event {
+            ts: 1_700_000_001,
+            level: Level::Info,
+            source: "delivery".to_string(),
+            message: "已投递（引用 kr/key/1/secret）".to_string(),
+            payload: Some(r#"{"key_id":1,"ref":"kr/key/1/secret"}"#.to_string()),
+        })
+        .expect("写正常行");
+    (store, path)
+}
+
+/// 库的「数据字节量」指纹：主库 + WAL 的长度。真写入一定会让其中之一变化。
+fn db_sizes(path: &Path) -> (u64, u64) {
+    let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    (
+        size(path),
+        size(&PathBuf::from(format!("{}-wal", path.display()))),
+    )
+}
+
+#[test]
+fn legacy_scrub_dry_run_writes_nothing() {
+    // **M16-S1 / P2-23**：真实库形态下，干跑必须**一个字节都不写**、**不 panic**。
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (store, path) = real_like_db(dir.path());
+
+    let rows_before = store.list_all_events().expect("读事件");
+    let secrets_before = store.count_events_with_secrets().expect("扫描");
+    let sizes_before = db_sizes(&path);
+
+    let planned = plan_legacy_scrub(&store);
+
+    assert_eq!(
+        planned, 2,
+        "两行都会被现有规则计划改写（真泄漏 + `kr/...` 引用形态——后者是 B-62 的既有规则）"
+    );
+    assert_eq!(
+        store.list_all_events().expect("读事件"),
+        rows_before,
+        "干跑不得改动任何事件行"
+    );
+    assert_eq!(
+        store.count_events_with_secrets().expect("复扫"),
+        secrets_before,
+        "干跑不得改变「含密钥形态」的行数"
+    );
+    assert_eq!(db_sizes(&path), sizes_before, "干跑不得写入库文件");
+}
+
+#[test]
+fn legacy_scrub_apply_rewrites_the_leak_and_does_not_panic() {
+    // **M16-S1 / P2-23**：实改把泄漏行掩掉，**不 panic**（即使库里还有别的形态）。
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (store, _path) = real_like_db(dir.path());
+
+    let written = store.scrub_legacy_events().expect("逐行改写");
+    assert_eq!(
+        written, 2,
+        "两行都会被现有规则改写（泄漏行 + 引用行；引用形态被掩是 B-62 的既有规则）"
+    );
+    assert_eq!(
+        store.count_events_with_secrets().expect("复扫"),
+        0,
+        "实改后不得再有含密钥形态的行"
+    );
+
+    let rows = store.list_all_events().expect("读事件");
+    let leaky = rows
+        .iter()
+        .find(|row| row.message.contains("取密钥失败"))
+        .expect("泄漏行还在");
+    assert!(
+        !leaky.message.contains(SECRET),
+        "明文必须被掩: {}",
+        leaky.message
+    );
+    assert!(
+        leaky.message.contains("sk-***"),
+        "该掩成 sk-***: {}",
+        leaky.message
+    );
+    let normal = rows
+        .iter()
+        .find(|row| row.message.contains("已投递"))
+        .expect("正常行还在");
+    assert!(
+        !normal.message.contains("kr/key/1/secret"),
+        "引用形态按既有规则掩掉（行为稳定即可）: {}",
+        normal.message
+    );
 }
