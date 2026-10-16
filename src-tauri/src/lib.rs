@@ -212,37 +212,22 @@ enum OnlineModelMeta {
     Disabled,
 }
 
-/// 通知总开关的**设置键**（M16-S9 / S5 复审 P1-1）。
-///
-/// 为什么是裸 KV 而不是 `Settings` 的字段：`Settings` 里今天**没有**总开关
-/// （只有 `notify_system_enabled`，默认 `true`，那是「系统通知这一路可用吗」，
-/// 不是「要不要跑通知」）。`settings.rs` 属 core，本步的写域只到 `src-tauri`
-/// 加一处 `observability.rs`；所以总开关先落在 KV 上，**缺省即关**——
-/// 与今天「`with_notify` 从不被调用」的行为**逐字相同**。
-///
-/// 要做进 `Settings`（含界面开关）是一次独立改动：需要 `settings.rs` 的字段 +
-/// 白名单 + DTO + 设置页，登记在 spec §13。
-const NOTIFY_ENABLED_KEY: &str = "notify_enabled";
-
 /// 从设置构造 `NotifyConfig`；**总开关没开就返回 `None`**（⇒ 不调 `with_notify`）。
 ///
 /// 判据（S5 复审 P1-1）：`with_notify` 零生产调用点 ⇒ `self.notify` 恒 `None` ⇒
 /// `dispatch_notifications` 在早退处返回 ⇒ **基线永不落库、`ModelsChanged` 永不触发**。
 /// 这条桥把「设置」接到「服务」上，同时保证默认关。
+///
+/// **单一事实来源**（M16-S9 第二步）：总开关是 `Settings::notify_enabled`（默认 `false`）。
+/// 早先那版从裸 KV 键读的兜底路径已删除——留两条路径就会出现「设置页显示关、实际开着」这类
+/// 不可归因的状态。
 fn build_notify_config(store: &Store) -> Option<keyrelay_core::notify::NotifyConfig> {
-    let enabled = store
-        .get_setting(NOTIFY_ENABLED_KEY)
-        .ok()
-        .flatten()
-        .is_some_and(|value| {
-            let v = value.trim();
-            v.eq_ignore_ascii_case("true") || v == "1"
-        });
-    if !enabled {
+    // 读不出来（老库/损坏）就退回 `None`：不让 app 因为设置读不出来而起不来，
+    // 也不静默打开通知（`None` = 不接线 = 与「通知从未接线」逐字相同）。
+    let settings = keyrelay_core::settings::Settings::load_from_store(store).ok()?;
+    if !settings.notify_enabled {
         return None;
     }
-    // 开关开着才读 `Settings`：读不出来（老库/损坏）就退回 `None`，不让 app 起不来。
-    let settings = keyrelay_core::settings::Settings::load_from_store(store).ok()?;
     Some(keyrelay_core::notify::NotifyConfig {
         system_enabled: settings.notify_system_enabled,
         webhook_url: {
@@ -253,7 +238,6 @@ fn build_notify_config(store: &Store) -> Option<keyrelay_core::notify::NotifyCon
                 Some(url.to_string())
             }
         },
-        // 阈值今天不在 `Settings` 里（同上）⇒ 保持 core 默认的「关」（`0.0`）。
         balance_threshold: 0.0,
         timeout: std::time::Duration::from_secs(settings.notify_timeout_secs),
     })

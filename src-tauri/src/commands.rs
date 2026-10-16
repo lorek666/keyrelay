@@ -333,6 +333,8 @@ pub struct SettingsDto {
     telemetry_enabled: bool,
     auto_update_enabled: bool,
     // ---- M6-S5：FR-3 通知 ----
+    /// M16-S9：通知**总开关**（默认关）。关着时服务层不装通知状态。
+    notify_enabled: bool,
     notify_system_enabled: bool,
     notify_webhook_url: String,
     notify_timeout_secs: u64,
@@ -1128,6 +1130,7 @@ fn settings_from_dto(dto: &SettingsDto) -> keyrelay_core::settings::Settings {
         proxy_mode: dto.proxy_mode.clone(),
         telemetry_enabled: dto.telemetry_enabled,
         auto_update_enabled: dto.auto_update_enabled,
+        notify_enabled: dto.notify_enabled,
         notify_system_enabled: dto.notify_system_enabled,
         notify_webhook_url: dto.notify_webhook_url.clone(),
         notify_timeout_secs: dto.notify_timeout_secs,
@@ -1155,6 +1158,7 @@ fn settings_to_dto(settings: &keyrelay_core::settings::Settings) -> SettingsDto 
         proxy_mode: settings.proxy_mode.clone(),
         telemetry_enabled: settings.telemetry_enabled,
         auto_update_enabled: settings.auto_update_enabled,
+        notify_enabled: settings.notify_enabled,
         notify_system_enabled: settings.notify_system_enabled,
         notify_webhook_url: settings.notify_webhook_url.clone(),
         notify_timeout_secs: settings.notify_timeout_secs,
