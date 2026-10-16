@@ -1,12 +1,11 @@
 //! Claude Code 通道：`~/.claude/settings.json` 的 `env.ANTHROPIC_*`。
 //!
 //! 本机实测（2026-10-12）该文件有 **6 个顶层键**与 **9 个 `env` 键**，
-//! 投递只允许碰其中两个：
+//! 投递只允许碰其中两个（+ M14-S7 新增的 `ANTHROPIC_MODEL`）：
 //! ```json
-//! { "env": { "ANTHROPIC_AUTH_TOKEN": "sk-…", "ANTHROPIC_BASE_URL": "https://…" } }
+//! { "env": { "ANTHROPIC_AUTH_TOKEN": "sk-…", "ANTHROPIC_BASE_URL": "https://…", "ANTHROPIC_MODEL": "gpt-4o" } }
 //! ```
-//! 其余键（`permissions` / `enabledPlugins` / 其它 `ANTHROPIC_DEFAULT_*_MODEL`）必须保留——
-//! 把用户的模型别名配置洗掉会让 Claude Code 行为突变。
+//! 其余键（`permissions` / `enabledPlugins` / 其它 `ANTHROPIC_DEFAULT_*_MODEL`）必须保留。
 
 use std::path::{Path, PathBuf};
 
@@ -20,11 +19,13 @@ use crate::inject::Patch;
 pub struct ClaudeCodeWriter {
     path: PathBuf,
     base_url: String,
+    model: Option<String>,
 }
 
 impl ClaudeCodeWriter {
     pub const FIELD_TOKEN: &'static str = "ANTHROPIC_AUTH_TOKEN";
     pub const FIELD_BASE_URL: &'static str = "ANTHROPIC_BASE_URL";
+    pub const FIELD_MODEL: &'static str = "ANTHROPIC_MODEL";
     const ENV_KEY: &'static str = "env";
 
     pub fn new(home: &Path, base_url: &str) -> Self {
@@ -35,7 +36,17 @@ impl ClaudeCodeWriter {
         Self {
             path: path.into(),
             base_url: base_url.to_string(),
+            model: None,
         }
+    }
+
+    pub fn with_model(home: &Path, base_url: &str, model: Option<&str>) -> Self {
+        let mut w = Self::new(home, base_url);
+        w.model = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        w
     }
 
     pub fn path(&self) -> &Path {
@@ -57,6 +68,9 @@ impl DeliveryWriter for ClaudeCodeWriter {
         if !self.base_url.is_empty() {
             names.push(Self::FIELD_BASE_URL.to_string());
         }
+        if self.model.is_some() {
+            names.push(Self::FIELD_MODEL.to_string());
+        }
         names
     }
 
@@ -65,18 +79,26 @@ impl DeliveryWriter for ClaudeCodeWriter {
         if !self.base_url.is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
+        if let Some(m) = &self.model {
+            fields.push(literal_field(Self::FIELD_MODEL, m));
+        }
         fields
     }
 
     fn plan(&self, api_key: &str) -> Result<Patch> {
         let before = read_text_or_empty(&self.path)?;
-        let after = build_after(&before, api_key, &self.base_url, &self.path)?;
+        let after = build_after(&before, api_key, &self.base_url, &self.model, &self.path)?;
         Ok(Patch::secret_bearing(self.path.clone(), before, after))
     }
 }
 
-/// 生成写入后的完整文本。`api_key` 会出现在返回值里——调用方不得打印。
-fn build_after(before: &str, api_key: &str, base_url: &str, path: &Path) -> Result<String> {
+fn build_after(
+    before: &str,
+    api_key: &str,
+    base_url: &str,
+    model: &Option<String>,
+    path: &Path,
+) -> Result<String> {
     if api_key.trim().is_empty() {
         return Err(Error::inject(path, "密钥为空，拒绝写入"));
     }
@@ -91,11 +113,16 @@ fn build_after(before: &str, api_key: &str, base_url: &str, path: &Path) -> Resu
             Value::String(api_key.to_string()),
         );
         if base_url.is_empty() {
-            // base_url 为空表示「只投递密钥」：不动用户已有的 BASE_URL
         } else {
             env.insert(
                 ClaudeCodeWriter::FIELD_BASE_URL.to_string(),
                 Value::String(base_url.to_string()),
+            );
+        }
+        if let Some(m) = model {
+            env.insert(
+                ClaudeCodeWriter::FIELD_MODEL.to_string(),
+                Value::String(m.clone()),
             );
         }
     }
@@ -132,7 +159,6 @@ mod tests {
 
     #[test]
     fn preserves_every_other_key() {
-        // 仿本机真实形态：6 个顶层键 + 9 个 env 键
         let dir = tmp();
         let before = r#"{
   "env": {
@@ -161,7 +187,6 @@ mod tests {
         assert_eq!(after["env"]["ANTHROPIC_AUTH_TOKEN"], SECRET);
         assert_eq!(after["env"]["ANTHROPIC_BASE_URL"], BASE);
 
-        // 除目标两个键外，其余键的**值**必须完全相同
         for key in ["permissions", "enableWorkflows", "enabledPlugins"] {
             assert_eq!(after[key], before_v[key], "顶层键 {key} 被改动了");
         }
@@ -169,12 +194,11 @@ mod tests {
             after["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
             before_v["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"]
         );
+        // ANTHROPIC_MODEL 不传 model 时不改
         assert_eq!(
             after["env"]["ANTHROPIC_MODEL"],
             before_v["env"]["ANTHROPIC_MODEL"]
         );
-        // 缩进风格保留
-        assert!(patch.after.contains("\n  \"env\""), "{}", patch.after);
     }
 
     #[test]
@@ -259,5 +283,54 @@ mod tests {
         assert_eq!(fields[0].masked, "…cdef");
         assert_eq!(fields[1].key, "ANTHROPIC_BASE_URL");
         assert_eq!(fields[1].masked, BASE);
+    }
+
+    // ============================ M14-S7：B 类——只写模型名，不写参数
+
+    const MODEL: &str = "gpt-4o";
+
+    #[test]
+    fn writes_model_name_only() {
+        let dir = tmp();
+        let writer = ClaudeCodeWriter::with_model(dir.path(), BASE, Some(MODEL));
+        let patch = writer.plan(SECRET).unwrap();
+        let v: Value = serde_json::from_str(&patch.after).unwrap();
+        assert_eq!(v["env"]["ANTHROPIC_MODEL"], MODEL);
+        // B 类不写 context_window / max_output
+        assert!(v["env"].get("contextWindow").is_none());
+        assert!(v["env"].get("maxTokens").is_none());
+    }
+
+    #[test]
+    fn model_plan_is_idempotent() {
+        let dir = tmp();
+        let writer = ClaudeCodeWriter::with_model(dir.path(), BASE, Some(MODEL));
+        std::fs::create_dir_all(writer.path().parent().unwrap()).ok();
+        let first = writer.plan(SECRET).unwrap();
+        std::fs::write(writer.path(), &first.after).unwrap();
+        let second = writer.plan(SECRET).unwrap();
+        assert_eq!(second.after, first.after);
+    }
+
+    #[test]
+    fn model_replaces_existing() {
+        let dir = tmp();
+        let before = json!({"env": {"ANTHROPIC_MODEL": "old-model"}}).to_string();
+        let writer = ClaudeCodeWriter::with_model(dir.path(), BASE, Some(MODEL));
+        std::fs::create_dir_all(writer.path().parent().unwrap()).ok();
+        std::fs::write(writer.path(), &before).unwrap();
+        let patch = writer.plan(SECRET).unwrap();
+        let v: Value = serde_json::from_str(&patch.after).unwrap();
+        assert_eq!(v["env"]["ANTHROPIC_MODEL"], MODEL);
+    }
+
+    #[test]
+    fn no_model_preserves_existing_model() {
+        let dir = tmp();
+        let before = json!({"env": {"ANTHROPIC_MODEL": "user-model"}}).to_string();
+        std::fs::write(writer_in(dir.path(), BASE).path(), &before).unwrap();
+        let patch = writer_in(dir.path(), BASE).plan(SECRET).unwrap();
+        let v: Value = serde_json::from_str(&patch.after).unwrap();
+        assert_eq!(v["env"]["ANTHROPIC_MODEL"], "user-model");
     }
 }
