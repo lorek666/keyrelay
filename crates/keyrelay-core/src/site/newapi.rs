@@ -294,10 +294,11 @@ fn safe_path_segment(id: &str) -> Result<&str> {
 
 /// 带操作上下文的失败归类。
 ///
-/// 站点原文先过 `redact::scrub`（BACKLOG B-36：`AuthFailed` 直接携带站点原文，
-/// 若站点把密钥回显在错误文案里就会原样外流）。
+/// 站点原文先过 [`super::site_text_for_error`]（剥控制字符 + 截断 + `redact::scrub`；
+/// BACKLOG B-36：`AuthFailed` 直接携带站点原文，若站点把密钥回显在错误文案里就会原样外流。
+/// M16-S3 P3-19 补上长度与字符集两道）。
 fn classify_failure(op: &str, message: &str) -> Error {
-    let scrubbed = crate::redact::scrub(message);
+    let scrubbed = super::site_text_for_error(message);
     match classify_login_message(&scrubbed) {
         Error::AuthFailed(detail) => Error::AuthFailed(format!("{op}被站点拒绝（{detail}）")),
         // 验证码 / 二次验证与操作无关，保持原样
@@ -570,7 +571,14 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
                 // 早先的实现把 `access_token` 写死 `None`，于是在**不发 Set-Cookie、
                 // 只回 body token** 的站点上，登录返回 200 却拿到一个空会话——
                 // 随后每个带会话的请求都 401（`newapi.example.com` 实测复现）。
-                let access_token = json_str(&value, "/data/access_token").map(str::to_string);
+                // M16-S3 P3-20：空串（`"access_token": ""`）等于**没有令牌**。
+                // 不加这一层，`Some("")` 会让下面的守卫以为会话已经建好
+                // （`access_token.is_none()` 为 false）⇒ 绕过 M9-S1 的「空会话即失败」，
+                // 用户拿到一个每次请求都 401 的空会话。
+                let access_token = json_str(&value, "/data/access_token")
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string);
                 let cookies = resp.set_cookies();
                 if access_token.is_none() && cookies.is_empty() {
                     // 明确的失败。返回空会话会让「登录成功」和「什么都做不了」同时成立，
@@ -1006,5 +1014,76 @@ mod tests {
         let groups = parse_user_groups(&data).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].rate, Some(0.0));
+    }
+
+    // ============================================================ M16-S3 P3-20：空 access_token
+
+    use crate::site::transport::{HttpResponse, MockTransport};
+    use crate::site::Credentials;
+
+    fn login_with(login_body: serde_json::Value, set_cookie: Option<&str>) -> Result<Session> {
+        let probe = HttpResponse::json(200, json!({"success": true, "data": {"enabled": false}}))
+            .expect("探测响应");
+        let mut login = HttpResponse::json(200, login_body).expect("登录响应");
+        if let Some(cookie) = set_cookie {
+            login = login.with_header("Set-Cookie", cookie);
+        }
+        let adapter = NewApi::new(MockTransport::new(vec![probe, login]));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(adapter.login("https://relay.example.com", Credentials::new("me", "pw")))
+    }
+
+    #[test]
+    fn login_with_empty_access_token_and_no_cookie_is_a_failure() {
+        // M16-S3 P3-20：`"access_token": ""` 曾经被当成「有令牌」⇒ 守卫不触发 ⇒
+        // 用户拿到一个每次请求都 401 的空会话（M9-S1 的「空会话即失败」被绕过）。
+        let err = login_with(
+            json!({"success": true, "message": "", "data": {"id": 7, "access_token": ""}}),
+            None,
+        )
+        .expect_err("空 access_token + 无 cookie 必须失败");
+        assert!(
+            matches!(&err, Error::AuthFailed(m) if m.contains("无法建立会话")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn login_with_whitespace_access_token_and_no_cookie_is_a_failure() {
+        let err = login_with(
+            json!({"success": true, "data": {"id": 7, "access_token": "   "}}),
+            None,
+        )
+        .expect_err("纯空白 access_token + 无 cookie 必须失败");
+        assert!(matches!(err, Error::AuthFailed(_)), "{err:?}");
+    }
+
+    #[test]
+    fn login_with_empty_access_token_but_a_cookie_still_builds_a_session() {
+        // 空令牌不等于「登录失败」：站点仍可能给了会话 cookie（旧版形态）——
+        // 这时会话可用，只是没有 bearer 令牌。
+        let session = login_with(
+            json!({"success": true, "data": {"id": 7, "access_token": ""}}),
+            Some("session=abc; Path=/; HttpOnly"),
+        )
+        .expect("有 cookie 时应能建会话");
+        assert_eq!(session.access_token, None, "空串不得被当成令牌");
+        assert_eq!(session.cookies.len(), 1);
+    }
+
+    #[test]
+    fn login_with_a_real_access_token_still_keeps_it() {
+        let session = login_with(
+            json!({"success": true, "data": {"id": 7, "access_token": "pat-abcdefgh12345678"}}),
+            None,
+        )
+        .expect("有令牌时应能建会话");
+        assert_eq!(
+            session.access_token.as_deref(),
+            Some("pat-abcdefgh12345678")
+        );
     }
 }
