@@ -248,12 +248,19 @@ impl DeliveryChannel {
 /// 文件（Codex 的 endpoint 在 `~/.codex/config.toml`，不在 `auth.json` 里），否则 agent 会把
 /// 本地令牌发到站点、拿回 401。
 ///
-/// 判据与 `resolve` / `resolve_for_gateway` 的装配表**同源**：Codex 的 writer 只吃 `home`
-/// （`CodexAuthWriter::new(home)`），其余通道都吃 `base_url`（`*Writer::with_model(home,
-/// base_url, …)`）。新增通道时，如果新 writer 不吃 `base_url`，这里要同步加进去——
-/// 有单测钉住当前这张表。
+/// 判据**不是**「writer 的构造器吃不吃 `base_url`」，而是「**落点文件里到底有没有 endpoint**」——
+/// 两者会分叉：`DshWriter::new(home, _base_url)` 收了 `base_url` 却**不使用**
+/// （`dsh.rs` 只写 `KEYRELAY_API_KEY`；DSH 的 endpoint 在用户自己配的
+/// `~/.dsh/profiles/desktop/cordis.patch.yml` 里，M14-S3 spec §4.3）⇒ 它和 Codex 一样属于
+/// 「落点文件里没有 endpoint」。
+///
+/// 例外集是**显式清单**，并由 `endpoint_in_channel_matches_what_the_writer_writes`
+/// 从 writer 真正产出的 `fields` 反推校验（不是复读本函数）。
 pub fn channel_carries_endpoint(channel: DeliveryChannel) -> bool {
-    !matches!(channel, DeliveryChannel::CodexAuthJson)
+    !matches!(
+        channel,
+        DeliveryChannel::CodexAuthJson | DeliveryChannel::DeepSeekHarness
+    )
 }
 
 /// 纯函数、无 IO。UI **必须**调用它取文案，不得在界面里硬编码判断——否则新增通道时又会漏一处。
@@ -1447,15 +1454,48 @@ mod tests {
     /// 这里会红——提醒作者把它加进 `channel_carries_endpoint` 的例外集，
     /// 否则界面会以为「换了令牌就等于换了地址」，而 Codex 那类通道会 401。
     #[test]
-    fn only_codex_auth_json_lacks_an_endpoint_in_its_target_file() {
+    fn endpoint_in_channel_matches_what_the_writer_writes() {
+        // M16-S9：这条守卫**由 writer 的产出反推**，不再复读 `channel_carries_endpoint`
+        // 的实现（旧写法遍历 `ALL` 却断言同一个 `matches!`，是同义反复：`DshWriter`
+        // 收了 `base_url` 却不写 endpoint 这件事它抓不到）。
+        //
+        // 判据：对每个通道，用**非空** `base_url` 解析出 writer，取它真正会写进文件的
+        // `fields`；`fields` 里有没有 endpoint 形状的键，必须与 `channel_carries_endpoint`
+        // 的取值一致。`base_url` 传空会让「会写 endpoint 的通道」少写那一行（`resolve_for`
+        // 的口径），所以必须传非空——否则这条守卫会往反方向假绿。
+        //
+        // 形状判据与前端 `planWritesEndpoint` 同源（`src/lib/deliveryView.ts`）。
+        let is_endpoint_key = |key: &str| {
+            let lower = key.to_ascii_lowercase();
+            lower.contains("base_url")
+                || lower.contains("baseurl")
+                || lower.contains("api_base")
+                || lower.contains("apibase")
+                || lower.contains("endpoint")
+        };
+
+        let home = tempfile::tempdir().expect("临时 home");
+        let mut checked = 0usize;
         for channel in DeliveryChannel::ALL {
-            let carries = channel_carries_endpoint(channel);
-            if channel == DeliveryChannel::CodexAuthJson {
-                assert!(!carries, "Codex 的 auth.json 里没有 endpoint");
-            } else {
-                assert!(carries, "{} 的落点文件里应当有 endpoint", channel.as_str());
-            }
+            let writer = resolve_for(channel, home.path(), "https://relay.example.com")
+                .unwrap_or_else(|e| panic!("{} 应能解析出 writer: {e}", channel.as_str()));
+            let fields = writer.fields("sk-probe-0123456789abcdef");
+            let writes_endpoint = fields.iter().any(|f| is_endpoint_key(&f.key));
+            assert_eq!(
+                channel_carries_endpoint(channel),
+                writes_endpoint,
+                "{}：`channel_carries_endpoint` 说 {}，但 writer 的 fields 里{} endpoint 形状的键（{:?}）",
+                channel.as_str(),
+                channel_carries_endpoint(channel),
+                if writes_endpoint { "有" } else { "没有" },
+                fields.iter().map(|f| f.key.clone()).collect::<Vec<_>>()
+            );
+            checked += 1;
         }
+        assert_eq!(checked, DeliveryChannel::ALL.len(), "必须逐条通道都核过");
+        // canary：判据本身要能识别 endpoint 形状（否则整条守卫会恒绿）
+        assert!(is_endpoint_key("OPENAI_BASE_URL"));
+        assert!(!is_endpoint_key("OPENAI_API_KEY"));
     }
 
     #[test]
