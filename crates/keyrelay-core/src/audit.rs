@@ -135,11 +135,37 @@ pub fn scan_paths(paths: &[PathBuf]) -> AuditReport {
 ///   与「文件被删了就不再扫」的假绿。
 /// - 空路径字符串也照收：`scan_paths` 会把它当 `NotFound` 跳过，不会 panic。
 pub fn merge_export_registry(paths: &mut Vec<PathBuf>, records: &[ExportRecord]) {
+    // M16-S6a：去重必须按**规范化后的真实路径**比，不能按字符串比。
+    //
+    // 修前的两个漏口（都会让 `files_scanned` 注水——那是审计报告里唯一的「覆盖面」证据）：
+    // 1. **目录 vs 文件**：扫描集合里有 `<home>/.keyrelay/exports`（目录），而登记表里是
+    //    该目录下的某个文件 ⇒ 字符串永不相等 ⇒ 同一个文件被计两次（目录遍历一次 + 登记一次）。
+    //    实测：一个文件让 `files_scanned` 从 0 变成 2。
+    // 2. **同一路径的不同写法**：macOS 上 `/var/…` 与 `/private/var/…` 是同一个地方，
+    //    符号链接与相对段同理 ⇒ 字符串比较会把同一个文件当两个。
+    //
+    // 判据：`canonicalize` 能成功就用真实路径（顺带把符号链接与 `..` 归一），
+    // 失败（文件已被删）退回原串——**不做存在性检查**（那会引入 TOCTOU 与「文件被删了就不再扫」）。
+    fn real(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    // `existing` 要**随循环增长**：登记表内部也可能有重复项（同一路径登记两次），
+    // 只跟「进来时的集合」比会漏掉批内重复（既有集成测试钉着这一条）。
+    let mut existing: Vec<PathBuf> = paths.iter().map(|p| real(p)).collect();
     for record in records {
         let path = PathBuf::from(record.path.as_str());
-        if !paths.contains(&path) {
-            paths.push(path);
+        let real_path = real(&path);
+        // 已被覆盖 ⇒ 跳过：`==` 挡「同一个文件的不同写法」，`starts_with` 挡
+        // 「登记路径落在某个被扫描目录里」（遍历会扫到它）。
+        let covered = existing
+            .iter()
+            .any(|entry| real_path == *entry || real_path.starts_with(entry));
+        if covered {
+            continue;
         }
+        existing.push(real_path);
+        paths.push(path);
     }
 }
 
@@ -227,6 +253,50 @@ mod tests {
     use std::fs;
 
     const SECRET: &str = "sk-audit-0123456789abcdef";
+
+    /// M16-S6a：登记表去重按**规范化真实路径**，不按字符串。
+    ///
+    /// 两个漏口各一条断言（修前都会让 `files_scanned` 注水）：
+    /// ① 登记路径落在**被扫描目录**里 ⇒ 遍历已经会扫到它，不得再 push；
+    /// ② 同一文件的**不同写法**（这里用符号链接；macOS 的 `/var` ↔ `/private/var` 同理）
+    ///    ⇒ 不得当成两个。
+    #[test]
+    fn export_registry_dedupes_by_real_path_not_by_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let exports = dir.path().join("exports");
+        fs::create_dir_all(&exports).unwrap();
+        let file = exports.join("keyrelay-export-1.json");
+        fs::write(&file, "{}\n").unwrap();
+
+        let record = |path: &std::path::Path| crate::store::ExportRecord {
+            path: path.display().to_string(),
+            encrypted: false,
+            bytes: 3,
+            exported_at: 0,
+        };
+
+        // ① 扫描集合里是**目录**，登记表里是该目录下的文件 ⇒ 不重复添加
+        let mut paths = vec![exports.clone()];
+        merge_export_registry(&mut paths, &[record(&file)]);
+        assert_eq!(paths.len(), 1, "目录已覆盖该文件，不得再 push: {paths:?}");
+
+        // ② 同一文件的不同写法（符号链接）⇒ 不重复添加
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.json");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            let mut paths = vec![file.clone()];
+            merge_export_registry(&mut paths, &[record(&link)]);
+            assert_eq!(paths.len(), 1, "同一文件的不同写法不得当成两个: {paths:?}");
+        }
+
+        // ③ 正向对照：真正**不相干**的路径必须照收（防「一律跳过」的假修复）
+        let outside = dir.path().join("other.json");
+        fs::write(&outside, "{}\n").unwrap();
+        let mut paths = vec![exports.clone()];
+        merge_export_registry(&mut paths, &[record(&outside)]);
+        assert_eq!(paths.len(), 2, "目录外的登记路径必须收: {paths:?}");
+    }
 
     #[test]
     fn clean_directory_reports_clean() {
