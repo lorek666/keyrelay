@@ -1,4 +1,4 @@
-import type { DeliveryField } from "./api";
+import type { DeliveryMode } from "./api";
 
 /**
  * 投递预览的展示层派生（M16-S6b）。
@@ -7,22 +7,30 @@ import type { DeliveryField } from "./api";
  */
 
 /**
- * 这份计划里有没有写「agent 该往哪发请求」的字段。
+ * 网关模式下，是否该提示「本通道**不写 endpoint**」。
  *
- * 用途：网关模式下，有的通道**只写令牌、不写 endpoint**（例如 `codex-auth-json` 写的是
- * `~/.codex/auth.json` 里的 `auth_mode` + `OPENAI_API_KEY`，没有 base_url 字段；
- * `dsh` 同理）。这种通道里打开「指向本地网关」时，agent 仍会把请求发到**站点**，
- * 拿的是本地网关令牌 ⇒ 站点回 401。用户看不出这一点，因为开关文案对所有通道是同一句。
+ * ## 判据**只来自后端字段**（M16-S6b 复审 P2-1 的闭环）
  *
- * 判据**来自数据**（计划里实际要写的字段名），不是按通道名硬编码——后者在新增通道时
- * 必然漏一处，而漏掉的那处会给出一个错的生效预期。
+ * `plan.endpointInChannel` 由后端 `delivery::channel_carries_endpoint(channel)` 给出——
+ * **与 writer 装配表同源**。这里不再做任何推导：
  *
- * 后端若将来在 DTO 上给出显式字段（例如 `endpointManaged`），应改为读它；
- * 在那之前，字段名是唯一可得的数据（M8-S4 spec §4.3 承诺的
- * `codex_channel_reports_that_the_endpoint_is_out_of_scope` 在仓库里尚不存在）。
+ * - 曾经有过一版按「计划里字段名」正则猜的实现（`planWritesEndpoint`），它与后端字段
+ *   **两套机制并存**：任一侧改动都会分叉，而症状是「提示错了」而不是报错（正是 P2-1 的顾虑）。
+ *   该函数已**删除**（不是降级成兜底——兜底等于把第二套机制留着）。
+ * - 后端字段是 DTO 的必填项，且由 `check-commands.mjs` 的 B-122 对账**双向**钉住
+ *   （Rust DTO 字段集合 == TS 类型键集合）⇒ 正常情况下它**不可能**缺失。
+ * - `undefined`（例如前端配了旧二进制）按「**不提示**」处理：宁可不提示，也不给一条
+ *   可能错的提示——错提示会把用户引去改一个本来正确的配置。
+ *
+ * 通道自身的事实（哪条通道真的写 endpoint）由后端负责；**前端不判特例**
+ * （例如 DSH 的 `channel_carries_endpoint` 与事实不符一事，已由后端在 `m16/dsh-fix` 修，
+ * 前端在这里再判一次就会又变成两套）。
  */
-export function planWritesEndpoint(fields: DeliveryField[]): boolean {
-  return fields.some((f) => /base[_-]?url|endpoint|api[_-]?base/i.test(f.key));
+export function shouldWarnEndpointOutOfScope(
+  mode: DeliveryMode,
+  endpointInChannel: boolean | undefined,
+): boolean {
+  return mode === "gateway" && endpointInChannel === false;
 }
 
 /**
