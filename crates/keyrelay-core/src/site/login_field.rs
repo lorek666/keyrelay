@@ -184,14 +184,14 @@ mod tests {
     #[test]
     fn email_precheck_rejects_only_what_cannot_be_an_email() {
         for bad in [
-            "",                   // ① 空串
-            "   ",                // ① 空白
+            "",                           // ① 空串
+            "   ",                        // ① 空白
             "USER_PLACEHOLDER",           // ② 没有 @（真实站点实测被拒的那个值）
             " USER_PLACEHOLDER ",         // ② trim 之后仍没有 @
             "USER_PLACEHOLDER qq",        // ② 空格不算 @
             "USER_PLACEHOLDER@",          // ④ 域名为空
-            "@qq.com",            // ③ 本地部为空
-            "@",                  // ③④
+            "@qq.com",                    // ③ 本地部为空
+            "@",                          // ③④
             "USER_PLACEHOLDER@qq",        // ⑤ 域名没有点
             "USER_PLACEHOLDER@localhost", // ⑤ 同上（站点正则也要求有点）
         ] {
