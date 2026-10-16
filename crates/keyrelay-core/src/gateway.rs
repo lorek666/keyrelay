@@ -639,6 +639,35 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
     if config.token.trim().is_empty() {
         return Err(Error::Store("网关的本地令牌为空".into()));
     }
+    // P3-9 / M8-S1 §10 第 3 条（W3 的集合不变式）：`route` 里的每个 `key_ref`
+    // 都必须能落到一把**可用**的明文上——在 `keys_by_ref` 里，或者被显式标记为已回收
+    // （已回收是合法状态：那正是「不再使用它」的表达）。
+    //
+    // 为什么放在 `start()` 而不是构造方：构造点不止一处（`single_upstream`、服务层的
+    // `build_gateway_route`、测试、将来的调用方），把守卫放在**所有构造点的下游**才不会漏。
+    // 不满足时的症状本来是「每个上游都跳过 → 502」，根因（忘填密钥映射）看不见。
+    //
+    // 文案**不打印 `key_ref` 原文**：引用本身是线索（M7-S0 §4.3 的红线），只说数量。
+    {
+        let revoked_set: std::collections::HashSet<String> = config
+            .revoked_refs
+            .as_ref()
+            .and_then(|refs| refs.lock().ok().map(|set| set.clone()))
+            .unwrap_or_default();
+        let missing: Vec<&str> = config
+            .route
+            .key_refs()
+            .into_iter()
+            .filter(|r| !config.keys_by_ref.contains_key(*r) && !revoked_set.contains(*r))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::Store(format!(
+                "网关启动被拒绝：路由表里有 {} 个上游的密钥既不在 keys_by_ref 里、\
+                 也没有被标记为已回收——构造方忘了填密钥映射（在第一个请求上会表现成 502）",
+                missing.len()
+            )));
+        }
+    }
 
     let mut builder = reqwest::Client::builder()
         // §3.5-2：上游**必须**有超时。没有它，一个接了连接却不回应的上游会让请求永远挂着，

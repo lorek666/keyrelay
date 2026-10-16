@@ -231,6 +231,73 @@ fn dead_upstream(site_id: i64, key_ref: &str, rate: f64) -> Upstream {
     }
 }
 
+/// P3-9 / M8-S1 §10 第 3 条（W3 的集合不变式）：`route` 里的每个 `key_ref`
+/// 必须落在 `keys_by_ref`（有可用明文）或 `revoked_refs`（显式标记不用）里。
+/// 缺一个就**在 `start()` 报错**，而不是等到第一个请求变成 502。
+#[tokio::test]
+async fn route_and_keys_by_ref_must_agree() {
+    /// 按「keys 里填哪些引用 / revoked 里标哪些」构造一份路由配置。
+    fn config_with(
+        keys: &[&str],
+        revoked: &[&str],
+    ) -> GatewayConfig {
+        let mut map = std::collections::HashMap::new();
+        for r in keys {
+            let plain = if *r == REF_A { KEY_A } else { KEY_B };
+            map.insert((*r).to_string(), Zeroizing::new(plain.to_string()));
+        }
+        GatewayConfig {
+            port: 0,
+            token: generate_token(),
+            site_id: 0,
+            base_url: String::new(),
+            api_key: Zeroizing::new(String::new()),
+            site_display_name: "路由模式".to_string(),
+            route: RouteTable::new(vec![dead_upstream(1, REF_A, 0.1)]),
+            breaker: long_cooldown(),
+            keys_by_ref: map,
+            upstream_timeout: UpstreamTimeout::default(),
+            revoked_refs: if revoked.is_empty() {
+                None
+            } else {
+                Some(Arc::new(Mutex::new(
+                    revoked.iter().map(|r| (*r).to_string()).collect(),
+                )))
+            },
+            on_observation: None,
+            on_usage: None,
+            upstream_proxy: None,
+            on_failure: None,
+        }
+    }
+
+    // ① 路由里有 REF_A，但既没明文也没标已回收 ⇒ 拒绝启动
+    let err = start(config_with(&[], &[]))
+        .await
+        .expect_err("缺明文的 key_ref 必须让启动失败（否则第一个请求才 502）");
+    let text = err.to_string();
+    assert!(
+        text.contains("密钥映射"),
+        "文案要说清根因是构造方忘了填密钥映射: {text}"
+    );
+    assert!(
+        !text.contains(REF_A),
+        "**不得**打印 key_ref 原文（引用本身是线索，M7-S0 §4.3）: {text}"
+    );
+
+    // ② 有明文 ⇒ 允许启动
+    let handle = start(config_with(&[REF_A], &[]))
+        .await
+        .expect("填齐明文的 route 必须能启动");
+    handle.shutdown_and_wait().await;
+
+    // ③ 没明文但被标成已回收 ⇒ 合法（「不再使用它」的显式表达）
+    let handle = start(config_with(&[], &[REF_A]))
+        .await
+        .expect("已回收的 key_ref 是合法状态（网关会跳过它并记事件）");
+    handle.shutdown_and_wait().await;
+}
+
 /// 极简 HTTP 客户端：POST + JSON body。
 fn http_post(url: &str, token: &str, path: &str, body: &str) -> (u16, String) {
     let without_scheme = url.trim_start_matches("http://");
@@ -863,9 +930,13 @@ async fn breaker_opens_even_when_the_failure_is_slower_than_the_cooldown() {
 
 #[tokio::test]
 async fn the_last_sendable_candidate_returns_its_own_status() {
-    // §3.5-3（DEBUG 报告 §2.3）：`is_last` 把**没有明文**的候选也计进去，
+    // §3.5-3（DEBUG 报告 §2.3）：`is_last` 把**发不出去**的候选也计进去，
     // 于是「最后一个真的发得出去的候选」被误判成「不是最后一个」，它的响应被丢掉、
     // 继续往下走 → 502。症状：唯一可用上游返回 429，用户看到 502，`Retry-After` 被吞掉。
+    //
+    // M16-S4 / P3-9：让 B「发不出去」的方式从**缺明文**改成**已回收**——
+    // 缺明文的 route 现在会在 `start()` 就被拒（`route_and_keys_by_ref_must_agree`），
+    // 而「已回收」是合法状态。被测性质不变：A 仍然是最后一个**发得出去**的候选。
     let a = spawn_upstream_always(1, REF_A, "429 Too Many Requests");
     let b = spawn_upstream_always(2, REF_B, "200 OK");
 
@@ -876,9 +947,9 @@ async fn the_last_sendable_candidate_returns_its_own_status() {
             cooldown: Duration::from_secs(60),
         },
         UpstreamTimeout::default(),
-        None,
-        // **只给 A 明文**：B 进不了 sendable，因此 A 就是最后一个发得出去的候选。
-        vec![(REF_A, KEY_A)],
+        // **B 标记为已回收**：它进不了 sendable，因此 A 就是最后一个发得出去的候选。
+        Some(vec![REF_B.to_string()]),
+        vec![(REF_A, KEY_A), (REF_B, KEY_B)],
     )
     .await;
 
@@ -888,53 +959,53 @@ async fn the_last_sendable_candidate_returns_its_own_status() {
     assert_eq!(
         status, 429,
         "A 是最后一个发得出去的候选 ⇒ 必须如实返回它的 429；\
-         修复前会继续往下走，最终 502（B 没有明文，发不出去）"
+         修复前会继续往下走，最终 502（B 发不出去）"
     );
-    assert_eq!(b.request_count(), 0, "B 没有明文，不该被请求");
+    assert_eq!(b.request_count(), 0, "B 已回收，不该被请求");
 }
 
 #[tokio::test]
-async fn a_missing_plaintext_is_visible_not_silent() {
-    // §10（M7 审计 D-2）：缺明文的候选原来**静默** `continue`。
-    // 若构造方忘了填 `keys_by_ref`，表现是「每个上游都跳过 → 502」，
-    // 看起来像「故障切换不工作」，根因却是密钥映射空着——没有任何线索。
+async fn a_missing_plaintext_is_refused_at_startup() {
+    // §10（M7 审计 D-2）+ M16-S4 / P3-9：缺明文的候选原来**静默** `continue`，
+    // 症状是「每个上游都跳过 → 502」，根因（构造方忘填密钥映射）看不见。
+    // 现在前移到 `start()`：**这种配置根本起不来**，错误文案直接说根因。
+    //
+    // 旧用例（`a_missing_plaintext_is_visible_not_silent`）断言的是运行期 502 + status=0 事件；
+    // 那条路径保留为**纵深防御**（`is_sendable` 仍然同时查明文与回收），
+    // 但既然启动就拒绝，运行期就构造不出这种状态了。
     let a = spawn_upstream_always(1, REF_A, "200 OK");
 
-    let (handle, token, failures, _obs) = start_routed_with(
-        &[(&a, 1.0)],
-        BreakerPolicy {
+    let err = start(GatewayConfig {
+        port: 0,
+        token: generate_token(),
+        site_id: 0,
+        base_url: String::new(),
+        api_key: Zeroizing::new(String::new()),
+        site_display_name: "路由模式".to_string(),
+        route: RouteTable::new(vec![a.upstream(1.0)]),
+        breaker: BreakerPolicy {
             threshold: 3,
             cooldown: Duration::from_secs(60),
         },
-        UpstreamTimeout::default(),
-        None,
         // 故意不给任何明文。
-        vec![],
-    )
-    .await;
+        keys_by_ref: std::collections::HashMap::new(),
+        upstream_timeout: UpstreamTimeout::default(),
+        revoked_refs: None,
+        on_observation: None,
+        on_usage: None,
+        upstream_proxy: None,
+        on_failure: None,
+    })
+    .await
+    .expect_err("缺明文的 route 必须在 start() 就被拒（P3-9）");
 
-    let (status, _) = post(&handle, &token, &body_with_model()).await;
-    handle.shutdown_and_wait().await;
-
-    assert_eq!(
-        status, 502,
-        "没有可用的上游 ⇒ 502（这是对的，只是不能**静默**）"
-    );
-    assert_eq!(a.request_count(), 0, "没有明文就不该发出去");
-
-    let log = failures.lock().expect("锁").clone();
+    let text = err.to_string();
+    assert!(text.contains("密钥映射"), "文案要说清根因: {text}");
     assert!(
-        !log.is_empty(),
-        "缺明文必须产生失败事件，否则用户拿不到任何线索"
+        !text.contains(REF_A) && !text.contains("kr/key"),
+        "文案里不得出现 key_ref 原文（引用本身是线索）: {text}"
     );
-    assert!(
-        log.iter().all(|f| f.status == 0),
-        "「一个候选都没发出去」没有 HTTP 状态码，用 0 这个哨兵（编 503 会让事件说谎）: {log:?}"
-    );
-    assert!(
-        log.iter().all(|f| !f.model.contains("kr/key")),
-        "事件里不得出现 key_ref 原文（引用本身是线索）: {log:?}"
-    );
+    assert_eq!(a.request_count(), 0, "拒绝启动 ⇒ 一个请求都不会发出去");
 }
 
 #[tokio::test]
