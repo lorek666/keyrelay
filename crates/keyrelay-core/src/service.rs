@@ -601,12 +601,16 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     ///
     /// `None`（默认）时 `probe_model` fallback 到 `self.transport`——测试用 `MockTransport`
     /// 走这条路径（M4 集成测试可 mock）。生产装配由壳层 `with_probe_transport` 注入一个
-    /// `ReqwestTransport`（timeout 120s、不套 retry），避免 sync probe 被 15s 总超时砍断、
-    /// 以及 429 被 `RetryingTransport` 自动重试 3 次（Retry-After 被 cap 到 5s，白打 + 等 10s）。
+    /// `ReqwestTransport`（timeout 120s、不套 retry）：120s 是**单次请求**的上界、不是检测
+    /// 总时长（B-160 起提交走 `sync=false`、等待交给轮询），不套 retry 是因为 429 会被
+    /// `RetryingTransport` 自动重试 3 次（Retry-After 被 cap 到 5s，白打 + 等 10s）。
     probe_transport: Option<crate::site::transport_reqwest::ReqwestTransport>,
-    /// B-134：probe 轮询兜底参数（`sync=true` 的 POST 返回非终态时才用）。
+    /// B-134 引入 / B-160 重设计：probe 轮询参数。
     ///
-    /// 默认 [`crate::probe::PollPolicy::default`]（6 次 × 5s）。`max_attempts = 0` 即关闭兜底。
+    /// B-160 起轮询是**主路径**（提交走 `sync=false`），不再是「同步 POST 没跑完时的兜底」：
+    /// 默认 [`crate::probe::PollPolicy::default`]（退避 2s→15s、预算 900s、容忍 5 次连续失败）。
+    /// 真机实测一次重模型检测服务端要 186.98s（async）/ 360.53s（sync），30s 的旧默认值
+    /// 根本盖不住 ⇒ 会在服务端已经给出判定之后再把它丢掉。
     probe_poll: crate::probe::PollPolicy,
     /// B-134：轮询等待实现。生产 `TokioSleeper`，测试注入 `RecordingSleeper`（不真睡）。
     ///
@@ -793,7 +797,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             // 默认 None：测试不调 `with_probe_transport` 时 fallback 到 `self.transport`（Mock），
             // 让 probe_model 的集成测试能用 Mock 预置响应（M4）。
             probe_transport: None,
-            // B-134：默认开着轮询兜底（6 次 × 5s），但只对「bazaarlink 明说还在跑」的 run 生效。
+            // B-160：默认就是主路径用的那份策略（退避 2s→15s、预算 900s、容忍 5 次连续失败）。
             probe_poll: crate::probe::PollPolicy::default(),
             probe_sleeper: Arc::new(crate::site::retry::TokioSleeper),
             // 默认 None：**不做在线补全**。生产由壳层 `with_meta_transport` 注入；
@@ -913,10 +917,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
 
     /// M15-S1 复审 H1+M2：注入 probe 专用 transport。
     ///
-    /// 生产装配由壳层调用，传入一个**不套 `RetryingTransport`**、timeout 足够长（120s）的
-    /// `ReqwestTransport`：bazaarlink `sync=true` 要等服务端跑完多轮推理对比，远超站点
-    /// transport 的 15s 总超时；429 也不该被站点重试策略抢着重试（probe 层自己映射成
-    /// `RateLimited` 告诉用户）。
+    /// 生产装配由壳层调用，传入一个**不套 `RetryingTransport`** 的 `ReqwestTransport`：
+    /// bazaarlink 是第三方服务，429 由 probe 层自己映射成 `RateLimited` 告诉用户，
+    /// 不该被站点重试策略抢着重试（Retry-After 被 cap 到 5s，白打 + 等 10s）。
+    ///
+    /// **timeout 的语义在 B-160 之后变了**：旧注释说「120s 是因为 `sync=true` 要等服务端
+    /// 跑完多轮推理对比」——那是把 120s 当成「检测总时长」在用，而真机实测要 360.53s，
+    /// 于是重模型必然超时。现在提交是 `sync=false`（秒级返回）、等待交给轮询，每条连接
+    /// 都是短请求，超时值只需要**兜住一次请求挂死**，不再需要覆盖整轮检测。
     ///
     /// 不调用 = `probe_transport` 保持 `None`，`probe_model` fallback 到 `self.transport`
     /// ——测试用 `MockTransport` 走这条路径，零改动现有测试。
@@ -928,11 +936,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         self
     }
 
-    /// B-134：注入 probe 轮询兜底的参数与等待实现。
+    /// B-134：注入 probe 轮询的参数与等待实现。
     ///
     /// 生产不调用（默认 `PollPolicy::default()` + `TokioSleeper`）；测试调用是为了
-    /// **不真睡**——`max_attempts` 与 `interval` 一起注入，测试就能断言
-    /// 「补查了几次、每次等了多久」，而不是靠 `sleep` 把测试拖慢 30s。
+    /// **不真睡**——退避与预算一起注入，测试就能断言「补查了几次、每次等了多久」，
+    /// 而不是靠 `sleep` 把测试拖慢十几分钟（B-160 的默认预算是 900s）。
     pub fn with_probe_poll(
         mut self,
         policy: crate::probe::PollPolicy,
@@ -3235,8 +3243,13 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// **不落** `items[].response` / `responseHeaders` / `startedByIp` / `userKey`（敏感）。
     /// 事件只 log 元数据（site_id / key_id / modelId / verdict），**不 log apiKey**。
     ///
-    /// B-134：POST 返回非终态时按 [`crate::probe::PollPolicy`] 补查（best-effort，
-    /// 补查失败不影响本次结果）；拿到终态后按「有没有判定」分流记事件（见 F1 分支）。
+    /// B-134：提交后按 [`crate::probe::PollPolicy`] 轮询到终态（best-effort，**永不**因
+    /// 轮询失败而把一次检测判成失败）。
+    ///
+    /// B-160：主路径是 `sync=false` 异步提交 + 轮询——`sync=true` 会把整轮检测压在**一条**
+    /// HTTP 连接上（真机 360.53s），必然撞上传输层 timeout 120s。详见 `crate::probe` 模块文档。
+    /// 停止原因（[`crate::probe::PollStop`]）决定事件怎么记：拿到判定 / 跑完没判定 /
+    /// 预算等完仍在跑，是三种不同的用户可见结论。
     pub async fn probe_model(
         &self,
         key_id: i64,
@@ -3283,11 +3296,17 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             api_key,
             model_id,
             claimed_model: Some(claimed),
-            sync: true,
+            // B-160：主路径走**异步提交**。`sync=true` 要求服务端在**一条** HTTP 连接上
+            // 把整轮检测跑完（真机实测 360.53s），而 probe 传输层 timeout 是 120s
+            // ⇒ 重模型必然超时，用户看到「检测失败」，服务端其实给出了 0.98 置信度的判定。
+            // `sync=false` 是**秒级**返回 runId（curl 直测 0.75s；产品真机用例 9.27s，
+            // 两者都是「与检测时长无关的一小段」），剩下的时间交给下面的轮询——每条连接都是
+            // 短请求，单次失败还能重试，不再把已经跑出来的结论一起丢掉。
+            sync: false,
         };
-        // H1+M2（独立复审）：优先用 probe_transport（独立 timeout 120s、不套 retry）；
+        // H1+M2（独立复审）：优先用 probe_transport（独立 timeout、不套 retry）；
         // None 时 fallback 到 self.transport（测试 Mock 路径，M4 可 mock）。
-        // 收成 `&dyn` 是为了 POST 与轮询补查走**同一条**选择逻辑，不把二选一写两遍。
+        // 收成 `&dyn` 是为了提交与轮询走**同一条**选择逻辑，不把二选一写两遍。
         let transport: &dyn HttpTransport = match &self.probe_transport {
             Some(pt) => pt,
             None => &self.transport,
@@ -3310,32 +3329,39 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 return Err(err);
             }
         };
-        // B-134：POST 返回**非终态**（bazaarlink 明说还在跑）时补查一次机会。
-        // `needs_poll` 为假（终态 / 已有判定 / 状态未知）⇒ 一次请求都不发。
-        let run = if crate::probe::needs_poll(&run) {
-            let (run, polled) =
-                crate::probe::poll_probe_run(transport, run, self.probe_poll, &*self.probe_sleeper)
-                    .await;
-            if polled > 0 {
-                // 只记元数据：补查成功几次、最终状态、有没有判定（apiKey / 响应正文都不进）。
-                self.log(observability::event_with_payload(
-                    Level::Debug,
-                    "probe",
-                    "模型检测轮询补查完成",
-                    serde_json::json!({
-                        "site_id": row.site_id,
-                        "key_id": key_id,
-                        "run_id": run.run_id,
-                        "status": run.status,
-                        "polled": polled,
-                        "has_verdict": run.verdict_status.is_some(),
-                    }),
-                ));
-            }
-            run
-        } else {
-            run
-        };
+        // B-134 骨架 / B-160 主路径：提交后**轮询到终态**。异步提交的响应只有 runId
+        // （没有 status），所以这步几乎总要走。
+        //
+        // 第三个参数 `submitted_async` **由 `req.sync` 推导**，不写第二个字面量：判据跟着
+        // 提交方式走，两处各写一份就等于给「装配层悄悄失效」留门——独立复审 P2-1 实测过，
+        // 把这里硬写成 `false` 时整套单测仍全绿，B-160 会在装配层静默退化。
+        let outcome = crate::probe::poll_probe_run(
+            transport,
+            run,
+            !req.sync,
+            self.probe_poll,
+            &*self.probe_sleeper,
+        )
+        .await;
+        // 只记元数据：停下来原因、补查了几次、失败几次、最终状态、有没有判定
+        //（apiKey / 响应正文都不进）。
+        self.log(observability::event_with_payload(
+            Level::Debug,
+            "probe",
+            "模型检测轮询结束",
+            serde_json::json!({
+                "site_id": row.site_id,
+                "key_id": key_id,
+                "run_id": outcome.run.run_id,
+                "status": outcome.run.status,
+                "stop": outcome.stop,
+                "polled": outcome.polled,
+                "errors": outcome.errors,
+                "has_verdict": outcome.run.verdict_status.is_some(),
+            }),
+        ));
+        let run = outcome.run;
+        let poll_stop = outcome.stop;
         // 持久化摘要（best-effort：落库失败只 warn，不 mask 检测成功）
         if let Err(err) = self.store.insert_probe_run(
             row.site_id,
@@ -3353,38 +3379,75 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         }
         // 事件只 log 元数据，不 log apiKey / 响应正文
         //
-        // F1（独立检查）：`run_probe` 是**一次性** POST（`sync=true`），没有客户端轮询兜底。
-        // bazaarlink 对「key 访问不了该模型」这类情况会**秒级返回 completed 但不带
-        // identityAssessment**（真机实测 4 次：420–663ms、verdict 全空）。旧实现无条件记
+        // F1（独立检查）：bazaarlink 对「key 访问不了该模型」这类情况会**秒级返回 completed
+        // 但不带 identityAssessment**（真机实测 4 次：420–663ms、verdict 全空）。旧实现无条件记
         // info「模型检测完成」+ 落一条 verdict 全空的行——失败被伪装成成功，事件流与历史表
         // 都看不出区别。现在按「有没有拿到判定」分流：拿到 → info「完成」；
-        // 没拿到 → warn「未得出判定」（**仍落库**：run_id / report_url 是真实的，报告能点开）。
-        self.log(match run.verdict_status {
-            Some(_) => observability::event_with_payload(
-                Level::Info,
-                "probe",
-                "模型检测完成",
-                serde_json::json!({
-                    "site_id": row.site_id,
-                    "key_id": key_id,
-                    "run_id": run.run_id,
-                    "verdict": run.verdict_status,
-                    "identity": run.identity_status,
-                }),
-            ),
-            None => observability::event_with_payload(
-                Level::Warn,
-                "probe",
-                "模型检测未得出判定",
-                serde_json::json!({
-                    "site_id": row.site_id,
-                    "key_id": key_id,
-                    "run_id": run.run_id,
-                    "status": run.status,
-                    "identity": run.identity_status,
-                }),
-            ),
-        });
+        // 没拿到 → warn（**仍落库**：run_id / report_url 是真实的，报告能点开）。
+        //
+        // B-160 补充两种「不是没判定、而是没等到」：
+        // - 预算等完、run 还在跑 ⇒ 服务端还在算，结论随时可能出现；
+        // - 连续补查失败超限 / 撞硬上限 ⇒ **判定服务不可达**，连 run 状态都问不到。
+        // 这两种都不该被记成「跑完了没给判定」——那句话的含义是「服务端明确跑完但没结论」
+        // （F1 分支），混在一起用户会以为是模型测不出来（独立复审 P2-3）。
+        let waited_out = matches!(poll_stop, crate::probe::PollStop::BudgetExhausted);
+        let unreachable = matches!(
+            poll_stop,
+            crate::probe::PollStop::TooManyErrors | crate::probe::PollStop::AttemptsExhausted
+        );
+        self.log(
+            match (run.verdict_status.as_ref(), waited_out, unreachable) {
+                (Some(_), _, _) => observability::event_with_payload(
+                    Level::Info,
+                    "probe",
+                    "模型检测完成",
+                    serde_json::json!({
+                        "site_id": row.site_id,
+                        "key_id": key_id,
+                        "run_id": run.run_id,
+                        "verdict": run.verdict_status,
+                        "identity": run.identity_status,
+                    }),
+                ),
+                (None, true, _) => observability::event_with_payload(
+                    Level::Warn,
+                    "probe",
+                    "模型检测未在等待预算内完成",
+                    serde_json::json!({
+                        "site_id": row.site_id,
+                        "key_id": key_id,
+                        "run_id": run.run_id,
+                        "status": run.status,
+                        "budget_secs": self.probe_poll.budget.as_secs(),
+                        "report": run.report_url,
+                    }),
+                ),
+                (None, false, true) => observability::event_with_payload(
+                    Level::Warn,
+                    "probe",
+                    "模型检测查询中断（判定服务不可达）",
+                    serde_json::json!({
+                        "site_id": row.site_id,
+                        "key_id": key_id,
+                        "run_id": run.run_id,
+                        "status": run.status,
+                        "stop": poll_stop,
+                    }),
+                ),
+                (None, false, false) => observability::event_with_payload(
+                    Level::Warn,
+                    "probe",
+                    "模型检测未得出判定",
+                    serde_json::json!({
+                        "site_id": row.site_id,
+                        "key_id": key_id,
+                        "run_id": run.run_id,
+                        "status": run.status,
+                        "identity": run.identity_status,
+                    }),
+                ),
+            },
+        );
         Ok(run)
     }
 
@@ -5606,18 +5669,44 @@ mod tests {
         MockTransport,
         Arc<crate::site::retry::RecordingSleeper>,
     ) {
+        // 退避 1s、预算 3s ⇒ 最多 3 次补查后 `BudgetExhausted`。
+        // 定值而不是 `PollPolicy::default()`：默认预算 900s，测试里每次补查都要问
+        // 「预算还够吗」，不钉死就断言不出「停在第几次」。
+        probe_service_with_poll(
+            tail,
+            crate::probe::PollPolicy {
+                first_delay: std::time::Duration::from_secs(1),
+                max_interval: std::time::Duration::from_secs(1),
+                // 3.5s 而不是 3s：预算**把请求耗时也算进去**（B-160 复审 P2-2 的修法），
+                // Mock 往返虽≈0 但不是 0，卡在 3s 上会让「问 3 次」变成「问 2 次」。
+                budget: std::time::Duration::from_millis(3_500),
+                max_consecutive_errors: 5,
+            },
+        )
+        .await
+    }
+
+    /// 同 `probe_service_with_mock`，但轮询策略由调用方给。
+    ///
+    /// 需要它的用例都是「要跨过预算才能触发的那条分支」——例如连续补查失败到
+    /// `TooManyErrors`，那要 5 次失败才有结论，而默认 3s 预算会先把它变成
+    /// `BudgetExhausted`（顺序：预算按退避先扣，扣完就不再问）。
+    async fn probe_service_with_poll(
+        tail: Vec<HttpResponse>,
+        policy: crate::probe::PollPolicy,
+    ) -> (
+        KeyRelayService<MockTransport>,
+        i64,
+        MockTransport,
+        Arc<crate::site::retry::RecordingSleeper>,
+    ) {
         let mut responses = vec![status_response()];
         responses.extend(tail);
         let store = Store::open_in_memory().expect("内存库");
         let mock = MockTransport::new(responses);
         let sleeper = Arc::new(crate::site::retry::RecordingSleeper::default());
-        let service = KeyRelayService::new(store, mock.clone(), test_config()).with_probe_poll(
-            crate::probe::PollPolicy {
-                max_attempts: 3,
-                interval: std::time::Duration::from_secs(1),
-            },
-            sleeper.clone(),
-        );
+        let service = KeyRelayService::new(store, mock.clone(), test_config())
+            .with_probe_poll(policy, sleeper.clone());
         let site = service
             .add_site("https://relay.example.com")
             .await
@@ -5681,6 +5770,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_model_reports_an_unreachable_probe_service_separately_from_no_verdict() {
+        // 连续补查失败 ⇒ **判定服务不可达**。这和「跑完了但没给判定」是两回事：
+        // 混成一句会让用户以为「这个模型测不出来」（独立复审 P2-3）。
+        let submitted = HttpResponse::json(
+            200,
+            json!({ "runId": "r-poll", "claimToken": "ct-not-echoed" }),
+        )
+        .expect("构造异步提交响应");
+        // 只给提交帧：之后的补查全部落空（Mock 队列空 ⇒ 每次都是 Err）。
+        let (service, key_id, _mock, _sleeper) = probe_service_with_poll(
+            vec![submitted],
+            crate::probe::PollPolicy {
+                first_delay: std::time::Duration::from_secs(1),
+                max_interval: std::time::Duration::from_secs(1),
+                budget: std::time::Duration::from_secs(60),
+                max_consecutive_errors: 3,
+            },
+        )
+        .await;
+
+        let run = service
+            .probe_model(key_id, "glm-5.3".into(), None, None, true)
+            .await
+            .expect("查询中断也不该把检测变成 Err");
+        assert_eq!(run.run_id, "r-poll", "run_id 必须带回来");
+
+        let events = service.recent_events(100).expect("recent_events");
+        let probe_events: Vec<_> = events.iter().filter(|e| e.source == "probe").collect();
+        let interrupted = probe_events
+            .iter()
+            .find(|e| e.message.contains("模型检测查询中断"))
+            .unwrap_or_else(|| panic!("判定服务不可达应有专门事件: {probe_events:?}"));
+        assert_eq!(interrupted.level, "warn");
+        let payload = interrupted.payload.as_deref().unwrap_or_default();
+        assert!(
+            payload.contains("\"stop\":\"TooManyErrors\""),
+            "要写清是哪条停止原因: {payload}"
+        );
+        assert!(
+            payload.contains("\"run_id\":\"r-poll\""),
+            "要把 run_id 留给用户: {payload}"
+        );
+        assert!(
+            !probe_events
+                .iter()
+                .any(|e| e.message.contains("未得出判定")),
+            "「查不到」不能被记成「跑完了没结论」: {probe_events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn probe_model_failure_logs_warn_event_without_api_key() {
         // mock 预置 400（body 含 apiKey 回显）——验证 M1 scrub + M3 warn event 不泄漏。
         let bad = HttpResponse::new(400, br#"{"echoed":"sk-test-secret-12345678"}"#.to_vec());
@@ -5718,10 +5858,10 @@ mod tests {
 
     #[tokio::test]
     async fn probe_model_without_verdict_logs_warn_not_completed() {
-        // F1：`run_probe` 是一次性 POST（sync=true），bazaarlink 对「key 访问不了该模型」
-        // 会**秒级返回 200 + completed 但不带 identityAssessment**（真机实测 4 次：
-        // 420–663ms、verdict 全空）。旧实现无条件记 info「模型检测完成」并落一行 verdict
-        // 全空 —— 失败被伪装成成功。本测试钉住分流：无判定 ⇒ warn，且不得出现「完成」。
+        // F1：bazaarlink 对「key 访问不了该模型」会**秒级返回 completed 但不带
+        // identityAssessment**（真机实测 4 次：420–663ms、verdict 全空）。
+        // 旧实现无条件记 info「模型检测完成」并落一行 verdict 全空 —— 失败被伪装成成功。
+        // 本测试钉住分流：跑到终态但没有判定 ⇒ warn，且不得出现「完成」。
         let no_verdict = HttpResponse::json(
             200,
             json!({
@@ -5785,9 +5925,19 @@ mod tests {
 
     #[tokio::test]
     async fn probe_model_polls_until_the_verdict_arrives() {
-        // B-134：`sync=true` 的 POST 没等到跑完（bazaarlink 回 `running`）时补查一次机会。
-        // 真机依据：POST 侧的超时窗口是固定的，而检测要跑多轮推理对比（真机实测一次
-        // 49.8s）——非终态返回是真会发生的形态，不是假想。
+        // B-160：主路径是 `sync=false` 提交（服务端秒级回一个 run）+ 轮询到终态。
+        // 真机依据：curl 直测提交 0.75s、产品用例 9.27s；run 在服务端跑 186.98s / 252.42s
+        // 才 `completed`。同步路径要 360.53s，而传输层 120s 就掐断 ⇒ 旧实现会把这条判定丢掉。
+        //
+        // **提交帧刻意用真机的异步形状**（只有 `runId` + `claimToken`，**没有 `status`**）：
+        // 用 `{"status":"running"}` 那种帧的话，`needs_poll` 的同步分支也会返回 true，
+        // 于是「装配层把 `submitted_async` 传错」这件事在测试里完全看不出来
+        //（独立复审 P2-1 实测过这一点）。用真实形状，传错就立刻红。
+        let submitted = HttpResponse::json(
+            200,
+            json!({ "runId": "r-poll", "claimToken": "ct-not-echoed" }),
+        )
+        .expect("构造异步提交响应");
         let running = HttpResponse::json(200, json!({ "runId": "r-poll", "status": "running" }))
             .expect("构造 running 响应");
         let finished = HttpResponse::json(
@@ -5810,7 +5960,7 @@ mod tests {
         )
         .expect("构造 completed 响应");
         let (service, key_id, mock, sleeper) =
-            probe_service_with_mock(vec![running, finished]).await;
+            probe_service_with_mock(vec![submitted, running, finished]).await;
 
         let run = service
             .probe_model(key_id, "glm-5.3".into(), None, None, true)
@@ -5824,15 +5974,26 @@ mod tests {
         );
         assert_eq!(run.true_model.as_deref(), Some("glm-5.2"));
         assert_eq!(run.status, "completed");
-        // 请求数 = 指纹 1 + POST 1 + 补查 1
-        assert_eq!(mock.request_count(), 3, "补查只发一次就够");
+        // 请求数 = 指纹 1 + 提交 1 + 补查 2（提交帧没有 status，第一次补查仍是 running）
+        assert_eq!(mock.request_count(), 4, "两发补查才收敛");
+        // **B-160 的证伪点 ①**：提交必须是 `sync=false`。改回 `true` 本断言立刻红，
+        // 而真机上那个改动会让整轮检测压在一条 120s 的连接上。
+        let submit = mock.nth_request(1).expect("第二次请求是提交");
+        assert_eq!(submit.method, crate::site::transport::Method::Post);
+        let body: serde_json::Value =
+            serde_json::from_slice(submit.body.as_deref().unwrap_or_default())
+                .expect("提交体是 JSON");
+        assert_eq!(body["sync"], false, "B-160：主路径必须异步提交");
         let poll = mock.nth_request(2).expect("第三次请求是补查");
         assert_eq!(poll.method, crate::site::transport::Method::Get);
         assert_eq!(poll.url, "https://bazaarlink.ai/api/probe/run/r-poll");
         assert_eq!(
             sleeper.calls(),
-            vec![std::time::Duration::from_secs(1)],
-            "补查前等一个 interval（测试里不真睡）"
+            vec![
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1)
+            ],
+            "每次补查前退避一次（测试里不真睡）"
         );
 
         // 落库的是**补查后**的结果，不是 POST 那个半成品
@@ -5844,7 +6005,7 @@ mod tests {
         );
         assert_eq!(rows[0].true_model.as_deref(), Some("glm-5.2"));
 
-        // 有判定 ⇒ info「模型检测完成」，且补查事件不含 apiKey
+        // 有判定 ⇒ info「模型检测完成」，且轮询事件不含 apiKey
         let events = service.recent_events(100).expect("recent_events");
         let probe_events: Vec<_> = events.iter().filter(|e| e.source == "probe").collect();
         assert!(
@@ -5853,11 +6014,21 @@ mod tests {
                 .any(|e| e.level == "info" && e.message.contains("模型检测完成")),
             "拿到判定应记 info「模型检测完成」: {probe_events:?}"
         );
+        let poll_event = probe_events
+            .iter()
+            .find(|e| e.message.contains("模型检测轮询结束"))
+            .unwrap_or_else(|| {
+                panic!("轮询应留一条事件（含次数/失败数与停止原因）: {probe_events:?}")
+            });
+        let payload = poll_event.payload.as_deref().unwrap_or_default();
         assert!(
-            probe_events
-                .iter()
-                .any(|e| e.message.contains("轮询补查完成")),
-            "补查应留一条事件（含次数与最终状态）: {probe_events:?}"
+            payload.contains("\"stop\":\"Settled\""),
+            "轮询事件要带停止原因: {payload}"
+        );
+        assert!(
+            // 提交帧没有 status ⇒ 第一次补查仍是 running，第二次才 completed。
+            payload.contains("\"polled\":2"),
+            "轮询事件要带成功次数: {payload}"
         );
         for ev in &probe_events {
             let text = format!("{} {}", ev.message, ev.payload.as_deref().unwrap_or(""));
@@ -5870,7 +6041,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_model_keeps_the_result_when_the_poll_never_finishes() {
-        // 补查用尽次数仍是 `running` ⇒ 保留 POST 结果并落库（不是报错、不是丢记录）。
+        // 预算等完仍是 `running` ⇒ 保留最后一次结果并落库（不是报错、不是丢记录）。
         let running = || {
             HttpResponse::json(200, json!({ "runId": "r-poll", "status": "running" }))
                 .expect("构造 running 响应")
@@ -5881,18 +6052,54 @@ mod tests {
         let run = service
             .probe_model(key_id, "glm-5.3".into(), None, None, true)
             .await
-            .expect("补查没结果也不算失败");
+            .expect("轮询没等到终态也不算失败");
 
         assert_eq!(run.status, "running");
         assert_eq!(run.verdict_status, None);
-        // 指纹 1 + POST 1 + 补查 3（`probe_service_with_mock` 的 max_attempts）
-        assert_eq!(mock.request_count(), 5, "补查次数上限必须被尊重");
+        // 指纹 1 + 提交 1 + 补查 3（`probe_service_with_mock` 的预算 3s / 退避 1s）
+        assert_eq!(mock.request_count(), 5, "轮询预算必须被尊重");
         assert_eq!(sleeper.calls().len(), 3);
 
         let rows = service.store.list_probe_runs(10).expect("list_probe_runs");
         assert_eq!(rows.len(), 1, "没跑完也要留一条历史");
         assert_eq!(rows[0].status.as_deref(), Some("running"));
         assert_eq!(rows[0].verdict_status, None);
+        assert_eq!(
+            rows[0].run_id, "r-poll",
+            "run_id 必须落库（这是唯一的线索）"
+        );
+
+        // B-160：等超了不是「没得出判定」，而是「还在跑」——两种结论对用户含义完全不同，
+        // 事件文案必须分开，并且要带上 run_id 与等了多少秒。
+        let events = service.recent_events(100).expect("recent_events");
+        let probe_events: Vec<_> = events.iter().filter(|e| e.source == "probe").collect();
+        let waited = probe_events
+            .iter()
+            .find(|e| e.message.contains("未在等待预算内完成"))
+            .unwrap_or_else(|| panic!("预算等尽应记专门的事件: {probe_events:?}"));
+        assert_eq!(waited.level, "warn", "等超了是 warn: {waited:?}");
+        let payload = waited.payload.as_deref().unwrap_or_default();
+        assert!(
+            payload.contains("\"run_id\":\"r-poll\""),
+            "等超了要把 run_id 留给用户: {payload}"
+        );
+        assert!(
+            payload.contains("\"budget_secs\":3"),
+            "等超了要说清等了多久（读的是真实注入的预算）: {payload}"
+        );
+        assert!(
+            !probe_events
+                .iter()
+                .any(|e| e.message.contains("未得出判定")),
+            "「还在跑」不能被记成「跑完了没给判定」: {probe_events:?}"
+        );
+        for ev in &probe_events {
+            let text = format!("{} {}", ev.message, ev.payload.as_deref().unwrap_or(""));
+            assert!(
+                !text.contains("sk-test-secret-12345678"),
+                "轮询事件泄漏 apiKey: {text}"
+            );
+        }
     }
 
     #[tokio::test]

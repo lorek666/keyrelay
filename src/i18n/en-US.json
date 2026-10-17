@@ -42,6 +42,8 @@
     "baseUrl": "Base URL (optional, default = site URL /v1)",
     "consent": "I confirm: the site's API key will be sent to third-party bazaarlink.ai for model probing.",
     "running": "Probing…",
+    "elapsed": "Elapsed {time}",
+    "elapsedHint": "Heavy models can take several minutes — keep this window open and avoid resubmitting.",
     "start": "Start Probe",
     "noKey": "No local key for this site",
     "selectKey": "Select key",

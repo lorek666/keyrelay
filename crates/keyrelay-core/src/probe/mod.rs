@@ -11,11 +11,24 @@
 //! - 响应里 `items[].response` / `responseHeaders` / `startedByIp` / `userKey` 视为敏感，
 //!   `ProbeRun` 只取身份判定摘要，**不持久化**这些敏感字段。
 //!
-//! # 两条请求路径
+//! # 两条请求，一条主路径
 //!
-//! 1. [`run_probe`]：POST `sync=true`（M15-S1 主路径）；
-//! 2. [`poll_probe_run`]：POST 返回**非终态**时的补查兜底（B-134），best-effort、
+//! 1. [`run_probe`]：POST 提交。生产走 `sync=false`（B-160 起改为主路径）——秒级返回
+//!    `{runId, claimToken}`，把「等服务端跑完」这件事从**一条长连接**挪到**轮询**上；
+//! 2. [`poll_probe_run`]：`GET /api/probe/run/<runId>` 轮询到终态。best-effort、
 //!    永不把一次成功的检测变成失败。
+//!
+//! # 为什么主路径要异步（B-160）
+//!
+//! 真机实测（2026-10-17，真实中转站 + 真实模型）：`sync=true` 的 POST
+//! **单条连接要挂满全程 360.53s**，而薄壳注入的 probe 传输层 timeout 是 120s
+//! ⇒ 重模型必然超时，用户看到「检测失败」，而服务端其实给出了高置信度判定。
+//! 同一个模型改用 `sync=false` + 轮询：POST **0.75s** 返回，run 在服务端跑
+//! **186.98s** 后 `completed`，拿到的判定与 `sync=true` 那次**逐字相同**
+//! （`clean_match_submodel_mismatch` / `GPT-5.6 Luna` / `0.98`）。
+//!
+//! 异步不只是「绕开超时」：判定现在挂在**可重复查询的 runId** 上，单次轮询失败
+//! 可以重试，而不是把已经跑出来的结论一起丢掉。
 
 use std::time::Duration;
 
@@ -39,27 +52,100 @@ const PROBE_ENDPOINT: &str = "https://bazaarlink.ai/api/probe/run";
 /// 即路由 `/api/probe/run/<runId>` 存在且接受 GET（集合路由只接受 POST）。
 const PROBE_RUN_ENDPOINT_PREFIX: &str = "https://bazaarlink.ai/api/probe/run/";
 
-/// 轮询兜底参数（B-134）。
+/// 轮询参数（B-134 引入，B-160 重设计）。
 ///
-/// `sync=true` 的 POST 若返回**非终态**（`running` 等），补查 `GET /api/probe/run/<runId>`
-/// 直到拿到终态或次数用尽。默认 6 次 × 5s ⇒ 最多多等 30s：
-/// 同步窗口内都没跑完的检测，再等 30s 是「值得多等」与「别把界面挂住」之间的折中。
-/// `max_attempts = 0` ⇒ 关闭轮询兜底（回到 M15-S1 的一次性 POST 行为）。
+/// 旧形状是「固定次数 × 固定间隔」（6 × 5s = 30s）。那是给 `sync=true` 的**兜底**设计的：
+/// 主路径已经把结果等回来了，兜底只值 30s。B-160 起轮询是**主路径**——它要覆盖
+/// 「服务端跑完一整轮多轮推理对比」的全部时间（真机实测 186.98s / 360.53s），
+/// 所以换成**退避 + 总预算**：
+///
+/// - 退避让轻模型（真机 2–9s）也能被很快问到，而长跑不会把补查打得太密；
+/// - 预算是**墙上时间**的上界，用尽即停，且**停下时仍然返回手上的 run**
+///   （`run_id` 一定在；`report_url` 只有服务端收尾后才有，不承诺）。
+///
+/// ## 预算怎么算
+///
+/// `budget` 累计**两样**：计划睡眠时长 + **实测的请求耗时**。两样都计入，预算才是真的
+/// 墙上时间上界——只算睡眠的话，「62 次补查 × 每次 GET 允许 120s」这种最坏情况会把
+/// 900s 的预算拖成两小时（独立复审 P2-2 指出过这一点，修的就是这里）。
+///
+/// 测试友好性：请求耗时用 `Instant` 实测，而测试里的 `MockTransport` 往返只有微秒级，
+/// 所以「预算 3.5s / 退避 1s ⇒ 问 3 次」这类断言仍然精确、不需要假时钟。
+/// （写 3.5s 而不是 3s 是刻意的：`≈0` 不是 `0`，卡在整数边界上会因几微秒而少问一次——
+/// 那等于把断言钉在「Mock 恰好不耗时」这个巧合上。）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PollPolicy {
-    /// 补查次数上限（不含 POST 本身）。
-    pub max_attempts: u32,
-    /// 两次补查之间的等待。走注入的 [`Sleeper`]，测试里不真睡。
-    pub interval: Duration,
+    /// 首次补查前的等待。刚提交的 run 立刻查大概率还是 `pending`。
+    pub first_delay: Duration,
+    /// 退避上限：`first_delay` 逐次翻倍，到此值后固定。
+    pub max_interval: Duration,
+    /// 预算（累计计划睡眠 + 实测请求耗时）。用尽 ⇒ [`PollStop::BudgetExhausted`]。
+    pub budget: Duration,
+    /// 连续补查失败的容忍次数。`0` = 一次都不容忍。
+    ///
+    /// 单次失败**不算失败**：判定挂在 runId 上，网络抖一下就放弃等于把 B-160 的收益还回去。
+    /// 任意一次补查成功后连续计数归零。
+    pub max_consecutive_errors: u32,
 }
+
+/// 轮询的**硬**尝试次数上限：防「预算不为零但退避为零」这类配置把人绕进死循环。
+///
+/// 真机形态下永远够用（默认预算 900s ÷ 平均 15s ≈ 60 次）。
+pub const MAX_POLL_ATTEMPTS: u32 = 1000;
 
 impl Default for PollPolicy {
     fn default() -> Self {
         Self {
-            max_attempts: 6,
-            interval: Duration::from_secs(5),
+            first_delay: Duration::from_secs(2),
+            max_interval: Duration::from_secs(15),
+            // 真机实测最长的两次：186.98s（async）与 360.53s（sync）。900s 留出充分余量，
+            // 同时给界面一个「最多等多久」的确定上界。
+            budget: Duration::from_secs(900),
+            max_consecutive_errors: 5,
         }
     }
+}
+
+impl PollPolicy {
+    /// 第 `attempt`（从 1 起）次补查前该睡多久：`min(first_delay * 2^(attempt-1), max_interval)`。
+    fn delay_for(&self, attempt: u32) -> Duration {
+        let shift = attempt.saturating_sub(1).min(32);
+        let scaled = self
+            .first_delay
+            .checked_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
+            .unwrap_or(self.max_interval);
+        scaled.min(self.max_interval)
+    }
+}
+
+/// 轮询为什么停下来。进事件流，便于线上判断「没拿到判定到底是谁的问题」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PollStop {
+    /// 一次都没补查：提交就带回了终态（或判定），或同步路径下服务端没说要等。
+    NotNeeded,
+    /// 追到了 run 级终态（`completed`/`failed`/`aborted`）。
+    ///
+    /// **不是**「拿到判定」：异步路径上判定会先于终态出现，但那是中间态
+    /// （真机实测：70.26s 时 `trueModel=None`，187s 后才有子模型）——
+    /// 所以异步路径只在终态停，见 [`needs_poll`] 的文档。
+    Settled,
+    /// 预算用尽——run 可能仍在跑（runId 仍然有效）。
+    BudgetExhausted,
+    /// 连续补查失败超过容忍次数（判定服务不可达）。
+    TooManyErrors,
+    /// 撞上 [`MAX_POLL_ATTEMPTS`] 硬上限（配置异常的自保）。
+    AttemptsExhausted,
+}
+
+/// 轮询的完整结果。**不只是 run**：`stop` 决定上层怎么向用户交代。
+#[derive(Clone, Debug)]
+pub struct PollOutcome {
+    pub run: ProbeRun,
+    /// 成功的补查次数。
+    pub polled: u32,
+    /// 失败的补查次数（累计）。
+    pub errors: u32,
+    pub stop: PollStop,
 }
 
 /// probe 请求。`api_key` 是明文，手写 `Debug` 不泄漏。
@@ -129,7 +215,13 @@ pub struct ProbeRun {
     pub completed_at: Option<i64>,
 }
 
-/// 发 probe 请求（POST bazaarlink，`sync=true` 等完成）。
+/// 发 probe 请求（POST bazaarlink）并解析返回的 run。
+///
+/// **`sync` 由 [`ProbeRequest::sync`] 决定**：
+/// - `sync=false`（生产主路径，B-160 起）：秒级返回 `{runId, claimToken}`，由
+///   [`poll_probe_run`] 轮询到终态；
+/// - `sync=true`（遗留路径 / 对照组）：服务端在**这条连接上**等到整轮跑完——
+///   真机实测 360.53s，会撞上传输层 120s 超时，只在受控实验里用。
 ///
 /// 复用传入的 `HttpTransport`——生产用 `ReqwestTransport`，测试用 `MockTransport`。
 /// 限流（429）读 `Retry-After` 头；502/503/400/403 映射成可读错误。
@@ -162,49 +254,144 @@ pub async fn fetch_probe_run<T: HttpTransport + ?Sized>(
 
 /// run 仍在跑。只认**明说在跑**的词。
 ///
-/// 反向（终态）不写成一张表：`completed` / `failed` / `aborted` 与「词表外的任何值」
-/// 对轮询决策是同一个答案——不补查。写成两张表反而会让人以为「终态」在别处有分支。
+/// 词表来自真机观测：`sync=false` 提交后 run 级状态依次出现 `pending` → `running`，
+/// `sync=true` 的终态是 `completed` / `failed`。
 fn is_running_status(status: &str) -> bool {
     matches!(status, "running" | "queued" | "pending" | "in_progress")
 }
 
-/// 是否需要轮询补查：**只在 bazaarlink 明说还在跑**、且这次没拿到判定时才补查。
-///
-/// 两种「不该补查」都是实测过的真实形态，不能靠猜：
-/// - `completed` + 无判定：key 访问不了该模型时 POST 秒级（420–663ms）返回这个形态
-///   ——**已是终态**，再问多少次都是同一个答案，补查只会白等 30s（B-134 真机记录）；
-/// - `status` 缺失（解析成 `"unknown"`）：没有依据认定它还会变，不拿 30s 赌。
-pub fn needs_poll(run: &ProbeRun) -> bool {
-    run.verdict_status.is_none() && is_running_status(&run.status)
+/// run 已经收尾。**认不出来的一律当「没收尾」**——多问一次代价是 15s，
+/// 少问一次代价是把结论判给一个还在跑的 run（B-160 的教训）。
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "aborted")
 }
 
-/// 轮询兜底：把一个**非终态**的 run 追到终态（best-effort）。
+/// 是否需要继续轮询。
 ///
-/// 返回 `(最新一次拿到的 run, 成功补查次数)`。三条停止条件：拿到终态或判定、
-/// 次数用尽、补查请求失败（保留上一次的结果）。
+/// `submitted_async = true`（B-160 起的主路径）：提交时**明确要了异步**、响应里带 runId，
+/// 服务端已受理 ⇒ 只要它没明说终止，就继续等。
 ///
-/// **永不返回 `Err`**：POST 的结果才是判定来源，补查只是多给一次机会——补查失败
-/// 不能把一次成功的检测变成失败。失败原因在这里吞掉，调用方按 `polled` 记事件。
+/// 这一条**不能**沿用同步路径的判据：`sync=false` 的响应体只有 `{runId, claimToken}`，
+/// **压根没有 `status` 字段**（解析成 `"unknown"`）。同步路径把 `unknown` 当作「不补查」
+/// 是有依据的（`sync=true` 的响应是服务端对这次请求的最终答复），而异步路径下同一个
+/// `unknown` 的含义正好相反——它是「刚交出去，还没问过」。判据必须跟着**提交方式**走，
+/// 而不是跟着**响应长什么样**走。
+///
+/// # 为什么异步路径**不等判定出现就收手**（真机教训，别改回去）
+///
+/// 2026-10-17 真机实测（`real_site_contract.rs` 的 B-160 用例）：把「已有判定 ⇒ 停」用在
+/// 异步路径上，轮询会在 **70.26s** 收手，拿到的是
+///
+/// ```text
+/// status="running"  verdict=Some("clean_match_family_only")  true_model=None
+/// ```
+///
+/// ——**服务端还在跑**，此刻序列化出来的是一份**没定到子模型**的中间判定。同一把 key、
+/// 同一模型的终版是 `clean_match_submodel_mismatch` / `trueModel="GPT-5.6 Luna"` / `0.98`。
+/// 也就是说「早停」不是省时间，是**把结论换成了错的**。所以异步路径的唯一收手条件是
+/// **run 级状态终止**（`completed` / `failed` / `aborted`），判定出现只是中间态。
+///
+/// `submitted_async = false`：M15-S1 遗留的同步路径，只在服务端**明说还在跑**且没判定时补查。
+/// 两种「不该补查」都是实测过的真实形态：
+/// - `completed` + 无判定：key 访问不了该模型时 POST 秒级（420–663ms）返回这个形态
+///   ——**已是终态**，再问多少次都是同一个答案，补查只会白等（B-134 真机记录）；
+/// - `status` 缺失（解析成 `"unknown"`）：同步响应的 `unknown` 没有依据认定它还会变。
+pub fn needs_poll(run: &ProbeRun, submitted_async: bool) -> bool {
+    if is_terminal_status(&run.status) {
+        return false;
+    }
+    if submitted_async {
+        // 异步提交：run 已经在服务端队列/执行中，只差时间。
+        // **不看判定**——中间态也带判定，见上面的真机记录。
+        true
+    } else {
+        run.verdict_status.is_none() && is_running_status(&run.status)
+    }
+}
+
+/// 轮询到终态（best-effort），返回**最后一次**拿到的 run 与停下来原因。
+///
+/// 三条停止条件：拿到终态或判定、预算用尽（按计划睡眠时长计）、连续失败超限。
+///
+/// **永不返回 `Err`**：提交的结果才是判定来源，轮询只是把它取回来——轮询失败
+/// 不能把一次可能成功的检测变成失败。
+///
+/// 与 B-134 旧实现的两点关键差异：
+/// - 单次补查失败**不中止**（旧实现 `Err(_) => break`）；失败要连续到 `max_consecutive_errors`
+///   才放弃，且中途成功一次即归零——判定挂在 runId 上，网络抖一下不该丢掉结论；
+/// - 停下来时**一定**把 `run` 带回去（含 `run_id` / `report_url`），上层因此还能落一条
+///   可追的历史与可点开的报告。旧实现在超时路径上会把 run 丢掉，等于换个方式丢结论。
 pub async fn poll_probe_run<T: HttpTransport + ?Sized>(
     transport: &T,
     first: ProbeRun,
+    submitted_async: bool,
     policy: PollPolicy,
     sleeper: &dyn Sleeper,
-) -> (ProbeRun, u32) {
+) -> PollOutcome {
     let mut run = first;
     let mut polled = 0u32;
-    // 先睡再查：POST 刚返回，立刻重查大概率还是同一个 `running`。
-    while polled < policy.max_attempts && needs_poll(&run) {
-        sleeper.sleep(policy.interval).await;
-        match fetch_probe_run(transport, &run.run_id).await {
-            Ok(next) => {
-                polled += 1;
-                run = next;
+    let mut errors = 0u32;
+    let mut consecutive_errors = 0u32;
+    // 已花掉的预算：**计划睡眠 + 实测请求耗时**（两样都算，预算才是墙上时间上界）。
+    let mut spent = Duration::ZERO;
+    let mut stop = PollStop::NotNeeded;
+
+    if needs_poll(&run, submitted_async) {
+        loop {
+            let attempt = polled + errors + 1;
+            if attempt > MAX_POLL_ATTEMPTS {
+                stop = PollStop::AttemptsExhausted;
+                break;
             }
-            Err(_) => break,
+            let delay = policy.delay_for(attempt);
+            // 预算按「打算睡多少」先扣一次：先问下一次还睡得下吗，睡不下就不再问。
+            if spent.saturating_add(delay) > policy.budget {
+                stop = PollStop::BudgetExhausted;
+                break;
+            }
+            sleeper.sleep(delay).await;
+            spent = spent.saturating_add(delay);
+            // 请求本身的往返也计入预算：否则 900s 的预算遇到慢响应会变成两小时。
+            // 用 `Instant` 而不是注入时钟——测试里 `MockTransport` 往返≈0，
+            // 「预算 3s / 退避 1s ⇒ 问 3 次」这类断言仍然精确。
+            let requested_at = std::time::Instant::now();
+            let fetched = fetch_probe_run(transport, &run.run_id).await;
+            spent = spent.saturating_add(requested_at.elapsed());
+            match fetched {
+                Ok(next) => {
+                    polled += 1;
+                    consecutive_errors = 0;
+                    run = next;
+                }
+                Err(_) => {
+                    errors += 1;
+                    consecutive_errors += 1;
+                    if consecutive_errors >= policy.max_consecutive_errors {
+                        stop = PollStop::TooManyErrors;
+                        break;
+                    }
+                }
+            }
+            // 先判是否已收敛：真拿到终态就该报 `Settled`，哪怕这一发把预算吃穿了——
+            // 「等超了」是没拿到结论时的说法，不是拿到结论后的说法。
+            if !needs_poll(&run, submitted_async) {
+                stop = PollStop::Settled;
+                break;
+            }
+            // 预算可能在这次请求里就被吃掉（慢响应），这里补一次判：不再往下问。
+            if spent > policy.budget {
+                stop = PollStop::BudgetExhausted;
+                break;
+            }
         }
     }
-    (run, polled)
+
+    PollOutcome {
+        run,
+        polled,
+        errors,
+        stop,
+    }
 }
 
 fn parse_probe_response(resp: HttpResponse) -> Result<ProbeRun> {
@@ -591,11 +778,30 @@ mod tests {
         }
     }
 
-    fn poll_policy(max_attempts: u32) -> PollPolicy {
+    fn poll_policy(first_delay: u64, max_interval: u64, budget: u64) -> PollPolicy {
         PollPolicy {
-            max_attempts,
-            interval: Duration::from_secs(1),
+            first_delay: Duration::from_secs(first_delay),
+            max_interval: Duration::from_secs(max_interval),
+            budget: Duration::from_secs(budget),
+            ..PollPolicy::default()
         }
+    }
+
+    /// `sync=false` 提交响应的**真实形状**（真机标定）：只有 `runId` + `claimToken`，
+    /// **没有 `status` 字段**。刻意走真正的解析器，而不是手搓一个 `ProbeRun`——
+    /// 手搓的话 `status == "unknown"` 就成了「测试里顺便写死的前提」，而不是被测代码的产物。
+    fn async_submit_run() -> ProbeRun {
+        let run = parse_probe_run(&json!({
+            "runId": "r-poll",
+            "claimToken": "ct-not-echoed"
+        }))
+        .unwrap();
+        assert_eq!(
+            run.status, "unknown",
+            "真机形态：sync=false 的响应没有 status，解析成 unknown"
+        );
+        assert!(run.verdict_status.is_none());
+        run
     }
 
     #[tokio::test]
@@ -613,76 +819,324 @@ mod tests {
     }
 
     #[test]
-    fn needs_poll_only_when_the_run_is_still_running_without_a_verdict() {
+    fn needs_poll_sync_path_only_when_the_run_is_still_running_without_a_verdict() {
         let mut run = running_run();
-        assert!(needs_poll(&run), "running 且无判定 ⇒ 补查");
+        assert!(needs_poll(&run, false), "running 且无判定 ⇒ 补查");
 
         // 真机形态（B-134 实测 420–663ms）：已终态、无判定 ⇒ 不补查。
         run.status = "completed".into();
-        assert!(!needs_poll(&run), "completed 无判定是终态，补查只会白等");
+        assert!(
+            !needs_poll(&run, false),
+            "completed 无判定是终态，补查只会白等"
+        );
 
-        // status 缺失时解析成 "unknown" ⇒ 不拿 30s 赌。
+        // status 缺失时解析成 "unknown" ⇒ 同步响应已是这次请求的最终答复，不赌。
         run.status = "unknown".into();
-        assert!(!needs_poll(&run), "unknown 无依据认定还会变，不补查");
+        assert!(!needs_poll(&run, false), "unknown 无依据认定还会变，不补查");
 
         // 有判定 ⇒ 无论什么状态都不补查。
         run.status = "running".into();
         run.verdict_status = Some("ambiguous".into());
-        assert!(!needs_poll(&run), "已有判定 ⇒ 不补查");
+        assert!(!needs_poll(&run, false), "已有判定 ⇒ 不补查");
     }
 
-    #[tokio::test]
-    async fn poll_probe_run_stops_as_soon_as_the_run_finishes() {
-        let mock = MockTransport::new(vec![completed_with_verdict()]);
-        let sleeper = RecordingSleeper::default();
-        let (run, polled) = poll_probe_run(&mock, running_run(), poll_policy(3), &sleeper).await;
-        assert_eq!(polled, 1, "第一次补查就拿到终态");
-        assert_eq!(run.status, "completed");
-        assert_eq!(
-            run.verdict_status.as_deref(),
-            Some("clean_match_submodel_mismatch")
+    /// **B-160 的核心**：同一个 `status == "unknown"`，判据必须跟着**提交方式**走。
+    ///
+    /// 证伪方式：把 `needs_poll` 的 `submitted_async` 分支删掉（退回 `is_running_status`），
+    /// 本用例第一段立刻红——而那正是 B-160 的线上形态（异步提交后一次都不问，直接判「没结论」）。
+    #[test]
+    fn needs_poll_async_path_keeps_asking_even_when_the_response_had_no_status() {
+        let run = async_submit_run();
+        assert_eq!(run.status, "unknown");
+        assert!(
+            needs_poll(&run, true),
+            "异步提交：响应没有 status 不等于它不在跑"
         );
-        assert_eq!(run.true_model.as_deref(), Some("glm-5.2"));
-        assert_eq!(sleeper.calls(), vec![Duration::from_secs(1)]);
-        assert_eq!(mock.request_count(), 1, "拿到终态后不得再补查");
+        assert!(
+            !needs_poll(&run, false),
+            "同一个响应在同步语义下不补查（两种语义不能混）"
+        );
+
+        // 明说终止 ⇒ 两种语义都不再问。
+        let mut done = async_submit_run();
+        done.status = "completed".into();
+        assert!(!needs_poll(&done, true));
+
+        // **真机教训（2026-10-17）**：run 仍是 `running` 时服务端已经会吐出判定，
+        // 但那是**中间判定**（`clean_match_family_only` / `trueModel=None`），
+        // 终版是 `clean_match_submodel_mismatch` / `GPT-5.6 Luna`。
+        // ⇒ 异步路径**不能**因为「看到判定」就收手，必须等 run 级状态终止。
+        let mut early = async_submit_run();
+        early.status = "running".into();
+        early.verdict_status = Some("clean_match_family_only".into());
+        assert!(
+            needs_poll(&early, true),
+            "异步路径上「有判定」只是中间态，必须继续等到终态"
+        );
+        // 同步语义下（遗留路径）「有判定」仍然收手——那里响应就是这次请求的最终答复。
+        assert!(!needs_poll(&early, false));
+    }
+
+    /// 上面那条判据的**端到端**版本：run 先给出中间判定、之后才终止，
+    /// 轮询必须把终版拿回来，而不是在第一个判定上停住。
+    #[tokio::test]
+    async fn poll_probe_run_does_not_stop_on_an_intermediate_verdict() {
+        let intermediate = HttpResponse::json(
+            200,
+            json!({
+                "runId": "r-poll",
+                "status": "running",
+                "identityAssessment": {
+                    "status": "match",
+                    "verdict": { "status": "clean_match_family_only", "confidence": "high" }
+                }
+            }),
+        )
+        .expect("构造中间态响应");
+        let mock = MockTransport::new(vec![intermediate, completed_with_verdict()]);
+        let sleeper = RecordingSleeper::default();
+        let out = poll_probe_run(
+            &mock,
+            async_submit_run(),
+            true,
+            poll_policy(1, 1, 60),
+            &sleeper,
+        )
+        .await;
+        assert_eq!(out.stop, PollStop::Settled);
+        assert_eq!(out.polled, 2, "中间判定之后还要再问一次");
+        assert_eq!(out.run.status, "completed");
+        assert_eq!(
+            out.run.verdict_status.as_deref(),
+            Some("clean_match_submodel_mismatch"),
+            "必须拿到终版判定，不能停在中间态"
+        );
+        assert_eq!(out.run.true_model.as_deref(), Some("glm-5.2"));
+    }
+
+    #[test]
+    fn poll_delay_backs_off_from_first_delay_then_caps() {
+        let p = PollPolicy::default();
+        let seq: Vec<u64> = (1..=7).map(|k| p.delay_for(k).as_secs()).collect();
+        assert_eq!(seq, vec![2, 4, 8, 15, 15, 15, 15], "翻倍退避到上限后固定");
+        // 极端 attempt 不 panic、不溢出。
+        assert_eq!(p.delay_for(u32::MAX).as_secs(), 15);
+        assert_eq!(p.delay_for(0).as_secs(), 2);
     }
 
     #[tokio::test]
-    async fn poll_probe_run_gives_up_after_max_attempts() {
+    async fn poll_probe_run_settles_and_returns_the_verdict() {
+        // 真机形态：pending → running → completed（+判定）。
         let mock = MockTransport::new(vec![
+            HttpResponse::json(200, json!({ "runId": "r-poll", "status": "pending" })).unwrap(),
             running_response(),
-            running_response(),
-            running_response(),
+            completed_with_verdict(),
         ]);
         let sleeper = RecordingSleeper::default();
-        let (run, polled) = poll_probe_run(&mock, running_run(), poll_policy(3), &sleeper).await;
-        assert_eq!(polled, 3, "用满次数上限");
-        assert_eq!(run.status, "running");
-        assert_eq!(run.verdict_status, None);
-        assert_eq!(sleeper.calls().len(), 3, "每次补查前都等一个 interval");
-        assert_eq!(mock.request_count(), 3);
+        let out = poll_probe_run(
+            &mock,
+            async_submit_run(),
+            true,
+            poll_policy(1, 1, 60),
+            &sleeper,
+        )
+        .await;
+        assert_eq!(out.stop, PollStop::Settled);
+        assert_eq!(out.polled, 3);
+        assert_eq!(out.errors, 0);
+        assert_eq!(out.run.status, "completed");
+        assert_eq!(
+            out.run.verdict_status.as_deref(),
+            Some("clean_match_submodel_mismatch")
+        );
+        assert_eq!(out.run.true_model.as_deref(), Some("glm-5.2"));
+        assert_eq!(sleeper.calls().len(), 3, "每次补查前退避一次");
+        assert_eq!(mock.request_count(), 3, "拿到终态后不得再补查");
     }
 
     #[tokio::test]
-    async fn poll_probe_run_keeps_the_post_result_when_a_poll_fails() {
-        // 补查失败（404/5xx/传输错误）⇒ 保留 POST 的结果，且**不再打**第二次。
-        let mock = MockTransport::new(vec![HttpResponse::new(500, b"boom".to_vec())]);
+    async fn poll_probe_run_stops_on_budget_and_still_returns_the_run() {
+        // 预算 3s、退避 1s ⇒ 睡满 3 次后下一次「睡不下」⇒ 停。
+        // 关键断言：停下时**最后一次问到的 run 原样带回去**——B-160 要的是「等不到结论也别把线索丢了」。
+        //
+        // 注意 `report_url` 不在这里断言：真机上 `reportUrl` 只随**终态**响应出现
+        // （run 还在跑时顶层没有这个键），而本用例的 run 一直没跑完。把「没等到的 run
+        // 也必须有报告链接」写成断言，就是拿一个服务端不承诺的东西当契约。
+        let frame = || {
+            HttpResponse::json(
+                200,
+                json!({ "runId": "r-poll", "status": "running", "modelId": "glm-5.3" }),
+            )
+            .expect("构造 running 响应")
+        };
+        let mock = MockTransport::new(vec![frame(), frame(), frame(), frame()]);
         let sleeper = RecordingSleeper::default();
-        let (run, polled) = poll_probe_run(&mock, running_run(), poll_policy(3), &sleeper).await;
-        assert_eq!(polled, 0, "失败的补查不计入成功次数");
-        assert_eq!(run.status, "running", "保留 POST 结果");
-        assert_eq!(run.run_id, "r-poll");
-        assert_eq!(mock.request_count(), 1, "补查失败即停，不刷接口");
+        let out = poll_probe_run(
+            &mock,
+            async_submit_run(),
+            true,
+            // 预算 3.5s（不是 3s）：预算现在**把请求耗时也算进去**，任何非零耗时都会让
+            // `spent + delay > budget` 提前一拍成立。留 0.5s 余量，断言才钉在
+            // 「问了 3 次」这个语义上，而不是钉在「Mock 往返恰好为 0」这个巧合上。
+            PollPolicy {
+                budget: Duration::from_millis(3_500),
+                ..poll_policy(1, 1, 60)
+            },
+            &sleeper,
+        )
+        .await;
+        assert_eq!(out.stop, PollStop::BudgetExhausted);
+        assert_eq!(out.polled, 3, "预算内问了 3 次");
+        assert_eq!(sleeper.calls().len(), 3);
+        assert_eq!(out.run.run_id, "r-poll", "run_id 必须带回去");
+        assert_eq!(
+            out.run.status, "running",
+            "带回来的是**最后一次**问到的 run，不是提交时那个半成品"
+        );
+        assert_eq!(
+            mock.request_count(),
+            3,
+            "预算用尽后不得再多打一次（第 4 帧没被消费）"
+        );
     }
 
     #[tokio::test]
-    async fn poll_probe_run_with_zero_attempts_makes_no_request() {
-        // `max_attempts = 0` ⇒ 关闭兜底，退回一次性 POST 行为。
+    async fn poll_probe_run_tolerates_a_transient_failure() {
+        // 旧实现（B-134）在这里 `break`，等于网络抖一下就把已经跑出来的结论丢掉。
+        let mock = MockTransport::new(vec![running_response()]);
+        mock.push_error(Error::Transport("connection reset".into()));
+        mock.push(completed_with_verdict());
+        let sleeper = RecordingSleeper::default();
+        let out = poll_probe_run(
+            &mock,
+            async_submit_run(),
+            true,
+            poll_policy(1, 1, 60),
+            &sleeper,
+        )
+        .await;
+        assert_eq!(out.stop, PollStop::Settled, "一次失败不该中止");
+        assert_eq!(out.errors, 1);
+        assert_eq!(out.polled, 2);
+        assert_eq!(out.run.status, "completed");
+        assert_eq!(mock.request_count(), 3, "失败那一次也真的打出去了");
+    }
+
+    /// **判别性用例**（独立复审 P2-4）：把「成功一次就归零连续失败计数」删掉，
+    /// 这条必须红。
+    ///
+    /// 形态取「错-对-错-对-错-对」且容忍 2 次：只要连续计数**不**归零，
+    /// 第二发失败后就会判 `TooManyErrors` 提前收手；归零了才能一直问到终态。
+    /// 只注入一次失败的用例（上一条）对这件事**没有判别力**——容忍 5 次时删不删归零都过。
+    #[tokio::test]
+    async fn poll_probe_run_resets_the_consecutive_error_count_on_success() {
+        let mock = MockTransport::new(vec![running_response()]);
+        mock.push_error(Error::Transport("connection reset".into()));
+        mock.push(running_response());
+        mock.push_error(Error::Transport("connection reset".into()));
+        mock.push(running_response());
+        mock.push_error(Error::Transport("connection reset".into()));
+        mock.push(completed_with_verdict());
+        let sleeper = RecordingSleeper::default();
+        let policy = PollPolicy {
+            max_consecutive_errors: 2,
+            ..poll_policy(1, 1, 600)
+        };
+        let out = poll_probe_run(&mock, async_submit_run(), true, policy, &sleeper).await;
+        assert_eq!(
+            out.stop,
+            PollStop::Settled,
+            "中途成功过就必须把连续失败计数归零，不能因为早先的失败而提前收手"
+        );
+        assert_eq!(out.errors, 3, "三次失败都记在累计数里");
+        assert_eq!(out.polled, 4, "中间那三发成功都要真的问出去");
+        assert_eq!(out.run.status, "completed");
+    }
+
+    #[tokio::test]
+    async fn poll_probe_run_with_a_zero_budget_makes_no_request() {
+        // 预算 0 ⇒ 一次都不问（「用尽即停」的最短形态）。
+        let mock = MockTransport::new(vec![running_response()]);
+        let sleeper = RecordingSleeper::default();
+        let out = poll_probe_run(
+            &mock,
+            async_submit_run(),
+            true,
+            poll_policy(1, 1, 0),
+            &sleeper,
+        )
+        .await;
+        assert_eq!(out.stop, PollStop::BudgetExhausted);
+        assert_eq!(out.polled, 0);
+        assert_eq!(mock.request_count(), 0);
+        assert!(sleeper.calls().is_empty());
+        assert_eq!(out.run.run_id, "r-poll", "预算 0 也要把 run_id 带回去");
+    }
+
+    #[tokio::test]
+    async fn poll_probe_run_caps_a_zero_backoff_configuration() {
+        // 配置异常（退避 0 但预算 > 0）不能变成死循环：由 `MAX_POLL_ATTEMPTS` 兜住。
+        // 这**不是**「立刻停」——退避 0 时预算永远花不完，只能靠硬上限。
+        let frames: Vec<HttpResponse> =
+            (0..MAX_POLL_ATTEMPTS).map(|_| running_response()).collect();
+        let mock = MockTransport::new(frames);
+        let sleeper = RecordingSleeper::default();
+        let policy = PollPolicy {
+            first_delay: Duration::ZERO,
+            max_interval: Duration::ZERO,
+            budget: Duration::from_secs(60),
+            max_consecutive_errors: 5,
+        };
+        let out = poll_probe_run(&mock, async_submit_run(), true, policy, &sleeper).await;
+        assert_eq!(out.stop, PollStop::AttemptsExhausted);
+        assert_eq!(out.polled, MAX_POLL_ATTEMPTS);
+        assert_eq!(out.run.run_id, "r-poll");
+    }
+
+    #[tokio::test]
+    async fn poll_probe_run_gives_up_after_consecutive_errors() {
+        // 空队列 ⇒ 每次补查都是 Err。
+        let mock = MockTransport::new(Vec::new());
+        let sleeper = RecordingSleeper::default();
+        let out = poll_probe_run(
+            &mock,
+            async_submit_run(),
+            true,
+            poll_policy(1, 1, 600),
+            &sleeper,
+        )
+        .await;
+        assert_eq!(out.stop, PollStop::TooManyErrors);
+        assert_eq!(out.polled, 0);
+        assert_eq!(out.errors, 5, "默认容忍 5 次连续失败");
+        assert_eq!(out.run.run_id, "r-poll");
+    }
+
+    #[tokio::test]
+    async fn poll_probe_run_with_zero_error_tolerance_stops_on_the_first_failure() {
+        let mock = MockTransport::new(Vec::new());
+        let sleeper = RecordingSleeper::default();
+        let policy = PollPolicy {
+            max_consecutive_errors: 0,
+            ..poll_policy(1, 1, 600)
+        };
+        let out = poll_probe_run(&mock, async_submit_run(), true, policy, &sleeper).await;
+        assert_eq!(out.stop, PollStop::TooManyErrors);
+        assert_eq!(out.errors, 1, "0 容忍 = 第一次失败就停");
+        assert_eq!(mock.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn poll_probe_run_is_not_needed_when_a_verdict_is_already_there() {
+        // 提交就带判定（轻模型 / 服务端忽略 async）⇒ 一次 GET 都不发。
         let mock = MockTransport::new(vec![]);
         let sleeper = RecordingSleeper::default();
-        let (run, polled) = poll_probe_run(&mock, running_run(), poll_policy(0), &sleeper).await;
-        assert_eq!(polled, 0);
-        assert_eq!(run.status, "running");
+        let mut settled = async_submit_run();
+        settled.status = "completed".into();
+        settled.verdict_status = Some("clean_match".into());
+        let out = poll_probe_run(&mock, settled, true, poll_policy(1, 1, 600), &sleeper).await;
+        assert_eq!(out.stop, PollStop::NotNeeded);
+        assert_eq!(out.polled, 0);
         assert_eq!(mock.request_count(), 0);
         assert!(sleeper.calls().is_empty());
     }
