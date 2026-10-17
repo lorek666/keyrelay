@@ -96,13 +96,15 @@ fn build_transport_with_proxy(proxy: Option<String>) -> AppTransport {
     }
 }
 
-/// M15-S1 复审 H1+M2：probe 专用 transport。
+/// M15-S1 复审 H1+M2 / B-160：probe 专用 transport。
 ///
 /// 与站点 transport 的两点差异：
-/// - **timeout 120s**（站点是 15s）：bazaarlink `sync=true` 要等服务端跑完多轮推理对比，
-///   15s 几乎必然超时——用户拿不到结果还白扣 30/IP/hour 配额。
 /// - **不套 `RetryingTransport`**：429 由 probe 层自己映射成 `RateLimited` 告诉用户，
 ///   不该被站点重试策略抢着重试（Retry-After 被 cap 到 5s，白打 + 等 10s）。
+/// - **timeout 120s**：这是「单次请求挂死的上界」，**不是**检测总时长。B-160 起 probe 主路径
+///   是 `sync=false` 提交（真机 0.75s 返回）加轮询，每条连接都是短请求；整轮检测要等多久
+///   由 `PollPolicy::budget` 决定（默认 900s）。旧实现把 120s 当检测总时长用，而真机实测
+///   一次重模型要 **360.53s** ⇒ 必然超时、丢掉服务端已经给出的判定。
 fn build_probe_transport(proxy: Option<String>) -> ReqwestTransport {
     let config = TransportConfig {
         timeout: std::time::Duration::from_secs(120),

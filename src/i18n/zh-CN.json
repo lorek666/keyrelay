@@ -42,6 +42,8 @@
     "baseUrl": "Base URL（可选，默认 = 站点地址 /v1）",
     "consent": "我确认：将把该站点的 API key 发送给第三方 bazaarlink.ai 进行模型检测。",
     "running": "检测中…",
+    "elapsed": "已等待 {time}",
+    "elapsedHint": "重模型检测需要数分钟，请保持窗口打开、勿重复提交。",
     "start": "开始检测",
     "noKey": "该站点无本地密钥",
     "selectKey": "选择密钥",

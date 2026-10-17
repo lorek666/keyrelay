@@ -24,6 +24,11 @@ const SELF = fileURLToPath(import.meta.url);
 const NEEDLES = [
   { label: "真实站点账号名", value: ["test", "user"].join("") },
   { label: "已作废的站点口令", value: ["aa123", "123"].join("") },
+  // M18-S1：真机验证时**两次**把真实域名写进了文档与代码注释（第一次在 M17-S1 第二轮入库时
+  // 漏了，第二次是本步新写的 spec/module doc）。这类值不是「凭证」，所以旧禁词表抓不到——
+  // 但它们同样是「仓库里不该出现的真实标识」，一并守。
+  { label: "真实站点域名", value: ["aizhong", "zhuan"].join("") },
+  { label: "真机 SSH 私钥文件名", value: ["xinzhuan", "_key"].join("") },
 ];
 
 /** 允许出现的白名单：占位符（大小写不敏感地匹配「占位」语义）。 */

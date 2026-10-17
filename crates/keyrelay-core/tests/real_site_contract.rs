@@ -28,7 +28,7 @@ use std::env;
 use std::time::{Duration, Instant};
 
 use keyrelay_core::probe::{
-    fetch_probe_run, needs_poll, poll_probe_run, run_probe, PollPolicy, ProbeRequest,
+    needs_poll, poll_probe_run, run_probe, PollPolicy, PollStop, ProbeRequest,
 };
 use keyrelay_core::site::registry::SiteRegistry;
 use keyrelay_core::site::retry::TokioSleeper;
@@ -68,6 +68,19 @@ fn transport() -> ReqwestTransport {
         ..TransportConfig::default()
     };
     ReqwestTransport::new(config).expect("构造真实传输层")
+}
+
+/// **与生产 `build_probe_transport` 同形**的传输层：120s 单请求超时、不套 retry。
+///
+/// B-160 的复现要点就在这里——120s 是**单次请求**的上界，而旧实现把它当成「整轮检测的
+/// 总时长」在用。用例必须用这条传输层，否则「>120s 也拿得到判定」就不成立。
+fn probe_transport() -> ReqwestTransport {
+    let config = TransportConfig {
+        proxy: env_opt("KR_REAL_PROXY"),
+        timeout: Duration::from_secs(120),
+        ..TransportConfig::default()
+    };
+    ReqwestTransport::new(config).expect("构造真实 probe 传输层")
 }
 
 /// 真实站点指纹识别：`SiteRegistry` 按 `SiteKind::ALL` 的顺序逐个 `detect`。
@@ -219,136 +232,153 @@ async fn sub2api_key_lifecycle_on_a_real_deployment() {
     println!("回收 ok：列表里已消失（回收后 total={}）", after.len());
 }
 
-/// **B-134 的真机证据**：`sync=false` 让 bazaarlink 立刻回一个**非终态** run，然后用
-/// `poll_probe_run` 真轮询到终态——这条路径在本波之前**只有 mock 覆盖**。
+/// 真机 probe 的入口：**key 驱动**，不是登录驱动。
 ///
-/// 若该部署的 `sync=false` 仍然直接给终态，本用例**退化**为「用真实 run_id 打一次轮询端点」
-/// （`fetch_probe_run`），并把这一点如实打印出来——不假装拿到了 `running`。
+/// 返回 `(base_url, api_key, model_id)`，三者任一缺失就打印 `SKIP` 并返回 `None`。
+///
+/// # 为什么不用 `KR_REAL_SUB2API_*` 走登录 + 建密钥
+///
+/// 2026-10-17 复验时该部署的**登录端点要求 Cloudflare Turnstile**
+/// （`turnstile_enabled=true` 且 secret 已配置，本地无法产出 token），也就是
+/// 「B-160 能不能复验」会取决于一件与 B-160 完全无关的事。probe 路径本身只需要
+/// **一把可用的 key**，所以把凭据入口收敛成 key。
+///
+/// # 代价（如实写在文档里，不藏）
+///
+/// 用例**不回收**这把 key——回收需要管理权限。运营者应当给一把**一次性** key，
+/// 跑完自行吊销。这比「用例自己建、自己删」少一段覆盖，换来的是「不依赖管理端点」。
+fn probe_target() -> Option<(String, String, String)> {
+    let vars = require(&["KR_REAL_PROBE_BASE", "KR_REAL_PROBE_KEY"])?;
+    let model = env_opt("KR_REAL_PROBE_MODEL").unwrap_or_else(|| "gpt-4o-mini".into());
+    Some((vars[0].clone(), vars[1].clone(), model))
+}
+
+/// **B-160 的真机验收**：走**与生产同形**的路径——`sync=false` 提交 + `poll_probe_run`
+/// 用 `PollPolicy::default()` 轮询到终态，并且**用生产那条 120s 超时的传输层**。
+///
+/// 断言的核心不是「拿到了判定」（那取决于站点与模型，不是本用例的契约），而是：
+/// - 提交响应的形状就是异步形状（`needs_poll(run, true) == true`）——这是 B-160 的触发条件；
+/// - 轮询确实收敛到 `Settled`（不是把预算等完、也不是连续失败）；
+/// - **`run_id` 一定带得回来**，即使没拿到判定。
+///
+/// 耗时只**打印**不断言：它取决于站点当时的负载与模型，把它写死成断言会变成偶发红。
+/// 但打印出来正好是证据——真机实测同一模型 `sync=true` 单条连接要 360.53s，
+/// 而这条传输层 120s 就掐断；`sync=false` 那条路在 187s 时仍然拿回了判定。
 #[tokio::test]
 #[ignore = "会走真实网络与真实站点（需要 KR_REAL_* 环境变量），用 --ignored 显式执行"]
-async fn probe_async_run_is_polled_until_terminal_on_a_real_deployment() {
-    let Some(vars) = require(&[
-        "KR_REAL_SUB2API_BASE",
-        "KR_REAL_SUB2API_EMAIL",
-        "KR_REAL_SUB2API_PASSWORD",
-    ]) else {
+async fn probe_async_submit_plus_poll_survives_a_run_longer_than_the_http_timeout() {
+    let Some((base, key_secret, model)) = probe_target() else {
         return;
     };
-    let (base, email, password) = (vars[0].clone(), vars[1].clone(), vars[2].clone());
-    let model = env_opt("KR_REAL_PROBE_MODEL").unwrap_or_else(|| "gpt-4o-mini".into());
-    let registry = SiteRegistry::new(transport());
-    let adapter = registry.adapter(SiteKind::Sub2Api);
-    let session = adapter
-        .login(&base, Credentials::new(email, password))
-        .await
-        .expect("真实登录应当成功");
-    let key = adapter
-        .create_key(
-            &base,
-            &session,
-            KeySpec::named(format!("keyrelay/m17-poll/{}", std::process::id())),
-        )
-        .await
-        .expect("建密钥");
 
-    let transport = transport();
+    // 生产同形：120s 单请求超时、不套 retry。
+    let probe_transport = probe_transport();
     let req = ProbeRequest {
         base_url: base.clone(),
-        api_key: zeroize::Zeroizing::new(key.secret.clone()),
+        api_key: zeroize::Zeroizing::new(key_secret),
         model_id: model.clone(),
         claimed_model: None,
-        sync: false, // ← 关键：要求 bazaarlink 立刻返回 run（异步模式）
+        sync: false, // B-160：主路径
     };
 
-    let first = run_probe(&transport, &req)
+    let t0 = Instant::now();
+    let first = run_probe(&probe_transport, &req)
         .await
-        .expect("异步 probe 应当返回 run");
+        .expect("异步 probe 提交应当返回 run");
+    let submit = t0.elapsed();
     println!(
-        "sync=false：status={:?} needs_poll={} verdict={:?} run_id={}",
-        first.status,
-        needs_poll(&first),
-        first.verdict_status,
-        first.run_id
+        "[B-160] 提交 ok：耗时={submit:?} status={:?} verdict={:?} run_id={} report={:?}",
+        first.status, first.verdict_status, first.run_id, first.report_url
+    );
+    // 真机形状：`sync=false` 的响应只有 runId + claimToken，没有 status ⇒ 解析成 unknown。
+    assert_eq!(
+        first.status, "unknown",
+        "真机形状变了：异步提交响应现在带了 status={:?}",
+        first.status
+    );
+    assert!(
+        needs_poll(&first, true),
+        "异步提交响应必须被判为「要轮询」，否则 B-160 的结论会在提交后立刻丢掉"
+    );
+    assert!(
+        !needs_poll(&first, false),
+        "同一个响应在同步语义下不轮询——两种语义不能混"
     );
 
-    if needs_poll(&first) {
-        let policy = PollPolicy {
-            max_attempts: 20,
-            interval: Duration::from_secs(10),
-        };
-        let t0 = Instant::now();
-        let (last, polls) = poll_probe_run(&transport, first, policy, &TokioSleeper).await;
+    let policy = PollPolicy::default();
+    let outcome = poll_probe_run(&probe_transport, first, true, policy, &TokioSleeper).await;
+    let total = t0.elapsed();
+    println!(
+        "[B-160] 轮询结束：stop={:?} polled={} errors={} 总耗时={total:?} status={:?} \
+         identity={:?} verdict={:?} true_family={:?} true_model={:?} confidence={:?} \
+         warnings={} bazaarlink_wall={:?} report={:?} run_id={}",
+        outcome.stop,
+        outcome.polled,
+        outcome.errors,
+        outcome.run.status,
+        outcome.run.identity_status,
+        outcome.run.verdict_status,
+        outcome.run.true_family,
+        outcome.run.true_model,
+        outcome.run.confidence,
+        outcome.run.warnings_count,
+        match (outcome.run.created_at, outcome.run.completed_at) {
+            (Some(a), Some(b)) => Some(Duration::from_millis((b - a).max(0) as u64)),
+            _ => None,
+        },
+        outcome.run.report_url,
+        outcome.run.run_id
+    );
+    if total >= Duration::from_secs(120) {
         println!(
-            "轮询结束：polls={polls} 耗时={:?} status={:?} verdict={:?} identity={:?} true_model={:?} confidence={:?}",
-            t0.elapsed(),
-            last.status,
-            last.verdict_status,
-            last.identity_status,
-            last.true_model,
-            last.confidence
+            "[B-160] ✅ 复现：本次从提交到收尾 {total:?} > 120s。旧实现把整轮检测压在一条连接上、\
+             120s 掐断 ⇒ 这一条判定在旧实现下必然丢失。"
         );
-        assert!(polls > 0, "needs_poll 为真时轮询至少要真的发过一次请求");
     } else {
         println!(
-            "退化路径：本部署的 sync=false 直接给终态（{:?}）⇒ 只用真实 run_id 打一次轮询端点",
-            first.status
-        );
-        let fetched = fetch_probe_run(&transport, &first.run_id)
-            .await
-            .expect("轮询端点对真实 run_id 应当可解析");
-        println!(
-            "fetch_probe_run ok：status={:?} verdict={:?}（与 POST 的终态一致={}）",
-            fetched.status,
-            fetched.verdict_status,
-            fetched.status == first.status
+            "[B-160] ⚠️ 本次 {total:?} < 120s，未复现超时形态（站点/模型这次跑得快）——\
+             不假装复现，如实记录。"
         );
     }
 
-    adapter
-        .revoke_key(&base, &session, &key.remote_id)
-        .await
-        .expect("回收探针用的密钥");
-    println!("探针用的密钥已回收（remote_id={}）", key.remote_id);
+    assert_eq!(
+        outcome.stop,
+        PollStop::Settled,
+        "轮询必须收敛到终态（不是预算用尽、也不是连续失败）：{outcome:?}"
+    );
+    assert!(!outcome.run.run_id.is_empty(), "run_id 必须带回来");
+    assert_eq!(
+        outcome.run.status, "completed",
+        "真机异步 run 的终态是 completed"
+    );
+
+    println!(
+        "探针结束：全程用过的 run_id={}（这把 key 是一次性的，请运营者自行吊销）",
+        outcome.run.run_id
+    );
 }
 
+/// **B-160 的对照组**：旧路径（`sync=true` 一次性 POST）在生产那条 120s 的传输层上跑，
+/// 只读打印耗时与结果；**不断言**具体判定值（那取决于站点与模型，不是本用例的契约）。
 ///
-/// 只读判据：打印 `status` / 判定字段 / 耗时 / `needs_poll`；**不断言**具体判定值
-/// （那取决于站点与模型，不是本用例的契约）。
+/// 重模型下这里应当打印 `Err(Transport(... timed out ...))`——那正是 B-160 的复现。
+/// 轻模型下它可能正常返回，所以**不能**把「必然超时」写成断言（会变成偶发红）。
 #[tokio::test]
 #[ignore = "会走真实网络与真实站点（需要 KR_REAL_* 环境变量），用 --ignored 显式执行"]
 async fn probe_reports_the_run_lifecycle_for_a_real_key() {
-    let Some(vars) = require(&[
-        "KR_REAL_SUB2API_BASE",
-        "KR_REAL_SUB2API_EMAIL",
-        "KR_REAL_SUB2API_PASSWORD",
-    ]) else {
+    let Some((base, key_secret, model)) = probe_target() else {
         return;
     };
-    let (base, email, password) = (vars[0].clone(), vars[1].clone(), vars[2].clone());
-    let model = env_opt("KR_REAL_PROBE_MODEL").unwrap_or_else(|| "gpt-4o-mini".into());
-    let registry = SiteRegistry::new(transport());
-    let adapter = registry.adapter(SiteKind::Sub2Api);
-    let session = adapter
-        .login(&base, Credentials::new(email, password))
-        .await
-        .expect("真实登录应当成功");
 
-    let key = adapter
-        .create_key(
-            &base,
-            &session,
-            KeySpec::named(format!("keyrelay/m17-probe/{}", std::process::id())),
-        )
-        .await
-        .expect("建密钥");
-
-    let transport = transport();
+    // 对照组必须用**生产那条 120s 传输层**：B-160 要证明的正是「这条路径在 120s 掐断、
+    // 而服务端的判定还在后面」。用 60s 的 `transport()` 会把变量搞混。
+    let transport = probe_transport();
     let req = ProbeRequest {
         base_url: base.clone(),
-        api_key: zeroize::Zeroizing::new(key.secret.clone()),
+        api_key: zeroize::Zeroizing::new(key_secret),
         model_id: model.clone(),
         claimed_model: None,
-        sync: true,
+        sync: true, // ← 对照组：B-160 之前的**唯一**路径
     };
     let t0 = Instant::now();
     let outcome = run_probe(&transport, &req).await;
@@ -357,11 +387,11 @@ async fn probe_reports_the_run_lifecycle_for_a_real_key() {
     match &outcome {
         Ok(run) => {
             println!(
-                "probe ok：耗时={:?} status={:?} needs_poll={} identity={:?} verdict={:?} \
-                 true_model={:?} confidence={:?} warnings={} report={:?}",
+                "[对照组 sync=true] probe ok：耗时={:?} status={:?} needs_poll={} identity={:?} \
+                 verdict={:?} true_model={:?} confidence={:?} warnings={} report={:?}",
                 elapsed,
                 run.status,
-                needs_poll(run),
+                needs_poll(run, false),
                 run.identity_status,
                 run.verdict_status,
                 run.true_model,
@@ -370,12 +400,8 @@ async fn probe_reports_the_run_lifecycle_for_a_real_key() {
                 run.report_url
             );
         }
-        Err(e) => println!("probe 失败（也是证据）：耗时={elapsed:?} err={e}"),
+        Err(e) => println!(
+            "[对照组 sync=true] probe 失败（**这条就是 B-160 的复现**）：耗时={elapsed:?} err={e}"
+        ),
     }
-
-    adapter
-        .revoke_key(&base, &session, &key.remote_id)
-        .await
-        .expect("回收探针用的密钥");
-    println!("探针用的密钥已回收（remote_id={}）", key.remote_id);
 }

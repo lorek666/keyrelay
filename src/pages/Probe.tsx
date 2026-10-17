@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, FlaskConical, Loader2 } from "lucide-react";
 import {
@@ -17,6 +17,10 @@ import { useTranslation, translate, getCurrentDict } from "../i18n";
  *
  * 把站点 key 发给第三方 bazaarlink.ai 检测模型真伪。**apiKey 外流**——必须勾选同意。
  * 结果摘要落本地历史（probe_runs），不落 items[].response 等敏感字段。
+ *
+ * M18-S1：主路径改为「异步提交 + 轮询到终态」，一次检测的整体等待时间从秒级变成
+ * **可达 15 分钟**（真机实测单次 187–360s）。所以进行中除转圈外必须显示已等待时长，
+ * 否则用户会把一段正常的等待当成卡死。
  */
 export default function Probe() {
   const { t } = useTranslation();
@@ -32,6 +36,10 @@ export default function Probe() {
   const [baseUrlOverride, setBaseUrlOverride] = useState("");
   const [agreed, setAgreed] = useState(false);
   const [result, setResult] = useState<ProbeRun | null>(null);
+  /** 本次检测已等待的毫秒数。未在检测中时恒为 0。 */
+  const [elapsedMs, setElapsedMs] = useState(0);
+  /** 本次检测的起算时刻（`Date.now()`）。计时自点击「开始检测」起算，**不是**自组件挂载。 */
+  const startedAtRef = useRef(0);
 
   const activeSiteId = siteId ?? sites.data?.[0]?.id ?? null;
   const activeSite = (sites.data ?? []).find((s) => s.id === activeSiteId);
@@ -52,6 +60,17 @@ export default function Probe() {
     },
   });
 
+  // 只在检测进行中走表；请求一结束（成功/失败/中止）或组件卸载，必须把定时器清掉，
+  // 否则它会一直对着已收尾的界面（或已卸载的组件）每秒 setState。
+  const pending = mutation.isPending;
+  useEffect(() => {
+    if (!pending) return;
+    const timer = window.setInterval(() => {
+      setElapsedMs(Date.now() - startedAtRef.current);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [pending]);
+
   const canSubmit =
     activeSiteId !== null &&
     keyId !== null &&
@@ -61,6 +80,10 @@ export default function Probe() {
   function submit() {
     if (!canSubmit || keyId === null) return;
     setResult(null);
+    // M18-S1：计时归零并重设起算点。放这里而不是挂载时——挂载时刻与用户点「开始检测」
+    // 之间可能隔着很久（填表单、翻历史），拿挂载时刻当起点会一上来就显示几分钟。
+    startedAtRef.current = Date.now();
+    setElapsedMs(0);
     mutation.mutate({
       keyId,
       modelId: modelId.trim(),
@@ -148,6 +171,12 @@ export default function Probe() {
             <FlaskConical size={14} /> {t("probe.start")}
           </button>
         )}
+        {mutation.isPending ? (
+          <div className="probe-progress">
+            <p className="mono">{t("probe.elapsed", { time: formatElapsed(elapsedMs) })}</p>
+            <p className="muted">{t("probe.elapsedHint")}</p>
+          </div>
+        ) : null}
         {mutation.error ? (
           <p className="error" role="alert">
             <AlertTriangle size={14} aria-hidden />{" "}
@@ -246,6 +275,15 @@ function siteName(
 ): string {
   const s = sites?.find((x) => x.id === id);
   return s ? s.displayName || s.baseUrl : `#${id}`;
+}
+
+/**
+ * 毫秒 → `分:秒`（`3:21`）。秒固定补零，分钟不补——轮询预算 900s 就是 `15:00`，
+ * 这个量级的读数不需要 `00:03` 那种前导零。负值（系统时钟回拨）钳到 `0:00`。
+ */
+function formatElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 }
 
 /**
