@@ -141,10 +141,24 @@ fn to_reqwest_method(method: Method) -> HttpMethod {
 fn describe(error: &reqwest::Error) -> Error {
     // P2-19：reqwest 错误原文可能带完整 URL（含 userinfo），进文案前先 scrub。
     let msg = crate::redact::scrub(&error.to_string());
+    // **顺序是载重逻辑，不是随手写的**（M19-S2 / 独立复审 P3-2）：
+    // `is_timeout()` 必须排在 `is_connect()` 前面，因为「连接阶段挂到超时」在 reqwest 里
+    // 表现为 `is_timeout()`，而**超时可能发生在读阶段**（请求已经送出去了）。
+    // 两个谓词同时为真时往「可能已送达」那一侧判，是**保守**方向：
+    // 代价是少重放一次（用户多等一轮），而不是重复计费（不可逆）。
     if error.is_timeout() {
         Error::Transport(format!("请求超时: {msg}"))
     } else if error.is_connect() {
-        Error::Transport(format!("连接失败: {msg}"))
+        // M19-S2 / B-162：连接层失败的**类别**要活着走出 trait 边界。
+        // 此前这里被压成 `Transport`，于是「能不能安全重放」这个判断在 probe 层
+        // 只能靠猜文案——而猜错的代价是重复计费。
+        //
+        // 判据与网关侧 B-138 的 `classify_send_error` 同源（同一个 `is_connect()`），
+        // 这样「上游没收到请求」在全仓只有**一个**定义。
+        //
+        // 这里**不加**「连接失败: 」前缀：变体自己的 Display 已经是
+        // 「连接未建立（请求未送达）: …」，再套一层前缀只会得到一句叠词。
+        Error::NotDelivered(msg)
     } else {
         Error::Transport(format!("请求失败: {msg}"))
     }

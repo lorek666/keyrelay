@@ -620,13 +620,22 @@ impl<T: HttpTransport + 'static> SiteAdapter for Sub2Api<T> {
     ) -> Result<KeyMaterial> {
         let base = normalize_base_url(base_url);
         let mut body = json!({ "name": spec.name });
-        if let Some(group) = spec
-            .group
-            .as_deref()
-            .filter(|g| !g.is_empty())
-            .and_then(|g| g.parse::<i64>().ok())
-        {
-            body["group_id"] = json!(group);
+        if let Some(group) = spec.group.as_deref().filter(|g| !g.is_empty()) {
+            // M19-S1 / B-161：**不再静默丢弃**。此前的写法是
+            // `.and_then(|g| g.parse::<i64>().ok())`——解析失败就什么都不做，
+            // 于是界面传来的分组名（`"gpt plus"`）被悄悄扔掉，密钥建出来不带 `group_id`，
+            // 用户要到 agent 收到 403 才知道。这里改成响亮失败：一个字节都不发，
+            // 直接把「该传什么」告诉用户。
+            //
+            // 为什么错误类型是 `InvalidInput` 而不是 `Transport`：这不是网络问题，
+            // 是**入参形态**不符合站点约定（见 `Error::InvalidInput` 的注释）。
+            let id = group.parse::<i64>().map_err(|_| {
+                Error::InvalidInput(format!(
+                    "Sub2API 的分组要用数字 id（例如 \"2\"），收到的是 \"{group}\"；\
+                     已拒绝创建——否则会建出一把没有绑定分组、调用时被站点 403 拒绝的密钥"
+                ))
+            })?;
+            body["group_id"] = json!(id);
         }
         if let Some(quota) = spec.quota_limit {
             body["quota"] = json!(quota);
@@ -790,6 +799,11 @@ impl<T: HttpTransport + 'static> SiteAdapter for Sub2Api<T> {
         Ok(groups
             .into_iter()
             .map(|group| GroupInfo {
+                // M19-S1 / B-161：`id` 必须传下去。Sub2API 建密钥要的是数字主键
+                // （`group_id`），而 `name` 是给人看的（`"gpt plus"`）。此前这里把 id
+                // 丢在适配器里，界面只能拿名字当标识往下传，`create_key` 解析成整数失败
+                // 后**静默丢弃** ⇒ 用户选了分组，密钥建出来却不带分组。
+                id: group.id.map(|id| id.to_string()),
                 rate: group
                     .id
                     .and_then(|id| rates.as_ref().and_then(|map| map.get(&id).copied()))

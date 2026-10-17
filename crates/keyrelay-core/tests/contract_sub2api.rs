@@ -452,6 +452,73 @@ async fn create_key_reads_plaintext_from_the_create_response() {
     assert_eq!(body_of(&requests[0])["name"], "codex/daily");
 }
 
+/// M19-S1 / B-161：分组标识必须是**数字 id**，且必须真的进请求体。
+///
+/// 此前 `create_key` 用 `.and_then(|g| g.parse::<i64>().ok())` 处理分组——解析失败
+/// 就**什么都不做**。界面传的是分组名（`"gpt plus"`），于是用户选了分组、密钥却建出来
+/// 不带 `group_id`，要到 agent 收到 `403 API key is not assigned to any group` 才发现。
+#[tokio::test]
+async fn create_key_sends_the_numeric_group_id() {
+    let transport = MockTransport::new(vec![json_resp(
+        201,
+        json!({"code": 0, "message": "success", "data": {"id": 21, "key": SECRET, "name": "k"}}),
+    )]);
+    let adapter = Sub2Api::new(transport);
+
+    adapter
+        .create_key(
+            BASE,
+            &session(),
+            KeySpec {
+                group: Some("2".into()),
+                ..KeySpec::named("k")
+            },
+        )
+        .await
+        .unwrap();
+
+    let requests = adapter.transport().requests();
+    assert_eq!(body_of(&requests[0])["group_id"], 2, "group_id 必须是数字");
+}
+
+/// 分组串不是数字 ⇒ **响亮失败**，且站点侧零请求。
+///
+/// 零请求这一点是判据：如果先发一次再报错，站点上就会多出一把不带分组的密钥
+/// （建出来就不可用），而用户看到的却是一条错误——比静默丢弃更糟。
+#[tokio::test]
+async fn create_key_rejects_a_group_name_instead_of_dropping_it() {
+    let transport = MockTransport::new(vec![]);
+    let adapter = Sub2Api::new(transport);
+
+    let err = adapter
+        .create_key(
+            BASE,
+            &session(),
+            KeySpec {
+                group: Some("gpt plus".into()),
+                ..KeySpec::named("k")
+            },
+        )
+        .await
+        .unwrap_err();
+
+    match err {
+        keyrelay_core::error::Error::InvalidInput(message) => {
+            assert!(
+                message.contains("gpt plus"),
+                "要回显用户输入的那个串: {message}"
+            );
+            assert!(message.contains("数字 id"), "要告诉他该传什么: {message}");
+        }
+        other => panic!("期望 InvalidInput，实际: {other:?}"),
+    }
+    assert_eq!(
+        adapter.transport().request_count(),
+        0,
+        "入参不合法时一个字节都不该发出去"
+    );
+}
+
 #[tokio::test]
 async fn reveal_key_fetches_by_id() {
     let transport = MockTransport::new(vec![ok(json!({"id": 12, "key": SECRET}))]);

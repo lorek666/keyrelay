@@ -228,13 +228,65 @@ pub struct ProbeRun {
 ///
 /// `T: ?Sized` 是为了让调用方能把 `&dyn HttpTransport` 传进来（服务层要在
 /// 「probe 专用 transport」与「默认 transport」之间二选一，见 `Service::probe_model`）。
+///
+/// # 提交失败只重放一次，且只重放**可证明未送达**的那一类（M19-S2 / B-162）
+///
+/// 异步化（B-160）让**等待**变得可重试，但**提交**仍是一次请求：连一次都送不出去，
+/// 用户既没有结论、也没有 runId。所以这里补一次重放——判据严格限定在
+/// [`Error::is_not_delivered`]（连接层失败，对端没看到这个请求）。
+///
+/// **为什么不能放宽到「任何传输错误」**：读超时、连接建立后中断、响应体 EOF 这些
+/// 失败**可能**已经送达并被计费，重放会让用户在站点上多付一笔、且不可逆。
+/// 这条口径与网关侧 B-138 同源。
+///
+/// **为什么重放一次就够**：连接层失败的瞬时成因（DNS 抖动、握手被重置）通常一次就过；
+/// 连试两次都建不起连接，说明是配置或网络形态问题（例如代理 scheme 不对），
+/// 再多试几次只会让用户多等、把错误信息埋得更深。
 pub async fn run_probe<T: HttpTransport + ?Sized>(
     transport: &T,
     req: &ProbeRequest,
 ) -> Result<ProbeRun> {
     let http = HttpRequest::new(Method::Post, PROBE_ENDPOINT).json_body(&req.to_json())?;
-    let resp = transport.request(http).await?;
+    let resp = match transport.request(http.clone()).await {
+        Ok(resp) => resp,
+        // 第一次就没送达 ⇒ 重放一次。`http` 已经 clone 好，重放用的请求体与首次**逐字相同**。
+        Err(err) if err.is_not_delivered() => match transport.request(http).await {
+            Ok(resp) => resp,
+            Err(second) if second.is_not_delivered() => {
+                // `is_not_delivered()` 已判定变体；取不到原文时留空，不用 `unwrap`（库内禁 panic）。
+                let detail = if let Error::NotDelivered(message) = second {
+                    message
+                } else {
+                    String::new()
+                };
+                // 文案不要重复变体自己的语义（独立复审闭环 P3-5）：`NotDelivered` 的
+                // Display 已经是「连接未建立（请求未送达）: …」，这里只需要补上
+                // 「试过第二次了」这一个新信息，否则会读成
+                // 「连接未建立（请求未送达）: 重试一次后仍无法建立连接（两次请求都未送达）: …」。
+                return Err(Error::NotDelivered(format!("重试一次后仍失败：{detail}")));
+            }
+            Err(second) => return Err(ambiguous_submit_failure(second)),
+        },
+        Err(err) => return Err(ambiguous_submit_failure(err)),
+    };
     parse_probe_response(resp)
+}
+
+/// 提交阶段「可能已送达」的失败：**结论未知**，文案必须把这件事说出来。
+///
+/// 只说「传输错误」会让用户以为「没发出去，重试一次就好」；实际可能是服务端已经
+/// 受理并在跑检测（甚至已经计费）。这两种情况下该做的事完全不同——前者重试无害，
+/// 后者重试就是重复花钱。所以这里改写成一句明确的话。
+///
+/// 只包装 [`Error::Transport`]：其余变体（限流、额度、认证…）都带着自己准确的语义，
+/// 套上「无法确认是否已受理」反而把它们的意思搅浑了。
+fn ambiguous_submit_failure(err: Error) -> Error {
+    match err {
+        Error::Transport(message) => Error::Transport(format!(
+            "提交检测请求时连接中断，无法确认服务端是否已受理（可能已在检测、也可能已计费）：{message}"
+        )),
+        other => other,
+    }
 }
 
 /// `GET /api/probe/run/<runId>`：查一次 run 的当前状态（轮询兜底用）。
@@ -744,6 +796,110 @@ mod tests {
             "400 body 不得回显 apiKey: {msg}"
         );
         assert!(msg.contains("检测请求被拒"));
+    }
+
+    // ---- M19-S2：提交只重放「可证明未送达」的那一类 ----
+
+    fn async_frame() -> HttpResponse {
+        HttpResponse::json(200, json!({ "runId": "r-replay", "claimToken": "c-1" })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn submit_replays_once_when_the_connection_was_never_established() {
+        // 连接层失败 ⇒ 请求没送达 ⇒ 重放安全。第二次成功，整轮检测照常继续。
+        let mock = MockTransport::new(vec![]);
+        mock.push_error(Error::NotDelivered("连接失败: tcp connect error".into()));
+        mock.push(async_frame());
+
+        let run = run_probe(&mock, &probe_req()).await.unwrap();
+        assert_eq!(run.run_id, "r-replay");
+        assert_eq!(mock.request_count(), 2, "必须重放一次");
+
+        // 重放用的请求与首次**逐字相同**（同一个检测目标，不是另一次检测）。
+        // 整条 `HttpRequest` 比较，而不是挑几个字段——挑字段就会漏掉 headers 这类
+        // 同样参与契约的东西（独立复审 P3-3）。
+        let first = mock.nth_request(0).unwrap();
+        let second = mock.nth_request(1).unwrap();
+        assert_eq!(first, second, "重放请求必须与首次逐字相同");
+    }
+
+    #[tokio::test]
+    async fn submit_gives_up_after_exactly_one_replay() {
+        // 两次都建不起连接 ⇒ 停在 2 次，不进入第三轮。
+        let mock = MockTransport::new(vec![]);
+        mock.push_error(Error::NotDelivered("连接失败: dns error".into()));
+        mock.push_error(Error::NotDelivered("连接失败: dns error".into()));
+        mock.push(async_frame()); // 不该被消费
+
+        let err = run_probe(&mock, &probe_req()).await.unwrap_err();
+        assert_eq!(mock.request_count(), 2, "只重放一次，不是无限重试");
+        match err {
+            Error::NotDelivered(message) => {
+                assert!(message.contains("重试一次后仍失败"), "{message}");
+                assert!(message.contains("dns error"), "要保留原始成因: {message}");
+                // 变体 Display 已含「连接未建立（请求未送达）」，文案不该再重复一遍
+                assert!(
+                    !message.contains("仍无法建立连接"),
+                    "不要与变体自身的语义叠词: {message}"
+                );
+            }
+            other => panic!("期望 NotDelivered，实际: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_does_not_replay_an_ambiguous_failure() {
+        // 读超时 / 连接建立后中断：**可能已送达并计费** ⇒ 一次都不重放。
+        let mock = MockTransport::new(vec![]);
+        mock.push_error(Error::Transport(
+            "请求超时: error sending request for url (https://probe.example.com/api/probe/run)"
+                .into(),
+        ));
+        mock.push(async_frame()); // 不该被消费
+
+        let err = run_probe(&mock, &probe_req()).await.unwrap_err();
+        assert_eq!(mock.request_count(), 1, "不可证明未送达 ⇒ 不重放");
+        let message = err.to_string();
+        assert!(
+            message.contains("无法确认服务端是否已受理"),
+            "必须把「结论未知」说出来: {message}"
+        );
+        assert!(message.contains("请求超时"), "保留原始成因: {message}");
+        assert!(
+            matches!(err, Error::Transport(_)),
+            "类别不能被改写：{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_does_not_replay_a_rate_limited_response() {
+        // 429 是**响应**：请求已经送达。重放会白打一次并再次被限流。
+        let mock = MockTransport::new(vec![
+            HttpResponse::new(429, br#"{"error":"slow down"}"#.to_vec())
+                .with_header("Retry-After", "7"),
+            async_frame(),
+        ]);
+
+        let err = run_probe(&mock, &probe_req()).await.unwrap_err();
+        assert_eq!(mock.request_count(), 1, "429 不得重放");
+        assert!(
+            matches!(
+                err,
+                Error::RateLimited {
+                    retry_after_secs: 7
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn not_delivered_is_retryable_so_site_side_backoff_is_unchanged() {
+        // 这个变体此前是 `Transport` 的一个分支，站点侧的 `RetryingTransport` 一直重试它。
+        // 加变体而漏掉 `is_retryable()`，等于把站点的瞬时连接故障悄悄降级成「一次就放弃」。
+        assert!(Error::NotDelivered("连接失败".into()).is_retryable());
+        assert!(Error::Transport("请求超时".into()).is_retryable());
+        assert!(!Error::AuthFailed("x".into()).is_retryable());
     }
 
     #[tokio::test]

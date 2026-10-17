@@ -48,6 +48,23 @@ pub enum Error {
     #[error("传输错误: {0}")]
     Transport(String),
 
+    /// 连接层失败：DNS / TCP / TLS 在**握手阶段**就失败了，请求体一个字节都没进对端
+    /// 的处理流程（M19-S2 / B-162）。
+    ///
+    /// 这个变体存在的唯一理由是**计费安全**：它回答的是「这次失败能不能把同一个请求
+    /// 再发一次而不产生重复扣费」。答案是可以——对端根本没看到这个请求。
+    ///
+    /// 与 [`Error::Transport`] 的分界：`Transport` 包含**可能已送达**的失败
+    /// （读超时、连接建立后中断、响应体读到一半 EOF），那些**不能**重放。
+    /// 判据只有一处：`reqwest::Error::is_connect()`（见 `site::transport_reqwest::describe`），
+    /// 与网关侧 B-138 的重放口径同源。别在别处凭文案猜——`"连接失败: …"` 这个前缀是
+    /// 给人看的，不是契约。
+    ///
+    /// **边界（实测）**：`is_connect()` **不**覆盖「连接挂起直到 `connect_timeout`」，
+    /// 那类失败在 reqwest 里表现为 `is_timeout()` ⇒ 仍落在 `Transport`（不可重放）。
+    #[error("连接未建立（请求未送达）: {0}")]
+    NotDelivered(String),
+
     /// 输入形态不符合该站点类型的约定（M9-S2 / B-120）。**请求未发出**。
     ///
     /// 为什么单开一个变体，而不是复用现成的两个：
@@ -111,7 +128,20 @@ impl Error {
 
     /// 该错误是否值得重试（用于调度器退避策略）
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Error::Transport(_) | Error::RateLimited { .. })
+        // `NotDelivered` 必须在这里：它此前是 `Transport` 的一个分支，站点侧的
+        // `RetryingTransport` 一直会重试它（连接失败重试是安全的）。加变体而漏掉这一条，
+        // 等于把站点侧的瞬时连接故障从「重试 3 次」悄悄降级成「一次就放弃」。
+        matches!(
+            self,
+            Error::Transport(_) | Error::NotDelivered(_) | Error::RateLimited { .. }
+        )
+    }
+
+    /// 这次失败**可证明**请求没有送达对端（M19-S2）。
+    ///
+    /// 只用于「能不能把同一个请求再发一次」这一个判断，不要拿它当错误分类用。
+    pub fn is_not_delivered(&self) -> bool {
+        matches!(self, Error::NotDelivered(_))
     }
 }
 

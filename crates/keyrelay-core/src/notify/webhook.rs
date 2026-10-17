@@ -210,10 +210,19 @@ fn safe_endpoint(url: &str) -> String {
 
 /// 传输层错误的**种类**（只保留种类，不保留原文）。
 ///
-/// 分类靠 `ReqwestTransport::describe` 的既有文案（「请求超时」/「连接失败」/「请求失败」）；
-/// 认不出来一律归到「请求失败」——**兜底方向是「少说」而不是「多说」**，因为多说就等于把
-/// 原文转发出去，而原文里可能带着 URL 上的凭据。
+/// **先按变体判，再按文案兜底**（M19-S2 / 独立复审 P2-1）：
+///
+/// - 连接层失败现在有专属变体 [`Error::NotDelivered`]，它的 Display 是
+///   「连接未建立（请求未送达）: …」，**不再带「连接失败」四个字**——只靠文案分类会把
+///   「连不上」报成「请求失败」，把唯一可诊断的信息丢掉。变体判定是结构性的，不会再被
+///   文案改动打穿。
+/// - 其余情况仍按 `ReqwestTransport::describe` 的既有文案分类；认不出来一律归到
+///   「请求失败」——**兜底方向是「少说」而不是「多说」**，因为多说就等于把原文转发出去，
+///   而原文里可能带着 URL 上的凭据。
 fn transport_failure_kind(err: &Error) -> &'static str {
+    if err.is_not_delivered() {
+        return "连接失败";
+    }
     let text = err.to_string();
     if text.contains("超时") {
         "请求超时"
@@ -567,6 +576,23 @@ mod tests {
         assert_eq!(transport_failure_kind(&refused), "连接失败");
         let other = Error::Transport("读取响应体失败: 意外 EOF".into());
         assert_eq!(transport_failure_kind(&other), "请求失败");
+    }
+
+    /// M19-S2 / 独立复审 P2-1：连接层失败现在有专属变体，**Display 里没有「连接失败」四个字**。
+    ///
+    /// 这条用例存在的理由就是钉死「分类不能只靠文案」：一旦有人把变体判定删掉、
+    /// 退回纯文案匹配，`NotDelivered` 会被报成「请求失败」，用户拿到的唯一线索
+    /// （连不上 vs 已发出）就没了。用真实的 Display 文本构造，不手写前缀。
+    #[test]
+    fn not_delivered_is_reported_as_a_connection_failure() {
+        let refused = Error::NotDelivered(
+            "error sending request for url (http://127.0.0.1:1/api/probe/run)".into(),
+        );
+        assert!(
+            !refused.to_string().contains("连接失败"),
+            "前提：该变体的 Display 不含「连接失败」四个字，否则本用例测不出文案耦合: {refused}"
+        );
+        assert_eq!(transport_failure_kind(&refused), "连接失败");
     }
 
     #[test]

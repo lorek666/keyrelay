@@ -311,6 +311,30 @@ async fn full_flow_against_fake_newapi_site() {
         .expect("读本地行")
         .expect("行在");
     assert_eq!(plain.group_name, None, "没填分组 ⇒ NULL");
+    // ④-c M19-S1：**标识发给站点，显示名落本地**。
+    // `group` 现在是站点原生标识（Sub2API 上是 `"3"` 这种数字），落库要存人看的名字，
+    // 否则密钥表显示一个无意义的数字，而且按分组名查倍率会落空（倍率排序随之退化）。
+    let labelled = service
+        .create_key(
+            summary.id,
+            KeySpec {
+                group: Some("3".to_string()),
+                group_label: Some("gpt plus".to_string()),
+                ..KeySpec::named("codex/labelled")
+            },
+        )
+        .await
+        .expect("创建带标识+显示名的令牌");
+    let labelled_row = service
+        .store()
+        .get_key(labelled.id)
+        .expect("读本地行")
+        .expect("行在");
+    assert_eq!(
+        labelled_row.group_name.as_deref(),
+        Some("gpt plus"),
+        "有显示名时落显示名，不落站点标识"
+    );
     // `status` 仍然不写：它是本地词表，`unknown` 的含义是「本产品没对它做过任何事」
     assert_eq!(
         row.status, "unknown",

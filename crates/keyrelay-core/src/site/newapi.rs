@@ -388,6 +388,10 @@ fn parse_user_groups(data: &Value) -> Result<Vec<GroupInfo>> {
             .filter(|d| !d.is_empty())
             .map(|d| d.to_string());
         out.push(GroupInfo {
+            // M19-S1：NewAPI 的分组**没有独立主键**——`/api/user/self/groups` 返回的是
+            // 以分组名为键的对象，建令牌时 `group` 字段收的也是名字。所以这里 `id = None`，
+            // 前端会回落到 `name`，行为与本字段出现之前逐字一致。
+            id: None,
             name: name.clone(),
             rate,
             description,

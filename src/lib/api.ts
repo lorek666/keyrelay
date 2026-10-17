@@ -420,7 +420,15 @@ export type LoginArgs = {
 export type CreateKeyArgs = {
   siteId: number;
   name: string;
+  /** **站点原生**分组标识（Sub2API 是数字主键，NewAPI 是分组名）——发给站点。 */
   group?: string;
+  /**
+   * 分组的显示名——只用于本地记录与界面展示（M19-S1）。
+   *
+   * 与 `group` 分开传：标识发给站点，名字给人看。合成一个字段时落库的
+   * `group_name` 会变成 `"2"`，密钥表显示无意义的数字，按分组名查倍率也会落空。
+   */
+  groupLabel?: string;
 };
 
 export type DeliveryArgs = {
@@ -1292,6 +1300,14 @@ export async function refreshAll(): Promise<RefreshSummary> {
 // ============================================ M6-S5：FR-2 / FR-7
 
 export type Group = {
+  /**
+   * **站点原生**的分组标识，用于回填创建密钥时的 `group`（M19-S1 / B-161）。
+   *
+   * `null` = 该站点以分组名为标识（NewAPI：`/api/user/self/groups` 的对象键就是名字），
+   * 此时用 `name`。Sub2API 的分组有数字主键（`"2"`），建密钥的接口只认它——
+   * 传名字会被拒（以前是被**静默丢弃**，密钥建出来不带分组）。
+   */
+  id: string | null;
   name: string;
   /** 分组倍率。`null` = 站点没给（**不是 0**，0 表示免费分组）。 */
   rate: number | null;
@@ -1301,8 +1317,8 @@ export type Group = {
 export async function availableGroups(siteId: number): Promise<Group[]> {
   if (!hasTauri) {
     return mock([
-      { name: "default", rate: 1, description: null },
-      { name: "vip", rate: 0.5, description: "折扣分组" },  // i18n:skip
+      { id: "1", name: "default", rate: 1, description: null },
+      { id: "2", name: "vip", rate: 0.5, description: "折扣分组" }, // i18n:skip
     ]);
   }
   return invokeCommand<Group[]>("available_groups", { siteId });
@@ -1614,6 +1630,18 @@ export async function suggestKeyName(
 export function formatGroupRate(rate: number | null): string {
   if (rate === null || !Number.isFinite(rate) || rate <= 0) return translate(getCurrentDict(), "common.rateUnknown");
   return `${rate}×`;
+}
+
+/**
+ * 把一个分组映射成**可以回填给站点**的标识（M19-S1 / B-161）。
+ *
+ * 优先用 `id`（站点原生标识，Sub2API 的数字主键），没有才回落到 `name`
+ * （NewAPI 的分组名本身就是标识）。空串按「没有 id」处理——后端若回一个 `""`，
+ * 传下去只会得到一条「分组不存在」的错误，回落反而能工作。
+ */
+export function groupKeyOf(group: Group): string {
+  const id = group.id?.trim();
+  return id ? id : group.name;
 }
 
 export type AutostartState = "enabled" | "disabled" | "unknown";

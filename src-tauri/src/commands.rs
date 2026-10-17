@@ -512,7 +512,14 @@ pub struct LoginArgs {
 pub struct CreateKeyArgs {
     site_id: i64,
     name: String,
+    /// **站点原生**的分组标识（Sub2API 是 `"2"` 这种数字，NewAPI 是分组名）。
     group: Option<String>,
+    /// 分组的显示名，只用于本地记录与界面展示（M19-S1）。
+    ///
+    /// 与 `group` 分开传的理由：标识要发给站点，名字要给人看。合成一个字段时，
+    /// 落库的 `keys.group_name` 会变成 `"2"`——密钥表显示一个无意义的数字，
+    /// 而且按分组名查倍率会落空（网关的倍率排序随之退化）。
+    group_label: Option<String>,
 }
 
 #[tauri::command]
@@ -623,6 +630,7 @@ pub async fn create_key(
 ) -> Result<StoredKeyDto, String> {
     let mut spec = keyrelay_core::site::KeySpec::named(args.name);
     spec.group = args.group;
+    spec.group_label = args.group_label;
     state
         .service
         .create_key(args.site_id, spec)
@@ -1845,6 +1853,11 @@ pub async fn refresh_all(state: State<'_, AppState>) -> Result<RefreshSummaryDto
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupDto {
+    /// **站点原生**的分组标识（M19-S1 / B-161）。`None` = 该站点以分组名为标识。
+    ///
+    /// 这一层此前也把它丢了：`GroupInfo.id` 在适配器里没被填上，DTO 里又没有这个字段，
+    /// 于是前端只拿得到名字。Sub2API 建密钥要的是数字主键 ⇒ 名字被静默丢弃。
+    id: Option<String>,
     name: String,
     /// 分组倍率。`None` = 站点没给（**不是 0**，0 表示免费分组）。
     rate: Option<f64>,
@@ -1864,6 +1877,7 @@ pub async fn available_groups(
             groups
                 .into_iter()
                 .map(|g| GroupDto {
+                    id: g.id,
                     name: g.name,
                     rate: g.rate,
                     description: g.description,

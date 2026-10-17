@@ -46,8 +46,23 @@ fn bearer_session() -> Session {
     }
 }
 
+/// NewAPI 的分组：**名字就是标识** ⇒ `id = None`（M19-S1）。
 fn group(name: &str, rate: Option<f64>, description: Option<&str>) -> GroupInfo {
     GroupInfo {
+        id: None,
+        name: name.to_string(),
+        rate,
+        description: description.map(str::to_string),
+    }
+}
+
+/// Sub2API 的分组：有数字主键 ⇒ `id = Some("1")` 之类（M19-S1 / B-161）。
+///
+/// 这个 helper 存在的理由就是让「id 有没有被传下来」在断言里**看得见**：
+/// 之前它恒为 `None`，界面只能拿名字当标识，建密钥时被静默丢弃。
+fn sub_group(id: &str, name: &str, rate: Option<f64>, description: Option<&str>) -> GroupInfo {
+    GroupInfo {
+        id: Some(id.to_string()),
         name: name.to_string(),
         rate,
         description: description.map(str::to_string),
@@ -240,8 +255,8 @@ async fn sub2api_available_groups_merges_two_calls_in_order() {
     assert_eq!(
         groups,
         vec![
-            group("default", Some(0.9), Some("默认分组")),
-            group("vip", Some(1.1), Some("高级")),
+            sub_group("1", "default", Some(0.9), Some("默认分组")),
+            sub_group("2", "vip", Some(1.1), Some("高级")),
         ],
         "按 id 合并，顺序 = available 的顺序"
     );
@@ -285,8 +300,8 @@ async fn sub2api_available_groups_rates_null_falls_back_to_rate_multiplier() {
     assert_eq!(
         groups,
         vec![
-            group("default", Some(1.0), None),
-            group("vip", Some(1.2), Some("高级")),
+            sub_group("1", "default", Some(1.0), None),
+            sub_group("2", "vip", Some(1.2), Some("高级")),
         ],
         "rates 缺失 → 回落到 rate_multiplier"
     );
@@ -329,7 +344,7 @@ async fn sub2api_available_groups_no_rate_multiplier_yields_none() {
         .unwrap();
     assert_eq!(
         groups,
-        vec![group("default", None, None)],
+        vec![sub_group("1", "default", None, None)],
         "既无覆盖倍率也无基准倍率 → rate = None"
     );
 }
@@ -350,7 +365,7 @@ async fn sub2api_available_groups_rate_multiplier_zero() {
         .unwrap();
     assert_eq!(
         groups,
-        vec![group("free", Some(0.0), Some("免费"))],
+        vec![sub_group("1", "free", Some(0.0), Some("免费"))],
         "rate_multiplier = 0 → 回落后为 Some(0.0)"
     );
 }
@@ -372,9 +387,9 @@ async fn sub2api_available_groups_empty_description_is_none() {
     assert_eq!(
         groups,
         vec![
-            group("a", None, None),
-            group("b", None, None),
-            group("c", None, Some("有说明")),
+            sub_group("1", "a", None, None),
+            sub_group("2", "b", None, None),
+            sub_group("3", "c", None, Some("有说明")),
         ]
     );
 }
@@ -391,7 +406,7 @@ async fn sub2api_available_groups_accepts_items_envelope() {
         .available_groups(SUB2API_BASE, &bearer_session())
         .await
         .unwrap();
-    assert_eq!(groups, vec![group("a", Some(2.0), None)]);
+    assert_eq!(groups, vec![sub_group("1", "a", Some(2.0), None)]);
 }
 
 #[tokio::test]
@@ -556,12 +571,12 @@ async fn sub2api_available_groups_rates_follow_parse_rate_semantics() {
     assert_eq!(
         groups,
         vec![
-            group("free", Some(0.0), None), // 0 = 免费分组，必须保留（不能丢条目）
-            group("neg", None, None),       // 负数 ⇒ 条目被忽略 ⇒ 回落 None
-            group("str", Some(2.0), None),  // 字符串数字按边界表
-            group("bad", None, None),       // 非数字 ⇒ 忽略
-            group("ok", Some(1.5), None),
-            group("missing", None, None), // rates 里没有 ⇒ None（既有口径）
+            sub_group("1", "free", Some(0.0), None), // 0 = 免费分组，必须保留（不能丢条目）
+            sub_group("2", "neg", None, None),       // 负数 ⇒ 条目被忽略 ⇒ 回落 None
+            sub_group("3", "str", Some(2.0), None),  // 字符串数字按边界表
+            sub_group("4", "bad", None, None),       // 非数字 ⇒ 忽略
+            sub_group("5", "ok", Some(1.5), None),
+            sub_group("6", "missing", None, None), // rates 里没有 ⇒ None（既有口径）
         ]
     );
 }
