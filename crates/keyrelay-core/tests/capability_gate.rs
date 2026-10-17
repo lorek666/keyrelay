@@ -139,6 +139,7 @@ async fn unsupported_entry_points_fail_before_asking_for_a_session() {
                     keyrelay_core::site::KeySpec {
                         name: "x".into(),
                         group: None,
+                        group_label: None,
                         quota_limit: None,
                         expires_at: None,
                     },

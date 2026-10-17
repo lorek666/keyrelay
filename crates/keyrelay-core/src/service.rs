@@ -92,6 +92,9 @@ fn error_kind(err: &Error) -> &'static str {
         Error::QuotaExhausted => "额度不足",
         Error::NotFound(_) => "远端资源不存在",
         Error::Transport(_) => "网络/协议错误",
+        // M19-S2：与「网络/协议错误」分开记——连接层失败意味着**请求没送达对端**，
+        // 而「要不要把同一个请求再发一次」正是靠这条差别判断的，不该被压成同一个词。
+        Error::NotDelivered(_) => "连接未建立",
         // M9-S2：与「认证失败」分开记——用户要做的是**改输入**，不是重新登录。
         Error::InvalidInput(_) => "输入不符合站点要求",
         Error::Vault(_) => "钥匙串错误",
@@ -1279,9 +1282,23 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let session = self.session(site_id)?;
         let adapter = self.registry.adapter(kind);
         let name = spec.name.clone();
-        // 分组名在 `spec` 被 move 进适配器**之前**取出来：它是用户刚填的权威值，
+        // 分组在 `spec` 被 move 进适配器**之前**取出来：它是用户刚选的权威值，
         // 适配器不回传它（`KeyMaterial` 只有 remote_id + secret）。
-        let group_name = spec.group.clone();
+        //
+        // M19-S1：落库存**显示名**而不是站点标识。`spec.group` 现在是站点原生标识
+        // （Sub2API 上是 `"2"`），存它会让密钥表显示一个无意义的数字，更要紧的是
+        // `refresh` 里按分组名查倍率会落空 ⇒ 网关按倍率排序退化成「未知」。
+        // 调用方没给显示名时（CLI / 测试）回落成标识，行为与改动前一致。
+        //
+        // **空串要在回落之前滤掉**（独立复审闭环 P3-3）：写成
+        // `label.or_else(group).filter(!empty)` 时，`Some("")` 会先命中 `or_else` 的短路
+        // 条件（它只看 `Some`/`None`），于是回落不触发、最后被 `filter` 丢成 NULL——
+        // 「显示名是空串」与「根本没给显示名」本该走同一条回落路径。
+        let group_name = spec
+            .group_label
+            .clone()
+            .filter(|g| !g.is_empty())
+            .or_else(|| spec.group.clone().filter(|g| !g.is_empty()));
         match adapter.create_key(&site.base_url, &session, spec).await {
             Ok(material) => {
                 // 站点上已经建好了。此刻若本地保存失败，必须如实告诉用户
@@ -2919,7 +2936,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .flatten()
             .and_then(|row| row.group_name);
         let rate = key_group
-            .and_then(|name| groups.iter().find(|group| group.name == name))
+            // M19-S1：存的可能是**显示名**（产品建的 key）也可能是**站点原生标识**
+            // （CLI/测试建的、或将来别的写入方）。两种都认，否则「按 id 存」的 key
+            // 会静默退化成「倍率未知」，把排序依据悄悄丢掉。
+            .and_then(|stored| {
+                groups
+                    .iter()
+                    .find(|group| group.name == stored || group.id.as_deref() == Some(&stored))
+            })
             .and_then(|group| group.rate);
         if let Ok(mut map) = self.site_facts.lock() {
             map.entry(site_id).or_default().rate = rate;

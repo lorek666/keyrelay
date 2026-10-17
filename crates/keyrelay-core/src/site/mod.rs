@@ -271,7 +271,21 @@ pub struct KeyDailyUsage {
 #[derive(Clone, Debug, PartialEq)]
 pub struct KeySpec {
     pub name: String,
+    /// **站点原生**的分组标识，取自 [`GroupInfo::id`]；`None` = 不指定分组。
+    ///
+    /// **不是**给人看的名字：Sub2API 要 `"2"`（数字主键），NewAPI 要 `"vip"`（名字即标识，
+    /// 其 [`GroupInfo::id`] 恒为 `None`）。把名字传给 Sub2API 会被它拒绝——这正是
+    /// M19-S1 修掉的那个静默丢弃。
     pub group: Option<String>,
+    /// 分组的**显示名**（人看的那个），只用于本地记录与界面展示。
+    ///
+    /// 为什么要有它：`group` 是站点原生标识，Sub2API 上是 `"2"` 这种数字；把它原样存进
+    /// 本地 `keys.group_name`，密钥表就会显示一个没有意义的数字，而**倍率查询**
+    /// （`service.rs` 里按分组名找倍率）也会落空 ⇒ 网关的按倍率排序退化成「未知」。
+    ///
+    /// 适配器**不得**读这个字段（它不参与任何站点请求）；它只是把「用户看到的那个名字」
+    /// 一路带到落库那一行。`None` 时调用方回落成 `group`。
+    pub group_label: Option<String>,
     /// 站点侧的额度上限（NewAPI 为 quota 单位，None 表示不限）
     pub quota_limit: Option<f64>,
     pub expires_at: Option<i64>,
@@ -282,6 +296,7 @@ impl KeySpec {
         Self {
             name: name.into(),
             group: None,
+            group_label: None,
             quota_limit: None,
             expires_at: None,
         }
@@ -354,8 +369,24 @@ impl Balance {
 /// `rate` 是站点给出的**计费倍率**，站点没给或该用户没有专属覆盖倍率时为 `None`
 /// ——`None` 与「倍率 1.0」是两件事，调用方不得把 `None` 当成 1.0 展示（M6-S4 spec §6.1）。
 /// 本类型**不含任何凭证**。
+///
+/// # `id` 与 `name` 是两件事（M19-S1 / B-161）
+///
+/// `id` 是**站点原生标识**，用于回填 [`KeySpec::group`]；`name` 只用于显示。
+/// 什么时候两者不同：
+///
+/// - **Sub2API**：分组有数字主键（`groups.id`），建密钥时接口要的是 `group_id`（整数），
+///   而 `name` 是给人看的（`"gpt plus"` / `"自用"`）。此前 `GroupInfo` 丢掉了 `id`，
+///   界面只能把 `name` 当标识往下传，Sub2API 的 `create_key` 又只认整数 ⇒
+///   **静默丢掉了用户选的分组**，密钥建出来不带 `group_id`，调用时被站点 403。
+/// - **NewAPI**：分组**没有**独立主键，接口与界面都以名字为标识 ⇒ `id = None`，
+///   前端回落到 `name`，行为与加这个字段之前逐字一致。
+///
+/// 类型是 `Option<String>` 而不是 `i64`：标识要原样走完「适配器 → IPC → 前端 → 适配器」
+/// 这条链路，不在中间做数值解析，将来某个站点用非数字标识也不必再改一次类型。
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupInfo {
+    pub id: Option<String>,
     pub name: String,
     pub rate: Option<f64>,
     pub description: Option<String>,
@@ -650,6 +681,9 @@ pub(crate) fn scrub_error(err: Error) -> Error {
         Error::AuthFailed(m) => Error::AuthFailed(crate::redact::scrub(&m)),
         Error::NotFound(m) => Error::NotFound(crate::redact::scrub(&m)),
         Error::Transport(m) => Error::Transport(crate::redact::scrub(&m)),
+        // M19-S2：新变体必须跟着脱敏。它的文案里带 reqwest 原文（含完整 URL），
+        // 加变体却漏掉这一条，等于在脱敏网上开一个洞。
+        Error::NotDelivered(m) => Error::NotDelivered(crate::redact::scrub(&m)),
         Error::FingerprintMismatch(m) => Error::FingerprintMismatch(crate::redact::scrub(&m)),
         // M7-S0：`Unsupported` 的文案可能带上站点回显的原文，因此与上面四条同等对待。
         Error::Unsupported(m) => Error::Unsupported(crate::redact::scrub(&m)),
@@ -947,6 +981,10 @@ mod tests {
             Error::Unsupported(format!("站点回显 {secret}")),
             // M9-S2：新变体也走同一层。今天它只带本产品字面量，但类型不保证永远如此。
             Error::InvalidInput(format!("站点说：{secret}")),
+            // M19-S2：连接层失败的文案里带 reqwest 原文（含完整 URL），必须跟着脱敏。
+            // 这一条**只能靠用例守**：`scrub_error` 的 match 末尾有 `other => other` 兜底，
+            // 漏写新变体不会编译失败，只会静默透传原文。
+            Error::NotDelivered(format!("连接失败 {secret}")),
         ] {
             let text = scrub_error(err).to_string();
             assert!(!text.contains(secret), "错误文案泄漏密钥: {text}");
@@ -971,6 +1009,7 @@ mod tests {
     #[test]
     fn group_info_carries_no_secret() {
         let g = GroupInfo {
+            id: Some("2".into()),
             name: "vip".into(),
             rate: Some(0.8),
             description: Some("高级分组".into()),

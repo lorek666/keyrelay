@@ -298,9 +298,10 @@
       "nameHintPre": "Default name follows ",
       "nameHintMid": ", using your local today. It's just a label: rename it to anything you recognize.",
       "groupLabel": "Group (optional)",
-      "groupDefault": "Unspecified (site default)",
-      "groupNoCap": "This site type has no group concept; the key is created in the site default (per capability set, not hardcoded by type name).",
-      "groupError": "Couldn't read group list ({error}); will create in the site default.",
+      "groupDefault": "Unspecified (no group bound)",
+      "groupNoCap": "This site type has no group concept; the key is created without a group field (per capability set, not hardcoded by type name).",
+      "groupError": "Couldn't read group list ({error}); the key will be created without a group field.",
+      "groupUnboundWarn": "No group selected: this site binds keys by group id, so an ungrouped key may be created but then rejected with 403. Whether ungrouped keys are allowed is a deployment setting we cannot detect here.",
       "groupRateWarn": "Some groups have no usable rate from the site; they show \"Rate unknown\"—never fall back to 1×, so you don't pick a group on a wrong cost assumption.",
       "nameError": "Couldn't generate a default name ({error}); please fill in manually."
     },

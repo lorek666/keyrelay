@@ -5,6 +5,7 @@ import {
   availableGroups,
   createKey,
   formatGroupRate,
+  groupKeyOf,
   listKeys,
   listSites,
   listStoredKeys,
@@ -116,6 +117,26 @@ export default function Keys() {
     retry: false,
   });
 
+  /**
+   * 当前选中的分组（M19-S1）。
+   *
+   * 下拉的 `value` 是**站点原生标识**（Sub2API 上是 `"2"`），而落库要存**显示名**
+   * （`"gpt plus"`）——否则密钥表显示一个数字、按分组名查倍率也会落空。
+   * 这里按同一个映射把标识找回来，两个值一起交给后端。
+   */
+  const selectedGroup = (groups.data ?? []).find((option) => groupKeyOf(option) === group);
+
+  /**
+   * 该站点的分组是否带**原生 id**（M19-S1 / 独立复审 P2-3）。
+   *
+   * 带原生 id ⇒ 站点是按 id 绑定密钥的（Sub2API），不绑分组可能被站点拒绝（403）；
+   * 不带 ⇒ 站点以分组名为标识（NewAPI），不传分组等于「跟随用户自己的分组」，是安全默认。
+   * 「未选分组」的提示只在前一种情况下出现，否则就是误报。
+   */
+  const hasNativeGroupIds = (groups.data ?? []).some(
+    (option) => (option.id ?? "").trim() !== "",
+  );
+
   // 主表用**本地已存密钥**（投递需要它的本地 id）；站点侧列表只作对照
   const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
   // 主表跟随所选站点（M9-S4 / D）：此前站点下拉只管「新建 / 对齐 / 对照」，主表却列全部站点，
@@ -208,7 +229,10 @@ export default function Keys() {
       createKey({
         siteId: activeSite!,
         name,
+        // M19-S1：`group` 是**站点原生标识**（发给站点），`groupLabel` 是显示名（落本地）。
+        // 下拉的 value 是标识，用户看到的是名字，两者都要带过去。
         group: group || undefined,
+        groupLabel: selectedGroup?.name,
       }),
     onSuccess: async (key) => {
       setError(null);
@@ -570,7 +594,10 @@ export default function Keys() {
           >
             <option value="">{t("keys.createDialog.groupDefault")}</option>
             {(groups.data ?? []).map((option) => (
-              <option key={option.name} value={option.name}>
+              // M19-S1 / B-161：`value` 必须是**站点原生标识**。有 id 用 id（Sub2API 的
+              // 建密钥接口只认数字主键），没有才回落到名字（NewAPI 以名字为标识）。
+              // 此前一律用名字 ⇒ Sub2API 把名字解析成整数失败、静默丢弃用户选的分组。
+              <option key={groupKeyOf(option)} value={groupKeyOf(option)}>
                 {option.name} · {formatGroupRate(option.rate)}
               </option>
             ))}
@@ -581,6 +608,17 @@ export default function Keys() {
         ) : null}
         {groups.isError ? (
           <p className="muted">{t("keys.createDialog.groupError", { error: (groups.error as Error).message })}</p>
+        ) : null}
+        {/*
+          有可选分组却没选：不阻断（能不能不绑分组取决于站点部署），但要把后果说清楚。
+
+          **只在「该站点按分组 id 绑定」时才提示**（独立复审 P2-3）：NewAPI 不传分组
+          等于「跟随用户自己的分组」，是安全默认，弹这条会把用户推向 spec §2 明确
+          不做的「随便选一个」。判据用「分组带不带原生 id」而不是站点类型名——
+          与 `groupNoCap` 同一口径：能力/数据说了算，不按类型名硬编码。
+        */}
+        {(caps?.groups ?? false) && hasNativeGroupIds && !group ? (
+          <p className="muted">{t("keys.createDialog.groupUnboundWarn")}</p>
         ) : null}
         {(groups.data ?? []).some(
           (option) => option.rate === null || !Number.isFinite(option.rate) || option.rate <= 0,

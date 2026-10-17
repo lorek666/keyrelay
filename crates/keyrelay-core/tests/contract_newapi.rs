@@ -869,6 +869,7 @@ async fn create_key_finds_token_beyond_the_first_short_page() {
                 quota_limit: None,
                 expires_at: None,
                 group: None,
+                group_label: None,
             },
         )
         .await

@@ -284,3 +284,57 @@ async fn real_stack_retries_429_with_retry_after() {
         "等待时长应取 Retry-After"
     );
 }
+
+/// M19-S2 / B-162：连接层失败必须**带着类别**走出 trait 边界。
+///
+/// 判据是 `reqwest::Error::is_connect()`——DNS / TCP / TLS 握手阶段就失败，请求体
+/// 一个字节都没进对端。只有这一类可以安全重放（对端没看到请求，不可能计费）。
+///
+/// 这条用例同时是 `describe()` 分类的**真实 socket 证据**：`127.0.0.1:1` 上没有监听者，
+/// TCP 直接 RST。用 mock 是证明不了的——mock 里的错误是我们自己造的形状。
+#[tokio::test]
+async fn refused_connection_is_classified_as_not_delivered() {
+    let transport = transport(Duration::from_secs(2));
+    let err = transport
+        .request(HttpRequest::new(
+            Method::Post,
+            "http://127.0.0.1:1/api/probe/run",
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, Error::NotDelivered(_)),
+        "连接被拒 ⇒ 请求未送达 ⇒ 必须可重放；实际: {err:?}"
+    );
+    assert!(err.is_not_delivered());
+    assert!(err.is_retryable(), "站点侧重试策略不得因加变体而退化");
+    assert!(
+        err.to_string().contains("连接未建立"),
+        "文案要说清「没连上、请求没送达」: {err}"
+    );
+}
+
+/// 对照：超时**不是**「未送达」。
+///
+/// 已连上但等不到响应头（读超时）说明请求已经送出去了，可能已被处理并计费 ⇒ 不可重放。
+/// 这条与上一条一起，钉死 `describe()` 里两个分支的边界。
+#[tokio::test]
+async fn timeout_is_not_classified_as_not_delivered() {
+    let base_url = spawn_silent_server();
+    let transport = transport(Duration::from_millis(300));
+
+    let err = transport
+        .request(HttpRequest::new(
+            Method::Get,
+            format!("{base_url}/api/status"),
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(
+        !err.is_not_delivered(),
+        "超时可能已送达 ⇒ 不得判为未送达；实际: {err:?}"
+    );
+    assert!(matches!(err, Error::Transport(_)), "{err:?}");
+}
