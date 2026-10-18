@@ -97,13 +97,18 @@ fn spawn_server(responses: Vec<String>) -> FakeServer {
     }
 }
 
-/// 接受连接但**永不响应**：用于验证超时被遵守。
-fn spawn_silent_server() -> String {
+/// 接受连接但**过了 `keep_open` 才关闭**：用于验证超时被遵守。
+///
+/// `keep_open` 必须由调用方的**配置超时**推导，而且必须比它**长**：
+/// - 比超时长 ⇒ 客户端一定先超时，测的才是「超时生效」；
+/// - 写成裸 3 秒（本步之前的样子）⇒ 换任何别的超时值来测，夹具可能比客户端先松手，
+///   于是客户端收到的是「连接被关闭」而不是「超时」，用例名与实测行为对不上。
+fn spawn_silent_server(keep_open: Duration) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
     let addr = listener.local_addr().expect("读取本地地址");
     thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
-            thread::sleep(Duration::from_secs(3));
+            thread::sleep(keep_open);
             drop(stream);
         }
     });
@@ -375,10 +380,33 @@ fn webhook_does_not_follow_redirects() {
 
 #[test]
 fn webhook_obeys_the_configured_timeout() {
-    let base_url = spawn_silent_server();
+    // M21-S1 / B-163：**删掉墙上时钟的绝对上界**，把「超时有没有被遵守」换成错误种类判据。
+    //
+    // 原来的写法是 `elapsed < 5s`（配置超时才 300ms，等于 16 倍），满载时实测 14.36s 直接红
+    // ⇒「机器慢」被误报成「产品没遵守超时」。
+    //
+    // 本步先试过「把上界改成配置值的 4 倍」，**注入实测证明那救不了**：在 `started` 之后
+    // 插 14s 睡眠（等价于满载时线程被推迟调度），新上界照样报「耗时 14.31s」。
+    // 原因在结构上：`elapsed` 从 `Instant::now()` 算起，而 reqwest 的超时从**请求发出**才计时。
+    // 中间那段——`send()` 里的 `webhook_payload(&n.scrubbed())`、`post()` 里的
+    // `thread::spawn` + 从零建一个 tokio 运行时——**超时管不到**，却又被量到了。
+    // 所以任何以 `elapsed` 为判据的上界都必然被满载误伤，只能换判据。
+    //
+    // 换成的判据：错误**种类**。实测锚点——把配置超时改大、让夹具先松手，客户端等不到超时，
+    // 收到的是 `webhook 请求失败（host）` 而不是 `webhook 请求超时（host）`。
+    // 所以「含超时」这一条同时表达了：① 超时真的触发了；② 它短于夹具握持时长。
+    // 它是确定性的，与机器负载无关。
+    //
+    // 旧上界想防的回归（超时形同不存在 ⇒ 一路等到对端关连接）已被这一条覆盖：
+    // 那种情形下错误是「请求失败」，不含「超时」⇒ 立刻红。
+    const CONFIGURED: Duration = Duration::from_millis(300);
+    /// 夹具比对端配置超时多握这么久，保证客户端一定先超时（而不是收到「连接被关闭」）。
+    const SLACK: Duration = Duration::from_millis(2_700);
+
+    let base_url = spawn_silent_server(CONFIGURED + SLACK);
     let notifier = WebhookNotifier::with_transport(
         NotifyConfig {
-            timeout: Duration::from_millis(300),
+            timeout: CONFIGURED,
             ..config(Some(&format!("{base_url}/hook")))
         },
         Box::new(keyrelay_core::notify::ReqwestWebhookTransport::default()),
@@ -396,18 +424,19 @@ fn webhook_obeys_the_configured_timeout() {
         .expect_err("静默端点必须超时");
     let elapsed = started.elapsed();
 
+    // 判据一（主判据，负载无关）：错误必须是**超时**。
     assert!(
         err.to_string().contains("超时"),
         "超时必须被如实报告: {err}"
     );
+    // 判据二（下界）：真的在等。删掉它会放过「压根没发请求、立刻失败」这类更危险的回归。
+    // 放宽到 3/4：`send()` 在请求发出前还有序列化 + 线程派生，没必要卡着满值。
     assert!(
-        elapsed >= Duration::from_millis(250),
+        elapsed >= CONFIGURED * 3 / 4,
         "耗时 {elapsed:?} 太短：像是立刻失败而不是等超时"
     );
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "耗时 {elapsed:?}：超时没有被遵守（配置是 300ms）"
-    );
+    // 这里**故意没有**上界。原因见上面的注释：`elapsed` 含一段超时管不到的时间，
+    // 任何绝对或相对的上界都会被满载误伤。要防的回归已由判据一覆盖。
 }
 
 #[test]
@@ -442,8 +471,15 @@ fn webhook_with_zero_timeout_is_a_race_but_never_hangs() {
         ));
         let elapsed = started.elapsed();
 
+        // M21-S1 / B-163：这条钉的是「**不挂死**」，所以仍然需要一个上界。
+        //
+        // 不能像上面那条一样换成错误种类——`timeout = 0` 时**允许** `Ok(())`，
+        // 那时没有任何错误可判。所以这里保留时间上界，但选值要能扛负载：
+        // 参照量是「一次成功的本地回环请求」，实测 547µs / 4.9ms。
+        // 250ms 比它宽两个数量级（线程派生 + 建运行时的抖动都装得下），
+        // 又比原来的 5s 紧 20 倍（真正的挂死是「永不返回」，不会停在 250ms 边界上）。
         assert!(
-            elapsed < Duration::from_secs(5),
+            elapsed < Duration::from_millis(250),
             "耗时 {elapsed:?}：`timeout = 0` 挂死了（调用方必须传 > 0）"
         );
         outcomes.push(match outcome {
