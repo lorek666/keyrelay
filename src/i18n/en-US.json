@@ -316,6 +316,15 @@
       "step3Revoke": "Revoke the old key on the site (remote id {id})—irreversible",
       "step3Skip": "Old key has no site-side id; this step is skipped (not a failure)",
       "groupInherit": "The new key will stay in the old key's group \"{group}\"; if that group no longer exists on the site, rotation is refused before anything is created (no unusable key is left behind).",
+      "groupCheck": {
+        "action": "Check group",
+        "checking": "Checking…",
+        "matched": "Group \"{group}\" still exists on the site; rotation will bind to it.",
+        "renamed": "The group was renamed on the site: \"{oldName}\" → \"{newName}\". Rotation will bind to the renamed group.",
+        "missing": "Group \"{group}\" no longer exists on the site. Rotation will be refused before anything is created; the old key will not be revoked.",
+        "missingNoId": "Group \"{group}\" was not found on the site. This local record has no site-side group id, so matching is by name only—a site-side rename is indistinguishable. Rotation will be refused before anything is created; the old key will not be revoked.",
+        "unavailable": "Couldn't check the group: {reason}"
+      },
       "unmappedError": "Channels for targets {targets} can't be identified; rotation would miss them. If you proceed and revoke the old key, they'd be stuck on it forever. Fix these targets first—this action is blocked.",
       "newNameLabel": "Name for the new key"
     },

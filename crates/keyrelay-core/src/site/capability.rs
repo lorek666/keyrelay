@@ -43,6 +43,17 @@ pub struct SiteCapabilities {
     ///
     /// 界面据本字段决定用量列显示与否（`true` 显示、`false` 隐藏，不按 `kind` 硬编码）。
     pub key_usage: bool,
+    /// 该站点的分组有**稳定主键**（适配器返回的 `GroupInfo.id` 为 `Some`）。
+    ///
+    /// - Sub2API：`true`（`/api/v1/groups/available` 的 `id` 是 `int64` 主键）。
+    /// - NewAPI：`false`（分组以**名字**为标识，`id` 恒为 `None`）。
+    /// - `CustomOpenAiCompatible`：`false`（没有分组概念）。
+    ///
+    /// **为什么要有它**（M22-S1 复审 P1-1）：`keys.group_id` 只能存**真正的主键**。
+    /// NewAPI 的分组名（`"vip"`）一旦被当成 id 落库，轮换就会按 id 找而永远找不到
+    /// （NewAPI 的 `id` 全是 `None`）⇒ 这把 key 从此**每次轮换都被拒**，而站点根本没改名。
+    /// 这条是「站点类型的设计能力」，所以放能力表，不在 `create_key` 里按 `kind` 分支。
+    pub group_ids: bool,
 }
 
 /// 站点类型的**设计能力**。纯函数、无 IO、无网络。
@@ -62,6 +73,9 @@ pub fn capabilities(kind: SiteKind) -> SiteCapabilities {
             //（NewAPI `used_quota` / Sub2API `quota_used`），Sub2API 另有 `usage/daily` 日趋势。
             // 适配器已解析进 `KeyMeta.quota_used`，`key_usage` 从 `false` 改 `true`。
             key_usage: true,
+            // 两个站点在这一格上**不同**：Sub2API 的分组有 `int64` 主键，NewAPI 以名字为标识。
+            // 写在同一个臂里会让 `keys.group_id` 存进 NewAPI 的分组名（M22-S1 复审 P1-1）。
+            group_ids: matches!(kind, SiteKind::Sub2Api),
         },
         // 只读的 OpenAI 兼容端点：只有一个 `/v1/models` 可读，没有任何令牌管理端点，
         // 也没有余额/分组概念（M7-S0 §3.2）。
@@ -74,6 +88,8 @@ pub fn capabilities(kind: SiteKind) -> SiteCapabilities {
             balance: false,
             groups: false,
             key_usage: false,
+            // 没有分组概念，自然也没有主键。
+            group_ids: false,
         },
     }
 }
@@ -97,6 +113,7 @@ mod tests {
                 balance: true,
                 groups: true,
                 key_usage: true,
+                group_ids: false,
             }
         );
         assert_eq!(
@@ -110,6 +127,7 @@ mod tests {
                 balance: true,
                 groups: true,
                 key_usage: true,
+                group_ids: true,
             }
         );
         assert_eq!(
@@ -123,6 +141,7 @@ mod tests {
                 balance: false,
                 groups: false,
                 key_usage: false,
+                group_ids: false,
             }
         );
     }

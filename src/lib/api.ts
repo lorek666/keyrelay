@@ -1391,6 +1391,13 @@ export type RotationPlan = {
    * 后端会在建新密钥之前拒绝（B-166）——绝不会建出一把不带分组的然后把旧的回收掉。
    */
   oldGroupName: string | null;
+  /**
+   * 旧 key 本地记录的分组**站点原生 id**（M22-S1）。`null` = 旧行没存过 / 站点没有 id 概念。
+   *
+   * 有它时「校验分组」按 **id 精确比对**：id 是站点主键，分组改名不影响。
+   * 没有它只能按名字比，界面上要如实说明「改过名就认不出来」。
+   */
+  oldGroupId: string | null;
 };
 
 /**
@@ -1411,6 +1418,7 @@ export async function rotationPlan(keyId: number): Promise<RotationPlan> {
       unmappedTargets: [],
       oldRemoteId: "1",
       oldGroupName: null,
+      oldGroupId: null,
     });
   }
   return invokeCommand<RotationPlan>("rotation_plan", { keyId });

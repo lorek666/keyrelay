@@ -33,6 +33,7 @@ vi.mock("../lib/api", async (importOriginal) => {
 });
 
 import {
+  availableGroups,
   rotationDue,
   rotationPlan,
   suggestKeyName,
@@ -73,7 +74,10 @@ const DUE = [
   },
 ];
 
-function plan(oldGroupName: string | null): RotationPlan {
+function plan(
+  oldGroupName: string | null,
+  oldGroupId: string | null = null,
+): RotationPlan {
   return {
     keyId: 9,
     siteId: SITE_ID,
@@ -83,6 +87,7 @@ function plan(oldGroupName: string | null): RotationPlan {
     unmappedTargets: [],
     oldRemoteId: "9",
     oldGroupName,
+    oldGroupId,
   };
 }
 
@@ -147,5 +152,79 @@ describe("M20-S1 轮换继承分组", () => {
     await openRotationDialog();
 
     expect(screen.queryByText(/新密钥会继续绑定旧密钥所在的分组/)).toBeNull();
+  });
+});
+
+/**
+ * M22-S1 / B-167：预览必须零请求（PRD §7），所以「站点上还有没有这个分组」只能靠用户
+ * **主动点一下**。这里钉三件事：不点就零请求；点了按 **id** 精确比；id 命中而名字变了
+ * 要报「已改名」而不是「不存在」（改名不是猜——id 是站点主键）。
+ */
+describe("M22-S1 轮换分组按需在线校验", () => {
+  const GP = { id: "2", name: "gpt plus", rate: 1.5, description: null };
+
+  it("不点「校验分组」⇒ 一个请求都不发（预览仍是纯本地的）", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue(plan("gpt plus", "2"));
+    vi.mocked(availableGroups).mockClear();
+
+    renderKeys();
+    await openRotationDialog();
+
+    expect(screen.getByRole("button", { name: "校验分组" })).toBeDefined();
+    expect(availableGroups).toHaveBeenCalledTimes(0);
+  });
+
+  it("按 id 命中且名字一致 ⇒ 报「站点上仍有这个分组」", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue(plan("gpt plus", "2"));
+    vi.mocked(availableGroups).mockClear();
+    vi.mocked(availableGroups).mockResolvedValue([GP]);
+
+    renderKeys();
+    await openRotationDialog();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "校验分组" }));
+    });
+
+    expect(availableGroups).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/站点上仍有分组「gpt plus」/)).toBeDefined();
+  });
+
+  it("按 id 命中但名字变了 ⇒ 报「已改名」，不是「不存在」", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue(plan("gpt plus", "2"));
+    vi.mocked(availableGroups).mockClear();
+    vi.mocked(availableGroups).mockResolvedValue([{ ...GP, name: "gpt plus v2" }]);
+
+    renderKeys();
+    await openRotationDialog();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "校验分组" }));
+    });
+
+    expect(
+      screen.getByText(/分组已在站点上改名：「gpt plus」→「gpt plus v2」/),
+    ).toBeDefined();
+    // 负向断言必须钉**校验结果那一句**，不能用「站点上已经没有这个分组」这种共有词：
+    // 预览里那句静态文案 `groupInherit` 也含这几个字，会假通过（M20-S1 复审踩过的同一个坑）。
+    expect(screen.queryByText(/站点上已经没有这个分组「gpt plus」。/)).toBeNull();
+  });
+
+  it("没有 id、名字也找不到 ⇒ 文案点明「只能按名字比对，改过名就认不出来」", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue(plan("gpt plus", null));
+    vi.mocked(availableGroups).mockClear();
+    vi.mocked(availableGroups).mockResolvedValue([{ ...GP, id: "7", name: "other" }]);
+
+    renderKeys();
+    await openRotationDialog();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "校验分组" }));
+    });
+
+    expect(
+      screen.getByText(/没有站点侧的分组 id，只能按名字比对/),
+    ).toBeDefined();
   });
 });
