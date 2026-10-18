@@ -138,7 +138,24 @@ fn to_reqwest_method(method: Method) -> HttpMethod {
     }
 }
 
-fn describe(error: &reqwest::Error) -> Error {
+/// 代理背景下「读/总超时」的一条配置诊断（M21-S2 / B-164）。
+///
+/// **为什么只说 http(s)**：`http://` 代理要把域名交给代理解析，遇到 fake-IP（DNS 命中
+/// 伪造地址）时代理会向一个不存在的地址发起连接，一路挂到超时——这正是 M18-S1 真机那次
+/// 事故的成因（实测约 17s，`is_connect()` 两个谓词都不满足 ⇒ 既不能重放也判不出是否已送达）。
+/// `socks5://` 由对端解析域名，正是那次事故的**正确替代方案**，提示它等于建议用户从对的改出去。
+///
+/// 只描述可能性与下一步，不断言因果：读超时也可能是服务端真的慢。
+fn proxy_timeout_hint(proxy_url: &str) -> Option<&'static str> {
+    let scheme = proxy_url
+        .split_once("://")
+        .map(|(s, _)| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    (scheme == "http" || scheme == "https")
+        .then_some("已配置 http(s) 代理：若目标主机被解析成保留地址（fake-IP），连接会挂到超时，可改用 socks5 代理")
+}
+
+fn describe(error: &reqwest::Error, proxy_url: Option<&str>) -> Error {
     // P2-19：reqwest 错误原文可能带完整 URL（含 userinfo），进文案前先 scrub。
     let msg = crate::redact::scrub(&error.to_string());
     // **顺序是载重逻辑，不是随手写的**（M19-S2 / 独立复审 P3-2）：
@@ -147,7 +164,13 @@ fn describe(error: &reqwest::Error) -> Error {
     // 两个谓词同时为真时往「可能已送达」那一侧判，是**保守**方向：
     // 代价是少重放一次（用户多等一轮），而不是重复计费（不可逆）。
     if error.is_timeout() {
-        Error::Transport(format!("请求超时: {msg}"))
+        // M21-S2 / B-164：挂起式失败既不能重放、也判不出是否已送达，用户原先只拿到
+        // 「请求超时」三个字。配了 http(s) 代理时补一条**条件**建议。
+        let hint = proxy_url.and_then(proxy_timeout_hint);
+        match hint {
+            Some(hint) => Error::Transport(format!("请求超时: {msg}；{hint}")),
+            None => Error::Transport(format!("请求超时: {msg}")),
+        }
     } else if error.is_connect() {
         // M19-S2 / B-162：连接层失败的**类别**要活着走出 trait 边界。
         // 此前这里被压成 `Transport`，于是「能不能安全重放」这个判断在 probe 层
@@ -201,7 +224,10 @@ impl HttpTransport for ReqwestTransport {
             builder = builder.body(body);
         }
 
-        let response = builder.send().await.map_err(|e| describe(&e))?;
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| describe(&e, self.config.proxy.as_deref()))?;
 
         let status = response.status().as_u16();
         let headers = response
@@ -396,6 +422,56 @@ mod tests {
         );
         assert!(!message.contains("s3cr3t-token"), "泄漏了凭据: {message}");
         assert!(!message.contains("alice"), "泄漏了用户名: {message}");
+    }
+
+    // ============================================ M21-S2 / B-164：代理背景下的超时诊断
+
+    /// http(s) 代理 + 超时 ⇒ 该给诊断。这是 M18-S1 真机那次事故的成因
+    /// （fake-IP 让 `http://` 代理连到一个不存在的地址，一路挂到超时）。
+    #[test]
+    fn http_proxy_gets_the_timeout_hint() {
+        assert!(proxy_timeout_hint("http://127.0.0.1:7897").is_some());
+        assert!(proxy_timeout_hint("https://proxy.example.com:8080").is_some());
+        // scheme 大小写不敏感
+        assert!(proxy_timeout_hint("HTTP://127.0.0.1:7897").is_some());
+    }
+
+    /// socks5 是那次事故的**正确替代方案** ⇒ 提示它等于建议用户从对的改出去。
+    #[test]
+    fn socks_proxies_do_not_get_the_timeout_hint() {
+        for url in [
+            "socks5://127.0.0.1:1080",
+            "socks5h://127.0.0.1:1080",
+            "socks4://127.0.0.1:1080",
+            "socks4a://127.0.0.1:1080",
+        ] {
+            assert!(
+                proxy_timeout_hint(url).is_none(),
+                "{url} 不该带诊断：socks 系由对端解析域名"
+            );
+        }
+    }
+
+    /// 没配代理 ⇒ 一个字都不加。没代理时的超时与代理无关。
+    #[test]
+    fn no_proxy_means_no_hint() {
+        assert!(proxy_timeout_hint("").is_none());
+        // 没有 scheme 的串（配置阶段就会被拒，但判据本身要能容错）
+        assert!(proxy_timeout_hint("127.0.0.1:7897").is_none());
+    }
+
+    /// 诊断文案必须是**固定**的一段：不拼 host、不拼代理地址。
+    ///
+    /// 拼了就得为它再过一层 scrub（代理地址可带 userinfo），而诊断本身不需要这些信息。
+    #[test]
+    fn the_hint_carries_no_variable_data() {
+        let a = proxy_timeout_hint("http://alice:s3cr3t@10.0.0.1:7897").expect("http 代理");
+        let b = proxy_timeout_hint("http://other.example.com").expect("http 代理");
+        assert_eq!(a, b, "文案必须与具体地址无关");
+        assert!(!a.contains("alice"), "泄漏用户名: {a}");
+        assert!(!a.contains("s3cr3t"), "泄漏凭据: {a}");
+        assert!(!a.contains("10.0.0.1"), "不该拼 host: {a}");
+        assert!(a.contains("socks5"), "要给出可执行的下一步: {a}");
     }
 
     #[test]
