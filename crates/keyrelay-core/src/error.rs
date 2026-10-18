@@ -143,6 +143,23 @@ impl Error {
     pub fn is_not_delivered(&self) -> bool {
         matches!(self, Error::NotDelivered(_))
     }
+
+    /// 把一个「可能已送达」的传输失败说清楚（M21-S3 / B-165）。
+    ///
+    /// 全仓只有这一个地方生成这类话：probe 的提交失败（M19-S2）与站点侧非幂等写
+    /// 放弃重试（本步）共用。**别在别处拼同义句**——两处措辞一旦漂移，用户会以为
+    /// 那是两种不同的故障。
+    ///
+    /// 只包装 [`Error::Transport`]：其余变体（限流、额度、认证…）都带着自己准确的语义，
+    /// 套上「无法确认是否已处理」反而把它们的意思搅浑了。
+    pub fn note_maybe_delivered(self, op: &str) -> Error {
+        match self {
+            Error::Transport(message) => Error::Transport(format!(
+                "{op}时连接中断，无法确认服务端是否已处理（可能已成功、也可能没有）：{message}"
+            )),
+            other => other,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

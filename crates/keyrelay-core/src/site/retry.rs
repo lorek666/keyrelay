@@ -141,7 +141,33 @@ impl<T: HttpTransport> HttpTransport for RetryingTransport<T> {
                     self.sleeper.sleep(delay).await;
                 }
                 Ok(response) => return Ok(response),
-                Err(err) if can_retry && err.is_retryable() => {
+                // M21-S3 / B-165：重试判据 = `is_retryable()` **且**（本请求可安全重发
+                // **或** 这次失败可证明未送达 **或** 服务端明确说「没处理」）。
+                //
+                // 改动前这里是 `err.is_retryable()`，而它覆盖**全部** `Error::Transport`
+                // ——读超时也在内。读超时意味着请求**可能已送达**，于是 `create_key`
+                // 多重试一次就会在站点上多留一把产品不知道的令牌（NewAPI 的
+                // `POST /api/token` 没有幂等键）。
+                //
+                // `is_retryable()` 必须留在最前面：它是「这类错误值不值得再试」的总门
+                // （认证失败、额度不足、验证码、NotFound 一律原地返回，避免把风控撞成封号）。
+                // 后面的括号只负责**再收窄一层**——「值得试」不等于「可以重复发」。
+                // （第一版把 `retry_safe` 写在最前面，于是 `retry_safe = true` 时连
+                // `AuthFailed` 都会被重试，`does_not_retry_auth_failure` 立刻红。）
+                //
+                // 三项豁免：
+                // - `retry_safe`：GET/列举这类天然幂等，重复发没有副作用；
+                // - `NotDelivered`：连接层失败，对端根本没看到这个请求，重放安全
+                //   （判据与网关 B-138、probe M19-S2 同源）；
+                // - `RateLimited`：服务端**明说**没处理，退避后重试是协议的一部分，
+                //   与请求是否幂等无关。
+                Err(err)
+                    if can_retry
+                        && err.is_retryable()
+                        && (req.retry_safe
+                            || err.is_not_delivered()
+                            || matches!(err, Error::RateLimited { .. })) =>
+                {
                     let delay = match err {
                         Error::RateLimited { retry_after_secs } => {
                             Duration::from_secs(retry_after_secs).min(self.policy.max_delay)
@@ -149,6 +175,12 @@ impl<T: HttpTransport> HttpTransport for RetryingTransport<T> {
                         _ => self.policy.delay_for(attempt),
                     };
                     self.sleeper.sleep(delay).await;
+                }
+                // M21-S3 / B-165：非幂等写撞上「可能已送达」的失败 ⇒ 不重试，并把
+                // 「服务端可能已经处理了」这件事说清楚（用户得知道自己该去站点上核对，
+                // 而不是当成一次普通失败再点一次「重试」——那一下才真的会多出一把密钥）。
+                Err(err) if !req.retry_safe && err.is_retryable() => {
+                    return Err(err.note_maybe_delivered("提交非幂等请求"));
                 }
                 Err(err) => return Err(err),
             }
@@ -247,6 +279,109 @@ mod tests {
             );
             assert_eq!(transport.request(request()).await.unwrap_err(), err);
             assert_eq!(mock.request_count(), 1);
+        }
+    }
+
+    // ============================================ M21-S3 / B-165
+
+    fn unsafe_request() -> HttpRequest {
+        HttpRequest::new(
+            super::super::transport::Method::Post,
+            "https://x.example.com/v1/keys",
+        )
+        .retry_unsafe()
+    }
+
+    /// 非幂等写 + 读超时 ⇒ **恰好 1 次**请求（读超时可能已送达）。
+    ///
+    /// 这是 B-165 的核心判据。改动前这里是 `err.is_retryable()`，而它覆盖全部
+    /// `Transport`，于是建令牌会发 3 次——NewAPI 没有幂等键，站点上会多出两把
+    /// 产品不知道的令牌。
+    #[tokio::test]
+    async fn an_unsafe_request_is_not_retried_on_an_ambiguous_failure() {
+        let mock = MockTransport::new(vec![]);
+        mock.push_error(Error::Transport("请求超时".into()));
+
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let transport =
+            RetryingTransport::with_sleeper(mock.clone(), RetryPolicy::default(), sleeper.clone());
+
+        let err = transport.request(unsafe_request()).await.unwrap_err();
+        assert_eq!(mock.request_count(), 1, "读超时不得重试非幂等写");
+        assert!(sleeper.calls().is_empty(), "不重试就不该退避等待");
+        let message = err.to_string();
+        assert!(
+            message.contains("无法确认服务端是否已处理"),
+            "必须把「可能已处理」说清楚: {message}"
+        );
+    }
+
+    /// 同一类非幂等写，但失败是**可证明未送达** ⇒ 仍然重试。
+    ///
+    /// 收窄不能收过头：连接层失败时对端根本没看到这个请求，重放是安全的，
+    /// 砍掉它等于把站点侧瞬时连接故障从「重试 3 次」降级成「一次就放弃」。
+    #[tokio::test]
+    async fn an_unsafe_request_is_still_retried_when_not_delivered() {
+        let mock = MockTransport::new(vec![]);
+        // 默认 max_attempts = 3，所以要让三次都失败才看得出「重试真的发生了」。
+        for _ in 0..3 {
+            mock.push_error(Error::NotDelivered("连接被拒".into()));
+        }
+
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let transport =
+            RetryingTransport::with_sleeper(mock.clone(), RetryPolicy::default(), sleeper.clone());
+
+        let err = transport.request(unsafe_request()).await.unwrap_err();
+        assert_eq!(
+            mock.request_count(),
+            3,
+            "NotDelivered 可证明未送达，应重试到 max_attempts"
+        );
+        assert!(matches!(err, Error::NotDelivered(_)), "{err:?}");
+    }
+
+    /// 非幂等写 + 429 ⇒ 仍然重试。429 意味着服务端**未处理**，重试安全。
+    #[tokio::test]
+    async fn an_unsafe_request_is_still_retried_on_429() {
+        let mock = MockTransport::new(vec![]);
+        mock.push_error(Error::RateLimited {
+            retry_after_secs: 1,
+        });
+        mock.push(HttpResponse::new(201, "created".as_bytes().to_vec()));
+
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let transport =
+            RetryingTransport::with_sleeper(mock.clone(), RetryPolicy::default(), sleeper.clone());
+
+        let resp = transport.request(unsafe_request()).await.unwrap();
+        assert_eq!(resp.status, 201);
+        assert_eq!(mock.request_count(), 2, "429 与请求是否幂等无关");
+    }
+
+    /// 回归防线：`is_retryable()` 必须留在判据**最前面**。
+    ///
+    /// 第一版的写法是 `can_retry && (req.retry_safe || err.is_not_delivered())`——
+    /// `retry_safe` 短路在前，于是默认 `true` 的 GET 请求连 `AuthFailed` 都会被重试，
+    /// `does_not_retry_auth_failure` 当场红。认证失败重试正是 `retry.rs` 模块注释里
+    /// 「避免把风控撞成封号」要防的那件事，所以这条用例钉住顺序。
+    #[tokio::test]
+    async fn retry_safe_does_not_bypass_the_retryable_gate() {
+        for err in [
+            Error::AuthFailed("密码错误".into()),
+            Error::QuotaExhausted,
+            Error::CaptchaRequired,
+            Error::NotFound("key".into()),
+        ] {
+            let mock = MockTransport::new(vec![]);
+            mock.push_error(err.clone());
+            let transport = RetryingTransport::with_sleeper(
+                mock.clone(),
+                RetryPolicy::default(),
+                Arc::new(RecordingSleeper::default()),
+            );
+            assert_eq!(transport.request(request()).await.unwrap_err(), err);
+            assert_eq!(mock.request_count(), 1, "{err:?} 不得被重试");
         }
     }
 
