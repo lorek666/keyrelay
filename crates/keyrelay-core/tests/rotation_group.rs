@@ -76,8 +76,10 @@ async fn setup(kind: &str, group: Option<&str>, login: bool) -> Fixture {
 
 /// 同上，但额外写 `keys.group_id`（M22-S1：按 id 认定分组的那条路径要用）。
 ///
-/// 单独一层是因为 `insert_key` 有 65 处调用点、**刻意没有**给它加参数（见 spec §2）；
-/// 这里用窄方法 `set_key_group` 补写，与生产路径 `create_key` 的做法一致。
+/// M22-S2 / B-172 之后，夹具与生产走**同一条**写入口径（`insert_key_with_group`，
+/// 两列同一条 INSERT）。M22-S1 期这里用的是「先插行、再 `set_key_group` 补写」——
+/// 那条路径本身就是本步要消掉的东西，而夹具若还留着它，就等于测试还在构造
+/// **生产造不出来**的行形态。
 async fn setup_full(
     kind: &str,
     group: Option<&str>,
@@ -108,13 +110,15 @@ async fn setup_with_login(
     let site_id = store.upsert_site(kind, BASE, "测试站").expect("写站点");
     let reference = secret_ref("key", 1, "secret");
     let key_id = store
-        .insert_key(site_id, "codex/daily", &reference, Some("9"), group)
+        .insert_key_with_group(
+            site_id,
+            "codex/daily",
+            &reference,
+            Some("9"),
+            group,
+            group_id,
+        )
         .expect("写密钥记录");
-    if group_id.is_some() {
-        store
-            .set_key_group(key_id, group_id, group)
-            .expect("写分组 id");
-    }
 
     let vault = Arc::new(MemoryVault::new());
     vault.put(&reference, OLD_SECRET).expect("写钥匙串");
@@ -531,6 +535,90 @@ async fn rotation_accepts_a_group_that_was_renamed_on_the_site() {
         "改名后必须记新名字，否则下次轮换又认不出来"
     );
     assert_eq!(plan.old_group_id.as_deref(), Some("2"));
+}
+
+/// 改名认定必须**留痕**：id 命中而名字不同 ⇒ 事件表里有一条改名事件（M22-S2 / B-173）。
+///
+/// 这条与下一条**成对**：删掉 `if native_id.is_some()` 守卫 ⇒ 这条红；把事件改成无条件记
+/// ⇒ 下一条红。只钉一侧等于没钉（删守卫或恒记事件都能蒙过单侧断言）。
+#[tokio::test]
+async fn rotation_logs_a_rename_event_when_the_id_matches_and_the_name_differs() {
+    let f = setup_full(
+        SiteKind::Sub2Api.as_str(),
+        Some("gpt plus"),
+        Some("2"),
+        true,
+    )
+    .await;
+    f.mock.push(ok(json!([
+        {"id": 1, "name": "default"},
+        {"id": 2, "name": "gpt plus v2"}
+    ])));
+    f.mock.push(ok(json!({"1": 1.0, "2": 0.5})));
+    f.mock.push(create_key_ok());
+    f.mock.push(delete_ok());
+
+    f.service
+        .rotate_key(f.key_id, KeySpec::named("codex/daily-2"))
+        .await
+        .expect("按 id 认出是同一分组，轮换应成功");
+
+    let events = f.service.recent_events(200).expect("读事件");
+    let rename = events
+        .iter()
+        .find(|event| event.message.contains("分组已在站点上改名"))
+        .unwrap_or_else(|| panic!("id 命中而名字不同必须记改名事件：{events:?}"));
+    // 两个名字都要在文案里：只报新名，用户看不出这条事件跟自己的旧记录有关
+    assert!(
+        rename.message.contains("「gpt plus」") && rename.message.contains("「gpt plus v2」"),
+        "文案要写出「旧名 → 新名」：{}",
+        rename.message
+    );
+    // payload 按 JSON 解析再断言，不靠字符串里键的顺序
+    let payload: Value = serde_json::from_str(rename.payload.as_deref().unwrap_or("null"))
+        .expect("payload 应是 JSON");
+    assert_eq!(payload["old_group_name"], json!("gpt plus"));
+    assert_eq!(payload["new_group_name"], json!("gpt plus v2"));
+}
+
+/// 旧行只认得**站点原生标识**时，名字分支按 `g.id` 命中 ⇒ **不是改名**，不许记事件。
+///
+/// 这是 M22-S1 复审 P2-1 的原样：那种行落库的 `group_name` 是 `"2"`（M19-S1 的
+/// CLI/测试回落路径），与站点上的 `"gpt plus"` 天然不同——无条件记事件就会每轮换一次
+/// 就报一次「分组已改名」的假事件。
+#[tokio::test]
+async fn rotation_logs_no_rename_event_when_the_row_only_knows_a_native_id() {
+    let f = setup(SiteKind::Sub2Api.as_str(), Some("2"), true).await;
+    f.mock.push(groups_available());
+    f.mock.push(groups_rates());
+    f.mock.push(create_key_ok());
+    f.mock.push(delete_ok());
+
+    let run = f
+        .service
+        .rotate_key(f.key_id, KeySpec::named("codex/daily-2"))
+        .await
+        .expect("按原生标识命中，轮换应成功");
+
+    // 先证明**确实走了名字分支并解析出了名字**：否则「没有改名事件」可能是空断言
+    // （轮换没解析到分组时也不会有事件，那种绿毫无意义）。
+    let plan = f
+        .service
+        .rotation_plan(run.new_key.id)
+        .expect("取新 key 的预览");
+    assert_eq!(
+        plan.old_group_name.as_deref(),
+        Some("gpt plus"),
+        "名字分支要把原生标识解析成站点上的名字"
+    );
+
+    let events = f.service.recent_events(200).expect("读事件");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.message.contains("分组已在站点上改名")),
+        "名字分支命中不是改名，不许记改名事件：{events:?}"
+    );
 }
 
 /// 按 id 找时，id **不在**列表里 ⇒ 只可能是被删了（改名不会改变 id），必须拒绝。

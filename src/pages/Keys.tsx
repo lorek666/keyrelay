@@ -732,8 +732,11 @@ export default function Keys() {
             */}
             {/*
               M22-S1 复审 P2-2：入口条件**不能只看名字**。一行「有 `group_id` 但没有
-              `group_name`」的密钥（`set_key_group(id, Some(id), None)` 是公开形态）正是最
-              需要按 id 校验的那种，只按名字门控会让它连按钮都看不到。
+              `group_name`」的密钥正是最需要按 id 校验的那种，只按名字门控会让它连按钮
+              都看不到。（M22-S2 之后库里不再有"先插行、再补 id"的第二条写路径；
+              生产路径也不会写出「有 id 没名字」的行——`create_key` 两列都写、导入路径
+              两列都空。但库层面这两个参数各自可选，入口按「任一非空」门控才不必依赖
+              上游永远不这么写。）
             */}
             {rotating.oldGroupName?.trim() || rotating.oldGroupId?.trim() ? (
               <>

@@ -779,6 +779,7 @@ fn gateway_stop_then_start_on_the_same_port_succeeds() {
             "codex/daily",
             Some("12"),
             None,
+            None,
             "sk-gateway-0123456789abcdef",
         )
         .expect("写密钥")
@@ -846,6 +847,7 @@ fn gateway_stop_is_bounded_even_with_an_in_flight_request() {
             site,
             "codex/daily",
             Some("12"),
+            None,
             None,
             "sk-slow-0123456789abcdef",
         )
@@ -967,6 +969,7 @@ fn rotation_plan_is_local_and_lists_the_fixed_three_steps() {
             "codex/daily",
             Some("12"),
             None,
+            None,
             "sk-rotation-0123456789ab",
         )
         .expect("写密钥")
@@ -1016,6 +1019,7 @@ fn rotate_key_reaches_the_business_path_without_a_session() {
             site,
             "codex/daily",
             Some("12"),
+            None,
             None,
             "sk-rotation-0123456789ab",
         )
@@ -1144,6 +1148,7 @@ fn gateway_rotate_token_refuses_mismatched_key_and_keeps_gateway_running() {
             "codex/daily",
             Some("12"),
             None,
+            None,
             "sk-a-0123456789abcdef",
         )
         .expect("写密钥 A")
@@ -1154,6 +1159,7 @@ fn gateway_rotate_token_refuses_mismatched_key_and_keeps_gateway_running() {
             site,
             "codex/night",
             Some("13"),
+            None,
             None,
             "sk-b-0123456789abcdef",
         )
@@ -1225,6 +1231,7 @@ fn gateway_rotate_token_restarts_the_running_gateway_with_the_new_token() {
             site,
             "codex/daily",
             Some("12"),
+            None,
             None,
             "sk-a-0123456789abcdef",
         )
@@ -1452,6 +1459,7 @@ fn list_channel_bindings_filters_out_unbound_rows() {
             "codex/live",
             Some("1"),
             None,
+            None,
             "sk-live-0123456789abcdef",
         )
         .expect("写密钥")
@@ -1462,6 +1470,7 @@ fn list_channel_bindings_filters_out_unbound_rows() {
             site,
             "codex/dead",
             Some("2"),
+            None,
             None,
             "sk-dead-0123456789abcdef",
         )
@@ -1553,7 +1562,14 @@ fn list_deliveries_returns_newest_first_with_camel_case_fields() {
         .expect("写站点");
     let key = state
         .service
-        .store_key_material(site, "codex/a", Some("1"), None, "sk-hist-0123456789abcdef")
+        .store_key_material(
+            site,
+            "codex/a",
+            Some("1"),
+            None,
+            None,
+            "sk-hist-0123456789abcdef",
+        )
         .expect("写密钥")
         .id;
     assert_ne!(

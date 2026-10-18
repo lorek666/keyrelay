@@ -34,6 +34,17 @@ fn sub2api_ok(data: serde_json::Value) -> HttpResponse {
 
 /// 一个可用的 Sub2API 站点 + 一把带分组的 key。
 fn fixture(responses: Vec<HttpResponse>) -> Fixture {
+    fixture_with_group(responses, Some("vip"), None)
+}
+
+/// 同上，但分组两列由调用方给（M22-S2 / B-171：倍率按 `group_id` 认定要用）。
+///
+/// 走 `insert_key_with_group`——与生产 `create_key` 同一条写入口径，两列同一条 INSERT。
+fn fixture_with_group(
+    responses: Vec<HttpResponse>,
+    group_name: Option<&str>,
+    group_id: Option<&str>,
+) -> Fixture {
     let dir = tempfile::tempdir().expect("临时目录");
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
@@ -44,7 +55,14 @@ fn fixture(responses: Vec<HttpResponse>) -> Fixture {
         .expect("站点");
     let reference = secret_ref("key", 1, "secret");
     let key_id = store
-        .insert_key(site_id, "m16/daily", &reference, Some("1"), Some("vip"))
+        .insert_key_with_group(
+            site_id,
+            "m16/daily",
+            &reference,
+            Some("1"),
+            group_name,
+            group_id,
+        )
         .expect("密钥行");
     let vault = Arc::new(MemoryVault::new());
     vault
@@ -170,8 +188,100 @@ async fn rate_is_none_when_the_keys_group_has_no_rate() {
     );
 }
 
-// ============================================================ P3-28
+// ============================================================ 倍率按 id 认定（M22-S2 / B-171）
 
+/// **站点侧改了名**：本地记的是「gpt plus」+ 主键 2，站点上 id 2 现在叫「gpt plus v2」。
+///
+/// 轮换早已按 id 认定（M22-S1），倍率这里却还在只按名字 ⇒ 改名后倍率变「未知」，
+/// 网关按倍率排序的依据静默消失，直到下一次轮换把新名字写回。id 是主键，改名不改它。
+#[tokio::test]
+async fn rate_follows_the_group_id_after_the_site_renames_it() {
+    let f = fixture_with_group(
+        vec![
+            login_response(&jwt_with_exp(9_999_999_999)),
+            sub2api_ok(json!([
+                {"id": 1, "name": "default", "description": ""},
+                {"id": 2, "name": "gpt plus v2", "description": ""},
+            ])),
+            sub2api_ok(json!({"1": 0.5, "2": 2.0})),
+        ],
+        // 本地记的是**旧名**，但主键还是 2
+        Some("gpt plus"),
+        Some("2"),
+    );
+    f.service
+        .login(f.site_id, Credentials::new("me@example.com", "pw-12345678"))
+        .await
+        .expect("登录");
+    f.service.available_groups(f.site_id).await.expect("拉分组");
+
+    assert_eq!(
+        f.service.site_rate_for_test(f.site_id),
+        Some(2.0),
+        "B-171：站点改名后倍率必须仍按 group_id 取到（按名字会落空 ⇒ 未知）"
+    );
+}
+
+/// 有 `group_id` 而站点列表里没有该 id ⇒ `None`，**不**回落到按名字找。
+///
+/// 这条防的是"回落"这一诱人的修法：名字分支会把另一个分组的倍率记到这把 key 上，
+/// 而排序看起来照常有依据——正是 P2-12 要防的那种"看起来对、其实是错"。
+#[tokio::test]
+async fn rate_is_none_when_the_stored_group_id_is_gone_even_if_the_name_matches() {
+    let f = fixture_with_group(
+        vec![
+            login_response(&jwt_with_exp(9_999_999_999)),
+            // 站点上有个**同名**的 `vip`（id 1），但本地记的主键是 9
+            sub2api_ok(json!([{"id": 1, "name": "vip", "description": ""}])),
+            sub2api_ok(json!({"1": 0.5})),
+        ],
+        Some("vip"),
+        Some("9"),
+    );
+    f.service
+        .login(f.site_id, Credentials::new("me@example.com", "pw-12345678"))
+        .await
+        .expect("登录");
+    f.service.available_groups(f.site_id).await.expect("拉分组");
+
+    assert_eq!(
+        f.service.site_rate_for_test(f.site_id),
+        None,
+        "B-171：主键不在列表里 ⇒ 未知；按名字回落会把 id=1 的 0.5 记到这把 key 上"
+    );
+}
+
+/// id **命中**但该分组没有倍率 ⇒ `None`（M22-S2 复审 §6-2：id 分支的覆盖闭环）。
+///
+/// 既有那条 `rate_is_none_when_the_keys_group_has_no_rate` 走的是**名字**分支；
+/// 两个分支共用末尾的 `.and_then(|group| group.rate)`，但只覆盖一侧时，将来若把
+/// id 分支改成「命中就给个默认倍率」，没有任何用例会红。
+#[tokio::test]
+async fn rate_is_none_when_the_id_matches_but_the_group_has_no_rate() {
+    let f = fixture_with_group(
+        vec![
+            login_response(&jwt_with_exp(9_999_999_999)),
+            // 站点上有 id=2，但既没有 rate_multiplier，rates 里也没有 "2"
+            sub2api_ok(json!([{"id": 2, "name": "gpt plus", "description": ""}])),
+            sub2api_ok(json!({"1": 0.5})),
+        ],
+        Some("gpt plus"),
+        Some("2"),
+    );
+    f.service
+        .login(f.site_id, Credentials::new("me@example.com", "pw-12345678"))
+        .await
+        .expect("登录");
+    f.service.available_groups(f.site_id).await.expect("拉分组");
+
+    assert_eq!(
+        f.service.site_rate_for_test(f.site_id),
+        None,
+        "B-171：id 命中但该分组没有倍率 ⇒ 未知（不得借用别的分组的 0.5）"
+    );
+}
+
+// ============================================================ P3-28
 #[tokio::test]
 async fn needs_login_is_reported_when_balance_fails_and_keys_401() {
     // 余额 503（非认证类，**排在前**）+ 令牌列表 401（认证类）。
