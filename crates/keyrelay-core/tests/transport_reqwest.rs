@@ -319,6 +319,87 @@ async fn refused_connection_is_classified_as_not_delivered() {
 ///
 /// 已连上但等不到响应头（读超时）说明请求已经送出去了，可能已被处理并计费 ⇒ 不可重放。
 /// 这条与上一条一起，钉死 `describe()` 里两个分支的边界。
+/// M21-S1 / B-164：配了 `http://` 代理时，超时错误要带一条**配置诊断**。
+///
+/// 用的是本地假代理（接受连接后沉默），所以这里复现的是「代理那头挂住」这一**形状**，
+/// 与 M18-S1 真机那次（`http://` 代理 + fake-IP，约 17s，两个谓词都不满足）同源。
+/// 真机那个 fake-IP 场景在 CI 里不可移植，所以用本地等价物承载判据。
+#[tokio::test]
+async fn a_timeout_through_an_http_proxy_carries_a_diagnosis() {
+    // 假代理：收下连接就沉默，让客户端超时
+    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定代理端口");
+    let proxy_addr = listener.local_addr().expect("读取代理地址");
+    thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            thread::sleep(Duration::from_secs(5));
+            drop(stream);
+        }
+    });
+
+    let silent = spawn_silent_server();
+    // 代理地址里带 userinfo：诊断不得把它拼进去（代理商 + 凭据都要脱敏）
+    let transport = ReqwestTransport::new(TransportConfig {
+        timeout: Duration::from_millis(300),
+        proxy: Some(format!("http://alice:s3cr3t-token@{proxy_addr}")),
+        ..TransportConfig::default()
+    })
+    .expect("合法代理应可构造");
+
+    let err = transport
+        .request(HttpRequest::new(
+            Method::Get,
+            format!("{silent}/api/status"),
+        ))
+        .await
+        .expect_err("代理挂住必须超时");
+
+    assert!(matches!(err, Error::Transport(_)), "{err:?}");
+    let message = err.to_string();
+    assert!(
+        message.contains("请求超时"),
+        "主错误必须仍是超时: {message}"
+    );
+    assert!(message.contains("fake-IP"), "应附上代理诊断: {message}");
+    assert!(
+        message.contains("socks5"),
+        "诊断要给出可执行的下一步: {message}"
+    );
+    assert!(!message.contains("s3cr3t-token"), "泄漏代理凭据: {message}");
+    assert!(!message.contains("alice"), "泄漏代理用户名: {message}");
+}
+
+/// 配 `socks5://` 代理时的失败**不**带诊断。
+///
+/// 说明（别被用例名误导）：这里指向一个没人听的 socks5 端口，实测拿到的是
+/// `连接未建立（NotDelivered）`——**不是**超时，所以它走不到 `describe()` 的超时分支。
+/// 「socks5 + 真超时不带诊断」由同文件的单测 `socks_proxies_do_not_get_the_timeout_hint`
+/// 直接钉住（那条不需要真的跑通 socks 握手）。本条负责的是**另一件事**：
+/// 即使请求真的失败了，也绝不允许把「建议改用 socks5」这句话塞给一个已经在用 socks 的用户。
+#[tokio::test]
+async fn a_socks5_proxy_failure_carries_no_proxy_diagnosis() {
+    let silent = spawn_silent_server();
+    let transport = ReqwestTransport::new(TransportConfig {
+        timeout: Duration::from_millis(300),
+        proxy: Some("socks5://127.0.0.1:1".to_string()),
+        ..TransportConfig::default()
+    })
+    .expect("socks5 代理合法");
+
+    let err = transport
+        .request(HttpRequest::new(
+            Method::Get,
+            format!("{silent}/api/status"),
+        ))
+        .await
+        .expect_err("应失败");
+
+    let message = err.to_string();
+    assert!(
+        !message.contains("fake-IP"),
+        "socks 代理不该被建议改走 socks5: {message}"
+    );
+}
+
 #[tokio::test]
 async fn timeout_is_not_classified_as_not_delivered() {
     let base_url = spawn_silent_server();
