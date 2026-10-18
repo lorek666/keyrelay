@@ -318,6 +318,8 @@ async fn a_newly_added_site_reports_its_drift_on_the_very_round_it_appears() {
             second,
             "gemini/second",
             Some("9"),
+            // 分组名 / 分组 id 都不知道：NewAPI 没有分组主键（M22-S2 把 id 并进同一次写入）
+            None,
             None,
             "sk-second-0123456789abcdef",
         )

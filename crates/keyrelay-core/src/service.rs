@@ -1314,8 +1314,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .clone()
             .filter(|g| !g.is_empty())
             .or_else(|| spec.group.clone().filter(|g| !g.is_empty()));
-        // M22-S1：站点原生分组 id 单独留一份。`spec` 随后被 move 进适配器，而 id 要在
-        // 建键成功之后写库。它落 `keys.group_id`，让**轮换能按 id 认定分组**——名字会被
+        // M22-S1：站点原生分组 id 单独留一份。`spec` 随后被 move 进适配器，而 id 要跟着
+        // 密钥行一起落库。它落 `keys.group_id`，让**轮换能按 id 认定分组**——名字会被
         // 站点改（B-168），id 不会。
         //
         // 空串同样滤掉：`Some("")` 落库等于存了个既非 id 也非名字的东西。
@@ -1340,6 +1340,13 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                         &name,
                         Some(&material.remote_id),
                         group_name.as_deref(),
+                        // 分组 id 与密钥行**同一次写入**（M22-S2 / B-172）。M22-S1 的
+                        // 「先插行、再补 id」两写不原子：第二写失败只能吞成一条 Warn 事件，
+                        // 库里留下「行在、id 缺」的中间态，而那条降级通道没有任何非测试
+                        // 路径能走到——等于一条永远没人验证的分支。现在要么两列都落、
+                        // 要么整行不写（失败即走下面的 `map_err`：站点上已创建、本地
+                        // 没存上，明确报错并补偿删掉钥匙串里刚写的明文）。
+                        group_id.as_deref(),
                         &material.secret,
                     )
                     .map_err(|err| {
@@ -1348,27 +1355,6 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                             material.remote_id
                         ))
                     })?;
-                // 分组 id 单独补写。**失败不中断**：此刻站点上密钥已存在、本地密钥已进钥匙串，
-                // 中断会让用户手里多一把「产品不承认」的密钥。少一个 id 只降级「站点改名后
-                // 还能不能认出这个分组」，不影响本次结果——但**必须留可见痕迹**，
-                // 否则就是静默降级（本仓库反复踩过的形态）。
-                if let Some(gid) = group_id.as_deref() {
-                    if let Err(err) =
-                        self.store
-                            .set_key_group(stored.id, Some(gid), group_name.as_deref())
-                    {
-                        self.log(observability::event_with_payload(
-                            Level::Warn,
-                            "key",
-                            "分组 id 未落库，下次轮换只能按分组名比对",
-                            serde_json::json!({
-                                "site_id": site_id,
-                                "key_id": stored.id,
-                                "error": crate::redact::scrub(&err.to_string()),
-                            }),
-                        ));
-                    }
-                }
                 self.log(observability::event_with_payload(
                     Level::Info,
                     "key",
@@ -2810,7 +2796,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             Err(err) => return Err(err),
         };
         // 有 id ⇒ **只按 id**（稳）。没有 id 才回落到「名字或原生值」——那个判据与
-        // `available_groups` 里查倍率的那一处**逐字同源**：只按名字匹配会让「CLI/测试建的
+        // `available_groups` 里查倍率的那一处**逐字同源**（M22-S2 / B-171 之后两边都是
+        // 「id 优先、无 id 才按名/原生值」）：只按名字匹配会让「CLI/测试建的
         // 行」被误判成分组已不存在（那种行落库的是站点原生标识，M19-S1 的回落路径）。
         let by_name = display.unwrap_or_default();
         let matched = match native_id {
@@ -3139,21 +3126,43 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         //
         // 查不到（key 没有分组 / 分组不在列表里 / 该分组没有倍率）⇒ **置 `None`**（未知），
         // 不回落、也不保留旧值：保留旧值会让上一次的 key 分组继续影响本轮的排序。
+        //
+        // M22-S2 / B-171：判据与 `rotation_inherit_group` **同源**——有站点主键就**只按 id**，
+        // 没有才回落「名字或原生标识」。M22-S1 已经拿 id 做了轮换认定，这里却还在只按名字：
+        // 站点把「gpt plus」改成「GPT Plus」之后，轮换照常（按 id），倍率却变「未知」——
+        // 网关按倍率排序的依据就这么静默消失了，而本地 `group_name` 是旧的这一点
+        // 恰恰是改名造成的。id 是主键，改名不改它。
+        //
+        // 有 id 而列表里没有该 id（分组被删）⇒ `None`，**不**回落到按名字找：
+        // 那会把另一个分组的倍率记到这把 key 上，正是 P2-12 要防的「看起来有依据而其实是错的」。
         let key_group = self
             .pick_gateway_key(site_id)
             .ok()
             .flatten()
-            .and_then(|row| row.group_name);
-        let rate = key_group
-            // M19-S1：存的可能是**显示名**（产品建的 key）也可能是**站点原生标识**
-            // （CLI/测试建的、或将来别的写入方）。两种都认，否则「按 id 存」的 key
-            // 会静默退化成「倍率未知」，把排序依据悄悄丢掉。
-            .and_then(|stored| {
-                groups
+            .map(|row| (row.group_id, row.group_name));
+        let rate = key_group.and_then(|(stored_id, stored_name)| {
+            let stored_id = stored_id
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty());
+            let stored_name = stored_name
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty());
+            match stored_id {
+                Some(id) => groups
                     .iter()
-                    .find(|group| group.name == stored || group.id.as_deref() == Some(&stored))
-            })
-            .and_then(|group| group.rate);
+                    .find(|group| group.id.as_deref() == Some(id.as_str())),
+                // M19-S1：存的可能是**显示名**（产品建的 key）也可能是**站点原生标识**
+                // （CLI/测试建的、或将来别的写入方）。两种都认，否则「按 id 存」的 key
+                // 会静默退化成「倍率未知」，把排序依据悄悄丢掉。
+                None => {
+                    let stored = stored_name?;
+                    groups.iter().find(|group| {
+                        group.name == stored || group.id.as_deref() == Some(stored.as_str())
+                    })
+                }
+            }
+            .and_then(|group| group.rate)
+        });
         if let Ok(mut map) = self.site_facts.lock() {
             map.entry(site_id).or_default().rate = rate;
         }
@@ -3313,8 +3322,16 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 .unwrap_or_else(|| remote_id.clone());
             // 分组名传 `None`：这条路径的名字都是从 `KeyMeta` 反查的，分组同样没有
             // 权威来源 ⇒ 落 `NULL` 让界面显示空，不猜（M8-S5B §6.5）。
-            match self.store_key_material(site_id, &name, Some(&remote_id), None, &material.secret)
-            {
+            // 导入路径的分组是**不知道**：`KeyMeta` 里没有分组字段（M8-S5B §6.5 的
+            // 「绝不猜」），所以名字与 id 都传 `None`——两列都落 `NULL`。
+            match self.store_key_material(
+                site_id,
+                &name,
+                Some(&remote_id),
+                None,
+                None,
+                &material.secret,
+            ) {
                 Ok(_) => imported += 1,
                 Err(err) => {
                     // 单条失败不中断整批：对齐是尽力而为的，失败的那条下一轮还能再来。
@@ -4789,6 +4806,9 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         remote_id: Option<&str>,
         // 分组名：`None` = 「不知道」⇒ 落 `NULL`，**绝不猜**（M8-S5B §6.5）。
         group_name: Option<&str>,
+        // 站点侧分组主键：`None` = 「没有 / 不知道」。只有能力表 `group_ids` 为真的站点类型
+        // 才可能有值（M22-S2 / B-172：与 `group_name` 在**同一条 INSERT** 里落库）。
+        group_id: Option<&str>,
         secret: &str,
     ) -> Result<StoredKey> {
         if secret.trim().is_empty() {
@@ -4798,10 +4818,14 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         let secret_ref = crate::vault::secret_ref("key", &ref_id, "secret");
         self.vault.put(&secret_ref, secret)?;
 
-        match self
-            .store
-            .insert_key(site_id, name, &secret_ref, remote_id, group_name)
-        {
+        match self.store.insert_key_with_group(
+            site_id,
+            name,
+            &secret_ref,
+            remote_id,
+            group_name,
+            group_id,
+        ) {
             Ok(id) => {
                 let stored = StoredKey {
                     id,

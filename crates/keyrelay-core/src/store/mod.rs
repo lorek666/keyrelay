@@ -811,6 +811,33 @@ impl Store {
         remote_id: Option<&str>,
         group_name: Option<&str>,
     ) -> Result<i64> {
+        // 签名一个参数都不加（调用点从 65 降到 62：4 处改用 `insert_key_with_group`、
+        // 1 处新增内联测试；其余 61 处逐字未动）。委托给带分组 id 的那一版，
+        // 传 `None` ⇒ `keys.group_id` 落 `NULL`，与 M22-S1 之前的落库形态逐字一致。
+        self.insert_key_with_group(site_id, name, secret_ref, remote_id, group_name, None)
+    }
+
+    /// 与 [`Self::insert_key`] 同一条语句，但**同时**写分组标识（M22-S2 / B-172）。
+    ///
+    /// 为什么是**新方法**而不是给 `insert_key` 加参数：它的 65 处调用点里绝大多数是测试
+    /// （生产只有 3 处），加参数会让改动淹在机械修改里，且每一处都要重新判断「这里该传什么」。
+    ///
+    /// 为什么不再保留 M22-S1 的 `set_key_group`（"先插行、再补 id"）：那条路径
+    /// **两写不原子**，第二写失败只能吞成 Warn 事件 ⇒ 库里留下「行在、id 缺」的中间态，
+    /// 而这条形态没有任何非测试消费者，留着它等于留第二个写入口径。现在两列在
+    /// **同一条 INSERT** 里，要么都落、要么整行不写。
+    ///
+    /// `group_id` 是站点原生主键（Sub2API 的数字 id）；`group_name` 是给人看的名字。
+    /// 两者都可以是 `None`（NewAPI 没有 id 概念 / 调用方不知道名字）。
+    pub fn insert_key_with_group(
+        &self,
+        site_id: i64,
+        name: &str,
+        secret_ref: &str,
+        remote_id: Option<&str>,
+        group_name: Option<&str>,
+        group_id: Option<&str>,
+    ) -> Result<i64> {
         if !is_valid_secret_ref(secret_ref) {
             return Err(Error::Store(format!(
                 "secret_ref 必须是钥匙串引用（kr/<scope>/<id>/<field>），拒绝写入疑似明文: {}",
@@ -819,38 +846,20 @@ impl Store {
         }
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO keys(site_id, remote_id, name, secret_ref, created_at, group_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![site_id, remote_id, name, secret_ref, now_secs(), group_name],
+            "INSERT INTO keys(site_id, remote_id, name, secret_ref, created_at, group_name, group_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                site_id,
+                remote_id,
+                name,
+                secret_ref,
+                now_secs(),
+                group_name,
+                group_id
+            ],
         )
         .map_err(|e| Error::Store(format!("写入密钥记录失败: {e}")))?;
         Ok(conn.last_insert_rowid())
-    }
-
-    /// 只更新分组标识与显示名（M22-S1）。
-    ///
-    /// 单独一个方法而**不是**给 `insert_key` 加参数：`insert_key` 有 65 处调用点（生产 3 处 +
-    /// 测试 62 处），加一个参数会让本步的真实改动淹在机械改动里，且每一处都要判断「这里该传什么」。
-    ///
-    /// `group_id` 是站点原生主键（Sub2API 的数字 id）；`group_name` 是给人看的名字。
-    /// 两者都可以是 `None`（NewAPI 没有 id 概念 / 调用方不知道名字）。
-    pub fn set_key_group(
-        &self,
-        key_id: i64,
-        group_id: Option<&str>,
-        group_name: Option<&str>,
-    ) -> Result<()> {
-        let conn = self.lock()?;
-        let affected = conn
-            .execute(
-                "UPDATE keys SET group_id = ?2, group_name = ?3 WHERE id = ?1",
-                params![key_id, group_id, group_name],
-            )
-            .map_err(|e| Error::Store(format!("更新密钥分组失败: {e}")))?;
-        if affected == 0 {
-            return Err(Error::NotFound(format!("密钥 #{key_id} 不存在")));
-        }
-        Ok(())
     }
 
     /// 按 id 取单条密钥记录（投递时用它拿 `secret_ref`）。
@@ -2653,46 +2662,61 @@ mod tests {
         assert_eq!(rows.len(), 1, "应只剩 1 条新记录");
         assert_eq!(rows[0].model, "new");
     }
-    /// `set_key_group` 写进去的必须能读回来，且只动分组两列（M22-S1）。
+    /// `group_id` 与 `group_name` 必须与密钥行**同一次**写入、且都能读回（M22-S2 / B-172）。
+    ///
+    /// 这条替换了 M22-S1 的 `set_key_group` 往返测试：那种「先插行、再 UPDATE 两列」
+    /// 的形态已不存在，留着旧测试就等于保住一条本步要消掉的写入口径。
     #[test]
-    fn set_key_group_round_trips_and_touches_only_the_group_columns() {
+    fn insert_key_with_group_writes_both_group_columns() {
         let dir = tempfile::tempdir().expect("临时目录");
         let store = Store::open(&dir.path().join("keyrelay.db")).expect("建库");
         let site = store
             .upsert_site("sub2api", "https://sub.example.com", "站")
             .expect("写站点");
-        let id = store
-            .insert_key(site, "codex/daily", "kr/key/1/secret", Some("9"), None)
-            .expect("写密钥");
 
-        store
-            .set_key_group(id, Some("2"), Some("gpt plus"))
-            .expect("写分组");
+        let id = store
+            .insert_key_with_group(
+                site,
+                "codex/daily",
+                "kr/key/1/secret",
+                Some("9"),
+                Some("gpt plus"),
+                Some("2"),
+            )
+            .expect("写密钥");
 
         let row = store.get_key(id).expect("取行").expect("应存在");
         assert_eq!(row.group_id.as_deref(), Some("2"));
         assert_eq!(row.group_name.as_deref(), Some("gpt plus"));
-        // 只动分组两列：其余字段必须逐字不变
+        // 其余列逐字不变：这条写入不夹带任何别的字段
         assert_eq!(row.name, "codex/daily");
         assert_eq!(row.remote_id.as_deref(), Some("9"));
         assert_eq!(row.secret_ref, "kr/key/1/secret");
     }
 
-    /// 对不存在的 id 调用必须报 `NotFound`，而不是静默地「更新了 0 行」。
+    /// 两个分组列都可以是「不知道」⇒ `NULL`；且 `insert_key` 与它的落库形态**逐字一致**。
     ///
-    /// M22-S1 复审 P2-4：`affected == 0` 这条分支原先零覆盖。它不是死代码——
-    /// `create_key` 若在 insert 与 set 之间丢了行（理论上不该发生），这里就是唯一报警点。
+    /// 后半句是给 65 处旧调用点的保证：本步只是把委托插进中间，不许顺手改变它们的语义
+    /// （例如把 `None` 写成空串，或给 `group_id` 编一个值）。
     #[test]
-    fn set_key_group_reports_not_found_instead_of_silently_updating_nothing() {
+    fn insert_key_leaves_both_group_columns_null() {
         let dir = tempfile::tempdir().expect("临时目录");
         let store = Store::open(&dir.path().join("keyrelay.db")).expect("建库");
+        let site = store
+            .upsert_site("sub2api", "https://sub.example.com", "站")
+            .expect("写站点");
 
-        let err = store
-            .set_key_group(424242, Some("2"), Some("gpt plus"))
-            .expect_err("不存在的 id 必须报错");
-        assert!(
-            matches!(&err, Error::NotFound(m) if m.contains("424242")),
-            "文案要点名那个 id：{err:?}"
-        );
+        let plain = store
+            .insert_key(site, "a", "kr/key/1/secret", None, None)
+            .expect("旧入口");
+        let grouped_none = store
+            .insert_key_with_group(site, "b", "kr/key/2/secret", None, None, None)
+            .expect("新入口");
+
+        for id in [plain, grouped_none] {
+            let row = store.get_key(id).expect("取行").expect("应存在");
+            assert_eq!(row.group_name, None, "不知道就落 NULL，不许猜：{row:?}");
+            assert_eq!(row.group_id, None, "没有站点主键就落 NULL：{row:?}");
+        }
     }
 }
