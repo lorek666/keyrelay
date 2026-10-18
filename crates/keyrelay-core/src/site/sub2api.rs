@@ -134,6 +134,7 @@ impl<T: HttpTransport> Sub2Api<T> {
             "email": cred.username,
             "password": cred.password,
         });
+        // M21-S3 / B-165：同 NewAPI 侧——登录是用户主动的一次操作、不产孤儿 ⇒ 保持可重发。
         let req =
             HttpRequest::new(Method::Post, format!("{base}/api/v1/auth/login")).json_body(&body)?;
         let resp = self.transport.request(req).await?;
@@ -648,6 +649,15 @@ impl<T: HttpTransport + 'static> SiteAdapter for Sub2Api<T> {
         // 但我们不该依赖那个默认值——始终带一个唯一的键即可。
         req.headers
             .push(("Idempotency-Key".to_string(), new_idempotency_key()));
+        // M21-S3 / B-165：这里**故意**不标 `retry_unsafe`。
+        //
+        // 与 NewAPI 的关键差异：NewAPI 的 `POST /api/token` 没有幂等键，读超时后重试
+        // 会在站点上多留一把产品不知道的令牌；Sub2API 有这个 `Idempotency-Key`，
+        // 而 `RetryingTransport` 重试时发的是 `req.clone()`——**同一个键**——
+        // 服务端据此去重。所以读超时后重试不会多出一把密钥。
+        // 键是在**本函数内**生成的（每次调用一个新键），所以只有传输层的重试
+        // 才会复用同一个键；上层重调 `create_key` 会拿到新键、也就没有去重保护——
+        // 这也是 `probe` / 本步都把重试放在传输层而不是上层的原因。
         let resp = self.transport.request(req).await?;
         if resp.status != 200 && resp.status != 201 {
             return Err(map_http_error(
@@ -701,7 +711,11 @@ impl<T: HttpTransport + 'static> SiteAdapter for Sub2Api<T> {
         let url = format!("{base}/api/v1/keys/{id}");
         let resp = self
             .transport
-            .request(Self::request(Method::Delete, url, session))
+            .request(
+                // M21-S3 / B-165：DELETE 终态幂等，但**不能安全重试**——读超时时那次删除
+                // 可能已经成功，重试的 404 会让用户以为密钥从没存在过。
+                Self::request(Method::Delete, url, session).retry_unsafe(),
+            )
             .await?;
         if resp.status != 200 && resp.status != 204 {
             return Err(map_http_error(

@@ -38,6 +38,19 @@ pub struct HttpRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
+    /// 重复发送同一请求是否**安全**（M21-S3 / B-165）。
+    ///
+    /// `true`（默认）= GET/列举/登录探测这类天然幂等的请求，重复发没有副作用。
+    /// `false` = 「重复发一次就多一个对象」的写：建令牌、回收令牌，以及登录三连
+    /// （登录不产孤儿，但重发会短时间内翻倍登录尝试，正是风控计数喜欢的形状）。
+    ///
+    /// `false` 只影响 `RetryingTransport` 对**可能已送达**失败的处理：`Error::NotDelivered`
+    /// （连接层失败，对端根本没看到这个请求）仍然重试；读超时、连接建立后中断
+    /// **一次都不重试**。判据与网关 B-138、probe M19-S2 同源。
+    ///
+    /// **默认 `true` 是有意选的**：漏标一个新写点 ⇒ 保持旧行为（多重试一次），
+    /// 不会把「本来安全的」误判成「不能重试」而白白损失可用性。
+    pub retry_safe: bool,
 }
 
 impl HttpRequest {
@@ -47,7 +60,14 @@ impl HttpRequest {
             url: url.into(),
             headers: Vec::new(),
             body: None,
+            retry_safe: true,
         }
+    }
+
+    /// 标记「重复发送不安全」（非幂等写 / 风控敏感）。
+    pub fn retry_unsafe(mut self) -> Self {
+        self.retry_safe = false;
+        self
     }
 
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {

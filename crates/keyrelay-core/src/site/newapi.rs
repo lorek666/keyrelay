@@ -554,6 +554,13 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
     async fn login(&self, base_url: &str, cred: Credentials) -> Result<Session> {
         let base = normalize_base_url(base_url);
         let body = self.login_body(&base, &cred).await?;
+        // M21-S3 / B-165：登录**故意不标** `retry_unsafe`（可安全重发）。
+        //
+        // 本步最初按「登录重发会翻倍登录尝试、撞风控」把它收了窄，实测发现那是错的：
+        // 登录是**用户主动点的一次操作**，失败立刻显示在眼前、他随手就能再点一次；
+        // 而需要收窄的 `create_key` 跑在轮换里，无人在场、也没有即时反馈。
+        // 也就是说登录的「重试收益」并不低，而它又不产孤儿对象 ⇒ 按同一把尺子量
+        // 它与读路径同类，保持原有重试行为。
         let req =
             HttpRequest::new(Method::Post, format!("{base}/api/user/login")).json_body(&body)?;
         let resp = self.transport.request(req).await?;
@@ -723,6 +730,9 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
         });
         let req = self
             .request(Method::Post, format!("{base}/api/token/"), session)
+            // M21-S3 / B-165：建令牌是**非幂等**写（NewAPI 的 `POST /api/token` 没有幂等键）。
+            // 读超时意味着这一次可能已经建成功了，重试会在站点上多留一把产品不知道的令牌。
+            .retry_unsafe()
             .json_body(&body)?;
         let resp = self.transport.request(req).await?;
         if resp.status != 200 {
@@ -786,7 +796,12 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
         );
         let resp = self
             .transport
-            .request(self.request(Method::Delete, url, session))
+            .request(
+                // M21-S3 / B-165：DELETE 按 HTTP 语义是幂等的（删两次终态相同），
+                // **但不能安全重试**：读超时时那次删除可能已经成功，重试会拿到 404，
+                // 于是用户被告知「令牌不存在」——而他刚刚还能用它。
+                self.request(Method::Delete, url, session).retry_unsafe(),
+            )
             .await?;
         if resp.status != 200 {
             return Err(map_http_error(
