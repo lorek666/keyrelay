@@ -1967,6 +1967,11 @@ pub struct RotationPlanDto {
     /// 认不出通道的目标；**非空 = 界面必须禁用「开始轮换」**
     unmapped_targets: Vec<String>,
     old_remote_id: Option<String>,
+    /// 旧 key 本地记录的分组**显示名**。`None` = 没绑过分组。
+    ///
+    /// 预览只展示、不校验（`rotation_plan` 一个请求都不发）；校验发生在执行时
+    /// （M20-S1 / B-166：站点上已无该分组 ⇒ 动手前拒绝，不会建出无分组的 key）。
+    old_group_name: Option<String>,
 }
 
 /// 轮换预览（FR-7）。只读，一个请求都不发。
@@ -1987,6 +1992,7 @@ pub fn rotation_plan(state: State<'_, AppState>, key_id: i64) -> Result<Rotation
             channels: plan.channels,
             unmapped_targets: plan.unmapped_targets,
             old_remote_id: plan.old_remote_id,
+            old_group_name: plan.old_group_name,
         })
         .map_err(|e| e.to_string())
 }

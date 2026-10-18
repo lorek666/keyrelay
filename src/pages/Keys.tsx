@@ -661,6 +661,28 @@ export default function Keys() {
                   : t("keys.rotationDialog.step3Skip")}
               </li>
             </ol>
+            {/*
+              M20-S1 / B-166：分组继承要说在**动手之前**。
+
+              旧 key 绑过分组时，新 key 必须继续待在同一个分组里，否则第三步回收旧 key
+              之后，站点上两把都不能用（未分组 key 一律 403 的站点）。显示名能否解析回
+              站点原生值要看站点当前的分组列表——那需要一次请求，而预览是**纯本地**的，
+              所以这里只承诺「会继承」+「站点上没这个分组时会拒绝」。
+            */}
+            {/*
+              与后端同判据：`.trim()` 后为空当作「没有分组」。
+
+              不 trim 的话，一个纯空格的名字会在预览里渲染成「会绑定分组『   』」，
+              而后端把它当无分组静默跳过——用户看到的信息与真实行为相反
+              （M20-S1 独立复审 P3-2）。
+            */}
+            {rotating.oldGroupName?.trim() ? (
+              <p className="muted">
+                {t("keys.rotationDialog.groupInherit", {
+                  group: rotating.oldGroupName.trim(),
+                })}
+              </p>
+            ) : null}
             {rotating.unmappedTargets.length > 0 ? (
               <p className="error" role="alert">
                 {t("keys.rotationDialog.unmappedError", { targets: rotating.unmappedTargets.join("、") })}
