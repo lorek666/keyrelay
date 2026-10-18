@@ -247,6 +247,12 @@ pub struct KeyRow {
     pub remote_id: Option<String>,
     pub name: String,
     pub group_name: Option<String>,
+    /// 站点原生分组主键（Sub2API 的数字 id）。`None` = 不知道 / 站点没有 id 概念（NewAPI）。
+    ///
+    /// `keys.group_id` 列从 M0 就在 DDL 里，但一直没人写；M22-S1 起由 `create_key` 写入。
+    /// **旧行仍是 `NULL`，不做回填**：回填只能按名字反查，而名字正是「改名后失效」的那个依据，
+    /// 回填等于把猜出来的值写进库（`rotation_inherit_group` 的 id 优先判据因此必须兼容 `None`）。
+    pub group_id: Option<String>,
     pub secret_ref: String,
     pub status: String,
     /// 本地记账的创建时间（unix 秒）。M6-S5 起用于密钥轮换判定
@@ -821,13 +827,39 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// 只更新分组标识与显示名（M22-S1）。
+    ///
+    /// 单独一个方法而**不是**给 `insert_key` 加参数：`insert_key` 有 65 处调用点（生产 3 处 +
+    /// 测试 62 处），加一个参数会让本步的真实改动淹在机械改动里，且每一处都要判断「这里该传什么」。
+    ///
+    /// `group_id` 是站点原生主键（Sub2API 的数字 id）；`group_name` 是给人看的名字。
+    /// 两者都可以是 `None`（NewAPI 没有 id 概念 / 调用方不知道名字）。
+    pub fn set_key_group(
+        &self,
+        key_id: i64,
+        group_id: Option<&str>,
+        group_name: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        let affected = conn
+            .execute(
+                "UPDATE keys SET group_id = ?2, group_name = ?3 WHERE id = ?1",
+                params![key_id, group_id, group_name],
+            )
+            .map_err(|e| Error::Store(format!("更新密钥分组失败: {e}")))?;
+        if affected == 0 {
+            return Err(Error::NotFound(format!("密钥 #{key_id} 不存在")));
+        }
+        Ok(())
+    }
+
     /// 按 id 取单条密钥记录（投递时用它拿 `secret_ref`）。
     pub fn get_key(&self, id: i64) -> Result<Option<KeyRow>> {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, site_id, remote_id, name, group_name, secret_ref, status, created_at,
-                        quota_used, quota_limit, currency
+                        quota_used, quota_limit, currency, group_id
                  FROM keys WHERE id = ?1",
             )
             .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
@@ -845,6 +877,7 @@ impl Store {
                     quota_used: row.get(8)?,
                     quota_limit: row.get(9)?,
                     currency: row.get(10)?,
+                    group_id: row.get(11)?,
                 })
             })
             .map_err(|e| Error::Store(format!("查询密钥失败: {e}")))?;
@@ -1189,7 +1222,7 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, site_id, remote_id, name, group_name, secret_ref, status, created_at,
-                        quota_used, quota_limit, currency
+                        quota_used, quota_limit, currency, group_id
                  FROM keys ORDER BY id",
             )
             .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
@@ -1207,6 +1240,7 @@ impl Store {
                     quota_used: row.get(8)?,
                     quota_limit: row.get(9)?,
                     currency: row.get(10)?,
+                    group_id: row.get(11)?,
                 })
             })
             .map_err(|e| Error::Store(format!("查询密钥失败: {e}")))?;
@@ -2618,5 +2652,47 @@ mod tests {
         let rows = store.recent_gateway_usage(24).unwrap();
         assert_eq!(rows.len(), 1, "应只剩 1 条新记录");
         assert_eq!(rows[0].model, "new");
+    }
+    /// `set_key_group` 写进去的必须能读回来，且只动分组两列（M22-S1）。
+    #[test]
+    fn set_key_group_round_trips_and_touches_only_the_group_columns() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let store = Store::open(&dir.path().join("keyrelay.db")).expect("建库");
+        let site = store
+            .upsert_site("sub2api", "https://sub.example.com", "站")
+            .expect("写站点");
+        let id = store
+            .insert_key(site, "codex/daily", "kr/key/1/secret", Some("9"), None)
+            .expect("写密钥");
+
+        store
+            .set_key_group(id, Some("2"), Some("gpt plus"))
+            .expect("写分组");
+
+        let row = store.get_key(id).expect("取行").expect("应存在");
+        assert_eq!(row.group_id.as_deref(), Some("2"));
+        assert_eq!(row.group_name.as_deref(), Some("gpt plus"));
+        // 只动分组两列：其余字段必须逐字不变
+        assert_eq!(row.name, "codex/daily");
+        assert_eq!(row.remote_id.as_deref(), Some("9"));
+        assert_eq!(row.secret_ref, "kr/key/1/secret");
+    }
+
+    /// 对不存在的 id 调用必须报 `NotFound`，而不是静默地「更新了 0 行」。
+    ///
+    /// M22-S1 复审 P2-4：`affected == 0` 这条分支原先零覆盖。它不是死代码——
+    /// `create_key` 若在 insert 与 set 之间丢了行（理论上不该发生），这里就是唯一报警点。
+    #[test]
+    fn set_key_group_reports_not_found_instead_of_silently_updating_nothing() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let store = Store::open(&dir.path().join("keyrelay.db")).expect("建库");
+
+        let err = store
+            .set_key_group(424242, Some("2"), Some("gpt plus"))
+            .expect_err("不存在的 id 必须报错");
+        assert!(
+            matches!(&err, Error::NotFound(m) if m.contains("424242")),
+            "文案要点名那个 id：{err:?}"
+        );
     }
 }

@@ -351,6 +351,15 @@ pub struct RotationPlan {
     /// 不发（PRD §7 的预览必须是纯本地的）。校验发生在执行时、`create_key` 之前
     /// （B-166）。`None` = 这把 key 从来没绑过分组。
     pub old_group_name: Option<String>,
+    /// 旧 key 本地记录的**站点原生分组 id**（`keys.group_id`，Sub2API 上是数字主键）。
+    ///
+    /// M22-S1：有 id 时轮换**按 id 认定**分组——id 是站点主键，分组改名不会改变它，
+    /// 而按名字匹配会在改名后直接失效（B-168）。`None` = 旧行没存过（本步之前的行）或
+    /// 站点没有 id 概念（NewAPI 的 `GroupInfo.id` 为 `None`，名字即标识）。
+    ///
+    /// 与 `old_group_name` 一样，预览只展示、不校验；在线校验是用户点「校验分组」时才发的
+    /// 独立请求（B-167）。
+    pub old_group_id: Option<String>,
 }
 
 /// 「回收旧 key」这一步的结局。四态**互斥且穷尽**，界面必须逐态给出不同文案——
@@ -1305,6 +1314,22 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             .clone()
             .filter(|g| !g.is_empty())
             .or_else(|| spec.group.clone().filter(|g| !g.is_empty()));
+        // M22-S1：站点原生分组 id 单独留一份。`spec` 随后被 move 进适配器，而 id 要在
+        // 建键成功之后写库。它落 `keys.group_id`，让**轮换能按 id 认定分组**——名字会被
+        // 站点改（B-168），id 不会。
+        //
+        // 空串同样滤掉：`Some("")` 落库等于存了个既非 id 也非名字的东西。
+        //
+        // **只有站点真有分组主键时才能这么存**（M22-S1 复审 P1-1）：NewAPI 的
+        // `GroupInfo.id` 恒为 `None`，`spec.group` 在那里是**分组名**（`"vip"`）。存进
+        // `keys.group_id` 后，下次轮换会走「有 id 只按 id 找」，而 NewAPI 的 id 全是
+        // `None` ⇒ 永不命中 ⇒ **这把 key 从此每次轮换都被拒**，而站点根本没改名。
+        // 这条判据属于「站点类型的设计能力」，所以查能力表，不在这里按 `kind` 分支。
+        let group_id = if crate::site::capability::capabilities(kind).group_ids {
+            spec.group.clone().filter(|g| !g.is_empty())
+        } else {
+            None
+        };
         match adapter.create_key(&site.base_url, &session, spec).await {
             Ok(material) => {
                 // 站点上已经建好了。此刻若本地保存失败，必须如实告诉用户
@@ -1323,6 +1348,27 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                             material.remote_id
                         ))
                     })?;
+                // 分组 id 单独补写。**失败不中断**：此刻站点上密钥已存在、本地密钥已进钥匙串，
+                // 中断会让用户手里多一把「产品不承认」的密钥。少一个 id 只降级「站点改名后
+                // 还能不能认出这个分组」，不影响本次结果——但**必须留可见痕迹**，
+                // 否则就是静默降级（本仓库反复踩过的形态）。
+                if let Some(gid) = group_id.as_deref() {
+                    if let Err(err) =
+                        self.store
+                            .set_key_group(stored.id, Some(gid), group_name.as_deref())
+                    {
+                        self.log(observability::event_with_payload(
+                            Level::Warn,
+                            "key",
+                            "分组 id 未落库，下次轮换只能按分组名比对",
+                            serde_json::json!({
+                                "site_id": site_id,
+                                "key_id": stored.id,
+                                "error": crate::redact::scrub(&err.to_string()),
+                            }),
+                        ));
+                    }
+                }
                 self.log(observability::event_with_payload(
                     Level::Info,
                     "key",
@@ -2702,32 +2748,48 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             unmapped_targets,
             old_remote_id: row.remote_id,
             old_group_name: row.group_name,
+            old_group_id: row.group_id,
         })
     }
 
-    /// 轮换前把旧密钥的分组**继承**给 `spec`（M20-S1 / B-166）。
+    /// 轮换前把旧密钥的分组**继承**给 `spec`（M20-S1 / B-166；M22-S1 加 id 认定）。
     ///
-    /// `display` 是旧密钥本地记录里的分组显示名（`RotationPlan::old_group_name`）。
-    /// 返回的 `spec` 就是随后要交给 `create_key` 的那一份。两种情况原样返回：
-    /// 旧 key 没绑分组、调用方已经显式给了分组。
+    /// `display` 是旧密钥本地记录里的分组显示名（`RotationPlan::old_group_name`），
+    /// `native_id` 是站点原生分组 id（`RotationPlan::old_group_id`）。
+    /// 返回的 `spec` 就是随后要交给 `create_key` 的那一份。两种情形原样返回：
+    /// 旧 key 没绑分组（两个都空）、调用方已经显式给了分组。
     ///
     /// **为什么解析不到必须拒绝而不是照旧建**：
     /// `rotate_key` 的第三步会回收旧密钥。新 key 不带分组 ⇒ 站点上两把都不能用
     /// （未分组 key 一律 403 的站点）；本地钥匙串里存的正是那把不能用的。
     /// 用户看到的却是「轮换完成」。所以这里宁可让轮换开始不了。
+    ///
+    /// **为什么有 id 就只按 id 找**（M22-S1 / B-168）：id 是站点主键，分组改名不改变它；
+    /// 名字会被改。按名字匹配在改名后必然失效 ⇒ 用户被迫手动重建密钥。没有 id 的旧行
+    /// （M22-S1 之前建的，或 NewAPI——它的 `GroupInfo.id` 是 `None`，名字即标识）才回落到
+    /// 名字匹配，那是唯一可用的依据。
     async fn rotation_inherit_group(
         &self,
         site_id: i64,
         mut spec: KeySpec,
         display: Option<&str>,
+        native_id: Option<&str>,
     ) -> Result<KeySpec> {
         // 调用方显式给了分组 ⇒ **显式优先**，本地继承不覆盖它。
         if spec.group.is_some() {
             return Ok(spec);
         }
-        let Some(display) = display.map(str::trim).filter(|name| !name.is_empty()) else {
+        let display = display.map(str::trim).filter(|name| !name.is_empty());
+        let native_id = native_id.map(str::trim).filter(|id| !id.is_empty());
+        // 两个都没有 ⇒ 旧 key 本来就没绑分组，行为与改动前**逐字一致**（不去站点上查）。
+        if display.is_none() && native_id.is_none() {
             return Ok(spec);
-        };
+        }
+        // 文案里要有个能读的指代：优先名字，没有名字就用 id（有 id 说明是按 id 找的）。
+        let label = display
+            .map(str::to_string)
+            .or_else(|| native_id.map(|id| format!("id={id}")))
+            .unwrap_or_default();
 
         // 站点侧分组列表是**唯一**能把显示名翻译成站点原生值的地方（Sub2API 要数字 id，
         // NewAPI 要分组名）。取数失败（网络/登录态/站点没这个能力）一律上抛：
@@ -2741,27 +2803,71 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             Ok(groups) => groups,
             Err(err @ Error::Unsupported(_)) => {
                 return Err(Error::Unsupported(format!(
-                    "{err}；无法确认分组「{display}」，本次轮换已取消，旧密钥未被回收。\
+                    "{err}；无法确认分组「{label}」，本次轮换已取消，旧密钥未被回收。\
                      请改用支持分组查询的站点类型，或手动新建一把带分组的密钥后再回收这把。"
                 )));
             }
             Err(err) => return Err(err),
         };
-        // 判据与 `available_groups` 里查倍率的那一处**逐字同源**：名字或 id 命中都算。
-        //
-        // 只按名字匹配会让「CLI/测试建的行」被误判成分组已不存在——那种行落库的
-        // 是站点原生标识（M19-S1 的回落路径：调用方没给显示名时存 `group`），
-        // 在 Sub2API 上就是 `"2"`，而站点列表里的 `name` 是 `"gpt plus"`。
-        let matched = groups
-            .iter()
-            .find(|group| group.name == display || group.id.as_deref() == Some(display))
-            .ok_or_else(|| {
+        // 有 id ⇒ **只按 id**（稳）。没有 id 才回落到「名字或原生值」——那个判据与
+        // `available_groups` 里查倍率的那一处**逐字同源**：只按名字匹配会让「CLI/测试建的
+        // 行」被误判成分组已不存在（那种行落库的是站点原生标识，M19-S1 的回落路径）。
+        let by_name = display.unwrap_or_default();
+        let matched = match native_id {
+            Some(id) => groups.iter().find(|group| group.id.as_deref() == Some(id)),
+            None => groups
+                .iter()
+                .find(|group| group.name == by_name || group.id.as_deref() == Some(by_name)),
+        };
+        let matched = matched.ok_or_else(|| match native_id {
+            // 按 id 找：只可能是被删了（改名不会改变 id）。文案把 **id 也写出来**——
+            // 它是用户在站点后台能查到的稳定标识；只报名字的话，改过名的分组会让用户
+            // 拿着一个站点上已经不存在的名字去搜。
+            Some(id) => {
+                let who = match display {
+                    Some(name) => format!("「{name}」（站点 id={id}）"),
+                    None => format!("（站点 id={id}）"),
+                };
                 Error::InvalidInput(format!(
-                    "旧密钥绑定的分组「{display}」在站点上已经不存在（可能被删除或改名）。\
+                    "旧密钥绑定的分组{who}在站点上已经不存在（可能被删除）。\
                      轮换必须让新密钥继续留在同一分组，否则它在该站点上无法调用；\
                      请先在站点上恢复这个分组，或手动新建一把带分组的密钥后再回收这把。"
                 ))
-            })?;
+            }
+            // 按名字找：**改名与删除分不开**，必须把这条限制说给用户。
+            None => Error::InvalidInput(format!(
+                "旧密钥绑定的分组「{label}」在站点上已经不存在（可能被删除或改名）。\
+                 这条本地记录没有站点侧的分组 id，只能按名字比对，所以站点侧改过名就认不出来。\
+                 轮换必须让新密钥继续留在同一分组，否则它在该站点上无法调用；\
+                 请先在站点上恢复这个分组，或手动新建一把带分组的密钥后再回收这把。"
+            )),
+        })?;
+        // 改名认定（M22-S1 / B-168）：id 命中而名字不同 ⇒ 这是**同一个分组**（id 是主键），
+        // 只是站点侧改了名。照常轮换，label 用站点**当前**名字。这不是「猜」——猜是拿名字
+        // 相似度去赌，而这里是主键相等。
+        //
+        // 事件**只在按 id 那条分支记**（M22-S1 复审 P2-1）：旧行的 `group_name` 可能落的是
+        // 站点原生标识（M19-S1 的 CLI/测试回落路径，例如 `"2"`），名字分支按 `g.id == "2"`
+        // 命中时 `matched.name`（`"gpt plus"`）与 `"2"` 不同——那不是改名，报出来就是假事件。
+        if native_id.is_some() {
+            if let Some(old_name) = display {
+                if matched.name != old_name {
+                    self.log(observability::event_with_payload(
+                        Level::Info,
+                        "key",
+                        format!(
+                            "轮换: 分组已在站点上改名「{old_name}」→「{}」",
+                            matched.name
+                        ),
+                        serde_json::json!({
+                            "site_id": site_id,
+                            "old_group_name": old_name,
+                            "new_group_name": matched.name,
+                        }),
+                    ));
+                }
+            }
+        }
         // 站点原生值：有 id 用 id（Sub2API），没有就名字自己（NewAPI）。
         spec.group = Some(matched.id.clone().unwrap_or_else(|| matched.name.clone()));
         // 落库用**名字**——按 id 存回本地会让密钥表显示 `"2"` 这种无意义数字，
@@ -2838,7 +2944,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         // 三条「解析不到」的路径（分组被删/改名、站点没有 groups 能力、拉取本身失败）
         // **全部**在动手前变成 `Err`，一条都不允许静默降级成「不带分组」。
         let spec = self
-            .rotation_inherit_group(plan.site_id, spec, plan.old_group_name.as_deref())
+            .rotation_inherit_group(
+                plan.site_id,
+                spec,
+                plan.old_group_name.as_deref(),
+                plan.old_group_id.as_deref(),
+            )
             .await?;
 
         // ① 建新 key（明文只进钥匙串，本函数全程不持有它）

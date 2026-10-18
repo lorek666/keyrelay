@@ -37,6 +37,20 @@ import { useTranslation, translate, getCurrentDict } from "../i18n";
  */
 const DEFAULT_AGENT_SEGMENT = "unassigned";
 
+/**
+ * 「校验分组」的结果（M22-S1 / B-167）。
+ *
+ * 这是**用户点了按钮才会发生**的一次只读拉取：轮换预览本身仍然一个请求都不发
+ * （PRD §7）。四态里最后一态刻意合并了「站点没有 groups 能力」与「网络/登录态失败」——
+ * 前端拿到的是一条字符串，按文案猜它属于哪一类是最脆的判据；统一按「无法校验」
+ * 呈现并把后端原文带出来，用户至少能看懂发生了什么。
+ */
+type GroupCheckState =
+  | { kind: "matched"; name: string }
+  | { kind: "renamed"; oldName: string; newName: string }
+  | { kind: "missing" }
+  | { kind: "error"; message: string };
+
 export default function Keys() {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -67,6 +81,7 @@ export default function Keys() {
   // 轮换：先出预览（`rotating`），用户确认后才真的动手（PRD §7 危险操作二次确认）
   const [rotating, setRotating] = useState<RotationPlan | null>(null);
   const [rotationName, setRotationName] = useState("");
+  const [rotationGroupCheck, setRotationGroupCheck] = useState<GroupCheckState | null>(null);
   /**
    * 轮换的建议名还在路上（M8-S5B 独立复审 P3-1）。
    *
@@ -183,6 +198,8 @@ export default function Keys() {
       setNotice(null);
       setRotationResult(null);
       setRotating(data);
+      // 上一次的分组校验结果属于上一把 key，必须清掉：留着会让用户以为已经验过这把。
+      setRotationGroupCheck(null);
       // 先清空再取建议名（P3-1）：否则建议名回来前显示的是上一次轮换用过的名字
       setRotationName("");
       setRotationSuggesting(true);
@@ -207,6 +224,43 @@ export default function Keys() {
       }
     },
     onError: (err: Error) => setError(err.message),
+  });
+
+  /**
+   * 「校验分组」（M22-S1 / B-167）：**用户触发**的一次只读拉取。
+   *
+   * 判据放在前端而不是后端，是因为这里只做**展示级比对**——真正动手时的权威判据仍在
+   * `rotation_inherit_group`（Rust 侧，`create_key` 之前）。两处判据一致的地方只有一条：
+   * **有 id 就按 id 比**（id 是站点主键，改名不影响）。
+   */
+  const groupCheck = useMutation({
+    mutationFn: (plan: RotationPlan) => availableGroups(plan.siteId),
+    onSuccess: (groups, plan) => {
+      const wantedId = plan.oldGroupId?.trim() || null;
+      const wantedName = plan.oldGroupName?.trim() || null;
+      if (wantedId) {
+        const hit = groups.find((g) => g.id === wantedId);
+        if (!hit) {
+          setRotationGroupCheck({ kind: "missing" });
+          return;
+        }
+        // id 命中而名字不同 ⇒ 站点侧改过名。**不是猜**：主键相等就是同一个分组。
+        setRotationGroupCheck(
+          wantedName && hit.name !== wantedName
+            ? { kind: "renamed", oldName: wantedName, newName: hit.name }
+            : { kind: "matched", name: hit.name },
+        );
+        return;
+      }
+      if (!wantedName) {
+        setRotationGroupCheck(null);
+        return;
+      }
+      // 没有 id 的旧行只能按名字比——站点改过名就认不出来，这一点在文案里如实说。
+      const hit = groups.find((g) => g.name === wantedName || g.id === wantedName);
+      setRotationGroupCheck(hit ? { kind: "matched", name: hit.name } : { kind: "missing" });
+    },
+    onError: (err: Error) => setRotationGroupCheck({ kind: "error", message: err.message }),
   });
 
   const rotationExecute = useMutation({
@@ -676,12 +730,74 @@ export default function Keys() {
               而后端把它当无分组静默跳过——用户看到的信息与真实行为相反
               （M20-S1 独立复审 P3-2）。
             */}
-            {rotating.oldGroupName?.trim() ? (
-              <p className="muted">
-                {t("keys.rotationDialog.groupInherit", {
-                  group: rotating.oldGroupName.trim(),
-                })}
-              </p>
+            {/*
+              M22-S1 复审 P2-2：入口条件**不能只看名字**。一行「有 `group_id` 但没有
+              `group_name`」的密钥（`set_key_group(id, Some(id), None)` 是公开形态）正是最
+              需要按 id 校验的那种，只按名字门控会让它连按钮都看不到。
+            */}
+            {rotating.oldGroupName?.trim() || rotating.oldGroupId?.trim() ? (
+              <>
+                {/* 这一句需要 `{group}`，所以仍然只在有**名字**时渲染。 */}
+                {rotating.oldGroupName?.trim() ? (
+                  <p className="muted">
+                    {t("keys.rotationDialog.groupInherit", {
+                      group: rotating.oldGroupName.trim(),
+                    })}
+                  </p>
+                ) : null}
+                {/*
+                  B-167：预览必须零请求（PRD §7），所以「站点上还有没有这个分组」只能靠用户
+                  **主动点一下**去查。不点就一个请求都不发，点一次只读拉一次分组列表。
+                */}
+                <div className="row">
+                  <button
+                    type="button"
+                    className="btn btn-ghost"
+                    onClick={() => groupCheck.mutate(rotating)}
+                    disabled={groupCheck.isPending}
+                  >
+                    {groupCheck.isPending
+                      ? t("keys.rotationDialog.groupCheck.checking")
+                      : t("keys.rotationDialog.groupCheck.action")}
+                  </button>
+                  {rotationGroupCheck ? (
+                    <span
+                      role="status"
+                      className={
+                        rotationGroupCheck.kind === "matched" ? "muted" : "error"
+                      }
+                    >
+                      {rotationGroupCheck.kind === "matched"
+                        ? t("keys.rotationDialog.groupCheck.matched", {
+                            group: rotationGroupCheck.name,
+                          })
+                        : rotationGroupCheck.kind === "renamed"
+                          ? t("keys.rotationDialog.groupCheck.renamed", {
+                              oldName: rotationGroupCheck.oldName,
+                              newName: rotationGroupCheck.newName,
+                            })
+                          : rotationGroupCheck.kind === "missing"
+                            ? t(
+                                rotating.oldGroupId?.trim()
+                                  ? "keys.rotationDialog.groupCheck.missing"
+                                  : "keys.rotationDialog.groupCheck.missingNoId",
+                                // 名字可能为空（见上面 P2-2 的条件放宽），这里必须容错：
+                                // 直接 `.trim()` 会在「只有 id 没有名字」的行上抛 TypeError；
+                                // 而且**空串会让文案渲染成「站点上已经没有这个分组「」」**——
+                                // 那种行就用 id 当指代（闭环复审 P3）。
+                                {
+                                  group:
+                                    rotating.oldGroupName?.trim() ||
+                                    `id=${rotating.oldGroupId?.trim() ?? ""}`,
+                                },
+                              )
+                            : t("keys.rotationDialog.groupCheck.unavailable", {
+                                reason: rotationGroupCheck.message,
+                              })}
+                    </span>
+                  ) : null}
+                </div>
+              </>
             ) : null}
             {rotating.unmappedTargets.length > 0 ? (
               <p className="error" role="alert">

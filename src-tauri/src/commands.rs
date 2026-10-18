@@ -1972,6 +1972,11 @@ pub struct RotationPlanDto {
     /// 预览只展示、不校验（`rotation_plan` 一个请求都不发）；校验发生在执行时
     /// （M20-S1 / B-166：站点上已无该分组 ⇒ 动手前拒绝，不会建出无分组的 key）。
     old_group_name: Option<String>,
+    /// 旧 key 本地记录的分组**站点原生 id**（M22-S1）。`None` = 旧行没存过 / 站点没有 id 概念。
+    ///
+    /// 有它时前端可以做**按 id 的精确在线校验**（id 是站点主键，分组改名不影响）；
+    /// 没有它就只能按名字比对，并在界面上如实说明「改过名就认不出来」。
+    old_group_id: Option<String>,
 }
 
 /// 轮换预览（FR-7）。只读，一个请求都不发。
@@ -1993,6 +1998,7 @@ pub fn rotation_plan(state: State<'_, AppState>, key_id: i64) -> Result<Rotation
             unmapped_targets: plan.unmapped_targets,
             old_remote_id: plan.old_remote_id,
             old_group_name: plan.old_group_name,
+            old_group_id: plan.old_group_id,
         })
         .map_err(|e| e.to_string())
 }
