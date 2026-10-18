@@ -315,6 +315,7 @@
       "step2Some": "Re-deliver the new key to {count} targets: {channels}",
       "step3Revoke": "Revoke the old key on the site (remote id {id})—irreversible",
       "step3Skip": "Old key has no site-side id; this step is skipped (not a failure)",
+      "groupInherit": "The new key will stay in the old key's group \"{group}\"; if that group no longer exists on the site, rotation is refused before anything is created (no unusable key is left behind).",
       "unmappedError": "Channels for targets {targets} can't be identified; rotation would miss them. If you proceed and revoke the old key, they'd be stuck on it forever. Fix these targets first—this action is blocked.",
       "newNameLabel": "Name for the new key"
     },

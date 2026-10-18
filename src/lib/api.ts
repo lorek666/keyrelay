@@ -1384,6 +1384,13 @@ export type RotationPlan = {
   /** 认不出通道的目标。非空 = 必须禁用「开始轮换」。 */
   unmappedTargets: string[];
   oldRemoteId: string | null;
+  /**
+   * 旧 key 本地记录的分组**显示名**。`null` = 没绑过分组。
+   *
+   * 只在预览里展示，**未**在站点上校验（预览是纯本地的）。执行时若站点上已无该分组，
+   * 后端会在建新密钥之前拒绝（B-166）——绝不会建出一把不带分组的然后把旧的回收掉。
+   */
+  oldGroupName: string | null;
 };
 
 /**
@@ -1403,6 +1410,7 @@ export async function rotationPlan(keyId: number): Promise<RotationPlan> {
       channels: ["codex-auth-json"],
       unmappedTargets: [],
       oldRemoteId: "1",
+      oldGroupName: null,
     });
   }
   return invokeCommand<RotationPlan>("rotation_plan", { keyId });

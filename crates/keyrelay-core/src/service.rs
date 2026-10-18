@@ -345,6 +345,12 @@ pub struct RotationPlan {
     pub unmapped_targets: Vec<String>,
     /// 旧 key 的站点侧 id；`None` = 本地记录里就没有，第三步会被跳过并说明
     pub old_remote_id: Option<String>,
+    /// 旧 key 本地记录的**分组显示名**（`keys.group_name`）。
+    ///
+    /// 预览只展示它，**不**在这里校验它是否还存在于站点上：`rotation_plan` 一个请求都
+    /// 不发（PRD §7 的预览必须是纯本地的）。校验发生在执行时、`create_key` 之前
+    /// （B-166）。`None` = 这把 key 从来没绑过分组。
+    pub old_group_name: Option<String>,
 }
 
 /// 「回收旧 key」这一步的结局。四态**互斥且穷尽**，界面必须逐态给出不同文案——
@@ -2695,7 +2701,73 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 .collect(),
             unmapped_targets,
             old_remote_id: row.remote_id,
+            old_group_name: row.group_name,
         })
+    }
+
+    /// 轮换前把旧密钥的分组**继承**给 `spec`（M20-S1 / B-166）。
+    ///
+    /// `display` 是旧密钥本地记录里的分组显示名（`RotationPlan::old_group_name`）。
+    /// 返回的 `spec` 就是随后要交给 `create_key` 的那一份。两种情况原样返回：
+    /// 旧 key 没绑分组、调用方已经显式给了分组。
+    ///
+    /// **为什么解析不到必须拒绝而不是照旧建**：
+    /// `rotate_key` 的第三步会回收旧密钥。新 key 不带分组 ⇒ 站点上两把都不能用
+    /// （未分组 key 一律 403 的站点）；本地钥匙串里存的正是那把不能用的。
+    /// 用户看到的却是「轮换完成」。所以这里宁可让轮换开始不了。
+    async fn rotation_inherit_group(
+        &self,
+        site_id: i64,
+        mut spec: KeySpec,
+        display: Option<&str>,
+    ) -> Result<KeySpec> {
+        // 调用方显式给了分组 ⇒ **显式优先**，本地继承不覆盖它。
+        if spec.group.is_some() {
+            return Ok(spec);
+        }
+        let Some(display) = display.map(str::trim).filter(|name| !name.is_empty()) else {
+            return Ok(spec);
+        };
+
+        // 站点侧分组列表是**唯一**能把显示名翻译成站点原生值的地方（Sub2API 要数字 id，
+        // NewAPI 要分组名）。取数失败（网络/登录态/站点没这个能力）一律上抛：
+        // 那三种失败都不是「可以不带分组」的理由。
+        //
+        // 其中「站点没有 groups 能力」要**补一层因果**再上抛：`capability_gate` 的原话
+        // 只说到「不支持读取分组」，用户读不到「因此轮换已取消、旧密钥没有被回收」——
+        // 而他会担心的恰恰是后半句（`RevokeOld` 是不可逆的）。这三条拒绝路径里只有
+        // 这一条的原文不带因果（M20-S1 独立复审 P1-1）。
+        let groups = match self.fetch_groups(site_id).await {
+            Ok(groups) => groups,
+            Err(err @ Error::Unsupported(_)) => {
+                return Err(Error::Unsupported(format!(
+                    "{err}；无法确认分组「{display}」，本次轮换已取消，旧密钥未被回收。\
+                     请改用支持分组查询的站点类型，或手动新建一把带分组的密钥后再回收这把。"
+                )));
+            }
+            Err(err) => return Err(err),
+        };
+        // 判据与 `available_groups` 里查倍率的那一处**逐字同源**：名字或 id 命中都算。
+        //
+        // 只按名字匹配会让「CLI/测试建的行」被误判成分组已不存在——那种行落库的
+        // 是站点原生标识（M19-S1 的回落路径：调用方没给显示名时存 `group`），
+        // 在 Sub2API 上就是 `"2"`，而站点列表里的 `name` 是 `"gpt plus"`。
+        let matched = groups
+            .iter()
+            .find(|group| group.name == display || group.id.as_deref() == Some(display))
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "旧密钥绑定的分组「{display}」在站点上已经不存在（可能被删除或改名）。\
+                     轮换必须让新密钥继续留在同一分组，否则它在该站点上无法调用；\
+                     请先在站点上恢复这个分组，或手动新建一把带分组的密钥后再回收这把。"
+                ))
+            })?;
+        // 站点原生值：有 id 用 id（Sub2API），没有就名字自己（NewAPI）。
+        spec.group = Some(matched.id.clone().unwrap_or_else(|| matched.name.clone()));
+        // 落库用**名字**——按 id 存回本地会让密钥表显示 `"2"` 这种无意义数字，
+        // 也会让 `refresh` 按名查倍率落空（M19-S1 的两个后果，同一个理由）。
+        spec.group_label = Some(matched.name.clone());
+        Ok(spec)
     }
 
     /// 执行一次轮换：`CreateNew → ReinjectAll → RevokeOld`（FR-7 / PRD §176 的「一键」）。
@@ -2708,6 +2780,9 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     /// 那是用户必须知道的可操作信息（「新 key 已建好，只注入成功了 1 个目标，
     /// 旧 key 还在站点上」），压成一条 `Err(String)` 只会被界面读成一句「轮换失败」。
     /// 只有**连开始都开始不了**的情形才返回 `Err`：key 不存在、或有目标认不出通道。
+    ///
+    /// M20-S1 / B-166 之后，「连开始都开始不了」还多了一种：**旧密钥绑定的分组在站点上
+    /// 已经不存在**。那会让新密钥建出来就不带分组，而第三步照样回收旧密钥。
     pub async fn rotate_key(&self, key_id: i64, spec: KeySpec) -> Result<RotationRun> {
         let plan = self.rotation_plan(key_id)?;
         if !plan.unmapped_targets.is_empty() {
@@ -2751,6 +2826,20 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 ),
             });
         }
+
+        // ⓿ 分组继承（M20-S1 / B-166）：新密钥必须继续待在旧密钥的分组里。编号不用
+        //    ①/②/③ —— 那三个号是轮换三步（建 / 注入 / 回收）的，占了会读混。
+        //
+        // **为什么必须在 create_key 之前**：`rotate_key` 的顺序是
+        // `CreateNew → ReinjectAll → RevokeOld`，一旦新 key 建出来不带分组，第三步照样
+        // 回收旧 key ⇒ 站点上两把都不能用（在「未分组 key 一律 403」的站点上，这正是
+        // 用户看到的「轮换完全失败但界面说成功」）。
+        //
+        // 三条「解析不到」的路径（分组被删/改名、站点没有 groups 能力、拉取本身失败）
+        // **全部**在动手前变成 `Err`，一条都不允许静默降级成「不带分组」。
+        let spec = self
+            .rotation_inherit_group(plan.site_id, spec, plan.old_group_name.as_deref())
+            .await?;
 
         // ① 建新 key（明文只进钥匙串，本函数全程不持有它）
         let new_key = self.create_key(plan.site_id, spec).await?;
@@ -2909,8 +2998,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         }
     }
 
-    /// 站点侧可用分组与倍率（FR-2）。
-    pub async fn available_groups(&self, site_id: i64) -> Result<Vec<crate::site::GroupInfo>> {
+    /// 站点侧分组列表（`site_id` + 能力门 + 会话 + 适配器）。**不含**观测缓存。
+    ///
+    /// 拆出来是为了让「轮换前把显示名解析回站点原生值」（B-166）与 `available_groups`
+    /// 走**同一条**取数路径——两处各写一份 `session`/`adapter` 的胶水代码，将来必然
+    /// 在一处漏掉能力门（M7-S5 复审 P1-1 就是在 `sync_site_keys` 上漏的）。
+    async fn fetch_groups(&self, site_id: i64) -> Result<Vec<crate::site::GroupInfo>> {
         let site = self.site(site_id)?;
         let kind = self.kind_of(&site)?;
         capability_gate(
@@ -2920,7 +3013,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         )?;
         let session = self.session(site_id)?;
         let adapter = self.registry.adapter(kind);
-        let groups = adapter.available_groups(&site.base_url, &session).await?;
+        adapter.available_groups(&site.base_url, &session).await
+    }
+
+    /// 站点侧可用分组与倍率（FR-2）。
+    pub async fn available_groups(&self, site_id: i64) -> Result<Vec<crate::site::GroupInfo>> {
+        let groups = self.fetch_groups(site_id).await?;
         // M8-S1 §5.4：倍率进观测缓存。`available_groups` 是用户触发的（FR-2 的下拉），
         // 观测只在用户看过分组之后才存在。
         //
