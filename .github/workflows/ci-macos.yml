@@ -46,6 +46,10 @@ jobs:
       - run: pnpm build
       - run: pnpm test
       - run: node scripts/check-commands.mjs
+      # M23-S3 / B-180：章程 ↔ 产物齐全性守护。单独一步、不并进 `pnpm test`，
+      # 是为了让 CI 日志里这一路**有自己的一行**——并进去会被 vitest 的输出冲掉，
+      # 红了也看不出是哪一条守护。本地 `pnpm test` 已含它，这一步是冗余的保险。
+      - run: node scripts/check-charter-steps.mjs
 
   build-universal:
     needs: gate-macos
