@@ -127,6 +127,8 @@ const steps = new Map();
 const crossMilestone = new Map();
 /** 被排除的「本章程自述不用产物」的 token（只计数 + 记样本，不纳入断言，见下）。 */
 const waived = new Map();
+/** 被排除的「非派工行」（变更记录表 / 散文提及 / 写域表），逐条可点名。 */
+const nonAssignment = [];
 
 /**
  * 章程**自述**「这一步不产生 spec/复审」的三类措辞：
@@ -159,6 +161,62 @@ const WAIVER_PATTERNS = [
   // 措辞指认一次已完成实测轮次（「（M9-S6 §7）」「见 M9-S6 实测」）
   /M\d+-S\d+[ab]?\s*(§|实测|证据)/,
 ];
+
+/**
+ * 行型判别（B-180）：**只有「派工行」里的本波 step 才纳入断言**。
+ *
+ * 为什么必须判行型：M23-S2 首版按「章程里出现的本波 token」一刀切断言，结果把三类
+ * **不是派工**的提及也断言了，制造 4 个假红：
+ *
+ * 1. **变更记录表**（`| v1.5 | 2026-10-12 | …M6-S7… |`）：记录的是「哪一版章程改了什么」，
+ *    里面的 token 是**被提及的既存 step**，不是本波派的工。M6-S7 由此假红
+ *    （它的产物 `docs/reviews/M6-S7-PRD覆盖度审计.md` 就在，只是名字不叫 `-复审`）。
+ * 2. **散文提及**（「见 M9-S6 §7」「`docs/M8-收口记录.md:6`」）：上下文引用。
+ * 3. **写域表 / 冻结接口表 / 裁决表**（`| \`routing.rs\` | **M8-S1** | … |`、
+ *    `| 1 | DEBUG §2.1 | … | M8-S1 | … |`）：它们确实与派工有关，但同一 step 的派工
+ *    在派工表（首格是 step token、或含「收了/转」的行）里已经断言过，不重复断言。
+ *
+ * **派工的两种行型**（本仓库 6 份章程都用这两种）：
+ * - **首格就是 step token**（M5-S0 §3 / M6-S0 §3 / M7-S0 §5 / M8-S0 §6 的派工表、
+ *   M8-S0 §1 的「条目 → 处置」表）：`| M5-S1 | 导出与脱敏纵深防御 | B-60 … | … |`。
+ * - **同行含指派动词**（「**收了** → M8-S1」「转 **M7-S6**」）：M8-S0 §1 每行都是。
+ *
+ * 判据（保守，宁可漏报也要少假红；**漏报的那部分由自证行点名补偿**）：
+ * - 必须是 Markdown 表格数据行（`|` 开头）；
+ * - 首格**不是**版本号（排除变更记录表）——**先判这一步**，否则
+ *   `| v1.1 | … 并入 … M8-S5A … |`（M8-S0:319，首格 `v1.1`、含「转」义）会被当成派工；
+ * - 且满足二者之一：① 首格含本行的 step token；② 同行含指派动词
+ *   （`收了` / `转 <Mx-Sy>` / `归属` / `待定` / `未参与本波次` / `按同一规则派` /
+ *   `停止写入后派` / `与 S1–S4 并行` / `复审者 =`）。
+ *
+ * **反向约束（为什么不能只按「首格是不是版本号」一刀切）**：M16-S0:53 的
+ * `| B-107 \`M7-S6\` 从未产出 \| … \| **收了** → 本波以 M16-S5/S6b/S7 承接 \|`
+ * 首格是 `B-107` 不是版本号、且含「收了」⇒ 它是**本波派的工**，必须照常断言
+ * （它断言的目标 token 是同里程碑的 M16-S*，这条判据保住了 B-169 的原型场景）。
+ */
+const TABLE_ROW = /^\s*\|/;
+const CHANGELOG_FIRST_CELL = /^v\d+(\.\d+)*$/i;
+const ASSIGNMENT_VERB =
+  /收了|转\s*\*{0,2}\s*M\d+-S\d+|归属|待定|未参与本波次|按同一规则派|停止写入后派|与 S1[–\-]S\d+\s*\*{0,2}并行|复审者\s*[=＝]/;
+/** 去掉 markdown 强调符与反引号，只留给「首格是什么」做字面比较。 */
+const stripEmphasis = (cell) => cell.replace(/[`*_~]/g, "").trim();
+
+/**
+ * 这一行是不是「派工行」？
+ *
+ * `token` 是**当前正在判断的那个 step token**——首格判据要用它：派工表的首格
+ * 正是 `M5-S1` / `M8-S5A 调试余项收口（§3.6）` 这种「token + 标题」的形态。
+ */
+function isAssignmentRow(raw, token) {
+  if (!TABLE_ROW.test(raw)) return false;
+  const firstCell = stripEmphasis(raw.split("|")[1] ?? "");
+  // 先排除变更记录表：`| v1.5 | 2026-10-12 | … |`。顺序不可交换（见上面注释）。
+  if (CHANGELOG_FIRST_CELL.test(firstCell)) return false;
+  // 形态①：首格就是 token（或「token + 标题」）
+  if (firstCell.startsWith(token)) return true;
+  // 形态②：同行有指派动词
+  return ASSIGNMENT_VERB.test(raw);
+}
 
 /**
  * 章程**自身**不需要 spec 之外的复审文件：`M5-S0-加固波次章程.md` 这类文件名本身就是
@@ -196,6 +254,13 @@ for (const charter of charters) {
         waived.get(token).push(record);
         continue;
       }
+      // B-180 行型判别：非派工行（变更记录表 / 散文 / 写域表）里的提及不进断言集。
+      // 逐条记进 `nonAssignment`（含 文件:行号 + 原文），由自证行点名输出——
+      // 漏报不能静默，否则「排除」就成了「放水」的别名。
+      if (!isAssignmentRow(raw, token)) {
+        nonAssignment.push({ ...record, token });
+        continue;
+      }
       if (WAIVER_PATTERNS.some((p) => p.test(raw))) {
         if (!waived.has(token)) waived.set(token, []);
         waived.get(token).push(record);
@@ -211,9 +276,44 @@ const asserted = [...steps.keys()].sort();
 if (asserted.length === 0) {
   die(
     `从 ${charters.length} 份章程里解析出 0 个待断言的本波 step（` +
-      `另有 ${crossMilestone.size} 个跨里程碑引用、${waived.size} 个被豁免 token）——` +
+      `另有 ${crossMilestone.size} 个跨里程碑引用、${waived.size} 个被豁免 token、` +
+      `${nonAssignment.length} 处非派工行提及）——` +
       `解析器坏了，不能当作通过。请检查 STEP_TOKEN 正则与 charterMilestone() 的里程碑号提取`,
   );
+}
+
+/**
+ * 「非派工行」的自证输出。
+ *
+ * 设计取舍：**不逐条列 200 多处**。按 token 聚合，每个 token 一行：
+ * ① 它有没有在**别处**以派工行进入断言集（有 ⇒ 这次排除无损，只是「同一 step 被多次提及」）；
+ * ② 只列**前 3 个**行号，够定位即可。
+ *
+ * 为什么不能只给个数：B-180 的教训是「排除」很容易变成「放水」的别名。所以每个 token
+ * 都必须能被点名核对——尤其是**从未以派工行出现**的那些（`onlyExcluded`），
+ * 它们提示「章程只在散文里提过这一步」。
+ */
+function reportNonAssignment(assertedTokens) {
+  if (nonAssignment.length === 0) return;
+  const byToken = new Map();
+  for (const r of nonAssignment) {
+    if (!byToken.has(r.token)) byToken.set(r.token, []);
+    byToken.get(r.token).push(r);
+  }
+  const all = [...byToken.keys()].sort();
+  const assertedSet = new Set(assertedTokens);
+  const onlyExcluded = all.filter((t) => !assertedSet.has(t));
+  console.log(
+    `  （自证）未纳入断言的 ${nonAssignment.length} 处非派工行提及，涉及 ${all.length} 个 token` +
+      `（其中 ${onlyExcluded.length} 个**从未**以派工行出现）：`,
+  );
+  for (const token of all) {
+    const rs = byToken.get(token);
+    const shown = rs.slice(0, 3).map((r) => `${r.charter}:${r.line}`);
+    const more = rs.length > 3 ? ` 等 ${rs.length} 处` : "";
+    const note = assertedSet.has(token) ? "" : "　← 只在非派工行出现过，未被断言";
+    console.log(`    - ${token}（${shown.join("、")}${more}）${note}`);
+  }
 }
 
 
@@ -282,6 +382,7 @@ console.log(
 console.log(
   `✓ 解析出 ${asserted.length} 个章程点名的本波 step；另有 ${crossMilestone.size} 个跨里程碑引用未纳入断言`,
 );
+reportNonAssignment(asserted);
 console.log(
   `✓ docs/specs 命中 ${specCovered}/${asserted.length} 个 step、` +
     `docs/reviews 命中 ${reviewCovered}/${asserted.length} 个 step`,
