@@ -119,6 +119,46 @@ impl WebhookNotifier {
 
 impl Notifier for WebhookNotifier {
     fn send(&self, n: &Notification) -> Result<()> {
+        // M22-S3 / B-174：**零超时在入口拒绝**，不传给传输层。
+        //
+        // 为什么是「输入非法」而不是「机器慢」：`Duration::ZERO` 在 reqwest + tokio 里
+        // **没有可用语义**。两条超时都落到 `tokio::time::sleep`：
+        //   - 总超时：`reqwest-0.13.5/src/async_impl/client.rs:2675`；
+        //   - 连接超时：`reqwest-0.13.5/src/connect.rs:147` 的 `TimeoutLayer::new(timeout)`，
+        //     它是 **`tower-0.5.3/src/timeout/mod.rs:66`** 的 `tokio::time::sleep`
+        //     （注意不是 `tower-http`——那个 crate 虽也在 reqwest 的依赖里，但不在这条链上）。
+        // 而零期限注册进 tokio 定时轮时**最迟在注册当轮**就被 fire：
+        // `runtime/time/wheel/mod.rs:94` 的 `when <= self.elapsed` ⇒
+        // `runtime/time/mod.rs:438` `entry.fire(Ok(()))`。于是两个 sleep 都立刻 Ready，
+        // 谁的 poll 先跑到谁先返回：`tower` 的 `ResponseFuture::poll` **先 poll sleep**、
+        // Ready 就直接返回 `Elapsed`（`tower/timeout/future.rs:40-53`，`inner` 一次都不 poll）；
+        // `reqwest` 的 `PendingRequest::poll` 也**先 poll total_timeout**、Ready 直接 Err
+        // （`client.rs:3097-3103`）。这正好解释旧用例实测到的两种结果：真 200 / 假超时。
+        //
+        // **「全量跑 22s」没能复现成这条机制的直接后果**，如实记录：
+        //   - 绕开本守卫直接打传输层（`Duration::ZERO` + 真实 reqwest）实测最坏 **4.9ms**、
+        //     典型 0.5–0.9ms ⇒ 零期限**本身**只值毫秒级；
+        //   - 剂量-反应曲线（本机 **10 核 M4**，`hw.ncpu=10`；`nproc` 因 `OMP_NUM_THREADS=2`
+        //     谎报 2）：0/2/4/8/16 个 `yes` 各 6 轮，最坏值 0.86ms → 1.08ms，**差四个数量级**；
+        //   - 外部卷 I/O 压力（反复 dd 写读 400–600MB）下仍是 0.31s 稳定；
+        //   - 该二进制单独跑稳定 0.31–0.33s，且 `cargo test` 是**串行**跑 target 的。
+        // 所以 22s 的成因**至今未定**（不是本步引入的：M22-S2 在本步改动前就必红）。
+        // 本步的判据**不依赖**那个解释：拒绝 0 之后这条路径不再有「两种结果」，
+        // 无论 22s 来自哪里都够不到它。成因调查登记为 B-178。
+        //
+        // 为什么不再「保留竞态、只钉不挂死」：那正是 M21-S1 的 250ms 上界，它护的是
+        // 一个两种结果都不由产品代码决定的病态输入。这里改成**明确的输入错误**，
+        // 让「时成时败」在产品侧不可能发生。
+        //
+        // 可达性：`Settings::validate` 早已拒绝 0、前端界是 1..60、历史遗留 0 会退回
+        // 默认 10 —— 所以今天只有测试能真的传 0 进来。这里是最后一道入口。
+        if self.config.timeout.is_zero() {
+            return Err(Error::Store(
+                "Webhook 超时不能为 0（零期限在 reqwest/tokio 里会让请求时成时败，\
+                 没有可用语义；至少 1 秒）"
+                    .to_string(),
+            ));
+        }
         let Some(url) = self.active_url() else {
             // 未配置 = 渠道未启用，不是错误
             return Ok(());
@@ -513,6 +553,49 @@ mod tests {
             assert!(matches!(err, Error::Transport(_)), "{url} → {err:?}");
             assert!(transport.calls().is_empty(), "{url} 不该发请求");
         }
+    }
+
+    /// M22-S3 / B-174：零超时在**入口**被拒绝，传输层一次都不碰。
+    ///
+    /// 集成侧 `webhook_with_zero_timeout_is_refused_before_it_reaches_the_transport`
+    /// 用 `RecordingTransport` 钉同一件事；这条是单元侧，钉的是错误**种类**
+    /// （`Error::Store`，即输入错误）而不是文案。
+    #[test]
+    fn send_refuses_a_zero_timeout_as_an_input_error() {
+        let transport = FakeTransport::ok(200);
+        let notifier = WebhookNotifier::with_transport(
+            NotifyConfig {
+                timeout: Duration::ZERO,
+                ..config(Some("http://127.0.0.1:1/hook"))
+            },
+            Box::new(transport.clone()),
+        );
+        let err = notifier.send(&note()).unwrap_err();
+        assert!(
+            matches!(err, Error::Store(_)),
+            "零超时是输入错误，不该是传输错误: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("不能为 0"),
+            "原因要点明是「零」: {err}"
+        );
+        assert!(transport.calls().is_empty(), "零超时不该发请求");
+    }
+
+    /// 对照组：守卫只挡 0。**没有这一条**，把上面那条误写成「无条件拒绝」也会全绿。
+    #[test]
+    fn send_still_posts_when_the_timeout_is_merely_tiny() {
+        let transport = FakeTransport::ok(204);
+        let notifier = WebhookNotifier::with_transport(
+            NotifyConfig {
+                timeout: Duration::from_nanos(1),
+                ..config(Some("http://127.0.0.1:1/hook"))
+            },
+            Box::new(transport.clone()),
+        );
+        notifier.send(&note()).expect("1ns 也是合法超时");
+        assert_eq!(transport.calls().len(), 1);
+        assert_eq!(transport.calls()[0].2, Duration::from_nanos(1));
     }
 
     #[test]
