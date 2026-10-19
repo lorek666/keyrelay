@@ -24,6 +24,55 @@ const BASE: &str = "https://sub.example.com";
 const OLD_SECRET: &str = "sk-old-0123456789abcdef";
 const NEW_SECRET: &str = "sk-new-0123456789abcdef";
 
+/// M23-S1 / B-175：轮换改名事件的**结构化判据**。
+///
+/// 两侧断言（有事件 / 没有事件）都只认这个常量键筛事件，**不再**看文案。
+/// 判据一旦是文案，改文案的人只同步一侧，另一侧就悄悄变成永远绿的空断言——
+/// 这正是 B-175 与 B-174 共同的教训：**判据必须是结构化的**。
+const RENAME_EVENT_KIND: &str = "rotation_group_renamed";
+
+/// 从一条事件的 payload 里取出结构化 `event` 键；解析不出（无 payload / 不是 JSON /
+/// 无此键）都返回 `None`。
+///
+/// 只收 `Option<&str>` 而不是具体事件类型：这样同一份判据既能用在生产路径返回的
+/// `store::EventRow` 上，也能用在自反断言里手搓的 `observability::Event` 上。
+fn event_kind(payload: Option<&str>) -> Option<String> {
+    let raw = payload?;
+    let parsed: Value = serde_json::from_str(raw).ok()?;
+    parsed["event"].as_str().map(str::to_string)
+}
+
+/// `store::EventRow` 的适配（生产路径）。
+fn row_kind(row: &keyrelay_core::store::EventRow) -> Option<String> {
+    event_kind(row.payload.as_deref())
+}
+
+/// 造一条带 JSON 载荷的事件（走公开 `event_with_payload`，与生产同一条脱敏路径）。
+fn observability_event_with_payload(payload: Value) -> keyrelay_core::observability::Event {
+    keyrelay_core::observability::event_with_payload(
+        keyrelay_core::observability::Level::Info,
+        "key",
+        "测试",
+        payload,
+    )
+}
+
+/// 造一条**载荷不是 JSON** 的事件：直接走公开 `event()` 后手填字段。
+/// 生产路径不可能产出这种载荷，但 `event_kind` 不能因此 panic。
+fn observability_event_with_raw_payload(raw: &str) -> keyrelay_core::observability::Event {
+    let mut event = keyrelay_core::observability::event(
+        keyrelay_core::observability::Level::Info,
+        "key",
+        "测试",
+    );
+    event.payload = Some(raw.to_string());
+    event
+}
+
+fn observability_event_no_payload() -> keyrelay_core::observability::Event {
+    keyrelay_core::observability::event(keyrelay_core::observability::Level::Info, "key", "测试")
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     service: KeyRelayService<MockTransport>,
@@ -563,12 +612,22 @@ async fn rotation_logs_a_rename_event_when_the_id_matches_and_the_name_differs()
         .await
         .expect("按 id 认出是同一分组，轮换应成功");
 
+    // 判据换成**结构化字段**（M23-S1 / B-175）：文案继续留着给人看，但不参与判定。
+    // 若把 `service.rs` 里那个固定键改掉/删掉，这条必须红——筛不到事件。
     let events = f.service.recent_events(200).expect("读事件");
-    let rename = events
+    let renames: Vec<&keyrelay_core::store::EventRow> = events
         .iter()
-        .find(|event| event.message.contains("分组已在站点上改名"))
-        .unwrap_or_else(|| panic!("id 命中而名字不同必须记改名事件：{events:?}"));
-    // 两个名字都要在文案里：只报新名，用户看不出这条事件跟自己的旧记录有关
+        .filter(|event| row_kind(event).as_deref() == Some(RENAME_EVENT_KIND))
+        .collect();
+    assert_eq!(
+        renames.len(),
+        1,
+        "按 id 认出同一分组、而站点上改了名 ⇒ 恰有一条改名事件：{:?}",
+        renames
+    );
+    let rename = renames[0];
+
+    // 文案只做展示：仍要求它写出「旧名 → 新名」（否则用户看不出这条事件跟自己的旧记录有关）。
     assert!(
         rename.message.contains("「gpt plus」") && rename.message.contains("「gpt plus v2」"),
         "文案要写出「旧名 → 新名」：{}",
@@ -613,12 +672,78 @@ async fn rotation_logs_no_rename_event_when_the_row_only_knows_a_native_id() {
     );
 
     let events = f.service.recent_events(200).expect("读事件");
+    // M23-S1 / B-175：反例也按结构化字段筛。**这一侧原来就是空断言**——它靠
+    // `message.contains("分组已在站点上改名")` 判「没有事件」，而文案一旦被改写
+    // （「分组更名」……）它永远绿。现在筛的是固定键，改文案打不到它。
+    let renames: Vec<&keyrelay_core::store::EventRow> = events
+        .iter()
+        .filter(|event| row_kind(event).as_deref() == Some(RENAME_EVENT_KIND))
+        .collect();
     assert!(
-        !events
-            .iter()
-            .any(|event| event.message.contains("分组已在站点上改名")),
-        "名字分支命中不是改名，不许记改名事件：{events:?}"
+        renames.is_empty(),
+        "按原生标识命中不是改名，不许记改名事件（按结构化键筛）：{renames:?}"
     );
+}
+
+/// **自反断言**：结构化判据真的在筛那个键，不是筛了个永远存在的字段。
+///
+/// 为什么必须有这一条：B-175 的病根是「判据看着在筛，其实筛的是句可改的文案」。
+/// 换成结构化键之后，同样的失败模式可能以另一种形式回来（键名写错、值写错、
+/// `event_kind` 永远返回 `None` 于是正例的 `assert_eq!(len, 1)` 反而抓得到、
+/// 但反例变成永远绿）。所以这里直接对判据本身下手。
+#[test]
+fn rename_event_kind_discriminates_the_real_events() {
+    // 三种 payload 形态：真改名事件 / 别的带载荷事件 / 无载荷事件
+    let real = observability_event_with_payload(json!({
+        "event": RENAME_EVENT_KIND,
+        "old_group_name": "a",
+        "new_group_name": "b",
+    }));
+    let other = observability_event_with_payload(json!({
+        "event": "some_other_event",
+        "old_group_name": "a",
+        "new_group_name": "b",
+    }));
+    let none = observability_event_with_payload(json!({
+        "old_group_name": "a",
+        "new_group_name": "b",
+    }));
+    let no_payload = observability_event_no_payload();
+    // payload 不是 JSON 时也不能 panic（`event_kind` 走 `ok()?`）
+    let bad_payload = observability_event_with_raw_payload("not-json");
+
+    assert_eq!(
+        event_kind(real.payload.as_deref()).as_deref(),
+        Some(RENAME_EVENT_KIND)
+    );
+    assert_eq!(
+        event_kind(other.payload.as_deref()).as_deref(),
+        Some("some_other_event")
+    );
+    assert_eq!(
+        event_kind(none.payload.as_deref()),
+        None,
+        "载荷里没有这个键时必须返回 None"
+    );
+    assert_eq!(
+        event_kind(no_payload.payload.as_deref()),
+        None,
+        "无载荷时必须返回 None"
+    );
+    assert_eq!(
+        event_kind(bad_payload.payload.as_deref()),
+        None,
+        "payload 非 JSON 时必须返回 None"
+    );
+
+    // 四类非目标事件都筛不出来 ⇒ 反例的 `is_empty()` 才有意义
+    for event in [&other, &none, &no_payload, &bad_payload] {
+        assert!(
+            event_kind(event.payload.as_deref()).as_deref() != Some(RENAME_EVENT_KIND),
+            "非改名事件不该被判成改名：{:?}",
+            event
+        );
+    }
 }
 
 /// 按 id 找时，id **不在**列表里 ⇒ 只可能是被删了（改名不会改变 id），必须拒绝。
