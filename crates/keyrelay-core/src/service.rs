@@ -2847,6 +2847,12 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                             matched.name
                         ),
                         serde_json::json!({
+                            // 结构化判据（M23-S1 / B-175）：固定键 + 固定字面量值，值不含任何
+                            // 外部输入 ⇒ 不引入新的脱敏面，`scrub_event_value` 照样过它、
+                            // 结果不变。键名口径同 `NotifyKind::as_str()`：稳定标识 ≠ 展示文案。
+                            // 测试两侧断言只认这个键筛事件，不再 `message.contains(...)`——
+                            // 判据一旦是文案，改文案的人只同步一侧，另一侧就悄悄变成永远绿的空断言。
+                            "event": "rotation_group_renamed",
                             "site_id": site_id,
                             "old_group_name": old_name,
                             "new_group_name": matched.name,
