@@ -4,7 +4,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection};
 
@@ -598,8 +598,26 @@ fn add_column_if_missing_with(
     }
 }
 
+/// WAL 切换的等待预算（B-156 / M24-S1）。
+///
+/// 取 10s 的理由：它必须**大于** `tests/store_wal_lock_retry.rs` 那条确定性用例的持锁时长
+/// （6s，判据是「熬过忙等超时」），留约 1.7× 余量；同时把旧的 ≈206s 上界压到 ~10s（低一个数量级）。
+const WAL_LOCK_BUDGET: Duration = Duration::from_secs(10);
+
+/// 预算内的轮询间隔。关掉忙等之后，每次尝试都是**立即**返回的 `SQLITE_BUSY`。
+const WAL_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+
+/// `busy_timeout` 的**通用**取值：服务建表 / `migrate` 等普通语句，**不是** WAL 那条 pragma
+/// （那条由 [`WAL_LOCK_BUDGET`] 单独管，见 `open_with_budget` 的注释）。
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_budget(path, WAL_LOCK_BUDGET)
+    }
+
+    /// `budget` 可注入**只为测试**：B-140 的教训是不可注入的预算只能靠「等 3.5 分钟」来验。
+    fn open_with_budget(path: &Path, budget: Duration) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::Store(format!("创建数据目录失败: {e}")))?;
@@ -610,32 +628,50 @@ impl Store {
         // （多进程 / 多线程），建表与其它语句都要拿写锁——不设忙等的话，
         // 另一个连接正在建表就会立刻 `database is locked`，`Store::open` 失败。
         // 5s 覆盖「另一个进程正在跑 migrate」这段窗口，又不会让真死锁挂太久。
-        conn.busy_timeout(std::time::Duration::from_secs(5))
+        conn.busy_timeout(BUSY_TIMEOUT)
             .map_err(|e| Error::Store(format!("设置忙等超时失败: {e}")))?;
         // 文件库必须真的跑在 WAL 上（并发读+写）。内存库不支持 WAL，只在 open_in_memory 分支跳过。
         //
-        // **这一步单独重试**：`PRAGMA journal_mode = WAL` 需要**独占锁**，而 SQLite 在
-        // 「改日志模式」这条路径上**不调用忙等处理器**（`SQLITE_BUSY` 立刻返回）⇒ 上面那个
-        // `busy_timeout` 对它无效。实测：4 线程并发首次打开同一个老库，20%~28% 命中
-        // `切换 WAL 模式失败: database is locked`（见
-        // `concurrent_first_upgrade_of_an_old_database_all_succeed`）。
+        // **这一步单独处理，并且刻意关掉忙等**（B-156 / M24-S1）：
+        // `PRAGMA journal_mode = WAL` 需要**独占锁**，而忙等在这条路径上**确实生效**——
+        // 证据是 B-140 那条确定性用例：另一个连接 `BEGIN EXCLUSIVE` 持锁 6s 时，
+        // `busy_timeout(5s)` 会先等满 5s 才拿到 `SQLITE_BUSY`（短于 5s 的争用光靠忙等就扛过去了）。
+        // 旧实现留着忙等、再用 40 次盲重试兜底 ⇒ 最坏 41 × (5s + 25ms) ≈ **206s**
+        // （M16-S10 实测 213.6s）；而旧注释写的是「这条路径不调用忙等处理器 ⇒ `busy_timeout`
+        // 对它无效、预算 ≈1s」——**那句话与实测不符**，正是 B-156 要修的东西。
+        //
+        // **为什么还要重试**：并发首次打开同一个老库时，多个进程都要把日志模式从
+        // rollback journal 切到 WAL，而这一步要独占锁 ⇒ 撞锁是**常态**而不是异常
+        // （`concurrent_first_upgrade_of_an_old_database_all_succeed` 实测 20%~28% 命中
+        // `database is locked`）。没有重试，正常启动就会随机失败。
+        //
+        // 现在的口径：**关掉忙等，等待只由 `budget` 控制**。每次尝试都是立即返回的
+        // `SQLITE_BUSY`，按 `WAL_RETRY_INTERVAL` 轮询，直到锁释放或预算耗尽。
         // 判据用**错误码**（`DatabaseBusy` / `DatabaseLocked`）而不是错误串：
         // 错误串是实现细节，别的错误（磁盘满、权限）**不许**被这个循环吞掉。
+        conn.busy_timeout(Duration::ZERO)
+            .map_err(|e| Error::Store(format!("关闭忙等失败: {e}")))?;
+        let started = Instant::now();
         let mut wal_attempts = 0u32;
         loop {
             match conn.pragma_update(None, "journal_mode", "WAL") {
                 Ok(()) => break,
-                Err(err) if wal_attempts < 40 && is_sqlite_busy(&err) => {
+                Err(err) if is_sqlite_busy(&err) && started.elapsed() < budget => {
                     wal_attempts += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    std::thread::sleep(WAL_RETRY_INTERVAL);
                 }
                 Err(err) => {
                     return Err(Error::Store(format!(
-                        "切换 WAL 模式失败（重试 {wal_attempts} 次后）: {err}"
+                        "切换 WAL 模式失败（重试 {wal_attempts} 次 / 预算 {}s 后）: {err}",
+                        budget.as_secs()
                     )))
                 }
             }
         }
+        // 恢复忙等：`migrate()` 与后续普通语句要它（P3-1 的另一半就在这里）。
+        // 恢复失败不许静默——否则「打开成功、之后所有并发写都不再等待」，比失败更糟。
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .map_err(|e| Error::Store(format!("恢复忙等超时失败: {e}")))?;
         let store = Self::from_conn(conn)?;
         // 记下路径（`from_conn` 不关心路径）
         Ok(Self {
@@ -2376,6 +2412,200 @@ mod tests {
         let conn = store.lock().unwrap();
         assert!(column_exists(&conn, "bindings", "unbound_at").unwrap());
         assert!(column_exists(&conn, "bindings", "delivery_mode").unwrap());
+    }
+
+    /// B-156 / M24-S1：`budget = 0` 时**零重试、立即放弃**。
+    ///
+    /// 这条同时是「忙等真的被关掉了」的判据：旧实现会在第一次尝试里等满
+    /// `busy_timeout(5s)` 才拿到 `SQLITE_BUSY`，所以 2s 的上界能把它区分出来。
+    #[test]
+    fn open_gives_up_immediately_when_the_budget_is_zero() {
+        let (dir, path) = make_rollback_journal_db_for_test();
+        let blocker = hold_exclusive_lock_for_test(&path);
+
+        let started = Instant::now();
+        let err = match Store::open_with_budget(&path, Duration::ZERO) {
+            Ok(_) => panic!("预算为 0 且锁被持有 ⇒ 必须立即放弃"),
+            Err(err) => err,
+        };
+        let elapsed = started.elapsed();
+        drop(blocker);
+
+        let text = err.to_string();
+        assert!(
+            text.contains("切换 WAL 模式失败"),
+            "文案应说清是切 WAL 失败: {text}"
+        );
+        assert!(
+            text.contains("重试 0 次"),
+            "预算为 0 必须零重试（旧实现是 40 次）: {text}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "预算为 0 时必须立刻返回（实测 {elapsed:?}）；>2s 说明忙等没关掉（旧实现会等满 5s）"
+        );
+        drop(dir);
+    }
+
+    /// B-156 / M24-S1：预算**真的**是等待的唯一来源——100ms 预算就该在 ~100ms 放弃。
+    ///
+    /// 上界 900ms 是刻意的：旧实现（40 次 × 25ms = 1000ms 的**次数**预算）会越过它 ⇒ 变红。
+    /// 只断言「有界」而不钉住量级，就抓不到「把预算偷偷改回次数」这种回退。
+    #[test]
+    fn open_gives_up_after_the_budget_and_says_how_many_retries() {
+        let (dir, path) = make_rollback_journal_db_for_test();
+        let blocker = hold_exclusive_lock_for_test(&path);
+
+        let started = Instant::now();
+        let err = match Store::open_with_budget(&path, Duration::from_millis(100)) {
+            Ok(_) => panic!("锁一直不放时必须按预算放弃，而不是无限等"),
+            Err(err) => err,
+        };
+        let elapsed = started.elapsed();
+        drop(blocker);
+
+        let text = err.to_string();
+        assert!(
+            text.contains("切换 WAL 模式失败"),
+            "文案应说清是切 WAL 失败: {text}"
+        );
+        assert!(
+            text.contains("预算 0s"),
+            "预算 100ms 被 as_secs() 截成 0s，文案里应能看到预算: {text}"
+        );
+        let retries: u32 = text
+            .split("重试 ")
+            .nth(1)
+            .and_then(|s| s.split(" 次").next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("文案里应报出真实重试次数: {text}"));
+        assert!(retries > 0, "预算 100ms 内必须真的重试过: {text}");
+        assert!(
+            elapsed >= Duration::from_millis(90),
+            "至少要等掉整个预算（实测 {elapsed:?}，预算 100ms）"
+        );
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "必须按预算放弃而不是按次数（实测 {elapsed:?}）；>900ms 说明预算被改成了 40 次盲重试"
+        );
+        drop(dir);
+    }
+
+    /// B-156 / M24-S1 / 复审 P2-1：**默认预算本身**必须被钉住。
+    ///
+    /// 为什么需要这条：本步的标题级成果是「206s → 10s」，但其它用例都走**注入预算**
+    /// （0 / 100ms / 300ms），默认预算只剩「> 6s」这条隐式下界。把 `WAL_LOCK_BUDGET`
+    /// 悄悄改成 200s，全部测试仍然绿 ⇒ 回退是静默的。这里直接把数字钉死：
+    /// 改它就必须同时改这条断言，评审时逃不掉。
+    ///
+    /// 刻意**不**给 6s 那条用例加上界（复审建议的 `< 8s`）：B-163 的教训是墙上时钟上界
+    /// 会被满载误伤（6s 的持锁窗口 + 机器 I/O 停顿时很容易越过 8s），而「能静默回退的东西」
+    /// 是这个常量，不是那条用例的耗时。
+    #[test]
+    fn wal_budget_is_pinned_so_the_206s_regression_cannot_sneak_back() {
+        assert_eq!(
+            WAL_LOCK_BUDGET,
+            Duration::from_secs(10),
+            "默认预算变了就重跑 B-156 的标定：旧实现是 ≈206s，本步把它压到 10s"
+        );
+        assert_eq!(
+            WAL_RETRY_INTERVAL,
+            Duration::from_millis(25),
+            "轮询间隔变了要重新评估「预算内会试几次」"
+        );
+        assert!(
+            WAL_LOCK_BUDGET > Duration::from_secs(6),
+            "预算必须大于 6s 持锁用例的窗口，否则那条用例会变成必然失败"
+        );
+    }
+
+    /// B-156 / M24-S1 / 复审 P3-4：**非 busy 类错误一次都不重试**，直接冒泡。
+    ///
+    /// 判据是错误码（`is_sqlite_busy`），所以「文件不是数据库」这种错必须**立即**报出来，
+    /// 不能被当成「别人拿着锁」去轮询 —— 那会把一个永久性错误拖成 10s 的假等待。
+    /// 这条同时给 `is_sqlite_busy` 加了回归钉：将来把它放宽成「任何 `SqliteFailure`」就红。
+    #[test]
+    fn open_does_not_retry_non_busy_errors() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("not-a-database.db");
+        // 一个**能打开、但不是数据库**的文件：`Connection::open` 是惰性的（成功），
+        // 第一条要读文件头的语句才报 `SQLITE_NOTADB`。
+        std::fs::write(&path, b"this is definitely not a sqlite database file")
+            .expect("写垃圾文件");
+
+        let started = Instant::now();
+        let err = match Store::open_with_budget(&path, Duration::from_secs(10)) {
+            Ok(_) => panic!("垃圾文件不可能打开成功"),
+            Err(err) => err,
+        };
+        let elapsed = started.elapsed();
+
+        let text = err.to_string();
+        assert!(
+            text.contains("重试 0 次"),
+            "非 busy 错误不许进重试循环（文案里应是重试 0 次）: {text}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "非 busy 错误必须立即冒泡（实测 {elapsed:?}）；>1s 说明被当成锁争用去轮询了"
+        );
+        drop(dir);
+    }
+
+    /// B-156 / M24-S1：WAL 切换成功后必须**恢复**忙等，否则之后所有并发写都不再等待。
+    ///
+    /// 判据是行为而不是内部状态（`busy_timeout` 不可查询）：另一连接持写锁 1.2s，
+    /// 从 `Store` 做一次写必须**等过去**；若恢复那行被删掉，这次写会立刻
+    /// `database is locked`（或直接失败）。
+    #[test]
+    fn open_restores_the_busy_timeout_for_later_writes() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("keyrelay.db");
+        let store = Store::open(&path).expect("首次建库");
+
+        let blocker = hold_exclusive_lock_for_test(&path);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1_200));
+            // 连接关闭 ⇒ 未提交事务回滚 ⇒ 锁释放
+            drop(blocker);
+        });
+
+        let started = Instant::now();
+        store
+            .set_setting("m24s1.probe", "ok")
+            .expect("恢复忙等后这次写必须等到锁释放，而不是立刻报 database is locked");
+        let elapsed = started.elapsed();
+        releaser.join().expect("放锁线程");
+
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "必须等过持锁窗口（实测 {elapsed:?}）；没等就说明 busy_timeout 没恢复"
+        );
+    }
+
+    /// 造一个**非 WAL** 的库文件：只有「从 rollback journal 切到 WAL」才需要独占锁。
+    /// 夹具自断言初始模式是 `delete`，否则用例会变成空跑（B-140 的教训）。
+    fn make_rollback_journal_db_for_test() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("keyrelay.db");
+        let conn = Connection::open(&path).expect("建库");
+        conn.execute_batch("CREATE TABLE probe(id INTEGER PRIMARY KEY, note TEXT);")
+            .expect("建表");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("读 journal_mode");
+        assert_eq!(
+            mode, "delete",
+            "夹具必须是非 WAL 库（否则切 WAL 不需要独占锁，用例会空跑）"
+        );
+        (dir, path)
+    }
+
+    /// 拿一把排他锁：`BEGIN EXCLUSIVE` 立刻拿锁，不依赖线程调度。
+    fn hold_exclusive_lock_for_test(path: &Path) -> Connection {
+        let conn = Connection::open(path).expect("锁连接");
+        conn.execute_batch("BEGIN EXCLUSIVE").expect("拿排他锁");
+        conn
     }
 
     #[test]

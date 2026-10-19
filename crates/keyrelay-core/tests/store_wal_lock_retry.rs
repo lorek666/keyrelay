@@ -8,18 +8,17 @@
 //! （不依赖线程调度），而「从 rollback journal 切到 WAL」需要独占锁
 //! ⇒ 第一次尝试必然撞锁 ⇒ 只有重试循环能救。
 //!
-//! 快速用例（进常规门禁）：锁在窗口内释放 ⇒ **必须等到**锁释放后成功。
-//! 慢用例（`#[ignore]`）：锁一直不放 ⇒ 按预算放弃 + 报出真实重试次数（见该函数文档的实测说明）。
+//! **M24-S1（B-156）之后**：重试预算改成可注入的（私有 `Store::open_with_budget`），
+//! 于是「按预算放弃 + 报出真实重试次数」那一半从 `#[ignore]` 的 3.5 分钟用例
+//! 搬进了 `store/mod.rs` 的单元测试（`open_gives_up_immediately_when_the_budget_is_zero`
+//! 与 `open_gives_up_after_the_budget_and_says_how_many_retries`），跑一次约 0.1s。
+//! 本文件只保留**必须用真实默认预算**的那条：锁在窗口内释放 ⇒ 必须熬过去。
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use keyrelay_core::store::Store;
 use rusqlite::Connection;
-
-/// 与 `store/mod.rs::Store::open` 的重试预算保持一致（改那边时这里要跟着改）。
-const RETRY_ATTEMPTS: u64 = 40;
-const RETRY_DELAY_MS: u64 = 25;
 
 fn journal_mode(conn: &Connection) -> String {
     conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
@@ -57,9 +56,10 @@ fn open_waits_for_a_held_exclusive_lock_and_then_succeeds() {
     let db = dir.path().join("keyrelay.db");
     make_rollback_journal_db(&db);
 
-    // 持锁 **6s**：比 `busy_timeout(5s)` 长（M16-S10 实测：这条 pragma 会走忙等，
+    // 持锁 **6s**：必须大于 `busy_timeout(5s)`（M16-S10 实测：这条 pragma 会走忙等，
     // 所以短于 5s 的争用**光靠忙等就能扛过去**，那样这条用例就抓不到「重试循环没了」）。
-    // 只有重试循环能让它熬过 5s 之后的那一段。
+    // M24-S1 之后忙等被**刻意关掉**、改由 `WAL_LOCK_BUDGET`(10s) 控制 —— 6s 仍在预算内，
+    // 所以这条判据不变：只有「等到锁释放」才能成功。
     const HOLD_MS: u64 = 6_000;
     let blocker = hold_exclusive_lock(&db);
     let releaser = std::thread::spawn(move || {
@@ -82,53 +82,4 @@ fn open_waits_for_a_held_exclusive_lock_and_then_succeeds() {
     // 重试成功后必须真的切到 WAL（模式是持久化在文件头里的）
     let probe = Connection::open(&db).expect("复开");
     assert_eq!(journal_mode(&probe), "wal", "重试成功后必须切到 WAL");
-}
-
-/// **慢用例（`#[ignore]`，跑一次 ≈3.5 分钟）**：钉住「按预算放弃 + 报出真实重试次数」。
-///
-/// 为什么这么慢（M16-S10 实测，已回报 Lead）：`Store::open` 在 `PRAGMA journal_mode = WAL`
-/// 之前设了 `busy_timeout(5s)`，而**这条 pragma 在这台机器上确实会走忙等**——锁一直被持有时，
-/// 每次尝试要等满 5s 才拿到 `SQLITE_BUSY`，于是最坏总耗时 ≈ 41 × (5s + 25ms) ≈ **206s**
-/// （实测 213.6s）。这与 `store/mod.rs` 里「SQLite 在这条路径上不调用忙等处理器 ⇒
-/// `busy_timeout` 对它无效」的注释**不符**：预算实际上不是 ≈1s 而是 ≈3.5 分钟。
-///
-/// 快速的那一半（「锁会在窗口内释放 ⇒ 必须等到它」）在
-/// [`open_waits_for_a_held_exclusive_lock_and_then_succeeds`] 里，进常规门禁。
-#[test]
-#[ignore = "≈3.5 分钟：钉住重试预算的上界与真实重试次数（详见函数文档的实测说明）"]
-fn open_gives_up_after_the_retry_budget_and_says_how_many_retries() {
-    let dir = tempfile::tempdir().expect("临时目录");
-    let db = dir.path().join("keyrelay.db");
-    make_rollback_journal_db(&db);
-
-    // 锁一直不放：超过整个预算
-    let blocker = hold_exclusive_lock(&db);
-    let started = Instant::now();
-    let err = match Store::open(&db) {
-        Ok(_) => panic!("锁一直不放时必须按预算放弃，而不是无限等"),
-        Err(err) => err,
-    };
-    let elapsed = started.elapsed();
-    drop(blocker);
-
-    let text = err.to_string();
-    assert!(
-        text.contains("切换 WAL 模式失败"),
-        "错误文案应说清是切 WAL 失败: {text}"
-    );
-    assert!(
-        text.contains(&format!("重试 {RETRY_ATTEMPTS} 次")),
-        "必须报出真实的重试次数（旧实现是 0 次）: {text}"
-    );
-    // 有界：每次尝试受 busy_timeout(5s) 限制 ⇒ 总耗时落在 [预算, 41×5s + 余量] 内。
-    let budget = Duration::from_millis(RETRY_ATTEMPTS * RETRY_DELAY_MS);
-    let busy_bound = Duration::from_secs(5) * (RETRY_ATTEMPTS as u32 + 1);
-    assert!(
-        elapsed >= budget / 2,
-        "至少要等掉半个预算（实测 {elapsed:?}，预算 {budget:?}）"
-    );
-    assert!(
-        elapsed < busy_bound + Duration::from_secs(10),
-        "不许无界等待（实测 {elapsed:?}，busy_timeout 上界 {busy_bound:?}）"
-    );
 }
