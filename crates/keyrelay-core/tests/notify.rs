@@ -440,61 +440,91 @@ fn webhook_obeys_the_configured_timeout() {
 }
 
 #[test]
-fn webhook_with_zero_timeout_is_a_race_but_never_hangs() {
-    // `timeout` 由调用方保证 > 0（S5 的 `notify_timeout_secs` 默认 10、上限 60）。
+fn webhook_with_zero_timeout_is_refused_before_it_reaches_the_transport() {
+    // M22-S3 / B-174：把 M21-S1 留下的最后一条墙上时钟上界换成**可判定**判据。
     //
-    // 实测（本机 macOS aarch64 + reqwest 0.13，本地假端点）：`Duration::ZERO` **不是**
-    // 「不限时」，而是一个零期限 —— 谁先完成谁赢。同一个二进制里**两种结果都出现过**：
-    //   `Ok(())`（547µs）与 `Err("webhook 请求超时（http://127.0.0.1:…）")`（4.9ms）。
-    // 所以 `timeout = 0` 是**竞态**、不可依赖 → 给 S5 的结论：`Settings::validate`
-    // 应当拒绝 0（或映射时兜到 ≥ 1s），否则用户把超时设成 0 会得到「时灵时不灵」的 webhook。
+    // 为什么上界必然被误伤（不是「选个更宽的值」能救的）：`Duration::ZERO` 在
+    // reqwest + tokio 里没有任何可用语义。总超时（`reqwest/client.rs:2675`）与连接层
+    // `TimeoutLayer`（`reqwest/connect.rs:147`；接线是 `tower-0.5.3/src/timeout/mod.rs:66`，
+    // **不是** `tower-http`）都调 `tokio::time::sleep`，而零期限最迟在注册当轮就被 fire
+    // （`tokio/.../time/wheel/mod.rs:94` ⇒ `runtime/time/mod.rs:438` `entry.fire(Ok(()))`）
+    // ⇒ 两个 sleep 都立刻 Ready，**结果取决于谁先 poll**：
+    // `tower/timeout/future.rs:40-53` 先 poll sleep、Ready 就返回 `Elapsed`（inner 一次不 poll）；
+    // `client.rs:3097-3103` 先 poll `total_timeout`、Ready 直接 Err。旧用例观测到的
+    // 「真 200 / 假超时」两种结果就是这么来的。
     //
-    // 这条测试只钉住**确定性**的那部分：不挂死，且结果只能是这两种之一。
-    let mut outcomes: Vec<&'static str> = Vec::new();
-    for _ in 0..5 {
-        let server = spawn_server(vec![http_response("200 OK", "application/json", "{}")]);
-        let notifier = WebhookNotifier::with_transport(
-            NotifyConfig {
-                timeout: Duration::ZERO,
-                ..config(Some(&format!("{}/hook", server.base_url)))
-            },
-            Box::new(keyrelay_core::notify::ReqwestWebhookTransport::default()),
-        );
+    // 实测（M22-S2 与本步）：单跑 40 次、隔离 30 次、本目标内 20 次全绿；
+    // `cargo test --workspace` 那一轮红在 22.45s。
+    // **22s 的成因本步没能复现**：该机制本身实测只值毫秒级（绕开本守卫直打传输层
+    // 最坏 4.936ms），剂量-反应曲线 0→16 个 `yes` 只把最坏值从 0.86ms 推到 1.08ms
+    // （本机 10 核 M4——`nproc` 因 `OMP_NUM_THREADS=2` 谎报 2 核），外部卷 I/O 压力下
+    // 仍 0.31s 稳定。所以成因另记 B-178；本判据**不依赖**那个解释。
+    //
+    // M21-S1 当年的 250ms 上界护的就是这个病态输入。本步改判据：
+    // **零超时在入口被拒绝，且一个请求都不发**。
+    // 这样「时成时败」在产品侧不可能发生，也不需要墙上时钟。
+    let transport = RecordingTransport {
+        status: 200,
+        ..RecordingTransport::default()
+    };
+    let notifier = WebhookNotifier::with_transport(
+        NotifyConfig {
+            timeout: Duration::ZERO,
+            ..config(Some("http://127.0.0.1:9/hook"))
+        },
+        Box::new(transport.clone()),
+    );
 
-        let started = Instant::now();
-        let outcome = notifier.send(&Notification::new(
+    let err = notifier
+        .send(&Notification::new(
             NotifyKind::Drift,
             Some(1),
             "配置漂移",
             "x",
             NOW,
-        ));
-        let elapsed = started.elapsed();
+        ))
+        .expect_err("零超时必须被拒绝，不能带着竞态发出去");
 
-        // M21-S1 / B-163：这条钉的是「**不挂死**」，所以仍然需要一个上界。
-        //
-        // 不能像上面那条一样换成错误种类——`timeout = 0` 时**允许** `Ok(())`，
-        // 那时没有任何错误可判。所以这里保留时间上界，但选值要能扛负载：
-        // 参照量是「一次成功的本地回环请求」，实测 547µs / 4.9ms。
-        // 250ms 比它宽两个数量级（线程派生 + 建运行时的抖动都装得下），
-        // 又比原来的 5s 紧 20 倍（真正的挂死是「永不返回」，不会停在 250ms 边界上）。
-        assert!(
-            elapsed < Duration::from_millis(250),
-            "耗时 {elapsed:?}：`timeout = 0` 挂死了（调用方必须传 > 0）"
-        );
-        outcomes.push(match outcome {
-            Ok(()) => "ok",
-            Err(e) => {
-                let text = e.to_string();
-                assert!(
-                    text.contains("请求超时"),
-                    "`timeout = 0` 只应产出「超时」错误，实测: {text}"
-                );
-                "timeout"
-            }
-        });
-    }
-    println!("timeout=0 的五次实测: {outcomes:?}");
+    let text = err.to_string();
+    assert!(
+        text.contains("不能为 0"),
+        "拒绝的原因要说清是「零」而不是别的失败: {text}"
+    );
+    // 关键：连传输层都没碰到。若这里发出过请求，说明守卫装在了错误的位置
+    //（比如只在 `post()` 里判，那时请求已经离开发送方）。
+    let calls = transport.seen.lock().unwrap().clone();
+    assert!(calls.is_empty(), "零超时不该产生任何请求: {calls:?}");
+}
+
+#[test]
+fn webhook_with_a_nonzero_timeout_still_reaches_the_transport() {
+    // 对照组：守卫只挡 0，不碰合法值。删掉这条，把上面那条的判据误写成
+    // 「无条件拒绝」也会全绿——那是另一个方向的假绿。
+    let transport = RecordingTransport {
+        status: 204,
+        ..RecordingTransport::default()
+    };
+    let notifier = WebhookNotifier::with_transport(
+        NotifyConfig {
+            timeout: Duration::from_millis(1),
+            ..config(Some("http://127.0.0.1:9/hook"))
+        },
+        Box::new(transport.clone()),
+    );
+
+    notifier
+        .send(&Notification::new(
+            NotifyKind::Drift,
+            Some(1),
+            "配置漂移",
+            "x",
+            NOW,
+        ))
+        .expect("1ms 是合法超时，应照常发出");
+
+    let calls = transport.seen.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "非零超时必须照常调用传输层: {calls:?}");
+    assert_eq!(calls[0].2, Duration::from_millis(1), "超时值要原样透传");
 }
 
 #[test]
