@@ -1061,3 +1061,41 @@ async fn revoke_key_reports_local_status_not_updated_when_the_keys_update_fails(
         "没有触发器时必须写上 revoked: {report:?}"
     );
 }
+
+// ============================================================ B-179
+
+/// `NotifyConfig.timeout = 0` 触发 webhook 零超时守卫（`Error::Store`）⇒
+/// service 把标题分流成「通知配置非法」，不是「通知发送失败」。
+/// 这是 P3 不可达路径（生产 Settings 不允许 0），测试用直接构造触发。
+#[tokio::test]
+async fn webhook_config_error_is_titled_config_not_send_failure() {
+    let f = fixture(vec![
+        login_response(&jwt_with_exp(9_999_999_999)),
+        sub2api_ok(json!({"balance": 10.0, "total_recharged": 100.0})), // 10 < 15
+        sub2api_ok(json!([])),                                          // groups
+    ]);
+    f.service
+        .login(f.site_id, Credentials::new("me@example.com", "pw-12345678"))
+        .await
+        .expect("登录");
+    let svc = f.service.with_notify(keyrelay_core::notify::NotifyConfig {
+        system_enabled: false,
+        webhook_url: Some("http://example.cc/webhook".into()),
+        balance_threshold: 15.0,
+        timeout: std::time::Duration::ZERO, // 触发零超时守卫 ⇒ Error::Store
+    });
+    svc.refresh_all().await.expect("刷新");
+    let events = Store::open(&f.db_path)
+        .expect("开库")
+        .list_events(200)
+        .expect("事件");
+    assert!(
+        events.iter().any(|e| e.message.contains("通知配置非法")),
+        "B-179：配置非法应分流成『通知配置非法』，实际 {:?}",
+        events.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+    assert!(
+        !events.iter().any(|e| e.message.contains("通知发送失败")),
+        "B-179：配置非法不得报成『通知发送失败』"
+    );
+}

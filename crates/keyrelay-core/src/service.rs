@@ -2401,14 +2401,30 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                     self.resolved_upstream_proxy(),
                 );
                 if let Err(err) = notifier.send(item) {
-                    failures.push(format!("webhook: {err}"));
+                    // B-179：按 err 变体分流前缀。`Error::Store` 是配置非法（如零超时守卫），
+                    // 不是发送失败——读事件表的人据此不会去查网络。其他变体（IO / 超时 / 认证）
+                    // 仍是「webhook」前缀。
+                    let label = match &err {
+                        crate::error::Error::Store(_) => "webhook 配置非法",
+                        _ => "webhook",
+                    };
+                    failures.push(format!("{label}: {err}"));
                 }
             }
             if !failures.is_empty() {
+                // B-179：标题按 failures 内容分流。有「配置非法」前缀 ⇒ 标题也用「通知配置非法」，
+                // 否则「通知发送失败」。子串匹配够用：当前只有 webhook 零超时守卫用这个词；
+                // 复审要点是「将来新增含『配置非法』的 failure 文案时这条匹配是否仍准」。
+                let has_config_err = failures.iter().any(|f| f.contains("配置非法"));
+                let title = if has_config_err {
+                    "通知配置非法"
+                } else {
+                    "通知发送失败"
+                };
                 self.log(observability::event_with_payload(
                     Level::Warn,
                     "app",
-                    format!("通知发送失败: {}", failures.join(" | ")),
+                    format!("{title}: {}", failures.join(" | ")),
                     serde_json::json!({
                         "kind": format!("{:?}", item.kind),
                         "webhook": crate::redact::mask_webhook_url(
