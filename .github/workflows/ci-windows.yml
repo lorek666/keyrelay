@@ -45,6 +45,10 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # M24-S2 / B-73：与 macOS 对等的一步。
+      # 同样是**自证**（干净检出上必然通过），不是拦截；脚本只用 node + git，跨平台。
+      - run: node scripts/check-clean-gate.mjs
+
       # 六门禁（Windows 侧）
       - run: cargo fmt --check --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings

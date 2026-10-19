@@ -22,15 +22,19 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import {
   existsSync,
+  mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
+  rmSync,
   statSync,
+  symlinkSync,
 } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 
 const USAGE =
-  "用法: node scripts/check-mut-isolation.mjs [--target-dir <目录>] [--run -- <命令> [参数...]]";
+  "用法: node scripts/check-mut-isolation.mjs [--self-test] [--target-dir <目录>] [--run -- <命令> [参数...]]";
 
 const RESIDUE_DIRS = ["crates", "src", "src-tauri"];
 const RESIDUE_PATTERNS = ["MUT-", "M5 变异"];
@@ -45,9 +49,14 @@ const flags = separator >= 0 ? argv.slice(0, separator) : argv;
 const child = separator >= 0 ? argv.slice(separator + 1) : [];
 
 let targetDirFlag = null;
+let selfTest = false;
 for (let i = 0; i < flags.length; i += 1) {
   const flag = flags[i];
   if (flag === "--run") continue;
+  if (flag === "--self-test") {
+    selfTest = true;
+    continue;
+  }
   if (flag === "--target-dir") {
     targetDirFlag = flags[i + 1] ?? null;
     i += 1;
@@ -68,6 +77,12 @@ if (separator >= 0 && child.length === 0) {
   process.exit(1);
 }
 const runMode = separator >= 0;
+
+// `--self-test`：只自证**判定逻辑**，不读真实仓库、不跑 cargo、不依赖网络。
+// 必须在「现场」那一步之前返回 —— 它不需要在 git 仓库里跑（CI/新克隆都能自检）。
+if (selfTest) {
+  process.exit(runSelfTest());
+}
 
 // ------------------------------------------------------------------ 工具
 
@@ -118,6 +133,96 @@ function sharesTargetWith(worktreeReal, targetReal) {
   // 恰好是这个守护唯一要防的形态（PROCESS.md §3 的假绿）。
   const otherTarget = realpathSoft(join(worktreeReal, "target"));
   return targetReal === otherTarget || targetReal.startsWith(otherTarget + sep);
+}
+
+/**
+ * `--self-test`（M24-S2 / B-73）：用**临时目录造 fixture** 自证判定逻辑没退化。
+ *
+ * 为什么需要它：这个守护以前只有「手动 `--run`」一条路径，没人知道它是不是还活着。
+ * 接进 `pnpm test` 后，每次测试都会问一句「判定逻辑还认得出共享 target 吗」——
+ * 一个恒 false 的判定（最容易写出来的退化）会当场红。
+ *
+ * 四条 fixture（全部在 `os.tmpdir()` 下，跑完删除）：
+ *   S1 有效 target 在**别的 worktree 的 target/ 里面**（子目录）⇒ 必须判共享（不隔离）
+ *   S2 有效 target 是独立目录 ⇒ 必须判不共享（隔离）
+ *   S3 别的 worktree 的 `target/` 是**指向共享目录的符号链接** ⇒ 必须判共享（P1-1 的形态）
+ *   S4 与 target/ **前缀相同但同级**的目录（`target-other`）⇒ 必须判不共享（`sep` 边界）
+ *
+ * 退出码：0 = 四条全符合期望；1 = 有任一条不符合（逐条打印期望/实际，不静默）。
+ */
+function runSelfTest() {
+  let base;
+  try {
+    base = mkdtempSync(join(tmpdir(), "kr-mut-selftest-"));
+  } catch (error) {
+    fail(`--self-test 建临时目录失败：${error.message}`);
+    return 1;
+  }
+
+  const fakeWtA = join(base, "fake-wt-a");
+  const fakeWtB = join(base, "fake-wt-b");
+  const sharedTarget = join(base, "shared-target");
+  const isolated = join(base, "isolated");
+
+  try {
+    mkdirSync(join(fakeWtA, "target", "debug"), { recursive: true });
+    mkdirSync(fakeWtB, { recursive: true });
+    mkdirSync(sharedTarget, { recursive: true });
+    mkdirSync(isolated, { recursive: true });
+    // B 的 target/ 是指向共享目录的符号链接 —— 拼字符串与真实路径写法不同，是 P1-1 的形态。
+    symlinkSync(sharedTarget, join(fakeWtB, "target"), "dir");
+
+    const wtA = realpathSoft(fakeWtA);
+    const wtB = realpathSoft(fakeWtB);
+
+    const cases = [
+      {
+        id: "S1",
+        desc: "有效 target 在别的 worktree 的 target/ 之下（子目录）⇒ 判共享（不隔离）",
+        expect: true,
+        actual: sharesTargetWith(wtA, realpathSoft(join(fakeWtA, "target", "debug"))),
+      },
+      {
+        id: "S2",
+        desc: "有效 target 是独立目录 ⇒ 判不共享（隔离）",
+        expect: false,
+        actual: sharesTargetWith(wtA, realpathSoft(isolated)),
+      },
+      {
+        id: "S3",
+        desc: "别的 worktree 的 target/ 是指向共享目录的符号链接 ⇒ 判共享（P1-1 形态）",
+        expect: true,
+        actual: sharesTargetWith(wtB, realpathSoft(sharedTarget)),
+      },
+      {
+        id: "S4",
+        desc: "与 target/ 前缀相同但同级的目录（target-other）⇒ 判不共享（sep 边界）",
+        expect: false,
+        actual: sharesTargetWith(wtA, realpathSoft(join(fakeWtA, "target-other"))),
+      },
+    ];
+
+    let bad = 0;
+    console.log("=== check-mut-isolation --self-test（fixture 自证，不跑 cargo）===");
+    for (const testCase of cases) {
+      const pass = testCase.actual === testCase.expect;
+      if (!pass) bad += 1;
+      console.log(
+        `${pass ? "✓" : "✗"} ${testCase.id}  期望=${testCase.expect} 实际=${testCase.actual}  ${testCase.desc}`,
+      );
+    }
+    console.log(`${bad === 0 ? "✓" : "✗"} ${cases.length - bad}/${cases.length} 条符合期望`);
+    if (bad > 0) {
+      fail("判定逻辑已退化：上面 ✗ 的那条就是退化点（改回后应恢复 ✓）。");
+      return 1;
+    }
+    return 0;
+  } catch (error) {
+    fail(`--self-test 建 fixture 失败：${error.message}`);
+    return 1;
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 }
 
 /** 扫 `crates/ src/ src-tauri/` 的变异残留，返回 `文件:行: 内容` */

@@ -39,6 +39,11 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # M24-S2 / B-73：门禁取数前置守护。
+      # 性质要说清：这是**自证（self-proof）**——干净检出上它**必然**通过，拦不住任何东西；
+      # 它证明的是「下面这些门禁数字属于这次提交的内容」（B-43 的原始事故只发生在本地脏树）。
+      - run: node scripts/check-clean-gate.mjs
+
       # 六门禁（macOS 侧）
       - run: cargo fmt --check --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
