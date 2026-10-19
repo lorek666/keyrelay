@@ -1,0 +1,37 @@
+#!/bin/sh
+# M24-S2 / B-73：提交时自动守护（索引语义）。
+#
+# 为什么是「索引语义」：`check-no-real-credentials.mjs` 读的是 `git ls-files -s` 的 blob ——
+# 也就是**下一次 commit 会写进去的那份字节**。这正是提交前的语义，能拦住
+# 「git add 了真值、再把工作树改回干净」这种形态（B-170 实测复现过）。
+#
+# 零依赖：只用 sh 内建 + git + node（不引 grep/sed 等外部工具）。
+# 绕过：git commit --no-verify（git 自带；CI 的 pnpm test 仍会跑同样的守护）。
+#
+# 由 `pnpm hooks:install` 启用（git config core.hooksPath .githooks）。
+
+set -u
+
+echo "[pre-commit] ① 凭证卫生（索引语义：git ls-files -s 的 blob）"
+if ! node scripts/check-no-real-credentials.mjs; then
+  echo "[pre-commit] ✗ 凭证守护未过 —— 本次提交被拒绝（用 git commit --no-verify 可绕过，但 CI 仍会拦）"
+  exit 1
+fi
+
+# 只有改章程/产物时才需要齐全性检查（否则是给无关提交添延迟）。
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+case "$STAGED" in
+  *docs/specs/*|*docs/reviews/*)
+    echo "[pre-commit] ② 暂存区含 docs/specs|docs/reviews ⇒ 跑章程↔产物齐全性"
+    if ! node scripts/check-charter-steps.mjs; then
+      echo "[pre-commit] ✗ 章程↔产物齐全性未过 —— 本次提交被拒绝"
+      exit 1
+    fi
+    ;;
+  *)
+    echo "[pre-commit] ② 暂存区不含 docs/specs|docs/reviews ⇒ 跳过章程守护（本次不涉及）"
+    ;;
+esac
+
+echo "[pre-commit] ✓ 通过"
+exit 0
