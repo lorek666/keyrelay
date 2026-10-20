@@ -80,14 +80,15 @@ const CHANNEL = {
   mcode: "mcode",
   pi: "pi",
 };
-/** M14-S1 起 Continue 已删，11 通道均不要求 model（OpenCode 系列的 model 可选）。 */
+/** M14-S1 起 Continue 已删，11 通道均不要求 model（OpenCode 系列的 model 可选）。
+ *  M25-S1 起 codex 真路径要 model：env KEYRELAY_REAL_MODEL 优于空表。 */
 const MODEL = {};
 
 /** 每个 agent 的可执行文件名、冒烟用的最小子命令、目标配置的相对路径。
  *  新 6 通道（claude-desktop/grok-build/openclaw/hermes/mcode/pi）多为桌面或配置型 agent，
  *  本机通常无 CLI 二进制 ⇒ realAgentAvailable=false ⇒ 自动落 mock 路径。 */
 const TARGETS = {
-  codex: { bin: "codex", smoke: ["exec", "echo ok"], config: ".codex/auth.json" },
+  codex: { bin: "codex", smoke: ["exec", "say ok"], config: ".codex/auth.json" },
   "claude-code": { bin: "claude", smoke: ["-p", "echo ok"], config: ".claude/settings.json" },
   opencode: { bin: "opencode", smoke: ["run", "echo ok"], config: ".config/opencode/opencode.json" },
   "opencode-jsonc": { bin: "opencode", smoke: ["run", "echo ok"], config: ".config/opencode/opencode.jsonc" },
@@ -99,6 +100,31 @@ const TARGETS = {
   mcode: { bin: "mcode", smoke: ["--version"], config: ".minimax/config.yaml" },
   pi: { bin: "pi", smoke: ["--version"], config: ".pi/agent/models.json" },
 };
+
+/** M25-S1：codex 真路径需要写 ~/.codex/config.toml（LoongPort 同形 + wire_api=responses），
+ *  让 codex 真用上上游网关的 Responses API（codex 0.162.1 起 chat wire 已被砍）。
+ *  在 codex-auth-json 注入完成后追加写 config.toml；回滚时一并删掉。 */
+function writeCodexConfigToml(home, base, model) {
+  if (!base) return null;
+  const dir = resolve(home, ".codex");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const path = resolve(dir, "config.toml");
+  let backup = null;
+  if (existsSync(path)) {
+    backup = readFileSync(path);
+  }
+  const q = (s) => JSON.stringify(s);
+  const body =
+    `model_provider = "custom"\n` +
+    (model ? `model = ${q(model)}\n` : ``) +
+    `disable_response_storage = true\n\n` +
+    `[model_providers.custom]\n` +
+    `name = "custom"\n` +
+    `base_url = ${q(base)}\n` +
+    `wire_api = "responses"\n`;
+  writeFileSync(path, body, { mode: 0o600 });
+  return { path, backup };
+}
 
 /** mock 路径用的占位密钥（sk- 形态、长度 ≥ 12；不是任何真实密钥）。 */
 const PLACEHOLDER_KEY = "sk-keyrelay-smoke-mock-0123456789abcdef";
@@ -121,6 +147,7 @@ function info(message) {
 }
 
 let backupPathRef = null;
+let codexConfigRef = null; // M25-S1：codex 真路径写出的 config.toml，回滚时要还原/删
 function cleanup(preserveBackup = false) {
   if (backupPathRef && existsSync(backupPathRef)) {
     if (preserveBackup) {
@@ -128,6 +155,18 @@ function cleanup(preserveBackup = false) {
     } else {
       rmSync(backupPathRef);
       console.log(`  已清理本次留下的备份 ${backupPathRef}`);
+    }
+  }
+  // M25-S1：codex 真路径写出的 ~/.codex/config.toml
+  if (codexConfigRef && existsSync(codexConfigRef.path)) {
+    if (preserveBackup) {
+      console.error(`  ⚠ 保留 codex config.toml（原配置可能未还原）`);
+    } else if (codexConfigRef.backup != null) {
+      writeFileSync(codexConfigRef.path, codexConfigRef.backup, { mode: 0o600 });
+      console.log(`  已还原 ~/.codex/config.toml 备份`);
+    } else {
+      rmSync(codexConfigRef.path);
+      console.log(`  已删除本次新建的 ~/.codex/config.toml`);
     }
   }
 }
@@ -236,7 +275,11 @@ console.log(`\n三连（${mode} 路径）：注入 → agent 冒烟请求 → �
 // ① 注入：CLI apply-delivery --smoke（store/backup 由 --home 派生）
 // CLI 调用不覆盖 HOME：CLI 用 --home flag 解析路径，不读 HOME；让 CLI 看到真实 $HOME，
 // --home=<temp> ≠ $HOME ⇒ --smoke 防呆放行（若覆盖 HOME=temp，--home==HOME 会误触发防呆）。
-const modelArgs = MODEL[agent] ? ["--model", MODEL[agent]] : [];
+// M25-S1：model 优先级：MODEL 表 > KEYRELAY_REAL_MODEL env；codex 真路径用它写 config.toml。
+const realModelFromEnv = process.env.KEYRELAY_REAL_MODEL ?? "";
+const modelName = MODEL[agent] ?? (realMode && realModelFromEnv ? realModelFromEnv : "");
+const modelArgs = modelName ? ["--model", modelName] : [];
+const realBaseUrl = process.env.KEYRELAY_REAL_BASE_URL ?? "";
 const inject = spawnSync(
   cli,
   ["apply-delivery", "--channel", channel, "--smoke", "--home", home, ...modelArgs],
@@ -257,6 +300,15 @@ if (!existsSync(configPath)) {
   fail(`投递报了成功，但目标文件不存在: ${configPath}`);
 }
 check("① 注入写出目标文件", true, `${statSync(configPath).size} B；journal=${journalId.slice(0, 12)}…`);
+
+// M25-S1：codex 真路径要追加写 ~/.codex/config.toml（让 codex 用 NewAPI 的 chat completions）
+if (realMode && agent === "codex") {
+  if (!realBaseUrl.startsWith("http")) {
+    fail("codex 真路径需要 KEYRELAY_REAL_BASE_URL（如 https://<relayed-upstream>/v1）");
+  }
+  codexConfigRef = writeCodexConfigToml(home, realBaseUrl, modelName);
+  info(`已写 ~/.codex/config.toml（LoongPort 同形 + wire_api=responses）`);
+}
 
 // ② 冒烟请求：真路径跑真 agent；mock 路径跑 CLI mock-agent
 let smokeOk = false;
@@ -280,6 +332,16 @@ if (realMode) {
     !looksLikeSecret(smokeOut),
     looksLikeSecret(smokeOut) ? "输出里出现 sk-/nap-/32位hex" : "干净",
   );
+  // M25-S1：codex 真路径额外断言「真模型返回结果」——输出非空 + 含可识别响应文本
+  if (agent === "codex") {
+    const trimmedOut = smokeOut.trim();
+    const hasNonEmptyBody = trimmedOut.length > 0;
+    check(
+      "② codex 真路径拿到真模型响应（输出非空）",
+      smokeOk && hasNonEmptyBody,
+      hasNonEmptyBody ? `输出 ${trimmedOut.length} 字节` : "输出为空",
+    );
+  }
 } else {
   // mock 路径：CLI mock-agent 只读解析注入产物、校验密钥字段在
   const smoke = spawnSync(cli, ["mock-agent", "--channel", channel, "--home", home], {

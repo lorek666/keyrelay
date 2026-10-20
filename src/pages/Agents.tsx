@@ -33,6 +33,7 @@ import { useTranslation, translate, getCurrentDict } from "../i18n";
  */
 const CHANNELS = [
   { id: "codex-auth-json", label: "Codex CLI（~/.codex/auth.json）", agent: "codex" },
+  { id: "codex-config", label: "Codex Config（~/.codex/config.toml）", agent: "codex-config" },
   { id: "claude-code-settings", label: "Claude Code（~/.claude/settings.json）", agent: "claude-code" },
   { id: "opencode", label: "OpenCode（~/.config/opencode/opencode.json）", agent: "opencode" },
   { id: "opencode-jsonc", label: "OpenCode JSONC（~/.config/opencode/opencode.jsonc）", agent: "opencode-jsonc" },
@@ -90,7 +91,7 @@ export default function Agents() {
   // 不支持模型名的通道：claude-desktop / cursor / dsh（配置文件不含模型字段）。
   // 这是**输入框显不显示**的界面判断，不是能力判断：要不要、缺了怎么办由后端决定并报错说明。
   // 防抖后再进查询键——每次预览都要读一次钥匙串，不该每敲一个字读一次。
-  const NO_MODEL_CHANNELS = new Set(["claude-desktop", "cursor", "dsh", "codex-auth-json"]);
+  const NO_MODEL_CHANNELS = new Set(["claude-desktop", "cursor", "dsh", "codex-auth-json", "codex-config"]);
   const needsModel = !NO_MODEL_CHANNELS.has(channel);
   // 当前通道所属的 agent（解绑按 agent 做，不是按通道）。
   // `channel` 只可能来自 `CHANNELS`（初始值与下拉都在其中），所以这里的兜底不可达；

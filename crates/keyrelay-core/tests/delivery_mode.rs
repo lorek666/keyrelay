@@ -119,18 +119,31 @@ async fn every_channel_can_point_at_the_gateway() {
         );
         // **令牌必须换掉**：产物里的密钥值应当是网关令牌（掩码末四位），而不是站点密钥。
         // 这一条是「半个开关」的探测器——`base_url` 换成网关、令牌却还是站点密钥的配置会 401。
-        assert!(
-            plan.fields.iter().any(|f| f.masked.ends_with("6789")),
-            "{} 写进去的应当是网关令牌：{:?}",
-            channel.as_str(),
-            plan.fields
-        );
-        assert!(
-            !plan.fields.iter().any(|f| f.masked.ends_with("cdef")),
-            "{} 不该写站点密钥：{:?}",
-            channel.as_str(),
-            plan.fields
-        );
+        // M25-S1：codex-config 不含密钥（sk 走 codex-auth-json 配套投递），不参与令牌断言；
+        // 但仍要验证「base_url 指向网关」——半个开关的另一边。
+        if channel == DeliveryChannel::CodexConfig {
+            assert!(
+                plan.fields
+                    .iter()
+                    .any(|f| f.key == "base_url" && f.masked.contains("127.0.0.1:8787")),
+                "{} 写进去的 base_url 应当指向网关：{:?}",
+                channel.as_str(),
+                plan.fields
+            );
+        } else {
+            assert!(
+                plan.fields.iter().any(|f| f.masked.ends_with("6789")),
+                "{} 写进去的应当是网关令牌：{:?}",
+                channel.as_str(),
+                plan.fields
+            );
+            assert!(
+                !plan.fields.iter().any(|f| f.masked.ends_with("cdef")),
+                "{} 不该写站点密钥：{:?}",
+                channel.as_str(),
+                plan.fields
+            );
+        }
 
         if channel == DeliveryChannel::CodexAuthJson || channel == DeliveryChannel::DeepSeekHarness
         {

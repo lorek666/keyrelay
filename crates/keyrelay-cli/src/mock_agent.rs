@@ -41,6 +41,10 @@ pub fn check(channel: DeliveryChannel, home: &Path) -> MockOutcome {
     }
     match channel {
         DeliveryChannel::CodexAuthJson => check_json_top_level(&text, "OPENAI_API_KEY"),
+        // M25-S1：codex-config 不含密钥（sk 仍走 auth.json），
+        // mock-agent 校验 base_url + wire_api 字段在 ⇒ 注入产物结构正确。
+        // 与 codex-auth-json 配套投递时，密钥校验由 codex-auth-json 那条负责。
+        DeliveryChannel::CodexConfig => check_codex_config_shape(&text),
         DeliveryChannel::ClaudeCodeSettings | DeliveryChannel::ClaudeDesktop => {
             check_json_nested(&text, &["env", "ANTHROPIC_AUTH_TOKEN"])
         }
@@ -162,6 +166,63 @@ fn check_yaml_ref_key(text: &str, key_name: &str) -> MockOutcome {
         }
     }
     MockOutcome::KeyMissing(format!("refs 段中缺少 {key_name}"))
+}
+
+/// M25-S1：codex-config 通道的 mock-agent 校验。
+///
+/// **不含密钥**（sk 走 `~/.codex/auth.json`，由 codex-auth-json 通道负责）。
+/// 这里只校验「注入产物结构对」：
+/// - 顶部 `model_provider = "custom"` 在；
+/// - 段 `[model_providers.custom]` 在；
+/// - 段内 `base_url = "..."` 在（非空）；
+/// - 段内 `wire_api = "responses"` 在。
+///
+/// 不解析 TOML（与 grok-build / hermes 等通道同口径，行级扫描）。
+fn check_codex_config_shape(text: &str) -> MockOutcome {
+    let mut saw_provider_top = false;
+    let mut in_provider_section = false;
+    let mut saw_base_url = false;
+    let mut saw_wire_api = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        // 进入/退出段
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_provider_section = trimmed == "[model_providers.custom]";
+            continue;
+        }
+        if in_provider_section {
+            if trimmed.starts_with("base_url") && trimmed.contains('=') {
+                let value = trimmed.split('=').nth(1).unwrap_or("").trim();
+                if value.is_empty() {
+                    return MockOutcome::KeyMissing("base_url 为空字符串".into());
+                }
+                saw_base_url = true;
+            }
+            if trimmed.starts_with("wire_api") && trimmed.contains('=') {
+                let value = trimmed.split('=').nth(1).unwrap_or("").trim();
+                if value.is_empty() {
+                    return MockOutcome::KeyMissing("wire_api 为空字符串".into());
+                }
+                saw_wire_api = true;
+            }
+        } else if trimmed.starts_with("model_provider") && trimmed.contains('=') {
+            saw_provider_top = true;
+        }
+    }
+    if !saw_provider_top {
+        return MockOutcome::KeyMissing("缺少顶部 model_provider 字段".into());
+    }
+    if !in_provider_section && !saw_base_url && !saw_wire_api {
+        // 走完都没进过段：段不在
+        return MockOutcome::KeyMissing("缺少 [model_providers.custom] 段".into());
+    }
+    if !saw_base_url {
+        return MockOutcome::KeyMissing("段内缺少 base_url 字段".into());
+    }
+    if !saw_wire_api {
+        return MockOutcome::KeyMissing("段内缺少 wire_api 字段".into());
+    }
+    MockOutcome::Ok
 }
 
 /// dotenv 行级扫描：找 `GEMINI_API_KEY=...`（允许 `export ` 前缀与引号值）。

@@ -24,7 +24,11 @@ fn list_channels_matches_all_exactly() {
     let want: Vec<&str> = DeliveryChannel::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(got, want);
     assert_eq!(got.len(), DeliveryChannel::ALL.len());
-    assert_eq!(got.len(), 19, "M14-S3 起 19 通道");
+    assert_eq!(
+        got.len(),
+        20,
+        "M14-S3 起 19 通道（M25-S1 加 codex-config 变 20）"
+    );
 }
 
 #[test]

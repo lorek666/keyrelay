@@ -183,7 +183,7 @@ fn list_channels_exits_0_and_lists_all() {
     assert_eq!(lines.len(), DeliveryChannel::ALL.len());
     assert_eq!(
         lines.len(),
-        19,
-        "M14-S3 起 19 通道（M14-S1 删 Continue/Shell + 加 6 新，M14-S2 加 6，M14-S3 加 2）"
+        20,
+        "M14-S3 起 19 通道（M25-S1 加 codex-config 变 20）"
     );
 }

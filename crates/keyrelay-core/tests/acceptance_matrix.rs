@@ -285,10 +285,19 @@ fn inject_rollback_roundtrip_is_byte_identical() {
         // 目标文件里**必须**有密钥——那就是投递的目的（`delivery_codex.rs` 的
         // `full_flow_leaves_no_secret_on_disk_or_in_logs` ⑤ 钉的是同一条）。
         // 「密钥不进……」的红线管的是**事件/日志/导出/库**，不是 agent 自己的配置。
-        assert!(
-            text.contains(SECRET),
-            "{name} 的目标文件里没有密钥：这次投递是空跑"
-        );
+        // M25-S1：codex-config 不含密钥（sk 走 codex-auth-json 配套投递），
+        // 它的目标文件验「base_url 在」而不是「密钥在」——投递目的仍是写入。
+        if channel == DeliveryChannel::CodexConfig {
+            assert!(
+                text.contains("base_url = \"") && text.contains("wire_api = \"responses\""),
+                "{name} 的目标文件里没有 base_url/wire_api：这次投递是空跑"
+            );
+        } else {
+            assert!(
+                text.contains(SECRET),
+                "{name} 的目标文件里没有密钥：这次投递是空跑"
+            );
+        }
         f.service
             .rollback_delivery(&created.journal_id)
             .unwrap_or_else(|e| panic!("{name} 回滚失败: {e}"));

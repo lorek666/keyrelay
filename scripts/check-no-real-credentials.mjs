@@ -57,6 +57,21 @@ const NEEDLES = [
   { label: "真实站点显示名", value: ["天枢", "AI"].join("") },
 ];
 
+// M25-S1 复审 P0-1：通用 `sk-` 形态禁词（真 NewAPI/Sub2API key 后缀 48 位）。
+// 上面 NEEDLES 是**具体值**字面量，抓不到「任意 `sk-` 长串」这一类泄漏（M25-S1 真机 evidence
+// 两份文件曾写过一把 48 字符真 key，作者脱敏后 NEEDLES 全过，但「通用 `sk-` 形态」当时没守）。
+// 这条单独走**形态匹配**：`sk-` 后跟 ≥ 40 字符（A–Z、a–z、0–9、`-`、`_`）才算真 key。
+// 阈值 40 的理由：实测真 key 后缀 48 位；本仓库所有占位/mock key（`sk-0123…0123…`、
+// `sk-LEAK000…`、`sk-keyrelay-smoke-mock-…`、`sk-PROBE-…`、`sk-xupstream-header-leak-…`）
+// 后缀都 ≤ 36 位 ⇒ 阈值 40 把占位全放行、把真 key 全抓。
+const SECRET_SHAPE_NEEDLES = [
+  {
+    label: "通用 sk- 长密钥形态",
+    // 形态：`sk-` + ≥40 位 base32-ish 字符（与 crate::redact 同口径，但不重复 import）
+    regex: /\bsk-[A-Za-z0-9_-]{40,}\b/,
+  },
+];
+
 function trackedBlobs() {
   // `--full-name` 让路径恒为**仓库根相对**（否则从子目录跑会带上前缀）。
   //
@@ -193,6 +208,13 @@ function main() {
       }
       hits.push({ file, label: needle.label, count });
     }
+    // M25-S1 复审 P0-1：通用 sk- 形态禁词（与 NEEDLES 同一份 hits，但走 regex）
+    for (const shape of SECRET_SHAPE_NEEDLES) {
+      const matches = text.match(shape.regex);
+      if (matches) {
+        hits.push({ file, label: shape.label, count: matches.length });
+      }
+    }
   }
 
   if (unreadable > 0) {
@@ -205,7 +227,7 @@ function main() {
   if (hits.length === 0) {
     console.log(
       `✓ 仓库里没有真实账号名/口令残留（扫了 ${scanned} 个索引里的已跟踪文件` +
-        `（共 ${entries.length} 条），${NEEDLES.length} 条禁词）`,
+        `（共 ${entries.length} 条），${NEEDLES.length} 条具体禁词 + ${SECRET_SHAPE_NEEDLES.length} 条形态禁词）`,
     );
     process.exit(0);
   }
