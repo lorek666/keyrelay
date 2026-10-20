@@ -15,8 +15,10 @@
 // 不在 WindowServer 的进程组里，JS 没真正跑起来（27 次 `ui_ready_at` 零命中、WebContent 12 秒
 // 只烧 0.06s CPU 都是这一现象的副作用，不是宿主能力的边界）。**修法**：用 `--app <KeyRelay.app>`
 // 走 `open -n` 让 LaunchServices 在用户 GUI 会话里启动新实例，env（含 `KEYRELAY_HOME`）从父
-// shell 正常传播。3 次重复：`ui_ready_at` 全部落库（1097 / 1089 / 1099 ms；M27-S1 重测另得
-// 689 / 598 / 607 / 1032 ms）。**`--binary` 模式保留**作为对比口径（与 M16-S7 同形）。
+// shell 正常传播。`--app` 模式 3 次重复：`ui_ready_at` 全部落库（623 / 687 / 881 ms；证据
+// `docs/evidence/m16s7-gui.md §16.2`）。`--binary` 模式在当前 Aqua-attached shell 下也能落库
+// （533 / 546 ms；§16.2 反向证据，证明 M16-S7 零命中是当时 shell 上下文的产物）。**`--binary`
+// 模式保留**作为对比口径（与 M16-S7 同形）。
 //
 // 用法（M27-S1 起 `--app` 与 `--binary` 二选一，必填其一）：
 //   node scripts/gui-walkthrough-macos.mjs --app <KeyRelay.app> [--runs 10] [--wait 30]
@@ -159,6 +161,8 @@ function coldStartOnce(opts, runIndex) {
   let appExitedEarly = false;
   let pidMiss = false;
   let child = null;
+  // `--app` 模式下用 pgrep diff 找本实例 pid 的闭包（P3-2：局部闭包，不挂函数对象属性）
+  let findNewPid = null;
 
   if (opts.app !== null) {
     // --- `--app` 模式（M27-S1，B-154 修法）---
@@ -175,7 +179,7 @@ function coldStartOnce(opts, runIndex) {
       appExitedEarly = true;
     } else {
       // launch 后逐 tick pgrep，diff 出新 pid（不属于 launch 前基线的）
-      const findNewPid = () => {
+      findNewPid = () => {
         const after = pgrepKeyRelay();
         for (const p of after) if (!before.has(p)) return p;
         return null;
@@ -183,11 +187,9 @@ function coldStartOnce(opts, runIndex) {
       // 先同步扫一次（多数情况 launch 后 50ms 内 pid 已可见）
       pid = findNewPid();
       if (pid === null) {
-        // 把「待 tick 内继续找」丢给主轮询；先记一个 sentinel 让上层继续走
+        // 待 tick 内继续找；先记 sentinel 让上层继续走
         pidMiss = true;
       }
-      // 把 findNewPid 暴露给主循环用闭包继续找
-      coldStartOnce._findNewPid = findNewPid;
     }
   } else {
     // --- `--binary` 模式（M16-S7 同形）---
@@ -205,14 +207,37 @@ function coldStartOnce(opts, runIndex) {
     let ui = null;
     let finished = false;
 
+    /**
+     * 杀之前先验身份（P2-2 复审建议）：`pgrep -f KeyRelay` 的基线只覆盖 launch 前已存在的
+     * 进程；launch 后若恰有无关进程的命令行含 `KeyRelay`（如 `tail -f …/KeyRelay.app/…`）
+     * 落在同一窗口，diff 会认错 pid。杀前用 `ps -p <pid> -o comm=` 验明 comm 必须是
+     * **本 `.app` 包内的可执行**（macOS 上 `comm=` 返回完整可执行路径，如
+     * `<opts.app>/Contents/MacOS/keyrelay`）；不匹配则记 `pidMiss` 不杀。
+     * `--binary` 模式下 pid 来自 `child.pid`，不需要验（child 是自己 spawn 的）。
+     */
+    const pidIdentityOk = (p) => {
+      if (p === null) return false;
+      if (opts.binary !== null) return true; // 自己 spawn 的，身份确定
+      const r = spawnSync("ps", ["-p", String(p), "-o", "comm="], { encoding: "utf8" });
+      if (r.status !== 0) return false;
+      const comm = (r.stdout || "").trim();
+      // comm 应是 <opts.app>/Contents/MacOS/<executable>；用路径前缀判断（resolve 规范化）
+      const appDir = resolve(opts.app) + "/";
+      return comm.startsWith(appDir);
+    };
+
     const finish = () => {
       if (finished) return;
       finished = true;
       clearInterval(tick);
       clearTimeout(deadline);
-      // 只杀**自己识别到的** pid（不按进程名 pkill，避免杀掉用户自己的实例）
-      if (pid !== null) {
+      // 只杀**自己识别到的且身份核对过的** pid（不按进程名 pkill，避免杀掉用户自己的实例
+      // 或同窗口出现的无关进程——P2-2）
+      if (pid !== null && pidIdentityOk(pid)) {
         try { process.kill(Number(pid), "SIGKILL"); } catch {}
+      } else if (pid !== null && opts.app !== null) {
+        // `--app` 模式下 pid 身份不匹配 ⇒ 不杀，记 pidMiss
+        pidMiss = true;
       } else if (child !== null) {
         try { child.kill("SIGKILL"); } catch {}
       }
@@ -221,8 +246,8 @@ function coldStartOnce(opts, runIndex) {
 
     const tick = setInterval(() => {
       // `--app` 模式若 pidMiss，每 tick 继续找新 pid
-      if (pid === null && opts.app !== null && typeof coldStartOnce._findNewPid === "function") {
-        const p = coldStartOnce._findNewPid();
+      if (pid === null && opts.app !== null && findNewPid !== null) {
+        const p = findNewPid();
         if (p !== null) { pid = p; pidMiss = false; }
       }
       if (pid !== null && win === null) {
