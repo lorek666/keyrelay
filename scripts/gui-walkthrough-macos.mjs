@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // M16-S7 · macOS GUI 真机走查（**AppleScript 后端**）
+// M27-S1 · 启动方式订正（**根因订正见下方「B-154」段**）
 //
 // 为什么不是 tauri-driver：tauri-driver 官方不支持 macOS（WKWebView 没有 WebDriver 后端），
 // 本机也从未安装。
@@ -9,9 +10,18 @@
 //   证不到：WebView 内部的 JS 状态、invoke 往返的字节、DOM 结构
 // 并且本机**采不到该窗口的像素**（窗口存在 ≠ 能采到它的像素）——见 spec §4 的坑清单。
 //
-// 用法：
-//   node scripts/gui-walkthrough-macos.mjs [--runs 10] [--binary <path>] [--wait 30]
-//                                          [--out <dir>] [--keep] [--fixture-port 18999]
+// **B-154（M27-S1 订正）**：M16-S7 用 `spawn(opts.binary, ...)` 直接 exec 二进制——
+// shell-spawned child **未挂到 Aqua GUI 会话**，WebContent 子进程虽然出现，但 main process
+// 不在 WindowServer 的进程组里，JS 没真正跑起来（27 次 `ui_ready_at` 零命中、WebContent 12 秒
+// 只烧 0.06s CPU 都是这一现象的副作用，不是宿主能力的边界）。**修法**：用 `--app <KeyRelay.app>`
+// 走 `open -n` 让 LaunchServices 在用户 GUI 会话里启动新实例，env（含 `KEYRELAY_HOME`）从父
+// shell 正常传播。3 次重复：`ui_ready_at` 全部落库（1097 / 1089 / 1099 ms；M27-S1 重测另得
+// 689 / 598 / 607 / 1032 ms）。**`--binary` 模式保留**作为对比口径（与 M16-S7 同形）。
+//
+// 用法（M27-S1 起 `--app` 与 `--binary` 二选一，必填其一）：
+//   node scripts/gui-walkthrough-macos.mjs --app <KeyRelay.app> [--runs 10] [--wait 30]
+//                                        [--out <dir>] [--keep] [--fixture-port 18999]
+//   node scripts/gui-walkthrough-macos.mjs --binary <path>   [同上选项]   # M16-S7 直接 spawn 路径
 //
 // **退出码语义**（M16-S7 复审 P2-4）：
 //   0 = 两条口径**都**拿到了至少一个有效样本
@@ -30,7 +40,11 @@ import { join, resolve } from "node:path";
 function parseArgs(argv) {
   const opts = {
     runs: 10,
-    binary: "/Volumes/Date/kr-t-gui/release/keyrelay",
+    // 默认 null：M27-S1 起 `--app` 与 `--binary` 二选一必填其一。
+    // 旧默认 `/Volumes/Date/kr-t-gui/release/keyrelay` 是 M16-S7 的开发机路径，
+    // 默默继续沿用会让「照文档复跑」跑到一个不存在的二进制 ⇒ 误判环境。
+    app: null,
+    binary: null,
     // 默认写到**临时目录**：旧默认 `docs/evidence` 会让「照文档复跑一次」弄脏工作树（P2-6）
     out: join(tmpdir(), "kr-m16s7-walkthrough"),
     fixturePort: 18999,
@@ -40,6 +54,7 @@ function parseArgs(argv) {
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--runs") opts.runs = Number(argv[++i]);
+    else if (a === "--app") opts.app = argv[++i];
     else if (a === "--binary") opts.binary = argv[++i];
     else if (a === "--out") opts.out = argv[++i];
     else if (a === "--wait") opts.waitSec = Number(argv[++i]);
@@ -47,14 +62,23 @@ function parseArgs(argv) {
     else if (a === "--keep") opts.keep = true;
     else if (a === "--help" || a === "-h") {
       console.log(
-        "用法: node scripts/gui-walkthrough-macos.mjs [--runs N] [--binary PATH] [--wait SEC] [--out DIR] [--keep] [--fixture-port PORT]\n" +
-          "退出码: 0 = 两条口径都有样本；1 = 任一口径 0 样本 / 前置不满足",
+        "用法: node scripts/gui-walkthrough-macos.mjs (--app <KeyRelay.app> | --binary <path>) [--runs N] [--wait SEC] [--out DIR] [--keep] [--fixture-port PORT]\n" +
+          "退出码: 0 = 两条口径都有样本；1 = 任一口径 0 样本 / 前置不满足 / 用法错误",
       );
       process.exit(0);
     } else {
       console.error(`未知参数: ${a}`);
       process.exit(1);
     }
+  }
+  // M27-S1：二选一必填
+  if (opts.app === null && opts.binary === null) {
+    console.error("用法错误：必须提供 --app <KeyRelay.app> 或 --binary <path> 之一（M27-S1 起强制）");
+    process.exit(1);
+  }
+  if (opts.app !== null && opts.binary !== null) {
+    console.error("用法错误：--app 与 --binary 二选一，不能同时提供");
+    process.exit(1);
   }
   return opts;
 }
@@ -99,10 +123,30 @@ end tell`;
 const nowMs = () => Date.now();
 
 /**
+ * **按进程名** pgrep KeyRelay pid 集合（M27-S1 新增）。
+ *
+ * 用途：`--app` 模式下 `open -n` 不直接返回 pid，需 launch 前后做 pgrep diff 找本实例 pid。
+ * 用 `pgrep -f KeyRelay`：能匹配到 .app 包内的可执行（路径含 "KeyRelay.app"）以及裸二进制
+ * （名称含 "keyrelay" 大小写敏感下不匹配，但 LaunchServices 启动后的进程名是 "KeyRelay"）。
+ * 返回 Set<string>，pgrep 失败返回空 Set（不抛错，让 diff 逻辑自己处理）。
+ */
+function pgrepKeyRelay() {
+  const r = spawnSync("pgrep", ["-f", "KeyRelay"], { encoding: "utf8" });
+  if (r.status !== 0) return new Set();
+  return new Set(r.stdout.trim().split(/\s+/).filter(Boolean));
+}
+
+/**
  * 一次冷启动：并行轮询「窗口出现」与「ui_ready_at 落库」，两条口径并列报。
  *
  * 为什么每次都要**新建临时 HOME**：`ui_ready_at` 是持久化的，复用 HOME 会让第二次之后的
  * 新口径立刻命中旧值 ⇒ 数字无意义。
+ *
+ * 启动方式（M27-S1 订正）：
+ *   `--app <KeyRelay.app>`：用 `open -n` 启动 .app 包，挂到 Aqua 会话；env 透传由父 shell
+ *     完成。`open` 不直接给 pid，需 launch 前后 pgrep diff 找本实例 pid（B-154 修法）。
+ *   `--binary <path>`：直接 spawn（与 M16-S7 同形）。本模式下若环境不带 Aqua（如非交互
+ *     harness），WebContent 不会真正跑 JS —— 这正是 B-154 的现象，保留作为对比口径。
  */
 function coldStartOnce(opts, runIndex) {
   const home = join(tmpdir(), `kr-m16s7-run-${runIndex}`);
@@ -111,32 +155,77 @@ function coldStartOnce(opts, runIndex) {
   const db = join(home, ".keyrelay", "keyrelay.db");
 
   const t0 = nowMs();
-  const app = spawn(opts.binary, [], {
-    env: { ...process.env, KEYRELAY_HOME: home },
-    stdio: ["ignore", "ignore", "ignore"],
-  });
-  const pid = app.pid;
+  let pid = null;
+  let appExitedEarly = false;
+  let pidMiss = false;
+  let child = null;
+
+  if (opts.app !== null) {
+    // --- `--app` 模式（M27-S1，B-154 修法）---
+    if (!existsSync(opts.app) || !opts.app.endsWith(".app")) {
+      console.error(`--app 路径不存在或不是 .app 包: ${opts.app}`);
+      process.exit(1);
+    }
+    const before = pgrepKeyRelay();
+    const r = spawnSync("open", ["-n", opts.app], {
+      env: { ...process.env, KEYRELAY_HOME: home },
+      encoding: "utf8",
+    });
+    if (r.status !== 0) {
+      appExitedEarly = true;
+    } else {
+      // launch 后逐 tick pgrep，diff 出新 pid（不属于 launch 前基线的）
+      const findNewPid = () => {
+        const after = pgrepKeyRelay();
+        for (const p of after) if (!before.has(p)) return p;
+        return null;
+      };
+      // 先同步扫一次（多数情况 launch 后 50ms 内 pid 已可见）
+      pid = findNewPid();
+      if (pid === null) {
+        // 把「待 tick 内继续找」丢给主轮询；先记一个 sentinel 让上层继续走
+        pidMiss = true;
+      }
+      // 把 findNewPid 暴露给主循环用闭包继续找
+      coldStartOnce._findNewPid = findNewPid;
+    }
+  } else {
+    // --- `--binary` 模式（M16-S7 同形）---
+    child = spawn(opts.binary, [], {
+      env: { ...process.env, KEYRELAY_HOME: home },
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    pid = child.pid;
+    child.on("exit", () => { appExitedEarly = true; });
+  }
 
   return new Promise((done) => {
     let win = null;
     let winInfo = null;
     let ui = null;
     let finished = false;
-    let appExitedEarly = false;
-    app.on("exit", () => { appExitedEarly = true; });
 
     const finish = () => {
       if (finished) return;
       finished = true;
       clearInterval(tick);
       clearTimeout(deadline);
-      // 只杀**自己 spawn 的** pid
-      try { app.kill("SIGKILL"); } catch {}
-      done({ win, winInfo, ui, home, pid, appExitedEarly });
+      // 只杀**自己识别到的** pid（不按进程名 pkill，避免杀掉用户自己的实例）
+      if (pid !== null) {
+        try { process.kill(Number(pid), "SIGKILL"); } catch {}
+      } else if (child !== null) {
+        try { child.kill("SIGKILL"); } catch {}
+      }
+      done({ win, winInfo, ui, home, pid, appExitedEarly, pidMiss });
     };
 
     const tick = setInterval(() => {
-      if (win === null) {
+      // `--app` 模式若 pidMiss，每 tick 继续找新 pid
+      if (pid === null && opts.app !== null && typeof coldStartOnce._findNewPid === "function") {
+        const p = coldStartOnce._findNewPid();
+        if (p !== null) { pid = p; pidMiss = false; }
+      }
+      if (pid !== null && win === null) {
         const info = windowInfoForPid(pid);
         if (info.state === "WIN") { win = nowMs() - t0; winInfo = info; }
       }
@@ -173,16 +262,21 @@ async function main() {
   const lines = [];
   const say = (s) => { console.log(s); lines.push(s); };
 
+  const mode = opts.app !== null ? "app" : "binary";
+  const target = opts.app !== null ? opts.app : opts.binary;
+  const targetExists = mode === "app" ? (existsSync(opts.app) && opts.app.endsWith(".app")) : existsSync(opts.binary);
+
   say(`# M16-S7 GUI 真机走查（AppleScript 后端）`);
   say(`时间: ${new Date().toISOString()}`);
-  say(`二进制: ${opts.binary}（存在: ${existsSync(opts.binary)}）`);
+  say(`启动模式: ${mode === "app" ? "--app（open -n .app 包，M27-S1 B-154 修法）" : "--binary（直接 spawn，M16-S7 同形）"}`);
+  say(`目标: ${target}（存在: ${targetExists}）`);
   say(`等待上限: ${opts.waitSec}s  runs: ${opts.runs}`);
 
   const proc = osa('tell application "System Events" to count processes');
   const ax = osa('tell application "System Events" to get UI elements enabled');
   say(`前置: System Events 进程数=${proc.out} UI elements enabled=${ax.out}`);
   say(`前置: tauri-driver=${spawnSync("which", ["tauri-driver"]).status === 0 ? "已装" : "未安装"}`);
-  if (!existsSync(opts.binary)) { console.error("二进制不存在"); process.exit(1); }
+  if (!targetExists) { console.error("目标不存在或不是 .app 包"); process.exit(1); }
 
   mkdirSync(opts.out, { recursive: true });
 
@@ -203,8 +297,9 @@ async function main() {
       if (r.win !== null) wins.push(r.win);
       if (r.ui !== null) uis.push(r.ui);
       say(
-        `第 ${i} 次: 窗口=${r.win ?? "—"}ms  ui_ready=${r.ui ?? "—"}ms  pid=${r.pid}` +
-          (r.appExitedEarly ? "  ⚠️ 进程提前退出" : ""),
+        `第 ${i} 次: 窗口=${r.win ?? "—"}ms  ui_ready=${r.ui ?? "—"}ms  pid=${r.pid ?? "—"}` +
+          (r.appExitedEarly ? "  ⚠️ 进程提前退出" : "") +
+          (r.pidMiss ? "  ⚠️ pgrep 未找到本实例 pid（在 wait 上限内）" : ""),
       );
       if (i === 1) say(`  窗口元数据（出现时采样）: ${JSON.stringify(r.winInfo)}`);
       if (!opts.keep) rmSync(r.home, { recursive: true, force: true });
