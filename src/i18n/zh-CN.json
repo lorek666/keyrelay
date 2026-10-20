@@ -166,6 +166,7 @@
       "login": "登录",
       "openOfficial": "打开官方页面过一次",
       "finishCaptcha": "我已过完，接上会话",
+      "finishLogin": "我已登录",
       "connecting": "接上会话中…"
     },
     "notice": {
@@ -181,7 +182,8 @@
       "fingerprint": "只会调用站点的公开状态接口做指纹识别；登录凭证不落库，只进系统钥匙串。",
       "captchaTitle": "需要人机验证：{name}",
       "captchaBody": "该站点要求人机验证。KeyRelay 不绕过验证码——请点下面的按钮打开站点官方页面，由您自己完成登录与验证；过完之后回到这里点「我已过完，接上会话」。窗口里的页面是站点自己的页面，我们不会替您点击、也不会读取页面内容。",
-      "captchaUnsupportedBody": "该站点要求人机验证，但它的会话基于访问令牌（Bearer）而非 Cookie——KeyRelay 的 WebView 兜底抓不到这种会话。请改用 API 密钥直连，或在上方表单完成登录后重试。"
+      "captchaUnsupportedBody": "该站点要求人机验证，但它的会话基于访问令牌（Bearer）而非 Cookie——KeyRelay 的 WebView 兜底抓不到这种会话。请改用 API 密钥直连，或在上方表单完成登录后重试。",
+      "captchaBearerBody": "该站点要求人机验证。请在打开的官方页面里完成登录（包括验证码）；KeyRelay 会从页面读取站点自己保存的登录凭据来接入会话——不读取页面内容、不替您点击、也不绕过验证码。登录完成后回到这里点「我已登录」。凭据不会显示在界面上，也不会写进日志。"
     },
     "list": {
       "title": "已接入（{count}）",

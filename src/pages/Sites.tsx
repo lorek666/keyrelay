@@ -17,6 +17,7 @@ import {
 } from "../lib/api";
 import ConfirmDialog from "../components/ConfirmDialog";
 import Skeleton from "../components/Skeleton";
+import { captchaPanelMode } from "../lib/captchaMode";
 import CapButton from "../components/CapButton";
 import { useTranslation, translate, getCurrentDict } from "../i18n";
 
@@ -36,6 +37,8 @@ export default function Sites() {
   const [captchaOpened, setCaptchaOpened] = useState(false);
 
   const sites = useQuery({ queryKey: ["sites"], queryFn: listSites });
+  // M28-S2 / B-191 B 路：面板三态只来自能力表（不按 kind 硬编码）。
+  const captchaMode = captchaSite ? captchaPanelMode(captchaSite.capabilities) : null;
 
   const detect = useMutation({
     mutationFn: detectSite,
@@ -193,7 +196,7 @@ export default function Sites() {
       {captchaSite ? (
         <div className="card">
           <h3>{t("sites.hint.captchaTitle", { name: captchaSite.displayName })}</h3>
-          {captchaSite.capabilities.webviewCaptchaSupported ? (
+          {captchaMode === "cookie" ? (
             <>
               <p className="muted">{t("sites.hint.captchaBody")}</p>
               <div className="row">
@@ -225,11 +228,45 @@ export default function Sites() {
                 </button>
               </div>
             </>
+          ) : captchaMode === "bearer" ? (
+            // M28-S2 / B-191 B 路：会话在响应体里（Bearer），登录页脚本把站点自己写入
+            // localStorage 的 access token 经 `keyrelay-creds://` 回传；用户**自己**完成
+            // 登录与验证码，KeyRelay 不替点、不读页面内容、不绕过验证码。
+            <>
+              <p className="muted">{t("sites.hint.captchaBearerBody")}</p>
+              <div className="row">
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={beginCaptcha.isPending}
+                  onClick={() => beginCaptcha.mutate(captchaSite.id)}
+                >
+                  {t("sites.btn.openOfficial")}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  disabled={!captchaOpened || finishCaptcha.isPending}
+                  onClick={() => finishCaptcha.mutate(captchaSite.id)}
+                >
+                  {finishCaptcha.isPending
+                    ? t("sites.btn.connecting")
+                    : t("sites.btn.finishLogin")}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  disabled={cancelCaptcha.isPending}
+                  onClick={() => cancelCaptcha.mutate(captchaSite.id)}
+                >
+                  {t("common.cancel")}
+                </button>
+              </div>
+            </>
           ) : (
-            // M26-S1 / B-191：该站点类型不支持 WebView cookie 兜底（Sub2API 走 Bearer，
-            // 不写 Set-Cookie）。替换面板：解释原因 + 仅「取消」按钮——
-            // 不渲染「打开官方页面过一次」「我已过完」，避免用户撞墙后才看到误导文案。
-            // 判据只来自 capabilities.webviewCaptchaSupported，**不按 kind 硬编码**（M7-S2 §3.3）。
+            // M26-S1 / B-191：该站点类型没有任何 WebView 兜底（两种能力位都 false）。
+            // 替换面板：解释原因 + 仅「取消」按钮——不渲染「打开官方页面过一次」「我已过完」，
+            // 避免用户撞墙后才看到误导文案。判据只来自能力表，**不按 kind 硬编码**（M7-S2 §3.3）。
             <>
               <p className="muted">{t("sites.hint.captchaUnsupportedBody")}</p>
               <div className="row">

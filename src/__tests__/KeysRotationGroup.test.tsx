@@ -60,6 +60,9 @@ const SITES: SiteRow[] = [
       balance: true,
       groups: true,
       keyUsage: false,
+      // M28-S2：两种 WebView 兜底都是 false（夹具不跑验证码面板）。
+      webviewCaptchaSupported: false,
+      webviewBearerSupported: false,
     },
   },
 ];

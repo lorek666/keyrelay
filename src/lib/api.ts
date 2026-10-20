@@ -54,6 +54,18 @@ export type SiteCapabilities = {
    * 判据**只**来自后端那张表（与 `loginField` 同形），页面里**不得**按 `kind` 硬编码。
    */
   webviewCaptchaSupported: boolean;
+  /**
+   * 该站点类型能否用「WebView localStorage → `keyrelay-creds://`」回传会话
+   * （M28-S2 / B-191 B 路，与能力表同源）。
+   *
+   * `true`（Sub2API）= 后端在官方登录页里注入脚本；用户**自己**完成登录后，站点 SPA
+   * 写入 localStorage 的 access token 经自定义 scheme 回传，后端再补 `cf_clearance`
+   * 拼成 Bearer 会话。界面据此把「不适用」面板换成「登录后点我已登录」。
+   *
+   * 与 `webviewCaptchaSupported` 是**两种不同的取数机制**，可以同时为 `false`
+   * （= 该类型没有任何 WebView 兜底）。判据只来自后端能力表，页面不得按 `kind` 硬编码。
+   */
+  webviewBearerSupported: boolean;
 };
 
 export type SiteRow = {
@@ -510,6 +522,8 @@ const MOCK_CAPS_LOGINABLE: SiteCapabilities = {
   keyUsage: true,
   // M26-S1 / B-191：NewAPI 会话可走 Set-Cookie，WebView cookie 兜底可达。
   webviewCaptchaSupported: true,
+  // M28-S2 / B-191 B 路：NewAPI 不走 localStorage 回传（cookie 已覆盖）。
+  webviewBearerSupported: false,
 };
 
 /**
@@ -527,6 +541,8 @@ const MOCK_CAPS_SUB2API: SiteCapabilities = {
   groups: true,
   keyUsage: true,
   webviewCaptchaSupported: false,
+  // M28-S2 / B-191 B 路：Sub2API 走 localStorage 回传 ⇒ 预览里能看到「登录后点我已登录」面板。
+  webviewBearerSupported: true,
 };
 
 /**
@@ -573,8 +589,9 @@ const MOCK_SITES: SiteRow[] = [
       balance: false,
       groups: false,
       keyUsage: false,
-      // M26-S1：无登录流程，fail-closed。
+      // M26-S1 / M28-S2：无登录流程，两种 WebView 兜底都 fail-closed。
       webviewCaptchaSupported: false,
+      webviewBearerSupported: false,
     },
   },
 ];
@@ -698,10 +715,14 @@ export async function captchaBegin(siteId: number): Promise<CaptchaChallenge> {
 }
 
 /**
- * 「我已过完」：后端去窗口里抓会话 cookie 并接上会话。
+ * 「我已过完」（M28-S2 起按能力位分流）：
  *
- * cookie 值**不经过前端**（从 WebView 直接进核心层）；提交前后端会先比对页面 origin，
- * 页面离开了站点域名就拒绝提交（防止把别处的 cookie 存成本站会话）。
+ * - **cookie 站点**（NewAPI）：后端去窗口里抓会话 cookie 并接上会话；
+ * - **Bearer 站点**（Sub2API）：登录凭据已由登录页脚本经 `keyrelay-creds://` 回传，
+ *   这里只补 HttpOnly 的 `cf_clearance`，由后端拼成 Bearer 会话。
+ *
+ * 两路的值都**不经过前端**（从 WebView 直接进核心层）；提交前后端都会先比对页面 origin，
+ * 页面离开了站点域名就拒绝提交（防止把别处的凭据存成本站会话）。
  */
 export async function captchaComplete(siteId: number): Promise<void> {
   if (!hasTauri) {

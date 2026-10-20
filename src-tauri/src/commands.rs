@@ -61,6 +61,13 @@ pub struct SiteCapabilitiesDto {
     /// 界面据此决定「打开官方页面过一次」面板渲染与否；后端 `captcha_complete` 据此
     /// 在 `window.cookies()` 之前直接拒绝（不调 cookies、不进 validate、不关窗）。
     webview_captcha_supported: bool,
+    /// M28-S2 / B-191 B 路：该站点类型能否用「WebView localStorage → `keyrelay-creds://`」
+    /// 回传会话（与能力表同源）。`true` 的站点（Sub2API）走注入脚本 + 导航拦截；
+    /// 界面据此把「不适用」面板换成「登录后点我已登录」。
+    ///
+    /// 与 `webview_captcha_supported` 是**两种不同的取数机制**，可以同时为 false
+    /// （= 该类型没有任何 WebView 兜底）。判据只来自能力表，页面**不得**按 `kind` 硬编码。
+    webview_bearer_supported: bool,
 }
 
 impl SiteCapabilitiesDto {
@@ -76,6 +83,7 @@ impl SiteCapabilitiesDto {
             groups: caps.groups,
             key_usage: caps.key_usage,
             webview_captcha_supported: caps.webview_captcha_supported,
+            webview_bearer_supported: caps.webview_bearer_supported,
         }
     }
 
@@ -96,6 +104,7 @@ impl SiteCapabilitiesDto {
             groups: false,
             key_usage: false,
             webview_captcha_supported: false,
+            webview_bearer_supported: false,
         }
     }
 }
@@ -2440,6 +2449,37 @@ impl From<keyrelay_core::service::UnbindOutcome> for UnbindOutcomeDto {
 
 // ============================================================== 人工过验证码（M8-S2 / FR-1:102）
 
+/// 人工验证的**取数方式**（M28-S2 / B-191 B 路；判据只来自能力表）。
+///
+/// - `Cookies`：会话走 `Set-Cookie`，`window.cookies()` 抓得到（NewAPI）；
+/// - `Bearer`：会话是响应体里的 access token，走「WebView localStorage → `keyrelay-creds://`」
+///   回传（Sub2API）；
+/// - `Unsupported`：该类型没有任何 WebView 兜底（Custom / 未知类型）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CaptchaCaptureMode {
+    Cookies,
+    Bearer,
+    Unsupported,
+}
+
+/// 能力位 → 取数方式。**cookie 优先**：两者都为 true 的站点目前不存在，但若将来出现，
+/// 抓 cookie 比注入脚本更保守（不执行任何 JS、不加 incognito）。
+///
+/// `None`（认不出的 `kind`）⇒ `Unsupported`：fail-closed，绝不猜一条取数路径。
+fn captcha_capture_mode(kind: Option<keyrelay_core::site::SiteKind>) -> CaptchaCaptureMode {
+    let Some(kind) = kind else {
+        return CaptchaCaptureMode::Unsupported;
+    };
+    let caps = keyrelay_core::site::capability::capabilities(kind);
+    if caps.webview_captcha_supported {
+        CaptchaCaptureMode::Cookies
+    } else if caps.webview_bearer_supported {
+        CaptchaCaptureMode::Bearer
+    } else {
+        CaptchaCaptureMode::Unsupported
+    }
+}
+
 /// 人机验证窗口的标签。**按站点**：同一站点的重复打开是「聚焦已有窗口」。
 fn captcha_window_label(site_id: i64) -> String {
     format!("captcha-{site_id}")
@@ -2536,15 +2576,24 @@ pub async fn captcha_begin<R: tauri::Runtime>(
         .begin_captcha(site_id)
         .map_err(|e| e.to_string())?;
 
-    // ② 站点显示名（窗口标题要能认出是哪个站；拿不到就退回站点号）
-    let display_name = state
+    // ② 站点**整行**：窗口标题用 `display_name`；Bearer 分支还要 `base_url`（算 origin、
+    //    生成注入脚本）。拿不到就退回站点号（与 HEAD 同形——`begin_captcha` 已保证站点存在）。
+    let site_row = state
         .service
         .sites()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .find(|site| site.id == site_id)
-        .map(|site| site.display_name)
+        .find(|site| site.id == site_id);
+    let display_name = site_row
+        .as_ref()
+        .map(|site| site.display_name.clone())
         .unwrap_or_else(|| format!("站点 #{site_id}"));
+    // M28-S2：取数方式只由能力表决定（不按 kind 硬编码；认不出类型 ⇒ Unsupported）。
+    let mode = captcha_capture_mode(
+        site_row
+            .as_ref()
+            .and_then(|site| keyrelay_core::site::SiteKind::parse(&site.kind)),
+    );
 
     let label = captcha_window_label(site_id);
     if let Some(existing) = app.get_webview_window(&label) {
@@ -2557,12 +2606,63 @@ pub async fn captcha_begin<R: tauri::Runtime>(
             .url
             .parse::<tauri::Url>()
             .map_err(|e| format!("人机验证页面地址无法解析: {e}"))?;
-        let window =
-            tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::External(url))
+        let mut builder =
+            tauri::WebviewWindowBuilder::new(&app, label.clone(), tauri::WebviewUrl::External(url))
                 .title(format!("人机验证 · {display_name}"))
-                .inner_size(1000.0, 760.0)
-                .build()
-                .map_err(|e| format!("打开人机验证窗口失败: {e}"))?;
+                .inner_size(1000.0, 760.0);
+
+        // M28-S2 / B-191 B 路：**只有 Bearer 站点**才加 incognito + 注入脚本 + 导航拦截。
+        // Cookies / Unsupported 分支逐项保持 HEAD（不加这三项，最终 build 参数与 HEAD 一致）。
+        if mode == CaptchaCaptureMode::Bearer {
+            let base_url = site_row
+                .as_ref()
+                .map(|site| site.base_url.clone())
+                .ok_or_else(|| format!("站点 #{site_id} 不存在"))?;
+            let script = keyrelay_core::site::webview_creds::login_script(&base_url)
+                .map_err(|e| e.to_string())?;
+            let expected_origin = keyrelay_core::site::webview_creds::site_origin(&base_url)
+                .map_err(|e| e.to_string())?;
+            let app_for_nav = app.clone();
+            let label_for_nav = label.clone();
+            builder = builder
+                // incognito：登录页的 localStorage / cookie 不落盘（B 路的凭据只该进钥匙串）。
+                .incognito(true)
+                .initialization_script(script)
+                .on_navigation(move |url| {
+                    // ① 不是回传 URL ⇒ 普通导航，放行。
+                    let Some(parsed) =
+                        keyrelay_core::site::webview_creds::parse_creds_navigation(url.as_str())
+                    else {
+                        return true;
+                    };
+                    // ② 回传只在**本站文档**下接受：先比窗口当前文档的 origin。
+                    //    页面被跳到第三方 ⇒ 拦下，什么都不存（防「在别处登录」）。
+                    let origin_ok = app_for_nav
+                        .get_webview_window(&label_for_nav)
+                        .and_then(|window| window.url().ok())
+                        .map(|current| current.origin().ascii_serialization() == expected_origin)
+                        .unwrap_or(false);
+                    if !origin_ok {
+                        return false;
+                    }
+                    match parsed {
+                        Ok(creds) => {
+                            // 成功/失败都拦下这次导航（`keyrelay-creds://` 不是可加载的页面）。
+                            // store 失败只意味着「窗口里这次登录不被接受」：不 panic、不写日志值。
+                            if let Some(state) = app_for_nav.try_state::<AppState>() {
+                                let _ = state.service.store_webview_creds(site_id, creds);
+                            }
+                            false
+                        }
+                        // 畸形回传：拦下（不把畸形 URL 当普通导航加载）。
+                        Err(_) => false,
+                    }
+                });
+        }
+
+        let window = builder
+            .build()
+            .map_err(|e| format!("打开人机验证窗口失败: {e}"))?;
 
         // 关窗 = 取消（T6）：相位回 `Idle`，不写缓存 / 钥匙串 / 事件。
         // 只监听 `CloseRequested`（用户发起的关闭）——`destroy()`（我们主动关）不触发它，
@@ -2644,15 +2744,53 @@ pub async fn captcha_complete<R: tauri::Runtime>(
     // `service.rs::kind_of` 同源——见 spec §6.1。`service.rs::kind_of` 报 Store 错，
     // 这里走 fail-closed 文案，是**刻意如此**（认不出类型 ⇒ 绝不渲染兜底面板）。
     let kind = keyrelay_core::site::SiteKind::parse(&site_row.kind);
-    let webview_captcha_supported = kind
-        .map(|k| keyrelay_core::site::capability::capabilities(k).webview_captcha_supported)
-        .unwrap_or(false); // 认不出类型 ⇒ fail-closed
-    if !webview_captcha_supported {
-        return Err(
-            "该站点类型不支持 WebView 兜底人工验证：会话基于访问令牌而非 Cookie，\
-             请改用 API 密钥直连，或在上方表单完成登录后重试。"
-                .to_string(),
-        );
+    match captcha_capture_mode(kind) {
+        // M28-S2 / B-191 B 路：Sub2API 的会话在响应体里（Bearer），`window.cookies()` 抓不到。
+        // 登录页脚本已经通过 `keyrelay-creds://` 把 access_token 交给服务层（captcha_begin 的
+        // 导航回调里 store_webview_creds）；这里只补 **HttpOnly 的 `cf_clearance`**（JS 读不到），
+        // 然后让服务层把两半拼成 Bearer 会话。
+        CaptchaCaptureMode::Bearer => {
+            // ④' 只读本站域的 cookie（别的站一律不碰），只取第一条合法 cf_clearance。
+            let host = site_host_of(&base_url)
+                .ok_or_else(|| "无法从站点地址解析出域名，本次提交被拒绝".to_string())?;
+            let cookies = window
+                .cookies()
+                .map_err(|e| format!("读取窗口 cookie 失败: {e}"))?;
+            let pairs: Vec<(String, String)> = cookies
+                .into_iter()
+                .filter(|cookie| cookie_belongs_to_site(cookie.domain().unwrap_or(""), &host))
+                .map(|cookie| (cookie.name().to_string(), cookie.value().to_string()))
+                .collect();
+            let cf_clearance = keyrelay_core::site::webview_creds::extract_cf_clearance(&pairs);
+
+            // ⑤' 与 cookie 路径同口径：读 cookie 跨了 await，提交前再查一次相位。
+            if !captcha_submit_is_allowed(&state.service.captcha_phase(site_id)) {
+                return Err(
+                    "该站点当前已不在等待人工验证（可能已被取消）：本次提交已忽略，窗口保持打开。"
+                        .to_string(),
+                );
+            }
+            state
+                .service
+                .complete_webview_login(site_id, cf_clearance)
+                .map_err(|e| e.to_string())?;
+
+            // ⑥' 成功后清掉页面里的两个续期键（尽力而为：失败不阻断——incognito + destroy
+            //     已保证页面存储不落盘），再关窗。失败时**不关窗**、相位留在人工态，可重试。
+            let _ = window.eval(keyrelay_core::site::webview_creds::strip_refresh_keys_js());
+            let _ = window.destroy();
+            return Ok(());
+        }
+        // 与 HEAD **逐字一致**：该类型没有任何 WebView 兜底。
+        CaptchaCaptureMode::Unsupported => {
+            return Err(
+                "该站点类型不支持 WebView 兜底人工验证：会话基于访问令牌而非 Cookie，\
+                 请改用 API 密钥直连，或在上方表单完成登录后重试。"
+                    .to_string(),
+            );
+        }
+        // cookie 路径：下面 ④⑤ 逐字保持 HEAD（NewAPI 行为不变）。
+        CaptchaCaptureMode::Cookies => {}
     }
 
     // ④ 抓 + 过滤（值不过 IPC）
@@ -2946,6 +3084,8 @@ mod tests {
         );
         // M26-S1 / B-191：NewAPI 会话可走 Set-Cookie，WebView cookie 兜底可达。
         assert_eq!(value["capabilities"]["webviewCaptchaSupported"], true);
+        // M28-S2 / B-191 B 路：NewAPI 不走 localStorage 回传（cookie 已覆盖）。
+        assert_eq!(value["capabilities"]["webviewBearerSupported"], false);
         // M9-S2 / B-120：登录账号栏的约定也随站点类型下发（NewAPI 是用户名）。
         assert_eq!(value["loginField"], "username");
 
@@ -2962,8 +3102,10 @@ mod tests {
         let value = to_value(&sub2api);
         assert_eq!(value["loginField"], "email");
         // M26-S1 / B-191：Sub2API 走 Bearer (JWT 在响应体)，不写 Set-Cookie，
-        // WebView 兜底架构性抓不到——UI 必须把「打开官方页面过一次」面板替换成「不适用」。
+        // WebView **cookie** 兜底架构性抓不到。
         assert_eq!(value["capabilities"]["webviewCaptchaSupported"], false);
+        // M28-S2 / B-191 B 路：但 localStorage 回传可用 ⇒ UI 渲染「登录后点我已登录」。
+        assert_eq!(value["capabilities"]["webviewBearerSupported"], true);
 
         // 认不出的站点类型 ⇒ 全部 false（fail-closed：宁可全灰，也不给点了才报错的按钮）。
         let unknown = SiteSummaryDto::from_row(keyrelay_core::service::SiteSummary {
@@ -2978,6 +3120,8 @@ mod tests {
         assert_eq!(value["capabilities"]["login"], false);
         // M26-S1 / B-191：认不出类型 ⇒ fail-closed，绝不让「打开官方页面过一次」面板渲染。
         assert_eq!(value["capabilities"]["webviewCaptchaSupported"], false);
+        // M28-S2：两种取数方式都 fail-closed（不渲染 bearer 面板）。
+        assert_eq!(value["capabilities"]["webviewBearerSupported"], false);
         // 认不出类型 ⇒ 账号约定为 `null`：界面回落到中性标签「账号」，**不猜**是用户名
         // （猜错的代价与 B-120 一样：用户按标签填，站点直接拒）。
         //
@@ -3314,6 +3458,35 @@ mod tests {
         assert_eq!(
             gateway_base_url_for(&DeliveryChannel::ClaudeDesktop, url),
             url.to_string()
+        );
+    }
+
+    /// M28-S2 / B-191 B 路：取数方式**只**由能力表决定（三臂 + `None` 臂）。
+    ///
+    /// 这四条钉住的是「壳层的分流判据」：cookie 优先、Bearer 次之、其余/未知一律
+    /// Unsupported（fail-closed，绝不猜一条取数路径）。
+    #[test]
+    fn captcha_capture_mode_follows_the_capability_table() {
+        use keyrelay_core::site::SiteKind;
+        assert_eq!(
+            captcha_capture_mode(Some(SiteKind::NewApi)),
+            CaptchaCaptureMode::Cookies,
+            "NewAPI：会话走 Set-Cookie ⇒ cookie 抓取"
+        );
+        assert_eq!(
+            captcha_capture_mode(Some(SiteKind::Sub2Api)),
+            CaptchaCaptureMode::Bearer,
+            "Sub2API：会话是响应体里的 JWT ⇒ localStorage 回传"
+        );
+        assert_eq!(
+            captcha_capture_mode(Some(SiteKind::CustomOpenAiCompatible)),
+            CaptchaCaptureMode::Unsupported,
+            "Custom：没有登录流程 ⇒ 没有任何 WebView 兜底"
+        );
+        assert_eq!(
+            captcha_capture_mode(None),
+            CaptchaCaptureMode::Unsupported,
+            "认不出的 kind ⇒ fail-closed"
         );
     }
 
