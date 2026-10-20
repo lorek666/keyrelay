@@ -43,6 +43,17 @@ export type SiteCapabilities = {
    * （`keys.quota_used` 没有写入器），所以界面**不显示**用量列（M7-S0 §3.2 裁决 / B-96）。
    */
   keyUsage: boolean;
+  /**
+   * 该站点类型能否被 **WebView cookie 抓取兜底**（M26-S1 / B-191，与能力表同源）。
+   *
+   * `true` = 会话走 `Set-Cookie`，`window.cookies()` 抓得到（NewAPI）；
+   * `false` = 会话走非 Cookie 机制（Sub2API 的 Bearer / 无登录），抓不到——
+   * 用户在 WebView 里登录成功后，`window.cookies()` 拿到空集，且 cookie-only 会话
+   * 对 Bearer 鉴权不可用。界面据此把「打开官方页面过一次」面板**替换**成「不适用」面板。
+   *
+   * 判据**只**来自后端那张表（与 `loginField` 同形），页面里**不得**按 `kind` 硬编码。
+   */
+  webviewCaptchaSupported: boolean;
 };
 
 export type SiteRow = {
@@ -497,6 +508,25 @@ const MOCK_CAPS_LOGINABLE: SiteCapabilities = {
   groups: true,
   // M14-S3：NewAPI/Sub2API 的 key_usage 从 false 改 true（list_keys 带用量）。
   keyUsage: true,
+  // M26-S1 / B-191：NewAPI 会话可走 Set-Cookie，WebView cookie 兜底可达。
+  webviewCaptchaSupported: true,
+};
+
+/**
+ * M26-S1 / B-191：Sub2API 的会话是 Authorization: Bearer（JWT 在响应体，不写 Set-Cookie），
+ * WebView cookie 兜底架构性抓不到——mock 里把这一格单独设 false，浏览器预览时能肉眼核
+ * 「打开官方页面过一次」面板是否被替换成「不适用」面板。
+ */
+const MOCK_CAPS_SUB2API: SiteCapabilities = {
+  login: true,
+  listKeys: true,
+  createKey: true,
+  revealKey: true,
+  revokeKey: true,
+  balance: true,
+  groups: true,
+  keyUsage: true,
+  webviewCaptchaSupported: false,
 };
 
 /**
@@ -525,7 +555,7 @@ const MOCK_SITES: SiteRow[] = [
     displayName: "示例 Sub2API（mock·邮箱登录）",  // i18n:skip
     health: "unknown",
     loginField: "email",
-    capabilities: MOCK_CAPS_LOGINABLE,
+    capabilities: MOCK_CAPS_SUB2API,
   },
   {
     id: 3,
@@ -543,6 +573,8 @@ const MOCK_SITES: SiteRow[] = [
       balance: false,
       groups: false,
       keyUsage: false,
+      // M26-S1：无登录流程，fail-closed。
+      webviewCaptchaSupported: false,
     },
   },
 ];

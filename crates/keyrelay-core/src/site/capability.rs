@@ -54,6 +54,27 @@ pub struct SiteCapabilities {
     /// （NewAPI 的 `id` 全是 `None`）⇒ 这把 key 从此**每次轮换都被拒**，而站点根本没改名。
     /// 这条是「站点类型的设计能力」，所以放能力表，不在 `create_key` 里按 `kind` 分支。
     pub group_ids: bool,
+    /// 该站点类型的会话机制能否被 **WebView cookie 抓取兜底**（M26-S1 / B-191）。
+    ///
+    /// **定义**：`true` = 会话凭证走 `Set-Cookie`，`window.cookies()` 能抓到；
+    /// `false` = 会话走非 Cookie 机制（Bearer / 无登录），抓不到——
+    /// 用户在 WebView 里登录成功后点「我已过完」，后端 `window.cookies()` 拿到空集，
+    /// 即便非空也只能造 cookie-only 会话，对该站点的 Bearer 鉴权不可用。
+    ///
+    /// 取值（与 `sub2api::with_auth` / `newapi::login` 的实测形态一致）：
+    /// - NewAPI：`true`（`newapi.rs:580-603` 走 `Set-Cookie` 或 `data.access_token`，
+    ///   cookie 路径在真实部署上可达；本字段只判「能否被 cookie 兜底」，不判「是否唯一路径」）。
+    /// - Sub2API：`false`（`sub2api.rs:82-83` 出 `Authorization: Bearer`，登录响应 JSON 体
+    ///   里的 `access_token` 是 JWT，**从不写 `Set-Cookie`**；SPA 把它存进 localStorage，
+    ///   `window.cookies()` 结构性拿不到）。
+    /// - `CustomOpenAiCompatible`：`false`（`login = false`，根本不进 `CaptchaRequired` 分支；
+    ///   fail-closed 同向落点）。
+    ///
+    /// **为什么放能力表**：与 `group_ids` 同形——这是「站点类型的设计能力」，不在
+    /// `captcha_complete` / `Sites.tsx` 里按 `kind` 分支（M7-S2 §3.3 红线）。
+    /// 界面据此决定「打开官方页面过一次」面板**渲染与否**；核心层据此在 `window.cookies()`
+    /// **之前**直接拒绝，不调 cookies、不进 validate、不关窗。
+    pub webview_captcha_supported: bool,
 }
 
 /// 站点类型的**设计能力**。纯函数、无 IO、无网络。
@@ -76,6 +97,11 @@ pub fn capabilities(kind: SiteKind) -> SiteCapabilities {
             // 两个站点在这一格上**不同**：Sub2API 的分组有 `int64` 主键，NewAPI 以名字为标识。
             // 写在同一个臂里会让 `keys.group_id` 存进 NewAPI 的分组名（M22-S1 复审 P1-1）。
             group_ids: matches!(kind, SiteKind::Sub2Api),
+            // M26-S1 / B-191：两个站点在「会话机制」这一格上也**不同**。
+            // NewAPI 走 `Set-Cookie`（或 access_token），cookie 兜底路径可达 ⇒ `true`。
+            // Sub2API 走 `Authorization: Bearer`（JWT 在响应体里，不写 Set-Cookie）⇒ `false`：
+            // WebView 兜底抓不到这种会话，UI 必须把「打开官方页面过一次」面板替换成「不适用」。
+            webview_captcha_supported: matches!(kind, SiteKind::NewApi),
         },
         // 只读的 OpenAI 兼容端点：只有一个 `/v1/models` 可读，没有任何令牌管理端点，
         // 也没有余额/分组概念（M7-S0 §3.2）。
@@ -90,6 +116,8 @@ pub fn capabilities(kind: SiteKind) -> SiteCapabilities {
             key_usage: false,
             // 没有分组概念，自然也没有主键。
             group_ids: false,
+            // 没有登录流程，根本不进 CaptchaRequired 分支；fail-closed 同向落点。
+            webview_captcha_supported: false,
         },
     }
 }
@@ -114,6 +142,7 @@ mod tests {
                 groups: true,
                 key_usage: true,
                 group_ids: false,
+                webview_captcha_supported: true,
             }
         );
         assert_eq!(
@@ -128,6 +157,7 @@ mod tests {
                 groups: true,
                 key_usage: true,
                 group_ids: true,
+                webview_captcha_supported: false,
             }
         );
         assert_eq!(
@@ -142,6 +172,7 @@ mod tests {
                 groups: false,
                 key_usage: false,
                 group_ids: false,
+                webview_captcha_supported: false,
             }
         );
     }
@@ -155,5 +186,28 @@ mod tests {
         ] {
             assert_eq!(capabilities(kind), capabilities(kind));
         }
+    }
+
+    /// M26-S1 / B-191：`webview_captcha_supported` 取值与站点的会话机制逐条对齐。
+    ///
+    /// 钉死契约理由，不是「按 kind 排出三个布尔」：
+    /// - NewAPI：`newapi.rs::login` 走 `Set-Cookie` 或 `data.access_token`，cookie 兜底可达 ⇒ `true`。
+    /// - Sub2API：`sub2api.rs::with_auth` 出 `Authorization: Bearer`，`access_token` 是 JWT 在响应体里，
+    ///   **从不写 `Set-Cookie`** ⇒ WebView 兜底抓不到 ⇒ `false`。
+    /// - Custom：`login = false`，不进 `CaptchaRequired` 分支 ⇒ fail-closed `false`。
+    #[test]
+    fn webview_captcha_supported_matches_session_mechanism() {
+        assert!(
+            capabilities(SiteKind::NewApi).webview_captcha_supported,
+            "NewAPI 会话可走 Set-Cookie，WebView cookie 兜底可达"
+        );
+        assert!(
+            !capabilities(SiteKind::Sub2Api).webview_captcha_supported,
+            "Sub2API 走 Bearer (JWT 在响应体)，不写 Set-Cookie，WebView 兜底架构性抓不到"
+        );
+        assert!(
+            !capabilities(SiteKind::CustomOpenAiCompatible).webview_captcha_supported,
+            "无登录流程，fail-closed"
+        );
     }
 }

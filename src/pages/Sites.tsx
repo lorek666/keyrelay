@@ -193,33 +193,57 @@ export default function Sites() {
       {captchaSite ? (
         <div className="card">
           <h3>{t("sites.hint.captchaTitle", { name: captchaSite.displayName })}</h3>
-          <p className="muted">{t("sites.hint.captchaBody")}</p>
-          <div className="row">
-            <button
-              type="button"
-              className="btn"
-              disabled={beginCaptcha.isPending}
-              onClick={() => beginCaptcha.mutate(captchaSite.id)}
-            >
-              {t("sites.btn.openOfficial")}
-            </button>
-            <button
-              type="button"
-              className="btn btn-primary"
-              disabled={!captchaOpened || finishCaptcha.isPending}
-              onClick={() => finishCaptcha.mutate(captchaSite.id)}
-            >
-              {finishCaptcha.isPending ? t("sites.btn.connecting") : t("sites.btn.finishCaptcha")}
-            </button>
-            <button
-              type="button"
-              className="btn btn-ghost"
-              disabled={cancelCaptcha.isPending}
-              onClick={() => cancelCaptcha.mutate(captchaSite.id)}
-            >
-              {t("common.cancel")}
-            </button>
-          </div>
+          {captchaSite.capabilities.webviewCaptchaSupported ? (
+            <>
+              <p className="muted">{t("sites.hint.captchaBody")}</p>
+              <div className="row">
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={beginCaptcha.isPending}
+                  onClick={() => beginCaptcha.mutate(captchaSite.id)}
+                >
+                  {t("sites.btn.openOfficial")}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  disabled={!captchaOpened || finishCaptcha.isPending}
+                  onClick={() => finishCaptcha.mutate(captchaSite.id)}
+                >
+                  {finishCaptcha.isPending
+                    ? t("sites.btn.connecting")
+                    : t("sites.btn.finishCaptcha")}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  disabled={cancelCaptcha.isPending}
+                  onClick={() => cancelCaptcha.mutate(captchaSite.id)}
+                >
+                  {t("common.cancel")}
+                </button>
+              </div>
+            </>
+          ) : (
+            // M26-S1 / B-191：该站点类型不支持 WebView cookie 兜底（Sub2API 走 Bearer，
+            // 不写 Set-Cookie）。替换面板：解释原因 + 仅「取消」按钮——
+            // 不渲染「打开官方页面过一次」「我已过完」，避免用户撞墙后才看到误导文案。
+            // 判据只来自 capabilities.webviewCaptchaSupported，**不按 kind 硬编码**（M7-S2 §3.3）。
+            <>
+              <p className="muted">{t("sites.hint.captchaUnsupportedBody")}</p>
+              <div className="row">
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  disabled={cancelCaptcha.isPending}
+                  onClick={() => cancelCaptcha.mutate(captchaSite.id)}
+                >
+                  {t("common.cancel")}
+                </button>
+              </div>
+            </>
+          )}
         </div>
       ) : null}
 

@@ -57,6 +57,10 @@ pub struct SiteCapabilitiesDto {
     balance: bool,
     groups: bool,
     key_usage: bool,
+    /// M26-S1 / B-191：该站点类型能否被 WebView cookie 抓取兜底（与能力表同源）。
+    /// 界面据此决定「打开官方页面过一次」面板渲染与否；后端 `captcha_complete` 据此
+    /// 在 `window.cookies()` 之前直接拒绝（不调 cookies、不进 validate、不关窗）。
+    webview_captcha_supported: bool,
 }
 
 impl SiteCapabilitiesDto {
@@ -71,6 +75,7 @@ impl SiteCapabilitiesDto {
             balance: caps.balance,
             groups: caps.groups,
             key_usage: caps.key_usage,
+            webview_captcha_supported: caps.webview_captcha_supported,
         }
     }
 
@@ -78,6 +83,8 @@ impl SiteCapabilitiesDto {
     ///
     /// 这是 fail-closed 的方向——界面会把按钮全灰掉，用户看到一个明确的空状态；
     /// 反过来（猜一个「什么都能做」）会给出点了才报错的按钮，而报的错还是别的原因。
+    /// M26-S1：`webview_captcha_supported` 同向落点 `false`——
+    /// 认不出类型时，绝不让「打开官方页面过一次」面板渲染出来。
     fn none() -> Self {
         Self {
             login: false,
@@ -88,6 +95,7 @@ impl SiteCapabilitiesDto {
             balance: false,
             groups: false,
             key_usage: false,
+            webview_captcha_supported: false,
         }
     }
 }
@@ -2608,19 +2616,41 @@ pub async fn captcha_complete<R: tauri::Runtime>(
         .ok_or_else(|| "人机验证窗口已关闭：请重新点「打开官方页面过一次」".to_string())?;
 
     // ③ 抓 cookie **之前**做 origin 比对（S2 §9 第 2 条）
-    let base_url = state
+    let site_row = state
         .service
         .sites()
         .map_err(|e| e.to_string())?
         .into_iter()
         .find(|site| site.id == site_id)
-        .map(|site| site.base_url)
         .ok_or_else(|| format!("站点 #{site_id} 不存在"))?;
+    let base_url = site_row.base_url.clone();
     let page_url = window.url().map_err(|e| format!("读取窗口地址失败: {e}"))?;
     if !keyrelay_core::site::captcha::origin_matches(&base_url, page_url.as_str()) {
         return Err(
             "页面已不在该站点的域名下（可能被跳转到了别处）；为避免把别处的 cookie 存进来，\
              本次提交被拒绝。请在窗口里回到该站点页面后重试。"
+                .to_string(),
+        );
+    }
+
+    // ③′ M26-S1 / B-191：WebView cookie 兜底对该站点类型不适用时，**在 `window.cookies()`
+    // 之前**直接拒绝。Sub2API 的会话是 `Authorization: Bearer`（JWT 在响应体里，不写
+    // `Set-Cookie`），`window.cookies()` 结构性拿不到，且 cookie-only 会话对 Bearer 鉴权
+    // 不可用——继续走 ④/⑤ 只会报误导文案（「没抓到 cookie」），用户其实已登录成功。
+    // 不调 cookies、不进 validate、**不关窗**（与既有「校验失败留窗」同向，留给用户看）。
+    // 错误文案不含任何 cookie 值（沿用 `captcha.rs` 红线）。
+    //
+    // `kind` 解析与 `commands.rs::SiteSummaryDto::from_row`（`:107`）同形、与
+    // `service.rs::kind_of` 同源——见 spec §6.1。`service.rs::kind_of` 报 Store 错，
+    // 这里走 fail-closed 文案，是**刻意如此**（认不出类型 ⇒ 绝不渲染兜底面板）。
+    let kind = keyrelay_core::site::SiteKind::parse(&site_row.kind);
+    let webview_captcha_supported = kind
+        .map(|k| keyrelay_core::site::capability::capabilities(k).webview_captcha_supported)
+        .unwrap_or(false); // 认不出类型 ⇒ fail-closed
+    if !webview_captcha_supported {
+        return Err(
+            "该站点类型不支持 WebView 兜底人工验证：会话基于访问令牌而非 Cookie，\
+             请改用 API 密钥直连，或在上方表单完成登录后重试。"
                 .to_string(),
         );
     }
@@ -2914,6 +2944,8 @@ mod tests {
             value["capabilities"]["keyUsage"], true,
             "M14-S3：NewAPI list_keys 带 used_quota，key_usage=true"
         );
+        // M26-S1 / B-191：NewAPI 会话可走 Set-Cookie，WebView cookie 兜底可达。
+        assert_eq!(value["capabilities"]["webviewCaptchaSupported"], true);
         // M9-S2 / B-120：登录账号栏的约定也随站点类型下发（NewAPI 是用户名）。
         assert_eq!(value["loginField"], "username");
 
@@ -2929,6 +2961,9 @@ mod tests {
         });
         let value = to_value(&sub2api);
         assert_eq!(value["loginField"], "email");
+        // M26-S1 / B-191：Sub2API 走 Bearer (JWT 在响应体)，不写 Set-Cookie，
+        // WebView 兜底架构性抓不到——UI 必须把「打开官方页面过一次」面板替换成「不适用」。
+        assert_eq!(value["capabilities"]["webviewCaptchaSupported"], false);
 
         // 认不出的站点类型 ⇒ 全部 false（fail-closed：宁可全灰，也不给点了才报错的按钮）。
         let unknown = SiteSummaryDto::from_row(keyrelay_core::service::SiteSummary {
@@ -2941,6 +2976,8 @@ mod tests {
         let value = to_value(&unknown);
         assert_eq!(value["capabilities"]["listKeys"], false);
         assert_eq!(value["capabilities"]["login"], false);
+        // M26-S1 / B-191：认不出类型 ⇒ fail-closed，绝不让「打开官方页面过一次」面板渲染。
+        assert_eq!(value["capabilities"]["webviewCaptchaSupported"], false);
         // 认不出类型 ⇒ 账号约定为 `null`：界面回落到中性标签「账号」，**不猜**是用户名
         // （猜错的代价与 B-120 一样：用户按标签填，站点直接拒）。
         //
