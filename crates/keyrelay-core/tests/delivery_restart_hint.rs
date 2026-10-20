@@ -52,7 +52,11 @@ fn tree_snapshot_detects_changes() {
 
 #[test]
 fn restart_hint_covers_every_channel() {
-    assert_eq!(DeliveryChannel::ALL.len(), 19, "M14-S3：ALL 由 17 变 19");
+    assert_eq!(
+        DeliveryChannel::ALL.len(),
+        20,
+        "M14-S3：ALL 由 17 变 19（M25-S1 加 codex-config 变 20）"
+    );
     // 穷举 match 由编译器保证「每个变体都有取值」；这里钉住「七个通道各不相同地可达」
     let mut hints: Vec<&'static str> = Vec::new();
     for channel in DeliveryChannel::ALL {
@@ -62,7 +66,7 @@ fn restart_hint_covers_every_channel() {
             RestartHint::DependsOnNewSession => "new-session",
         });
     }
-    assert_eq!(hints.len(), 19);
+    assert_eq!(hints.len(), 20);
 }
 
 #[test]

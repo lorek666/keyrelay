@@ -13,6 +13,7 @@ pub mod claude_desktop;
 pub mod cline;
 pub mod cline_desktop;
 pub mod codex_auth;
+pub mod codex_config;
 pub mod cursor;
 pub mod deepseek;
 pub mod dsh;
@@ -40,6 +41,9 @@ use crate::redact::mask_secret;
 pub enum DeliveryChannel {
     /// `~/.codex/auth.json`（本步实现）
     CodexAuthJson,
+    /// `~/.codex/config.toml` 的 `[model_providers.custom]` 段（M25-S1）。
+    /// 与 [`DeliveryChannel::CodexAuthJson`] 配套投递——同一把 sk 走两个文件。
+    CodexConfig,
     /// `~/.claude/settings.json` 的 `env` 段（M1-S3）
     ClaudeCodeSettings,
     /// `~/.config/opencode/opencode.json` 的 `provider.<id>.options`（M6-S1）
@@ -84,8 +88,9 @@ pub enum DeliveryChannel {
 }
 
 impl DeliveryChannel {
-    pub const ALL: [DeliveryChannel; 19] = [
+    pub const ALL: [DeliveryChannel; 20] = [
         DeliveryChannel::CodexAuthJson,
+        DeliveryChannel::CodexConfig,
         DeliveryChannel::ClaudeCodeSettings,
         DeliveryChannel::OpenCode,
         DeliveryChannel::GeminiCli,
@@ -109,6 +114,7 @@ impl DeliveryChannel {
     pub fn as_str(self) -> &'static str {
         match self {
             DeliveryChannel::CodexAuthJson => "codex-auth-json",
+            DeliveryChannel::CodexConfig => "codex-config",
             DeliveryChannel::ClaudeCodeSettings => "claude-code-settings",
             DeliveryChannel::OpenCode => "opencode",
             DeliveryChannel::GeminiCli => "gemini-cli",
@@ -133,6 +139,7 @@ impl DeliveryChannel {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "codex-auth-json" => Ok(DeliveryChannel::CodexAuthJson),
+            "codex-config" => Ok(DeliveryChannel::CodexConfig),
             "claude-code-settings" => Ok(DeliveryChannel::ClaudeCodeSettings),
             "opencode" => Ok(DeliveryChannel::OpenCode),
             "gemini-cli" => Ok(DeliveryChannel::GeminiCli),
@@ -169,6 +176,7 @@ impl DeliveryChannel {
     pub fn agent_id(self) -> &'static str {
         match self {
             DeliveryChannel::CodexAuthJson => "codex",
+            DeliveryChannel::CodexConfig => "codex-config",
             DeliveryChannel::ClaudeCodeSettings => "claude-code",
             DeliveryChannel::OpenCode => "opencode",
             DeliveryChannel::GeminiCli => "gemini-cli",
@@ -210,6 +218,7 @@ impl DeliveryChannel {
     pub fn relative_target(self) -> PathBuf {
         match self {
             DeliveryChannel::CodexAuthJson => PathBuf::from(".codex").join("auth.json"),
+            DeliveryChannel::CodexConfig => PathBuf::from(".codex").join("config.toml"),
             DeliveryChannel::ClaudeCodeSettings => PathBuf::from(".claude").join("settings.json"),
             DeliveryChannel::OpenCode => PathBuf::from(".config")
                 .join("opencode")
@@ -272,6 +281,7 @@ pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
         // 保守方向（M7-S3 spec §8）：多提示一次重启无害；反过来（说「改完即生效」而其实没生效）
         // 会让用户以为投递失败。
         DeliveryChannel::CodexAuthJson
+        | DeliveryChannel::CodexConfig
         | DeliveryChannel::ClaudeCodeSettings
         | DeliveryChannel::OpenCode
         | DeliveryChannel::GeminiCli
@@ -584,6 +594,11 @@ pub fn resolve_for_binding_with_meta(
 
     match channel {
         DeliveryChannel::CodexAuthJson => Ok(Box::new(codex_auth::CodexAuthWriter::new(home))),
+        DeliveryChannel::CodexConfig => Ok(Box::new(codex_config::CodexConfigWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+        ))),
         DeliveryChannel::ClaudeCodeSettings => Ok(Box::new(
             claude_code::ClaudeCodeWriter::with_model(home, base_url, model_owned.as_deref()),
         )),
@@ -1015,6 +1030,7 @@ mod tests {
             strings,
             vec![
                 "codex-auth-json",
+                "codex-config",
                 "claude-code-settings",
                 "opencode",
                 "gemini-cli",
@@ -1055,7 +1071,7 @@ mod tests {
             );
             seen.push(id);
         }
-        assert_eq!(seen.len(), 19);
+        assert_eq!(seen.len(), 20);
     }
 
     #[test]
@@ -1119,7 +1135,7 @@ mod tests {
             );
             seen.push(target);
         }
-        assert_eq!(seen.len(), 19);
+        assert_eq!(seen.len(), 20);
     }
 
     #[test]
@@ -1236,7 +1252,7 @@ mod tests {
                 channel.as_str()
             );
         }
-        assert_eq!(DeliveryChannel::ALL.len(), 19);
+        assert_eq!(DeliveryChannel::ALL.len(), 20);
     }
 
     #[test]

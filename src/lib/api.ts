@@ -853,6 +853,7 @@ export async function listChannelBindings(): Promise<ChannelBinding[]> {
  */
 const AGENT_CHANNELS: Record<string, string> = {
   codex: "codex-auth-json",
+  "codex-config": "codex-config",
   "claude-code": "claude-code-settings",
   opencode: "opencode",
   "opencode-jsonc": "opencode-jsonc",
