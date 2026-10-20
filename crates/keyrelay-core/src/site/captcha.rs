@@ -174,6 +174,7 @@ pub fn session_from_captcha_cookies(cookies: &[(String, String)]) -> Session {
         cookies: cookies.to_vec(),
         access_token: None,
         user_id: None,
+        user_agent: None,
     }
 }
 
@@ -274,7 +275,7 @@ fn split_scheme(raw: &str) -> Result<(String, &str)> {
 /// 不再手写 authority 切分。此前手写版把三类**同一台主机**判成不同 origin
 /// （`xn--…` 与 Unicode 域名、`h.example.com.`、`:0443`）⇒ 失败关闭 ⇒ 这些站点
 /// 永远提交不了验证码。判定方向仍是**失败关闭**：解析不出 ⇒ `None` ⇒ `origin_matches` 为 `false`。
-fn origin_of(raw: &str) -> Option<String> {
+pub(crate) fn origin_of(raw: &str) -> Option<String> {
     let (scheme, host, port, _) = parts_of(raw)?;
     Some(format!("{scheme}://{host}{port}"))
 }

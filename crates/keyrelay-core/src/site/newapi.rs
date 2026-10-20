@@ -602,6 +602,7 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
                     cookies,
                     access_token,
                     user_id,
+                    user_agent: None,
                 })
             }
             429 => Err(Error::RateLimited {

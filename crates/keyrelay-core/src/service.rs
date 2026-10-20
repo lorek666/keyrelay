@@ -276,6 +276,17 @@ pub struct KeychainPurgeReport {
 /// 而不是在 `src-tauri` 与前端里到处写裸字面量。
 pub const HEALTH_UNKNOWN: &str = "unknown";
 pub const HEALTH_OK: &str = "ok";
+
+/// B 路凭据槽的 TTL（M28-S1 §2.1.5）：从捕获到用户点「我已登录」。
+///
+/// 10 分钟：够用户过完人机验证 + 等页面跳转，又不至于让一份旧凭据在内存里长期驻留。
+pub const WEBVIEW_CREDS_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// B 路凭据槽里的条目（内存，不入库）。
+struct StoredWebviewCredentials {
+    creds: crate::site::webview_creds::WebviewCredentials,
+    captured_at: std::time::Instant,
+}
 pub const HEALTH_NEEDS_LOGIN: &str = "needs_login";
 
 /// 一轮刷新的结果。不含任何密钥。
@@ -712,6 +723,12 @@ pub struct KeyRelayService<T: HttpTransport + Clone + 'static> {
     /// 只放相位、不放 cookie——cookie 在 [`SessionCache`]（同样只在内存）。
     /// **不入库**：重启后回到 `Idle` 是对的（等待中的窗口本来就不存在了）。
     captcha_phases: Mutex<HashMap<i64, CaptchaPhase>>,
+    /// B 路凭据槽（M28-S1 / B-191）：按站点隔离，**只在内存**。
+    ///
+    /// 生命周期与相位一致：`cancel_captcha` / `remove_site` 清槽，登录成功后清槽；
+    /// 槽里放过期的条目由 TTL（[`WEBVIEW_CREDS_TTL`]）判「视为没有」并顺手删掉。
+    /// **不入库、不进事件、不进导出**（凭据与密钥同级）。
+    webview_creds: Mutex<HashMap<i64, StoredWebviewCredentials>>,
     /// `refresh_all` 的**跨调用互斥**（P3-27 / DEBUG-REPORT-v3 §3-27）。
     ///
     /// `MAX_REFRESH_CONCURRENCY` 只约束一次调用内部的在途数；前台节拍、后台任务与
@@ -839,6 +856,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
             revoked_refs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             gateway_token_persistent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             captcha_phases: Mutex::new(HashMap::new()),
+            webview_creds: Mutex::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
         };
         // M13-S1：启动时从钥匙串恢复持久化 session，重启免登。best-effort，不阻断启动。
@@ -1155,6 +1173,147 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         Ok(())
     }
 
+    // ============================================================== B 路凭据通道（M28-S1 / B-191）
+
+    /// 存一条 WebView 回传的凭据（B 路）。
+    ///
+    /// 只在**人工态**且站点类型支持 B 路时接受；覆盖旧值。
+    /// **不写事件、不写日志**（连「收到凭据」都不记 —— 避免侧信道）。
+    pub fn store_webview_creds(
+        &self,
+        site_id: i64,
+        creds: crate::site::webview_creds::WebviewCredentials,
+    ) -> Result<()> {
+        // 先判能力位：不支持的站点类型恒报 `Unsupported`（与 M26-S1 的「不适用」面板同口径），
+        // 不能因为「相位恰好不是人工态」就把它说成「不在等待人工验证」——那会误导用户。
+        let site = self.site(site_id)?;
+        let kind = self.kind_of(&site)?;
+        if !crate::site::capability::capabilities(kind).webview_bearer_supported {
+            return Err(Error::Unsupported(
+                "该站点类型不支持 WebView 凭据回传（B 路）".to_string(),
+            ));
+        }
+        if !matches!(
+            self.captcha_phase(site_id),
+            CaptchaPhase::AwaitingHuman { .. }
+        ) {
+            return Err(Error::AuthFailed(
+                "该站点当前不在等待人工验证：收到的凭据已忽略".to_string(),
+            ));
+        }
+        // 防御：调用方可能没校验，这里再验一次形态（错误文案不含值）。
+        crate::site::webview_creds::validate_access_token(&creds.access_token)?;
+        let mut map = self
+            .webview_creds
+            .lock()
+            .map_err(|_| Error::Store("凭据槽锁不可用".to_string()))?;
+        map.insert(
+            site_id,
+            StoredWebviewCredentials {
+                creds,
+                captured_at: std::time::Instant::now(),
+            },
+        );
+        Ok(())
+    }
+
+    /// 测试用：凭据槽里的条数（清槽路径的判据 —— 不能只断言相位）。
+    #[cfg(test)]
+    fn webview_creds_len_for_test(&self) -> usize {
+        self.webview_creds.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// 测试用：注入一个**指定捕获时刻**的凭据（TTL 用例需要，不引入时钟抽象）。
+    #[cfg(test)]
+    fn store_webview_creds_at(
+        &self,
+        site_id: i64,
+        creds: crate::site::webview_creds::WebviewCredentials,
+        captured_at: std::time::Instant,
+    ) {
+        if let Ok(mut map) = self.webview_creds.lock() {
+            map.insert(site_id, StoredWebviewCredentials { creds, captured_at });
+        }
+    }
+
+    /// 用槽里的凭据完成登录（B 路）。
+    ///
+    /// 顺序（spec §10 复审要点）：相位检查 → 槽（TTL）→ 构造会话 → `health` → 缓存 →
+    /// 钥匙串 → 相位 `Idle` → 清槽 → Info 事件（**只带 site_id**）。
+    /// 失败时槽**保留**（允许用户重试），只有 TTL 过期才清。
+    pub fn complete_webview_login(&self, site_id: i64, cf_clearance: Option<String>) -> Result<()> {
+        if !matches!(
+            self.captcha_phase(site_id),
+            CaptchaPhase::AwaitingHuman { .. }
+        ) {
+            return Err(Error::AuthFailed(
+                "该站点当前不在等待人工验证：无法完成 WebView 登录".to_string(),
+            ));
+        }
+        let stored = {
+            let mut map = self
+                .webview_creds
+                .lock()
+                .map_err(|_| Error::Store("凭据槽锁不可用".to_string()))?;
+            match map.get(&site_id) {
+                None => {
+                    return Err(Error::AuthFailed(
+                        "还没有收到 WebView 回传的凭据：请先在打开的页面里登录".to_string(),
+                    ))
+                }
+                Some(stored) if stored.captured_at.elapsed() > WEBVIEW_CREDS_TTL => {
+                    map.remove(&site_id);
+                    return Err(Error::AuthFailed(
+                        "WebView 回传的凭据已过期（超过 10 分钟），请重新打开页面登录".to_string(),
+                    ));
+                }
+                Some(stored) => stored.creds.clone(),
+            }
+        };
+
+        let mut creds = stored;
+        // cf_clearance 由壳层从 `window.cookies()` 补（HttpOnly，JS 读不到）。
+        // 非法 ⇒ 忽略（不阻断登录；没有 cf 时 Bearer 会话通常仍可用，只是过不了 CF 挑战）。
+        if let Some(cf) = cf_clearance {
+            if crate::site::webview_creds::validate_cf_clearance(&cf).is_ok() {
+                creds.cf_clearance = Some(cf);
+            }
+        }
+        let session = crate::site::webview_creds::session_from_webview_credentials(&creds)?;
+
+        // 镜像 `login` 的 B-61 顺序：先 health，再缓存，再钥匙串（best-effort）。
+        self.store.set_site_health(site_id, HEALTH_OK)?;
+        let stored_json = session.to_stored();
+        self.sessions.put(site_id, session)?;
+        if let Ok(s) = stored_json {
+            if let Err(err) = self.vault.put(&self.session_ref(site_id), &s) {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "vault",
+                    format!("持久化会话失败: {err}"),
+                    serde_json::json!({ "site_id": site_id }),
+                ));
+            }
+        }
+        self.set_captcha_phase(site_id, CaptchaPhase::Idle);
+        self.clear_webview_creds(site_id);
+        // 只带 site_id：凭据值、UA、cf_clearance 一律不进事件表。
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "site",
+            "WebView 登录凭据已接入：会话已建立",
+            serde_json::json!({ "site_id": site_id }),
+        ));
+        Ok(())
+    }
+
+    /// 清掉某站点的 B 路凭据槽（与相位同生命周期）。
+    fn clear_webview_creds(&self, site_id: i64) {
+        if let Ok(mut map) = self.webview_creds.lock() {
+            map.remove(&site_id);
+        }
+    }
+
     // ============================================================== 人工过验证码（M8-S2 / FR-1:102）
 
     /// 当前人工验证相位（缺省 `Idle`）。命令层与测试可见。
@@ -1260,6 +1419,8 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     pub fn cancel_captcha(&self, site_id: i64) {
         let next = captcha::step(self.captcha_phase(site_id), CaptchaEvent::Cancelled);
         self.set_captcha_phase(site_id, next);
+        // B 路：取消 ⇒ 丢弃已回传的凭据（与相位同生命周期，M28-S1 §2.1.5）。
+        self.clear_webview_creds(site_id);
     }
 
     pub async fn list_keys(&self, site_id: i64) -> Result<Vec<KeyMeta>> {
@@ -1445,6 +1606,7 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
     pub fn remove_site(&self, site_id: i64) -> Result<()> {
         self.sessions.invalidate(site_id);
         self.set_captcha_phase(site_id, CaptchaPhase::Idle);
+        self.clear_webview_creds(site_id);
         // 先删钥匙串持久化 session，再删 DB 行（复审 High 修正）。
         // 原顺序（先 DB 后钥匙串 best-effort）在 vault.delete 失败时留孤儿 session_ref：
         // site_id 已从 list_sites 消失，owned_secret_refs 兜不住，rowid 复用后同 id 新站
@@ -5581,6 +5743,7 @@ mod tests {
                     cookies: vec![("a".into(), "1".into())],
                     access_token: None,
                     user_id: None,
+                    user_agent: None,
                 },
             )
             .unwrap();
@@ -5715,6 +5878,7 @@ mod tests {
             cookies: vec![("session".into(), "abc".into())],
             access_token: None,
             user_id: None,
+            user_agent: None,
         };
         service
             .vault
@@ -6655,5 +6819,250 @@ mod tests {
             Some(128_000),
             "内置命中与网络无关"
         );
+    }
+
+    // ============================================================ B 路凭据通道（M28-S1）
+
+    use crate::site::webview_creds::WebviewCredentials;
+
+    /// 一个 sub2api 站点 + 已进入人工态的服务。返回 (service, site_id, vault)。
+    async fn sub2api_awaiting_human() -> (
+        KeyRelayService<MockTransport>,
+        i64,
+        Arc<crate::vault::MemoryVault>,
+        MockTransport,
+    ) {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let home = dir.keep();
+        let vault = Arc::new(crate::vault::MemoryVault::new());
+        let store = Store::open_in_memory().expect("内存库");
+        let transport = MockTransport::new(vec![
+            // newapi 的 /api/status：404 ⇒ 不匹配
+            HttpResponse::new(404, b"nope".to_vec()),
+            // sub2api 的 /api/v1/settings/public
+            HttpResponse::json(
+                200,
+                json!({"code": 0, "data": {"site_name": "示例 Sub2API"}}),
+            )
+            .expect("构造响应"),
+            // 登录：400 + 人机验证 ⇒ CaptchaRequired ⇒ 进入人工态
+            HttpResponse::json(400, json!({"code": 400, "message": "captcha required"}))
+                .expect("构造响应"),
+            // list_keys（完成登录后验证会话可用）
+            HttpResponse::json(200, json!({"code": 0, "data": {"items": [], "total": 0}}))
+                .expect("构造响应"),
+        ]);
+        let handle = transport.clone();
+        let service = KeyRelayService::new(
+            store,
+            transport,
+            ServiceConfig {
+                vault: Arc::clone(&vault) as Arc<dyn crate::vault::Vault>,
+                home: home.clone(),
+                backup_dir: home.join("backups"),
+            },
+        );
+        let site = service
+            .add_site("https://sub.example.com")
+            .await
+            .expect("加入站点");
+        assert_eq!(site.kind, "sub2api");
+        let err = service
+            .login(
+                site.id,
+                crate::site::Credentials::new("me@example.com", "pw-12345678"),
+            )
+            .await
+            .expect_err("应当要求人机验证");
+        assert!(matches!(err, Error::CaptchaRequired), "{err:?}");
+        (service, site.id, vault, handle)
+    }
+
+    fn webview_creds_fixture() -> WebviewCredentials {
+        WebviewCredentials {
+            access_token: "tok-webview-abc".to_string(),
+            user_agent: Some("UA/1.0 (WebView)".to_string()),
+            cf_clearance: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn store_and_complete_webview_login_builds_the_bearer_session() {
+        let (service, site_id, vault, handle) = sub2api_awaiting_human().await;
+        service
+            .store_webview_creds(site_id, webview_creds_fixture())
+            .expect("存凭据");
+        service
+            .complete_webview_login(site_id, Some("cf-value_1".to_string()))
+            .expect("完成登录");
+
+        // 相位回 Idle、health=ok
+        assert_eq!(service.captcha_phase(site_id), CaptchaPhase::Idle);
+        let site = service
+            .sites()
+            .expect("站点列表")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(site.health, HEALTH_OK);
+        // 钥匙串里有持久化会话
+        assert!(
+            vault
+                .get(&crate::vault::secret_ref("site", site_id, "session"))
+                .expect("读钥匙串")
+                .is_some(),
+            "会话应已持久化"
+        );
+        // 会话可用：list_keys 带出 Bearer + UA + cf_clearance
+        service.list_keys(site_id).await.expect("会话应当可用");
+        let requests = handle.requests();
+        let req = requests.last().expect("有请求");
+        let headers: Vec<(String, String)> = req.headers.clone();
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Bearer tok-webview-abc"),
+            "{headers:?}"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "User-Agent" && v == "UA/1.0 (WebView)"),
+            "UA 必须回放（cf_clearance 与 UA 绑定）：{headers:?}"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "Cookie" && v.contains("cf_clearance=cf-value_1")),
+            "{headers:?}"
+        );
+        // 槽已清：再 complete 一次 ⇒ 「还没有收到」
+        // 成功之后相位已回 Idle ⇒ 第二次调用先撞相位检查（报「不在人工态」也是对的）；
+        // 关键是**槽已经没了**：把相位重新置回人工态也拿不到旧凭据。
+        let err = service
+            .complete_webview_login(site_id, None)
+            .expect_err("槽应已清空");
+        assert!(matches!(err, Error::AuthFailed(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn store_webview_creds_requires_awaiting_human() {
+        let (service, site_id, _vault, _handle) = sub2api_awaiting_human().await;
+        // 先取消 ⇒ 回 Idle
+        service.cancel_captcha(site_id);
+        let err = service
+            .store_webview_creds(site_id, webview_creds_fixture())
+            .expect_err("非人工态必须拒绝");
+        assert!(matches!(err, Error::AuthFailed(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn store_webview_creds_rejects_unsupported_kinds() {
+        // newapi：能力位 `webview_bearer_supported = false` ⇒ `Unsupported`（与相位无关）
+        let dir = tempfile::tempdir().expect("临时目录");
+        let home = dir.keep();
+        let service = KeyRelayService::new(
+            Store::open_in_memory().expect("内存库"),
+            MockTransport::new(vec![HttpResponse::json(
+                200,
+                json!({"success": true, "data": {"system_name": "示例 NewAPI", "version": "0.8"}}),
+            )
+            .expect("构造响应")]),
+            ServiceConfig {
+                vault: Arc::new(crate::vault::MemoryVault::new()),
+                home: home.clone(),
+                backup_dir: home.join("backups"),
+            },
+        );
+        let site = service
+            .add_site("https://relay.example.com")
+            .await
+            .expect("站点");
+        assert_eq!(site.kind, "newapi");
+        let err = service
+            .store_webview_creds(site.id, webview_creds_fixture())
+            .expect_err("newapi 不支持 B 路");
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn complete_without_slot_is_auth_failed() {
+        let (service, site_id, _vault, _handle) = sub2api_awaiting_human().await;
+        let err = service
+            .complete_webview_login(site_id, None)
+            .expect_err("没有槽必须拒绝");
+        assert!(matches!(err, Error::AuthFailed(_)), "{err:?}");
+        assert!(
+            matches!(
+                service.captcha_phase(site_id),
+                CaptchaPhase::AwaitingHuman { .. }
+            ),
+            "失败时相位不变（允许重试）"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_slot_is_rejected_and_cleared() {
+        let (service, site_id, _vault, _handle) = sub2api_awaiting_human().await;
+        service.store_webview_creds_at(
+            site_id,
+            webview_creds_fixture(),
+            std::time::Instant::now() - WEBVIEW_CREDS_TTL - std::time::Duration::from_secs(1),
+        );
+        let err = service
+            .complete_webview_login(site_id, None)
+            .expect_err("TTL 过期必须拒绝");
+        assert!(err.to_string().contains("过期"), "{err}");
+        // 槽被清 ⇒ 再来一次是「还没有收到」
+        let err = service
+            .complete_webview_login(site_id, None)
+            .expect_err("槽应已清");
+        assert!(err.to_string().contains("还没有收到"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn cancel_and_remove_site_clear_the_slot() {
+        // ① cancel：槽必须真的被清。判据不是「相位回 Idle」，而是把相位**重新置成
+        //    人工态**后 `complete` 报「还没有收到」（若槽还在，就会走到构造会话那一步）。
+        let (service, site_id, _vault, _handle) = sub2api_awaiting_human().await;
+        service
+            .store_webview_creds(site_id, webview_creds_fixture())
+            .expect("存凭据");
+        assert_eq!(service.webview_creds_len_for_test(), 1);
+        service.cancel_captcha(site_id);
+        assert_eq!(service.captcha_phase(site_id), CaptchaPhase::Idle);
+        assert_eq!(service.webview_creds_len_for_test(), 0, "cancel 必须清槽");
+        // 相位重新置成人工态（测试在 mod tests 内，可直接调私有 setter）
+        service.set_captcha_phase(
+            site_id,
+            CaptchaPhase::AwaitingHuman {
+                site_id,
+                challenge: crate::site::CaptchaChallenge {
+                    site_id,
+                    url: "https://sub.example.com/login".to_string(),
+                },
+            },
+        );
+        let err = service
+            .complete_webview_login(site_id, None)
+            .expect_err("槽已清 ⇒ 必须报「还没有收到」");
+        assert!(
+            err.to_string().contains("还没有收到"),
+            "必须是「没有凭据」而不是「不在人工态」：{err}"
+        );
+
+        // ② remove_site：删站前存槽，删站后槽必须为空
+        let (service2, site2, _vault2, _handle2) = sub2api_awaiting_human().await;
+        service2
+            .store_webview_creds(site2, webview_creds_fixture())
+            .expect("存凭据");
+        assert_eq!(service2.webview_creds_len_for_test(), 1);
+        service2.remove_site(site2).expect("删站");
+        assert_eq!(
+            service2.webview_creds_len_for_test(),
+            0,
+            "remove_site 必须清槽"
+        );
+        assert_eq!(service2.captcha_phase(site2), CaptchaPhase::Idle);
     }
 }

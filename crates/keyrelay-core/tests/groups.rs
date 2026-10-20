@@ -35,6 +35,7 @@ fn cookie_session() -> Session {
         cookies: vec![("session".to_string(), "abc".to_string())],
         access_token: None,
         user_id: Some("7".to_string()),
+        user_agent: None,
     }
 }
 
@@ -43,6 +44,7 @@ fn bearer_session() -> Session {
         cookies: Vec::new(),
         access_token: Some("tok-abc".to_string()),
         user_id: Some("7".to_string()),
+        user_agent: None,
     }
 }
 
