@@ -2480,6 +2480,17 @@ fn captcha_capture_mode(kind: Option<keyrelay_core::site::SiteKind>) -> CaptchaC
     }
 }
 
+/// 导航回传的 origin 闸门（纯函数，便于单测）：当前文档 URL 必须与站点同源。
+///
+/// 两侧都走 [`keyrelay_core::site::webview_creds::site_origin`]（WHATWG 解析 +
+/// 尾点 / IDN / 默认端口归一），避免 `Url::origin()` 与 `origin_of` 口径不一致——
+/// 尾点 FQDN 的站点在 Bearer 路径会静默 fail-closed。
+fn navigation_origin_allowed(current_url: &str, expected_origin: &str) -> bool {
+    keyrelay_core::site::webview_creds::site_origin(current_url)
+        .map(|origin| origin == expected_origin)
+        .unwrap_or(false)
+}
+
 /// 人机验证窗口的标签。**按站点**：同一站点的重复打开是「聚焦已有窗口」。
 fn captcha_window_label(site_id: i64) -> String {
     format!("captcha-{site_id}")
@@ -2640,7 +2651,9 @@ pub async fn captcha_begin<R: tauri::Runtime>(
                     let origin_ok = app_for_nav
                         .get_webview_window(&label_for_nav)
                         .and_then(|window| window.url().ok())
-                        .map(|current| current.origin().ascii_serialization() == expected_origin)
+                        .map(|current| {
+                            navigation_origin_allowed(current.as_str(), &expected_origin)
+                        })
                         .unwrap_or(false);
                     if !origin_ok {
                         return false;
@@ -3488,6 +3501,32 @@ mod tests {
             CaptchaCaptureMode::Unsupported,
             "认不出的 kind ⇒ fail-closed"
         );
+    }
+
+    /// M28-S2 复审 P2-1 / P3-2：origin 闸门必须是**可单测的纯函数**，且两侧口径同源
+    /// （`site_origin` 会剥尾点 / IDN→punycode / 默认端口归一；`Url::origin()` 不会）。
+    #[test]
+    fn navigation_origin_gate_accepts_only_the_site_origin() {
+        let expected = "https://sub.example.com";
+        assert!(navigation_origin_allowed(
+            "https://sub.example.com/login",
+            expected
+        ));
+        assert!(
+            navigation_origin_allowed("https://SUB.example.com./login", expected),
+            "尾点 FQDN + 大小写必须按同一 origin 处理（P3-2）"
+        );
+        assert!(!navigation_origin_allowed(
+            "https://evil.example.com/login",
+            expected
+        ));
+        assert!(!navigation_origin_allowed(
+            "https://sub.example.com.evil.example/login",
+            expected
+        ));
+        assert!(!navigation_origin_allowed("about:blank", expected));
+        assert!(!navigation_origin_allowed("data:text/html,x", expected));
+        assert!(!navigation_origin_allowed("not a url", expected));
     }
 
     #[test]

@@ -231,7 +231,7 @@ export default function Sites() {
           ) : captchaMode === "bearer" ? (
             // M28-S2 / B-191 B 路：会话在响应体里（Bearer），登录页脚本把站点自己写入
             // localStorage 的 access token 经 `keyrelay-creds://` 回传；用户**自己**完成
-            // 登录与验证码，KeyRelay 不替点、不读页面内容、不绕过验证码。
+            // 登录与验证码，KeyRelay 不替点、不读页面正文/输入框、不绕过验证码。
             <>
               <p className="muted">{t("sites.hint.captchaBearerBody")}</p>
               <div className="row">

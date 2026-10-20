@@ -183,7 +183,7 @@
       "captchaTitle": "Captcha required: {name}",
       "captchaBody": "This site requires a captcha. KeyRelay does not bypass captchas—click the button below to open the site's official page and complete the login and captcha yourself; then come back and click \"Done, attach session\". The page in the window is the site's own; we won't click or read it for you.",
       "captchaUnsupportedBody": "This site requires a captcha, but its session uses a bearer access token rather than a cookie—KeyRelay's WebView fallback cannot capture such a session. Please connect via API key directly, or retry the login form above.",
-      "captchaBearerBody": "This site requires a captcha. Complete the login (including the captcha) in the official page that opens; KeyRelay reads the login credential the site itself saved in the page to attach the session—it does not read page content, does not click for you, and does not bypass captchas. When you are done, come back and click \"I've signed in\". The credential is never shown in the UI and never written to logs."
+      "captchaBearerBody": "This site requires a captcha. Complete the login (including the captcha) in the official page that opens; KeyRelay reads the login credential the site itself saved in order to attach the session—it reads only that credential store, not page text or form inputs, does not click for you, and does not bypass captchas. When you are done, come back and click \"I've signed in\". The credential is never shown in the UI and never written to logs."
     },
     "list": {
       "title": "Added ({count})",
