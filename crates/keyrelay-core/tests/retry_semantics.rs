@@ -61,6 +61,7 @@ fn cookie_session() -> Session {
         cookies: vec![("session".to_string(), "abc".to_string())],
         access_token: None,
         user_id: Some("7".to_string()),
+        user_agent: None,
     }
 }
 
@@ -164,6 +165,7 @@ async fn sub2api_create_key_keeps_retrying_because_of_the_idempotency_key() {
                 cookies: Vec::new(),
                 access_token: Some("tok".to_string()),
                 user_id: Some("7".to_string()),
+                user_agent: None,
             },
             KeySpec::named("codex/daily"),
         )

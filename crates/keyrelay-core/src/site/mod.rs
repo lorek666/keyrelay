@@ -11,6 +11,7 @@ pub mod retry;
 pub mod sub2api;
 pub mod transport;
 pub mod transport_reqwest;
+pub mod webview_creds;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -170,6 +171,12 @@ pub struct Session {
     pub cookies: Vec<(String, String)>,
     pub access_token: Option<String>,
     pub user_id: Option<String>,
+    /// WebView 登录页回传的 UA（`cf_clearance` 与 UA 绑定，Cloudflare 机制）。
+    ///
+    /// 旧持久化数据（M13-S1 的钥匙串 JSON）**没有**该字段 ⇒ `serde(default)` ⇒ `None`，
+    /// 行为与加字段前逐字一致（M28-S1 §2.1.3）。
+    #[serde(default)]
+    pub user_agent: Option<String>,
 }
 
 impl std::fmt::Debug for Session {
@@ -181,6 +188,8 @@ impl std::fmt::Debug for Session {
                 &self.access_token.as_ref().map(|_| "<已设置>"),
             )
             .field("user_id", &self.user_id)
+            // M28-S1：UA 不是凭据，但它与 cf_clearance 绑定 —— 与 token 同纪律，只报有没有。
+            .field("user_agent", &self.user_agent.as_ref().map(|_| "<已设置>"))
             .finish()
     }
 }
@@ -807,6 +816,7 @@ mod tests {
             cookies: vec![("session".into(), "supersecret".into())],
             access_token: Some("deadbeef".into()),
             user_id: Some("7".into()),
+            user_agent: None,
         };
         let text = format!("{s:?}");
         assert!(!text.contains("supersecret"));
@@ -1203,6 +1213,7 @@ mod tests {
                 cookies: Vec::new(),
                 access_token: Some("tok-probe".to_string()),
                 user_id: Some("7".to_string()),
+                user_agent: None,
             }
         }
 
@@ -1397,6 +1408,7 @@ mod tests {
             ],
             access_token: Some("tok-xyz".into()),
             user_id: Some("7".into()),
+            user_agent: None,
         };
         let stored = session.to_stored().expect("序列化");
         let back = Session::from_stored(&stored).expect("反序列化");
@@ -1410,6 +1422,46 @@ mod tests {
         assert!(Session::from_stored("").is_err());
     }
 
+    /// M28-S1 / B-191：**旧钥匙串 JSON（没有 `user_agent` 字段）必须仍能读**。
+    ///
+    /// M13-S1 起会话是 `Session::to_stored()` 的 JSON 存进钥匙串；M28-S1 加字段时如果没
+    /// `serde(default)`，所有老用户的持久化会话都会反序列化失败 ⇒ 静默掉登录。
+    #[test]
+    fn session_from_stored_accepts_old_json_without_user_agent() {
+        let old = r#"{"cookies":[["session","abc"]],"access_token":"tok","user_id":"7"}"#;
+        let session = Session::from_stored(old).expect("旧 JSON 必须可读");
+        assert_eq!(session.user_agent, None, "缺字段 ⇒ None");
+        assert_eq!(session.access_token.as_deref(), Some("tok"));
+        assert_eq!(session.cookies.len(), 1);
+    }
+
+    /// 往返：三个既有字段 + 新的 `user_agent` 都要保住。
+    #[test]
+    fn session_round_trips_with_user_agent() {
+        let session = Session {
+            cookies: vec![("cf_clearance".into(), "cf-1".into())],
+            access_token: Some("tok".into()),
+            user_id: Some("7".into()),
+            user_agent: Some("UA/1.0".into()),
+        };
+        let back = Session::from_stored(&session.to_stored().expect("序列化")).expect("反序列化");
+        assert_eq!(back, session);
+    }
+
+    /// UA 与 token 同纪律：`Debug` 只报「有没有」，不打印值。
+    #[test]
+    fn session_debug_hides_user_agent_value() {
+        let session = Session {
+            cookies: Vec::new(),
+            access_token: None,
+            user_id: None,
+            user_agent: Some("SECRET-UA-VALUE".into()),
+        };
+        let text = format!("{session:?}");
+        assert!(!text.contains("SECRET-UA-VALUE"), "{text}");
+        assert!(text.contains("<已设置>"), "{text}");
+    }
+
     #[test]
     fn session_to_stored_carries_secrets_debug_does_not() {
         // 结构性钉子：to_stored 的输出含明文 cookie/token（给钥匙串），但 Debug 不含。
@@ -1418,6 +1470,7 @@ mod tests {
             cookies: vec![("session".into(), "SECRET-COOKIE".into())],
             access_token: Some("SECRET-TOKEN".into()),
             user_id: None,
+            user_agent: None,
         };
         let stored = session.to_stored().unwrap();
         assert!(

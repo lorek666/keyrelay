@@ -74,7 +74,20 @@ pub struct SiteCapabilities {
     /// `captcha_complete` / `Sites.tsx` 里按 `kind` 分支（M7-S2 §3.3 红线）。
     /// 界面据此决定「打开官方页面过一次」面板**渲染与否**；核心层据此在 `window.cookies()`
     /// **之前**直接拒绝，不调 cookies、不进 validate、不关窗。
+    ///
+    /// **M28-S1 / B-191 B 路起**：本字段只描述 **cookie 抓取**这一种兜底。Sub2API 的
+    /// `false` **不再等价于**「UI 必须显示不适用」——还要看 [`Self::webview_bearer_supported`]。
     pub webview_captcha_supported: bool,
+    /// 本产品今天是否支持用「WebView 页面 localStorage → `keyrelay-creds://`」拿会话（M28-S1 / B-191）。
+    ///
+    /// - Sub2API：`true`（SPA 把 `auth_token` 写进 localStorage，是唯一需要这条路的类型）。
+    /// - NewAPI：`false`（cookie 兜底已覆盖，**不**同时开两条取数路径）。
+    /// - `CustomOpenAiCompatible`：`false`（没有登录流程）。
+    ///
+    /// 与 `webview_captcha_supported` 是**两种不同的取数机制**，不是同一格的两种写法：
+    /// 前者抓 `window.cookies()`（HttpOnly，JS 读不到），后者读页面 localStorage（JS 可读）
+    /// 并回传 `keyrelay-creds://`。两者可以同时为 `false`（= 该类型没有任何 WebView 兜底）。
+    pub webview_bearer_supported: bool,
 }
 
 /// 站点类型的**设计能力**。纯函数、无 IO、无网络。
@@ -102,6 +115,9 @@ pub fn capabilities(kind: SiteKind) -> SiteCapabilities {
             // Sub2API 走 `Authorization: Bearer`（JWT 在响应体里，不写 Set-Cookie）⇒ `false`：
             // WebView 兜底抓不到这种会话，UI 必须把「打开官方页面过一次」面板替换成「不适用」。
             webview_captcha_supported: matches!(kind, SiteKind::NewApi),
+            // M28-S1 / B-191：B 路（localStorage → keyrelay-creds://）只有 Sub2API 需要。
+            // NewAPI 的 cookie 兜底已覆盖，不同时开两条取数路径；Custom 没有登录流程。
+            webview_bearer_supported: matches!(kind, SiteKind::Sub2Api),
         },
         // 只读的 OpenAI 兼容端点：只有一个 `/v1/models` 可读，没有任何令牌管理端点，
         // 也没有余额/分组概念（M7-S0 §3.2）。
@@ -118,6 +134,7 @@ pub fn capabilities(kind: SiteKind) -> SiteCapabilities {
             group_ids: false,
             // 没有登录流程，根本不进 CaptchaRequired 分支；fail-closed 同向落点。
             webview_captcha_supported: false,
+            webview_bearer_supported: false,
         },
     }
 }
@@ -143,6 +160,7 @@ mod tests {
                 key_usage: true,
                 group_ids: false,
                 webview_captcha_supported: true,
+                webview_bearer_supported: false,
             }
         );
         assert_eq!(
@@ -158,6 +176,7 @@ mod tests {
                 key_usage: true,
                 group_ids: true,
                 webview_captcha_supported: false,
+                webview_bearer_supported: true,
             }
         );
         assert_eq!(
@@ -173,6 +192,7 @@ mod tests {
                 key_usage: false,
                 group_ids: false,
                 webview_captcha_supported: false,
+                webview_bearer_supported: false,
             }
         );
     }
@@ -209,5 +229,32 @@ mod tests {
             !capabilities(SiteKind::CustomOpenAiCompatible).webview_captcha_supported,
             "无登录流程，fail-closed"
         );
+    }
+
+    /// M28-S1 / B-191：`webview_bearer_supported` 的取值与「哪种会话机制需要 B 路」逐条对齐。
+    ///
+    /// 钉死**契约理由**，不是按 kind 排三个布尔：
+    /// - Sub2API：SPA 把 `auth_token` 写进 localStorage（`stores/auth.ts:11`），cookie 抓不到 ⇒ 只有它能走 B 路 ⇒ `true`。
+    /// - NewAPI：`Set-Cookie` 已被 cookie 兜底覆盖，不同时开两条取数路径 ⇒ `false`。
+    /// - Custom：`login = false`，没有登录流程 ⇒ fail-closed `false`。
+    #[test]
+    fn webview_bearer_supported_is_only_for_sub2api() {
+        assert!(
+            capabilities(SiteKind::Sub2Api).webview_bearer_supported,
+            "Sub2API 的 auth_token 在 localStorage，B 路是唯一可达路径"
+        );
+        assert!(
+            !capabilities(SiteKind::NewApi).webview_bearer_supported,
+            "NewAPI 已有 cookie 兜底，不同时开两条取数路径"
+        );
+        assert!(
+            !capabilities(SiteKind::CustomOpenAiCompatible).webview_bearer_supported,
+            "无登录流程，fail-closed"
+        );
+        // 两种机制可以同时为 false；Sub2API 是「cookie 假 / B 路真」，NewAPI 是「cookie 真 / B 路假」。
+        let sub = capabilities(SiteKind::Sub2Api);
+        let new = capabilities(SiteKind::NewApi);
+        assert!(!sub.webview_captcha_supported && sub.webview_bearer_supported);
+        assert!(new.webview_captcha_supported && !new.webview_bearer_supported);
     }
 }

@@ -82,6 +82,11 @@ impl<T: HttpTransport> Sub2Api<T> {
         if let Some(token) = &session.access_token {
             headers.push(("Authorization".to_string(), format!("Bearer {token}")));
         }
+        // M28-S1 / B-191：`cf_clearance` 与 UA 绑定（Cloudflare 机制）——不一同回放等于白拿。
+        // `None` 时**不加**这个头：与加字段前逐字一致（老会话 / 密码登录路径不受影响）。
+        if let Some(ua) = &session.user_agent {
+            headers.push(("User-Agent".to_string(), ua.clone()));
+        }
         if !session.cookies.is_empty() {
             let cookie = session
                 .cookies
@@ -937,6 +942,7 @@ fn session_from(data: &Value) -> Result<Session> {
         cookies: Vec::new(),
         access_token: Some(access_token),
         user_id,
+        user_agent: None,
     })
 }
 

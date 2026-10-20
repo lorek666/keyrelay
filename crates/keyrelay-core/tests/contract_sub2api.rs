@@ -25,6 +25,7 @@ fn session() -> Session {
         cookies: Vec::new(),
         access_token: Some("tok-abc".to_string()),
         user_id: Some("7".to_string()),
+        user_agent: None,
     }
 }
 
@@ -608,5 +609,42 @@ async fn balance_missing_field_is_an_error() {
     assert!(
         matches!(err, Error::Transport(ref m) if m.contains("balance")),
         "{err:?}"
+    );
+}
+
+// ============================================================ M28-S1：UA 回放（B 路会话）
+
+#[tokio::test]
+async fn list_keys_replays_user_agent_when_session_has_one() {
+    let transport = MockTransport::new(vec![ok(json!({"items": [], "total": 0}))]);
+    let adapter = Sub2Api::new(transport.clone());
+    let mut s = session();
+    s.user_agent = Some("UA/1.0 (WebView)".to_string());
+    adapter.list_keys(BASE, &s).await.expect("list_keys");
+
+    let requests = transport.requests();
+    let headers = &requests[0].headers;
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k == "User-Agent" && v == "UA/1.0 (WebView)"),
+        "B 路会话必须回放 UA（cf_clearance 与 UA 绑定）：{headers:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_keys_omits_user_agent_when_session_has_none() {
+    let transport = MockTransport::new(vec![ok(json!({"items": [], "total": 0}))]);
+    let adapter = Sub2Api::new(transport.clone());
+    adapter
+        .list_keys(BASE, &session())
+        .await
+        .expect("list_keys");
+
+    let requests = transport.requests();
+    let headers = &requests[0].headers;
+    assert!(
+        !headers.iter().any(|(k, _)| k == "User-Agent"),
+        "没有 UA 时不得凭空加头（与加字段前逐字一致）：{headers:?}"
     );
 }

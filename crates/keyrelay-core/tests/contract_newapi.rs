@@ -13,6 +13,7 @@ fn session() -> Session {
         cookies: vec![("session".into(), "abc123".into())],
         access_token: None,
         user_id: Some("7".into()),
+        user_agent: None,
     }
 }
 
@@ -494,6 +495,7 @@ async fn create_key_sends_bearer_when_session_has_access_token() {
         cookies: vec![],
         access_token: Some("pat-abcdefghijklmnop".into()),
         user_id: None,
+        user_agent: None,
     };
 
     adapter

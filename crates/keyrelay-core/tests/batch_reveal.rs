@@ -42,6 +42,7 @@ fn session() -> Session {
         cookies: Vec::new(),
         access_token: Some("tok-abc".to_string()),
         user_id: Some("7".to_string()),
+        user_agent: None,
     }
 }
 
