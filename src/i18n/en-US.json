@@ -180,7 +180,8 @@
     "hint": {
       "fingerprint": "Only the site's public status endpoint is called for fingerprinting; credentials are never persisted, only stored in the system keychain.",
       "captchaTitle": "Captcha required: {name}",
-      "captchaBody": "This site requires a captcha. KeyRelay does not bypass captchas—click the button below to open the site's official page and complete the login and captcha yourself; then come back and click \"Done, attach session\". The page in the window is the site's own; we won't click or read it for you."
+      "captchaBody": "This site requires a captcha. KeyRelay does not bypass captchas—click the button below to open the site's official page and complete the login and captcha yourself; then come back and click \"Done, attach session\". The page in the window is the site's own; we won't click or read it for you.",
+      "captchaUnsupportedBody": "This site requires a captcha, but its session uses a bearer access token rather than a cookie—KeyRelay's WebView fallback cannot capture such a session. Please connect via API key directly, or retry the login form above."
     },
     "list": {
       "title": "Added ({count})",
