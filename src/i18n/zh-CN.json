@@ -32,7 +32,69 @@
     "agents": "Agent 投递",
     "history": "变更历史",
     "settings": "设置",
-    "probe": "模型检测"
+    "probe": "模型检测",
+    "usage": "用量"
+  },
+  "usage": {
+    "rangeLabel": "统计范围",
+    "range": {
+      "d7": "近 7 天",
+      "d30": "近 30 天",
+      "d90": "近 90 天"
+    },
+    "siteFilter": "站点",
+    "allSites": "全部站点",
+    "scopeHint": "Token 只统计经 KeyRelay 本地网关转发的请求（agent 直连站点的不在此列）；余额来自每轮刷新写入的快照。",
+    "siteFallback": "站点 {id}",
+    "unknownModel": "未知模型",
+    "loading": "加载中…",
+    "error": "读取用量失败：{error}",
+    "empty": "所选范围内还没有用量数据。网关转发过请求、或手动「刷新全部」拉过余额后，这里就会出现内容。",
+    "cards": {
+      "tokens": "Token 总量",
+      "requests": "请求数",
+      "sites": "活跃站点",
+      "models": "活跃模型"
+    },
+    "trend": {
+      "title": "Token 趋势（按天）",
+      "empty": "所选范围内没有网关流量。"
+    },
+    "balance": {
+      "title": "站点余额趋势",
+      "currency": "{currency} 余额",
+      "empty": "所选范围内没有余额快照。在设置里开启定时刷新，或手动「刷新全部」后会出现。",
+      "note": "每个站点每天取最后一条快照；不同币种分图，不混算。"
+    },
+    "sites": {
+      "title": "站点汇总",
+      "empty": "所选范围内没有网关流量。",
+      "colSite": "站点",
+      "colRequests": "请求",
+      "colPrompt": "输入 tokens",
+      "colCompletion": "输出 tokens",
+      "colTotal": "总量",
+      "colShare": "占比",
+      "colKeyUsage": "每密钥用量",
+      "keyUsageYes": "可观测",
+      "keyUsageNo": "不提供"
+    },
+    "models": {
+      "title": "模型分布",
+      "empty": "所选范围内没有网关流量。"
+    },
+    "keys": {
+      "title": "按密钥（近 {days} 天）",
+      "note": "数据来自 Sub2API 的每日采样；NewAPI 只有累计额度、没有日趋势端点。",
+      "noCapability": "所有站点都不提供每密钥用量（能力位 keyUsage = false）。",
+      "empty": "所选范围内还没有每密钥用量采样。",
+      "partial": "{sites} 不提供每密钥用量，未计入本表。",
+      "colSite": "站点",
+      "colKey": "密钥",
+      "colRequests": "请求",
+      "colTokens": "tokens",
+      "colCost": "费用"
+    }
   },
   "probe": {
     "target": "检测目标",
