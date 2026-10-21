@@ -933,9 +933,11 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         Ok(())
     }
 
-    /// 会话过期信息（B-121）：JWT `exp` ⇒ 精确；无 JWT（NewAPI 走 Cookie）⇒ `None`。
+    /// 会话过期信息（B-121）：JWT `exp` ⇒ 精确；无 JWT（旧版 NewAPI 的 cookie-only 会话）⇒ `None`。
     ///
-    /// **不实现 refresh**：过期只用于**展示**与「不再恢复」的判断；续期一律走重新登录。
+    /// **NewAPI 新版（M29-S1）**：带 `new_api_refresh` 的会话由
+    /// `refresh_sessions_if_needed` 在 `exp` 临近时自动续期；续期失败才回到重新登录。
+    /// 其余站点类型仍以重新登录为唯一续期手段。
     pub fn session_expiry(&self, site_id: i64) -> Option<SessionExpiry> {
         let token = self.sessions.get(site_id)?.access_token?;
         let expires_at = jwt_exp(&token)?;
