@@ -172,13 +172,80 @@ pub async fn detect_only(base_url: &str, proxy: Option<String>) -> Result<SiteFi
 }
 
 fn state_from_store(store: Store, db_path: PathBuf, db_error: Option<String>) -> AppState {
-    state_with_config(
-        store,
-        db_path,
-        db_error,
-        ServiceConfig::production(home_dir()),
-        OnlineModelMeta::Enabled,
-    )
+    let home = home_dir();
+    let config = build_service_config(home, &store);
+    state_with_config(store, db_path, db_error, config, OnlineModelMeta::Enabled)
+}
+
+/// 生产保险库装配 + 一次性钥匙串迁移（ADR-0003 / M33-S1）。
+///
+/// 顺序不能反：**先**迁移、**再**把 vault 交给 service——迁移要用 store 的引用索引，
+/// 而 store 一旦 move 进 `KeyRelayService` 就拿不到了。
+fn build_service_config(home: PathBuf, store: &Store) -> ServiceConfig {
+    let (vault_db, key_file) = keyrelay_core::vault::local::default_paths(&home);
+    match keyrelay_core::vault::LocalVault::open(&vault_db, &key_file) {
+        Ok(vault) => {
+            run_keychain_migration(&vault, store);
+            ServiceConfig::with_vault(std::sync::Arc::new(vault), home)
+        }
+        Err(err) => {
+            // 不静默：vaultBackend 会变成 "memory"，Overview 页有红色告警。
+            eprintln!(
+                "[keyrelay] 本地保险库不可用（{}），密钥将只存在内存里: {err}",
+                vault_db.display()
+            );
+            ServiceConfig::in_memory(home)
+        }
+    }
+}
+
+/// 把钥匙串里的旧条目搬进加密库，校验一致后删除旧条目。
+///
+/// 只在真机启动路径上跑：钥匙串不可用（用户拒绝、平台不支持）就整体跳过，
+/// 下一次启动再试——**不会**因为迁移失败而阻止 App 启动。
+fn run_keychain_migration(vault: &keyrelay_core::vault::LocalVault, store: &Store) {
+    use keyrelay_core::vault::{migrate_once, KeychainVault, Vault, MIGRATION_MARKER};
+
+    match vault.meta_get(MIGRATION_MARKER) {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("[keyrelay] 读迁移标记失败，跳过迁移: {err}");
+            return;
+        }
+    }
+
+    let refs = match store.all_secret_refs() {
+        Ok(refs) => refs,
+        Err(err) => {
+            eprintln!("[keyrelay] 枚举密钥引用失败，跳过迁移: {err}");
+            return;
+        }
+    };
+
+    let keychain = KeychainVault::new();
+    if let Err(err) = keychain.probe() {
+        eprintln!("[keyrelay] 系统钥匙串不可用，跳过一次性迁移: {err}");
+        return;
+    }
+
+    match migrate_once(&keychain, vault, refs) {
+        Ok(outcome) if !outcome.already_done => {
+            let report = outcome.report;
+            eprintln!(
+                "[keyrelay] 钥匙串迁移：导入 {} 条，跳过 {} 条，失败 {} 条",
+                report.imported,
+                report.skipped,
+                report.failed.len()
+            );
+            for (reference, reason) in report.failed {
+                // 引用不是密钥，可以打；原因由我们自建，也不含密钥材料。
+                eprintln!("[keyrelay] 迁移失败 {reference}: {reason}");
+            }
+        }
+        Ok(_) => {}
+        Err(err) => eprintln!("[keyrelay] 钥匙串迁移出错（下次启动重试）: {err}"),
+    }
 }
 
 /// 测试用：内存钥匙串，绝不触碰用户真实钥匙串与 `~/.keyrelay`。

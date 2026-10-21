@@ -112,6 +112,10 @@ fn platform_specific_files_match_the_known_inventory() {
     //   非 macOS 明确返回「未安装」（应用包是 macOS 概念，不猜 Linux 的 .desktop）；
     //   CLI 在 Windows 上额外尝试 `.exe` / `.cmd`。Windows 侧未真机执行，
     //   见 `docs/evidence/platform-parity.md` §1.3。
+    // M33-S1 新增一项（2026-10-21）：
+    // - `vault/keyfile.rs`：设备绑定取 macOS `IOPlatformUUID` / Windows `MachineGuid` /
+    //   Linux `/etc/machine-id` 三条分支 + 非 unix 的文件权限空实现；
+    //   真机只跑 macOS 那条，Windows/Linux 分支靠本条清单与单测兜住（未真机执行）。
     let expected = vec![
         "agents.rs".to_string(),
         "autostart.rs".to_string(),
@@ -122,6 +126,7 @@ fn platform_specific_files_match_the_known_inventory() {
         "notify/system.rs".to_string(),
         "proxy.rs".to_string(),
         "vault/keychain.rs".to_string(),
+        "vault/keyfile.rs".to_string(),
     ];
 
     assert_eq!(
