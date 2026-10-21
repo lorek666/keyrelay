@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   AlertTriangle,
+  BarChart3,
   FlaskConical,
   History as HistoryIcon,
   KeyRound,
@@ -11,6 +12,7 @@ import {
   Settings as SettingsIcon,
 } from "lucide-react";
 import Overview from "./pages/Overview";
+import Usage from "./pages/Usage";
 import Sites from "./pages/Sites";
 import Keys from "./pages/Keys";
 import Agents from "./pages/Agents";
@@ -33,6 +35,7 @@ const NAV_GROUPS = [
 
 const PAGES = [
   { id: "overview", labelKey: "nav.overview", icon: LayoutDashboard, group: "nav.group.daily", render: () => <Overview /> },
+  { id: "usage", labelKey: "nav.usage", icon: BarChart3, group: "nav.group.daily", render: () => <Usage /> },
   { id: "sites", labelKey: "nav.sites", icon: Server, group: "nav.group.asset", render: () => <Sites /> },
   { id: "keys", labelKey: "nav.keys", icon: KeyRound, group: "nav.group.asset", render: () => <Keys /> },
   { id: "probe", labelKey: "nav.probe", icon: FlaskConical, group: "nav.group.asset", render: () => <Probe /> },

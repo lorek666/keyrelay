@@ -955,3 +955,117 @@ button.ghost:disabled {
   font-size: 11px;
   overflow-wrap: anywhere;
 }
+
+/* ============================================================ M34-S1：用量看板
+
+   图表是手写 SVG（无图表库）：`.usage-chart` 按 viewBox 等比缩放，
+   宽度跟随卡片；文字大小在 SVG 内用 CSS 统一给，避免每处 `font-size` 属性。 */
+.usage-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.usage-range {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.usage-site-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.usage-site-filter select {
+  min-width: 180px;
+}
+
+.usage-note {
+  margin: 6px 0 0;
+  font-size: 12px;
+}
+
+.usage-chart {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin-top: 10px;
+}
+
+.usage-chart text {
+  fill: var(--muted);
+  font-size: 10px;
+  font-family: inherit;
+}
+
+.usage-legend {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.usage-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.usage-legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+.usage-balance-block {
+  margin-top: 14px;
+}
+
+.usage-balance-block h4 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.usage-bar-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 180px) 1fr minmax(90px, 160px);
+  gap: 10px;
+  align-items: center;
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+.usage-bar-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-bar-track {
+  height: 10px;
+  border-radius: 5px;
+  background: var(--line-soft);
+  overflow: hidden;
+}
+
+.usage-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 5px;
+  background: var(--accent);
+}
+
+.usage-bar-value {
+  color: var(--muted);
+  text-align: right;
+  white-space: nowrap;
+}

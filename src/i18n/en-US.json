@@ -32,7 +32,69 @@
     "agents": "Agent Delivery",
     "history": "Change History",
     "settings": "Settings",
-    "probe": "Model Probe"
+    "probe": "Model Probe",
+    "usage": "Usage"
+  },
+  "usage": {
+    "rangeLabel": "Range",
+    "range": {
+      "d7": "Last 7 days",
+      "d30": "Last 30 days",
+      "d90": "Last 90 days"
+    },
+    "siteFilter": "Site",
+    "allSites": "All sites",
+    "scopeHint": "Token counts cover only requests relayed through the local KeyRelay gateway (agent traffic sent directly to a site is not included). Balances come from snapshots written on each refresh.",
+    "siteFallback": "Site {id}",
+    "unknownModel": "Unknown model",
+    "loading": "Loading…",
+    "error": "Failed to load usage: {error}",
+    "empty": "No usage in the selected range yet. It appears after the gateway relays requests or after a manual refresh collects balances.",
+    "cards": {
+      "tokens": "Total tokens",
+      "requests": "Requests",
+      "sites": "Active sites",
+      "models": "Active models"
+    },
+    "trend": {
+      "title": "Token trend (daily)",
+      "empty": "No gateway traffic in the selected range."
+    },
+    "balance": {
+      "title": "Site balance trend",
+      "currency": "{currency} balance",
+      "empty": "No balance snapshots in the selected range. Enable auto-refresh in Settings or run a manual refresh.",
+      "note": "One snapshot per site per day (the last one). Currencies are charted separately."
+    },
+    "sites": {
+      "title": "Site summary",
+      "empty": "No gateway traffic in the selected range.",
+      "colSite": "Site",
+      "colRequests": "Requests",
+      "colPrompt": "Input tokens",
+      "colCompletion": "Output tokens",
+      "colTotal": "Total",
+      "colShare": "Share",
+      "colKeyUsage": "Per-key usage",
+      "keyUsageYes": "Observable",
+      "keyUsageNo": "Unavailable"
+    },
+    "models": {
+      "title": "Model distribution",
+      "empty": "No gateway traffic in the selected range."
+    },
+    "keys": {
+      "title": "Per key (last {days} days)",
+      "note": "Data comes from Sub2API daily samples; NewAPI exposes cumulative quota only and has no daily-trend endpoint.",
+      "noCapability": "No site provides per-key usage (keyUsage capability is false).",
+      "empty": "No per-key usage samples in the selected range.",
+      "partial": "{sites} do not provide per-key usage and are not included.",
+      "colSite": "Site",
+      "colKey": "Key",
+      "colRequests": "Requests",
+      "colTokens": "Tokens",
+      "colCost": "Cost"
+    }
   },
   "probe": {
     "target": "Detection Target",

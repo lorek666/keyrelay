@@ -670,6 +670,93 @@ const MOCK_EVENTS: EventRow[] = [
   },
 ];
 
+/**
+ * M34-S1：浏览器预览的用量看板数据（确定性，不依赖随机数）。
+ *
+ * 三个站点各造一点差异：1 号两个模型、2 号 Sub2API 币种 CNY、3 号只有网关流量且
+ * `keyUsage=false`——预览里能同时看到「按模型分布」「币种分图」与「能力位不提供」三种形态。
+ */
+function mockUsageDashboard(days: number, siteId: number | null): UsageDashboard {
+  const rangeDays = Math.min(90, Math.max(1, Math.round(days)));
+  const sites = siteId === null ? [1, 2, 3] : [siteId];
+  const modelsBySite: Record<number, string[]> = {
+    1: ["gpt-4o-mini", "deepseek-v4"],
+    2: ["claude-sonnet-4"],
+    3: [""],
+  };
+  const baseBySite: Record<number, number> = { 1: 14_000, 2: 6_000, 3: 2_000 };
+  const daily: UsageDaily[] = [];
+  const snapshots: UsageSnapshotDaily[] = [];
+  const totalsBySite = new Map<number, number>();
+
+  for (let offset = rangeDays - 1; offset >= 0; offset -= 1) {
+    const day = new Date();
+    day.setDate(day.getDate() - offset);
+    const date = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`;
+    for (const site of sites) {
+      const models = modelsBySite[site] ?? ["gpt-4o-mini"];
+      models.forEach((model, index) => {
+        const wave = 0.6 + 0.8 * Math.abs(Math.sin((offset + 1) * (0.7 + index * 0.3)));
+        const total = Math.round((baseBySite[site] ?? 2_000) * wave);
+        const prompt = Math.round(total * 0.72);
+        daily.push({
+          date,
+          siteId: site,
+          model,
+          requests: Math.max(1, Math.round(total / 900)),
+          promptTokens: prompt,
+          completionTokens: total - prompt,
+          totalTokens: total,
+        });
+        totalsBySite.set(site, (totalsBySite.get(site) ?? 0) + total);
+      });
+      const used = Math.round((rangeDays - offset) * (site === 2 ? 0.8 : 1.1) * 100) / 100;
+      const budget = site === 2 ? 30 : 20;
+      snapshots.push({
+        date,
+        siteId: site,
+        used,
+        remaining: Math.max(0, Math.round((budget - used) * 100) / 100),
+        currency: site === 2 ? "CNY" : "USD",
+        samples: 2,
+      });
+    }
+  }
+
+  // 每 key 用量只造 1/2 号（3 号能力位为 false，界面必须把它挡在表外）。
+  const keyUsage: KeyUsageTotal[] = [];
+  if (sites.includes(1)) {
+    const total = totalsBySite.get(1) ?? 0;
+    keyUsage.push({
+      keyId: 11,
+      siteId: 1,
+      keyName: "keyrelay/codex/20261022",  // i18n:skip
+      requests: Math.round(total / 1200),
+      inputTokens: Math.round(total * 0.72),
+      outputTokens: Math.round(total * 0.28),
+      totalTokens: total,
+      cost: Math.round(total * 0.000002 * 100) / 100,
+      currency: "USD",
+    });
+  }
+  if (sites.includes(2)) {
+    const total = totalsBySite.get(2) ?? 0;
+    keyUsage.push({
+      keyId: 12,
+      siteId: 2,
+      keyName: "keyrelay/claude/20261022",  // i18n:skip
+      requests: Math.round(total / 1500),
+      inputTokens: Math.round(total * 0.75),
+      outputTokens: Math.round(total * 0.25),
+      totalTokens: total,
+      cost: Math.round(total * 0.000003 * 100) / 100,
+      currency: "CNY",
+    });
+  }
+
+  return { rangeDays, siteId, daily, snapshots, keyUsage };
+}
+
 function mock<T>(value: T): Promise<T> {
   return Promise.resolve(value);
 }
@@ -1112,6 +1199,71 @@ export async function recentKeyUsage(
 ): Promise<KeyUsageSample[]> {
   if (!hasTauri) return mock([]);
   return invokeCommand<KeyUsageSample[]>("recent_key_usage", { keyId, days });
+}
+
+/**
+ * M34-S1：用量看板 —— 网关 token 按（本地日, 站点, 模型）聚合的一行。
+ *
+ * `date` 是**本地时区**的 `YYYY-MM-DD`；`model` 空串表示网关没解析出模型名
+ * （界面显示「未知模型」，不归并成别的名字）。
+ */
+export type UsageDaily = {
+  date: string;
+  siteId: number;
+  model: string;
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+};
+
+/** M34-S1：站点余额快照按（本地日, 站点）聚合的一行；每天取最后一条。 */
+export type UsageSnapshotDaily = {
+  date: string;
+  siteId: number;
+  used: number;
+  remaining: number;
+  currency: string;
+  /** 当日快照条数（>1 表示当天刷新过多次）。 */
+  samples: number;
+};
+
+/** M34-S1：`usage_samples` 按 key 汇总的一行（仅 Sub2API 站点有数据）。 */
+export type KeyUsageTotal = {
+  keyId: number;
+  siteId: number;
+  keyName: string;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cost: number;
+  /** `keys.currency`；未记录时为 `null`（不猜币种）。 */
+  currency: string | null;
+};
+
+/** M34-S1：用量页一次取全的聚合数据（只读）。 */
+export type UsageDashboard = {
+  /** 夹取后的实际窗口天数（1..=90）。 */
+  rangeDays: number;
+  /** 回显筛选；`null` = 全部站点。 */
+  siteId: number | null;
+  daily: UsageDaily[];
+  snapshots: UsageSnapshotDaily[];
+  keyUsage: KeyUsageTotal[];
+};
+
+/**
+ * M34-S1：取用量看板数据（近 `days` 天，可按站点筛选）。
+ *
+ * 后端夹取 `days` 到 `1..=90` 并在 `rangeDays` 回显；`siteId=null` 表示全部站点。
+ */
+export async function usageDashboard(
+  days = 30,
+  siteId: number | null = null,
+): Promise<UsageDashboard> {
+  if (!hasTauri) return mock(mockUsageDashboard(days, siteId));
+  return invokeCommand<UsageDashboard>("usage_dashboard", { days, siteId });
 }
 
 /** M14-S1：模型别名映射（B-110）—— agent 侧模型名 → 真实模型名。 */

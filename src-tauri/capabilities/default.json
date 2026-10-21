@@ -60,6 +60,7 @@
     "allow-recent-gateway-usage",
     "allow-recent-usage-snapshots",
     "allow-recent-key-usage",
+    "allow-usage-dashboard",
     "allow-list-alias-map",
     "allow-upsert-alias",
     "allow-delete-alias",
