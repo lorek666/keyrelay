@@ -2266,12 +2266,16 @@ pub fn autostart_set(state: State<'_, AppState>, enabled: bool) -> Result<Autost
 /// 只读：核心层不执行安装命令、不创建目录、不写盘。返回值里的
 /// `installCommands` 只供界面展示/复制，应用不会替用户运行。
 #[tauri::command]
-pub fn detect_agents(state: State<'_, AppState>) -> Vec<keyrelay_core::agents::AgentStatus> {
-    // 20 条探测内部已是并行；Tauri 的同步命令不阻塞 WebView 的渲染线程。
-    // 试过 async + spawn_blocking：`State<'_, AppState>` 不能跨 await，
-    // `AppHandle` / `Window` 在 Tauri 2.12 又不实现 CommandArg（编译期拒绝），
-    // 为一条只读探测引入额外的状态克隆不值得。单条最长 5s，仍在可接受范围。
-    keyrelay_core::agents::detect_agents(state.service.home())
+pub async fn detect_agents(
+    state: State<'_, AppState>,
+) -> Result<Vec<keyrelay_core::agents::AgentStatus>, String> {
+    // 20 条探测内部已是并行，但每条都要等 `--version`（单条上限 5s）。
+    // 放到 blocking 线程池执行，避免占住 IPC/窗口主线程：只克隆一个 PathBuf，
+    // 不把 `State` 移进闭包。
+    let home = state.service.home().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || keyrelay_core::agents::detect_agents(&home))
+        .await
+        .map_err(|error| format!("Agent 探测线程异常退出：{error}"))
 }
 
 /// 探测「已知但本版本不托管」的 agent 落点（M7-S3 / 章程 R-7）。
