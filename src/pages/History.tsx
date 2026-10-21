@@ -117,7 +117,7 @@ export default function History() {
   };
 
   return (
-    <section>
+    <section className="page">
       <p className="muted">{t("history.intro")}</p>
 
       {notice ? <p className="ok" role="status">{notice}</p> : null}
@@ -161,10 +161,11 @@ export default function History() {
           </p>
         ) : null}
         {deliveries.data?.length === 0 ? (
-          <p className="muted">{t("history.deliveries.empty")}</p>
+          <p className="muted empty">{t("history.deliveries.empty")}</p>
         ) : null}
 
         {deliveries.data?.length ? (
+          <div className="table-wrap">
           <table className="table">
             <thead>
               <tr>
@@ -220,6 +221,7 @@ export default function History() {
               })}
             </tbody>
           </table>
+          </div>
         ) : null}
         <p className="muted">{t("history.deliveries.hint")}</p>
       </div>
@@ -244,10 +246,11 @@ export default function History() {
           </p>
         ) : null}
         {events.data?.length === 0 ? (
-          <p className="muted">{t("history.events.empty")}</p>
+          <p className="muted empty">{t("history.events.empty")}</p>
         ) : null}
 
         {events.data?.length ? (
+          <div className="table-wrap">
           <table className="table">
             <thead>
               <tr>
@@ -276,6 +279,7 @@ export default function History() {
               ))}
             </tbody>
           </table>
+          </div>
         ) : null}
       </div>
 

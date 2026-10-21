@@ -94,6 +94,7 @@ function AppInner() {
                     key={item.id}
                     type="button"
                     className={item.id === page ? "nav-item active" : "nav-item"}
+                    aria-current={item.id === page ? "page" : undefined}
                     onClick={() => setPage(item.id)}
                   >
                     <Icon size={15} aria-hidden />
@@ -123,7 +124,10 @@ function AppInner() {
           </p>
         ) : null}
 
-        {current.render()}
+        {/* M33-S1：key={page} ⇒ 切页时容器重挂载，一次性淡入/上移动效只播一次 */}
+        <div className="page-stage" key={page}>
+          {current.render()}
+        </div>
       </main>
     </div>
   );

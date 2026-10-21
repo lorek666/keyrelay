@@ -551,7 +551,7 @@ export default function SettingsPage() {
     JSON.stringify(draft) !== JSON.stringify(current.data);
 
   return (
-    <section>
+    <section className={dirty ? "page settings-page has-dirty" : "page settings-page"}>
       <p className="muted">{t("settings.intro")}</p>
 
       {notice ? <p className="ok" role="status">{notice}</p> : null}
@@ -565,355 +565,357 @@ export default function SettingsPage() {
         <p className="muted">{t("settings.loading")}</p>
       ) : (
         <>
-          <div className="card">
-            <h3>{t("settings.autorefresh.title")}</h3>
-            <p className="muted">{t("settings.autorefresh.body")}</p>
-            <div className="row">
-              {PRESETS.map((preset) => (
-                <button
-                  key={preset.value}
-                  type="button"
-                  className={
-                    draft.refreshIntervalSecs === preset.value
-                      ? "btn btn-primary"
-                      : "btn"
-                  }
-                  onClick={() =>
-                    setDraft({ ...draft, refreshIntervalSecs: preset.value })
-                  }
-                >
-                  {t(preset.labelKey)}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="card">
-            <h3>{t("settings.balanceAlert.title")}</h3>
-            <label className="field">
-              <span>{t("settings.balanceAlert.label")}</span>
-              <input
-                className="input"
-                type="number"
-                min={0}
-                step="0.5"
-                value={draft.balanceAlertThreshold}
-                onChange={(e) =>
-                  setDraft({
-                    ...draft,
-                    balanceAlertThreshold: Number(e.target.value),
-                  })
-                }
-              />
-            </label>
-          </div>
-
-          <div className="card">
-            <h3>{t("settings.startupCheck.title")}</h3>
-            <label className="checkline">
-              <input
-                type="checkbox"
-                checked={draft.driftCheckOnStart}
-                onChange={(e) =>
-                  setDraft({ ...draft, driftCheckOnStart: e.target.checked })
-                }
-              />
-              <span>{t("settings.startupCheck.label")}</span>
-            </label>
-          </div>
-
-          <div className="card">
-            <h3>{t("settings.ui.title")}</h3>
-            <label className="field">
-              <span>{t("settings.ui.theme")}</span>
-              <select
-                className="input"
-                value={draft.theme}
-                onChange={(e) => setDraft({ ...draft, theme: e.target.value })}
-              >
-                <option value="system">{t("settings.ui.themeSystem")}</option>
-                <option value="light">{t("settings.ui.themeLight")}</option>
-                <option value="dark">{t("settings.ui.themeDark")}</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>{t("settings.ui.language")}</span>
-              <select
-                className="input"
-                value={draft.language}
-                onChange={(e) => setDraft({ ...draft, language: e.target.value })}
-              >
-                <option value="zh-CN">{t("settings.ui.languageZh")}</option>
-                <option value="en-US">{t("settings.ui.languageEn")}</option>
-              </select>
-            </label>
-            {/* M14-S2：语言切换已做真（前端文案随语言切换）；后端返回文本仍原文，见 spec §11 D-1/D-2 */}
-            <p className="muted">{t("settings.ui.languageNote")}</p>
-            <label className="field">
-              <span>{t("settings.ui.proxy")}</span>
-              <div className="radio-row">
-                <label className="radio">
-                  <input
-                    type="radio"
-                    name="proxy-mode"
-                    value="auto"
-                    checked={draft.proxyMode === "auto"}
-                    onChange={() => setDraft({ ...draft, proxyMode: "auto" })}
-                  />
-                  {t("settings.ui.proxyAuto")}
-                </label>
-                <label className="radio">
-                  <input
-                    type="radio"
-                    name="proxy-mode"
-                    value="manual"
-                    checked={draft.proxyMode === "manual"}
-                    onChange={() => setDraft({ ...draft, proxyMode: "manual" })}
-                  />
-                  {t("settings.ui.proxyManual")}
-                </label>
-                <label className="radio">
-                  <input
-                    type="radio"
-                    name="proxy-mode"
-                    value="direct"
-                    checked={draft.proxyMode === "direct"}
-                    onChange={() => setDraft({ ...draft, proxyMode: "direct" })}
-                  />
-                  {t("settings.ui.proxyDirect")}
-                </label>
+          <div className="settings-grid">
+            <div className="card">
+              <h3>{t("settings.autorefresh.title")}</h3>
+              <p className="muted">{t("settings.autorefresh.body")}</p>
+              <div className="row">
+                {PRESETS.map((preset) => (
+                  <button
+                    key={preset.value}
+                    type="button"
+                    className={
+                      draft.refreshIntervalSecs === preset.value
+                        ? "btn btn-primary"
+                        : "btn"
+                    }
+                    onClick={() =>
+                      setDraft({ ...draft, refreshIntervalSecs: preset.value })
+                    }
+                  >
+                    {t(preset.labelKey)}
+                  </button>
+                ))}
               </div>
-            </label>
-            {draft.proxyMode === "auto" && (
-              <p className="muted">
-                {detected.data && detected.data.source ? (
-                  <>
-                    {t("settings.ui.proxyAutoDetectedPre")}<code>{detected.data.maskedUrl}</code>
-                    {t("settings.ui.proxyAutoDetectedMid", { source: proxySourceLabel(detected.data.source) })}
-                  </>
-                ) : (
-                  t("settings.ui.proxyAutoNone")
-                )}{" "}
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  onClick={() => detected.refetch()}
-                  disabled={detected.isFetching}
-                >
-                  {detected.isFetching ? t("settings.ui.proxyDetecting") : t("settings.ui.proxyDetectBtn")}
-                </button>
-              </p>
-            )}
-            {draft.proxyMode === "manual" && (
+            </div>
+
+            <div className="card">
+              <h3>{t("settings.balanceAlert.title")}</h3>
               <label className="field">
-                <span>{t("settings.ui.proxyManualLabel")}</span>
+                <span>{t("settings.balanceAlert.label")}</span>
+                <input
+                  className="input"
+                  type="number"
+                  min={0}
+                  step="0.5"
+                  value={draft.balanceAlertThreshold}
+                  onChange={(e) =>
+                    setDraft({
+                      ...draft,
+                      balanceAlertThreshold: Number(e.target.value),
+                    })
+                  }
+                />
+              </label>
+            </div>
+
+            <div className="card">
+              <h3>{t("settings.startupCheck.title")}</h3>
+              <label className="checkline">
+                <input
+                  type="checkbox"
+                  checked={draft.driftCheckOnStart}
+                  onChange={(e) =>
+                    setDraft({ ...draft, driftCheckOnStart: e.target.checked })
+                  }
+                />
+                <span>{t("settings.startupCheck.label")}</span>
+              </label>
+            </div>
+
+            <div className="card">
+              <h3>{t("settings.ui.title")}</h3>
+              <label className="field">
+                <span>{t("settings.ui.theme")}</span>
+                <select
+                  className="input"
+                  value={draft.theme}
+                  onChange={(e) => setDraft({ ...draft, theme: e.target.value })}
+                >
+                  <option value="system">{t("settings.ui.themeSystem")}</option>
+                  <option value="light">{t("settings.ui.themeLight")}</option>
+                  <option value="dark">{t("settings.ui.themeDark")}</option>
+                </select>
+              </label>
+              <label className="field">
+                <span>{t("settings.ui.language")}</span>
+                <select
+                  className="input"
+                  value={draft.language}
+                  onChange={(e) => setDraft({ ...draft, language: e.target.value })}
+                >
+                  <option value="zh-CN">{t("settings.ui.languageZh")}</option>
+                  <option value="en-US">{t("settings.ui.languageEn")}</option>
+                </select>
+              </label>
+              {/* M14-S2：语言切换已做真（前端文案随语言切换）；后端返回文本仍原文，见 spec §11 D-1/D-2 */}
+              <p className="muted">{t("settings.ui.languageNote")}</p>
+              <label className="field">
+                <span>{t("settings.ui.proxy")}</span>
+                <div className="radio-row">
+                  <label className="radio">
+                    <input
+                      type="radio"
+                      name="proxy-mode"
+                      value="auto"
+                      checked={draft.proxyMode === "auto"}
+                      onChange={() => setDraft({ ...draft, proxyMode: "auto" })}
+                    />
+                    {t("settings.ui.proxyAuto")}
+                  </label>
+                  <label className="radio">
+                    <input
+                      type="radio"
+                      name="proxy-mode"
+                      value="manual"
+                      checked={draft.proxyMode === "manual"}
+                      onChange={() => setDraft({ ...draft, proxyMode: "manual" })}
+                    />
+                    {t("settings.ui.proxyManual")}
+                  </label>
+                  <label className="radio">
+                    <input
+                      type="radio"
+                      name="proxy-mode"
+                      value="direct"
+                      checked={draft.proxyMode === "direct"}
+                      onChange={() => setDraft({ ...draft, proxyMode: "direct" })}
+                    />
+                    {t("settings.ui.proxyDirect")}
+                  </label>
+                </div>
+              </label>
+              {draft.proxyMode === "auto" && (
+                <p className="muted">
+                  {detected.data && detected.data.source ? (
+                    <>
+                      {t("settings.ui.proxyAutoDetectedPre")}<code>{detected.data.maskedUrl}</code>
+                      {t("settings.ui.proxyAutoDetectedMid", { source: proxySourceLabel(detected.data.source) })}
+                    </>
+                  ) : (
+                    t("settings.ui.proxyAutoNone")
+                  )}{" "}
+                  <button
+                    type="button"
+                    className="btn btn-ghost"
+                    onClick={() => detected.refetch()}
+                    disabled={detected.isFetching}
+                  >
+                    {detected.isFetching ? t("settings.ui.proxyDetecting") : t("settings.ui.proxyDetectBtn")}
+                  </button>
+                </p>
+              )}
+              {draft.proxyMode === "manual" && (
+                <label className="field">
+                  <span>{t("settings.ui.proxyManualLabel")}</span>
+                  <input
+                    className="input"
+                    type="text"
+                    placeholder={t("settings.ui.proxyManualPlaceholder")}
+                    value={draft.proxyUrl}
+                    onChange={(e) => setDraft({ ...draft, proxyUrl: e.target.value })}
+                  />
+                </label>
+              )}
+              {draft.proxyMode === "direct" && <p className="muted">{t("settings.ui.proxyDirectNote")}</p>}
+              <p className="muted">{t("settings.ui.proxyHint")}</p>
+            </div>
+
+            <div className="card">
+              <h3>{t("settings.notify.title")}</h3>
+              <p className="muted">{t("settings.notify.body")}</p>
+              {/*
+                M16-S9：总开关。**默认关** —— 关着时服务层不装通知状态（不评估、不落基线、
+                不弹通知、不发 webhook），与「通知功能从未接线」逐字相同。
+                关着时下面三项**禁用**而不是隐藏：让用户看得见「功能存在、但被总开关关掉了」。
+              */}
+              <label className="checkline">
+                <input
+                  type="checkbox"
+                  checked={draft.notifyEnabled}
+                  onChange={(e) =>
+                    setDraft({ ...draft, notifyEnabled: e.target.checked })
+                  }
+                />
+                <span>{t("settings.notify.enabled")}</span>
+              </label>
+              {!draft.notifyEnabled ? (
+                <p className="muted">{t("settings.notify.enabledHint")}</p>
+              ) : null}
+              <label className="checkline">
+                <input
+                  type="checkbox"
+                  checked={draft.notifySystemEnabled}
+                  disabled={!draft.notifyEnabled}
+                  onChange={(e) =>
+                    setDraft({ ...draft, notifySystemEnabled: e.target.checked })
+                  }
+                />
+                <span>{t("settings.notify.system")}</span>
+              </label>
+              <label className="field">
+                <span>{t("settings.notify.webhookUrl")}</span>
                 <input
                   className="input"
                   type="text"
-                  placeholder={t("settings.ui.proxyManualPlaceholder")}
-                  value={draft.proxyUrl}
-                  onChange={(e) => setDraft({ ...draft, proxyUrl: e.target.value })}
+                  disabled={!draft.notifyEnabled}
+                  placeholder={t("settings.notify.webhookPlaceholder")}
+                  value={draft.notifyWebhookUrl}
+                  onChange={(e) =>
+                    setDraft({ ...draft, notifyWebhookUrl: e.target.value })
+                  }
                 />
               </label>
-            )}
-            {draft.proxyMode === "direct" && <p className="muted">{t("settings.ui.proxyDirectNote")}</p>}
-            <p className="muted">{t("settings.ui.proxyHint")}</p>
-          </div>
-
-          <div className="card">
-            <h3>{t("settings.notify.title")}</h3>
-            <p className="muted">{t("settings.notify.body")}</p>
-            {/*
-              M16-S9：总开关。**默认关** —— 关着时服务层不装通知状态（不评估、不落基线、
-              不弹通知、不发 webhook），与「通知功能从未接线」逐字相同。
-              关着时下面三项**禁用**而不是隐藏：让用户看得见「功能存在、但被总开关关掉了」。
-            */}
-            <label className="checkline">
-              <input
-                type="checkbox"
-                checked={draft.notifyEnabled}
-                onChange={(e) =>
-                  setDraft({ ...draft, notifyEnabled: e.target.checked })
-                }
-              />
-              <span>{t("settings.notify.enabled")}</span>
-            </label>
-            {!draft.notifyEnabled ? (
-              <p className="muted">{t("settings.notify.enabledHint")}</p>
-            ) : null}
-            <label className="checkline">
-              <input
-                type="checkbox"
-                checked={draft.notifySystemEnabled}
-                disabled={!draft.notifyEnabled}
-                onChange={(e) =>
-                  setDraft({ ...draft, notifySystemEnabled: e.target.checked })
-                }
-              />
-              <span>{t("settings.notify.system")}</span>
-            </label>
-            <label className="field">
-              <span>{t("settings.notify.webhookUrl")}</span>
-              <input
-                className="input"
-                type="text"
-                disabled={!draft.notifyEnabled}
-                placeholder={t("settings.notify.webhookPlaceholder")}
-                value={draft.notifyWebhookUrl}
-                onChange={(e) =>
-                  setDraft({ ...draft, notifyWebhookUrl: e.target.value })
-                }
-              />
-            </label>
-            <label className="field">
-              <span>{t("settings.notify.webhookTimeout")}</span>
-              <input
-                className="input"
-                type="number"
-                disabled={!draft.notifyEnabled}
-                min={1}
-                max={60}
-                value={draft.notifyTimeoutSecs}
-                onChange={(e) =>
-                  setDraft({
-                    ...draft,
-                    notifyTimeoutSecs: Number(e.target.value),
-                  })
-                }
-              />
-            </label>
-            <p className="muted">
-              {t("settings.notify.webhookHintPre")}<code>{t("settings.notify.webhookHintCode")}</code>{t("settings.notify.webhookHintPost")}
-            </p>
-          </div>
-
-          <div className="card">
-            <h3>{t("settings.rotation.title")}</h3>
-            <p className="muted">{t("settings.rotation.body")}</p>
-            <label className="field">
-              <span>{t("settings.rotation.maxAge")}</span>
-              <input
-                className="input"
-                type="number"
-                min={0}
-                value={draft.rotationMaxAgeDays}
-                onChange={(e) =>
-                  setDraft({
-                    ...draft,
-                    rotationMaxAgeDays: Number(e.target.value),
-                  })
-                }
-              />
-            </label>
-            <label className="field">
-              <span>{t("settings.rotation.warnBefore")}</span>
-              <input
-                className="input"
-                type="number"
-                min={0}
-                value={draft.rotationWarnBeforeDays}
-                onChange={(e) =>
-                  setDraft({
-                    ...draft,
-                    rotationWarnBeforeDays: Number(e.target.value),
-                  })
-                }
-              />
-            </label>
-            {draft.rotationMaxAgeDays > 0 &&
-            draft.rotationWarnBeforeDays > draft.rotationMaxAgeDays ? (
-              <p className="error" role="alert">
-                <AlertTriangle size={14} aria-hidden /> {t("settings.rotation.error")}
+              <label className="field">
+                <span>{t("settings.notify.webhookTimeout")}</span>
+                <input
+                  className="input"
+                  type="number"
+                  disabled={!draft.notifyEnabled}
+                  min={1}
+                  max={60}
+                  value={draft.notifyTimeoutSecs}
+                  onChange={(e) =>
+                    setDraft({
+                      ...draft,
+                      notifyTimeoutSecs: Number(e.target.value),
+                    })
+                  }
+                />
+              </label>
+              <p className="muted">
+                {t("settings.notify.webhookHintPre")}<code>{t("settings.notify.webhookHintCode")}</code>{t("settings.notify.webhookHintPost")}
               </p>
-            ) : null}
-          </div>
+            </div>
 
-          <div className="card">
-            <h3>{t("settings.autostart.title")}</h3>
-            <label className="checkline">
-              <input
-                type="checkbox"
-                checked={draft.closeToTray}
-                onChange={(e) =>
-                  setDraft({ ...draft, closeToTray: e.target.checked })
-                }
-              />
-              <span>{t("settings.autostart.closeToTray")}</span>
-            </label>
-            <label className="checkline">
-              <input
-                type="checkbox"
-                checked={draft.startHidden}
-                onChange={(e) =>
-                  setDraft({ ...draft, startHidden: e.target.checked })
-                }
-              />
-              <span>{t("settings.autostart.startHidden")}</span>
-            </label>
-            <label className="checkline">
-              <input
-                type="checkbox"
-                checked={draft.autostartEnabled}
-                onChange={(e) =>
-                  setDraft({ ...draft, autostartEnabled: e.target.checked })
-                }
-              />
-              <span>
-                {t("settings.autostart.autostartLabelPre")}<code>{t("settings.autostart.autostartLabelCode")}</code>{t("settings.autostart.autostartLabelPost")}
-              </span>
-            </label>
-            {/*
-              开关只是一个「意愿」，磁盘上的自启项才是事实（M6-S7 审计 §4-3）。
-              只写不读会让界面长期显示一个已经不成立的结论——用户手工删掉 plist、
-              系统清理了自启项、或写在别的用户目录下，界面都看不出来。
-            */}
-            <p className="muted">
-              {t("settings.autostart.actualState")}
-              {autostart.isLoading
-                ? t("settings.autostart.stateLoading")
-                : autostart.isError
-                  ? t("settings.autostart.stateError", { error: (autostart.error as Error).message })
-                  : ` ${autostartStateLabel(autostart.data!.state)}`}
-            </p>
-            {autostartMismatch ? (
-              <p className="warnline" role="alert">
-                <AlertTriangle size={14} aria-hidden />
-                {t("settings.autostart.mismatchPre")}{autostartMismatch}{t("settings.autostart.mismatchPost")}
+            <div className="card">
+              <h3>{t("settings.rotation.title")}</h3>
+              <p className="muted">{t("settings.rotation.body")}</p>
+              <label className="field">
+                <span>{t("settings.rotation.maxAge")}</span>
+                <input
+                  className="input"
+                  type="number"
+                  min={0}
+                  value={draft.rotationMaxAgeDays}
+                  onChange={(e) =>
+                    setDraft({
+                      ...draft,
+                      rotationMaxAgeDays: Number(e.target.value),
+                    })
+                  }
+                />
+              </label>
+              <label className="field">
+                <span>{t("settings.rotation.warnBefore")}</span>
+                <input
+                  className="input"
+                  type="number"
+                  min={0}
+                  value={draft.rotationWarnBeforeDays}
+                  onChange={(e) =>
+                    setDraft({
+                      ...draft,
+                      rotationWarnBeforeDays: Number(e.target.value),
+                    })
+                  }
+                />
+              </label>
+              {draft.rotationMaxAgeDays > 0 &&
+              draft.rotationWarnBeforeDays > draft.rotationMaxAgeDays ? (
+                <p className="error" role="alert">
+                  <AlertTriangle size={14} aria-hidden /> {t("settings.rotation.error")}
+                </p>
+              ) : null}
+            </div>
+
+            <div className="card">
+              <h3>{t("settings.autostart.title")}</h3>
+              <label className="checkline">
+                <input
+                  type="checkbox"
+                  checked={draft.closeToTray}
+                  onChange={(e) =>
+                    setDraft({ ...draft, closeToTray: e.target.checked })
+                  }
+                />
+                <span>{t("settings.autostart.closeToTray")}</span>
+              </label>
+              <label className="checkline">
+                <input
+                  type="checkbox"
+                  checked={draft.startHidden}
+                  onChange={(e) =>
+                    setDraft({ ...draft, startHidden: e.target.checked })
+                  }
+                />
+                <span>{t("settings.autostart.startHidden")}</span>
+              </label>
+              <label className="checkline">
+                <input
+                  type="checkbox"
+                  checked={draft.autostartEnabled}
+                  onChange={(e) =>
+                    setDraft({ ...draft, autostartEnabled: e.target.checked })
+                  }
+                />
+                <span>
+                  {t("settings.autostart.autostartLabelPre")}<code>{t("settings.autostart.autostartLabelCode")}</code>{t("settings.autostart.autostartLabelPost")}
+                </span>
+              </label>
+              {/*
+                开关只是一个「意愿」，磁盘上的自启项才是事实（M6-S7 审计 §4-3）。
+                只写不读会让界面长期显示一个已经不成立的结论——用户手工删掉 plist、
+                系统清理了自启项、或写在别的用户目录下，界面都看不出来。
+              */}
+              <p className="muted">
+                {t("settings.autostart.actualState")}
+                {autostart.isLoading
+                  ? t("settings.autostart.stateLoading")
+                  : autostart.isError
+                    ? t("settings.autostart.stateError", { error: (autostart.error as Error).message })
+                    : ` ${autostartStateLabel(autostart.data!.state)}`}
               </p>
-            ) : null}
-          </div>
+              {autostartMismatch ? (
+                <p className="warnline" role="alert">
+                  <AlertTriangle size={14} aria-hidden />
+                  {t("settings.autostart.mismatchPre")}{autostartMismatch}{t("settings.autostart.mismatchPost")}
+                </p>
+              ) : null}
+            </div>
 
-          <div className="card">
-            <h3>{t("settings.privacy.title")}</h3>
-            <label className="checkline">
-              <input
-                type="checkbox"
-                checked={draft.telemetryEnabled}
-                onChange={(e) =>
-                  setDraft({ ...draft, telemetryEnabled: e.target.checked })
-                }
-              />
-              <span>
-                {t("settings.privacy.telemetryPre")}<strong>{t("settings.privacy.telemetryStrong")}</strong>{t("settings.privacy.telemetryPost")}
-              </span>
-            </label>
-            <label className="checkline">
-              <input
-                type="checkbox"
-                checked={draft.autoUpdateEnabled}
-                onChange={(e) =>
-                  setDraft({ ...draft, autoUpdateEnabled: e.target.checked })
-                }
-              />
-              <span>{t("settings.privacy.autoUpdate")}</span>
-            </label>
+            <div className="card">
+              <h3>{t("settings.privacy.title")}</h3>
+              <label className="checkline">
+                <input
+                  type="checkbox"
+                  checked={draft.telemetryEnabled}
+                  onChange={(e) =>
+                    setDraft({ ...draft, telemetryEnabled: e.target.checked })
+                  }
+                />
+                <span>
+                  {t("settings.privacy.telemetryPre")}<strong>{t("settings.privacy.telemetryStrong")}</strong>{t("settings.privacy.telemetryPost")}
+                </span>
+              </label>
+              <label className="checkline">
+                <input
+                  type="checkbox"
+                  checked={draft.autoUpdateEnabled}
+                  onChange={(e) =>
+                    setDraft({ ...draft, autoUpdateEnabled: e.target.checked })
+                  }
+                />
+                <span>{t("settings.privacy.autoUpdate")}</span>
+              </label>
+            </div>
           </div>
           <div className="row">
             <label style={{ fontWeight: 600, marginBottom: 4 }}>{t("settings.updateTitle")}</label>
             <UpdateChecker autoCheckOnMount={current.data?.autoUpdateEnabled ?? false} />
           </div>
 
-          <div className="row">
+          <div className={dirty ? "row settings-savebar floating" : "row settings-savebar"}>
             <button
               type="button"
               className="btn btn-primary"

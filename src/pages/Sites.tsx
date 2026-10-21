@@ -154,11 +154,11 @@ export default function Sites() {
   const fieldHint = loginFieldHint(loginTarget?.loginField ?? null);
 
   return (
-    <section>
+    <section className="page">
 
-      <div className="card">
+      <div className="card site-add-card">
         <h3>{t("sites.title")}</h3>
-        <div className="row">
+        <div className="row site-add-form">
           <input
             className="input grow"
             placeholder="https://relay.example.com"
@@ -299,10 +299,11 @@ export default function Sites() {
 
         {sites.isLoading ? <Skeleton rows={3} /> : null}
         {sites.data?.length === 0 ? (
-          <p className="muted">{t("sites.list.empty")}</p>
+          <p className="muted empty">{t("sites.list.empty")}</p>
         ) : null}
 
         {sites.data?.length ? (
+          <div className="table-wrap">
           <table className="table">
             <thead>
               <tr>
@@ -331,6 +332,7 @@ export default function Sites() {
               ))}
             </tbody>
           </table>
+          </div>
         ) : null}
       </div>
 
@@ -457,7 +459,9 @@ function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) 
   return (
     <tr>
       <td>{site.displayName}</td>
-      <td className="mono">{site.kind}</td>
+      <td className="mono">
+        <span className="kind-badge">{site.kind}</span>
+      </td>
       <td className="mono ellipsis" title={site.baseUrl}>
         {site.baseUrl}
       </td>
@@ -465,6 +469,7 @@ function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) 
         {/* 会话状态由服务层维护（B-61）：needs_login 表示「这个站需要重新登录」，
             它在刷新汇总里既不算成功也不算失败，所以必须在这里单独可见。 */}
         <span className={`health-${healthClass(site.health)}`}>
+          <span className="status-dot" aria-hidden />
           {healthLabel(site.health)}
         </span>
       </td>
