@@ -247,6 +247,54 @@ section > .muted {
   color: var(--muted);
 }
 
+/* ============================================================ M30-S2：Agent 落点卡片网格 */
+
+/* 宽屏多列、窄屏自然单列（auto-fill 会自己降列），不需要媒体查询。
+   minmax(240px, 1fr) 让长落点标签有足够宽度，配合下方的 overflow-wrap 不横向溢出。 */
+.agent-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+}
+
+.agent-choice {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--field);
+  color: inherit;
+  cursor: pointer;
+  padding: 10px 12px;
+  font: inherit;
+  /* 落点标签里有 `~/.config/opencode/opencode.jsonc` 这种长串：允许任意处断行 */
+  overflow-wrap: anywhere;
+}
+
+.agent-choice:hover,
+.agent-choice:focus-visible {
+  border-color: var(--accent);
+}
+
+/* 选中态：边框 + 底色双通道，不只靠颜色（色弱用户也能看出） */
+.agent-choice.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.agent-choice-name {
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.agent-choice-id {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+
 /* 统计卡（Overview 顶部那一排） */
 .cards {
   display: grid;

@@ -24,14 +24,15 @@ import ConfirmDialog from "../components/ConfirmDialog";
 import { useTranslation, translate, getCurrentDict } from "../i18n";
 
 /**
- * 十七条投递通道（M14-S1 删 Continue/Shell，新增 Claude Desktop/Grok/OpenClaw/Hermes/MCode/Pi）。
+ * 当前全部投递通道（M14-S1 删 Continue/Shell，新增 Claude Desktop/Grok/OpenClaw/Hermes/MCode/Pi；
+ * M30-S2 把每个落点铺成独立卡片，不再用下拉框隐藏）。
  *
  * 这里的 `label` 是**给人看的落点提示**；能力判断不在这里——投递能不能做、
  * 改完要不要重启，一律由后端给（`plan.restartHint`），本文件不得按通道硬编码判断。
  *
  * M14-S2：`label` 含文件路径（技术描述），中英同形，暂不抽——i18n:skip
  */
-const CHANNELS = [
+export const CHANNELS = [
   { id: "codex-auth-json", label: "Codex CLI（~/.codex/auth.json）", agent: "codex" },
   { id: "codex-config", label: "Codex Config（~/.codex/config.toml）", agent: "codex-config" },
   { id: "claude-code-settings", label: "Claude Code（~/.claude/settings.json）", agent: "claude-code" },
@@ -302,20 +303,6 @@ export default function Agents() {
               {t("agents.select.revokedHidden", { count: revokedHidden })}
             </span>
           ) : null}
-          <label className="field-inline">
-            <span>{t("agents.select.channel")}</span>
-            <select
-              className="input"
-              value={channel}
-              onChange={(e) => setChannel(e.target.value)}
-            >
-              {CHANNELS.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.label}
-                </option>
-              ))}
-            </select>
-          </label>
           {needsModel ? (
             <label className="field-inline">
               <span>{t("agents.select.model")}</span>
@@ -343,6 +330,31 @@ export default function Agents() {
           />
           <span>{t("agents.gatewayMode.label")}</span>
         </label>
+      </div>
+
+      {/*
+        M30-S2：把全部落点铺开成卡片。
+        每个 `CHANNELS` 条目一张独立卡（**不合并**同 agent 的多个落点）——
+        Codex / OpenCode / Cline 各自有多个目标文件，合并会让用户看不到真实可投递面。
+      */}
+      <div className="card">
+        <h3>{t("agents.picker.title", { count: CHANNELS.length })}</h3>
+        <p className="muted">{t("agents.picker.hint")}</p>
+        <div className="agent-grid">
+          {CHANNELS.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              className={"agent-choice" + (channel === c.id ? " selected" : "")}
+              aria-pressed={channel === c.id}
+              data-agent-channel={c.id}
+              onClick={() => setChannel(c.id)}
+            >
+              <span className="agent-choice-name">{c.label}</span>
+              <span className="agent-choice-id mono">{c.agent}</span>
+            </button>
+          ))}
+        </div>
       </div>
 
       {activeKey === null ? (

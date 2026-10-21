@@ -391,11 +391,14 @@
     "select": {
       "site": "Site",
       "key": "Key",
-      "channel": "Channel",
       "model": "Model",
       "modelPlaceholder": "e.g. gpt-4o",
       "keyPlaceholder": "(pick one)",
       "revokedHidden": "{count} revoked key(s) hidden (they are gone on the site and must not be delivered again)"
+    },
+    "picker": {
+      "title": "Supported agents ({count})",
+      "hint": "Every target is listed separately; pick one as this delivery destination."
     },
     "gatewayMode": {
       "label": "Point at local gateway: writes the gateway URL (/v1) and a local token, not the site key. To switch sites you only restart the gateway, no agent-side change. Requires the gateway to be running.",
