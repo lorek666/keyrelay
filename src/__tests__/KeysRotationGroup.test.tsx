@@ -102,6 +102,9 @@ function renderKeys() {
   qc.setQueryData(["sites"], SITES);
   qc.setQueryData(["stored-keys"], []);
   qc.setQueryData(["remote-keys", SITE_ID], []);
+  // M30-S1：分组倍率列会在页面打开时读缓存；这里预置空列表，把本文件隔离成
+  // 「轮换预览是否额外发请求」的纯本地断言（不把页面挂载时的展示请求算进来）。
+  qc.setQueryData(["groups", SITE_ID], []);
   // 轮换表是按「该轮换的密钥」渲染的，所以这里必须有一条到期的
   qc.setQueryData(["rotation-due"], DUE);
   return render(<Keys />, {

@@ -15,7 +15,8 @@
       "unknown": "Not signed in"
     },
     "rateUnknown": "Rate unknown",
-    "noUpdate": "No update available"
+    "noUpdate": "No update available",
+    "rateFree": "Free"
   },
   "nav": {
     "brand": "KeyRelay",
@@ -257,7 +258,8 @@
       "usage": "Usage",
       "action": "Action",
       "dueAt": "Due at",
-      "createdAt": "Created"
+      "createdAt": "Created",
+      "groupRate": "Group rate"
     },
     "usage": {
       "usedOverLimit": "Used {used} / {limit} {currency}",
