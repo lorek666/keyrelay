@@ -533,7 +533,7 @@ fn system_bin_dirs() -> [PathBuf; 3] {
     ]
 }
 
-fn find_bin(bin: &str, home: &Path) -> Option<PathBuf> {
+pub(crate) fn find_bin(bin: &str, home: &Path) -> Option<PathBuf> {
     let names: Vec<String> = if cfg!(windows) {
         vec![format!("{bin}.exe"), format!("{bin}.cmd"), bin.to_string()]
     } else {
@@ -557,6 +557,35 @@ fn find_bin(bin: &str, home: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// 更新执行用的 PATH（M34-S1 spec §4.4 第 4 条）：
+/// 家目录常见 bin + 系统目录 + 原 `PATH`，去重后按平台拼成字符串。
+///
+/// 为什么需要它：GUI 应用从 Finder/Dock 启动时 `PATH` 往往只有
+/// `/usr/bin:/bin:/usr/sbin:/sbin`，`npm` / `brew` 都在别处；更隐蔽的是
+/// `#!/usr/bin/env node` 的脚本会因找不到 `node` 而失败。注入这份 PATH 后，
+/// 子进程与用户终端里的行为一致。
+pub(crate) fn enriched_path(home: &Path) -> String {
+    let mut dirs: Vec<PathBuf> = home_bin_dirs(home)
+        .into_iter()
+        .chain(system_bin_dirs())
+        .collect();
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+
+    // 去重（保持首次出现顺序：家目录 bin 优先于系统目录）
+    let mut seen: Vec<PathBuf> = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        if !seen.iter().any(|existing| existing == &dir) {
+            seen.push(dir);
+        }
+    }
+
+    std::env::join_paths(seen)
+        .map(|paths| paths.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 #[cfg(unix)]
@@ -628,7 +657,7 @@ fn run_version(path: &Path, version_args: &[&str]) -> VersionRun {
     VersionRun::Ok(extract_version(&text))
 }
 
-fn read_to_string_async(
+pub(crate) fn read_to_string_async(
     mut reader: impl std::io::Read + Send + 'static,
 ) -> std::sync::mpsc::Receiver<String> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -655,7 +684,7 @@ fn read_to_string_async(
 }
 
 /// 取读线程已经读到的内容；最多等 500ms（管道被后台子孙继承时不会永远等）。
-fn read_available(rx: Option<std::sync::mpsc::Receiver<String>>) -> String {
+pub(crate) fn read_available(rx: Option<std::sync::mpsc::Receiver<String>>) -> String {
     let Some(rx) = rx else {
         return String::new();
     };
@@ -701,7 +730,7 @@ pub fn extract_version(output: &str) -> Option<String> {
 }
 
 /// 去 ANSI 转义（`ESC [ … m` 这类 SGR；版本命令偶尔带颜色）。
-fn strip_ansi(input: &str) -> String {
+pub(crate) fn strip_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {

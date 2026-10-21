@@ -2278,6 +2278,54 @@ pub async fn detect_agents(
         .map_err(|error| format!("Agent 探测线程异常退出：{error}"))
 }
 
+/// 检查 Agent 更新（M34-S1，**只读**）。
+///
+/// 先跑既有的 `detect_agents`（blocking 线程池），再按去重后的更新源并发拉最新版本
+/// （npm registry / Homebrew cask API / VS Code Marketplace 三个公开端点，不带任何凭证）。
+/// 单个源失败只影响对应通道，不整体报错；代理从 settings 解析，与 `detect_site` 同一份逻辑。
+#[tauri::command]
+pub async fn check_agent_updates(
+    state: State<'_, AppState>,
+) -> Result<Vec<keyrelay_core::agent_updates::AgentUpdateStatus>, String> {
+    let home = state.service.home().to_path_buf();
+    // 代理从 settings 解析，与 `detect_site` / 生产 transport 同一份 `resolve_proxy`（M10-S2）
+    let proxy = state.service.settings().ok().and_then(|s| {
+        let mode = keyrelay_core::proxy::ProxyMode::parse(&s.proxy_mode)
+            .unwrap_or(keyrelay_core::proxy::ProxyMode::Auto);
+        keyrelay_core::proxy::resolve_proxy(mode, &s.proxy_url)
+            .ok()
+            .flatten()
+            .map(|d| d.url)
+    });
+    let detect_home = home.clone();
+    let statuses = tauri::async_runtime::spawn_blocking(move || {
+        keyrelay_core::agents::detect_agents(&detect_home)
+    })
+    .await
+    .map_err(|error| format!("Agent 探测线程异常退出：{error}"))?;
+
+    Ok(keyrelay_core::agent_updates::check_agent_updates(&home, &statuses, proxy).await)
+}
+
+/// 执行一次白名单一键更新（M34-S1）。
+///
+/// **安全边界**：命令 argv 全部来自核心静态表 `agent_updates::specs()`，本命令只接收
+/// `channel`；不经 shell、不接受任何命令/参数/URL；`stdin = null`；每条策略独立超时并 kill。
+/// 未知 channel / 不支持一键更新的通道 ⇒ `Err(String)`（前端只在用户勾选同意后调用）。
+#[tauri::command]
+pub async fn update_agent(
+    state: State<'_, AppState>,
+    channel: String,
+) -> Result<keyrelay_core::agent_updates::AgentUpdateOutcome, String> {
+    let home = state.service.home().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        keyrelay_core::agent_updates::update_agent(&home, &channel)
+    })
+    .await
+    .map_err(|error| format!("更新线程异常退出：{error}"))?
+    .map_err(|error| error.to_string())
+}
+
 /// 用该密钥查询站点上**该分组可用**的模型 id（M32-S1）。
 ///
 /// 只读：密钥只经核心层 `key_secret`（唯一咽喉，已回收的 key 会被拒绝且不发请求），
