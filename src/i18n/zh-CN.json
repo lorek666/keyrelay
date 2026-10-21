@@ -15,7 +15,8 @@
       "unknown": "未登录"
     },
     "rateUnknown": "倍率未知",
-    "noUpdate": "没有可用的更新"
+    "noUpdate": "没有可用的更新",
+    "rateFree": "免费"
   },
   "nav": {
     "brand": "KeyRelay",
@@ -257,7 +258,8 @@
       "usage": "用量",
       "action": "操作",
       "dueAt": "到期时间",
-      "createdAt": "创建时间"
+      "createdAt": "创建时间",
+      "groupRate": "当前分组倍率"
     },
     "usage": {
       "usedOverLimit": "已用 {used} / {limit} {currency}",

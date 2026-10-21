@@ -1688,17 +1688,22 @@ export async function suggestKeyName(
 }
 
 /**
- * 分组倍率的展示口径（M6-S4 复审 P2-4 / P2-5 的裁决）。
+ * 分组倍率的展示口径（M30-S1 定稿；承 M6-S4 复审 P2-4 / P2-5、M12-S2 的「0 = 免费」裁决）。
  *
- * 只在**展示层**收紧，核心层不加校验：我们没有站点事实支撑「倍率 0 是不是合法值」
- * （有的部署可能用它表示免费分组），所以在核心层拒绝会改掉冻结接口的语义；
- * 而直接显示 `0` 或 `-1` 又会让用户以为「这个分组不要钱」。
+ * 只在**展示层**收紧，核心层不加校验 —— 但**0 是合法值**：它是「免费分组」的明确含义
+ * （M12-S2 已把它写进产品口径），早先把它并进「倍率未知」会让免费分组看起来像坏数据。
  *
- * 因此只渲染能确定是倍率的取值，其余一律显示为「倍率未知」——**绝不用 1.0 兜底**：
- * 那会让用户按错误的成本预期选分组，而选错分组的代价是真实的钱。
+ * - `null` / 非有限值 / **负数** ⇒ 「倍率未知」（我们无法确定负数代表什么，也不猜）；
+ * - `0` ⇒ 「免费」；
+ * - 正数 ⇒ `{rate}×`。
+ *
+ * **绝不用 1.0 兜底**：那会让用户按错误的成本预期选分组，而选错分组的代价是真实的钱。
  */
 export function formatGroupRate(rate: number | null): string {
-  if (rate === null || !Number.isFinite(rate) || rate <= 0) return translate(getCurrentDict(), "common.rateUnknown");
+  if (rate === null || !Number.isFinite(rate) || rate < 0) {
+    return translate(getCurrentDict(), "common.rateUnknown");
+  }
+  if (rate === 0) return translate(getCurrentDict(), "common.rateFree");
   return `${rate}×`;
 }
 

@@ -124,12 +124,14 @@ export default function Keys() {
   // 该轮换的密钥（FR-7）。纯本地判定：不联网、不读密钥。
   const rotation = useQuery({ queryKey: ["rotation-due"], queryFn: rotationDue });
 
-  // 站点侧分组与倍率（FR-2）。只在真的要建密钥时才问站点，且该站点类型得真有分组概念。
+  // 站点侧分组与倍率（FR-2 / M30-S1）：选中站点且该站点类型有分组概念就**页面打开即加载**——
+  // 密钥表的「当前分组倍率」列要用它；此前只在点「新建密钥」时才查，导致表格拿不到倍率。
   const groups = useQuery({
     queryKey: ["groups", activeSite],
     queryFn: () => availableGroups(activeSite!),
-    enabled: creating && activeSite !== null && (caps?.groups ?? false),
+    enabled: activeSite !== null && (caps?.groups ?? false),
     retry: false,
+    staleTime: 5 * 60 * 1000,
   });
 
   /**
@@ -140,6 +142,27 @@ export default function Keys() {
    * 这里按同一个映射把标识找回来，两个值一起交给后端。
    */
   const selectedGroup = (groups.data ?? []).find((option) => groupKeyOf(option) === group);
+
+  /**
+   * 某个分组标识对应的倍率（M30-S1）。
+   *
+   * 依次按**分组原生 id**、再按**分组名**匹配（与 `groupKeyOf` 的 id 优先判据一致）。
+   * 返回值三态：`undefined` = 没有分组 / 找不到（显示 `—`，**不猜测**）；
+   * `null` = 分组存在但站点没给倍率（显示「倍率未知」）；`number` = 站点的倍率。
+   */
+  function groupRateOf(groupKey: string | null | undefined): number | null | undefined {
+    if (!groupKey) return undefined;
+    const match = (groups.data ?? []).find(
+      (option) => option.id === groupKey || option.name === groupKey,
+    );
+    return match ? match.rate : undefined;
+  }
+
+  /** 「当前分组倍率」单元格：没有分组 / 找不到 ⇒ `—`；有分组 ⇒ 走 `formatGroupRate`。 */
+  const groupRateCell = (groupKey: string | null | undefined) => {
+    const rate = groupRateOf(groupKey);
+    return <td className="mono">{rate === undefined ? "—" : formatGroupRate(rate)}</td>;
+  };
 
   /**
    * 该站点的分组是否带**原生 id**（M19-S1 / 独立复审 P2-3）。
@@ -503,7 +526,7 @@ export default function Keys() {
                 <th>{t("keys.table.localId")}</th>
                 <th>{t("keys.table.name")}</th>
                 <th>{t("keys.table.group")}</th>
-                <th>{t("keys.table.remoteId")}</th>
+                <th>{t("keys.table.groupRate")}</th>
                 <th>{t("keys.table.status")}</th>
                 {/* M14-S3：用量列仅 keyUsage=true 时显示（spec §9）。数据来自 StoredKeyRow.quotaUsed/quotaLimit。 */}
                 {caps?.keyUsage && <th>{t("keys.table.usage")}</th>}
@@ -521,7 +544,7 @@ export default function Keys() {
                       <KeyRound size={13} aria-hidden /> {key.name}
                     </td>
                     <td className="mono">{key.group ?? "—"}</td>
-                    <td className="mono">{key.remoteId ?? "—"}</td>
+                    {groupRateCell(key.group)}
                     <td>
                       {/* `revoked`（我回收的·本地）与 `disabled`（站点禁的）**必须能分开**：
                           恢复方式不同，混成一个词会让用户不知道去哪处理（M7-S4）。 */}
@@ -580,7 +603,7 @@ export default function Keys() {
               <tr>
                 <th>{t("keys.table.name")}</th>
                 <th>{t("keys.table.group")}</th>
-                <th>{t("keys.table.remoteId")}</th>
+                <th>{t("keys.table.groupRate")}</th>
                 <th>{t("keys.table.status")}</th>
                 {caps?.keyUsage && <th>{t("keys.table.usage")}</th>}
                 <th>{t("keys.table.createdAt")}</th>
@@ -591,7 +614,7 @@ export default function Keys() {
                 <tr key={key.remoteId}>
                   <td>{key.name}</td>
                   <td className="mono">{key.group ?? "—"}</td>
-                  <td className="mono">{key.remoteId}</td>
+                  {groupRateCell(key.group)}
                   <td>
                     <span
                       className={`badge badge-${statusTone(key.status)}`}
@@ -675,7 +698,8 @@ export default function Keys() {
           <p className="muted">{t("keys.createDialog.groupUnboundWarn")}</p>
         ) : null}
         {(groups.data ?? []).some(
-          (option) => option.rate === null || !Number.isFinite(option.rate) || option.rate <= 0,
+          // M30-S1：0 = 免费分组，**不是**「倍率未知」——不要用 `<= 0`（会把免费误报成未知）。
+          (option) => option.rate === null || !Number.isFinite(option.rate) || option.rate < 0,
         ) ? (
           <p className="muted">{t("keys.createDialog.groupRateWarn")}</p>
         ) : null}
