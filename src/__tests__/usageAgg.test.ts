@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   emptyTotals,
+  formatCost,
   formatShare,
   formatTokens,
   groupByDay,
@@ -88,6 +89,14 @@ describe("usageAgg.groupByModel", () => {
     expect(rows[0].totalTokens).toBe(150);
     expect(rows[1].totalTokens).toBe(5);
   });
+
+  it("totalTokens 平局按码点序（不依赖运行环境的 locale）", () => {
+    const rows = groupByModel([
+      daily({ model: "b-model", totalTokens: 10 }),
+      daily({ model: "a-model", totalTokens: 10 }),
+    ]);
+    expect(rows.map((row) => row.model)).toEqual(["a-model", "b-model"]);
+  });
 });
 
 describe("usageAgg.groupByDay", () => {
@@ -170,8 +179,21 @@ describe("usageAgg.formatTokens", () => {
     expect(formatTokens(2_000_000)).toBe("2.0M");
   });
 
+  it("999.6 四舍五入到 1000 时走 K 档，不显示裸 1000", () => {
+    expect(formatTokens(999.6)).toBe("1.0K");
+  });
+
   it("非有限数返回占位符（不渲染 NaN）", () => {
     expect(formatTokens(Number.NaN)).toBe("—");
+  });
+});
+
+describe("usageAgg.formatCost", () => {
+  it("常规金额两位小数，小额四位（不把花过的钱显示成 0.00）", () => {
+    expect(formatCost(1.234)).toBe("1.23");
+    expect(formatCost(0)).toBe("0.00");
+    expect(formatCost(0.0012)).toBe("0.0012");
+    expect(formatCost(Number.NaN)).toBe("—");
   });
 });
 

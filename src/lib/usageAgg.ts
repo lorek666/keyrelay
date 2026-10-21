@@ -69,7 +69,13 @@ export function groupByModel(
   }
   return [...byModel.entries()]
     .map(([model, totals]) => ({ model, ...totals }))
-    .sort((a, b) => b.totalTokens - a.totalTokens || a.model.localeCompare(b.model));
+    .sort(
+      (a, b) =>
+        b.totalTokens - a.totalTokens ||
+        // 平局用码点序而不是 `localeCompare`（后者依赖运行环境的 locale，
+        // 同一份数据在不同机器上可能给出不同顺序——复审 P3-2）。
+        (a.model < b.model ? -1 : a.model > b.model ? 1 : 0),
+    );
 }
 
 /** 按本地日汇总：日期升序（`YYYY-MM-DD` 字符串序即日期序）。 */
@@ -174,7 +180,22 @@ export function formatTokens(n: number): string {
   const abs = Math.abs(n);
   if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (abs >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return `${Math.round(n)}`;
+  // 999.6 这类「不足 1000 但四舍五入到 1000」的值不能再显示成 "1000"：
+  // 先取整再判阈值，跨过 1000 就走 K 档（复审 P3-1）。
+  const rounded = Math.round(n);
+  if (Math.abs(rounded) >= 1_000) return `${(rounded / 1_000).toFixed(1)}K`;
+  return `${rounded}`;
+}
+
+/**
+ * 费用展示：小额保留 4 位小数，常规保留 2 位。
+ *
+ * `cost < 0.005` 时 `toFixed(2)` 会显示 `0.00`，让「花过钱」看起来像「没花钱」（复审 P3-4）。
+ */
+export function formatCost(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  if (n !== 0 && Math.abs(n) < 0.01) return n.toFixed(4);
+  return n.toFixed(2);
 }
 
 /** 占比文案：`25.0%`；总数 ≤ 0 时返回 `—`（「不知道」不当成 0%，与余额同纪律）。 */
