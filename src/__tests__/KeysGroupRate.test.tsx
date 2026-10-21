@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
@@ -74,6 +74,7 @@ const GROUPS: Group[] = [
   { id: "2", name: "gpt plus", rate: 0.085, description: null },
   { id: "3", name: "free", rate: 0, description: null },
   { id: "4", name: "自用", rate: 1, description: null },
+  { id: "5", name: "未定价", rate: null, description: null }, // i18n:skip
 ];
 
 function storedKey(
@@ -100,6 +101,7 @@ const KEYS: StoredKeyRow[] = [
   storedKey(2, "k-plus", "gpt plus", "22"),
   storedKey(3, "k-nogroup", null, "23"),
   storedKey(4, "k-unknown-group", "已删除的分组", "24"),
+  storedKey(5, "k-null-rate", "未定价", "25"), // i18n:skip
 ];
 
 const REMOTE: KeyRow[] = [
@@ -110,13 +112,17 @@ const REMOTE: KeyRow[] = [
 function renderKeys({
   groups = GROUPS,
   groupsReject = false,
+  preloadGroups = true,
   sites = SITES,
 }: {
   groups?: Group[];
   groupsReject?: boolean;
+  /** `false` ⇒ 不预置缓存，用来证明页面挂载时真的会去站点拉分组（M30-S1 复审 P2-1）。 */
+  preloadGroups?: boolean;
   sites?: SiteRow[];
 } = {}) {
   vi.mocked(suggestKeyName).mockResolvedValue("codex/agent/20261021");
+  vi.mocked(availableGroups).mockClear();
   vi.mocked(availableGroups).mockImplementation(async () => {
     if (groupsReject) throw new Error("站点不可用（测试注入）");
     return groups;
@@ -128,7 +134,7 @@ function renderKeys({
   qc.setQueryData(["stored-keys"], KEYS);
   qc.setQueryData(["rotation-due"], []);
   qc.setQueryData(["remote-keys", SITE_ID], REMOTE);
-  if (!groupsReject) qc.setQueryData(["groups", SITE_ID], groups);
+  if (!groupsReject && preloadGroups) qc.setQueryData(["groups", SITE_ID], groups);
   return render(<Keys />, {
     wrapper: ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={qc}>
@@ -180,7 +186,7 @@ describe("M30-S1 分组倍率展示", () => {
     expect(headers).toContain(zhCN.keys.table.groupRate);
   });
 
-  it("本地密钥表：0 倍率显示免费、0.085 显示 0.085×、无分组 / 找不到显示 —", () => {
+  it("本地密钥表：0 倍率显示免费、0.085 显示 0.085×、无分组 / 找不到 / 未定价显示对应值", () => {
     renderKeys();
     const table = tableWithHeader(zhCN.keys.table.groupRate);
 
@@ -191,8 +197,17 @@ describe("M30-S1 分组倍率展示", () => {
     expect(rowCellsOf(table, "k-plus")).toContain("0.085×");
     expect(rowCellsOf(table, "k-nogroup")).toContain("—");
     expect(rowCellsOf(table, "k-unknown-group")).toContain("—");
+    // 分组存在但站点没给倍率 ⇒ 未知，不是「免费」，也不是 1×。
+    expect(rowCellsOf(table, "k-null-rate")).toContain(zhCN.common.rateUnknown);
     // 绝不回落 1×
     expect(rowCellsOf(table, "k-unknown-group")).not.toContain("1×");
+  });
+
+  it("页面打开即加载分组倍率（不需要先点「新建密钥」）", async () => {
+    renderKeys({ preloadGroups: false });
+    const table = tableWithHeader(zhCN.keys.table.groupRate);
+    await waitFor(() => expect(rowCellsOf(table, "k-plus")).toContain("0.085×"));
+    expect(availableGroups).toHaveBeenCalledTimes(1);
   });
 
   it("站点侧对照表：同样按分组名匹配倍率、无「远端 id」列", () => {
