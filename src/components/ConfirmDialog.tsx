@@ -54,7 +54,7 @@ export default function ConfirmDialog({
   }, [onCancel]);
 
   return (
-    <dialog ref={ref} className="dialog" aria-label={title}>
+    <dialog ref={ref} className="dialog confirm-dialog" aria-label={title}>
       <h2>{title}</h2>
       <div className="dialog-body">{children}</div>
       <div className="dialog-actions">

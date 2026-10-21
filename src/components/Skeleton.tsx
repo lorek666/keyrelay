@@ -15,7 +15,7 @@ export default function Skeleton({
 }) {
   const count = Math.max(1, rows);
   return (
-    <div className="skeleton-wrap" aria-hidden>
+    <div className="skeleton-wrap" aria-hidden data-skeleton-variant={variant}>
       {Array.from({ length: count }, (_, i) => (
         <div
           key={i}

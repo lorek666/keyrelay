@@ -328,7 +328,7 @@ export default function Agents() {
   }, [plan.data?.consent, t]);
 
   return (
-    <section>
+    <section className="page">
       <p className="muted">{t("agents.intro")}</p>
 
       {notice ? <p className="ok" role="status">{notice}</p> : null}
@@ -395,7 +395,7 @@ export default function Agents() {
         M31-S1：单列工作台。一行一个落点——**不合并**同 agent 的多个目标文件
         （Codex / OpenCode / Cline 各有多处落点，合并会让用户看不到真实可投递面）。
       */}
-      <div className="card">
+      <div className="card agents-workbench">
         <h3>{t("agents.workbench.title", { count: CHANNELS.length })}</h3>
         <p className="muted">{t("agents.workbench.hint")}</p>
         {revokedHidden > 0 ? (
@@ -851,7 +851,7 @@ function InstallDialog({
   };
 
   return (
-    <dialog ref={ref} className="dialog" aria-label={t("agents.install.title", { name: label })}>
+    <dialog ref={ref} className="dialog install-dialog" aria-label={t("agents.install.title", { name: label })}>
       <h2>{t("agents.install.title", { name: label })}</h2>
       <div className="dialog-body">
         <p className="muted">{t("agents.install.hint")}</p>

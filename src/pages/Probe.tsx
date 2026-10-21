@@ -97,80 +97,89 @@ export default function Probe() {
     <div className="page probe-page">
       <section className="card">
         <h2>{t("probe.target")}</h2>
-        <label>
-          <span>{t("probe.site")}</span>
-          <select
-            value={activeSiteId ?? ""}
-            onChange={(e) => {
-              setSiteId(e.target.value ? Number(e.target.value) : null);
-              setKeyId(null);
-            }}
-          >
-            {(sites.data ?? []).map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.displayName || s.baseUrl}
+        <div className="probe-form">
+          <label className="probe-field">
+            <span>{t("probe.site")}</span>
+            <select
+              className="input"
+              value={activeSiteId ?? ""}
+              onChange={(e) => {
+                setSiteId(e.target.value ? Number(e.target.value) : null);
+                setKeyId(null);
+              }}
+            >
+              {(sites.data ?? []).map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.displayName || s.baseUrl}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="probe-field">
+            <span>{t("probe.key")}</span>
+            <select
+              className="input"
+              value={keyId ?? ""}
+              onChange={(e) => setKeyId(e.target.value ? Number(e.target.value) : null)}
+              disabled={siteKeys.length === 0}
+            >
+              <option value="">
+                {siteKeys.length === 0 ? t("probe.noKey") : t("probe.selectKey")}
               </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          <span>{t("probe.key")}</span>
-          <select
-            value={keyId ?? ""}
-            onChange={(e) => setKeyId(e.target.value ? Number(e.target.value) : null)}
-            disabled={siteKeys.length === 0}
-          >
-            <option value="">
-              {siteKeys.length === 0 ? t("probe.noKey") : t("probe.selectKey")}
-            </option>
-            {siteKeys.map((k) => (
-              <option key={k.id} value={k.id}>
-                {k.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          <span>{t("probe.modelId")}</span>
-          <input
-            value={modelId}
-            onChange={(e) => setModelId(e.target.value)}
-            placeholder="vendor/model-name"
-          />
-        </label>
-        <label>
-          <span>{t("probe.claimedModel")}</span>
-          <input
-            value={claimedModel}
-            onChange={(e) => setClaimedModel(e.target.value)}
-            placeholder={modelId || "vendor/model-name"}
-          />
-        </label>
-        <label>
-          <span>{t("probe.baseUrl")}</span>
-          <input
-            value={baseUrlOverride}
-            onChange={(e) => setBaseUrlOverride(e.target.value)}
-            placeholder={defaultBaseUrl}
-          />
-        </label>
-        <label className="checkbox-row">
-          <input
-            type="checkbox"
-            checked={agreed}
-            onChange={(e) => setAgreed(e.target.checked)}
-          />
-          <span>{t("probe.consent")}</span>
-        </label>
-        {mutation.isPending ? (
-          <button className="btn primary" disabled>
-            <Loader2 size={14} className="spin" /> {t("probe.running")}
-          </button>
-        ) : (
-          <button className="btn primary" onClick={submit} disabled={!canSubmit}>
-            <FlaskConical size={14} /> {t("probe.start")}
-          </button>
-        )}
+              {siteKeys.map((k) => (
+                <option key={k.id} value={k.id}>
+                  {k.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="probe-field">
+            <span>{t("probe.modelId")}</span>
+            <input
+              className="input"
+              value={modelId}
+              onChange={(e) => setModelId(e.target.value)}
+              placeholder="vendor/model-name"
+            />
+          </label>
+          <label className="probe-field">
+            <span>{t("probe.claimedModel")}</span>
+            <input
+              className="input"
+              value={claimedModel}
+              onChange={(e) => setClaimedModel(e.target.value)}
+              placeholder={modelId || "vendor/model-name"}
+            />
+          </label>
+          <label className="probe-field probe-field-wide">
+            <span>{t("probe.baseUrl")}</span>
+            <input
+              className="input"
+              value={baseUrlOverride}
+              onChange={(e) => setBaseUrlOverride(e.target.value)}
+              placeholder={defaultBaseUrl}
+            />
+          </label>
+          <label className="checkbox-row probe-field probe-field-wide probe-consent">
+            <input
+              type="checkbox"
+              checked={agreed}
+              onChange={(e) => setAgreed(e.target.checked)}
+            />
+            <span>{t("probe.consent")}</span>
+          </label>
+          <div className="probe-actions">
+            {mutation.isPending ? (
+              <button className="btn btn-primary" disabled>
+                <Loader2 size={14} className="spinning" /> {t("probe.running")}
+              </button>
+            ) : (
+              <button className="btn btn-primary" onClick={submit} disabled={!canSubmit}>
+                <FlaskConical size={14} /> {t("probe.start")}
+              </button>
+            )}
+          </div>
+        </div>
         {mutation.isPending ? (
           <div className="probe-progress">
             <p className="mono">{t("probe.elapsed", { time: formatElapsed(elapsedMs) })}</p>
@@ -194,12 +203,12 @@ export default function Probe() {
 
       <section className="card">
         <h2>{t("probe.history")}</h2>
-        {history.isLoading ? <p>{t("probe.loading")}</p> : null}
+        {history.isLoading ? <p className="empty">{t("probe.loading")}</p> : null}
         {history.data && history.data.length === 0 ? (
-          <p>{t("probe.empty")}</p>
+          <p className="empty">{t("probe.empty")}</p>
         ) : null}
         {history.data && history.data.length > 0 ? (
-          <table className="probe-history-table">
+          <table className="table probe-history-table">
             <thead>
               <tr>
                 <th>{t("probe.colTime")}</th>

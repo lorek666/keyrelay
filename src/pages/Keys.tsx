@@ -162,7 +162,11 @@ export default function Keys() {
   /** 「当前分组倍率」单元格：没有分组 / 找不到 ⇒ `—`；有分组 ⇒ 走 `formatGroupRate`。 */
   const groupRateCell = (groupKey: string | null | undefined) => {
     const rate = groupRateOf(groupKey);
-    return <td className="mono">{rate === undefined ? "—" : formatGroupRate(rate)}</td>;
+    return (
+      <td className="mono">
+        <span className="rate-pill">{rate === undefined ? "—" : formatGroupRate(rate)}</span>
+      </td>
+    );
   };
 
   /**
@@ -369,14 +373,14 @@ export default function Keys() {
   }
 
   return (
-    <section>
+    <section className="page">
 
       {sites.data?.length === 0 ? (
-        <p className="muted">{t("keys.empty")}</p>
+        <p className="muted empty">{t("keys.empty")}</p>
       ) : null}
 
       <div className="card">
-        <div className="row row-between">
+        <div className="row row-between keys-toolbar">
           <div className="row">
             <label className="field-inline">
               <span>{t("keys.siteSelect")}</span>
@@ -460,7 +464,7 @@ export default function Keys() {
 
         {rotationResult ? <div className="warnbox" role="status">{renderRun(rotationResult)}</div> : null}
 
-        <div className="row">
+        <div className="row keys-sync">
           {/* 对齐站点密钥 = 列举站点令牌 + 读回明文，两者缺一不可（M7-S2 §3.3） */}
           <CapButton
             allowed={syncAllowed(caps)}
@@ -510,17 +514,18 @@ export default function Keys() {
 
         {keys.isLoading ? <Skeleton rows={3} /> : null}
         {keys.isError ? (
-          <p className="muted">{t("keys.emptyStates.keysError", { error: (keys.error as Error).message })}</p>
+          <p className="muted empty">{t("keys.emptyStates.keysError", { error: (keys.error as Error).message })}</p>
         ) : null}
         {keys.data?.length === 0 ? (
-          <p className="muted">{t("keys.emptyStates.noKeys")}</p>
+          <p className="muted empty">{t("keys.emptyStates.noKeys")}</p>
         ) : null}
         {/* 两种空不能混成一句：「本地一把都没有」与「这个站下没有」处理方式不同 */}
         {keys.data?.length && siteKeys.length === 0 ? (
-          <p className="muted">{t("keys.emptyStates.noSiteKeys", { count: keys.data.length })}</p>
+          <p className="muted empty">{t("keys.emptyStates.noSiteKeys", { count: keys.data.length })}</p>
         ) : null}
 
         {siteKeys.length ? (
+          <div className="table-wrap">
           <table className="table">
             <thead>
               <tr>
@@ -542,7 +547,9 @@ export default function Keys() {
                   <tr key={key.id}>
                     <td className="mono">{key.id}</td>
                     <td>
-                      <KeyRound size={13} aria-hidden /> {key.name}
+                      <span className="key-name">
+                        <KeyRound size={13} aria-hidden /> {key.name}
+                      </span>
                     </td>
                     <td className="mono">{key.group ?? "—"}</td>
                     {groupRateCell(key.group)}
@@ -584,6 +591,7 @@ export default function Keys() {
               })}
             </tbody>
           </table>
+          </div>
         ) : null}
 
         <p className="muted">{t("keys.footnote")}</p>
@@ -599,6 +607,7 @@ export default function Keys() {
           <p className="muted">{t("keys.remote.error", { error: (remote.error as Error).message })}</p>
         ) : null}
         {remote.data?.length ? (
+          <div className="table-wrap">
           <table className="table">
             <thead>
               <tr>
@@ -632,6 +641,7 @@ export default function Keys() {
               ))}
             </tbody>
           </table>
+          </div>
         ) : null}
       </div>
 

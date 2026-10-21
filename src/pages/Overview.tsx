@@ -53,7 +53,7 @@ export default function Overview() {
   );
 
   return (
-    <section>
+    <section className="page">
       <div className="cards">
         <Stat
           icon={<Server size={16} aria-hidden />}
@@ -74,15 +74,17 @@ export default function Overview() {
           icon={<AlertTriangle size={16} aria-hidden />}
           label={t("overview.stat.alerts")}
           value={warnings.length}
+          tone={warnings.length > 0 ? "warn" : undefined}
         />
         <Stat
           icon={<ShieldCheck size={16} aria-hidden />}
           label={t("overview.stat.drift")}
           value={drifted.length}
+          tone={drifted.length > 0 ? "warn" : undefined}
         />
       </div>
 
-      <div className="card">
+      <div className="card run-state">
         <h3>{t("overview.runState.title")}</h3>
         <dl className="kv">
           <dt>{t("overview.runState.mode")}</dt>
@@ -310,15 +312,18 @@ function Stat({
   icon,
   label,
   value,
+  tone,
 }: {
   icon: React.ReactNode;
   label: string;
   value: number | string;
+  /** M33-S1：>0 的告警类指标给告警色调（中性时不传，样式与文案都不变）。 */
+  tone?: "warn" | "danger";
 }) {
   return (
-    <div className="stat">
+    <div className={tone ? `stat stat-${tone}` : "stat"}>
+      <span className="stat-icon">{icon}</span>
       <div className="stat-label">
-        {icon}
         <span>{label}</span>
       </div>
       <div className="stat-value">{value}</div>
