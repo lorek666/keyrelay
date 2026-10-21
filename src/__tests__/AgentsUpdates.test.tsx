@@ -406,6 +406,45 @@ describe("M34-S1 Agent 更新", () => {
     expect(document.querySelector('p.ok[role="status"]')!.textContent).not.toContain("更新到");
   });
 
+  it("⑧ 复审 P2-1：命令成功但更新后读不到版本，不谎报「已更新到未知」", async () => {
+    (updateAgent as unknown as { mockImplementationOnce: (fn: () => Promise<unknown>) => void })
+      .mockImplementationOnce(async () => ({
+        channel: "codex-auth-json",
+        success: true,
+        attempts: [
+          {
+            label: "自更新",
+            command: "codex update",
+            skipped: false,
+            success: true,
+            exitCode: 0,
+            timedOut: false,
+            outputTail: "",
+          },
+        ],
+        versionBefore: "0.162.1",
+        versionAfter: null,
+        versionChanged: true,
+        message: "命令执行成功，但更新后无法读取版本，请重新检测",
+      }));
+
+    renderPage();
+    await waitForUpdates();
+    fireEvent.click(row("codex-auth-json").querySelector(".agent-row-update")!);
+    await waitFor(() => expect(dialog()).not.toBeNull());
+    fireEvent.click(agreeBox());
+    await waitFor(() => expect(confirmButton().disabled).toBe(false));
+    fireEvent.click(confirmButton());
+
+    await waitFor(() => {
+      const ok = document.querySelector('p.ok[role="status"]');
+      expect(ok?.textContent ?? "").toContain("无法读取版本");
+    });
+    const text = document.querySelector('p.ok[role="status"]')!.textContent ?? "";
+    expect(text).not.toContain("更新到");
+    expect(text).not.toContain("未知");
+  });
+
   it("⑥ checkAgentUpdates 失败：汇总卡显示错误 + 重试，20 行照常渲染", async () => {
     const { checkAgentUpdates } = await import("../lib/api");
     (checkAgentUpdates as unknown as { mockRejectedValueOnce: (e: Error) => void }).mockRejectedValueOnce(

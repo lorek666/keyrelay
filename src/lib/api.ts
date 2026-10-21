@@ -1706,6 +1706,20 @@ export async function detectAgents(): Promise<AgentStatus[]> {
         ],
         installUrl: "https://chatgpt.com/codex",
       },
+      "codex-config": {
+        // 与 codex-auth-json 共用同一个 `codex` 二进制：真实后端两条通道的探测结果必然同时为
+        // installed。mock 里不补这一条会让「可更新 3」与页面上的 2 个徽标对不上（M34-S1 视觉走查）。
+        channel: "codex-config",
+        installed: true,
+        version: "0.162.1",
+        source: "/Users/you/.npm-global/bin/codex",
+        detail: null,
+        installCommands: [
+          { via: "script", command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh" },
+          { via: "npm", command: "npm install -g @openai/codex" },
+        ],
+        installUrl: "https://chatgpt.com/codex",
+      },
       "claude-code-settings": {
         channel: "claude-code-settings",
         installed: true,
@@ -1717,6 +1731,17 @@ export async function detectAgents(): Promise<AgentStatus[]> {
           { via: "npm", command: "npm install -g @anthropic-ai/claude-code" },
         ],
         installUrl: "https://code.claude.com/docs",
+      },
+      "grok-build": {
+        channel: "grok-build",
+        installed: true,
+        version: "1.0.50",
+        source: "/Users/you/.grok/bin/grok",
+        detail: null,
+        installCommands: [
+          { via: "script", command: "curl -fsSL https://x.ai/cli/install.sh | bash" },
+        ],
+        installUrl: "https://x.ai/cli",
       },
       dsh: {
         channel: "dsh",
@@ -1871,15 +1896,15 @@ export async function checkAgentUpdates(): Promise<AgentUpdateStatus[]> {
       },
       "grok-build": {
         channel: "grok-build",
-        installed: false,
-        currentVersion: null,
+        installed: true,
+        currentVersion: "1.0.50",
         latestVersion: null,
         state: "unsupported",
         source: "none",
         autoUpdate: false,
         command: null,
         manualUrl: "https://x.ai/cli",
-        message: null,
+        message: "该 Agent 没有公开版本源，无法自动检查更新", // i18n:skip mock 复刻后端静态文案
       },
     };
     return mock(Object.values(AGENT_CHANNELS).map((channel) => known[channel] ?? notInstalled(channel)));

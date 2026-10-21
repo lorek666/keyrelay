@@ -524,16 +524,20 @@ export default function Agents() {
           </p>
         ) : null}
 
-        {/* 结果：成功走 p.ok[role=status]（含 from → to），失败走 warnbox 逐条列 attempts。 */}
+        {/* 结果：成功走 p.ok[role=status]（含 from → to），失败走 warnbox 逐条列 attempts。
+            复审 P2-1：`versionAfter === null` 时**不得**说「已更新到未知」——后端已给了准确
+            话术（「更新后无法读取版本」），这里用同义的 i18n 文案，不用 `versionUnknown` 拼接。 */}
         {updateOutcome ? (
           updateOutcome.success ? (
             <p className="ok" role="status">
-              {updateOutcome.versionChanged
-                ? t("agents.update.success", {
-                    from: updateOutcome.versionBefore ?? t("agents.update.versionUnknown"),
-                    to: updateOutcome.versionAfter ?? t("agents.update.versionUnknown"),
-                  })
-                : t("agents.update.unchanged")}
+              {updateOutcome.versionAfter === null
+                ? t("agents.update.versionUnreadable")
+                : updateOutcome.versionChanged
+                  ? t("agents.update.success", {
+                      from: updateOutcome.versionBefore ?? t("agents.update.versionUnknown"),
+                      to: updateOutcome.versionAfter,
+                    })
+                  : t("agents.update.unchanged")}
             </p>
           ) : (
             <div className="warnbox" role="alert">
