@@ -597,40 +597,42 @@ export default function Agents() {
       <div className="card">
         <h3>{t("agents.consents.title", { count: consents.data?.length ?? 0 })}</h3>
         {consents.data?.length ? (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>{t("agents.consents.table.agent")}</th>
-                <th>{t("agents.consents.table.channel")}</th>
-                <th>{t("agents.consents.table.target")}</th>
-                <th>{t("agents.consents.table.fields")}</th>
-                <th>{t("agents.consents.table.state")}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {consents.data.map((row) => (
-                <tr key={`${row.agentId}-${row.channel}-${row.targetPath}`}>
-                  <td>{row.agentId}</td>
-                  <td className="mono">{row.channel}</td>
-                  <td className="mono ellipsis" title={row.targetPath}>
-                    {row.targetPath}
-                  </td>
-                  <td className="mono">{row.fields}</td>
-                  <td>
-                    {row.revokedAt ? (
-                      <span className="badge badge-warn" title={formatTs(row.revokedAt)}>
-                        {t("agents.consents.revoked", { ts: formatTs(row.revokedAt) })}
-                      </span>
-                    ) : (
-                      <span className="badge badge-ok" title={formatTs(row.grantedAt)}>
-                        {t("agents.consents.valid", { ts: formatTs(row.grantedAt) })}
-                      </span>
-                    )}
-                  </td>
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>{t("agents.consents.table.agent")}</th>
+                  <th>{t("agents.consents.table.channel")}</th>
+                  <th>{t("agents.consents.table.target")}</th>
+                  <th>{t("agents.consents.table.fields")}</th>
+                  <th>{t("agents.consents.table.state")}</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {consents.data.map((row) => (
+                  <tr key={`${row.agentId}-${row.channel}-${row.targetPath}`}>
+                    <td>{row.agentId}</td>
+                    <td className="mono">{row.channel}</td>
+                    <td className="mono ellipsis" title={row.targetPath}>
+                      {row.targetPath}
+                    </td>
+                    <td className="mono">{row.fields}</td>
+                    <td>
+                      {row.revokedAt ? (
+                        <span className="badge badge-warn" title={formatTs(row.revokedAt)}>
+                          {t("agents.consents.revoked", { ts: formatTs(row.revokedAt) })}
+                        </span>
+                      ) : (
+                        <span className="badge badge-ok" title={formatTs(row.grantedAt)}>
+                          {t("agents.consents.valid", { ts: formatTs(row.grantedAt) })}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         ) : (
           <p className="muted">{t("agents.consents.empty")}</p>
         )}

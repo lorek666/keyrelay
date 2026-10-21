@@ -208,32 +208,34 @@ export default function Probe() {
           <p className="empty">{t("probe.empty")}</p>
         ) : null}
         {history.data && history.data.length > 0 ? (
-          <table className="table probe-history-table">
-            <thead>
-              <tr>
-                <th>{t("probe.colTime")}</th>
-                <th>{t("probe.colSite")}</th>
-                <th>{t("probe.colModel")}</th>
-                <th>{t("probe.colVerdict")}</th>
-                <th>{t("probe.colStatus")}</th>
-                <th>{t("probe.colTrueModel")}</th>
-                <th>{t("probe.colConfidence")}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {history.data.map((r: ProbeRunRow) => (
-                <tr key={r.id}>
-                  <td>{new Date(r.recordedAt * 1000).toLocaleString()}</td>
-                  <td>{siteName(sites.data, r.siteId)}</td>
-                  <td className="mono">{r.modelId}</td>
-                  <td>{verdictLabel(r.verdictStatus)}</td>
-                  <td>{runStatusLabel(r.status)}</td>
-                  <td className="mono">{r.trueModel ?? "—"}</td>
-                  <td>{r.confidence ?? "—"}</td>
+          <div className="table-wrap">
+            <table className="table probe-history-table">
+              <thead>
+                <tr>
+                  <th>{t("probe.colTime")}</th>
+                  <th>{t("probe.colSite")}</th>
+                  <th>{t("probe.colModel")}</th>
+                  <th>{t("probe.colVerdict")}</th>
+                  <th>{t("probe.colStatus")}</th>
+                  <th>{t("probe.colTrueModel")}</th>
+                  <th>{t("probe.colConfidence")}</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {history.data.map((r: ProbeRunRow) => (
+                  <tr key={r.id}>
+                    <td>{new Date(r.recordedAt * 1000).toLocaleString()}</td>
+                    <td>{siteName(sites.data, r.siteId)}</td>
+                    <td className="mono">{r.modelId}</td>
+                    <td>{verdictLabel(r.verdictStatus)}</td>
+                    <td>{runStatusLabel(r.status)}</td>
+                    <td className="mono">{r.trueModel ?? "—"}</td>
+                    <td>{r.confidence ?? "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         ) : null}
       </section>
     </div>
