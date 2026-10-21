@@ -394,7 +394,10 @@
       "model": "Model",
       "modelPlaceholder": "e.g. gpt-4o",
       "keyPlaceholder": "(pick one)",
-      "revokedHidden": "{count} revoked key(s) hidden (they are gone on the site and must not be delivered again)"
+      "revokedHidden": "{count} revoked key(s) hidden (they are gone on the site and must not be delivered again)",
+      "modelLoading": "Loading models…",
+      "modelFetchFailed": "Could not load the model list; you can type one manually",
+      "modelEmpty": "This group has no available models; you can type one manually"
     },
     "gatewayMode": {
       "label": "Point at local gateway: writes the gateway URL (/v1) and a local token, not the site key. To switch sites you only restart the gateway, no agent-side change. Requires the gateway to be running.",

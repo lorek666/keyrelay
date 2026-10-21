@@ -86,9 +86,10 @@ describe("M31-S1 Agent 工作台（行列表）", () => {
     for (const c of CHANNELS) {
       const el = document.querySelector<HTMLElement>(`[data-agent-channel="${c.id}"]`)!;
       expect(el.getAttribute("data-agent-name")).toBe(c.agent);
-      // 名称与目标文件分开显示（目标文件在 `.agent-row-target` 里）
+      // M32-S1：行内不再显示目标文件路径（`.agent-row-target` 已移除），
+      // 只断言名称仍在——去掉路径不能把名称也弄丢。
       expect(el.querySelector(".agent-row-name")?.textContent).toBeTruthy();
-      expect(el.querySelector(".agent-row-target")?.textContent).toBeTruthy();
+      expect(el.querySelector(".agent-row-target")).toBeNull();
     }
   });
 

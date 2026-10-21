@@ -57,6 +57,13 @@ vi.mock("../lib/api", async (importOriginal) => {
               installCommands: [{ via: "npm", command: `npm i -g ${c.id}` }], installUrl: "https://example.test/install" },
       );
     }),
+    // M32-S1：模型清单按 keyId 返回（与任务书一致）
+    listKeyModels: vi.fn(async (keyId: number) => {
+      if (keyId === 101) return ["model-a", "model-b"];
+      if (keyId === 102) return ["model-c", "gpt-x"];
+      if (keyId === 201) return ["model-b"];
+      return [];
+    }),
     deliveryPlan: vi.fn(async () => ({
       agentId: "codex", channel: "codex-auth-json", targetPath: "/home/u/.codex/auth.json",
       targetExists: true, mode: "site", fields: [], endpointInChannel: false,
@@ -70,7 +77,15 @@ import { deliveryPlan } from "../lib/api";
 const rows = () => Array.from(document.querySelectorAll<HTMLElement>("[data-agent-channel]"));
 const row = (id: string) => document.querySelector<HTMLElement>(`[data-agent-channel="${id}"]`)!;
 const keySelect = (id: string) => row(id).querySelector<HTMLSelectElement>(".agent-row-key")!;
-const modelInput = (id: string) => row(id).querySelector<HTMLInputElement>(".agent-row-model")!;
+/** 模型控件：有清单时是 <select>，回退时是 <input>。两者都用同一个 class。 */
+const modelControl = (id: string) =>
+  row(id).querySelector<HTMLSelectElement | HTMLInputElement>(".agent-row-model")!;
+const modelSelect = (id: string) => row(id).querySelector<HTMLSelectElement>("select.agent-row-model")!;
+/** 当前模型下拉的全部 option value（loading 时只有占位项 ''）。 */
+const optionValues = (id: string) =>
+  Array.from(row(id).querySelector<HTMLSelectElement>("select.agent-row-model")?.options ?? []).map(
+    (o) => o.value,
+  );
 
 function renderPage() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -136,11 +151,15 @@ describe("M31-S1 Agent 工作台", () => {
 
     // 第 1 行：key=101 / model=model-a
     fireEvent.change(keySelect("claude-code-settings"), { target: { value: "101" } });
-    fireEvent.change(modelInput("claude-code-settings"), { target: { value: "model-a" } });
+    await waitFor(() =>
+      expect(optionValues("claude-code-settings")).toContain("model-a"),
+    );
+    fireEvent.change(modelSelect("claude-code-settings"), { target: { value: "model-a" } });
 
     // 第 2 行：key=102 / model=model-b
     fireEvent.change(keySelect("opencode"), { target: { value: "102" } });
-    fireEvent.change(modelInput("opencode"), { target: { value: "model-b" } });
+    await waitFor(() => expect(optionValues("opencode")).toContain("model-c"));
+    fireEvent.change(modelSelect("opencode"), { target: { value: "model-c" } });
 
     await waitFor(() => expect(keySelect("claude-code-settings").value).toBe("101"));
     expect(keySelect("opencode").value).toBe("102");
@@ -157,7 +176,7 @@ describe("M31-S1 Agent 工作台", () => {
         expect(raw).toBeTruthy();
         const parsed = JSON.parse(raw!);
         expect(parsed["claude-code-settings"].model).toBe("model-a");
-        expect(parsed.opencode.model).toBe("model-b");
+        expect(parsed.opencode.model).toBe("model-c");
       },
       { timeout: 2000 },
     );
@@ -171,7 +190,10 @@ describe("M31-S1 Agent 工作台", () => {
     renderPage();
     await waitFor(() => expect(keySelect("claude-code-settings")).not.toBeNull());
     await waitFor(() => expect(keySelect("claude-code-settings").value).toBe("102"));
-    expect(modelInput("claude-code-settings").value).toBe("restored-model");
+    // 102 的清单是 ["model-c","gpt-x"]，"restored-model" 不在里面
+    // ⇒ 必须追加为同值 option 并保持选中（不得静默清空）
+    await waitFor(() => expect(modelSelect("claude-code-settings")).not.toBeNull());
+    expect(modelSelect("claude-code-settings").value).toBe("restored-model");
   });
 
   it("⑥ 切换站点加载该站点偏好，不串台", async () => {
@@ -190,7 +212,7 @@ describe("M31-S1 Agent 工作台", () => {
     fireEvent.change(siteSelect, { target: { value: String(SITE_B) } });
 
     await waitFor(() => expect(keySelect("claude-code-settings").value).toBe("201"));
-    expect(modelInput("claude-code-settings").value).toBe("b");
+    expect(modelSelect("claude-code-settings").value).toBe("b");
   });
 
   it("⑦ 展开行把该行参数交给 deliveryPlan；未安装行不调用", async () => {
@@ -223,7 +245,8 @@ describe("M31-S1 Agent 工作台", () => {
     await waitFor(() => expect(keySelect("opencode")).not.toBeNull());
 
     fireEvent.change(keySelect("opencode"), { target: { value: "102" } });
-    fireEvent.change(modelInput("opencode"), { target: { value: "gpt-x" } });
+    await waitFor(() => expect(optionValues("opencode")).toContain("gpt-x"));
+    fireEvent.change(modelSelect("opencode"), { target: { value: "gpt-x" } });
     // 模型输入有 400ms 防抖；等它进查询键后再展开，否则 plan 拿到的是空 model。
     await new Promise((resolve) => setTimeout(resolve, 450));
     // 页面上唯一的 checkbox 是顶部「指向本地网关」
@@ -238,6 +261,71 @@ describe("M31-S1 Agent 工作台", () => {
       model: "gpt-x",
       mode: "gateway",
     });
+  });
+
+  // ------------------------------------------------------------------ M32-S1
+
+  it("⑫ 20 行都没有 .agent-row-target，页面文本不含 ~/.mimocode/", async () => {
+    renderPage();
+    await waitFor(() => expect(rows().length).toBe(20));
+
+    expect(document.querySelectorAll(".agent-row-target").length).toBe(0);
+    expect(document.body.textContent ?? "").not.toContain("~/.mimocode/");
+    // 顺带确认名称仍然正确（去掉路径不能把名称也弄丢）
+    expect(row("mimo-code").querySelector(".agent-row-name")?.textContent).toBe("MiMo Code");
+  });
+
+  it("⑬ 选 key 101 后下拉含 model-a/model-b；换 key 102 后变成该 key 的清单", async () => {
+    renderPage();
+    await waitFor(() => expect(keySelect("claude-code-settings")).not.toBeNull());
+
+    fireEvent.change(keySelect("claude-code-settings"), { target: { value: "101" } });
+    await waitFor(() => expect(optionValues("claude-code-settings")).toContain("model-a"));
+    let opts = optionValues("claude-code-settings");
+    expect(opts).toContain("model-a");
+    expect(opts).toContain("model-b");
+
+    fireEvent.change(keySelect("claude-code-settings"), { target: { value: "102" } });
+    await waitFor(() => expect(optionValues("claude-code-settings")).toContain("model-c"));
+    opts = optionValues("claude-code-settings");
+    expect(opts).not.toContain("model-a");
+  });
+
+  it("⑭ 已保存但不在清单的 model 仍作为选中项出现", async () => {
+    localStorage.setItem(
+      `keyrelay.agentPrefs.v1.${SITE_A}`,
+      JSON.stringify({ "claude-code-settings": { keyId: 101, model: "legacy-model" } }),
+    );
+    renderPage();
+    await waitFor(() => expect(modelSelect("claude-code-settings")?.value).toBe("legacy-model"));
+    const sel = modelSelect("claude-code-settings");
+    expect(sel.value).toBe("legacy-model");
+    expect(Array.from(sel.options).map((o) => o.value)).toContain("legacy-model");
+  });
+
+  it("⑮ listKeyModels 失败 ⇒ 回退 input + 提示，手输值能进 deliveryPlan", async () => {
+    const { listKeyModels } = await import("../lib/api");
+    (listKeyModels as unknown as { mockRejectedValueOnce: (e: Error) => void })
+      .mockRejectedValueOnce(new Error("boom"));
+
+    renderPage();
+    await waitFor(() => expect(keySelect("claude-code-settings")).not.toBeNull());
+    fireEvent.change(keySelect("claude-code-settings"), { target: { value: "101" } });
+
+    await waitFor(() =>
+      expect(row("claude-code-settings").textContent).toContain(zhCN.agents.select.modelFetchFailed),
+    );
+    const input = row("claude-code-settings").querySelector<HTMLInputElement>("input.agent-row-model")!;
+    expect(input).not.toBeNull();
+    fireEvent.change(input, { target: { value: "manual-model" } });
+
+    // 等 400ms 防抖进查询键，再展开
+    await new Promise((r) => setTimeout(r, 450));
+    fireEvent.click(row("claude-code-settings").querySelector(".agent-row-toggle")!);
+
+    await waitFor(() => expect(deliveryPlan).toHaveBeenCalled());
+    const arg = (deliveryPlan as unknown as { mock: { calls: unknown[][] } }).mock.calls.at(-1)![0];
+    expect(arg).toMatchObject({ keyId: 101, channel: "claude-code-settings", model: "manual-model" });
   });
 
   it("⑩ 已回收/不存在的 keyId 不拿去查预览", async () => {

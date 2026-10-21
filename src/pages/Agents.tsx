@@ -35,6 +35,7 @@ import { rollbackAftermath, rollbackAftermathTitle } from "../lib/rollback";
 import { maskRemovedValues, shouldWarnEndpointOutOfScope } from "../lib/deliveryView";
 import ConfirmDialog from "../components/ConfirmDialog";
 import AgentIcon from "../components/AgentIcon";
+import ModelPicker from "../components/ModelPicker";
 import { loadAgentPrefs, saveAgentPrefs, type AgentPref } from "../lib/agentPrefs";
 import { useTranslation, translate, getCurrentDict } from "../i18n";
 
@@ -414,7 +415,7 @@ export default function Agents() {
             const selectedKeyId = effectiveKeyId(c.id);
             const isOpen = expanded === c.id;
             const writingModel = !NO_MODEL_CHANNELS.has(c.id);
-            const { name, target } = splitChannelLabel(c.label);
+            const { name } = splitChannelLabel(c.label);
             return (
               <li
                 key={c.id}
@@ -433,7 +434,6 @@ export default function Agents() {
                     <AgentIcon icon={c.agent} name={name} />
                     <span className="agent-row-text">
                       <span className="agent-row-name">{name}</span>
-                      <span className="agent-row-target mono">{target}</span>
                     </span>
                   </button>
 
@@ -468,15 +468,13 @@ export default function Agents() {
                       </select>
 
                       {writingModel ? (
-                        <input
-                          className="input agent-row-model"
-                          aria-label={`${name} ${t("agents.select.model")}`}
+                        <ModelPicker
+                          keyId={selectedKeyId}
                           value={modelDraft[c.id] ?? ""}
-                          placeholder={t("agents.select.modelPlaceholder")}
-                          spellCheck={false}
-                          onChange={(e) =>
-                            setModelDraft((prev) => ({ ...prev, [c.id]: e.target.value }))
+                          onChange={(next) =>
+                            setModelDraft((prev) => ({ ...prev, [c.id]: next }))
                           }
+                          ariaLabel={`${name} ${t("agents.select.model")}`}
                         />
                       ) : (
                         <span className="muted agent-row-nomodel">{t("agents.row.noModel")}</span>

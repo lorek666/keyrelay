@@ -394,7 +394,10 @@
       "model": "模型名",
       "modelPlaceholder": "例如 gpt-4o",
       "keyPlaceholder": "（选择一把）",
-      "revokedHidden": "已隐藏 {count} 把已回收的密钥（站点上已经没了，不该再被投递）"
+      "revokedHidden": "已隐藏 {count} 把已回收的密钥（站点上已经没了，不该再被投递）",
+      "modelLoading": "加载模型…",
+      "modelFetchFailed": "模型清单获取失败，可手动输入",
+      "modelEmpty": "该分组没有可用模型，可手动输入"
     },
     "gatewayMode": {
       "label": "指向本地网关：写进去的是网关地址（/v1）与本地令牌，不是站点密钥。之后换站只要重启网关，agent 侧不用改。需要网关正在运行。",

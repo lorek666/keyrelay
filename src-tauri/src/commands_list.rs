@@ -55,6 +55,8 @@ pub const COMMANDS: &[&str] = &[
     "detect_unmanaged_targets",
     // M31-S1：Agent 安装/版本发现（只读）
     "detect_agents",
+    // M32-S1：Agent 模型下拉（只读，密钥不落日志）
+    "list_key_models",
     "suggest_key_name",
     // M8-S4：解绑（FR-2:115）、网关令牌轮换（§6.4）
     "unbind_agent",
