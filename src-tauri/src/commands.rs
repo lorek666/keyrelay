@@ -1137,6 +1137,125 @@ pub fn recent_key_usage(
         .map_err(|e| e.to_string())
 }
 
+// ============================================ M34-S1：用量看板
+
+/// M34-S1：网关 token 用量按（本地日, 站点, 模型）聚合的一行。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDailyDto {
+    date: String,
+    site_id: i64,
+    model: String,
+    requests: i64,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+}
+
+/// M34-S1：站点余额快照按（本地日, 站点）聚合的一行（每天取最后一条）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSnapshotDailyDto {
+    date: String,
+    site_id: i64,
+    used: f64,
+    remaining: f64,
+    currency: String,
+    samples: i64,
+}
+
+/// M34-S1：`usage_samples` 按 key 汇总的一行（join `keys` 取名字与币种）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyUsageTotalDto {
+    key_id: i64,
+    site_id: i64,
+    key_name: String,
+    requests: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+    cost: f64,
+    currency: Option<String>,
+}
+
+/// M34-S1：用量页一次取全的聚合数据。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardDto {
+    /// 夹取后的实际窗口天数（前端据此渲染「近 N 天」）。
+    range_days: i64,
+    /// 回显筛选；`None` = 全部站点。
+    site_id: Option<i64>,
+    daily: Vec<UsageDailyDto>,
+    snapshots: Vec<UsageSnapshotDailyDto>,
+    key_usage: Vec<KeyUsageTotalDto>,
+}
+
+/// M34-S1：用量页数据（只读；不写库、不改采集口径）。
+///
+/// `days` 缺省 30，夹到 `1..=90`（与 90 天裁剪窗口一致）；`site_id` 缺省 = 全部站点。
+/// 三条查询任一失败 ⇒ 整条命令报错（不返回半份数据）。
+#[tauri::command]
+pub fn usage_dashboard(
+    state: State<'_, AppState>,
+    days: Option<i64>,
+    site_id: Option<i64>,
+) -> Result<UsageDashboardDto, String> {
+    let range_days = keyrelay_core::store::clamp_usage_days(days.unwrap_or(30));
+    let store = state.service.store();
+    let daily = store
+        .usage_daily(range_days, site_id)
+        .map_err(|e| e.to_string())?;
+    let snapshots = store
+        .usage_snapshot_daily(range_days, site_id)
+        .map_err(|e| e.to_string())?;
+    let key_usage = store
+        .key_usage_totals(range_days, site_id)
+        .map_err(|e| e.to_string())?;
+    Ok(UsageDashboardDto {
+        range_days,
+        site_id,
+        daily: daily
+            .into_iter()
+            .map(|row| UsageDailyDto {
+                date: row.date,
+                site_id: row.site_id,
+                model: row.model,
+                requests: row.requests,
+                prompt_tokens: row.prompt_tokens,
+                completion_tokens: row.completion_tokens,
+                total_tokens: row.total_tokens,
+            })
+            .collect(),
+        snapshots: snapshots
+            .into_iter()
+            .map(|row| UsageSnapshotDailyDto {
+                date: row.date,
+                site_id: row.site_id,
+                used: row.used,
+                remaining: row.remaining,
+                currency: row.currency,
+                samples: row.samples,
+            })
+            .collect(),
+        key_usage: key_usage
+            .into_iter()
+            .map(|row| KeyUsageTotalDto {
+                key_id: row.key_id,
+                site_id: row.site_id,
+                key_name: row.key_name,
+                requests: row.requests,
+                input_tokens: row.input_tokens,
+                output_tokens: row.output_tokens,
+                total_tokens: row.total_tokens,
+                cost: row.cost,
+                currency: row.currency,
+            })
+            .collect(),
+    })
+}
+
 // ============================================ 漂移 / 设置 / 刷新（M3-S1）
 
 fn settings_from_dto(dto: &SettingsDto) -> keyrelay_core::settings::Settings {
@@ -3297,6 +3416,81 @@ mod tests {
         assert_eq!(value["siteCount"], 0);
         assert_eq!(value["dbError"], Value::Null);
         assert_eq!(value["vaultBackend"], "memory");
+    }
+
+    /// M34-S1：用量看板 DTO 的线上字段名（前端按 camelCase 读，漏改一侧就是静默空白）。
+    #[test]
+    fn usage_dashboard_dtos_serialize_in_camel_case() {
+        let dto = UsageDashboardDto {
+            range_days: 7,
+            site_id: Some(1),
+            daily: vec![UsageDailyDto {
+                date: "2026-10-21".into(),
+                site_id: 1,
+                model: "gpt-4".into(),
+                requests: 3,
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+            }],
+            snapshots: vec![UsageSnapshotDailyDto {
+                date: "2026-10-21".into(),
+                site_id: 1,
+                used: 1.5,
+                remaining: 8.5,
+                currency: "USD".into(),
+                samples: 2,
+            }],
+            key_usage: vec![KeyUsageTotalDto {
+                key_id: 9,
+                site_id: 1,
+                key_name: "key-a".into(),
+                requests: 4,
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                cost: 0.25,
+                currency: Some("USD".into()),
+            }],
+        };
+        let value = to_value(&dto);
+        assert_eq!(value["rangeDays"], 7);
+        assert_eq!(value["siteId"], 1);
+        assert_eq!(value["daily"][0]["date"], "2026-10-21");
+        assert_eq!(value["daily"][0]["siteId"], 1);
+        assert_eq!(value["daily"][0]["promptTokens"], 100);
+        assert_eq!(value["daily"][0]["completionTokens"], 50);
+        assert_eq!(value["daily"][0]["totalTokens"], 150);
+        assert_eq!(value["snapshots"][0]["remaining"], 8.5);
+        assert_eq!(value["snapshots"][0]["samples"], 2);
+        assert_eq!(value["keyUsage"][0]["keyId"], 9);
+        assert_eq!(value["keyUsage"][0]["keyName"], "key-a");
+        assert_eq!(value["keyUsage"][0]["totalTokens"], 15);
+        assert_eq!(value["keyUsage"][0]["currency"], "USD");
+        // 币种未知时必须是显式 null（键在、值为 null），不是缺键——前端类型是 `string | null`
+        let unknown_currency = to_value(&KeyUsageTotalDto {
+            key_id: 9,
+            site_id: 1,
+            key_name: "key-a".into(),
+            requests: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cost: 0.0,
+            currency: None,
+        });
+        assert!(
+            unknown_currency
+                .as_object()
+                .unwrap()
+                .contains_key("currency"),
+            "currency 键必须始终存在（值可为 null）: {unknown_currency}"
+        );
+        assert_eq!(unknown_currency["currency"], Value::Null);
+        // 反例：不得出现 snake_case
+        assert!(value.get("range_days").is_none());
+        assert!(value.get("key_usage").is_none());
+        assert!(value["daily"][0].get("site_id").is_none());
     }
 
     /// M1-S3：投递相关 DTO 的线上字段名与「不含密钥」双重断言。

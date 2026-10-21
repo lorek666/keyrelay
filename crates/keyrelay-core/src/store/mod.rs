@@ -222,6 +222,42 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// 用量看板查询窗口上限（天，M34-S1）。
+///
+/// 与 `prune_gateway_usage_log` / `prune_usage_snapshots` / `prune_usage_samples` 的 90 天
+/// 裁剪窗口一致：更早的数据已经不在库里，界面不提供更宽的窗口（否则是空承诺）。
+pub const USAGE_MAX_DAYS: i64 = 90;
+
+/// 把调用方给的窗口天数夹到 `1..=USAGE_MAX_DAYS`。命令层与 store 层共用这一条，
+/// 避免「命令回显 90、实际查了 30」这种两处夹取不一致。
+pub fn clamp_usage_days(days: i64) -> i64 {
+    days.clamp(1, USAGE_MAX_DAYS)
+}
+
+/// 本地时区「今天往前 `days_ago` 天」的日零点 epoch（秒）。
+///
+/// **`'utc'` 修饰符不能省**：`date(...)` 给出的是本地日期字符串，SQLite 默认把它当 UTC
+/// 解释；`'utc'` 告诉它「这个时间值在本地时区」，于是换算出的 epoch 才是本地日零点。
+/// 省掉后，在 UTC+8 上窗口起点会晚 8 小时（前一天的 08:00）。
+fn local_day_start(conn: &Connection, days_ago: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT CAST(strftime('%s', date('now','localtime','-' || ?1 || ' days'), 'utc') AS INTEGER)",
+        params![days_ago.max(0)],
+        |row| row.get(0),
+    )
+    .map_err(|e| Error::Store(format!("计算本地日零点失败: {e}")))
+}
+
+/// 本地时区「今天往前 `days_ago` 天」的 `YYYY-MM-DD`。
+fn local_day_ago(conn: &Connection, days_ago: i64) -> Result<String> {
+    conn.query_row(
+        "SELECT date('now','localtime','-' || ?1 || ' days')",
+        params![days_ago.max(0)],
+        |row| row.get(0),
+    )
+    .map_err(|e| Error::Store(format!("计算本地日期失败: {e}")))
+}
+
 /// 钥匙串引用形状：`kr/<scope>/<id>/<field>`（与 `vault::secret_ref` 一致）。
 ///
 /// 采用白名单而非黑名单：只拦 `sk-` / `nap-` 前缀会放过 32 位 hex 之类的明文
@@ -414,6 +450,50 @@ pub struct UsageSampleRow {
     pub total_tokens: i64,
     pub cost: f64,
     pub sampled_at: i64,
+}
+
+/// M34-S1：网关 token 用量按（本地日, 站点, 模型）聚合的一行。
+///
+/// `date` 是**本地时区**的 `YYYY-MM-DD`（`date(ts,'unixepoch','localtime')`）；
+/// `model` 保留空串作为独立分组（网关没解析出模型名时），前端显示「未知模型」。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageDailyRow {
+    pub date: String,
+    pub site_id: i64,
+    pub model: String,
+    pub requests: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+/// M34-S1：站点余额快照按（本地日, 站点）聚合的一行。
+///
+/// `used` / `remaining` / `currency` 取**当日最后一条**快照（`ts DESC, id DESC`），
+/// `samples` 是当日快照条数（>1 表示当天刷新过多次）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageSnapshotDailyRow {
+    pub date: String,
+    pub site_id: i64,
+    pub used: f64,
+    pub remaining: f64,
+    pub currency: String,
+    pub samples: i64,
+}
+
+/// M34-S1：`usage_samples` 按 key 汇总的一行（join `keys` 取名字与币种）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyUsageTotalRow {
+    pub key_id: i64,
+    pub site_id: i64,
+    pub key_name: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub cost: f64,
+    /// `keys.currency`；未记录时为 `None`（不猜币种，与 `Balance.known` 同纪律）。
+    pub currency: Option<String>,
 }
 
 /// M15-S1：一次 probe 检测的本地记录（`probe_runs` 表的一行）。
@@ -796,6 +876,58 @@ impl Store {
             .map_err(|e| Error::Store(format!("查询站点失败: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Store(format!("读取站点行失败: {e}")))
+    }
+
+    /// 迁移用：枚举所有「密钥落点引用」。
+    ///
+    /// 钥匙串没有枚举接口（ADR-0002 §2），所以迁移只能从**索引侧**反查：
+    /// `keys.secret_ref` ∪ `accounts.credential_ref` ∪ 每个站点的会话引用
+    /// （站点会话不在任何列里，是按 `kr/site/<id>/session` 约定拼出来的）。
+    ///
+    /// 去重后按字典序返回，保证迁移日志与测试可复现。
+    pub fn all_secret_refs(&self) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut refs = std::collections::BTreeSet::new();
+
+        let mut stmt = conn
+            .prepare("SELECT secret_ref FROM keys")
+            .map_err(|e| Error::Store(format!("准备查询密钥引用失败: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| Error::Store(format!("查询密钥引用失败: {e}")))?;
+        for row in rows {
+            let value = row.map_err(|e| Error::Store(format!("读取密钥引用失败: {e}")))?;
+            // 只收合法引用：历史库里可能有非 `kr/...` 的脏值，带进迁移会让它每次都失败。
+            if crate::vault::is_valid_secret_ref(&value) {
+                refs.insert(value);
+            }
+        }
+
+        let mut stmt = conn
+            .prepare("SELECT credential_ref FROM accounts")
+            .map_err(|e| Error::Store(format!("准备查询账号引用失败: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| Error::Store(format!("查询账号引用失败: {e}")))?;
+        for row in rows {
+            let value = row.map_err(|e| Error::Store(format!("读取账号引用失败: {e}")))?;
+            if crate::vault::is_valid_secret_ref(&value) {
+                refs.insert(value);
+            }
+        }
+
+        let mut stmt = conn
+            .prepare("SELECT id FROM sites")
+            .map_err(|e| Error::Store(format!("准备查询站点 id 失败: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|e| Error::Store(format!("查询站点 id 失败: {e}")))?;
+        for row in rows {
+            let id = row.map_err(|e| Error::Store(format!("读取站点 id 失败: {e}")))?;
+            refs.insert(crate::vault::secret_ref("site", id, "session"));
+        }
+
+        Ok(refs.into_iter().collect())
     }
 
     pub fn get_site(&self, id: i64) -> Result<Option<SiteRow>> {
@@ -1848,6 +1980,147 @@ impl Store {
         Ok(n)
     }
 
+    // ============================================================ M34-S1：用量看板聚合
+    //
+    // 三张表都是**只读聚合**：不写库、不改采集口径。日界一律按系统本地时区
+    // （`date(ts,'unixepoch','localtime')`），窗口含今天（`days=7` ⇒ 6 天前零点起）。
+    // `days` 与 `site_id` 的夹取/筛选语义见 spec §4.1 与 §6。
+
+    /// M34-S1：近 `days` 天（含今天）网关 token 用量，按（本地日, 站点, 模型）聚合。
+    ///
+    /// `model` 空串是独立分组（网关没解析出模型名），**不归并**成「未知」以外的名字。
+    pub fn usage_daily(&self, days: i64, site_id: Option<i64>) -> Result<Vec<UsageDailyRow>> {
+        let days = clamp_usage_days(days);
+        let conn = self.lock()?;
+        let cutoff = local_day_start(&conn, days - 1)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT date(ts, 'unixepoch', 'localtime') AS d, site_id, model,
+                        COUNT(*),
+                        COALESCE(SUM(prompt_tokens), 0),
+                        COALESCE(SUM(completion_tokens), 0),
+                        COALESCE(SUM(total_tokens), 0)
+                 FROM gateway_usage_log
+                 WHERE ts >= ?1 AND (?2 IS NULL OR site_id = ?2)
+                 GROUP BY d, site_id, model
+                 ORDER BY d ASC, site_id ASC, model ASC",
+            )
+            .map_err(|e| Error::Store(format!("prepare usage daily: {e}")))?;
+        let rows = stmt
+            .query_map(params![cutoff, site_id], |row| {
+                Ok(UsageDailyRow {
+                    date: row.get(0)?,
+                    site_id: row.get(1)?,
+                    model: row.get(2)?,
+                    requests: row.get(3)?,
+                    prompt_tokens: row.get(4)?,
+                    completion_tokens: row.get(5)?,
+                    total_tokens: row.get(6)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("query usage daily: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect usage daily: {e}")))
+    }
+
+    /// M34-S1：近 `days` 天余额快照，按（本地日, 站点）聚合，每天取**最后一条**。
+    ///
+    /// 用 `ROW_NUMBER() OVER (PARTITION BY 日, 站点 ORDER BY ts DESC, id DESC)` 而不是
+    /// `MAX(id)`：`MAX(id)` 只在「id 与 ts 单调同序」时成立，而快照的 ts 是写入时刻，
+    /// 排序口径要按**时间**而不是按自增号（同秒多条时再用 id 兜底）。
+    pub fn usage_snapshot_daily(
+        &self,
+        days: i64,
+        site_id: Option<i64>,
+    ) -> Result<Vec<UsageSnapshotDailyRow>> {
+        let days = clamp_usage_days(days);
+        let conn = self.lock()?;
+        let cutoff = local_day_start(&conn, days - 1)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT d, site_id, used, remaining, currency, samples FROM (
+                   SELECT date(ts, 'unixepoch', 'localtime') AS d,
+                          site_id, used, remaining, currency,
+                          COUNT(*) OVER (
+                            PARTITION BY date(ts, 'unixepoch', 'localtime'), site_id
+                          ) AS samples,
+                          ROW_NUMBER() OVER (
+                            PARTITION BY date(ts, 'unixepoch', 'localtime'), site_id
+                            ORDER BY ts DESC, id DESC
+                          ) AS rn
+                   FROM usage_snapshots
+                   -- `known = 0`（余额不可观测）的快照不画进趋势：它的 used/remaining
+                   -- 没有意义，混进去会把「不知道」显示成一条 0 余额的线（复审 P3-9）。
+                   WHERE known = 1 AND ts >= ?1 AND (?2 IS NULL OR site_id = ?2)
+                 )
+                 WHERE rn = 1
+                 ORDER BY d ASC, site_id ASC",
+            )
+            .map_err(|e| Error::Store(format!("prepare usage snapshot daily: {e}")))?;
+        let rows = stmt
+            .query_map(params![cutoff, site_id], |row| {
+                Ok(UsageSnapshotDailyRow {
+                    date: row.get(0)?,
+                    site_id: row.get(1)?,
+                    used: row.get(2)?,
+                    remaining: row.get(3)?,
+                    currency: row.get(4)?,
+                    samples: row.get(5)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("query usage snapshot daily: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect usage snapshot daily: {e}")))
+    }
+
+    /// M34-S1：近 `days` 天 `usage_samples` 按 key 汇总（join `keys` 取名字与币种）。
+    ///
+    /// 窗口按 `usage_samples.date`（站点给的 `YYYY-MM-DD`）比较，不按 `sampled_at`：
+    /// 每轮刷新会覆盖同日全部采样，`sampled_at` 总是「最近一轮」，用它过滤会把
+    /// 30 天前采集到的历史日也算进「近 7 天」。`date` 的时区归属站点，本产品不改写。
+    pub fn key_usage_totals(
+        &self,
+        days: i64,
+        site_id: Option<i64>,
+    ) -> Result<Vec<KeyUsageTotalRow>> {
+        let days = clamp_usage_days(days);
+        let conn = self.lock()?;
+        let cutoff_date = local_day_ago(&conn, days - 1)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT us.key_id, us.site_id, k.name,
+                        COALESCE(SUM(us.requests), 0),
+                        COALESCE(SUM(us.input_tokens), 0),
+                        COALESCE(SUM(us.output_tokens), 0),
+                        COALESCE(SUM(us.total_tokens), 0) AS total,
+                        COALESCE(SUM(us.cost), 0.0),
+                        k.currency
+                 FROM usage_samples us
+                 JOIN keys k ON k.id = us.key_id
+                 WHERE us.date >= ?1 AND (?2 IS NULL OR us.site_id = ?2)
+                 GROUP BY us.key_id, us.site_id, k.name, k.currency
+                 ORDER BY total DESC, us.key_id ASC",
+            )
+            .map_err(|e| Error::Store(format!("prepare key usage totals: {e}")))?;
+        let rows = stmt
+            .query_map(params![cutoff_date, site_id], |row| {
+                Ok(KeyUsageTotalRow {
+                    key_id: row.get(0)?,
+                    site_id: row.get(1)?,
+                    key_name: row.get(2)?,
+                    requests: row.get(3)?,
+                    input_tokens: row.get(4)?,
+                    output_tokens: row.get(5)?,
+                    total_tokens: row.get(6)?,
+                    cost: row.get(7)?,
+                    currency: row.get(8)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("query key usage totals: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect key usage totals: {e}")))
+    }
+
     // ============================================================ M14-S1：模型别名映射（B-110）
 
     /// 列出全部别名映射（B-110）。按 `alias` 升序——确定顺序，与
@@ -2892,6 +3165,272 @@ mod tests {
         assert_eq!(rows.len(), 1, "应只剩 1 条新记录");
         assert_eq!(rows[0].model, "new");
     }
+    // ---- M34-S1：用量看板聚合 ----
+
+    /// 与 store 查询同一口径的本地日标签（测试只用来算期望值）。
+    fn day_label(store: &Store, ts: i64) -> String {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT date(?1, 'unixepoch', 'localtime')",
+                params![ts],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// 本地时区「今天往前 `days_ago` 天」。
+    fn day_ago_label(store: &Store, days_ago: i64) -> String {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT date('now', 'localtime', '-' || ?1 || ' days')",
+                params![days_ago],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// 本地今天零点的 epoch（秒）。
+    ///
+    /// 夹具用它 + 固定偏移构造「今天之内」的时间戳，避免 `now - 30s` 这类写法在
+    /// 本地 00:00:00–00:00:29 运行时跨日（复审 P3-10）。
+    fn local_midnight(store: &Store) -> i64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT CAST(strftime('%s', date('now','localtime'), 'utc') AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn usage_daily_groups_by_local_day_site_and_model() {
+        let store = Store::open_in_memory().unwrap();
+        let site_a = store.upsert_site("newapi", "https://a", "A").unwrap();
+        let site_b = store.upsert_site("newapi", "https://b", "B").unwrap();
+        // 固定取「本地今天 00:01」起的时间戳：不用 `now - 30s`，避免本地零点后
+        // 半分钟内运行时两条记录跨日（复审 P3-10）。
+        let base = local_midnight(&store) + 600;
+        {
+            let conn = store.lock().unwrap();
+            let insert = |site: i64, model: &str, ts: i64, prompt: i64, completion: i64| {
+                conn.execute(
+                    "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![ts, site, model, prompt, completion, prompt + completion],
+                )
+                .unwrap();
+            };
+            insert(site_a, "gpt-4", base - 30, 10, 5);
+            insert(site_a, "gpt-4", base, 20, 10);
+            // 空模型名是**独立分组**，不并进 "gpt-4"
+            insert(site_a, "", base, 1, 1);
+            // 不同站点独立成行
+            insert(site_b, "gpt-4", base, 100, 50);
+        }
+        let rows = store.usage_daily(7, None).unwrap();
+        assert_eq!(rows.len(), 3, "两个站点 + 空模型名 ⇒ 三行");
+        let today = day_label(&store, base);
+        for row in &rows {
+            assert_eq!(row.date, today, "同一本地日应聚到一起");
+        }
+        // 排序：date ASC, site_id ASC, model ASC（空串排在 "gpt-4" 前）
+        assert_eq!(rows[0].site_id, site_a);
+        assert_eq!(rows[0].model, "");
+        assert_eq!(rows[0].requests, 1);
+        assert_eq!(rows[0].total_tokens, 2);
+        assert_eq!(rows[1].site_id, site_a);
+        assert_eq!(rows[1].model, "gpt-4");
+        assert_eq!(rows[1].requests, 2, "同站同模型同日两条应合并");
+        assert_eq!(rows[1].prompt_tokens, 30);
+        assert_eq!(rows[1].completion_tokens, 15);
+        assert_eq!(rows[1].total_tokens, 45);
+        assert_eq!(rows[2].site_id, site_b);
+        assert_eq!(rows[2].total_tokens, 150);
+    }
+
+    #[test]
+    fn usage_daily_window_and_site_filter() {
+        let store = Store::open_in_memory().unwrap();
+        let site_a = store.upsert_site("newapi", "https://a", "A").unwrap();
+        let site_b = store.upsert_site("newapi", "https://b", "B").unwrap();
+        // 同上：夹具锚在「本地今天 00:01」，不用 `now`（避免跨日假红）。
+        let base = local_midnight(&store) + 600;
+        {
+            let conn = store.lock().unwrap();
+            for (site, ts) in [(site_a, base), (site_b, base), (site_a, base - 3 * 86400)] {
+                conn.execute(
+                    "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, 'm', 1, 1, 2)",
+                    params![ts, site],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(store.usage_daily(7, None).unwrap().len(), 3);
+        let recent = store.usage_daily(2, None).unwrap();
+        assert_eq!(recent.len(), 2, "3 天前的记录不在近 2 天窗口");
+        let only_a = store.usage_daily(7, Some(site_a)).unwrap();
+        assert_eq!(only_a.len(), 2);
+        assert!(only_a.iter().all(|row| row.site_id == site_a));
+        assert!(
+            store.usage_daily(7, Some(9999)).unwrap().is_empty(),
+            "不存在的站点 ⇒ 空数组，不报错"
+        );
+        // 窗口夹取：0 ⇒ 1 天（今天）；91 ⇒ 90 天（这里只断言不 panic 且语义等价）
+        assert_eq!(store.usage_daily(0, None).unwrap().len(), 2);
+        assert_eq!(store.usage_daily(91, None).unwrap().len(), 3);
+        assert_eq!(clamp_usage_days(0), 1);
+        assert_eq!(clamp_usage_days(91), USAGE_MAX_DAYS);
+    }
+
+    #[test]
+    fn usage_snapshot_daily_takes_last_snapshot_of_the_day() {
+        let store = Store::open_in_memory().unwrap();
+        let site_a = store.upsert_site("newapi", "https://a", "A").unwrap();
+        let site_b = store.upsert_site("sub2api", "https://b", "B").unwrap();
+        // 锚在「本地今天 00:01」，避免 `now - 120s` 在零点后两分钟内跨日（P3-10）。
+        let base = local_midnight(&store) + 600;
+        {
+            let conn = store.lock().unwrap();
+            let insert = |site: i64, used: f64, remaining: f64, currency: &str, ts: i64| {
+                conn.execute(
+                    "INSERT INTO usage_snapshots(site_id, used, remaining, currency, known, ts) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+                    params![site, used, remaining, currency, ts],
+                )
+                .unwrap();
+            };
+            insert(site_a, 10.0, 90.0, "USD", base - 120);
+            insert(site_a, 12.0, 88.0, "USD", base - 60);
+            insert(site_a, 15.0, 85.0, "USD", base);
+            // **id 与 ts 逆序**：这条 id 最大、ts 更早。`MAX(id)` / `ORDER BY id DESC`
+            // 会取到 99.0；正确实现（ts DESC, id DESC）仍取 base 那条的 15.0。
+            // 没有这一行，两种实现给出同一结果，用例就是假绿（复审 P2-1）。
+            insert(site_a, 99.0, 1.0, "USD", base - 30);
+            insert(site_b, 1.0, 9.0, "CNY", base);
+            insert(site_a, 5.0, 95.0, "USD", base - 86400);
+            // `known = 0`（余额未知）的快照不得进图（P3-9）
+            conn.execute(
+                "INSERT INTO usage_snapshots(site_id, used, remaining, currency, known, ts) VALUES (?1, 0.0, 0.0, 'CNY', 0, ?2)",
+                params![site_b, base],
+            )
+            .unwrap();
+        }
+        let rows = store.usage_snapshot_daily(7, None).unwrap();
+        assert_eq!(rows.len(), 3, "昨天 A 一条 + 今天 A/B 各一条");
+        assert_eq!(rows[0].date, day_ago_label(&store, 1));
+        assert_eq!(rows[0].site_id, site_a);
+        assert_eq!(rows[0].used, 5.0);
+        assert_eq!(rows[1].date, day_label(&store, base));
+        assert_eq!(rows[1].site_id, site_a);
+        assert_eq!(
+            rows[1].used, 15.0,
+            "取当日最后一条（按 ts），不是第一条、也不是 id 最大那条（99.0）"
+        );
+        assert_eq!(rows[1].remaining, 85.0);
+        assert_eq!(rows[1].samples, 4);
+        assert_eq!(rows[2].site_id, site_b);
+        assert_eq!(rows[2].currency, "CNY");
+        assert_eq!(rows[2].samples, 1, "known=0 的行不计入 samples");
+        // days=1 ⇒ 只今天
+        assert_eq!(store.usage_snapshot_daily(1, None).unwrap().len(), 2);
+        // 站点过滤
+        let only_b = store.usage_snapshot_daily(7, Some(site_b)).unwrap();
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].site_id, site_b);
+    }
+
+    #[test]
+    fn key_usage_totals_sums_samples_and_joins_key_metadata() {
+        let store = Store::open_in_memory().unwrap();
+        let site = store.upsert_site("sub2api", "https://s", "S").unwrap();
+        let key = store
+            .insert_key_with_group(site, "key-a", "kr/key/1/secret", Some("r1"), None, None)
+            .unwrap();
+        store
+            .update_key_usage(key, Some(3.0), Some(10.0), Some("USD"))
+            .unwrap();
+        let today = day_ago_label(&store, 0);
+        let yesterday = day_ago_label(&store, 1);
+        let old = day_ago_label(&store, 10);
+        {
+            let conn = store.lock().unwrap();
+            for (date, requests, input, output, cost) in [
+                (today.as_str(), 2_i64, 100_i64, 50_i64, 0.5_f64),
+                (yesterday.as_str(), 1, 10, 5, 0.1),
+                (old.as_str(), 9, 900, 900, 9.0),
+            ] {
+                conn.execute(
+                    "INSERT INTO usage_samples(key_id, site_id, date, requests, input_tokens, output_tokens, total_tokens, cost, sampled_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![key, site, date, requests, input, output, input + output, cost, now_secs()],
+                )
+                .unwrap();
+            }
+        }
+        let rows = store.key_usage_totals(7, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key_id, key);
+        assert_eq!(rows[0].site_id, site);
+        assert_eq!(rows[0].key_name, "key-a");
+        assert_eq!(rows[0].requests, 3);
+        assert_eq!(rows[0].input_tokens, 110);
+        assert_eq!(rows[0].output_tokens, 55);
+        assert_eq!(rows[0].total_tokens, 165);
+        assert!((rows[0].cost - 0.6).abs() < 1e-9);
+        assert_eq!(rows[0].currency.as_deref(), Some("USD"));
+        // days=1 ⇒ 10 天前的采样按 `date` 被排除，只剩今天
+        let today_rows = store.key_usage_totals(1, None).unwrap();
+        assert_eq!(today_rows.len(), 1);
+        assert_eq!(today_rows[0].total_tokens, 150);
+        // 不存在的站点 ⇒ 空
+        assert!(store.key_usage_totals(7, Some(9999)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn usage_daily_window_starts_at_local_midnight() {
+        let store = Store::open_in_memory().unwrap();
+        let site = store.upsert_site("newapi", "https://a", "A").unwrap();
+        // 期望口径：本地今天零点 = `strftime('%s', date('now','localtime'), 'utc')`。
+        // 生产实现若漏掉 `'utc'`（把本地日期当 UTC 解释），在 UTC+8 上窗口起点会晚 8 小时，
+        // 零点整那条会被排除 ⇒ 本用例红。
+        let midnight = local_midnight(&store);
+        {
+            let conn = store.lock().unwrap();
+            for ts in [midnight, midnight - 1] {
+                conn.execute(
+                    "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, 'm', 1, 1, 2)",
+                    params![ts, site],
+                )
+                .unwrap();
+            }
+        }
+        let rows = store.usage_daily(1, None).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "days=1 的窗口从本地零点开始：含零点整，不含前一秒"
+        );
+        // 分组日必须是**本地日**。只断行数挡不住「生产 SQL 改成 UTC 日」的变异
+        // （UTC 分组下零点行与前一行都归到昨天，仍是 1 组）——复审 P2-2。
+        assert_eq!(
+            rows[0].date,
+            day_label(&store, midnight),
+            "零点整那行的分组日必须是本地日（不是 UTC 日）"
+        );
+    }
+
+    #[test]
+    fn usage_queries_return_empty_on_empty_database() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.usage_daily(7, None).unwrap().is_empty());
+        assert!(store.usage_snapshot_daily(7, None).unwrap().is_empty());
+        assert!(store.key_usage_totals(7, None).unwrap().is_empty());
+    }
+
     /// `group_id` 与 `group_name` 必须与密钥行**同一次**写入、且都能读回（M22-S2 / B-172）。
     ///
     /// 这条替换了 M22-S1 的 `set_key_group` 往返测试：那种「先插行、再 UPDATE 两列」

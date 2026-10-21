@@ -1,12 +1,21 @@
-//! 钥匙串抽象：密钥只进系统钥匙串，SQLite 只存引用。
+//! 密钥存储抽象：密钥只进加密保险库，元数据库只存引用。
 //!
-//! 设计约束（ADR-0002）：
-//! - `Vault` 是**哑存储**：只有 `put` / `get` / `delete`。系统钥匙串没有稳定的「按 service 枚举」接口，
-//!   因此**没有** `list()`；索引的唯一来源是 SQLite 的 `secret_ref` 列。
+//! 设计约束：
+//! - `Vault` 是**哑存储**：只有 `put` / `get` / `has` / `delete`。系统钥匙串没有稳定的
+//!   「按 service 枚举」接口，因此**没有** `list()`；索引的唯一来源是 SQLite 的 `secret_ref` 列。
 //! - `probe()` 让调用方在启动时判定后端可用性；不可用必须明确失败（`VaultUnavailable`），
-//!   发布路径**绝不**回退到 [`MemoryVault`]。
+//!   发布路径**绝不**静默回退到 [`MemoryVault`]。
+//!
+//! 落点（ADR-0003，2026-10-21 起）：
+//! - 生产：[`LocalVault`] —— `~/.keyrelay/vault.db` 存 `krseal1.` 密文，DEK 在 `vault.key`；
+//! - [`KeychainVault`] 降级为**一次性迁移源**，生产装配不再引用它；
+//! - [`MemoryVault`] 仍然只给测试与启动兜底（兜底时 `backend_name()` 会暴露 `memory`）。
 
 pub mod keychain;
+pub mod keyfile;
+pub mod local;
+pub mod migrate;
+pub mod seal;
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -14,6 +23,8 @@ use std::sync::Mutex;
 use crate::error::{Error, Result};
 
 pub use keychain::KeychainVault;
+pub use local::LocalVault;
+pub use migrate::{import_refs, migrate_once, MigrationOutcome, MigrationReport, MIGRATION_MARKER};
 
 /// 引用命名规则：`kr/<scope>/<id>/<field>`
 ///
@@ -30,7 +41,8 @@ pub fn is_valid_secret_ref(value: &str) -> bool {
 
 pub trait Vault: Send + Sync {
     /// 后端标识，用于诊断与「拒绝静默降级」断言。
-    /// 取值：`"macos-keychain"` / `"windows-credential-manager"` / `"memory"` / `"unsupported"`
+    /// 取值：`"local-sqlite"` / `"macos-keychain"` / `"windows-credential-manager"` /
+    /// `"memory"` / `"unsupported"`
     fn backend_name(&self) -> &'static str;
 
     /// 可用性探测。发布路径启动时调用一次；不可用即拒绝提供钥匙串能力。
