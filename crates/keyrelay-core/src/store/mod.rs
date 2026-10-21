@@ -3199,7 +3199,7 @@ mod tests {
         let now = now_secs();
         {
             let conn = store.lock().unwrap();
-            let mut insert = |site: i64, model: &str, ts: i64, prompt: i64, completion: i64| {
+            let insert = |site: i64, model: &str, ts: i64, prompt: i64, completion: i64| {
                 conn.execute(
                     "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![ts, site, model, prompt, completion, prompt + completion],
@@ -3275,7 +3275,7 @@ mod tests {
         let now = now_secs();
         {
             let conn = store.lock().unwrap();
-            let mut insert = |site: i64, used: f64, remaining: f64, currency: &str, ts: i64| {
+            let insert = |site: i64, used: f64, remaining: f64, currency: &str, ts: i64| {
                 conn.execute(
                     "INSERT INTO usage_snapshots(site_id, used, remaining, currency, known, ts) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
                     params![site, used, remaining, currency, ts],
