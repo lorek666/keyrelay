@@ -110,7 +110,10 @@ pub fn load_or_create(path: &Path, machine: &dyn MachineId) -> Result<VaultKey> 
             dek: Some(B64.encode(dek.as_ref())),
         },
     };
-    write_new(path, &body)?;
+    if !write_new(path, &body)? {
+        // 另一个进程抢先创建了密钥文件：用它的，不要覆盖。
+        return read_existing(path, machine);
+    }
     Ok(VaultKey {
         dek,
         device_bound: machine_id.is_some(),
@@ -165,9 +168,10 @@ fn read_existing(path: &Path, machine: &dyn MachineId) -> Result<VaultKey> {
         .dek
         .as_ref()
         .ok_or_else(|| vault_error("密钥文件未绑定设备，但缺少 dek 字段"))?;
-    let bytes = B64
-        .decode(raw)
-        .map_err(|e| vault_error(format!("密钥文件 dek 解码失败: {e}")))?;
+    let bytes = zeroize::Zeroizing::new(
+        B64.decode(raw)
+            .map_err(|e| vault_error(format!("密钥文件 dek 解码失败: {e}")))?,
+    );
     if bytes.len() != KEY_LEN {
         return Err(vault_error(format!(
             "密钥文件 dek 长度不对：{}（期望 {KEY_LEN}）",
@@ -175,7 +179,7 @@ fn read_existing(path: &Path, machine: &dyn MachineId) -> Result<VaultKey> {
         )));
     }
     let mut dek = Zeroizing::new([0u8; KEY_LEN]);
-    dek.copy_from_slice(&bytes);
+    dek.copy_from_slice(bytes.as_slice());
     Ok(VaultKey {
         dek,
         device_bound: false,
@@ -279,7 +283,8 @@ fn derive_kek(machine_id: &str, salt: &[u8], iterations: u32) -> Result<Zeroizin
     Ok(key)
 }
 
-fn write_new(path: &Path, body: &KeyFileBody) -> Result<()> {
+/// 返回 `true` = 本次创建成功；`false` = 目标已存在（并发首启），调用方应改读现有文件。
+fn write_new(path: &Path, body: &KeyFileBody) -> Result<bool> {
     let dir = path
         .parent()
         .ok_or_else(|| vault_error("密钥文件路径没有父目录"))?;
@@ -305,12 +310,23 @@ fn write_new(path: &Path, body: &KeyFileBody) -> Result<()> {
         .map_err(|e| vault_error(format!("写密钥文件失败: {e}")))?;
     drop(file);
 
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        vault_error(format!("落盘密钥文件失败: {e}"))
-    })?;
+    // 用 `hard_link` 而不是 `rename`：目标已存在时它会失败，而不是**覆盖**掉
+    // 另一个进程刚写好的密钥文件（覆盖 = 那一边的密钥永久丢失）。
+    match fs::hard_link(&tmp, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&tmp);
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&tmp);
+            return Ok(false);
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(vault_error(format!("落盘密钥文件失败: {e}", e = err)));
+        }
+    }
     set_file_private(path)?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -413,24 +429,14 @@ impl MachineId for SystemMachineId {
 mod tests {
     use super::*;
 
-    fn temp_dir() -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "keyrelay-keyfile-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&p).unwrap();
-        p
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("建临时目录")
     }
 
     #[test]
     fn creates_private_file_and_roundtrips() {
         let dir = temp_dir();
-        let path = dir.join("vault.key");
+        let path = dir.path().join("vault.key");
         let m = StaticMachineId(Some("machine-a".into()));
         let first = load_or_create(&path, &m).unwrap();
         assert!(first.device_bound);
@@ -439,18 +445,17 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "密钥文件必须是 0600");
-            let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            let dir_mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
             assert_eq!(dir_mode, 0o700, "密钥目录必须是 0700");
         }
         let second = load_or_create(&path, &m).unwrap();
         assert_eq!(first.dek.as_ref(), second.dek.as_ref());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn another_machine_cannot_unwrap() {
         let dir = temp_dir();
-        let path = dir.join("vault.key");
+        let path = dir.path().join("vault.key");
         let a = StaticMachineId(Some("machine-a".into()));
         let b = StaticMachineId(Some("machine-b".into()));
         load_or_create(&path, &a).unwrap();
@@ -460,29 +465,26 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("解不开"), "{err}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn unbound_fallback_is_labelled_truthfully() {
         let dir = temp_dir();
-        let path = dir.join("vault.key");
+        let path = dir.path().join("vault.key");
         let none = StaticMachineId(None);
         let key = load_or_create(&path, &none).unwrap();
         assert!(!key.device_bound);
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"deviceBound\": false"), "{text}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn corrupt_file_is_not_overwritten() {
         let dir = temp_dir();
-        let path = dir.join("vault.key");
+        let path = dir.path().join("vault.key");
         fs::write(&path, b"not json").unwrap();
         let m = StaticMachineId(Some("machine-a".into()));
         assert!(load_or_create(&path, &m).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"not json");
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

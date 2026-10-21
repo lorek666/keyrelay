@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use zeroize::Zeroizing;
 
 use super::keyfile::{self, MachineId, SystemMachineId, VaultKey};
@@ -52,6 +52,15 @@ impl LocalVault {
         key_path: &Path,
         machine: &dyn MachineId,
     ) -> Result<Self> {
+        // P1-1（复审）：密钥文件不在、库里却有密文 —— 这是「密钥丢了」，不是「首次运行」。
+        // 必须在这里拦住：否则会生成一把新 DEK，把旧数据锁死，而且启动一切正常。
+        if !key_path.exists() && db_has_secrets(db_path)? {
+            return Err(Error::Vault(format!(
+                "密钥文件 {} 不存在，但保险库里已有密文；拒绝生成新密钥（旧数据将永久解不开）。\
+                 请从备份恢复 vault.key，或删掉 vault.db 后重新录入密钥。",
+                key_path.display()
+            )));
+        }
         let key = keyfile::load_or_create(key_path, machine)?;
         Self::open_with_key(db_path, key)
     }
@@ -83,11 +92,17 @@ impl LocalVault {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         conn.execute_batch(DDL)
             .map_err(|e| Error::Vault(format!("建保险库表失败: {e}")))?;
-        Ok(Self {
+        let vault = Self {
             conn: Mutex::new(conn),
             dek: key.dek,
             device_bound: key.device_bound,
-        })
+        };
+        // P2-3（复审）：把「是否设备绑定」写进元信息，诊断时不用去翻密钥文件。
+        vault.meta_set(
+            "device_bound",
+            if vault.device_bound { "true" } else { "false" },
+        )?;
+        Ok(vault)
     }
 
     pub fn is_device_bound(&self) -> bool {
@@ -136,17 +151,29 @@ impl Vault for LocalVault {
         "local-sqlite"
     }
 
+    /// 不只 `SELECT 1`：**试解一行真实密文**，这样「密钥文件不属于这个库」
+    /// （例如恢复了旧的 vault.key 备份）会在启动时就暴露成 `VaultUnavailable`，
+    /// 而不是等到用户点开某把密钥才报「密文校验失败」（复审 P2-5）。
     fn probe(&self) -> Result<()> {
-        let conn = self.lock()?;
-        conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
-            .map(|_| ())
-            .map_err(|e| Error::VaultUnavailable(format!("保险库不可读: {e}")))
+        let first: Option<(String, String)> = {
+            let conn = self.lock()?;
+            conn.query_row("SELECT ref, seal FROM vault_secrets LIMIT 1", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()
+            .map_err(|e| Error::VaultUnavailable(format!("保险库不可读: {e}")))?
+        };
+        if let Some((reference, sealed)) = first {
+            seal::unseal(&self.dek, &reference, &sealed)
+                .map_err(|_| Error::VaultUnavailable("密钥文件与保险库不匹配".into()))?;
+        }
+        Ok(())
     }
 
     fn put(&self, key: &str, secret: &str) -> Result<()> {
         if !is_valid_secret_ref(key) {
             return Err(Error::Vault(
-                "钥匙串引用必须形如 kr/<scope>/<id>/<field>".into(),
+                "密钥引用必须形如 kr/<scope>/<id>/<field>".into(),
             ));
         }
         let sealed = seal::seal(&self.dek, key, secret)?;
@@ -164,7 +191,7 @@ impl Vault for LocalVault {
     fn get(&self, key: &str) -> Result<Option<String>> {
         if !is_valid_secret_ref(key) {
             return Err(Error::Vault(
-                "钥匙串引用必须形如 kr/<scope>/<id>/<field>".into(),
+                "密钥引用必须形如 kr/<scope>/<id>/<field>".into(),
             ));
         }
         let sealed: Option<String> = {
@@ -186,7 +213,7 @@ impl Vault for LocalVault {
     fn has(&self, key: &str) -> Result<bool> {
         if !is_valid_secret_ref(key) {
             return Err(Error::Vault(
-                "钥匙串引用必须形如 kr/<scope>/<id>/<field>".into(),
+                "密钥引用必须形如 kr/<scope>/<id>/<field>".into(),
             ));
         }
         let conn = self.lock()?;
@@ -203,7 +230,7 @@ impl Vault for LocalVault {
     fn delete(&self, key: &str) -> Result<()> {
         if !is_valid_secret_ref(key) {
             return Err(Error::Vault(
-                "钥匙串引用必须形如 kr/<scope>/<id>/<field>".into(),
+                "密钥引用必须形如 kr/<scope>/<id>/<field>".into(),
             ));
         }
         let conn = self.lock()?;
@@ -211,6 +238,30 @@ impl Vault for LocalVault {
             .map_err(|e| Error::Vault(format!("删除密文失败: {e}")))?;
         Ok(())
     }
+}
+
+/// 库文件存在且 `vault_secrets` 已有行（只读打开，绝不创建文件）。
+fn db_has_secrets(db_path: &Path) -> Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| Error::Vault(format!("只读打开保险库失败: {e}")))?;
+    let table_exists: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'vault_secrets'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| Error::Vault(format!("检查保险库表失败: {e}")))?;
+    if table_exists.is_none() {
+        return Ok(false);
+    }
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vault_secrets", [], |row| row.get(0))
+        .map_err(|e| Error::Vault(format!("统计保险库密文失败: {e}")))?;
+    Ok(n > 0)
 }
 
 fn now_secs() -> i64 {
@@ -230,24 +281,15 @@ pub fn default_paths(home: &Path) -> (PathBuf, PathBuf) {
 mod tests {
     use super::*;
 
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "keyrelay-vault-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("建临时目录")
     }
 
     #[test]
-    fn roundtrip_and_reopen() {
+    fn reopening_the_same_db_keeps_rows() {
         let dir = temp_dir();
         {
-            let vault = LocalVault::open_temp(&dir).unwrap();
+            let vault = LocalVault::open_temp(dir.path()).unwrap();
             vault.put("kr/key/1/secret", "sk-test-value").unwrap();
             assert_eq!(
                 vault.get("kr/key/1/secret").unwrap().as_deref(),
@@ -257,42 +299,39 @@ mod tests {
             assert_eq!(vault.count().unwrap(), 1);
             assert_eq!(vault.backend_name(), "local-sqlite");
         }
-        // 重开：`open_temp` 每次换 DEK，所以这里只能验库表还在；DEK 持久化由 keyfile 单测覆盖。
-        let vault = LocalVault::open_temp(&dir).unwrap();
+        // `open_temp` 每次换 DEK，所以这里只验库表还在；真正的「同一 key 文件重开可读」
+        // 由 `tests/vault_local.rs::secrets_survive_a_restart_with_the_same_key_file` 覆盖。
+        let vault = LocalVault::open_temp(dir.path()).unwrap();
         assert_eq!(vault.count().unwrap(), 1);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn delete_is_idempotent_and_get_returns_none() {
         let dir = temp_dir();
-        let vault = LocalVault::open_temp(&dir).unwrap();
+        let vault = LocalVault::open_temp(dir.path()).unwrap();
         vault.put("kr/key/2/secret", "v").unwrap();
         vault.delete("kr/key/2/secret").unwrap();
         vault.delete("kr/key/2/secret").unwrap();
         assert_eq!(vault.get("kr/key/2/secret").unwrap(), None);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn invalid_reference_is_rejected() {
         let dir = temp_dir();
-        let vault = LocalVault::open_temp(&dir).unwrap();
+        let vault = LocalVault::open_temp(dir.path()).unwrap();
         assert!(vault.put("not-a-ref", "v").is_err());
         assert!(vault.get("kr/key/1").is_err());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn meta_roundtrip() {
         let dir = temp_dir();
-        let vault = LocalVault::open_temp(&dir).unwrap();
+        let vault = LocalVault::open_temp(dir.path()).unwrap();
         assert_eq!(vault.meta_get("migrated_from_keychain").unwrap(), None);
         vault.meta_set("migrated_from_keychain", "1").unwrap();
         assert_eq!(
             vault.meta_get("migrated_from_keychain").unwrap().as_deref(),
             Some("1")
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

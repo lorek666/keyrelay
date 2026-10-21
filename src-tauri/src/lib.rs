@@ -173,7 +173,9 @@ pub async fn detect_only(base_url: &str, proxy: Option<String>) -> Result<SiteFi
 
 fn state_from_store(store: Store, db_path: PathBuf, db_error: Option<String>) -> AppState {
     let home = home_dir();
-    let config = build_service_config(home, &store);
+    // 主库降级时不要跑迁移：空的内存库枚举不出引用，会把「已完成」标记写死，
+    // 真实库恢复后迁移就被永久跳过了（复审 P1-3）。
+    let config = build_service_config(home, &store, db_error.is_some());
     state_with_config(store, db_path, db_error, config, OnlineModelMeta::Enabled)
 }
 
@@ -181,11 +183,20 @@ fn state_from_store(store: Store, db_path: PathBuf, db_error: Option<String>) ->
 ///
 /// 顺序不能反：**先**迁移、**再**把 vault 交给 service——迁移要用 store 的引用索引，
 /// 而 store 一旦 move 进 `KeyRelayService` 就拿不到了。
-fn build_service_config(home: PathBuf, store: &Store) -> ServiceConfig {
+fn build_service_config(home: PathBuf, store: &Store, db_degraded: bool) -> ServiceConfig {
     let (vault_db, key_file) = keyrelay_core::vault::local::default_paths(&home);
     match keyrelay_core::vault::LocalVault::open(&vault_db, &key_file) {
         Ok(vault) => {
-            run_keychain_migration(&vault, store);
+            if !vault.is_device_bound() {
+                eprintln!(
+                    "[keyrelay] 保险库未绑定设备（取不到设备标识）：密钥文件只受文件权限保护"
+                );
+            }
+            if db_degraded {
+                eprintln!("[keyrelay] 主库已降级为内存库，本次跳过钥匙串迁移");
+            } else {
+                run_keychain_migration(&vault, store);
+            }
             ServiceConfig::with_vault(std::sync::Arc::new(vault), home)
         }
         Err(err) => {
@@ -204,6 +215,7 @@ fn build_service_config(home: PathBuf, store: &Store) -> ServiceConfig {
 /// 只在真机启动路径上跑：钥匙串不可用（用户拒绝、平台不支持）就整体跳过，
 /// 下一次启动再试——**不会**因为迁移失败而阻止 App 启动。
 fn run_keychain_migration(vault: &keyrelay_core::vault::LocalVault, store: &Store) {
+    use keyrelay_core::vault::migrate::refs_for_migration;
     use keyrelay_core::vault::{migrate_once, KeychainVault, Vault, MIGRATION_MARKER};
 
     match vault.meta_get(MIGRATION_MARKER) {
@@ -215,7 +227,7 @@ fn run_keychain_migration(vault: &keyrelay_core::vault::LocalVault, store: &Stor
         }
     }
 
-    let refs = match store.all_secret_refs() {
+    let refs = match refs_for_migration(store) {
         Ok(refs) => refs,
         Err(err) => {
             eprintln!("[keyrelay] 枚举密钥引用失败，跳过迁移: {err}");
@@ -319,10 +331,10 @@ fn state_with_config(
     config: ServiceConfig,
     online_model_meta: OnlineModelMeta,
 ) -> AppState {
-    // 钥匙串可用性只在启动时探测一次并明确告警；不可用时投递相关能力会各自失败，
-    // **不会**静默换成内存实现（ADR-0002）。
+    // 保险库可用性只在启动时探测一次并明确告警；不可用时投递相关能力会各自失败，
+    // **不会**静默换成内存实现（ADR-0003）。
     if let Err(err) = config.vault.probe() {
-        eprintln!("[keyrelay] 系统钥匙串不可用，密钥投递将被禁用: {err}");
+        eprintln!("[keyrelay] 本地保险库不可用，密钥投递将被禁用: {err}");
     }
     // 先借用 store 解析代理（M10-S2），再把 store move 进 service——Store 不是 Clone，
     // 顺序不能反。代理非法时 resolved_proxy_url 已 eprintln 告警并返回 None（直连），
