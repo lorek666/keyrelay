@@ -72,7 +72,7 @@ vi.mock("../lib/api", async (importOriginal) => {
   };
 });
 
-import { deliveryPlan } from "../lib/api";
+import { deliveryPlan, listKeyModels } from "../lib/api";
 
 const rows = () => Array.from(document.querySelectorAll<HTMLElement>("[data-agent-channel]"));
 const row = (id: string) => document.querySelector<HTMLElement>(`[data-agent-channel="${id}"]`)!;
@@ -273,6 +273,18 @@ describe("M31-S1 Agent 工作台", () => {
     expect(document.body.textContent ?? "").not.toContain("~/.mimocode/");
     // 顺带确认名称仍然正确（去掉路径不能把名称也弄丢）
     expect(row("mimo-code").querySelector(".agent-row-name")?.textContent).toBe("MiMo Code");
+    // 未选密钥时不应发模型清单请求（enabled: keyId !== null）
+    expect(listKeyModels).not.toHaveBeenCalled();
+
+    // 安装弹窗标题/aria-label 也不能把路径带回来（复审 P2-1）
+    await waitFor(() => expect(row("mimo-code").querySelector(".agent-row-install")).not.toBeNull());
+    fireEvent.click(row("mimo-code").querySelector(".agent-row-install")!);
+    await waitFor(() => expect(document.querySelector("dialog[open]")).not.toBeNull());
+    const dialog = document.querySelector("dialog[open]")!;
+    expect(dialog.textContent).toContain("MiMo Code");
+    expect(dialog.textContent ?? "").not.toContain("~/.mimocode/");
+    expect(dialog.getAttribute("aria-label") ?? "").not.toContain("~/.mimocode/");
+    fireEvent(dialog, new Event("cancel", { cancelable: true }));
   });
 
   it("⑬ 选 key 101 后下拉含 model-a/model-b；换 key 102 后变成该 key 的清单", async () => {

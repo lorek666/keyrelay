@@ -71,21 +71,18 @@ export const CHANNELS = [
   { id: "dsh", label: "DeepSeek Harness（~/.dsh/.credentials.yaml）", agent: "dsh" },
 ];
 
-/** 生效策略文案（PRD FR-4:137 / M7-S3）。从 `restartHint` 取值派生，不按通道硬编码。 */
 /**
- * 把 `"Codex CLI（~/.codex/auth.json）"` 拆成名称与目标文件。
+ * 从 `"Codex CLI（~/.codex/auth.json）"` 取展示名称（括号前）。
  *
- * 落点标签本身就是「Agent 名（目标文件）」这一种形态（M14-S1 定的），
- * 拆分只用于**展示**（名称一行、目标一行小字），不参与任何判断。
- * 没有括号时整串当名称、目标留空。
+ * 落点标签是「Agent 名（目标文件）」形态；M32-S1 起界面不再显示目标路径，
+ * 因此只返回名称。没有括号时整串当名称。
  */
-function splitChannelLabel(label: string): { name: string; target: string } {
+function channelName(label: string): string {
   const i = label.indexOf("（");
-  const j = label.lastIndexOf("）");
-  if (i > 0 && j > i) return { name: label.slice(0, i), target: label.slice(i + 1, j) };
-  return { name: label, target: "" };
+  return i > 0 ? label.slice(0, i) : label;
 }
 
+/** 生效策略文案（PRD FR-4:137 / M7-S3）。从 `restartHint` 取值派生，不按通道硬编码。 */
 function restartHintLabel(hint: RestartHint): string {
   if (hint === "notNeeded") return translate(getCurrentDict(), "agents.restartHint.notNeeded");
   if (hint === "needed") return translate(getCurrentDict(), "agents.restartHint.needed");
@@ -415,7 +412,7 @@ export default function Agents() {
             const selectedKeyId = effectiveKeyId(c.id);
             const isOpen = expanded === c.id;
             const writingModel = !NO_MODEL_CHANNELS.has(c.id);
-            const { name } = splitChannelLabel(c.label);
+            const name = channelName(c.label);
             return (
               <li
                 key={c.id}
@@ -779,7 +776,7 @@ export default function Agents() {
       <InstallDialog
         open={installFor !== null}
         status={installFor ? agentByChannel.get(installFor) : undefined}
-        label={CHANNELS.find((c) => c.id === installFor)?.label ?? ""}
+        label={installFor ? channelName(CHANNELS.find((c) => c.id === installFor)?.label ?? "") : ""}
         copiedKey={copiedKey}
         onCopied={setCopiedKey}
         onClose={() => setInstallFor(null)}
