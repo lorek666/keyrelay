@@ -95,7 +95,11 @@ describe("M31-S1 Agent 工作台（行列表）", () => {
   it("③ 旧「通道」下拉已不存在", async () => {
     renderPage();
     await waitFor(() => expect(rows().length).toBe(CHANNELS.length));
-    expect(document.querySelectorAll('[role="combobox"]').length).toBe(0);
+    // 用可及性树而不是字面 `[role="combobox"]`：原生 `<select>` 没有 role 属性，
+    // 旧写法恒真（M30-S2 P2-2 复发，M31 复审 P2-3）。旧实现有站点/密钥/通道三个
+    // select，这里会是 3；新实现只剩顶部站点选择一个 select（mock 的所有行未安装，
+    // 所以行内 key 下拉也不出现）。
+    expect(screen.queryAllByRole("combobox")).toHaveLength(1);
     expect(Object.prototype.hasOwnProperty.call(zhCN.agents.select, "channel")).toBe(false);
     const labelled = Array.from(document.querySelectorAll("label")).filter(
       (l) => l.querySelector("span")?.textContent?.trim() === "通道",

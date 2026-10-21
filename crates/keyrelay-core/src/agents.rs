@@ -346,8 +346,13 @@ pub fn specs() -> &'static [AgentSpec] {
 
 // ============================================================ 探测
 
-/// 版本命令的超时（spec §4.1）。
-const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
+/// 版本命令的超时（spec §4.1，M31-S1 定为 **5 秒**）。
+///
+/// 为什么不是 2 秒：`node` / `npm` 类 CLI 冷启动就要 1–3 秒，2 秒会把「刚装完第一次检测」
+/// 误报成「版本命令超时」；macOS 对新写入脚本的首次 exec 还有 provenance 扫描
+/// （实测 8–15 秒，spec §9）——5 秒覆盖不到的极端情况由「再点一次重新检测」兜底
+/// （第二次 exec 不再扫描）。
+const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 并行探测全部 agent（`std::thread::scope`；单个探测 panic 不影响其余）。
 pub fn detect_agents(home: &Path) -> Vec<AgentStatus> {
@@ -575,7 +580,7 @@ enum VersionRun {
     Failed(String),
 }
 
-/// 跑 `<bin> --version`（2s 超时；stdout 优先、stderr 兜底）。
+/// 跑 `<bin> --version`（5s 超时；stdout 优先、stderr 兜底）。
 fn run_version(path: &Path, version_args: &[&str]) -> VersionRun {
     let mut child = match Command::new(path)
         .args(version_args)
@@ -609,12 +614,12 @@ fn run_version(path: &Path, version_args: &[&str]) -> VersionRun {
         return VersionRun::TimedOut;
     };
 
-    let out = stdout
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let err = stderr
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
+    // **不要 join 读线程**：子进程正常退出后，如果它派生的后台子孙进程继承了
+    // stdout/stderr 管道，`read_to_end` 要等那个子孙也退出才 EOF ⇒ join 会把
+    // 「2s/5s 超时」变成无限等待（复审 P2-1）。用 channel + recv_timeout 取已读结果；
+    // 极端情况下读线程会晚一点结束，但它不阻塞本命令的返回。
+    let out = read_available(stdout);
+    let err = read_available(stderr);
     if !status.success() && out.trim().is_empty() && err.trim().is_empty() {
         return VersionRun::Failed(format!("退出码 {}", status.code().unwrap_or(-1)));
     }
@@ -625,12 +630,48 @@ fn run_version(path: &Path, version_args: &[&str]) -> VersionRun {
 
 fn read_to_string_async(
     mut reader: impl std::io::Read + Send + 'static,
-) -> std::thread::JoinHandle<String> {
+) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = reader.read_to_end(&mut buffer);
-        String::from_utf8_lossy(&buffer).into_owned()
-    })
+        // **按块发送**而不是 read_to_end 后发一次：后台子孙进程继承管道时，
+        // read_to_end 要等它退出才 EOF；按块发送能让主线程先拿到已经输出的版本。
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx
+                        .send(String::from_utf8_lossy(&buffer[..n]).into_owned())
+                        .is_err()
+                    {
+                        break; // 接收端已因超时被丢掉
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
+/// 取读线程已经读到的内容；最多等 500ms（管道被后台子孙继承时不会永远等）。
+fn read_available(rx: Option<std::sync::mpsc::Receiver<String>>) -> String {
+    let Some(rx) = rx else {
+        return String::new();
+    };
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let mut out = String::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok(chunk) => out.push_str(&chunk),
+            Err(_) => break,
+        }
+    }
+    out
 }
 
 /// 从版本命令输出里提取版本（spec §4.1）：
@@ -815,16 +856,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_fake_bin(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("建目录");
-        std::fs::write(path, body).expect("写脚本");
-        let mut perms = std::fs::metadata(path).expect("元数据").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).expect("改权限");
-    }
-
-    #[cfg(unix)]
     #[test]
     fn detects_a_fake_cli_with_version() {
         use std::os::unix::fs::symlink;
@@ -834,7 +865,7 @@ mod tests {
         //
         // **不要在这里写一个临时 shell 脚本再直接 exec**：macOS 会给新 inode 打
         // `com.apple.provenance`，第一次 exec 要做安全扫描（实测 8–15s），
-        // 必然超过 run_version 的 2s 超时 ⇒ 测试假红（本文件历史上翻过一次车）。
+        // 必然超过 run_version 的 5s 超时 ⇒ 测试假红（本文件历史上翻过一次车）。
         // 软链到系统已有的 bash：二进制早已被扫描过，`bash --version` 又能稳定输出
         // 一个带数字与点的版本 token。精确的 `9.9.9` 解析由 `extract_version_...` 覆盖。
         let bin = home.join(".local/bin/codex");
@@ -858,18 +889,66 @@ mod tests {
         assert!(!status.install_commands.is_empty());
     }
 
+    /// 超时路径：软链到 `/bin/bash` + 假 spec 传 `-c "sleep 30"` ⇒ 必超时（真等满 5 秒）。
+    ///
+    /// 同样**不写临时脚本**（理由同上一条：macOS 首次 exec 的 provenance 扫描会把
+    /// 「超时测试」变成「扫描超时」，测的就不是 `run_version` 了）。
+    /// P2-1 回归：子进程正常退出，但它派生的后台子孙仍持有 stdout 管道。
+    /// 旧实现 `join()` 读线程会等那个子孙退出才返回（可能永久），本测试会挂；
+    /// 新实现按块读 + recv_timeout，拿到 `9.9.9` 就返回。
+    #[cfg(unix)]
+    #[test]
+    fn background_child_holding_the_pipe_does_not_block_the_probe() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let home = dir.path();
+        let bin = home.join(".local/bin/leakybin");
+        std::fs::create_dir_all(bin.parent().expect("parent")).expect("建目录");
+        std::os::unix::fs::symlink("/bin/bash", &bin).expect("建软链");
+
+        let spec = AgentSpec {
+            channel: "fake-leaky",
+            name: "Leaky",
+            probe: Probe::Cli {
+                bins: &["leakybin"],
+                version_args: &["-c", "(sleep 2 &); echo 9.9.9"],
+            },
+            config_path: None,
+            installs: &[inst!("npm", "npm i -g x")],
+            install_url: "https://example.invalid",
+        };
+        let started = std::time::Instant::now();
+        let status = detect_one(&spec, home);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "后台子孙持有管道时探测不得等待它退出：{:?}",
+            started.elapsed()
+        );
+        assert_eq!(status.version.as_deref(), Some("9.9.9"), "{status:?}");
+        assert!(status.detail.is_none(), "{status:?}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn fake_cli_that_times_out_is_installed_without_version() {
         let dir = tempfile::tempdir().expect("临时目录");
         let home = dir.path();
-        write_fake_bin(&home.join(".local/bin/codex"), "#!/bin/sh\nsleep 5\n");
-        let spec = specs()
-            .iter()
-            .find(|s| s.channel == "codex-auth-json")
-            .unwrap();
-        let status = detect_one(spec, home);
-        assert!(status.installed, "{status:?}");
+        let bin = home.join(".local/bin/slowbin");
+        std::fs::create_dir_all(bin.parent().expect("parent")).expect("建目录");
+        std::os::unix::fs::symlink("/bin/bash", &bin).expect("建软链");
+
+        let spec = AgentSpec {
+            channel: "fake-slow",
+            name: "Slow",
+            probe: Probe::Cli {
+                bins: &["slowbin"],
+                version_args: &["-c", "sleep 30"],
+            },
+            config_path: None,
+            installs: &[inst!("npm", "npm i -g x")],
+            install_url: "https://example.invalid",
+        };
+        let status = detect_one(&spec, home);
+        assert!(status.installed, "程序在就算已安装：{status:?}");
         assert_eq!(status.version, None, "超时 ⇒ 版本未知");
         assert_eq!(status.detail.as_deref(), Some("版本命令超时"));
     }

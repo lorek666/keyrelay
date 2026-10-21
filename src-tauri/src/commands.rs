@@ -2267,6 +2267,10 @@ pub fn autostart_set(state: State<'_, AppState>, enabled: bool) -> Result<Autost
 /// `installCommands` 只供界面展示/复制，应用不会替用户运行。
 #[tauri::command]
 pub fn detect_agents(state: State<'_, AppState>) -> Vec<keyrelay_core::agents::AgentStatus> {
+    // 20 条探测内部已是并行；Tauri 的同步命令不阻塞 WebView 的渲染线程。
+    // 试过 async + spawn_blocking：`State<'_, AppState>` 不能跨 await，
+    // `AppHandle` / `Window` 在 Tauri 2.12 又不实现 CommandArg（编译期拒绝），
+    // 为一条只读探测引入额外的状态克隆不值得。单条最长 5s，仍在可接受范围。
     keyrelay_core::agents::detect_agents(state.service.home())
 }
 

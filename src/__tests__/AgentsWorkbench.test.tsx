@@ -217,4 +217,40 @@ describe("M31-S1 Agent 工作台", () => {
     expect(row("codex-auth-json").querySelector(".agent-row-model")).toBeNull();
     expect(row("codex-auth-json").textContent).toContain(zhCN.agents.row.noModel);
   });
+
+  it("⑨ 展开行的 model 与网关模式都进 deliveryPlan 参数（不是全局旧值）", async () => {
+    renderPage();
+    await waitFor(() => expect(keySelect("opencode")).not.toBeNull());
+
+    fireEvent.change(keySelect("opencode"), { target: { value: "102" } });
+    fireEvent.change(modelInput("opencode"), { target: { value: "gpt-x" } });
+    // 模型输入有 400ms 防抖；等它进查询键后再展开，否则 plan 拿到的是空 model。
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    // 页面上唯一的 checkbox 是顶部「指向本地网关」
+    fireEvent.click(document.querySelector<HTMLInputElement>('input[type="checkbox"]')!);
+    fireEvent.click(row("opencode").querySelector(".agent-row-toggle")!);
+
+    await waitFor(() => expect(deliveryPlan).toHaveBeenCalled());
+    const arg = (deliveryPlan as unknown as { mock: { calls: unknown[][] } }).mock.calls.at(-1)![0];
+    expect(arg).toMatchObject({
+      keyId: 102,
+      channel: "opencode",
+      model: "gpt-x",
+      mode: "gateway",
+    });
+  });
+
+  it("⑩ 已回收/不存在的 keyId 不拿去查预览", async () => {
+    localStorage.setItem(
+      `keyrelay.agentPrefs.v1.${SITE_A}`,
+      JSON.stringify({ "claude-code-settings": { keyId: 999, model: "stale" } }),
+    );
+    renderPage();
+    await waitFor(() => expect(keySelect("claude-code-settings")).not.toBeNull());
+    expect(keySelect("claude-code-settings").value).toBe("");
+
+    fireEvent.click(row("claude-code-settings").querySelector(".agent-row-toggle")!);
+    await waitFor(() => expect(document.querySelector(".agent-row-plan")).not.toBeNull());
+    expect(deliveryPlan).not.toHaveBeenCalled();
+  });
 });
