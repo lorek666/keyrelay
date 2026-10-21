@@ -253,4 +253,36 @@ describe("M31-S1 Agent 工作台", () => {
     await waitFor(() => expect(document.querySelector(".agent-row-plan")).not.toBeNull());
     expect(deliveryPlan).not.toHaveBeenCalled();
   });
+
+  it("⑪ 切换站点会收起展开行并清空同意勾选", async () => {
+    localStorage.setItem(
+      `keyrelay.agentPrefs.v1.${SITE_A}`,
+      JSON.stringify({ "codex-auth-json": { keyId: 101, model: "" } }),
+    );
+    localStorage.setItem(
+      `keyrelay.agentPrefs.v1.${SITE_B}`,
+      JSON.stringify({ "codex-auth-json": { keyId: 201, model: "" } }),
+    );
+    renderPage();
+    await waitFor(() => expect(keySelect("codex-auth-json").value).toBe("101"));
+
+    fireEvent.click(row("codex-auth-json").querySelector(".agent-row-toggle")!);
+    await waitFor(() => expect(document.querySelector(".agent-row-plan")).not.toBeNull());
+    const consent = () =>
+      document.querySelector<HTMLInputElement>(".agent-row-plan .checkline input[type=checkbox]");
+    await waitFor(() => expect(consent()).not.toBeNull());
+    fireEvent.click(consent()!);
+    expect(consent()!.checked).toBe(true);
+
+    // 切站：prefs 换成 B 的 key，展开行收起，同意勾选重置。
+    fireEvent.change(document.querySelector<HTMLSelectElement>("select")!, {
+      target: { value: String(SITE_B) },
+    });
+    await waitFor(() => expect(keySelect("codex-auth-json").value).toBe("201"));
+    expect(document.querySelector(".agent-row-plan")).toBeNull();
+
+    fireEvent.click(row("codex-auth-json").querySelector(".agent-row-toggle")!);
+    await waitFor(() => expect(consent()).not.toBeNull());
+    expect(consent()!.checked).toBe(false);
+  });
 });
