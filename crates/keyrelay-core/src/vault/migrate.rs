@@ -9,6 +9,8 @@ use zeroize::Zeroizing;
 use super::local::LocalVault;
 use super::Vault;
 use crate::error::Result;
+use crate::service::GATEWAY_TOKEN_REF;
+use crate::store::Store;
 
 /// 迁移完成标记（写在 `vault_meta` 里）。有值就不再跑，避免每次启动 probe 钥匙串。
 pub const MIGRATION_MARKER: &str = "migrated_from_keychain";
@@ -26,6 +28,19 @@ pub struct MigrationOutcome {
     pub report: MigrationReport,
     /// 之前已经迁移过（本次什么都没做）。
     pub already_done: bool,
+}
+
+/// 迁移要覆盖的引用集合 = 库里的引用 + 网关本地令牌。
+///
+/// 网关令牌（`kr/gateway/local/token`）没有 `keys` 行、不在任何表里，但它是
+/// `owned_secret_refs()` 明确承认的「本产品拥有的条目」（复审 P1-2）。漏掉它，
+/// 升级后 `gateway_token()` 会生成新令牌，已有 agent 配置全部 401。
+pub fn refs_for_migration(store: &Store) -> Result<Vec<String>> {
+    let mut refs = store.all_secret_refs()?;
+    refs.push(GATEWAY_TOKEN_REF.to_string());
+    refs.sort();
+    refs.dedup();
+    Ok(refs)
 }
 
 /// 逐条搬运。`source` 通常是 `KeychainVault`，`target` 是 `LocalVault`。

@@ -41,7 +41,8 @@ pub fn is_valid_secret_ref(value: &str) -> bool {
 
 pub trait Vault: Send + Sync {
     /// 后端标识，用于诊断与「拒绝静默降级」断言。
-    /// 取值：`"macos-keychain"` / `"windows-credential-manager"` / `"memory"` / `"unsupported"`
+    /// 取值：`"local-sqlite"` / `"macos-keychain"` / `"windows-credential-manager"` /
+    /// `"memory"` / `"unsupported"`
     fn backend_name(&self) -> &'static str;
 
     /// 可用性探测。发布路径启动时调用一次；不可用即拒绝提供钥匙串能力。

@@ -148,8 +148,9 @@ mod tests {
     fn tampered_ciphertext_is_rejected() {
         let sealed = seal(&dek(), "kr/key/1/secret", "sk-abc123").unwrap();
         let mut bytes = sealed.into_bytes();
-        let last = bytes.len() - 1;
-        bytes[last] = if bytes[last] == b'A' { b'B' } else { b'A' };
+        // 改中间一个 base64 字符（不是末尾 padding）：解码后的密文确实变了。
+        let mid = bytes.len() / 2;
+        bytes[mid] = if bytes[mid] == b'A' { b'B' } else { b'A' };
         let tampered = String::from_utf8(bytes).unwrap();
         assert!(unseal(&dek(), "kr/key/1/secret", &tampered).is_err());
     }

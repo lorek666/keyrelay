@@ -125,8 +125,8 @@ fn error_kind(err: &Error) -> &'static str {
         Error::NotDelivered(_) => "连接未建立",
         // M9-S2：与「认证失败」分开记——用户要做的是**改输入**，不是重新登录。
         Error::InvalidInput(_) => "输入不符合站点要求",
-        Error::Vault(_) => "钥匙串错误",
-        Error::VaultUnavailable(_) => "钥匙串不可用",
+        Error::Vault(_) => "保险库错误",
+        Error::VaultUnavailable(_) => "保险库不可用",
         Error::ConsentRequired { .. } => "缺少用户同意",
         Error::FileBusy(_) => "目标文件被占用",
         Error::Store(_) => "本地存储错误",

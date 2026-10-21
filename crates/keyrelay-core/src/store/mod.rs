@@ -816,7 +816,11 @@ impl Store {
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|e| Error::Store(format!("查询密钥引用失败: {e}")))?;
         for row in rows {
-            refs.insert(row.map_err(|e| Error::Store(format!("读取密钥引用失败: {e}")))?);
+            let value = row.map_err(|e| Error::Store(format!("读取密钥引用失败: {e}")))?;
+            // 只收合法引用：历史库里可能有非 `kr/...` 的脏值，带进迁移会让它每次都失败。
+            if crate::vault::is_valid_secret_ref(&value) {
+                refs.insert(value);
+            }
         }
 
         let mut stmt = conn
@@ -826,7 +830,10 @@ impl Store {
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|e| Error::Store(format!("查询账号引用失败: {e}")))?;
         for row in rows {
-            refs.insert(row.map_err(|e| Error::Store(format!("读取账号引用失败: {e}")))?);
+            let value = row.map_err(|e| Error::Store(format!("读取账号引用失败: {e}")))?;
+            if crate::vault::is_valid_secret_ref(&value) {
+                refs.insert(value);
+            }
         }
 
         let mut stmt = conn
