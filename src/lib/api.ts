@@ -100,7 +100,7 @@ export type AppInfo = {
   siteCount: number;
   /** 数据库降级原因；非空表示当前跑在内存库上 */
   dbError?: string | null;
-  /** 钥匙串后端。`"memory"` 表示密钥没进系统钥匙串（真实运行里即为缺陷）。 */
+  /** 密钥存储后端。`"local-sqlite"` = 本地加密保险库；`"memory"` 表示密钥没落盘（真实运行里即为缺陷）。 */
   vaultBackend: string;
 };
 

@@ -1,7 +1,8 @@
 //! 从 argv 装配 `KeyRelayService` 的纯函数。
 //!
-//! CLI 是 `keyrelay-core` 的外部消费者：只用 `Store::open` / `MemoryVault` /
-//! `KeychainVault` / `ServiceConfig` / `MockTransport` 的既有 `pub` API。
+//! CLI 是 `keyrelay-core` 的外部消费者：只用 `Store::open` / `LocalVault` /
+//! `MemoryVault` / `KeychainVault`（仅迁移回退）/ `ServiceConfig` / `MockTransport`
+//! 的既有 `pub` API。
 //!
 //! 为什么用 `MockTransport`（而非 `reqwest`）：`apply_delivery` / `rollback_delivery`
 //! / `grant_consent` 全是纯本地操作，零网络。引入 `reqwest` 会让 CLI 背上 GUI 才
@@ -13,11 +14,14 @@ use std::sync::Arc;
 use keyrelay_core::service::{KeyRelayService, ServiceConfig};
 use keyrelay_core::site::transport::MockTransport;
 use keyrelay_core::store::Store;
-use keyrelay_core::vault::{KeychainVault, MemoryVault, Vault};
+use keyrelay_core::vault::{KeychainVault, LocalVault, MemoryVault, Vault};
 
-/// vault 后端选择。`--smoke` 路径强制 `Memory`（真密钥不进真钥匙串）。
+/// vault 后端选择。`--smoke` 路径强制 `Memory`（真密钥不落盘）。
+///
+/// `Local` 是默认值（ADR-0003）；`Keychain` 只为一个版本内的回退/对照保留。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum VaultChoice {
+    Local,
     Keychain,
     Memory,
 }
@@ -50,6 +54,10 @@ pub fn build_service(
 ) -> Result<KeyRelayService<MockTransport>, BuildError> {
     let store = Store::open(store_path).map_err(BuildError::OpenStore)?;
     let vault: Arc<dyn Vault> = match vault {
+        VaultChoice::Local => {
+            let (db_path, key_path) = keyrelay_core::vault::local::default_paths(home);
+            Arc::new(LocalVault::open(&db_path, &key_path).map_err(BuildError::OpenVault)?)
+        }
         VaultChoice::Keychain => Arc::new(KeychainVault::new()),
         VaultChoice::Memory => Arc::new(MemoryVault::new()),
     };
@@ -67,12 +75,14 @@ pub fn build_service(
 #[derive(Debug)]
 pub enum BuildError {
     OpenStore(keyrelay_core::Error),
+    OpenVault(keyrelay_core::Error),
 }
 
 impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BuildError::OpenStore(e) => write!(f, "打开本地库失败: {e}"),
+            BuildError::OpenVault(e) => write!(f, "打开加密保险库失败: {e}"),
         }
     }
 }

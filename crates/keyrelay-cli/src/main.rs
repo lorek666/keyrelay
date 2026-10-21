@@ -62,7 +62,7 @@ impl CliError {
 }
 
 const USAGE: &str = "用法:\n\
-  keyrelay-cli apply-delivery --key-id <N> --channel <C> [--model <M>] [--home <H>] [--store <S>] [--backup-dir <B>] [--vault keychain|memory]\n\
+  keyrelay-cli apply-delivery --key-id <N> --channel <C> [--model <M>] [--home <H>] [--store <S>] [--backup-dir <B>] [--vault local|memory|keychain]\n\
   keyrelay-cli apply-delivery --channel <C> [--model <M>] --smoke [--home <H>] [--store <S>] [--backup-dir <B>] [--i-know-this-is-real-home]\n\
   keyrelay-cli rollback-delivery --journal <J> [--store <S>]\n\
   keyrelay-cli grant-consent --key-id <N> --channel <C> [--home <H>] [--store <S>]\n\
@@ -327,7 +327,9 @@ fn parse_channel(flags: &Flags) -> Result<DeliveryChannel, CliError> {
 fn parse_vault(flags: &Flags) -> VaultChoice {
     match flags.value("vault").as_deref() {
         Some("memory") => VaultChoice::Memory,
-        _ => VaultChoice::Keychain,
+        // 一个版本内的回退/对照路径；生产默认已经换成本地加密保险库（ADR-0003）。
+        Some("keychain") => VaultChoice::Keychain,
+        _ => VaultChoice::Local,
     }
 }
 

@@ -798,6 +798,51 @@ impl Store {
             .map_err(|e| Error::Store(format!("读取站点行失败: {e}")))
     }
 
+    /// 迁移用：枚举所有「密钥落点引用」。
+    ///
+    /// 钥匙串没有枚举接口（ADR-0002 §2），所以迁移只能从**索引侧**反查：
+    /// `keys.secret_ref` ∪ `accounts.credential_ref` ∪ 每个站点的会话引用
+    /// （站点会话不在任何列里，是按 `kr/site/<id>/session` 约定拼出来的）。
+    ///
+    /// 去重后按字典序返回，保证迁移日志与测试可复现。
+    pub fn all_secret_refs(&self) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut refs = std::collections::BTreeSet::new();
+
+        let mut stmt = conn
+            .prepare("SELECT secret_ref FROM keys")
+            .map_err(|e| Error::Store(format!("准备查询密钥引用失败: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| Error::Store(format!("查询密钥引用失败: {e}")))?;
+        for row in rows {
+            refs.insert(row.map_err(|e| Error::Store(format!("读取密钥引用失败: {e}")))?);
+        }
+
+        let mut stmt = conn
+            .prepare("SELECT credential_ref FROM accounts")
+            .map_err(|e| Error::Store(format!("准备查询账号引用失败: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| Error::Store(format!("查询账号引用失败: {e}")))?;
+        for row in rows {
+            refs.insert(row.map_err(|e| Error::Store(format!("读取账号引用失败: {e}")))?);
+        }
+
+        let mut stmt = conn
+            .prepare("SELECT id FROM sites")
+            .map_err(|e| Error::Store(format!("准备查询站点 id 失败: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|e| Error::Store(format!("查询站点 id 失败: {e}")))?;
+        for row in rows {
+            let id = row.map_err(|e| Error::Store(format!("读取站点 id 失败: {e}")))?;
+            refs.insert(crate::vault::secret_ref("site", id, "session"));
+        }
+
+        Ok(refs.into_iter().collect())
+    }
+
     pub fn get_site(&self, id: i64) -> Result<Option<SiteRow>> {
         let conn = self.lock()?;
         let mut stmt = conn

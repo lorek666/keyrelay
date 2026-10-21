@@ -123,8 +123,8 @@
     },
     "error": {
       "refreshFailed": "Refresh failed: {error}",
-      "memoryVaultPre": "Currently using the in-memory keychain: ",
-      "memoryVaultPost": "keys won't enter the system keychain and are lost when the process exits. In a real run, this backend is a defect."
+      "memoryVaultPre": "Currently using the in-memory vault: ",
+      "memoryVaultPost": "keys never reach the local encrypted vault and are lost when the process exits. In a real run, this backend is a defect."
     },
     "warn": {
       "browserPreviewPre": "Browser preview mode: all data is sample, writes won't take effect. To connect the real backend, use ",

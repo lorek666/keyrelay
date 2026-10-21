@@ -123,8 +123,8 @@
     },
     "error": {
       "refreshFailed": "刷新失败：{error}",
-      "memoryVaultPre": "当前用的是内存钥匙串：",
-      "memoryVaultPost": "密钥不会进系统钥匙串，进程退出即丢失。真实运行里出现这个后端即为缺陷。"
+      "memoryVaultPre": "当前用的是内存保险库：",
+      "memoryVaultPost": "密钥不会进本地加密库，进程退出即丢失。真实运行里出现这个后端即为缺陷。"
     },
     "warn": {
       "browserPreviewPre": "当前是浏览器预览模式：所有数据都是示例，写操作不会生效。要连真实后端请用 ",
