@@ -67,10 +67,9 @@ describe("M30-S2 Agent 落点卡片", () => {
     expect(CHANNELS.length).toBe(20);
 
     const renderedIds = all.map((el) => el.getAttribute("data-agent-channel"));
+    // 顺序也要与 CHANNELS 一致：只断集合相等的话，把两个落点对调不会红。
+    expect(renderedIds).toEqual(CHANNELS.map((c) => c.id));
     expect(new Set(renderedIds).size).toBe(CHANNELS.length);
-    for (const c of CHANNELS) {
-      expect(renderedIds).toContain(c.id);
-    }
 
     // 每张卡都同时显示落点标签与稳定 agent id
     for (const c of CHANNELS) {
@@ -110,13 +109,14 @@ describe("M30-S2 Agent 落点卡片", () => {
     expect(first.classList.contains("selected")).toBe(false);
   });
 
-  it("④ 页面不再有「通道」下拉框", async () => {
+  it("④ 页面不再有「通道」下拉框（站点 / 密钥两个仍在）", async () => {
     renderPage();
     await waitFor(() => expect(cards().length).toBe(CHANNELS.length));
 
-    // 页面上不应残留任何 combobox（旧实现是 <select>）
-    // 注意：站点 / 密钥两个下拉仍在（M30-S2 不动它们），所以不能断言「页面上没有 select」
-    expect(document.querySelectorAll('[role="combobox"]').length).toBe(0);
+    // 原生 <select> 在可访问性树里就是 combobox；站点 / 密钥两个仍在（本步不动它们），
+    // 旧实现会多出第三个「通道」combobox。不能写 `querySelector('[role=combobox]')`：
+    // 原生 select 没有这个字面属性，那一行会恒真（M30-S2 复审 P2-2）。
+    expect(screen.getAllByRole("combobox")).toHaveLength(2);
 
     // i18n 的 `agents.select.channel` 已删除
     expect(Object.prototype.hasOwnProperty.call(zhCN.agents.select, "channel")).toBe(false);

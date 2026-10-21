@@ -250,10 +250,11 @@ section > .muted {
 /* ============================================================ M30-S2：Agent 落点卡片网格 */
 
 /* 宽屏多列、窄屏自然单列（auto-fill 会自己降列），不需要媒体查询。
-   minmax(240px, 1fr) 让长落点标签有足够宽度，配合下方的 overflow-wrap 不横向溢出。 */
+   `min(240px, 100%)` 让容器本身窄于 240px 时也不会把网格撑出横向滚动
+   （M30-S2 复审 P3-3）；长落点标签由下方的 overflow-wrap 负责断行。 */
 .agent-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr));
   gap: 10px;
 }
 

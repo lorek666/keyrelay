@@ -882,7 +882,7 @@ export async function listChannelBindings(): Promise<ChannelBinding[]> {
 /**
  * 前端侧的「agent ⇒ 通道」表（M8-S7 / B-116）。
  *
- * 与 `Agents.tsx` 的 `CHANNELS` **同源不同处**：那张表驱动投递页的下拉，
+ * 与 `Agents.tsx` 的 `CHANNELS` **同源不同处**：那张表驱动投递页的落点卡片，
  * 这张只服务「从一条 binding 反查它属于哪条通道」。两边都由
  * `scripts/check-commands.mjs` 的通道名对账守着 id 集合一致（B-101），
  * 所以不会静默分叉。

@@ -95,7 +95,7 @@ export default function Agents() {
   const NO_MODEL_CHANNELS = new Set(["claude-desktop", "cursor", "dsh", "codex-auth-json", "codex-config"]);
   const needsModel = !NO_MODEL_CHANNELS.has(channel);
   // 当前通道所属的 agent（解绑按 agent 做，不是按通道）。
-  // `channel` 只可能来自 `CHANNELS`（初始值与下拉都在其中），所以这里的兜底不可达；
+  // `channel` 只可能来自 `CHANNELS`（初始值与卡片都在其中），所以这里的兜底不可达；
   // 用空串而不是 `!`：解绑命令对空 agent_id 只会返回 `{0, 0}`（幂等零报告），不会误伤。
   const activeAgent = CHANNELS.find((c) => c.id === channel)?.agent ?? "";
   const [modelInput, setModelInput] = useState("");
@@ -338,9 +338,9 @@ export default function Agents() {
         Codex / OpenCode / Cline 各自有多个目标文件，合并会让用户看不到真实可投递面。
       */}
       <div className="card">
-        <h3>{t("agents.picker.title", { count: CHANNELS.length })}</h3>
+        <h3 id="agent-picker-title">{t("agents.picker.title", { count: CHANNELS.length })}</h3>
         <p className="muted">{t("agents.picker.hint")}</p>
-        <div className="agent-grid">
+        <div className="agent-grid" role="group" aria-labelledby="agent-picker-title">
           {CHANNELS.map((c) => (
             <button
               key={c.id}
