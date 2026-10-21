@@ -1737,6 +1737,208 @@ export async function detectAgents(): Promise<AgentStatus[]> {
   return invokeCommand<AgentStatus[]>("detect_agents");
 }
 
+// ============================================================ Agent 更新（M34-S1）
+
+/** 逐通道的更新检查状态（与后端 `AgentUpdateStatus::state` 同值）。 */
+export type AgentUpdateState =
+  | "available"
+  | "upToDate"
+  | "unknown"
+  | "unsupported"
+  | "error"
+  | "notInstalled";
+
+/** 更新源类别（与后端 `UpdateSourceKind::as_str()` 同值）。 */
+export type AgentUpdateSource = "npm" | "brewCask" | "marketplace" | "none";
+
+/**
+ * 一次更新检查的逐通道结果（M34-S1 §4.3）。
+ *
+ * **只读**：这里的信息只用于「要不要提示更新」；真正的执行是 [`updateAgent`]，
+ * 且前端**只能传 channel** —— 命令与参数全部来自后端静态表，前端无从注入。
+ */
+export type AgentUpdateStatus = {
+  channel: string;
+  installed: boolean;
+  currentVersion: string | null;
+  latestVersion: string | null;
+  state: AgentUpdateState;
+  source: AgentUpdateSource;
+  /** 至少有一个更新策略所需的工具能在本机找到 */
+  autoUpdate: boolean;
+  /** 第一个可执行策略的展示命令（后端 `argv.join(" ")`）；没有则 null */
+  command: string | null;
+  manualUrl: string | null;
+  /** 人话补充：检查失败原因 / 为什么不支持 / 为什么无法比较 */
+  message: string | null;
+};
+
+/** 一次更新尝试的执行记录。 */
+export type AgentUpdateAttempt = {
+  label: string;
+  command: string;
+  /** 工具没找到 ⇒ 该策略没执行 */
+  skipped: boolean;
+  success: boolean;
+  exitCode: number | null;
+  timedOut: boolean;
+  /** 已去 ANSI + 脱敏，只留尾部 */
+  outputTail: string;
+};
+
+/** 一次一键更新的结果。 */
+export type AgentUpdateOutcome = {
+  channel: string;
+  /** 任一策略成功即 true */
+  success: boolean;
+  attempts: AgentUpdateAttempt[];
+  versionBefore: string | null;
+  versionAfter: string | null;
+  versionChanged: boolean;
+  message: string | null;
+};
+
+/**
+ * 检查全部已安装 Agent 的最新版本（只读，命令 `check_agent_updates`，无参数）。
+ *
+ * 单个更新源失败不影响整体：那一条 `state="error"`，其余照常。10 分钟内复用缓存
+ * （由调用方的 `staleTime` 决定），刷新页面/手动重试才重新请求。
+ */
+export async function checkAgentUpdates(): Promise<AgentUpdateStatus[]> {
+  if (!hasTauri) {
+    // 浏览器预览：与 spec §4.3 的 mock 口径一致 —— 20 条、顺序同后端（= AGENT_CHANNELS 的值序）。
+    // codex 两个通道可更新、claude 可更新、dsh 已最新、grok 不支持检查、其余未安装。
+    const notInstalled = (channel: string): AgentUpdateStatus => ({
+      channel,
+      installed: false,
+      currentVersion: null,
+      latestVersion: null,
+      state: "notInstalled",
+      source: "none",
+      autoUpdate: false,
+      command: null,
+      manualUrl: null,
+      message: null,
+    });
+    const known: Record<string, AgentUpdateStatus> = {
+      "codex-auth-json": {
+        channel: "codex-auth-json",
+        installed: true,
+        currentVersion: "0.162.1",
+        latestVersion: "0.163.0",
+        state: "available",
+        source: "npm",
+        autoUpdate: true,
+        command: "codex update",
+        manualUrl: "https://chatgpt.com/codex",
+        message: null,
+      },
+      "codex-config": {
+        channel: "codex-config",
+        installed: true,
+        currentVersion: "0.162.1",
+        latestVersion: "0.163.0",
+        state: "available",
+        source: "npm",
+        autoUpdate: true,
+        command: "codex update",
+        manualUrl: "https://chatgpt.com/codex",
+        message: null,
+      },
+      "claude-code-settings": {
+        channel: "claude-code-settings",
+        installed: true,
+        currentVersion: "2.1.296",
+        latestVersion: "2.1.306",
+        state: "available",
+        source: "npm",
+        autoUpdate: true,
+        command: "claude update",
+        manualUrl: "https://code.claude.com/docs",
+        message: null,
+      },
+      dsh: {
+        channel: "dsh",
+        installed: true,
+        currentVersion: "0.2.1-rc.2",
+        latestVersion: "0.2.1-rc.2",
+        state: "upToDate",
+        source: "npm",
+        autoUpdate: false,
+        command: null,
+        manualUrl: "https://www.npmjs.com/package/@deepseek-ai/dsh",
+        message: null,
+      },
+      "grok-build": {
+        channel: "grok-build",
+        installed: false,
+        currentVersion: null,
+        latestVersion: null,
+        state: "unsupported",
+        source: "none",
+        autoUpdate: false,
+        command: null,
+        manualUrl: "https://x.ai/cli",
+        message: null,
+      },
+    };
+    return mock(Object.values(AGENT_CHANNELS).map((channel) => known[channel] ?? notInstalled(channel)));
+  }
+  return invokeCommand<AgentUpdateStatus[]>("check_agent_updates");
+}
+
+/**
+ * 执行一次一键更新（命令 `update_agent`，**只传 channel**）。
+ *
+ * 安全边界在后端：执行的 argv 只能来自静态表、不经 shell、不 sudo；前端传不了命令/参数。
+ * 这里只负责把结果原样带回给界面展示（成功 / 失败 / 每次尝试的记录）。
+ */
+export async function updateAgent(channel: string): Promise<AgentUpdateOutcome> {
+  if (!hasTauri) {
+    // 浏览器预览：codex 两个通道与 claude「更新成功」，版本从 mock 当前值变成 latest。
+    // 后端的 `UpdateStrategy.label` 本身就是中文静态串（"自更新" / "npm" / "Homebrew" / "VS Code"），
+    // mock 与它同形；真实展示值由后端给，前端不重译（见 spec §4.1）。
+    const selfUpdate = "自更新"; // i18n:skip
+    const known: Record<string, { before: string; after: string; label: string; command: string }> = {
+      "codex-auth-json": { before: "0.162.1", after: "0.163.0", label: selfUpdate, command: "codex update" },
+      "codex-config": { before: "0.162.1", after: "0.163.0", label: selfUpdate, command: "codex update" },
+      "claude-code-settings": { before: "2.1.296", after: "2.1.306", label: selfUpdate, command: "claude update" },
+    };
+    const hit = known[channel];
+    if (!hit) {
+      return mock({
+        channel,
+        success: false,
+        attempts: [],
+        versionBefore: null,
+        versionAfter: null,
+        versionChanged: false,
+        message: translate(getCurrentDict(), "agents.update.notSupported"),
+      });
+    }
+    return mock({
+      channel,
+      success: true,
+      attempts: [
+        {
+          label: hit.label,
+          command: hit.command,
+          skipped: false,
+          success: true,
+          exitCode: 0,
+          timedOut: false,
+          outputTail: "",
+        },
+      ],
+      versionBefore: hit.before,
+      versionAfter: hit.after,
+      versionChanged: true,
+      message: null,
+    });
+  }
+  return invokeCommand<AgentUpdateOutcome>("update_agent", { channel });
+}
+
 /**
  * 按 FR-2:113 的命名规范给一个默认名：`<app-id>/<agent-id>/<yyyymmdd>`。
  *

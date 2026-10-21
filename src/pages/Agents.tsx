@@ -24,12 +24,16 @@ import {
   revokeConsent,
   rollbackDelivery,
   unbindAgent,
+  checkAgentUpdates,
+  updateAgent,
   type DeliveryMode,
   type AgentStatus,
   type DeliveryOutcome,
   type DeliveryPlan,
   type RestartHint,
   type UnbindOutcome,
+  type AgentUpdateOutcome,
+  type AgentUpdateStatus,
 } from "../lib/api";
 import { rollbackAftermath, rollbackAftermathTitle } from "../lib/rollback";
 import { maskRemovedValues, shouldWarnEndpointOutOfScope } from "../lib/deliveryView";
@@ -199,6 +203,85 @@ export default function Agents() {
   );
   const [installFor, setInstallFor] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  // ---- M34-S1：Agent 更新（检查只读；执行必须经过确认弹窗 + 勾选同意）----
+  // `detect_agents` 成功后才检查：没有安装状态就没法判断「谁需要更新」，白跑一次网络。
+  // 10 分钟缓存 + 不自动重试：更新检查是提示性的，失败就让用户手动重试（spec §6）。
+  const updatesQuery = useQuery({
+    queryKey: ["agent-updates"],
+    queryFn: checkAgentUpdates,
+    enabled: agentsQuery.isSuccess,
+    staleTime: 10 * 60 * 1000,
+    retry: false,
+  });
+  const updateByChannel = useMemo(
+    () => new Map((updatesQuery.data ?? []).map((u) => [u.channel, u])),
+    [updatesQuery.data],
+  );
+  const updateCounts = useMemo(() => {
+    const rows = updatesQuery.data ?? [];
+    return {
+      available: rows.filter((u) => u.state === "available").length,
+      upToDate: rows.filter((u) => u.state === "upToDate").length,
+      unsupported: rows.filter((u) => u.state === "unsupported").length,
+      failed: rows.filter((u) => u.state === "error").length,
+    };
+  }, [updatesQuery.data]);
+
+  /** 确认弹窗对应的通道（null = 未打开）。 */
+  const [updateFor, setUpdateFor] = useState<string | null>(null);
+  /** 弹窗内「我同意执行该命令」——不勾选确认按钮不可用（spec §4.5）。 */
+  const [updateAgree, setUpdateAgree] = useState(false);
+  const [updateOutcome, setUpdateOutcome] = useState<AgentUpdateOutcome | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  // 「上次检查时间」直接从 query 的 `dataUpdatedAt` 派生，不额外存 state：
+  // 多一个 state + effect 只会在测试里制造一次 act() 之外的更新。
+  const lastCheckedAt =
+    updatesQuery.dataUpdatedAt > 0 ? new Date(updatesQuery.dataUpdatedAt) : null;
+
+  const updateMutation = useMutation({
+    mutationFn: (channel: string) => updateAgent(channel),
+    onSuccess: async (outcome) => {
+      setUpdateError(null);
+      setUpdateOutcome(outcome);
+      setUpdateFor(null);
+      setUpdateAgree(false);
+      // 两个通道可能共享同一二进制（Codex / OpenCode）：更新后**重新探测**再重新检查。
+      await qc.invalidateQueries({ queryKey: ["agents"] });
+      await qc.invalidateQueries({ queryKey: ["agent-updates"] });
+    },
+    onError: (err: Error) => {
+      setUpdateOutcome(null);
+      setUpdateError(err.message);
+      setUpdateFor(null);
+      setUpdateAgree(false);
+    },
+  });
+
+  const openUpdateDialog = (channel: string) => {
+    setUpdateOutcome(null);
+    setUpdateError(null);
+    setUpdateAgree(false);
+    setUpdateFor(channel);
+  };
+  const confirmUpdate = () => {
+    // 双保险：按钮已禁用，这里再挡一次，确保 pending 期间不会重复调用。
+    if (updateFor === null || !updateAgree || updateMutation.isPending) return;
+    updateMutation.mutate(updateFor);
+  };
+  /** 更新源类别的展示文案（`npm` / `brewCask` / `marketplace` / `none`）。 */
+  const updateSourceLabel = (source: AgentUpdateStatus["source"]): string => {
+    switch (source) {
+      case "npm":
+        return t("agents.update.sourceNpm");
+      case "brewCask":
+        return t("agents.update.sourceBrewCask");
+      case "marketplace":
+        return t("agents.update.sourceMarketplace");
+      default:
+        return t("agents.update.sourceNone");
+    }
+  };
 
   const [agreeChecked, setAgreeChecked] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -392,6 +475,86 @@ export default function Agents() {
       ) : null}
 
       {/*
+        M34-S1：Agent 更新汇总卡。**只提示，不动手**——真正的执行必须点开确认弹窗、
+        勾选同意后才会调 `update_agent`（前端只传 channel，命令来自后端静态表）。
+        检查失败不阻塞工作台：这里只多一条错误 + 重试。
+      */}
+      <div className="card agent-updates">
+        <div className="agent-updates-head">
+          <h3>{t("agents.update.title")}</h3>
+          <button
+            type="button"
+            className="btn agent-updates-refresh"
+            disabled={updatesQuery.isFetching || !agentsQuery.isSuccess}
+            onClick={() => {
+              void updatesQuery.refetch();
+            }}
+          >
+            {updatesQuery.isFetching ? t("agents.update.checking") : t("agents.update.refresh")}
+          </button>
+        </div>
+        {updatesQuery.isError ? (
+          <p className="error" role="alert">
+            <AlertTriangle size={14} aria-hidden />{" "}
+            {t("agents.update.checkFailed", { error: (updatesQuery.error as Error).message })}{" "}
+            <button type="button" className="btn" onClick={() => void updatesQuery.refetch()}>
+              {t("agents.update.retry")}
+            </button>
+          </p>
+        ) : (
+          <p className="agent-updates-summary">
+            {updatesQuery.isLoading
+              ? t("agents.update.checking")
+              : t("agents.update.summary", {
+                  available: updateCounts.available,
+                  upToDate: updateCounts.upToDate,
+                  unsupported: updateCounts.unsupported,
+                  error: updateCounts.failed,
+                })}
+          </p>
+        )}
+        {lastCheckedAt ? (
+          <p className="muted">
+            {t("agents.update.lastChecked", {
+              time: lastCheckedAt.toLocaleTimeString(undefined, {
+                hour: "2-digit",
+                minute: "2-digit",
+              }),
+            })}
+          </p>
+        ) : null}
+
+        {/* 结果：成功走 p.ok[role=status]（含 from → to），失败走 warnbox 逐条列 attempts。 */}
+        {updateOutcome ? (
+          updateOutcome.success ? (
+            <p className="ok" role="status">
+              {updateOutcome.versionChanged
+                ? t("agents.update.success", {
+                    from: updateOutcome.versionBefore ?? t("agents.update.versionUnknown"),
+                    to: updateOutcome.versionAfter ?? t("agents.update.versionUnknown"),
+                  })
+                : t("agents.update.unchanged")}
+            </p>
+          ) : (
+            <div className="warnbox" role="alert">
+              <p>
+                <AlertTriangle size={14} aria-hidden /> {t("agents.update.failed")}
+                {updateOutcome.message ? `：${updateOutcome.message}` : ""}
+              </p>
+              <UpdateAttempts outcome={updateOutcome} />
+            </div>
+          )
+        ) : null}
+        {updateError ? (
+          <div className="warnbox" role="alert">
+            <p>
+              <AlertTriangle size={14} aria-hidden /> {t("agents.update.failed")}：{updateError}
+            </p>
+          </div>
+        ) : null}
+      </div>
+
+      {/*
         M31-S1：单列工作台。一行一个落点——**不合并**同 agent 的多个目标文件
         （Codex / OpenCode / Cline 各有多处落点，合并会让用户看不到真实可投递面）。
       */}
@@ -404,6 +567,8 @@ export default function Agents() {
         <ul className="agent-list">
           {CHANNELS.map((c) => {
             const status = agentByChannel.get(c.id);
+            // M34-S1：更新检查结果（没有检查结果时 `undefined`，行上不渲染任何更新控件）。
+            const update = updateByChannel.get(c.id);
             // 后端应返回 20 条；缺一条时是「状态未知」，绝不能当成「未安装」——
             // 那会给出一个装了也白装的安装按钮，且把已装环境说成没装。
             const known = status !== undefined;
@@ -419,6 +584,7 @@ export default function Agents() {
                 className={"agent-row" + (isOpen ? " open" : "")}
                 data-agent-channel={c.id}
                 data-agent-name={c.agent}
+                data-agent-update-state={update?.state}
               >
                 <div className="agent-row-main">
                   <button
@@ -443,6 +609,28 @@ export default function Agents() {
                           ? (status?.version ?? t("agents.row.installed"))
                           : t("agents.row.notInstalled")}
                   </span>
+
+                  {/* M34-S1：只有「已安装 + 有新版」才出现徽标；不可一键更新的只留徽标（title=message）。 */}
+                  {update && installed && update.state === "available" ? (
+                    <span
+                      className="agent-update-badge"
+                      title={update.autoUpdate ? undefined : (update.message ?? undefined)}
+                    >
+                      {update.autoUpdate
+                        ? t("agents.update.badge", { version: update.latestVersion ?? "" })
+                        : t("agents.update.badgeNoAuto", { version: update.latestVersion ?? "" })}
+                    </span>
+                  ) : null}
+
+                  {update && installed && update.state === "available" && update.autoUpdate ? (
+                    <button
+                      type="button"
+                      className="btn agent-row-update"
+                      onClick={() => openUpdateDialog(c.id)}
+                    >
+                      {t("agents.update.update")}
+                    </button>
+                  ) : null}
 
                   {detecting || (!known && !agentsQuery.isError) ? null : installed ? (
                     <div className="agent-row-controls">
@@ -787,6 +975,64 @@ export default function Agents() {
         }}
       />
 
+      {/*
+        M34-S1：更新确认弹窗。**只在这里**才会调 `update_agent`，且必须勾选同意；
+        pending 期间确认按钮禁用（文案变「更新中…」），重复点击不会再次执行。
+      */}
+      <ConfirmDialog
+        open={updateFor !== null}
+        title={t("agents.update.confirmTitle", {
+          name: updateFor
+            ? channelName(CHANNELS.find((c) => c.id === updateFor)?.label ?? updateFor)
+            : "",
+        })}
+        confirmLabel={updateMutation.isPending ? t("agents.update.updating") : t("agents.update.confirm")}
+        confirmDisabled={!updateAgree || updateMutation.isPending}
+        onCancel={() => {
+          if (updateMutation.isPending) return;
+          setUpdateFor(null);
+          setUpdateAgree(false);
+        }}
+        onConfirm={confirmUpdate}
+      >
+        {(() => {
+          const target = updateFor ? updateByChannel.get(updateFor) : undefined;
+          return (
+            <>
+              <div className="agent-update-versions">
+                <span>
+                  {t("agents.update.confirmCurrent")}：
+                  <code className="mono">{target?.currentVersion ?? t("agents.update.versionUnknown")}</code>
+                </span>
+                <span aria-hidden>→</span>
+                <span>
+                  {t("agents.update.confirmLatest")}：
+                  <code className="mono">{target?.latestVersion ?? t("agents.update.versionUnknown")}</code>
+                </span>
+              </div>
+              <p>
+                {t("agents.update.confirmSource")}：
+                {target ? updateSourceLabel(target.source) : ""}
+              </p>
+              <p>
+                {t("agents.update.confirmCommand")}：
+                <code className="mono agent-update-command">{target?.command ?? ""}</code>
+              </p>
+              <p className="muted">{t("agents.update.confirmRisk")}</p>
+              <label className="checkline">
+                <input
+                  type="checkbox"
+                  checked={updateAgree}
+                  disabled={updateMutation.isPending}
+                  onChange={(e) => setUpdateAgree(e.target.checked)}
+                />
+                <span>{t("agents.update.agree")}</span>
+              </label>
+            </>
+          );
+        })()}
+      </ConfirmDialog>
+
     </section>
   );
 }
@@ -911,6 +1157,54 @@ function InstallDialog({
 function formatTs(ts: number): string {
   if (!ts) return "—";
   return new Date(ts * 1000).toLocaleString();
+}
+
+/**
+ * 一次更新失败的「执行记录」（M34-S1 §4.5）：逐条列出每次尝试的 label / command /
+ * exitCode / timedOut / skipped 与输出尾部。
+ *
+ * 输出尾部由后端去 ANSI + 脱敏 + 截断，这里只负责展示，**不做二次处理**。
+ */
+function UpdateAttempts({ outcome }: { outcome: AgentUpdateOutcome }) {
+  const { t } = useTranslation();
+  if (outcome.attempts.length === 0) return null;
+  return (
+    <div className="agent-update-result">
+      <p className="muted">{t("agents.update.attemptsTitle")}</p>
+      {outcome.attempts.map((attempt, index) => (
+        <div className="agent-update-attempt" key={`${attempt.label}-${index}`}>
+          <div className="agent-update-attempt-head">
+            <span className="badge">{attempt.label}</span>
+            <code className="mono agent-update-command">{attempt.command}</code>
+            {attempt.skipped ? (
+              <span className="badge badge-warn">{t("agents.update.attemptSkipped")}</span>
+            ) : (
+              <>
+                <span className={attempt.success ? "badge badge-ok" : "badge badge-warn"}>
+                  {attempt.success ? t("agents.update.attemptOk") : t("agents.update.attemptFail")}
+                </span>
+                {attempt.timedOut ? (
+                  <span className="badge badge-warn">{t("agents.update.attemptTimeout")}</span>
+                ) : null}
+                {attempt.exitCode !== null ? (
+                  <span className="muted mono">
+                    {t("agents.update.attemptExit", { code: attempt.exitCode })}
+                  </span>
+                ) : null}
+              </>
+            )}
+          </div>
+          {attempt.outputTail ? (
+            <pre className="mono">
+              <span className="muted">{t("agents.update.attemptOutput")}</span>
+              {"\n"}
+              {attempt.outputTail}
+            </pre>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function PlanView({

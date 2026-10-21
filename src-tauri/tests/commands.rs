@@ -1664,3 +1664,77 @@ fn report_ui_ready_writes_a_millisecond_timestamp_setting() {
     let ms2: i64 = again.parse().expect("仍是数字字符串");
     assert!(ms2 >= ms, "重复调用应覆盖成更新的时间戳: {ms} -> {ms2}");
 }
+
+// ---------- M34-S1：Agent 更新检查与白名单一键更新 ----------
+
+/// `check_agent_updates` 可达、返回 20 条、顺序与 `agents::specs()` 一致。
+///
+/// 会真的联网（每个源 8s 超时）；**失败也必须是「20 条 + 逐条 state」而不是整体 Err**，
+/// 这条测试同时钉住「单个源失败不影响整体」的契约形状。
+#[test]
+fn check_agent_updates_returns_twenty_rows_in_specs_order() {
+    let value = invoke("check_agent_updates").expect("check_agent_updates 应成功");
+    let rows = value.as_array().expect("返回值必须是数组");
+    assert_eq!(rows.len(), 20, "检查结果必须是 20 条");
+
+    let channels: Vec<&str> = rows
+        .iter()
+        .map(|row| row["channel"].as_str().expect("channel 必须是字符串"))
+        .collect();
+    let expected: Vec<&str> = keyrelay_core::agents::specs()
+        .iter()
+        .map(|spec| spec.channel)
+        .collect();
+    assert_eq!(channels, expected, "顺序必须与 agents::specs() 逐位一致");
+
+    for row in rows {
+        // 序列化契约：camelCase 键存在（Rust 侧字段是 snake_case）
+        assert!(
+            row.get("currentVersion").is_some(),
+            "缺少 camelCase 键 currentVersion: {row}"
+        );
+        assert!(row.get("latestVersion").is_some());
+        assert!(row.get("autoUpdate").is_some());
+        assert!(row.get("manualUrl").is_some());
+        let state = row["state"].as_str().expect("state 必须是字符串");
+        assert!(
+            matches!(
+                state,
+                "available" | "upToDate" | "unknown" | "unsupported" | "error" | "notInstalled"
+            ),
+            "state 不合法: {state}"
+        );
+        let source = row["source"].as_str().expect("source 必须是字符串");
+        assert!(
+            matches!(source, "npm" | "brewCask" | "marketplace" | "none"),
+            "source 不合法: {source}"
+        );
+    }
+}
+
+#[test]
+fn update_agent_on_unknown_channel_reports_business_error() {
+    let err = invoke_impl("update_agent", json!({ "channel": "no-such-channel" }))
+        .expect_err("未知通道必须报错");
+    assert_not_acl_rejection("update_agent", &err);
+    let message = err.to_string();
+    assert!(
+        message.contains("未知的投递通道"),
+        "错误信息应说明是未知通道: {message}"
+    );
+}
+
+#[test]
+fn update_agent_on_unsupported_channel_reports_business_error() {
+    // grok-build 没有更新源/策略；dsh 有源但无策略（只能手动）。
+    for channel in ["grok-build", "dsh"] {
+        let err = invoke_impl("update_agent", json!({ "channel": channel }))
+            .expect_err("不支持一键更新的通道必须报错");
+        assert_not_acl_rejection("update_agent", &err);
+        let message = err.to_string();
+        assert!(
+            message.contains("不支持一键更新"),
+            "{channel} 的拒绝文案不对: {message}"
+        );
+    }
+}
