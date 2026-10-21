@@ -1330,6 +1330,11 @@ async fn refresh_session_sends_the_expected_request() {
     let req = &requests[0];
     assert_eq!(req.url, "https://relay.example.com/api/user/auth/refresh");
     assert_eq!(
+        req.method.as_str(),
+        "POST",
+        "续期必须是 POST（M29-S1 复审 P2-2）"
+    );
+    assert_eq!(
         header_of(req, "Cookie"),
         Some("new_api_refresh=sid-1.secret-part"),
         "Cookie 头只许带续期凭据一条"
