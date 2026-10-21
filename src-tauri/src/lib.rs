@@ -397,6 +397,7 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::revoke_key,
             commands::purge_keychain,
             commands::detect_unmanaged_targets,
+            commands::detect_agents,
             commands::suggest_key_name,
             // M8-S4：解绑（FR-2:115）、网关令牌轮换（§6.4）
             commands::unbind_agent,

@@ -2261,6 +2261,15 @@ pub fn autostart_set(state: State<'_, AppState>, enabled: bool) -> Result<Autost
     Ok(dto)
 }
 
+/// 探测每个投递落点的 Agent 是否安装、版本与安装命令（M31-S1）。
+///
+/// 只读：核心层不执行安装命令、不创建目录、不写盘。返回值里的
+/// `installCommands` 只供界面展示/复制，应用不会替用户运行。
+#[tauri::command]
+pub fn detect_agents(state: State<'_, AppState>) -> Vec<keyrelay_core::agents::AgentStatus> {
+    keyrelay_core::agents::detect_agents(state.service.home())
+}
+
 /// 探测「已知但本版本不托管」的 agent 落点（M7-S3 / 章程 R-7）。
 ///
 /// 只读：核心层永不创建目录、永不写盘。它存在的理由是**不静默**——

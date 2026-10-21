@@ -396,10 +396,6 @@
       "keyPlaceholder": "（选择一把）",
       "revokedHidden": "已隐藏 {count} 把已回收的密钥（站点上已经没了，不该再被投递）"
     },
-    "picker": {
-      "title": "支持的 Agent（{count}）",
-      "hint": "每个落点单独列出；点一个作为本次投递目标。"
-    },
     "gatewayMode": {
       "label": "指向本地网关：写进去的是网关地址（/v1）与本地令牌，不是站点密钥。之后换站只要重启网关，agent 侧不用改。需要网关正在运行。",
       "title": "本地网关令牌（不是站点密钥）",
@@ -524,6 +520,32 @@
       "delivered": "已投递到 {path}（变更 {journal}）。{hint}",
       "revoked": "已撤销同意。已写入的文件不会被自动回滚——如需还原请用「变更历史」页。",
       "rolledBack": "已回滚 {journal}。"
+    },
+    "workbench": {
+      "title": "支持的 Agent（{count}）",
+      "hint": "一行一个落点。已安装的直接选密钥/模型后展开预览；未安装的先按命令装好再重新检测。",
+      "detectFailed": "检测失败：{error}"
+    },
+    "row": {
+      "detecting": "检测中…",
+      "unknown": "状态未知",
+      "installed": "已安装",
+      "notInstalled": "未安装",
+      "install": "安装",
+      "expand": "展开",
+      "collapse": "收起",
+      "noModel": "该落点不写模型"
+    },
+    "install": {
+      "title": "安装 {name}",
+      "hint": "把下面的命令复制到终端执行。KeyRelay 不会自动运行任何命令，也不会替你安装。",
+      "copy": "复制",
+      "copied": "已复制",
+      "copyFailed": "复制失败",
+      "redetect": "重新检测",
+      "url": "安装页",
+      "close": "关闭",
+      "empty": "后端没有给出安装命令，请按该 Agent 的官方文档安装。"
     }
   },
   "history": {

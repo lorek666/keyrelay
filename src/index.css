@@ -247,52 +247,195 @@ section > .muted {
   color: var(--muted);
 }
 
-/* ============================================================ M30-S2：Agent 落点卡片网格 */
+/* ============================================================ M31-S1：Agent 单列工作台 */
 
-/* 宽屏多列、窄屏自然单列（auto-fill 会自己降列），不需要媒体查询。
-   `min(240px, 100%)` 让容器本身窄于 240px 时也不会把网格撑出横向滚动
-   （M30-S2 复审 P3-3）；长落点标签由下方的 overflow-wrap 负责断行。 */
-.agent-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr));
-  gap: 10px;
-}
-
-.agent-choice {
+.agent-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  text-align: left;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 12px;
   background: var(--field);
-  color: inherit;
-  cursor: pointer;
+  overflow: hidden;
+}
+
+/* Magpie 式的一整张列表：行与行之间只画分隔线，不是一张张独立卡片 */
+.agent-row {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.agent-row + .agent-row {
+  border-top: 1px solid var(--line);
+}
+
+.agent-row.open {
+  background: var(--accent-soft);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.agent-row-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   padding: 10px 12px;
+  flex-wrap: wrap;
+}
+
+/* 名称/目标那一块整体可点（原生 button ⇒ 键盘可达） */
+.agent-row-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 220px;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
   font: inherit;
-  /* 落点标签里有 `~/.config/opencode/opencode.jsonc` 这种长串：允许任意处断行 */
+  cursor: pointer;
+}
+
+.agent-row-head:disabled {
+  cursor: default;
+}
+
+.agent-row-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+.agent-icon {
+  flex: 0 0 auto;
+  border-radius: 6px;
+  object-fit: contain;
+}
+
+.agent-icon-fallback {
+  display: inline-block;
+  text-align: center;
+  font-weight: 600;
+}
+
+.agent-row-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.agent-row-name {
+  font-size: 13px;
+  font-weight: 600;
   overflow-wrap: anywhere;
 }
 
-.agent-choice:hover,
-.agent-choice:focus-visible {
-  border-color: var(--accent);
-}
-
-/* 选中态：边框 + 底色双通道，不只靠颜色（色弱用户也能看出） */
-.agent-choice.selected {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-}
-
-.agent-choice-name {
-  font-size: 13px;
-  line-height: 1.35;
-}
-
-.agent-choice-id {
+.agent-row-target {
   font-size: 11px;
   color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.agent-badge {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.agent-badge.ok {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.agent-row-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 320px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.agent-row-key,
+.agent-row-model {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+
+.agent-row-nomodel {
+  font-size: 11px;
+}
+
+.agent-row-plan {
+  border-top: 1px solid var(--line);
+  padding: 12px;
+}
+
+/* 安装弹窗里的命令块：命令本身用等宽、可横向滚动（不换行是为了能整条复制/对照） */
+.install-cmds {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.install-cmd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.install-cmd-via {
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 48px;
+}
+
+.install-cmd-text {
+  flex: 1 1 220px;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+.install-url {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  overflow-wrap: anywhere;
+}
+
+/* 窄窗口：行变两行（图标+名称+徽标一行，控件一行），不横向滚动 */
+@media (max-width: 760px) {
+  .agent-row-main {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .agent-row-head {
+    flex: 1 1 auto;
+  }
+
+  .agent-row-controls {
+    flex: 1 1 auto;
+  }
 }
 
 

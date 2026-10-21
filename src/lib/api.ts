@@ -1653,6 +1653,91 @@ export async function detectUnmanagedTargets(): Promise<UnmanagedTarget[]> {
 }
 
 /**
+ * Agent 本机发现（M31-S1）：是否安装、版本、安装命令。
+ *
+ * 只读探测：后端不执行 `installCommands`，也不创建目录/写盘。
+ * `installCommands` 是给用户复制到终端里执行的**静态命令**；界面不得自动运行。
+ */
+export type AgentInstallCommand = {
+  /** `script` / `npm` / `brew` / `code` */
+  via: string;
+  command: string;
+};
+
+export type AgentStatus = {
+  /** 与 `DeliveryChannel::as_str()` 一一对应 */
+  channel: string;
+  installed: boolean;
+  /** 读不到版本时为 `null`（已安装但版本未知，不得编造） */
+  version: string | null;
+  /** 命中的可执行文件 / 应用包 / 扩展目录；未安装为 `null` */
+  source: string | null;
+  /** 人话补充，例如「配置还在，但程序未找到」 */
+  detail: string | null;
+  installCommands: AgentInstallCommand[];
+  installUrl: string | null;
+};
+
+export async function detectAgents(): Promise<AgentStatus[]> {
+  if (!hasTauri) {
+    const missing = (channel: string): AgentStatus => ({
+      channel,
+      installed: false,
+      version: null,
+      source: null,
+      detail: null,
+      installCommands: [
+        { via: "npm", command: "npm install -g example-agent" },
+      ],
+      installUrl: "https://example.com/install",
+    });
+    // 与真实后端一样返回全部 20 条：只给 5 条会让其余行落到「状态未知」，
+    // 浏览器预览里就看不到完整的工作台。
+    const installedMock: Record<string, AgentStatus> = {
+      "codex-auth-json": {
+        channel: "codex-auth-json",
+        installed: true,
+        version: "0.162.1",
+        source: "/Users/you/.npm-global/bin/codex",
+        detail: null,
+        installCommands: [
+          { via: "script", command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh" },
+          { via: "npm", command: "npm install -g @openai/codex" },
+        ],
+        installUrl: "https://chatgpt.com/codex",
+      },
+      "claude-code-settings": {
+        channel: "claude-code-settings",
+        installed: true,
+        version: "2.1.296",
+        source: "/Users/you/.local/bin/claude",
+        detail: null,
+        installCommands: [
+          { via: "script", command: "curl -fsSL https://claude.ai/install.sh | bash" },
+          { via: "npm", command: "npm install -g @anthropic-ai/claude-code" },
+        ],
+        installUrl: "https://code.claude.com/docs",
+      },
+      dsh: {
+        channel: "dsh",
+        installed: true,
+        version: "0.2.1-rc.2",
+        source: "/Applications/DeepSeek Harness.app",
+        detail: null,
+        installCommands: [
+          { via: "npm", command: "npm install -g @deepseek-ai/dsh" },
+        ],
+        installUrl: "https://www.npmjs.com/package/@deepseek-ai/dsh",
+      },
+    };
+    return mock(
+      Object.values(AGENT_CHANNELS).map((channel) => installedMock[channel] ?? missing(channel)),
+    );
+  }
+  return invokeCommand<AgentStatus[]>("detect_agents");
+}
+
+/**
  * 按 FR-2:113 的命名规范给一个默认名：`<app-id>/<agent-id>/<yyyymmdd>`。
  *
  * **日期由界面给**（M7-S5 决策 D-5）：Rust 侧不读时钟、不做时区——用户看到的「今天」
