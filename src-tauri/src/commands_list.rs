@@ -70,6 +70,8 @@ pub const COMMANDS: &[&str] = &[
     "recent_usage_snapshots",
     // M14-S3：per-key 用量采样（Sub2API usage/daily）
     "recent_key_usage",
+    // M34-S1：用量看板（站点 / 模型 / 天聚合，只读）
+    "usage_dashboard",
     // M14-S1：模型别名映射（B-110）
     "list_alias_map",
     "upsert_alias",

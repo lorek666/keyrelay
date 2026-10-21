@@ -1,14 +1,14 @@
 # KeyRelay · 中转站钥匙管家
 
 登录 NewAPI / Sub2API 中转站取 `sk-` 密钥，一键注入到本机各 agent 配置（Codex CLI、Claude Code、OpenCode…），
-密钥进系统钥匙串、配置写入可回滚。
+密钥进本地加密保险库、配置写入可回滚。
 
 > 产品需求：`PRD-KeyRelay-中转站钥匙管家.md`　工程流程：`docs/PROCESS.md`（**每一步先写 spec，再实现，再独立复审**）
 
 ## 目录结构
 
 ```
-crates/keyrelay-core/     # 纯逻辑库：站点适配器 / 注入器 / 钥匙串 / 存储（不依赖 Tauri）
+crates/keyrelay-core/     # 纯逻辑库：站点适配器 / 注入器 / 加密保险库 / 存储（不依赖 Tauri）
 src-tauri/                # Tauri 2 桌面壳：命令与平台胶水
 src/                      # React 18 + Vite 前端
 docs/specs/               # 每步 spec（先写）
@@ -45,7 +45,7 @@ cargo check -p keyrelay        # 桌面壳类型检查（需先 pnpm build 产�
 
 ## 安全红线（不可违反）
 
-1. 密钥只进系统钥匙串，SQLite 只存引用（`Store::insert_key` 会拒绝明文）。
+1. 密钥只进本地加密保险库（`vault.db` 密文 + `vault.key`，ADR-0003）；元数据库只存引用（`Store::insert_key` 会拒绝明文）。
 2. 任何日志/通知/错误信息先过 `keyrelay_core::redact::scrub`。
 3. 受管配置文件里只出现 base_url / provider / env 变量名；写密钥进 agent 配置必须先有用户显式同意。
 4. 配置写入必须原子、先备份、可字节级回滚；外部改动时拒绝覆盖。

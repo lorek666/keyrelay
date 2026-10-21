@@ -32,7 +32,69 @@
     "agents": "Agent Delivery",
     "history": "Change History",
     "settings": "Settings",
-    "probe": "Model Probe"
+    "probe": "Model Probe",
+    "usage": "Usage"
+  },
+  "usage": {
+    "rangeLabel": "Range",
+    "range": {
+      "d7": "Last 7 days",
+      "d30": "Last 30 days",
+      "d90": "Last 90 days"
+    },
+    "siteFilter": "Site",
+    "allSites": "All sites",
+    "scopeHint": "Token counts cover only requests relayed through the local KeyRelay gateway (agent traffic sent directly to a site is not included). Balances come from snapshots written on each refresh.",
+    "siteFallback": "Site {id}",
+    "unknownModel": "Unknown model",
+    "loading": "Loading…",
+    "error": "Failed to load usage: {error}",
+    "empty": "No usage in the selected range yet. It appears after the gateway relays requests or after a manual refresh collects balances.",
+    "cards": {
+      "tokens": "Total tokens",
+      "requests": "Requests",
+      "sites": "Active sites",
+      "models": "Active models"
+    },
+    "trend": {
+      "title": "Token trend (daily)",
+      "empty": "No gateway traffic in the selected range."
+    },
+    "balance": {
+      "title": "Site balance trend",
+      "currency": "{currency} balance",
+      "empty": "No balance snapshots in the selected range. Enable auto-refresh in Settings or run a manual refresh.",
+      "note": "One snapshot per site per day (the last one). Currencies are charted separately."
+    },
+    "sites": {
+      "title": "Site summary",
+      "empty": "No gateway traffic in the selected range.",
+      "colSite": "Site",
+      "colRequests": "Requests",
+      "colPrompt": "Input tokens",
+      "colCompletion": "Output tokens",
+      "colTotal": "Total",
+      "colShare": "Share",
+      "colKeyUsage": "Per-key usage",
+      "keyUsageYes": "Observable",
+      "keyUsageNo": "Unavailable"
+    },
+    "models": {
+      "title": "Model distribution",
+      "empty": "No gateway traffic in the selected range."
+    },
+    "keys": {
+      "title": "Per key (last {days} days)",
+      "note": "Data comes from Sub2API daily samples; NewAPI exposes cumulative quota only and has no daily-trend endpoint.",
+      "noCapability": "No site provides per-key usage (keyUsage capability is false).",
+      "empty": "No per-key usage samples in the selected range.",
+      "partial": "{sites} do not provide per-key usage and are not included.",
+      "colSite": "Site",
+      "colKey": "Key",
+      "colRequests": "Requests",
+      "colTokens": "Tokens",
+      "colCost": "Cost"
+    }
   },
   "probe": {
     "target": "Detection Target",
@@ -108,7 +170,7 @@
       "mode": "Mode",
       "db": "Local database",
       "version": "Version",
-      "vault": "Keychain",
+      "vault": "Vault",
       "modeTauri": "Tauri (backend connected)",
       "modeBrowser": "Browser preview (backend not connected)"
     },
@@ -123,8 +185,8 @@
     },
     "error": {
       "refreshFailed": "Refresh failed: {error}",
-      "memoryVaultPre": "Currently using the in-memory keychain: ",
-      "memoryVaultPost": "keys won't enter the system keychain and are lost when the process exits. In a real run, this backend is a defect."
+      "memoryVaultPre": "Currently using the in-memory vault: ",
+      "memoryVaultPost": "keys never reach the local encrypted vault and are lost when the process exits. In a real run, this backend is a defect."
     },
     "warn": {
       "browserPreviewPre": "Browser preview mode: all data is sample, writes won't take effect. To connect the real backend, use ",
@@ -180,7 +242,7 @@
       "cancelled": "Manual verification cancelled. Click \"Sign in\" again to retry."
     },
     "hint": {
-      "fingerprint": "Only the site's public status endpoint is called for fingerprinting; credentials are never persisted, only stored in the system keychain.",
+      "fingerprint": "Only the site's public status endpoint is called for fingerprinting; credentials are never persisted, only stored in the local encrypted vault.",
       "captchaTitle": "Captcha required: {name}",
       "captchaBody": "This site requires a captcha. KeyRelay does not bypass captchas—click the button below to open the site's official page and complete the login and captcha yourself; then come back and click \"Done, attach session\". The page in the window is the site's own; we won't click or read it for you.",
       "captchaUnsupportedBody": "This site requires a captcha, but its session uses a bearer access token rather than a cookie—KeyRelay's WebView fallback cannot capture such a session. Please connect via API key directly, or retry the login form above.",
@@ -237,7 +299,7 @@
       "revoke": "Revoke"
     },
     "sync": {
-      "hintPre": "Fetches the plaintext of existing site-side keys into the local keychain. Plaintext ",
+      "hintPre": "Fetches the plaintext of existing site-side keys into the local vault. Plaintext ",
       "hintStrong": "is never shown here",
       "hintPost": ", and never crosses IPC—no command in the layer has ever returned key plaintext.",
       "done": "Key sync done: site-side {siteTotal} / already local {alreadyLocal} / newly imported {imported}{unreadable}.",
@@ -288,15 +350,15 @@
     "emptyStates": {
       "loadingKeys": "Loading…",
       "keysError": "Read failed: {error}",
-      "noKeys": "No local keys yet. Click \"New key\"—on success the key goes straight into the system keychain.",
+      "noKeys": "No local keys yet. Click \"New key\"—on success the key goes straight into the local encrypted vault.",
       "noSiteKeys": "No local keys under this site ({count} under other sites, switch above to see them)."
     },
-    "footnote": "Key plaintext lives only in the system keychain; the backend never returns plaintext to the UI. Delivery uses the \"Local id\" above.",
+    "footnote": "Key plaintext lives only in the local encrypted vault; the backend never returns plaintext to the UI. Delivery uses the \"Local id\" above.",
     "createDialog": {
       "title": "New key",
       "confirming": "Creating…",
       "confirm": "Create",
-      "body": "On success the key is written directly to the system keychain; the UI shows only the last 4 digits. Confirm this key's purpose yourself.",
+      "body": "On success the key is written directly to the local encrypted vault; the UI shows only the last 4 digits. Confirm this key's purpose yourself.",
       "nameLabel": "Name",
       "namePlaceholderSuggesting": "Generating default name…",
       "namePlaceholder": "keyrelay/agent/yyyymmdd",
@@ -315,7 +377,7 @@
       "confirming": "Rotating…",
       "confirm": "Start rotation",
       "introPre": "Will run a fixed three-step rotation on \"{name}\" (local id {id}):",
-      "step1": "Create a new key on the site (plaintext goes straight to the system keychain)",
+      "step1": "Create a new key on the site (plaintext goes straight to the local encrypted vault)",
       "step2All": "Re-deliver the new key to all delivery targets (none bound now, this step is a no-op)",
       "step2Some": "Re-deliver the new key to {count} targets: {channels}",
       "step3Revoke": "Revoke the old key on the site (remote id {id})—irreversible",
@@ -380,14 +442,14 @@
     },
     "siteSelect": "Site",
     "notice": {
-      "created": "Created {name} ({masked}); key stored in the system keychain",
+      "created": "Created {name} ({masked}); key stored in the local encrypted vault",
       "revokedPre": "Revoked \"{name}\" on the site. Local record is marked \"revoked\" and kept—the site-side key is gone; this is irreversible.",
       "revokedLocalFail": "Note: local status wasn't written (see below); the next reconciliation will retry.",
       "revokedNote": "\n{note}"
     }
   },
   "agents": {
-    "intro": "Delivery writes a keychain key into the selected agent's config file. Every write requires consent first; a redacted diff is shown before writing.",
+    "intro": "Delivery writes a vault key into the selected agent's config file. Every write requires consent first; a redacted diff is shown before writing.",
     "select": {
       "site": "Site",
       "key": "Key",
@@ -707,7 +769,7 @@
       "title": "Export & backup",
       "bodyPre": "Export includes sites, key metadata, consent records, and settings. ",
       "bodyStrong": "The key body is not in the export",
-      "bodyPost": "—it lives only in the system keychain. So encryption protects metadata (site URLs, key names), not the key.",
+      "bodyPost": "—it lives only in the local encrypted vault. So encryption protects metadata (site URLs, key names), not the key.",
       "diagBodyPre": "\"Export diagnostics\" is another artifact for ",
       "diagBodyStrong": "filing bugs",
       "diagBodyPost": ": recent redacted events + a settings snapshot (no proxy or webhook values, only whether they're set) + version and library layout. It contains no key body, so there's no encrypted form.",
@@ -726,24 +788,24 @@
       "diagResultUnregistered": ". Note: this file wasn't registered in the \"known exports\" table; redaction audit won't scan it."
     },
     "keychain": {
-      "title": "Keychain entry cleanup",
+      "title": "Vault entry cleanup",
       "bodyPre": "Deletes all entries this product wrote to the ",
-      "bodyStrong": "system keychain",
+      "bodyStrong": "local encrypted vault",
       "bodyPost": " (by local database reference, one by one—no enumeration: macOS would prompt for authorization). Once the secret is gone it's gone: the site-side key still exists, but the local plaintext is lost forever.",
       "localKeepStrong": "The local record isn't deleted",
-      "localKeepPost": ": sites, key metadata, consent records, and change history are all kept; only the keychain entries they point to are gone (re-fetching a key restores them).",
-      "btn": "Clean up keychain entries",
+      "localKeepPost": ": sites, key metadata, consent records, and change history are all kept; only the vault entries they point to are gone (re-fetching a key restores them).",
+      "btn": "Clean up vault entries",
       "cleaning": "Cleaning…",
-      "dialogTitle": "Clean up keychain entries",
+      "dialogTitle": "Clean up vault entries",
       "confirm": "Confirm cleanup",
-      "dialogBodyPre": "Will delete this product's entries in the system keychain one by one. ",
+      "dialogBodyPre": "Will delete this product's entries in the local encrypted vault one by one. ",
       "dialogBodyStrong": "Irreversible",
       "dialogBodyPost": ": once gone, the local plaintext is unrecoverable; old values written to agent configs are unaffected (still in the files; re-deliver to overwrite).",
       "dialogLocalKeep": "Local database records won't be deleted.",
-      "agree": "I confirm deleting the key entries in the keychain and understand they're unrecoverable",
+      "agree": "I confirm deleting the key entries in the vault and understand they're unrecoverable",
       "result": "Cleanup done: attempted {attempted} / removed {removed} / failed {failed}.",
       "firstError": "First failure: {error}",
-      "failHint": "Failed entries remain in the keychain (a single failure doesn't abort the rest). Click again to retry; repeated failures usually mean keychain access was denied.",
+      "failHint": "Failed entries remain in the vault (a single failure doesn't abort the rest). Click again to retry; repeated failures usually mean vault access was denied.",
       "uninstallPre": "Uninstall note: macOS ",
       "uninstallStrong1": "has no",
       "uninstallMid": " uninstall hook, so the order is \"run cleanup here first, then delete the app\"—this product ",
@@ -800,14 +862,14 @@
       "upstream": "Upstream",
       "token": "Local token",
       "tokenStorage": "Token storage",
-      "persistent": "Stored in system keychain",
-      "temporary": "Temporary (keychain unavailable)—changes on restart"
+      "persistent": "Stored in local encrypted vault",
+      "temporary": "Temporary (vault unavailable)—changes on restart"
     },
     "hint": "Put the URL and token into the agent's config; or on the Agent Delivery page check \"point at local gateway\" to have KeyRelay write it for you.",
-    "persistentHint": "The token lives in the system keychain and persists across restarts—so to switch sites you only restart the gateway, no agent-side change (its config has the gateway URL and this token).",
+    "persistentHint": "The token lives in the local encrypted vault and persists across restarts—so to switch sites you only restart the gateway, no agent-side change (its config has the gateway URL and this token).",
     "temporaryHintPre": "This run uses a ",
     "temporaryHintStrong": "temporary token",
-    "temporaryHintPost": ": the keychain is unavailable, so the token changes on restart and gateway-pointing channels need re-delivery. Old tokens already in agent configs fail immediately.",
+    "temporaryHintPost": ": the vault is unavailable, so the token changes on restart and gateway-pointing channels need re-delivery. Old tokens already in agent configs fail immediately.",
     "btn": {
       "copy": "Copy token",
       "rotate": "Regenerate token",

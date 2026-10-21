@@ -24,7 +24,7 @@ use crate::site::{
     Balance, CaptchaChallenge, Credentials, KeyMaterial, KeyMeta, KeySpec, Session, SiteKind,
 };
 use crate::store::{ConsentRow, SiteRow, Store};
-use crate::vault::{KeychainVault, Vault};
+use crate::vault::Vault;
 
 use futures_util::stream::{self, StreamExt};
 
@@ -42,14 +42,42 @@ pub struct ServiceConfig {
 }
 
 impl ServiceConfig {
-    /// 生产装配：钥匙串用系统实现（`KeychainVault`），路径按 `home` 推导。
+    /// 生产装配：本地加密保险库（`LocalVault`，ADR-0003），路径按 `home` 推导。
     ///
-    /// 注意：这里**只**会构造系统钥匙串；不可用时由 `Vault::probe()`/各方法返回
-    /// [`Error::VaultUnavailable`]，绝不静默换成 `MemoryVault`。
+    /// 保险库打不开（`vault.key` 损坏、目录不可写）时**不静默**：打一条 stderr，
+    /// 退回 `MemoryVault` —— 此时 `vault_backend()` 会返回 `"memory"`，Overview 页
+    /// 有红色告警，用户能看见「密钥出问题了」，而不是以为一切正常。
+    /// 之所以还要有这条退路：启动阶段没有任何 UI 可用来报错，直接退出更糟。
     pub fn production(home: impl Into<PathBuf>) -> Self {
         let home = home.into();
+        Self::with_local_vault(home)
+    }
+
+    /// 用给定 `home` 构造本地保险库；失败时退回内存实现并留下 stderr 证据。
+    fn with_local_vault(home: PathBuf) -> Self {
+        let (db_path, key_path) = crate::vault::local::default_paths(&home);
+        let vault: Arc<dyn Vault> = match crate::vault::LocalVault::open(&db_path, &key_path) {
+            Ok(vault) => Arc::new(vault),
+            Err(err) => {
+                eprintln!(
+                    "[keyrelay] 本地保险库不可用（{}），密钥将只存在内存里: {err}",
+                    db_path.display()
+                );
+                Arc::new(crate::vault::MemoryVault::new())
+            }
+        };
         Self {
-            vault: Arc::new(KeychainVault::new()),
+            vault,
+            backup_dir: home.join(".keyrelay").join("backups"),
+            home,
+        }
+    }
+
+    /// 用调用方构造好的保险库装配（壳层需要先做一次性迁移，或测试要注入假后端）。
+    pub fn with_vault(vault: Arc<dyn Vault>, home: impl Into<PathBuf>) -> Self {
+        let home = home.into();
+        Self {
+            vault,
             backup_dir: home.join(".keyrelay").join("backups"),
             home,
         }
@@ -97,8 +125,8 @@ fn error_kind(err: &Error) -> &'static str {
         Error::NotDelivered(_) => "连接未建立",
         // M9-S2：与「认证失败」分开记——用户要做的是**改输入**，不是重新登录。
         Error::InvalidInput(_) => "输入不符合站点要求",
-        Error::Vault(_) => "钥匙串错误",
-        Error::VaultUnavailable(_) => "钥匙串不可用",
+        Error::Vault(_) => "保险库错误",
+        Error::VaultUnavailable(_) => "保险库不可用",
         Error::ConsentRequired { .. } => "缺少用户同意",
         Error::FileBusy(_) => "目标文件被占用",
         Error::Store(_) => "本地存储错误",
