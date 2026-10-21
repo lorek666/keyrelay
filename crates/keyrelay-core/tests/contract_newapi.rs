@@ -1299,3 +1299,187 @@ async fn list_keys_does_not_truncate_on_a_fractional_total() {
         "小数 total 不得被截断成整数"
     );
 }
+
+// ============================================================ M29-S1：续期（B-193）
+
+fn refresh_session_with(refresh: &str) -> Session {
+    Session {
+        cookies: vec![
+            ("new_api_refresh".into(), refresh.into()),
+            ("new_api_has_session".into(), "1".into()),
+        ],
+        access_token: Some("old-token".into()),
+        user_id: Some("7".into()),
+        user_agent: Some("UA/1.0".into()),
+    }
+}
+
+#[tokio::test]
+async fn refresh_session_sends_the_expected_request() {
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": {"access_token": "new-token", "user": {"id": 42}}}),
+    )]);
+    let adapter = NewApi::new(transport.clone());
+    let session = refresh_session_with("sid-1.secret-part");
+
+    adapter.refresh_session(BASE, &session).await.expect("续期");
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1);
+    let req = &requests[0];
+    assert_eq!(req.url, "https://relay.example.com/api/user/auth/refresh");
+    assert_eq!(
+        header_of(req, "Cookie"),
+        Some("new_api_refresh=sid-1.secret-part"),
+        "Cookie 头只许带续期凭据一条"
+    );
+    assert_eq!(header_of(req, "Origin"), Some("https://relay.example.com"));
+    assert_eq!(
+        header_of(req, "Referer"),
+        Some("https://relay.example.com/")
+    );
+    assert_eq!(header_of(req, "X-Auth-Session"), Some("sid-1"));
+    assert_eq!(header_of(req, "Accept"), Some("application/json"));
+}
+
+#[tokio::test]
+async fn refresh_session_parses_token_and_rotates_cookies() {
+    let mut resp = json_resp(
+        200,
+        json!({
+            "success": true,
+            "data": {"access_token": "  new-token  ", "token_type": "Bearer", "user": {"id": 42}}
+        }),
+    );
+    resp.headers.push((
+        "Set-Cookie".into(),
+        "new_api_refresh=rotated.secret-2; Path=/; HttpOnly".into(),
+    ));
+    resp.headers
+        .push(("Set-Cookie".into(), "new_api_session_hint=1; Path=/".into()));
+    let transport = MockTransport::new(vec![resp]);
+    let adapter = NewApi::new(transport);
+
+    let new = adapter
+        .refresh_session(BASE, &refresh_session_with("old.secret-1"))
+        .await
+        .expect("续期")
+        .expect("应当返回新会话");
+
+    assert_eq!(
+        new.access_token.as_deref(),
+        Some("new-token"),
+        "token 需 trim"
+    );
+    assert_eq!(new.user_id.as_deref(), Some("42"));
+    assert_eq!(new.user_agent.as_deref(), Some("UA/1.0"), "UA 沿用入参");
+    // 同名覆盖
+    assert_eq!(
+        new.cookie_value("new_api_refresh"),
+        Some("rotated.secret-2"),
+        "轮换后的 refresh cookie 必须覆盖旧值"
+    );
+    // 未变的其余 cookie 保留
+    assert_eq!(new.cookie_value("new_api_has_session"), Some("1"));
+    // 新 cookie 追加
+    assert_eq!(new.cookie_value("new_api_session_hint"), Some("1"));
+    assert_eq!(
+        new.cookies.len(),
+        3,
+        "同名覆盖不新增条目：{:?}",
+        new.cookies.len()
+    );
+}
+
+#[tokio::test]
+async fn refresh_session_with_empty_token_is_a_transport_error() {
+    for data in [
+        json!({}),
+        json!({"access_token": ""}),
+        json!({"access_token": "   "}),
+    ] {
+        let transport =
+            MockTransport::new(vec![json_resp(200, json!({"success": true, "data": data}))]);
+        let adapter = NewApi::new(transport);
+        let err = adapter
+            .refresh_session(BASE, &refresh_session_with("r.s"))
+            .await
+            .expect_err("缺 token 必须报错");
+        assert!(
+            matches!(&err, Error::Transport(m) if m.contains("续期响应缺少 access_token")),
+            "{err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_session_404_is_none() {
+    let transport = MockTransport::new(vec![json_resp(404, json!({"message": "not found"}))]);
+    let adapter = NewApi::new(transport);
+    let out = adapter
+        .refresh_session(BASE, &refresh_session_with("r.s"))
+        .await
+        .expect("404 不是错误");
+    assert!(
+        out.is_none(),
+        "旧版无端点 ⇒ Ok(None)，调用方走 cookie-only 兜底"
+    );
+}
+
+#[tokio::test]
+async fn refresh_session_401_is_auth_failed_without_secrets() {
+    let transport = MockTransport::new(vec![json_resp(
+        401,
+        json!({"message": "echo sid-1.secret-part old-token"}),
+    )]);
+    let adapter = NewApi::new(transport);
+    let err = adapter
+        .refresh_session(BASE, &refresh_session_with("sid-1.secret-part"))
+        .await
+        .expect_err("401 必须报 AuthFailed");
+    assert!(matches!(err, Error::AuthFailed(_)), "{err:?}");
+    let text = err.to_string();
+    assert!(!text.contains("secret-part"), "错误文案不得含凭据：{text}");
+    assert!(!text.contains("old-token"), "错误文案不得含 token：{text}");
+}
+
+#[tokio::test]
+async fn refresh_session_without_refresh_cookie_makes_no_request() {
+    // 空 MockTransport：任何请求都会 panic（队列为空 ⇒ MockTransport 失败）
+    let transport = MockTransport::new(vec![]);
+    let adapter = NewApi::new(transport.clone());
+    let mut s = session(); // 只有 `session` cookie，没有 `new_api_refresh`
+    s.access_token = Some("old".into());
+
+    let out = adapter
+        .refresh_session(BASE, &s)
+        .await
+        .expect("应当 Ok(None)");
+    assert!(out.is_none());
+    assert!(transport.requests().is_empty(), "没有续期凭据时不得发请求");
+}
+
+#[tokio::test]
+async fn list_keys_excludes_refresh_cookie_from_api_requests() {
+    let transport = MockTransport::new(vec![json_resp(
+        200,
+        json!({"success": true, "data": [], "total": 0}),
+    )]);
+    let adapter = NewApi::new(transport.clone());
+    let session = refresh_session_with("sid-1.secret-part");
+
+    let keys = adapter.list_keys(BASE, &session).await.expect("列举令牌");
+    assert!(keys.is_empty());
+
+    let req = &transport.requests()[0];
+    let cookie = header_of(req, "Cookie").unwrap_or_default();
+    assert!(
+        cookie.contains("new_api_has_session=1"),
+        "普通 cookie 应照常发送: {cookie}"
+    );
+    assert!(
+        !cookie.contains("new_api_refresh"),
+        "续期凭据只应发给续期端点，不得出现在普通 API 请求: {cookie}"
+    );
+}

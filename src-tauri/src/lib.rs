@@ -459,6 +459,34 @@ pub fn spawn_maintenance_tasks<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         }
     }
 
+    // M29-S1 / B-193：NewAPI 的 access token 只有 15 分钟寿命（`AccessTokenTTL`），
+    // 必须**持续**用 `new_api_refresh` 续期，否则 15 分钟后所有请求 401。
+    //
+    // 这个循环放在 `scheduler_enabled` 早退**之前**：它是「会话保活」，与「定时刷新
+    // 余额/密钥」是两个独立开关——关掉定时刷新不该让会话 15 分钟后失效。
+    //
+    // 首轮**立即执行**（不先 sleep）：启动时恢复出的会话可能是「token 已过期但 refresh
+    // cookie 还在」（`restore_sessions` 刻意保留），应当马上换一份新 token。
+    // 续期失败不 panic：最坏后果是「下一次请求可能 401」，下一轮（60s 后）还会再试。
+    let refresh_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match refresh_handle.try_state::<AppState>() {
+                Some(state) => {
+                    if let Err(err) = state.service.refresh_sessions_if_needed().await {
+                        // 服务层已按「401 误判 / 网络失败」分流并落了事件；这里只留一行运维日志。
+                        eprintln!("[keyrelay] 会话续期失败（下一轮重试）: {err}");
+                    }
+                }
+                None => {
+                    // 应用正在退出（或状态尚未装配）：不退出循环，等下一轮再看。
+                    eprintln!("[keyrelay] 会话续期：拿不到应用状态（下一轮重试）");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+
     if !settings.scheduler_enabled() {
         return;
     }
