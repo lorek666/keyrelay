@@ -53,6 +53,8 @@ pub const COMMANDS: &[&str] = &[
     "revoke_key",
     "purge_keychain",
     "detect_unmanaged_targets",
+    // M31-S1：Agent 安装/版本发现（只读）
+    "detect_agents",
     "suggest_key_name",
     // M8-S4：解绑（FR-2:115）、网关令牌轮换（§6.4）
     "unbind_agent",

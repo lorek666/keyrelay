@@ -106,7 +106,14 @@ fn platform_specific_files_match_the_known_inventory() {
     // - `proxy.rs`：系统代理探测按平台分派——macOS 走 `scutil --proxy`、Windows 走 `reg query`
     //   `HKCU\…\Internet Settings`、其余平台只读环境变量。解析 `scutil`/`reg query` 文本是纯函数，
     //   跨平台可测；真实进程探测在真机上验证（见 `docs/evidence/platform-parity.md` §1.2）。
+    //
+    // M31-S1 新增一项（2026-10-21）：
+    // - `agents.rs`：Agent 安装探测按平台分派——macOS 的 App 探测读 `.app/Contents/Info.plist`；
+    //   非 macOS 明确返回「未安装」（应用包是 macOS 概念，不猜 Linux 的 .desktop）；
+    //   CLI 在 Windows 上额外尝试 `.exe` / `.cmd`。Windows 侧未真机执行，
+    //   见 `docs/evidence/platform-parity.md` §1.3。
     let expected = vec![
+        "agents.rs".to_string(),
         "autostart.rs".to_string(),
         "delivery/claude_desktop.rs".to_string(),
         "delivery/cline.rs".to_string(),

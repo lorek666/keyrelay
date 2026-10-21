@@ -1,9 +1,21 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, RotateCcw, Send, ShieldCheck, Undo2, Unlink } from "lucide-react";
+import {
+  AlertTriangle,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  Download,
+  RotateCcw,
+  Send,
+  ShieldCheck,
+  Undo2,
+  Unlink,
+} from "lucide-react";
 import {
   applyDelivery,
   deliveryPlan,
+  detectAgents,
   detectUnmanagedTargets,
   grantConsent,
   listConsents,
@@ -13,6 +25,7 @@ import {
   rollbackDelivery,
   unbindAgent,
   type DeliveryMode,
+  type AgentStatus,
   type DeliveryOutcome,
   type DeliveryPlan,
   type RestartHint,
@@ -21,6 +34,8 @@ import {
 import { rollbackAftermath, rollbackAftermathTitle } from "../lib/rollback";
 import { maskRemovedValues, shouldWarnEndpointOutOfScope } from "../lib/deliveryView";
 import ConfirmDialog from "../components/ConfirmDialog";
+import AgentIcon from "../components/AgentIcon";
+import { loadAgentPrefs, saveAgentPrefs, type AgentPref } from "../lib/agentPrefs";
 import { useTranslation, translate, getCurrentDict } from "../i18n";
 
 /**
@@ -56,6 +71,20 @@ export const CHANNELS = [
 ];
 
 /** 生效策略文案（PRD FR-4:137 / M7-S3）。从 `restartHint` 取值派生，不按通道硬编码。 */
+/**
+ * 把 `"Codex CLI（~/.codex/auth.json）"` 拆成名称与目标文件。
+ *
+ * 落点标签本身就是「Agent 名（目标文件）」这一种形态（M14-S1 定的），
+ * 拆分只用于**展示**（名称一行、目标一行小字），不参与任何判断。
+ * 没有括号时整串当名称、目标留空。
+ */
+function splitChannelLabel(label: string): { name: string; target: string } {
+  const i = label.indexOf("（");
+  const j = label.lastIndexOf("）");
+  if (i > 0 && j > i) return { name: label.slice(0, i), target: label.slice(i + 1, j) };
+  return { name: label, target: "" };
+}
+
 function restartHintLabel(hint: RestartHint): string {
   if (hint === "notNeeded") return translate(getCurrentDict(), "agents.restartHint.notNeeded");
   if (hint === "needed") return translate(getCurrentDict(), "agents.restartHint.needed");
@@ -84,27 +113,94 @@ export default function Agents() {
     (k) => k.siteId === activeSite && k.status === "revoked",
   ).length;
 
-  const [keyId, setKeyId] = useState<number | null>(null);
-  const activeKey = keyId ?? null;
-  const [channel, setChannel] = useState(CHANNELS[0].id);
+  // ---- M31-S1：每行独立偏好（key + 模型），按站点持久化到 localStorage ----
+  const [prefs, setPrefs] = useState<Record<string, AgentPref>>({});
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [modelDraft, setModelDraft] = useState<Record<string, string>>({});
+  const [modelDebounced, setModelDebounced] = useState<Record<string, string>>({});
 
-  // 模型名：M14-S7 — 16 条通道能写模型名（+ 参数），3 条不能。
-  // 不支持模型名的通道：claude-desktop / cursor / dsh（配置文件不含模型字段）。
-  // 这是**输入框显不显示**的界面判断，不是能力判断：要不要、缺了怎么办由后端决定并报错说明。
-  // 防抖后再进查询键——每次预览都要读一次钥匙串，不该每敲一个字读一次。
-  const NO_MODEL_CHANNELS = new Set(["claude-desktop", "cursor", "dsh", "codex-auth-json", "codex-config"]);
-  const needsModel = !NO_MODEL_CHANNELS.has(channel);
-  // 当前通道所属的 agent（解绑按 agent 做，不是按通道）。
-  // `channel` 只可能来自 `CHANNELS`（初始值与卡片都在其中），所以这里的兜底不可达；
-  // 用空串而不是 `!`：解绑命令对空 agent_id 只会返回 `{0, 0}`（幂等零报告），不会误伤。
-  const activeAgent = CHANNELS.find((c) => c.id === channel)?.agent ?? "";
-  const [modelInput, setModelInput] = useState("");
-  const [modelTyped, setModelTyped] = useState("");
+  // 站点变化 ⇒ 重新加载该站点的每行偏好，并收起展开行（不串台）
   useEffect(() => {
-    const timer = setTimeout(() => setModelTyped(modelInput.trim()), 400);
-    return () => clearTimeout(timer);
-  }, [modelInput]);
-  const model = needsModel && modelTyped ? modelTyped : undefined;
+    if (activeSite === null) return;
+    const loaded = loadAgentPrefs(activeSite);
+    setPrefs(loaded);
+    setModelDraft(Object.fromEntries(Object.entries(loaded).map(([k, v]) => [k, v.model])));
+    setModelDebounced(Object.fromEntries(Object.entries(loaded).map(([k, v]) => [k, v.model])));
+    setExpanded(null);
+  }, [activeSite]);
+
+  const updatePref = useCallback(
+    (ch: string, patch: Partial<AgentPref>) => {
+      // 在 updater **外面**算 next：React 18 的 StrictMode 会双调用 updater，
+      // 把 localStorage 写入放进去会重复写（同值但仍是副作用），也会违反 updater 的纯函数约定。
+      const next = {
+        ...prefs,
+        [ch]: { ...(prefs[ch] ?? { keyId: null, model: "" }), ...patch },
+      };
+      setPrefs(next);
+      // 偏好不是关键路径：写失败静默（`saveAgentPrefs` 内部已 try/catch）
+      if (activeSite !== null) saveAgentPrefs(activeSite, next);
+    },
+    [prefs, activeSite],
+  );
+
+  // 模型输入 400ms 防抖后才进查询键——每次预览都要读一次钥匙串，不该每敲一个字读一次。
+  useEffect(() => {
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    for (const c of CHANNELS) {
+      const draft = (modelDraft[c.id] ?? "").trim();
+      const committed = modelDebounced[c.id] ?? "";
+      if (draft === committed) continue;
+      timers.push(
+        setTimeout(() => {
+          setModelDebounced((prev) => ({ ...prev, [c.id]: draft }));
+          updatePref(c.id, { model: draft });
+        }, 400),
+      );
+    }
+    return () => timers.forEach(clearTimeout);
+  }, [modelDraft, modelDebounced, updatePref]);
+
+  // 模型名：这几条落点的配置文件不含模型字段 ⇒ 不显示输入框（界面判断，不是能力判断）
+  const NO_MODEL_CHANNELS = new Set([
+    "claude-desktop",
+    "cursor",
+    "dsh",
+    "codex-auth-json",
+    "codex-config",
+  ]);
+
+  const rowPref = (ch: string): AgentPref => prefs[ch] ?? { keyId: null, model: "" };
+  // 展开行决定预览的全部参数；未展开时下游的 mutation 不会被调用
+  const channel = expanded ?? CHANNELS[0].id;
+  // 保存的 keyId 可能在别处被回收/删除：此时必须按「未选」处理。
+  // 直接拿旧 id 去查会得到一个 404/401，而不是一句「先选密钥」。
+  const effectiveKeyId = (ch: string | null): number | null => {
+    if (!ch) return null;
+    const id = rowPref(ch).keyId;
+    return id !== null && siteKeys.some((k) => k.id === id) ? id : null;
+  };
+  const activeKey = effectiveKeyId(expanded);
+  // 解绑按 agent 做，不是按通道（多个落点可能属于同一个 agent）
+  const activeAgent = CHANNELS.find((c) => c.id === expanded)?.agent ?? "";
+  const model = (() => {
+    if (!expanded || NO_MODEL_CHANNELS.has(expanded)) return undefined;
+    const v = (modelDebounced[expanded] ?? "").trim();
+    return v ? v : undefined;
+  })();
+
+  // ---- M31-S1：本机 Agent 发现（只读；安装命令只给用户复制，绝不自动执行）----
+  const agentsQuery = useQuery({
+    queryKey: ["agents"],
+    queryFn: detectAgents,
+    retry: false,
+  });
+  const agentByChannel = useMemo(
+    () => new Map((agentsQuery.data ?? []).map((a) => [a.channel, a])),
+    [agentsQuery.data],
+  );
+  const [installFor, setInstallFor] = useState<string | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   const [agreeChecked, setAgreeChecked] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -259,6 +355,7 @@ export default function Agents() {
         </p>
       ) : null}
 
+      {/* 顶部：站点选择 + 网关模式（全局密钥/模型下拉已移除，改为每行独立） */}
       <div className="card">
         <div className="row">
           <label className="field-inline">
@@ -266,10 +363,7 @@ export default function Agents() {
             <select
               className="input"
               value={activeSite ?? ""}
-              onChange={(e) => {
-                setSiteId(Number(e.target.value));
-                setKeyId(null);
-              }}
+              onChange={(e) => setSiteId(Number(e.target.value))}
             >
               {(sites.data ?? []).map((s) => (
                 <option key={s.id} value={s.id}>
@@ -278,110 +372,172 @@ export default function Agents() {
               ))}
             </select>
           </label>
-          <label className="field-inline">
-            <span>{t("agents.select.key")}</span>
-            <select
-              className="input"
-              value={activeKey ?? ""}
-              onChange={(e) =>
-                // 空选择是 `null`，**不是 0**（M8-S5B §6.7）：
-                // `Number("")` 恰好是 0，而 0 是一个看似合法的 key id，
-                // 下游会拿它去查一把不存在的 key，报「key 不存在」而不是「还没选」。
-                setKeyId(e.target.value === "" ? null : Number(e.target.value))
-              }
-            >
-              <option value="">{t("agents.select.keyPlaceholder")}</option>
-              {siteKeys.map((k) => (
-                <option key={k.id} value={k.id}>
-                  {k.name}（#{k.id}）
-                </option>
-              ))}
-            </select>
+          <label className="checkline">
+            <input
+              type="checkbox"
+              checked={gatewayMode}
+              onChange={(e) => setGatewayMode(e.target.checked)}
+            />
+            <span>{t("agents.gatewayMode.label")}</span>
           </label>
-          {revokedHidden > 0 ? (
-            <span className="muted">
-              {t("agents.select.revokedHidden", { count: revokedHidden })}
-            </span>
-          ) : null}
-          {needsModel ? (
-            <label className="field-inline">
-              <span>{t("agents.select.model")}</span>
-              <input
-                className="input"
-                value={modelInput}
-                onChange={(e) => setModelInput(e.target.value)}
-                placeholder={t("agents.select.modelPlaceholder")}
-                spellCheck={false}
-              />
-            </label>
-          ) : null}
-        </div>
-
-        {/*
-          指向本地网关（M8-S4 §6.2）。这是**投递参数**，不是新通道：
-          通道还是那七条，落点一字不变，只把写进去的 base_url 与密钥换成网关的。
-          换站时靠它做到「agent 侧零改动」（FR-5:158）。
-        */}
-        <label className="checkline">
-          <input
-            type="checkbox"
-            checked={gatewayMode}
-            onChange={(e) => setGatewayMode(e.target.checked)}
-          />
-          <span>{t("agents.gatewayMode.label")}</span>
-        </label>
-      </div>
-
-      {/*
-        M30-S2：把全部落点铺开成卡片。
-        每个 `CHANNELS` 条目一张独立卡（**不合并**同 agent 的多个落点）——
-        Codex / OpenCode / Cline 各自有多个目标文件，合并会让用户看不到真实可投递面。
-      */}
-      <div className="card">
-        <h3 id="agent-picker-title">{t("agents.picker.title", { count: CHANNELS.length })}</h3>
-        <p className="muted">{t("agents.picker.hint")}</p>
-        <div className="agent-grid" role="group" aria-labelledby="agent-picker-title">
-          {CHANNELS.map((c) => (
-            <button
-              key={c.id}
-              type="button"
-              className={"agent-choice" + (channel === c.id ? " selected" : "")}
-              aria-pressed={channel === c.id}
-              data-agent-channel={c.id}
-              onClick={() => setChannel(c.id)}
-            >
-              <span className="agent-choice-name">{c.label}</span>
-              <span className="agent-choice-id mono">{c.agent}</span>
-            </button>
-          ))}
         </div>
       </div>
 
-      {activeKey === null ? (
-        <p className="muted">
-          {keys.data && siteKeys.length === 0
-            ? t("agents.emptyKey.noSiteKey")
-            : t("agents.emptyKey.selectKey")}
-        </p>
-      ) : plan.isError ? (
+      {agentsQuery.isError ? (
         <p className="error" role="alert">
-          {(plan.error as Error).message}
+          <AlertTriangle size={14} aria-hidden />{" "}
+          {t("agents.workbench.detectFailed", { error: (agentsQuery.error as Error).message })}{" "}
+          <button type="button" className="btn" onClick={() => agentsQuery.refetch()}>
+            {t("agents.install.redetect")}
+          </button>
         </p>
-      ) : plan.isLoading ? (
-        <p className="muted">{t("agents.plan.generating")}</p>
-      ) : plan.data ? (
-        <PlanView
-          plan={plan.data}
-          consentLabel={consentLabel}
-          noChange={!!noChange}
-          agreeChecked={agreeChecked}
-          onAgreeChange={setAgreeChecked}
-          busy={grantAndApply.isPending}
-          onApply={() => setConfirming(true)}
-          onRevoke={() => setRevoking(true)}
-        />
       ) : null}
 
+      {/*
+        M31-S1：单列工作台。一行一个落点——**不合并**同 agent 的多个目标文件
+        （Codex / OpenCode / Cline 各有多处落点，合并会让用户看不到真实可投递面）。
+      */}
+      <div className="card">
+        <h3>{t("agents.workbench.title", { count: CHANNELS.length })}</h3>
+        <p className="muted">{t("agents.workbench.hint")}</p>
+        {revokedHidden > 0 ? (
+          <p className="muted">{t("agents.select.revokedHidden", { count: revokedHidden })}</p>
+        ) : null}
+        <ul className="agent-list">
+          {CHANNELS.map((c) => {
+            const status = agentByChannel.get(c.id);
+            // 后端应返回 20 条；缺一条时是「状态未知」，绝不能当成「未安装」——
+            // 那会给出一个装了也白装的安装按钮，且把已装环境说成没装。
+            const known = status !== undefined;
+            const installed = status?.installed === true;
+            const detecting = agentsQuery.isLoading;
+            const selectedKeyId = effectiveKeyId(c.id);
+            const isOpen = expanded === c.id;
+            const writingModel = !NO_MODEL_CHANNELS.has(c.id);
+            const { name, target } = splitChannelLabel(c.label);
+            return (
+              <li
+                key={c.id}
+                className={"agent-row" + (isOpen ? " open" : "")}
+                data-agent-channel={c.id}
+                data-agent-name={c.agent}
+              >
+                <div className="agent-row-main">
+                  <button
+                    type="button"
+                    className="agent-row-head"
+                    onClick={() => setExpanded(isOpen ? null : c.id)}
+                    aria-expanded={isOpen}
+                    disabled={!installed || detecting}
+                  >
+                    <AgentIcon icon={c.agent} name={name} />
+                    <span className="agent-row-text">
+                      <span className="agent-row-name">{name}</span>
+                      <span className="agent-row-target mono">{target}</span>
+                    </span>
+                  </button>
+
+                  <span className={"agent-badge" + (installed ? " ok" : "")}>
+                    {detecting
+                      ? t("agents.row.detecting")
+                      : agentsQuery.isError || !known
+                        ? t("agents.row.unknown")
+                        : installed
+                          ? (status?.version ?? t("agents.row.installed"))
+                          : t("agents.row.notInstalled")}
+                  </span>
+
+                  {detecting || (!known && !agentsQuery.isError) ? null : installed ? (
+                    <div className="agent-row-controls">
+                      <select
+                        className="input agent-row-key"
+                        aria-label={t("agents.select.key")}
+                        value={selectedKeyId ?? ""}
+                        onChange={(e) =>
+                          updatePref(c.id, {
+                            keyId: e.target.value === "" ? null : Number(e.target.value),
+                          })
+                        }
+                      >
+                        <option value="">{t("agents.select.keyPlaceholder")}</option>
+                        {siteKeys.map((k) => (
+                          <option key={k.id} value={k.id}>
+                            {k.name}（#{k.id}）
+                          </option>
+                        ))}
+                      </select>
+
+                      {writingModel ? (
+                        <input
+                          className="input agent-row-model"
+                          aria-label={t("agents.select.model")}
+                          value={modelDraft[c.id] ?? ""}
+                          placeholder={t("agents.select.modelPlaceholder")}
+                          spellCheck={false}
+                          onChange={(e) =>
+                            setModelDraft((prev) => ({ ...prev, [c.id]: e.target.value }))
+                          }
+                        />
+                      ) : (
+                        <span className="muted agent-row-nomodel">{t("agents.row.noModel")}</span>
+                      )}
+
+                      <button
+                        type="button"
+                        className="btn agent-row-toggle"
+                        aria-expanded={isOpen}
+                        onClick={() => setExpanded(isOpen ? null : c.id)}
+                      >
+                        {isOpen ? <ChevronDown size={14} aria-hidden /> : <ChevronRight size={14} aria-hidden />}
+                        {isOpen ? t("agents.row.collapse") : t("agents.row.expand")}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="agent-row-controls">
+                      <button
+                        type="button"
+                        className="btn agent-row-install"
+                        onClick={() => setInstallFor(c.id)}
+                      >
+                        <Download size={14} aria-hidden /> {t("agents.row.install")}
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {isOpen && installed ? (
+                  <div className="agent-row-plan">
+                    {activeKey === null ? (
+                      <p className="muted">
+                        {keys.data && siteKeys.length === 0
+                          ? t("agents.emptyKey.noSiteKey")
+                          : t("agents.emptyKey.selectKey")}
+                      </p>
+                    ) : plan.isError ? (
+                      <p className="error" role="alert">
+                        {(plan.error as Error).message}
+                      </p>
+                    ) : plan.isLoading ? (
+                      <p className="muted">{t("agents.plan.generating")}</p>
+                    ) : plan.data ? (
+                      <PlanView
+                        plan={plan.data}
+                        consentLabel={consentLabel}
+                        noChange={!!noChange}
+                        agreeChecked={agreeChecked}
+                        onAgreeChange={setAgreeChecked}
+                        busy={grantAndApply.isPending}
+                        onApply={() => setConfirming(true)}
+                        onRevoke={() => setRevoking(true)}
+                      />
+                    ) : null}
+                  </div>
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
+      </div>
       {lastOutcome ? (
         <div className="card">
           <h3>{t("agents.lastDelivery.title")}</h3>
@@ -617,7 +773,135 @@ export default function Agents() {
           </span>
         </label>
       </ConfirmDialog>
+    
+      {/*
+        M31-S1：安装说明弹窗。
+        **只展示与复制**：应用绝不自动执行这些命令（后端也只返回静态字符串）。
+      */}
+      <InstallDialog
+        open={installFor !== null}
+        status={installFor ? agentByChannel.get(installFor) : undefined}
+        label={CHANNELS.find((c) => c.id === installFor)?.label ?? ""}
+        copiedKey={copiedKey}
+        onCopied={setCopiedKey}
+        onClose={() => setInstallFor(null)}
+        onRedetect={() => {
+          agentsQuery.refetch();
+        }}
+      />
+
     </section>
+  );
+}
+
+/**
+ * 安装说明弹窗（M31-S1）。
+ *
+ * 只**展示与复制**：`installCommands` 是后端给的静态字符串，应用不执行、不安装。
+ * 用原生 `<dialog>` 拿焦点陷阱与 Esc 关闭（与 `ConfirmDialog` 同源做法）。
+ */
+function InstallDialog({
+  open,
+  status,
+  label,
+  copiedKey,
+  onCopied,
+  onClose,
+  onRedetect,
+}: {
+  open: boolean;
+  status: AgentStatus | undefined;
+  label: string;
+  copiedKey: string | null;
+  onCopied: (key: string | null) => void;
+  onClose: () => void;
+  onRedetect: () => void;
+}) {
+  const { t } = useTranslation();
+  const ref = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = ref.current;
+    if (!dialog) return;
+    if (open && !dialog.open) dialog.showModal();
+    if (!open && dialog.open) dialog.close();
+  }, [open]);
+
+  // 原生 dialog 的 Esc 会直接关掉元素；不拦下来时 React 的 open 仍是 true，
+  // 下一次点「安装」不会重新 showModal（状态没变）——弹窗就再也打不开了。
+  useEffect(() => {
+    const dialog = ref.current;
+    if (!dialog) return;
+    const onNativeCancel = (event: Event) => {
+      event.preventDefault();
+      onClose();
+    };
+    dialog.addEventListener("cancel", onNativeCancel);
+    return () => dialog.removeEventListener("cancel", onNativeCancel);
+  }, [onClose]);
+
+  const commands = status?.installCommands ?? [];
+
+  const copy = async (key: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      onCopied(key);
+      setTimeout(() => onCopied(null), 1500);
+    } catch {
+      onCopied("__failed__");
+      setTimeout(() => onCopied(null), 1500);
+    }
+  };
+
+  return (
+    <dialog ref={ref} className="dialog" aria-label={t("agents.install.title", { name: label })}>
+      <h2>{t("agents.install.title", { name: label })}</h2>
+      <div className="dialog-body">
+        <p className="muted">{t("agents.install.hint")}</p>
+        {commands.length === 0 ? (
+          <p className="muted">{t("agents.install.empty")}</p>
+        ) : (
+          <ul className="install-cmds">
+            {commands.map((cmd) => {
+              const key = `${cmd.via}:${cmd.command}`;
+              return (
+                <li key={key} className="install-cmd">
+                  <span className="install-cmd-via mono">{cmd.via}</span>
+                  <code className="install-cmd-text mono">{cmd.command}</code>
+                  <button type="button" className="btn" onClick={() => copy(key, cmd.command)}>
+                    <Copy size={14} aria-hidden />{" "}
+                    {copiedKey === key
+                      ? t("agents.install.copied")
+                      : copiedKey === "__failed__"
+                        ? t("agents.install.copyFailed")
+                        : t("agents.install.copy")}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        {status?.installUrl ? (
+          <p className="install-url">
+            <span className="muted">{t("agents.install.url")}：</span>
+            <code className="mono">{status.installUrl}</code>
+            <button type="button" className="btn" onClick={() => copy("__url__", status.installUrl!)}>
+              <Copy size={14} aria-hidden />{" "}
+              {copiedKey === "__url__" ? t("agents.install.copied") : t("agents.install.copy")}
+            </button>
+          </p>
+        ) : null}
+        {status?.detail ? <p className="muted">{status.detail}</p> : null}
+      </div>
+      <div className="dialog-actions">
+        <button type="button" className="btn" onClick={onRedetect}>
+          <RotateCcw size={14} aria-hidden /> {t("agents.install.redetect")}
+        </button>
+        <button type="button" className="btn btn-primary" onClick={onClose}>
+          {t("agents.install.close")}
+        </button>
+      </div>
+    </dialog>
   );
 }
 

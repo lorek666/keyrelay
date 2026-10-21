@@ -396,10 +396,6 @@
       "keyPlaceholder": "(pick one)",
       "revokedHidden": "{count} revoked key(s) hidden (they are gone on the site and must not be delivered again)"
     },
-    "picker": {
-      "title": "Supported agents ({count})",
-      "hint": "Every target is listed separately; pick one as this delivery destination."
-    },
     "gatewayMode": {
       "label": "Point at local gateway: writes the gateway URL (/v1) and a local token, not the site key. To switch sites you only restart the gateway, no agent-side change. Requires the gateway to be running.",
       "title": "Local gateway token (not the site key)",
@@ -524,6 +520,32 @@
       "delivered": "Delivered to {path} (change {journal}). {hint}",
       "revoked": "Consent revoked. Written files won't auto-rollback—use the Change History page to restore.",
       "rolledBack": "Rolled back {journal}."
+    },
+    "workbench": {
+      "title": "Supported agents ({count})",
+      "hint": "One row per target. If it is installed, pick a key/model and expand the preview; if not, install it first, then re-detect.",
+      "detectFailed": "Detection failed: {error}"
+    },
+    "row": {
+      "detecting": "Detecting…",
+      "unknown": "Status unknown",
+      "installed": "Installed",
+      "notInstalled": "Not installed",
+      "install": "Install",
+      "expand": "Expand",
+      "collapse": "Collapse",
+      "noModel": "This target does not write a model"
+    },
+    "install": {
+      "title": "Install {name}",
+      "hint": "Copy the command below into a terminal. KeyRelay never runs any command for you and never installs anything.",
+      "copy": "Copy",
+      "copied": "Copied",
+      "copyFailed": "Copy failed",
+      "redetect": "Re-detect",
+      "url": "Install page",
+      "close": "Close",
+      "empty": "The backend returned no install command; follow that agent's official docs."
     }
   },
   "history": {
