@@ -2462,6 +2462,18 @@ enum CaptchaCaptureMode {
     Unsupported,
 }
 
+/// Cookies 分支里是否要走 NewAPI 的「用 `new_api_refresh` 换 access_token」路径
+/// （M29-S1 / B-193）。
+///
+/// 为什么只有 NewAPI：新版 NewAPI 的 API 鉴权只认 `Authorization: Bearer <access_token>`
+/// （cookie 对 API 无效），所以抓完 cookie 还要换 token；**其它 cookie 站点**（例如
+/// Custom）保持 HEAD 的 cookie-only `complete_captcha`，逐字不动。
+///
+/// 抽成纯函数是为了让这条分支**可被单测钉住**——内联的 `matches!` 只有读代码才能验证。
+fn cookie_login_uses_newapi_exchange(kind: Option<keyrelay_core::site::SiteKind>) -> bool {
+    matches!(kind, Some(keyrelay_core::site::SiteKind::NewApi))
+}
+
 /// 能力位 → 取数方式。**cookie 优先**：两者都为 true 的站点目前不存在，但若将来出现，
 /// 抓 cookie 比注入脚本更保守（不执行任何 JS、不加 incognito）。
 ///
@@ -2829,10 +2841,22 @@ pub async fn captcha_complete<R: tauri::Runtime>(
                 .to_string(),
         );
     }
-    state
-        .service
-        .complete_captcha(site_id, pairs)
-        .map_err(|e| e.to_string())?;
+    // M29-S1 / B-193：NewAPI（新版）的 API 鉴权只认 `Authorization: Bearer <access_token>`，
+    // 只把 cookie 存进缓存对 API 无效——服务层会用 `new_api_refresh` 调
+    // `POST /api/user/auth/refresh` 换一份 access token 并落地（相位 / health / 缓存 /
+    // 钥匙串都由服务层负责，失败不关窗）。**其它 cookie 站点逐字保持 HEAD**。
+    if cookie_login_uses_newapi_exchange(kind) {
+        state
+            .service
+            .complete_newapi_webview_login(site_id, pairs)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        state
+            .service
+            .complete_captcha(site_id, pairs)
+            .map_err(|e| e.to_string())?;
+    }
 
     // ⑥ 成功才关窗（`destroy` 不发事件；相位已回 `Idle`）
     let _ = window.destroy();
@@ -3472,6 +3496,23 @@ mod tests {
             gateway_base_url_for(&DeliveryChannel::ClaudeDesktop, url),
             url.to_string()
         );
+    }
+
+    /// M29-S1 / B-193：Cookies 分支的分流判据——只有 NewAPI 走「refresh 换 token」。
+    ///
+    /// 这条钉住的是「别的 cookie 站点没被误伤」：Custom / Sub2API / 未知类型都必须
+    /// 继续走 HEAD 的 cookie-only `complete_captcha`。
+    #[test]
+    fn cookie_login_uses_newapi_exchange_only_for_newapi() {
+        use keyrelay_core::site::SiteKind;
+        assert!(cookie_login_uses_newapi_exchange(Some(SiteKind::NewApi)));
+        assert!(!cookie_login_uses_newapi_exchange(Some(
+            SiteKind::CustomOpenAiCompatible
+        )));
+        // Sub2API 走 Bearer（`CaptchaCaptureMode::Bearer`），根本到不了这个分支；
+        // 这里断言 false 是为了「万一将来有人把 Bearer 站点塞进 Cookies 分支」也不误走 NewAPI 路径。
+        assert!(!cookie_login_uses_newapi_exchange(Some(SiteKind::Sub2Api)));
+        assert!(!cookie_login_uses_newapi_exchange(None));
     }
 
     /// M28-S2 / B-191 B 路：取数方式**只**由能力表决定（三臂 + `None` 臂）。

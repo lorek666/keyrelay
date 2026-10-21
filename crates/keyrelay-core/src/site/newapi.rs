@@ -24,6 +24,12 @@ use crate::error::{Error, Result, SecondFactorKind};
 
 pub const DEFAULT_QUOTA_PER_UNIT: i64 = 500_000;
 
+/// NewAPI 的**续期凭据** cookie 名（M29-S1 / B-193）。
+///
+/// HttpOnly，JS 读不到 ⇒ 只能由 WebView 的 `window.cookies()` 取回；
+/// 它是「换 access_token 的钥匙」，与 token 同级（不进 SQLite / 事件 / 日志 / 错误文案）。
+pub const NEWAPI_REFRESH_COOKIE: &str = "new_api_refresh";
+
 /// `POST /api/token/batch/keys` 单次可提交的 id 数上限（站点硬上限）。
 ///
 /// 证据：`controller/token.go` 的 `GetTokenKeysBatch` 在 `len(ids) > 100` 时直接返回
@@ -58,7 +64,9 @@ impl<T: HttpTransport> NewApi<T> {
 
     fn auth_headers(&self, session: &Session) -> Vec<(String, String)> {
         let mut headers = vec![("Accept".to_string(), "application/json".to_string())];
-        if let Some(cookie) = session.cookie_header() {
+        // 续期凭据（HttpOnly、Path=/api/user/auth）只发给续期端点；普通 API 请求排除它，
+        // 避免把「换 token 的钥匙」带到不需要它的路径上（M29-S1 红线段）。
+        if let Some(cookie) = session.cookie_header_excluding(NEWAPI_REFRESH_COOKIE) {
             headers.push(("Cookie".to_string(), cookie));
         }
         if let Some(token) = &session.access_token {
@@ -938,6 +946,88 @@ impl<T: HttpTransport + 'static> SiteAdapter for NewApi<T> {
             )));
         }
         Ok(out)
+    }
+
+    /// M29-S1 / B-193：`POST {base}/api/user/auth/refresh`。
+    ///
+    /// 只从入参会话里取 [`NEWAPI_REFRESH_COOKIE`]；**没有就不发请求**（`Ok(None)`）。
+    /// 请求头纪律见 spec §4：`Cookie` **只**带这一条（不把整袋 cookie 发出去），
+    /// `Origin`/`Referer` 由 [`super::captcha::origin_of`] 算（不接受外部输入）。
+    async fn refresh_session(&self, base_url: &str, session: &Session) -> Result<Option<Session>> {
+        let Some(refresh) = session.cookie_value(NEWAPI_REFRESH_COOKIE) else {
+            // 没有续期凭据：不发请求（用空 MockTransport 自证）。
+            return Ok(None);
+        };
+        let base = normalize_base_url(base_url);
+        let origin = super::captcha::origin_of(&base).ok_or_else(|| {
+            Error::Transport(format!(
+                "站点地址无法解析出主机名：无法续期登录令牌（{}）",
+                super::display_url(&base)
+            ))
+        })?;
+
+        let mut req = HttpRequest::new(Method::Post, format!("{base}/api/user/auth/refresh"));
+        req.headers = vec![
+            ("Accept".to_string(), "application/json".to_string()),
+            ("Origin".to_string(), origin.clone()),
+            ("Referer".to_string(), format!("{origin}/")),
+            // **只**发续期凭据这一条：整袋 cookie 出去会把别的东西（例如 session 标记）
+            // 一并送到这个端点，超出「续期」需要的最小面。
+            (
+                "Cookie".to_string(),
+                format!("{NEWAPI_REFRESH_COOKIE}={refresh}"),
+            ),
+        ];
+        // `<sid>.<secret>` 形态才带 `X-Auth-Session`（站点用它做会话绑定校验）。
+        if let Some((sid, _)) = refresh.split_once('.') {
+            if !sid.is_empty() {
+                req.headers
+                    .push(("X-Auth-Session".to_string(), sid.to_string()));
+            }
+        }
+
+        let resp = self.transport.request(req).await?;
+        match resp.status {
+            200 => {
+                let value = Self::unwrap_success(&resp, "续期登录令牌")?;
+                let token = json_str(&value, "/data/access_token")
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string);
+                let Some(token) = token else {
+                    // 文案固定，不含站点原文（站点原文可能回显凭据）。
+                    return Err(Error::Transport("续期响应缺少 access_token".to_string()));
+                };
+                // `user.id`（新版）/ `id`（旧版）两个落点都读，与登录同口径。
+                let user_id = value
+                    .pointer("/data/user/id")
+                    .or_else(|| value.pointer("/data/id"))
+                    .and_then(|v| v.as_i64())
+                    .map(|id| id.to_string());
+                // 轮换：同名覆盖、新名追加；其余 cookie 原样保留。
+                let mut cookies = session.cookies.clone();
+                for (name, value) in resp.set_cookies() {
+                    match cookies.iter_mut().find(|(n, _)| n == &name) {
+                        Some(slot) => slot.1 = value,
+                        None => cookies.push((name, value)),
+                    }
+                }
+                Ok(Some(Session {
+                    cookies,
+                    access_token: Some(token),
+                    user_id,
+                    // UA 沿用入参：cf_clearance 之外，站点也可能用它做一致性校验。
+                    user_agent: session.user_agent.clone(),
+                }))
+            }
+            // 401/403：凭据被拒（会话已失效）。文案固定，不回显站点原文。
+            401 | 403 => Err(Error::AuthFailed(
+                "站点拒绝了续期凭据（登录会话已失效）".to_string(),
+            )),
+            // 404：旧版 NewAPI 没有续期端点 ⇒ 调用方走 cookie-only 兜底。
+            404 => Ok(None),
+            other => Err(map_http_error(other, &resp.body, resp.retry_after_secs())),
+        }
     }
 }
 

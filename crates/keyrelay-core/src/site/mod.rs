@@ -195,6 +195,18 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
+    /// 按名字取一条 cookie 的值（只读）。
+    ///
+    /// 同名多条取**第一条**（不同 `path` 下同名是 HTTP 的合法形态；本产品只关心
+    /// 「有没有这个凭据」，取第一条与 `cookie_header` 的发送顺序一致）。
+    /// **不得**把返回值打印 / 拼进错误文案（它是凭据）。
+    pub fn cookie_value(&self, name: &str) -> Option<&str> {
+        self.cookies
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
     pub fn cookie_header(&self) -> Option<String> {
         if self.cookies.is_empty() {
             return None;
@@ -206,6 +218,26 @@ impl Session {
                 .collect::<Vec<_>>()
                 .join("; "),
         )
+    }
+
+    /// 与 [`Self::cookie_header`] 相同，但**跳过**指定名字的 cookie。
+    ///
+    /// M29-S1：`new_api_refresh` 是 HttpOnly、`Path=/api/user/auth` 的续期凭据；
+    /// 浏览器只会把它发给续期端点。手工拼 `Cookie` 头时若整袋照发，会把它带到
+    /// `/api/user/self`、`/api/token` 等不需要它的端点，扩大秘密面。因此普通 API
+    /// 请求用本方法排除它；续期请求由 `NewApi::refresh_session` 单独拼那一条。
+    pub fn cookie_header_excluding(&self, exclude: &str) -> Option<String> {
+        let filtered: Vec<String> = self
+            .cookies
+            .iter()
+            .filter(|(k, _)| k != exclude)
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        if filtered.is_empty() {
+            None
+        } else {
+            Some(filtered.join("; "))
+        }
     }
 
     /// 序列化给钥匙串持久化（M13-S1）。返回值含明文 cookie/access_token，
@@ -502,6 +534,19 @@ pub trait SiteAdapter: Send + Sync {
     ) -> Result<Vec<(String, KeyMaterial)>> {
         let _ = (base_url, session, remote_ids);
         Err(Error::Unimplemented("该适配器未实现 reveal_keys".into()))
+    }
+
+    /// 用会话里已有的续期凭据换一份新会话（M29-S1 / B-193）。
+    ///
+    /// 默认 `Ok(None)` = 该适配器**没有**续期能力；调用方不得把它当成失败
+    /// （旧版站点 / Sub2API / Custom 都走这条默认路径）。
+    /// 返回 `Ok(Some(session))` 时，调用方负责把新会话写回缓存 + 钥匙串。
+    ///
+    /// 实现侧纪律：请求只发往站点自己的 origin；`Cookie` 头只带续期凭据那一条
+    /// （不把整袋 cookie 发出去）；**任何 `Err` 文案都不得包含 token / cookie 值**。
+    async fn refresh_session(&self, base_url: &str, session: &Session) -> Result<Option<Session>> {
+        let _ = (base_url, session);
+        Ok(None)
     }
 
     /// 拉取一把 key 近 30 天的日用量（M14-S3 / PRD FR-3）。

@@ -134,8 +134,9 @@ fn is_auth_failure(err: &Error) -> bool {
 
 /// 会话的过期信息（B-121 / FR-1:104「会话保持」）。
 ///
-/// `expires_at` 来自 JWT 的 `exp`（Sub2API 的 `access_token`）；NewAPI 走 Cookie、
-/// 没有 JWT ⇒ [`KeyRelayService::session_expiry`] 返回 `None`（「不知道什么时候过期」，
+/// `expires_at` 来自 JWT 的 `exp`（NewAPI / Sub2API 的 `access_token`）；
+/// 无 JWT 的纯 Cookie 会话（Custom / 旧版 NewAPI）⇒
+/// [`KeyRelayService::session_expiry`] 返回 `None`（「不知道什么时候过期」，
 /// 不是「马上过期」）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionExpiry {
@@ -165,9 +166,11 @@ fn jwt_exp(token: &str) -> Option<i64> {
 
 /// 会话是否**已过期**（B-121）：只看 JWT 的 `exp`。
 ///
-/// 没有 JWT（Cookie 会话）⇒ `false`（不算过期）：它的有效性由第一次请求的 401 判定，
-/// 那时 `mark_needs_login` 会删掉持久化条目。**不做时间上的兜底过期**——
+/// 没有 JWT（纯 Cookie 会话 / 旧版 NewAPI）⇒ `false`（不算过期）：它的有效性由第一次
+/// 请求的 401 判定，那时 `mark_needs_login` 会删掉持久化条目。**不做时间上的兜底过期**——
 /// 持久化形态里没有保存时刻，硬编一个「30 天」会把仍有效的会话误删（登记为残余项）。
+/// NewAPI 的新版会话有 JWT `exp`；即使已过期，只要还带 `new_api_refresh`，
+/// `restore_sessions` 会刻意保留，交给续期循环换新 token（M29-S1）。
 fn session_is_expired(session: &Session, now: i64) -> bool {
     session
         .access_token
@@ -892,7 +895,17 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                         // 恢复一个已知过期的会话只会让用户先看到「已登录」、再吃一次 401；
                         // 直接删掉，让界面如实显示「未登录」。
                         if session_is_expired(&session, unix_now_secs()) {
-                            let _ = self.vault.delete(&reference);
+                            // M29-S1：NewAPI 且**带续期凭据** ⇒ 不删、恢复进缓存，
+                            // 由续期循环换新 token（删了就得让用户重新过一遍验证码）。
+                            let keep = matches!(self.kind_of(&site), Ok(SiteKind::NewApi))
+                                && session
+                                    .cookie_value(crate::site::newapi::NEWAPI_REFRESH_COOKIE)
+                                    .is_some();
+                            if keep {
+                                let _ = self.sessions.put(site.id, session);
+                            } else {
+                                let _ = self.vault.delete(&reference);
+                            }
                             continue;
                         }
                         let _ = self.sessions.put(site.id, session);
@@ -1355,6 +1368,154 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
                 "该站点当前不需要人机验证（没有等待中的挑战）".to_string(),
             )),
         }
+    }
+
+    /// NewAPI 的 WebView cookie 登录完成（M29-S1 / B-193）：用 `new_api_refresh` 换 access_token。
+    ///
+    /// 顺序（spec §4 硬要求）：相位必须是 `AwaitingHuman` → `validate_captcha_cookies` →
+    /// kind 必须是 `NewApi` → `refresh_session` → **成功才**写 health / 缓存 / 钥匙串 /
+    /// 相位 `Idle` / Info 事件（只带 site_id）。
+    /// 任何失败：相位留在人工态，不写 health / 缓存 / 钥匙串 / 事件。
+    ///
+    /// 旧版 NewAPI 没有续期端点（404 ⇒ `Ok(None)`）⇒ 用 cookie-only 会话试一次 `balance`：
+    /// 成功则落地为 cookie 会话，失败则原样上抛、不改状态。
+    pub async fn complete_newapi_webview_login(
+        &self,
+        site_id: i64,
+        cookies: Vec<(String, String)>,
+    ) -> Result<()> {
+        if !matches!(
+            self.captcha_phase(site_id),
+            CaptchaPhase::AwaitingHuman { .. }
+        ) {
+            return Err(Error::AuthFailed(
+                "该站点当前不在等待人工验证：无法完成 NewAPI 登录".to_string(),
+            ));
+        }
+        captcha::validate_captcha_cookies(&cookies)?;
+        let site = self.site(site_id)?;
+        let kind = self.kind_of(&site)?;
+        if kind != SiteKind::NewApi {
+            return Err(Error::Unsupported(
+                "该站点类型不走 NewAPI 登录换取路径".to_string(),
+            ));
+        }
+
+        let cookie_session = captcha::session_from_captcha_cookies(&cookies);
+        let adapter = self.registry.adapter(kind);
+        let refreshed = adapter
+            .refresh_session(&site.base_url, &cookie_session)
+            .await?;
+        let (session, message) = match refreshed {
+            Some(new_session) => (new_session, "NewAPI 登录凭据已接入：会话已建立"),
+            None => {
+                // 旧版：cookie-only 兜底。探测失败 ⇒ 原错误上抛，**不**改任何状态。
+                adapter.balance(&site.base_url, &cookie_session).await?;
+                (cookie_session, "NewAPI 登录凭据已接入：Cookie 会话已建立")
+            }
+        };
+
+        // —— 只有走到这里才动状态 ——
+        self.store.set_site_health(site_id, HEALTH_OK)?;
+        let stored = session.to_stored();
+        self.sessions.put(site_id, session)?;
+        if let Ok(s) = stored {
+            if let Err(err) = self.vault.put(&self.session_ref(site_id), &s) {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "vault",
+                    format!("持久化会话失败: {err}"),
+                    serde_json::json!({ "site_id": site_id }),
+                ));
+            }
+        }
+        self.set_captcha_phase(site_id, CaptchaPhase::Idle);
+        // 只带 site_id：token / refresh cookie 一律不进事件表。
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "site",
+            message,
+            serde_json::json!({ "site_id": site_id }),
+        ));
+        Ok(())
+    }
+
+    /// 后台续期（M29-S1 / B-193）：只处理**有 `new_api_refresh` 的 NewAPI 会话**。
+    ///
+    /// 触发条件：`jwt_exp(access_token)` 存在且 `exp - now <= 180`。
+    /// token 缺失 / 非 JWT ⇒ **不主动续期**（旧形态保持「401 后重登」），避免凭猜测刷请求。
+    ///
+    /// 结果分流：`Ok(Some(new))` ⇒ health=ok + 缓存 + 钥匙串；
+    /// `Ok(None)` ⇒ no-op；`is_auth_failure` ⇒ `mark_needs_login`（删钥匙串条目）；
+    /// 其它错误（网络 / 5xx）⇒ **保留会话**，只记 Debug 事件（不含凭据），下一轮重试。
+    pub async fn refresh_sessions_if_needed(&self) -> Result<()> {
+        let now = unix_now_secs();
+        for site in self.store.list_sites()? {
+            let Ok(kind) = self.kind_of(&site) else {
+                continue;
+            };
+            if kind != SiteKind::NewApi {
+                continue;
+            }
+            let Some(session) = self.sessions.get(site.id) else {
+                continue;
+            };
+            if session
+                .cookie_value(crate::site::newapi::NEWAPI_REFRESH_COOKIE)
+                .is_none()
+            {
+                continue;
+            }
+            let Some(exp) = session.access_token.as_deref().and_then(jwt_exp) else {
+                continue;
+            };
+            // 只在**临近过期**（≤ 180s）时续期：token 15 分钟 ⇒ 约每 13 分钟一次请求。
+            if exp - now > 180 {
+                continue;
+            }
+            let adapter = self.registry.adapter(kind);
+            match adapter.refresh_session(&site.base_url, &session).await {
+                Ok(Some(new_session)) => {
+                    let stored = new_session.to_stored();
+                    let _ = self.store.set_site_health(site.id, HEALTH_OK);
+                    let _ = self.sessions.put(site.id, new_session);
+                    if let Ok(s) = stored {
+                        if let Err(err) = self.vault.put(&self.session_ref(site.id), &s) {
+                            self.log(observability::event_with_payload(
+                                Level::Warn,
+                                "vault",
+                                format!("持久化续期会话失败: {err}"),
+                                serde_json::json!({ "site_id": site.id }),
+                            ));
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) if is_auth_failure(&err) => {
+                    // 凭据被拒 ⇒ 会话确实失效：标 needs_login（内部会删钥匙串条目）。
+                    self.mark_needs_login(site.id);
+                    self.log(observability::event_with_payload(
+                        Level::Info,
+                        "site",
+                        "登录会话已过期，需要重新登录",
+                        serde_json::json!({ "site_id": site.id }),
+                    ));
+                }
+                Err(err) => {
+                    // 网络 / 5xx：**保留会话**，下一轮再试。Debug 级、不含凭据。
+                    self.log(observability::event_with_payload(
+                        Level::Debug,
+                        "site",
+                        format!(
+                            "续期登录令牌失败（保留会话，下一轮重试）: {}",
+                            error_kind(&err)
+                        ),
+                        serde_json::json!({ "site_id": site.id }),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 收下 WebView 抓到的 cookie（M8-S2 §9）。
@@ -7064,5 +7225,370 @@ mod tests {
             "remove_site 必须清槽"
         );
         assert_eq!(service2.captcha_phase(site2), CaptchaPhase::Idle);
+    }
+
+    // ============================================================ M29-S1：NewAPI 登录换取与续期（B-193）
+
+    use base64::Engine as _;
+
+    /// 造一个只有 `exp` 有意义的 JWT（与 `jwt_exp` 的口径一致：不校验签名）。
+    fn newapi_jwt(exp: i64) -> String {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"sub":"42","exp":{exp}}}"#).as_bytes());
+        format!("header.{payload}.sig")
+    }
+
+    /// 一个 NewAPI 站点（已进入人工态）+ 共享的钥匙串句柄。
+    async fn newapi_awaiting_human() -> (
+        KeyRelayService<MockTransport>,
+        i64,
+        Arc<crate::vault::MemoryVault>,
+        MockTransport,
+    ) {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let home = dir.keep();
+        let vault = Arc::new(crate::vault::MemoryVault::new());
+        let transport = MockTransport::new(vec![
+            // 指纹：/api/status
+            HttpResponse::json(
+                200,
+                json!({"success": true, "data": {"system_name": "示例 NewAPI", "version": "1.0.0-rc.45"}}),
+            )
+            .expect("构造响应"),
+            // 登录前探加密：未启用
+            HttpResponse::json(200, json!({"success": true, "data": {"enabled": false}}))
+                .expect("构造响应"),
+            // 登录：200 + success:false + 验证码 ⇒ unwrap_success 归类成 CaptchaRequired ⇒ 人工态
+            HttpResponse::json(200, json!({"success": false, "message": "请输入验证码"}))
+                .expect("构造响应"),
+        ]);
+        let handle = transport.clone();
+        let service = KeyRelayService::new(
+            Store::open_in_memory().expect("内存库"),
+            transport,
+            ServiceConfig {
+                vault: Arc::clone(&vault) as Arc<dyn crate::vault::Vault>,
+                home: home.clone(),
+                backup_dir: home.join("backups"),
+            },
+        );
+        let site = service
+            .add_site("https://newapi.example.com")
+            .await
+            .expect("站点");
+        assert_eq!(site.kind, "newapi");
+        let err = service
+            .login(
+                site.id,
+                crate::site::Credentials::new("me@example.com", "pw-12345678"),
+            )
+            .await
+            .expect_err("应当要求人机验证");
+        assert!(matches!(err, Error::CaptchaRequired), "{err:?}");
+        (service, site.id, vault, handle)
+    }
+
+    fn webview_cookies() -> Vec<(String, String)> {
+        vec![
+            ("new_api_refresh".to_string(), "sid-1.secret-1".to_string()),
+            ("new_api_has_session".to_string(), "1".to_string()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn complete_newapi_webview_login_lands_the_session() {
+        let (service, site_id, vault, _handle) = newapi_awaiting_human().await;
+        let token = newapi_jwt(9_999_999_999);
+        service.transport_push(json_ok_with(json!({
+            "success": true,
+            "data": {"access_token": token.clone(), "user": {"id": 42}}
+        })));
+
+        service
+            .complete_newapi_webview_login(site_id, webview_cookies())
+            .await
+            .expect("应当成功");
+
+        // health=ok、相位 Idle
+        let site = service.sites().expect("站点").into_iter().next().unwrap();
+        assert_eq!(site.health, HEALTH_OK);
+        assert_eq!(service.captcha_phase(site_id), CaptchaPhase::Idle);
+        // 缓存里有 token（用 session_expiry 间接断言：JWT exp 可读）
+        let expiry = service.session_expiry(site_id).expect("缓存里应有会话");
+        assert_eq!(expiry.expires_at, 9_999_999_999);
+        // 钥匙串里有完整 JSON（含 refresh cookie）
+        let stored = vault
+            .get(&crate::vault::secret_ref("site", site_id, "session"))
+            .expect("读钥匙串")
+            .expect("条目不存在的会话");
+        assert!(
+            stored.contains("new_api_refresh"),
+            "钥匙串 JSON 应含续期凭据"
+        );
+        // 事件只带 site_id：token / refresh cookie 一律不进事件表。
+        let events = service.recent_events(100).expect("recent_events");
+        let ev = events
+            .iter()
+            .find(|e| e.message.contains("NewAPI 登录凭据已接入"))
+            .expect("应有 NewAPI 登录接入事件");
+        let payload: serde_json::Value =
+            serde_json::from_str(ev.payload.as_deref().unwrap_or("null")).expect("事件 payload");
+        assert_eq!(payload, json!({ "site_id": site_id }));
+        let text = format!("{} {}", ev.message, ev.payload.as_deref().unwrap_or(""));
+        assert!(
+            !text.contains("new_api_refresh"),
+            "事件泄漏续期凭据: {text}"
+        );
+        assert!(!text.contains(&token), "事件泄漏 access_token: {text}");
+    }
+
+    #[tokio::test]
+    async fn complete_newapi_webview_login_rejects_bad_phase_and_bad_cookies() {
+        let (service, site_id, vault, _handle) = newapi_awaiting_human().await;
+        // 非法 cookie（空值）⇒ AuthFailed 且相位不变
+        let err = service
+            .complete_newapi_webview_login(site_id, vec![("x".to_string(), String::new())])
+            .await
+            .expect_err("空值 cookie 必须拒绝");
+        assert!(matches!(err, Error::AuthFailed(_)), "{err:?}");
+        assert!(matches!(
+            service.captcha_phase(site_id),
+            CaptchaPhase::AwaitingHuman { .. }
+        ));
+        assert!(vault
+            .get(&crate::vault::secret_ref("site", site_id, "session"))
+            .expect("读")
+            .is_none());
+        // 相位不对 ⇒ AuthFailed
+        service.cancel_captcha(site_id);
+        let err = service
+            .complete_newapi_webview_login(site_id, webview_cookies())
+            .await
+            .expect_err("非人工态必须拒绝");
+        assert!(matches!(err, Error::AuthFailed(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn complete_newapi_webview_login_404_falls_back_to_cookie_only() {
+        let (service, site_id, _vault, _handle) = newapi_awaiting_human().await;
+        // refresh 404 ⇒ 旧版 ⇒ cookie-only balance 探测成功
+        service.transport_push(
+            HttpResponse::json(404, json!({"message": "not found"})).expect("构造"),
+        );
+        service.transport_push(
+            HttpResponse::json(
+                200,
+                json!({"success": true, "data": {"quota": 100, "used_quota": 1}}),
+            )
+            .expect("构造"),
+        );
+        service
+            .complete_newapi_webview_login(site_id, webview_cookies())
+            .await
+            .expect("旧版应当走 cookie-only 成功");
+        let site = service.sites().expect("站点").into_iter().next().unwrap();
+        assert_eq!(site.health, HEALTH_OK);
+        assert_eq!(service.captcha_phase(site_id), CaptchaPhase::Idle);
+    }
+
+    #[tokio::test]
+    async fn complete_newapi_webview_login_404_and_balance_failure_keeps_state() {
+        let (service, site_id, vault, _handle) = newapi_awaiting_human().await;
+        service.transport_push(HttpResponse::json(404, json!({})).expect("构造"));
+        service.transport_push(HttpResponse::new(500, b"down".to_vec()));
+        let err = service
+            .complete_newapi_webview_login(site_id, webview_cookies())
+            .await
+            .expect_err("兜底探测失败必须上抛");
+        assert!(!err.to_string().contains("secret-1"), "错误文案不得含凭据");
+        assert!(matches!(
+            service.captcha_phase(site_id),
+            CaptchaPhase::AwaitingHuman { .. }
+        ));
+        assert!(
+            vault
+                .get(&crate::vault::secret_ref("site", site_id, "session"))
+                .expect("读")
+                .is_none(),
+            "失败不得写钥匙串"
+        );
+    }
+
+    /// 往服务的 MockTransport 队列里补一条响应（测试夹具用）。
+    trait PushResponse {
+        fn transport_push(&self, resp: HttpResponse);
+    }
+    impl PushResponse for KeyRelayService<MockTransport> {
+        fn transport_push(&self, resp: HttpResponse) {
+            self.transport.push(resp);
+        }
+    }
+
+    fn json_ok_with(value: serde_json::Value) -> HttpResponse {
+        HttpResponse::json(200, value).expect("构造响应")
+    }
+
+    /// 把一个会话直接写进钥匙串（模拟「上次运行留下的持久化会话」），然后恢复。
+    fn seed_session(
+        service: &KeyRelayService<MockTransport>,
+        vault: &Arc<crate::vault::MemoryVault>,
+        site_id: i64,
+        session: crate::site::Session,
+    ) {
+        let reference = crate::vault::secret_ref("site", site_id, "session");
+        vault
+            .put(&reference, &session.to_stored().expect("序列化"))
+            .expect("写钥匙串");
+        service.restore_sessions();
+    }
+
+    fn cookie_session(token: Option<String>, with_refresh: bool) -> crate::site::Session {
+        let mut cookies = Vec::new();
+        if with_refresh {
+            cookies.push(("new_api_refresh".to_string(), "sid-9.secret-9".to_string()));
+        }
+        crate::site::Session {
+            cookies,
+            access_token: token,
+            user_id: Some("42".to_string()),
+            user_agent: None,
+        }
+    }
+
+    /// 只数续期请求（夹具里的指纹 / 登录请求也在同一个 handle 里）。
+    fn refresh_requests(handle: &MockTransport) -> usize {
+        handle
+            .requests()
+            .iter()
+            .filter(|req| req.url.contains("/api/user/auth/refresh"))
+            .count()
+    }
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("时钟")
+            .as_secs() as i64
+    }
+
+    #[tokio::test]
+    async fn refresh_sessions_only_when_near_expiry() {
+        // 近过期（now+60）：发一次请求
+        let (service, site_id, vault, handle) = newapi_awaiting_human().await;
+        seed_session(
+            &service,
+            &vault,
+            site_id,
+            cookie_session(Some(newapi_jwt(now_secs() + 60)), true),
+        );
+        service.transport_push(json_ok_with(json!({
+            "success": true,
+            "data": {"access_token": newapi_jwt(now_secs() + 900), "user": {"id": 42}}
+        })));
+        service.refresh_sessions_if_needed().await.expect("续期");
+        assert_eq!(refresh_requests(&handle), 1, "近过期应当续期一次");
+
+        // 还早（now+3600）：不发请求
+        let (service2, site2, vault2, handle2) = newapi_awaiting_human().await;
+        seed_session(
+            &service2,
+            &vault2,
+            site2,
+            cookie_session(Some(newapi_jwt(now_secs() + 3600)), true),
+        );
+        service2.refresh_sessions_if_needed().await.expect("续期");
+        assert_eq!(refresh_requests(&handle2), 0, "还早时不得发请求（避免刷）");
+    }
+
+    #[tokio::test]
+    async fn refresh_sessions_auth_failure_marks_needs_login() {
+        let (service, site_id, vault, handle) = newapi_awaiting_human().await;
+        seed_session(
+            &service,
+            &vault,
+            site_id,
+            cookie_session(Some(newapi_jwt(now_secs() + 60)), true),
+        );
+        service
+            .transport_push(HttpResponse::json(401, json!({"message": "expired"})).expect("构造"));
+        service
+            .refresh_sessions_if_needed()
+            .await
+            .expect("续期不 panic");
+        assert_eq!(refresh_requests(&handle), 1);
+        let site = service.sites().expect("站点").into_iter().next().unwrap();
+        assert_eq!(site.health, HEALTH_NEEDS_LOGIN, "401 ⇒ needs_login");
+        assert!(
+            vault
+                .get(&crate::vault::secret_ref("site", site_id, "session"))
+                .expect("读")
+                .is_none(),
+            "needs_login 必须删掉钥匙串条目"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_sessions_network_error_keeps_the_session() {
+        let (service, site_id, vault, handle) = newapi_awaiting_human().await;
+        seed_session(
+            &service,
+            &vault,
+            site_id,
+            cookie_session(Some(newapi_jwt(now_secs() + 60)), true),
+        );
+        // 队列里没有响应 ⇒ MockTransport 返回错误（网络错误的等价物）
+        service
+            .refresh_sessions_if_needed()
+            .await
+            .expect("网络错误不得上抛");
+        assert_eq!(refresh_requests(&handle), 1);
+        assert!(
+            service.session_expiry(site_id).is_some(),
+            "网络错误必须保留会话"
+        );
+        let site = service.sites().expect("站点").into_iter().next().unwrap();
+        assert_ne!(
+            site.health, HEALTH_NEEDS_LOGIN,
+            "网络错误不得标 needs_login"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_keeps_expired_newapi_session_with_refresh_cookie() {
+        let (service, site_id, vault, _handle) = newapi_awaiting_human().await;
+        // 已过期（now-100）但有 refresh cookie ⇒ 保留并恢复
+        seed_session(
+            &service,
+            &vault,
+            site_id,
+            cookie_session(Some(newapi_jwt(now_secs() - 100)), true),
+        );
+        assert!(
+            service.session_expiry(site_id).is_some(),
+            "过期的 NewAPI 会话带 refresh cookie 时必须保留"
+        );
+        assert!(vault
+            .get(&crate::vault::secret_ref("site", site_id, "session"))
+            .expect("读")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn restore_deletes_expired_session_without_refresh_cookie() {
+        let (service, site_id, vault, _handle) = newapi_awaiting_human().await;
+        seed_session(
+            &service,
+            &vault,
+            site_id,
+            cookie_session(Some(newapi_jwt(now_secs() - 100)), false),
+        );
+        assert!(
+            service.session_expiry(site_id).is_none(),
+            "没有 refresh cookie 的过期会话应当删除"
+        );
+        assert!(vault
+            .get(&crate::vault::secret_ref("site", site_id, "session"))
+            .expect("读")
+            .is_none());
     }
 }
