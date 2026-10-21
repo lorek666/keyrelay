@@ -242,7 +242,7 @@ export function LineChart({
           index % step === 0 ? (
             <text
               key={`x-${date}`}
-              x={PAD.left + index * (PLOT_WIDTH / Math.max(dates.length - 1, 1))}
+              x={xFor(date)}
               y={HEIGHT - 8}
               textAnchor="middle"
             >

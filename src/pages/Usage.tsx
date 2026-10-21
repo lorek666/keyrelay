@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { listSites, usageDashboard } from "../lib/api";
 import {
+  formatCost,
   formatShare,
   formatTokens,
   groupByModel,
@@ -73,12 +74,27 @@ export default function Usage() {
   const balanceGroups = snapshotsByCurrency(snapshots);
 
   // keyUsage 能力位消费：只有 true 的站点可以出现在按密钥表里。
-  const capableSites = siteList.filter((site) => site.capabilities.keyUsage);
-  const incapableSites = siteList.filter((site) => !site.capabilities.keyUsage);
+  // 站点筛选生效时，只看**被选中的那个站点**——否则筛到一个没有能力的站点，
+  // 页面会显示「还没有采样」而不是「这个站点不提供」（复审 P3-5）。
+  const selectedSite =
+    siteId === null ? null : siteList.find((site) => site.id === siteId);
+  const capableSites = selectedSite
+    ? selectedSite.capabilities.keyUsage
+      ? [selectedSite]
+      : []
+    : siteList.filter((site) => site.capabilities.keyUsage);
+  const incapableSites = selectedSite
+    ? selectedSite.capabilities.keyUsage
+      ? []
+      : [selectedSite]
+    : siteList.filter((site) => !site.capabilities.keyUsage);
   const visibleKeyUsage = keyUsage.filter((row) =>
     capableSites.some((site) => site.id === row.siteId),
   );
   const capsReady = sites.isSuccess;
+  // 汇总卡在加载 / 出错时显示「—」而不是 0：0 是「确实没有流量」，与「还没读到」是两件事。
+  const cardValue = (value: string | number) =>
+    dashboard.isLoading || dashboard.isError ? "—" : value;
   const noData =
     !dashboard.isLoading &&
     !dashboard.isError &&
@@ -142,21 +158,19 @@ export default function Usage() {
       <div className="cards">
         <Stat
           label={t("usage.cards.tokens")}
-          value={dashboard.isLoading ? "—" : formatTokens(totals.totalTokens)}
+          value={cardValue(formatTokens(totals.totalTokens))}
         />
         <Stat
           label={t("usage.cards.requests")}
-          value={
-            dashboard.isLoading ? "—" : totals.requests.toLocaleString()
-          }
+          value={cardValue(totals.requests.toLocaleString())}
         />
         <Stat
           label={t("usage.cards.sites")}
-          value={dashboard.isLoading ? "—" : bySite.length}
+          value={cardValue(bySite.length)}
         />
         <Stat
           label={t("usage.cards.models")}
-          value={dashboard.isLoading ? "—" : byModel.length}
+          value={cardValue(byModel.length)}
         />
       </div>
 
@@ -228,7 +242,9 @@ export default function Usage() {
             </thead>
             <tbody>
               {bySite.map((row) => {
-                const capable = capsOf(row.siteId)?.keyUsage;
+                // 站点列表还没读回来时不能断言「不提供」——那是把「不知道」当成事实
+                // （与 Balance.known 同纪律，复审 P2-3）。
+                const capable = capsReady ? capsOf(row.siteId)?.keyUsage : undefined;
                 return (
                   <tr key={row.siteId}>
                     <td>{siteName(row.siteId)}</td>
@@ -242,9 +258,11 @@ export default function Usage() {
                       {formatShare(row.totalTokens, totals.totalTokens)}
                     </td>
                     <td>
-                      {capable
-                        ? t("usage.sites.keyUsageYes")
-                        : t("usage.sites.keyUsageNo")}
+                      {!capsReady
+                        ? "—"
+                        : capable
+                          ? t("usage.sites.keyUsageYes")
+                          : t("usage.sites.keyUsageNo")}
                     </td>
                   </tr>
                 );
@@ -322,8 +340,8 @@ export default function Usage() {
                   </td>
                   <td className="mono">
                     {row.currency
-                      ? `${row.cost.toFixed(2)} ${row.currency}`
-                      : row.cost.toFixed(2)}
+                      ? `${formatCost(row.cost)} ${row.currency}`
+                      : formatCost(row.cost)}
                   </td>
                 </tr>
               ))}

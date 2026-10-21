@@ -2049,7 +2049,9 @@ impl Store {
                             ORDER BY ts DESC, id DESC
                           ) AS rn
                    FROM usage_snapshots
-                   WHERE ts >= ?1 AND (?2 IS NULL OR site_id = ?2)
+                   -- `known = 0`（余额不可观测）的快照不画进趋势：它的 used/remaining
+                   -- 没有意义，混进去会把「不知道」显示成一条 0 余额的线（复审 P3-9）。
+                   WHERE known = 1 AND ts >= ?1 AND (?2 IS NULL OR site_id = ?2)
                  )
                  WHERE rn = 1
                  ORDER BY d ASC, site_id ASC",
@@ -3191,12 +3193,30 @@ mod tests {
             .unwrap()
     }
 
+    /// 本地今天零点的 epoch（秒）。
+    ///
+    /// 夹具用它 + 固定偏移构造「今天之内」的时间戳，避免 `now - 30s` 这类写法在
+    /// 本地 00:00:00–00:00:29 运行时跨日（复审 P3-10）。
+    fn local_midnight(store: &Store) -> i64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT CAST(strftime('%s', date('now','localtime'), 'utc') AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn usage_daily_groups_by_local_day_site_and_model() {
         let store = Store::open_in_memory().unwrap();
         let site_a = store.upsert_site("newapi", "https://a", "A").unwrap();
         let site_b = store.upsert_site("newapi", "https://b", "B").unwrap();
-        let now = now_secs();
+        // 固定取「本地今天 00:01」起的时间戳：不用 `now - 30s`，避免本地零点后
+        // 半分钟内运行时两条记录跨日（复审 P3-10）。
+        let base = local_midnight(&store) + 600;
         {
             let conn = store.lock().unwrap();
             let insert = |site: i64, model: &str, ts: i64, prompt: i64, completion: i64| {
@@ -3206,16 +3226,16 @@ mod tests {
                 )
                 .unwrap();
             };
-            insert(site_a, "gpt-4", now - 30, 10, 5);
-            insert(site_a, "gpt-4", now, 20, 10);
+            insert(site_a, "gpt-4", base - 30, 10, 5);
+            insert(site_a, "gpt-4", base, 20, 10);
             // 空模型名是**独立分组**，不并进 "gpt-4"
-            insert(site_a, "", now, 1, 1);
+            insert(site_a, "", base, 1, 1);
             // 不同站点独立成行
-            insert(site_b, "gpt-4", now, 100, 50);
+            insert(site_b, "gpt-4", base, 100, 50);
         }
         let rows = store.usage_daily(7, None).unwrap();
         assert_eq!(rows.len(), 3, "两个站点 + 空模型名 ⇒ 三行");
-        let today = day_label(&store, now);
+        let today = day_label(&store, base);
         for row in &rows {
             assert_eq!(row.date, today, "同一本地日应聚到一起");
         }
@@ -3239,10 +3259,11 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let site_a = store.upsert_site("newapi", "https://a", "A").unwrap();
         let site_b = store.upsert_site("newapi", "https://b", "B").unwrap();
-        let now = now_secs();
+        // 同上：夹具锚在「本地今天 00:01」，不用 `now`（避免跨日假红）。
+        let base = local_midnight(&store) + 600;
         {
             let conn = store.lock().unwrap();
-            for (site, ts) in [(site_a, now), (site_b, now), (site_a, now - 3 * 86400)] {
+            for (site, ts) in [(site_a, base), (site_b, base), (site_a, base - 3 * 86400)] {
                 conn.execute(
                     "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, 'm', 1, 1, 2)",
                     params![ts, site],
@@ -3272,7 +3293,8 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let site_a = store.upsert_site("newapi", "https://a", "A").unwrap();
         let site_b = store.upsert_site("sub2api", "https://b", "B").unwrap();
-        let now = now_secs();
+        // 锚在「本地今天 00:01」，避免 `now - 120s` 在零点后两分钟内跨日（P3-10）。
+        let base = local_midnight(&store) + 600;
         {
             let conn = store.lock().unwrap();
             let insert = |site: i64, used: f64, remaining: f64, currency: &str, ts: i64| {
@@ -3282,25 +3304,38 @@ mod tests {
                 )
                 .unwrap();
             };
-            insert(site_a, 10.0, 90.0, "USD", now - 120);
-            insert(site_a, 12.0, 88.0, "USD", now - 60);
-            insert(site_a, 15.0, 85.0, "USD", now);
-            insert(site_b, 1.0, 9.0, "CNY", now);
-            insert(site_a, 5.0, 95.0, "USD", now - 86400);
+            insert(site_a, 10.0, 90.0, "USD", base - 120);
+            insert(site_a, 12.0, 88.0, "USD", base - 60);
+            insert(site_a, 15.0, 85.0, "USD", base);
+            // **id 与 ts 逆序**：这条 id 最大、ts 更早。`MAX(id)` / `ORDER BY id DESC`
+            // 会取到 99.0；正确实现（ts DESC, id DESC）仍取 base 那条的 15.0。
+            // 没有这一行，两种实现给出同一结果，用例就是假绿（复审 P2-1）。
+            insert(site_a, 99.0, 1.0, "USD", base - 30);
+            insert(site_b, 1.0, 9.0, "CNY", base);
+            insert(site_a, 5.0, 95.0, "USD", base - 86400);
+            // `known = 0`（余额未知）的快照不得进图（P3-9）
+            conn.execute(
+                "INSERT INTO usage_snapshots(site_id, used, remaining, currency, known, ts) VALUES (?1, 0.0, 0.0, 'CNY', 0, ?2)",
+                params![site_b, base],
+            )
+            .unwrap();
         }
         let rows = store.usage_snapshot_daily(7, None).unwrap();
         assert_eq!(rows.len(), 3, "昨天 A 一条 + 今天 A/B 各一条");
         assert_eq!(rows[0].date, day_ago_label(&store, 1));
         assert_eq!(rows[0].site_id, site_a);
         assert_eq!(rows[0].used, 5.0);
-        assert_eq!(rows[1].date, day_label(&store, now));
+        assert_eq!(rows[1].date, day_label(&store, base));
         assert_eq!(rows[1].site_id, site_a);
-        assert_eq!(rows[1].used, 15.0, "取当日最后一条，不是第一条也不是最大值");
+        assert_eq!(
+            rows[1].used, 15.0,
+            "取当日最后一条（按 ts），不是第一条、也不是 id 最大那条（99.0）"
+        );
         assert_eq!(rows[1].remaining, 85.0);
-        assert_eq!(rows[1].samples, 3);
+        assert_eq!(rows[1].samples, 4);
         assert_eq!(rows[2].site_id, site_b);
         assert_eq!(rows[2].currency, "CNY");
-        assert_eq!(rows[2].samples, 1);
+        assert_eq!(rows[2].samples, 1, "known=0 的行不计入 samples");
         // days=1 ⇒ 只今天
         assert_eq!(store.usage_snapshot_daily(1, None).unwrap().len(), 2);
         // 站点过滤
@@ -3362,15 +3397,7 @@ mod tests {
         // 期望口径：本地今天零点 = `strftime('%s', date('now','localtime'), 'utc')`。
         // 生产实现若漏掉 `'utc'`（把本地日期当 UTC 解释），在 UTC+8 上窗口起点会晚 8 小时，
         // 零点整那条会被排除 ⇒ 本用例红。
-        let midnight: i64 = store
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT CAST(strftime('%s', date('now','localtime'), 'utc') AS INTEGER)",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let midnight = local_midnight(&store);
         {
             let conn = store.lock().unwrap();
             for ts in [midnight, midnight - 1] {
@@ -3386,6 +3413,13 @@ mod tests {
             rows.len(),
             1,
             "days=1 的窗口从本地零点开始：含零点整，不含前一秒"
+        );
+        // 分组日必须是**本地日**。只断行数挡不住「生产 SQL 改成 UTC 日」的变异
+        // （UTC 分组下零点行与前一行都归到昨天，仍是 1 组）——复审 P2-2。
+        assert_eq!(
+            rows[0].date,
+            day_label(&store, midnight),
+            "零点整那行的分组日必须是本地日（不是 UTC 日）"
         );
     }
 

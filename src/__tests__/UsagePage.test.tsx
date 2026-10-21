@@ -109,6 +109,15 @@ const DASHBOARD: UsageDashboard = {
     },
     {
       date: "2026-10-21",
+      siteId: 2,
+      model: "claude-sonnet-4",
+      requests: 1,
+      promptTokens: 40,
+      completionTokens: 10,
+      totalTokens: 50,
+    },
+    {
+      date: "2026-10-21",
       siteId: 3,
       model: "",
       requests: 1,
@@ -155,6 +164,17 @@ const DASHBOARD: UsageDashboard = {
       cost: 0.12,
       currency: "USD",
     },
+    {
+      keyId: 12,
+      siteId: 2,
+      keyName: "key-beta",
+      requests: 1,
+      inputTokens: 40,
+      outputTokens: 10,
+      totalTokens: 50,
+      cost: 0.02,
+      currency: "CNY",
+    },
     // 能力位 false 的站点即使后端返回了行，界面也必须挡掉（门控在界面层）。
     {
       keyId: 13,
@@ -198,8 +218,8 @@ describe("Usage 页（M34-S1）", () => {
   it("有数据：汇总、站点/模型/币种与按密钥表（keyUsage 门控）", async () => {
     renderUsage();
 
-    // 汇总卡：450 + 15 = 465 tokens（不是 450——Gamma 的流量也要计入总量）
-    expect(await screen.findByText("465")).toBeTruthy();
+    // 汇总卡：150 + 300 + 50 + 15 = 515 tokens（不是 450——Beta/Gamma 的流量也要计入总量）
+    expect(await screen.findByText("515")).toBeTruthy();
     expect(screen.getByText(zhCN.usage.cards.tokens)).toBeTruthy();
     expect(screen.getByText(zhCN.usage.cards.requests)).toBeTruthy();
 
@@ -216,13 +236,44 @@ describe("Usage 页（M34-S1）", () => {
     expect(screen.getByText("USD 余额")).toBeTruthy();
     expect(screen.getByText("CNY 余额")).toBeTruthy();
 
-    // 按密钥：Alpha 的行在；Gamma（keyUsage=false）的行被挡掉
+    // 按密钥：Alpha / Beta 的行在；Gamma（keyUsage=false）的行被挡掉
     expect(screen.getByText("key-alpha")).toBeTruthy();
+    expect(screen.getByText("key-beta")).toBeTruthy();
     expect(screen.queryByText("key-gamma")).toBeNull();
+    // 站点汇总表的「每密钥用量」列按站点能力位取值（验收 #5）：
+    // Alpha / Beta 可观测，Gamma 不提供。
+    expect(screen.getAllByText(zhCN.usage.sites.keyUsageYes)).toHaveLength(2);
+    expect(screen.getAllByText(zhCN.usage.sites.keyUsageNo)).toHaveLength(1);
     // 且明确告知哪些站点不提供
     expect(
       screen.getByText(zhCN.usage.keys.partial.replace("{sites}", "Gamma")),
     ).toBeTruthy();
+  });
+
+  it("站点列表未就绪时，能力位列显示「—」而不是「不提供」", async () => {
+    vi.mocked(listSites).mockReturnValue(new Promise<SiteRow[]>(() => {}));
+    renderUsage();
+
+    // 数据先到、站点能力后到：此时不能把「不知道」写成「不提供」。
+    expect(await screen.findByText("515")).toBeTruthy();
+    expect(screen.queryAllByText(zhCN.usage.sites.keyUsageNo)).toHaveLength(0);
+    // 汇总表三行（站点 1/2/3 都有网关流量），三行的能力位列都应是占位符
+    expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("筛选到 keyUsage=false 的站点：显示「不提供」而不是「没有采样」", async () => {
+    renderUsage();
+    await screen.findByText("515");
+
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText(zhCN.usage.siteFilter), {
+        target: { value: "3" },
+      });
+    });
+
+    expect(await screen.findByText(zhCN.usage.keys.noCapability)).toBeTruthy();
+    expect(screen.queryByText(zhCN.usage.keys.empty)).toBeNull();
+    expect(screen.queryByText("key-gamma")).toBeNull();
   });
 
   it("全部站点 keyUsage=false：不渲染按密钥表，给出「不提供」说明", async () => {
@@ -254,7 +305,7 @@ describe("Usage 页（M34-S1）", () => {
 
   it("切换范围 / 站点筛选会重新请求，参数与选择一致", async () => {
     renderUsage();
-    await screen.findByText("465");
+    await screen.findByText("515");
 
     await act(async () => {
       fireEvent.click(
