@@ -451,7 +451,7 @@ export default function Agents() {
                     <div className="agent-row-controls">
                       <select
                         className="input agent-row-key"
-                        aria-label={t("agents.select.key")}
+                        aria-label={`${name} ${t("agents.select.key")}`}
                         value={selectedKeyId ?? ""}
                         onChange={(e) =>
                           updatePref(c.id, {
@@ -470,7 +470,7 @@ export default function Agents() {
                       {writingModel ? (
                         <input
                           className="input agent-row-model"
-                          aria-label={t("agents.select.model")}
+                          aria-label={`${name} ${t("agents.select.model")}`}
                           value={modelDraft[c.id] ?? ""}
                           placeholder={t("agents.select.modelPlaceholder")}
                           spellCheck={false}
@@ -848,7 +848,9 @@ function InstallDialog({
       onCopied(key);
       setTimeout(() => onCopied(null), 1500);
     } catch {
-      onCopied("__failed__");
+      // 失败也按 key 记录：此前用全局 "__failed__" 会让**所有**复制按钮
+      // 同时显示「复制失败」，用户分不清是哪一条没复制成功（复审 P3-1）。
+      onCopied(`failed:${key}`);
       setTimeout(() => onCopied(null), 1500);
     }
   };
@@ -872,7 +874,7 @@ function InstallDialog({
                     <Copy size={14} aria-hidden />{" "}
                     {copiedKey === key
                       ? t("agents.install.copied")
-                      : copiedKey === "__failed__"
+                      : copiedKey === `failed:${key}`
                         ? t("agents.install.copyFailed")
                         : t("agents.install.copy")}
                   </button>
@@ -887,7 +889,11 @@ function InstallDialog({
             <code className="mono">{status.installUrl}</code>
             <button type="button" className="btn" onClick={() => copy("__url__", status.installUrl!)}>
               <Copy size={14} aria-hidden />{" "}
-              {copiedKey === "__url__" ? t("agents.install.copied") : t("agents.install.copy")}
+              {copiedKey === "__url__"
+                ? t("agents.install.copied")
+                : copiedKey === "failed:__url__"
+                  ? t("agents.install.copyFailed")
+                  : t("agents.install.copy")}
             </button>
           </p>
         ) : null}

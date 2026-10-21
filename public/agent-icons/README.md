@@ -4,5 +4,5 @@
 （`@lobehub/icons-static-svg`，MIT License），仅用于在 KeyRelay 的 Agent 列表里标识对应产品。
 
 - 图标只做识别用途，不改变任何投递行为。
-- 新增 Agent 时把对应 `<id>.svg` 放在本目录，并在 `src/pages/Agents.tsx` 的 `CHANNELS` 里填同一个 `icon` id。
+- 新增 Agent 时把对应 `<id>.svg` 放在本目录，并让 `src/pages/Agents.tsx` 的 `CHANNELS[].agent` 与文件名一致；同一 agent 的第二个落点（`codex-config` / `opencode-jsonc`）由 `AgentIcon` 的 `ICON_ALIAS` 复用主图标。
 - 图标缺失或加载失败时，`AgentIcon` 会退回名称首字母色块，不会留下破图。
