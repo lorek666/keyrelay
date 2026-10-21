@@ -627,8 +627,7 @@ section > .muted {
 .skeleton {
   height: 12px;
   border-radius: 6px;
-  background: linear-gradient(90deg, #1d2330 25%, #262d3d 37%, #1d2330 63%);
-  background-size: 400% 100%;
+  /* 颜色在 M33-S1 覆盖层里走 --line-soft / --panel（P3-2：旧深色硬编码已删） */
   animation: skeleton-shimmer 1.4s ease infinite;
 }
 
@@ -1019,6 +1018,9 @@ button.ghost:disabled {
 
 /* ============================================================================
    M33-S1：全站界面排版与动效升级
+
+   注意：本文件从 M33-S1 起是「两层」——前面是历史规则，本段是覆盖层。
+   改某个属性前先确认后层没有覆盖它；只增不删是为了把回退风险降到最低。
    —— 只新增规则与类名，不改既有类名语义；所有颜色走令牌（阴影/透明黑除外）；
       动效只动 transform / opacity / background-color / border-color / box-shadow。
    ============================================================================ */
@@ -1486,6 +1488,7 @@ p.warn[role="status"] {
   color: var(--warn);
 }
 
+/* 预留：当前没有 danger 语义的统计卡；保留给后续「错误计数」类指标 */
 .stat-danger {
   border-color: var(--danger);
   background: var(--danger-soft);
@@ -1900,5 +1903,10 @@ p.warn[role="status"] {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+
+  /* 原生 ::backdrop 不是普通元素，`*` 规则覆盖不到（复审 P2-2）；显式关掉遮罩淡入 */
+  .dialog[open]::backdrop {
+    animation: none !important;
   }
 }
