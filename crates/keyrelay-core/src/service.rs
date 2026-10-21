@@ -3461,6 +3461,29 @@ impl<T: HttpTransport + Clone + 'static> KeyRelayService<T> {
         adapter.available_groups(&site.base_url, &session).await
     }
 
+    /// 用该密钥调站点 `GET {base_url}/v1/models`，返回**排序去重**的模型 id（M32-S1）。
+    ///
+    /// 只读。密钥只经 [`Self::key_secret`]（唯一咽喉：已回收 / 不存在的 key 在这里被拒，
+    /// 且**不发任何请求**）；密钥不落日志、不进事件、不进错误文案。
+    /// 站点响应的解析口径沿用 [`crate::site::fetch_models`]（`data[].id`），非 2xx 走
+    /// 既有的 `map_http_error`（含站点原文脱敏）。
+    pub async fn models_for_key(&self, key_id: i64) -> Result<Vec<String>> {
+        let secret = self.key_secret(key_id)?;
+        let row = self
+            .store
+            .get_key(key_id)?
+            .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
+        let site = self
+            .store
+            .get_site(row.site_id)?
+            .ok_or_else(|| Error::NotFound(format!("站点 #{} 不存在", row.site_id)))?;
+        let mut models =
+            crate::site::fetch_models(&self.transport, &site.base_url, &secret).await?;
+        models.sort_unstable();
+        models.dedup();
+        Ok(models)
+    }
+
     /// 站点侧可用分组与倍率（FR-2）。
     pub async fn available_groups(&self, site_id: i64) -> Result<Vec<crate::site::GroupInfo>> {
         let groups = self.fetch_groups(site_id).await?;
@@ -7592,5 +7615,105 @@ mod tests {
             .get(&crate::vault::secret_ref("site", site_id, "session"))
             .expect("读")
             .is_none());
+    }
+
+    // ============================================================ M32-S1：模型下拉（list_key_models）
+
+    fn models_response(ids: &[&str]) -> HttpResponse {
+        let data: Vec<serde_json::Value> = ids.iter().map(|id| json!({"id": id})).collect();
+        HttpResponse::json(200, json!({"data": data})).expect("构造响应")
+    }
+
+    /// 建站点 + 一把 key（密钥进内存钥匙串），返回 (service, key_id, mock)。
+    async fn models_fixture(
+        tail: Vec<HttpResponse>,
+    ) -> (KeyRelayService<MockTransport>, i64, MockTransport) {
+        let mut responses = vec![status_response()];
+        responses.extend(tail);
+        let mock = MockTransport::new(responses);
+        let store = Store::open_in_memory().expect("内存库");
+        let service = KeyRelayService::new(store, mock.clone(), test_config());
+        let site = service
+            .add_site("https://relay.example.com")
+            .await
+            .expect("add_site");
+        let reference = crate::vault::secret_ref("key", 1, "secret");
+        service
+            .vault
+            .put(&reference, "sk-test-secret-12345678")
+            .expect("vault.put");
+        let key_id = service
+            .store
+            .insert_key(site.id, "k", &reference, Some("remote-1"), None)
+            .expect("insert_key");
+        (service, key_id, mock)
+    }
+
+    /// 只数 `/v1/models` 请求（夹具里的 /api/status 指纹也算在 mock 里）。
+    fn models_requests(mock: &MockTransport) -> usize {
+        mock.requests()
+            .iter()
+            .filter(|req| req.url.ends_with("/v1/models"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn models_for_key_sorts_and_dedupes() {
+        let (service, key_id, mock) =
+            models_fixture(vec![models_response(&["m2", "m1", "m1"])]).await;
+        let models = service.models_for_key(key_id).await.expect("取模型");
+        assert_eq!(models, vec!["m1".to_string(), "m2".to_string()]);
+        assert_eq!(models_requests(&mock), 1, "只发一次 /v1/models");
+        // 请求头必须带这把 key 的 Bearer（不是别人的）
+        let req = mock
+            .requests()
+            .into_iter()
+            .find(|r| r.url.ends_with("/v1/models"))
+            .expect("有 /v1/models 请求");
+        assert!(
+            req.headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Bearer sk-test-secret-12345678"),
+            "{:?}",
+            req.headers
+        );
+    }
+
+    #[tokio::test]
+    async fn models_for_key_rejects_revoked_key() {
+        let (service, key_id, mock) = models_fixture(vec![models_response(&["m1"])]).await;
+        service
+            .store
+            .set_key_status(key_id, crate::store::KEY_STATUS_REVOKED)
+            .expect("标已回收");
+        let err = service
+            .models_for_key(key_id)
+            .await
+            .expect_err("已回收必须拒绝");
+        assert!(!err.to_string().contains("sk-test-secret"), "{err}");
+        assert_eq!(models_requests(&mock), 0, "已回收的 key 不得发请求");
+    }
+
+    #[tokio::test]
+    async fn models_for_key_http_error_is_scrubbed() {
+        const SECRET_SHAPE: &str = "sk-ZZZZ0123456789ABCDEFGHIJKLMNOP";
+        // 400（不是 5xx）：4xx 的站点原文会进错误文案 ⇒ 才真正测到 scrub 那一步；
+        // 5xx 的文案是本产品固定串（不引用站点原文），测不出脱敏。
+        let (service, key_id, _mock) = models_fixture(vec![HttpResponse::json(
+            400,
+            json!({"error": {"message": format!("upstream exploded: {SECRET_SHAPE}")}}),
+        )
+        .expect("构造响应")])
+        .await;
+        let err = service
+            .models_for_key(key_id)
+            .await
+            .expect_err("非 2xx 必须报错");
+        let text = err.to_string();
+        assert!(
+            !text.contains(SECRET_SHAPE),
+            "错误文案不得原样带出站点原文里的密钥形态：{text}"
+        );
+        assert!(text.contains("sk-***"), "应当留下脱敏痕迹：{text}");
     }
 }

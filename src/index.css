@@ -335,12 +335,6 @@ section > .muted {
   overflow-wrap: anywhere;
 }
 
-.agent-row-target {
-  font-size: 11px;
-  color: var(--muted);
-  overflow-wrap: anywhere;
-}
-
 .agent-badge {
   flex: 0 0 auto;
   font-size: 11px;
@@ -945,4 +939,19 @@ button.ghost:disabled {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* M32-S1：模型清单取不到 / 为空时的回退输入 + 提示。
+   宽屏与下拉同占一行，提示紧跟在输入框下方（不撑宽行）。 */
+.agent-row-model-fallback {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 140px;
+  min-width: 0;
+}
+
+.agent-row-model-hint {
+  font-size: 11px;
+  overflow-wrap: anywhere;
 }

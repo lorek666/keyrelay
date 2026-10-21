@@ -1977,3 +1977,15 @@ export async function getProbeRun(id: number): Promise<ProbeRunRow | null> {
   if (!hasTauri) return mock(null);
   return invokeCommand<ProbeRunRow | null>("get_probe_run", { id });
 }
+
+/**
+ * 某把密钥可用的模型清单（M32-S1）。
+ *
+ * 后端用这把 key 调站点 `GET {base_url}/v1/models`，返回**已排序去重**的模型 id。
+ * 界面用它把模型输入改成下拉；取不到时（站点不支持 / 断网 / key 已回收）调用方回退文本输入，
+ * 所以这里是**普通 Promise**，不做任何降级——失败就让调用方看见。
+ */
+export async function listKeyModels(keyId: number): Promise<string[]> {
+  if (!hasTauri) return mock(["gpt-4o-mini", "claude-sonnet-4"]);
+  return invokeCommand<string[]>("list_key_models", { keyId });
+}

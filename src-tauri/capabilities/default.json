@@ -50,6 +50,7 @@
     "allow-purge-keychain",
     "allow-detect-unmanaged-targets",
     "allow-detect-agents",
+    "allow-list-key-models",
     "allow-suggest-key-name",
     "allow-unbind-agent",
     "allow-gateway-rotate-token",

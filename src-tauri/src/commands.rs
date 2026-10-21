@@ -2278,6 +2278,23 @@ pub async fn detect_agents(
         .map_err(|error| format!("Agent 探测线程异常退出：{error}"))
 }
 
+/// 用该密钥查询站点上**该分组可用**的模型 id（M32-S1）。
+///
+/// 只读：密钥只经核心层 `key_secret`（唯一咽喉，已回收的 key 会被拒绝且不发请求），
+/// **不落日志、不进事件、不进错误文案**；返回已排序去重的 `string[]`。
+/// 站点不可达 / 登出 / 密钥回收 ⇒ `Err`，前端回退为可手动输入的文本框。
+#[tauri::command]
+pub async fn list_key_models(
+    state: State<'_, AppState>,
+    key_id: i64,
+) -> Result<Vec<String>, String> {
+    state
+        .service
+        .models_for_key(key_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 探测「已知但本版本不托管」的 agent 落点（M7-S3 / 章程 R-7）。
 ///
 /// 只读：核心层永不创建目录、永不写盘。它存在的理由是**不静默**——
