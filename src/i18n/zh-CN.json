@@ -476,6 +476,7 @@
       "confirm": "确认更新",
       "updating": "更新中…",
       "success": "已从 {from} 更新到 {to}",
+      "versionUnreadable": "命令执行成功，但更新后无法读取版本，请重新检测",
       "unchanged": "命令成功，但检测到的版本没有变化（可能不是通过该方式安装的，请查看输出尾部）",
       "failed": "更新失败",
       "attemptsTitle": "执行记录",

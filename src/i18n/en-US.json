@@ -476,6 +476,7 @@
       "confirm": "Update now",
       "updating": "Updating…",
       "success": "Updated from {from} to {to}",
+      "versionUnreadable": "The command succeeded, but the new version could not be read. Please check again.",
       "unchanged": "The command succeeded but the detected version did not change (it may not have been installed this way; see the output tail)",
       "failed": "Update failed",
       "attemptsTitle": "Attempts",
