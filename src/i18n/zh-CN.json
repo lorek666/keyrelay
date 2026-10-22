@@ -238,6 +238,8 @@
       "add": "加入",
       "login": "登录",
       "openOfficial": "打开官方页面过一次",
+      "reopenCaptcha": "重新打开验证窗口",
+      "manualFinish": "手动接入",
       "finishCaptcha": "我已过完，接上会话",
       "finishLogin": "我已登录",
       "connecting": "接上会话中…"
@@ -249,10 +251,14 @@
       "loggedIn": "已登录：{name}",
       "opened": "已打开站点官方页面。请在窗口里由您自己完成登录与验证码，完成后回到这里点「我已过完，接上会话」。",
       "captchaDone": "人机验证完成，会话已接上：{name}",
+      "captchaAutoOpening": "已自动打开验证窗口，请勿关闭。",
+      "captchaAutoDone": "验证完成，会话已自动接入：{name}",
+      "captchaAutoFailed": "自动接入失败：窗口仍开着，您可以手动接入或取消。",
       "cancelled": "已取消人工验证。需要时重新点「登录」即可再试一次。"
     },
     "hint": {
       "fingerprint": "只会调用站点的公开状态接口做指纹识别；登录凭证不落库，只进本地加密保险库。",
+      "captchaAutoBody": "已自动打开验证窗口，请勿关闭；完成后会自动关闭并接入会话。您也可以在窗口里自己完成登录后点「手动接入」。",
       "captchaTitle": "需要人机验证：{name}",
       "captchaBody": "该站点要求人机验证。天枢 Relay 不绕过验证码——请点下面的按钮打开站点官方页面，由您自己完成登录与验证；过完之后回到这里点「我已过完，接上会话」。窗口里的页面是站点自己的页面，我们不会替您点击、也不会读取页面内容。",
       "captchaUnsupportedBody": "该站点要求人机验证，但它的会话基于访问令牌（Bearer）而非 Cookie——天枢 Relay 的 WebView 兜底抓不到这种会话。请改用 API 密钥直连，或在上方表单完成登录后重试。",

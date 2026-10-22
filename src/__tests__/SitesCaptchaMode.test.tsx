@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { beforeEach, describe, it, expect, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import Sites from "../pages/Sites";
@@ -17,6 +17,11 @@ import zhCN from "../i18n/zh-CN.json";
  * 页面就会从登录框切到人工验证面板。**不 mock 组件内部状态**，走真实用户路径。
  */
 
+/** M36-S1：组件挂载时订阅的「自动完成」处理器（测试里手动触发事件）。 */
+let autoHandler:
+  | ((event: { siteId: number; status: "completed" | "failed"; message: string | null }) => void)
+  | null = null;
+
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   return {
@@ -27,10 +32,20 @@ vi.mock("../lib/api", async (importOriginal) => {
     captchaBegin: vi.fn(),
     captchaComplete: vi.fn(),
     captchaCancel: vi.fn(),
+    onCaptchaAutoFinished: vi.fn(
+      async (
+        handler: (event: { siteId: number; status: "completed" | "failed"; message: string | null }) => void,
+      ) => {
+        autoHandler = handler;
+        return () => {
+          autoHandler = null;
+        };
+      },
+    ),
   };
 });
 
-import { listSites, loginSite, siteBalance, type SiteRow } from "../lib/api";
+import { captchaBegin, listSites, loginSite, siteBalance, type SiteRow } from "../lib/api";
 
 const caps = (over: Partial<SiteRow["capabilities"]>): SiteRow["capabilities"] => ({
   login: true,
@@ -85,6 +100,8 @@ async function renderAndTriggerCaptcha(site: SiteRow) {
   vi.mocked(listSites).mockResolvedValue([site]);
   vi.mocked(siteBalance).mockRejectedValue(new Error("未登录"));
   vi.mocked(loginSite).mockRejectedValue(new Error("需要人工完成验证码"));
+  vi.mocked(captchaBegin).mockResolvedValue({ siteId: site.id, url: "https://example.test/login" });
+  autoHandler = null;
 
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
@@ -119,52 +136,113 @@ async function renderAndTriggerCaptcha(site: SiteRow) {
   await act(async () => {
     fireEvent.click(confirm);
   });
+  return { qc };
 }
 
+beforeEach(() => {
+  // 每个用例从干净的调用计数开始：否则 `not.toHaveBeenCalled()` 会被上一条用例污染
+  // （captchaBegin 的累计调用会让 unsupported 那条假红）。
+  vi.clearAllMocks();
+  autoHandler = null;
+});
+
 describe("Sites 的人工验证面板（M28-S2：三态来自能力表）", () => {
-  it("cookie 站点：渲染 HEAD 的文案与「我已过完」，不渲染 bearer 文案", async () => {
+  it("cookie 站点：渲染自动文案与「手动接入」，并自动打开一次验证窗口", async () => {
     await renderAndTriggerCaptcha(SITE_COOKIE);
 
+    expect(await screen.findByText(zhCN.sites.hint.captchaAutoBody)).toBeTruthy();
     expect(
-      await screen.findByText(zhCN.sites.hint.captchaBody),
+      screen.getByRole("button", { name: zhCN.sites.btn.manualFinish }),
     ).toBeTruthy();
+    // M36-S1：登录以 captcha 拒绝后**自动**调用一次 captchaBegin（不用再点「打开」）
+    await waitFor(() => expect(captchaBegin).toHaveBeenCalledTimes(1));
+    expect(captchaBegin).toHaveBeenCalledWith(SITE_COOKIE.id);
+    // 兜底按钮仍在：重新打开 + 手动接入 + 取消
     expect(
-      screen.getByRole("button", { name: zhCN.sites.btn.finishCaptcha }),
+      screen.getByRole("button", { name: zhCN.sites.btn.reopenCaptcha }),
     ).toBeTruthy();
-    expect(screen.queryByText(zhCN.sites.hint.captchaBearerBody)).toBeNull();
-    expect(
-      screen.queryByRole("button", { name: zhCN.sites.btn.finishLogin }),
-    ).toBeNull();
+    expect(screen.getByRole("button", { name: zhCN.common.cancel })).toBeTruthy();
   });
 
-  it("bearer 站点：渲染 bearer 文案与「我已登录」，不出现「我已过完」", async () => {
+  it("bearer 站点：渲染自动文案与兜底按钮，并自动打开一次验证窗口", async () => {
     await renderAndTriggerCaptcha(SITE_BEARER);
 
+    expect(await screen.findByText(zhCN.sites.hint.captchaAutoBody)).toBeTruthy();
     expect(
-      await screen.findByText(zhCN.sites.hint.captchaBearerBody),
+      screen.getByRole("button", { name: zhCN.sites.btn.manualFinish }),
     ).toBeTruthy();
     expect(
-      screen.getByRole("button", { name: zhCN.sites.btn.finishLogin }),
+      screen.getByRole("button", { name: zhCN.sites.btn.reopenCaptcha }),
     ).toBeTruthy();
-    // 「打开官方页面过一次」在 bearer 面板里同样要有（用户要去官方页登录）
-    expect(
-      screen.getByRole("button", { name: zhCN.sites.btn.openOfficial }),
-    ).toBeTruthy();
-    expect(
-      screen.queryByRole("button", { name: zhCN.sites.btn.finishCaptcha }),
-    ).toBeNull();
-    expect(screen.queryByText(zhCN.sites.hint.captchaBody)).toBeNull();
+    await waitFor(() => expect(captchaBegin).toHaveBeenCalledTimes(1));
+    expect(captchaBegin).toHaveBeenCalledWith(SITE_BEARER.id);
   });
 
-  it("unsupported 站点：只渲染「不适用」文案与取消，不渲染任何取数按钮", async () => {
+  it("unsupported 站点：只渲染「不适用」文案与取消，**不自动打开**窗口", async () => {
     await renderAndTriggerCaptcha(SITE_UNSUPPORTED);
 
     expect(
       await screen.findByText(zhCN.sites.hint.captchaUnsupportedBody),
     ).toBeTruthy();
-    expect(screen.queryByRole("button", { name: zhCN.sites.btn.openOfficial })).toBeNull();
-    expect(screen.queryByRole("button", { name: zhCN.sites.btn.finishCaptcha })).toBeNull();
-    expect(screen.queryByRole("button", { name: zhCN.sites.btn.finishLogin })).toBeNull();
+    expect(screen.queryByRole("button", { name: zhCN.sites.btn.reopenCaptcha })).toBeNull();
+    expect(screen.queryByRole("button", { name: zhCN.sites.btn.manualFinish })).toBeNull();
     expect(screen.getByRole("button", { name: zhCN.common.cancel })).toBeTruthy();
+    // unsupported 不自动打开（判据只来自能力位）
+    expect(captchaBegin).not.toHaveBeenCalled();
+  });
+
+  // ============================================================ M36-S1：自动完成事件
+
+  it("completed 事件：清面板、成功提示、失效四组 query；他站事件忽略", async () => {
+    const { qc } = await renderAndTriggerCaptcha(SITE_COOKIE);
+    await waitFor(() => expect(autoHandler).not.toBeNull());
+    const spy = vi.spyOn(qc, "invalidateQueries");
+
+    // 他站事件：忽略（面板不动）
+    act(() => {
+      autoHandler!({ siteId: 999, status: "completed", message: null });
+    });
+    expect(screen.getByText(zhCN.sites.hint.captchaAutoBody)).toBeTruthy();
+
+    act(() => {
+      autoHandler!({ siteId: SITE_COOKIE.id, status: "completed", message: null });
+    });
+    await waitFor(() =>
+      expect(screen.queryByText(zhCN.sites.hint.captchaAutoBody)).toBeNull(),
+    );
+    expect(screen.getByText(/验证完成/)).toBeTruthy();
+    for (const key of ["sites", "stored-keys", "remote-keys", "balance"]) {
+      expect(spy).toHaveBeenCalledWith({ queryKey: [key] });
+    }
+  });
+
+  it("failed 事件：保留面板并显示可读错误；重复的 completed 幂等", async () => {
+    await renderAndTriggerCaptcha(SITE_COOKIE);
+    await waitFor(() => expect(autoHandler).not.toBeNull());
+
+    act(() => {
+      autoHandler!({ siteId: SITE_COOKIE.id, status: "failed", message: "自动接入失败（示例原因）" });
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toContain("自动接入失败（示例原因）"),
+    );
+    // 面板保留（还能手动接入/取消）
+    expect(screen.getByText(zhCN.sites.hint.captchaAutoBody)).toBeTruthy();
+
+    // 之后再来一次 completed：正常清面板
+    act(() => {
+      autoHandler!({ siteId: SITE_COOKIE.id, status: "completed", message: null });
+    });
+    await waitFor(() =>
+      expect(screen.queryByText(zhCN.sites.hint.captchaAutoBody)).toBeNull(),
+    );
+
+    // 迟到的重复 completed：面板已关 ⇒ 幂等忽略（不抛错、不再改状态）
+    const noticeText = screen.getByText(/验证完成/).textContent;
+    act(() => {
+      autoHandler!({ siteId: SITE_COOKIE.id, status: "completed", message: null });
+    });
+    expect(screen.getByText(/验证完成/).textContent).toBe(noticeText);
+    expect(screen.queryByText(zhCN.sites.hint.captchaAutoBody)).toBeNull();
   });
 });

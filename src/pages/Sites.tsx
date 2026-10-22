@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Plus, RefreshCw } from "lucide-react";
 import {
   addSite,
   captchaBegin,
+  onCaptchaAutoFinished,
   captchaCancel,
   captchaComplete,
   detectSite,
@@ -71,6 +72,17 @@ export default function Sites() {
     },
   });
 
+  // 打开站点官方页面（内嵌窗口由后端创建；用户自己在窗口里过验证码）。
+  const beginCaptcha = useMutation({
+    mutationFn: (siteId: number) => captchaBegin(siteId),
+    onSuccess: () => {
+      setError(null);
+      setCaptchaOpened(true);
+      setNotice(t("sites.notice.captchaAutoOpening"));
+    },
+    onError: (err: Error) => setError(err.message),
+  });
+
   const login = useMutation({
     mutationFn: () =>
       loginSite({
@@ -100,26 +112,21 @@ export default function Sites() {
       setPassword("");
       if (isCaptchaRequired(err)) {
         // 人工兜底通道（M8-S2 / FR-1:102）：站点要求人机验证。
-        // 按红线**不绕过**——收起登录框，切到「打开官方页面过一次」面板，让用户自己过。
+        // 按红线**不绕过**——收起登录框，切到「已自动打开验证窗口」面板，让用户自己过。
+        const target = loginTarget;
         setError(null);
         setLoginTarget(null);
-        setCaptchaSite(loginTarget);
+        setCaptchaSite(target);
         setCaptchaOpened(false);
+        // M36-S1：自动打开**一次**（同一轮登录只一次；失败时面板上还有「重新打开」）。
+        // `unsupported`（两种 WebView 能力位都 false）不自动打开，保留既有「不适用」面板。
+        if (target && captchaPanelMode(target.capabilities) !== "unsupported") {
+          beginCaptcha.mutate(target.id);
+        }
         return;
       }
       setError(err.message);
     },
-  });
-
-  // 打开站点官方页面（内嵌窗口由后端创建；用户自己在窗口里过验证码）。
-  const beginCaptcha = useMutation({
-    mutationFn: (siteId: number) => captchaBegin(siteId),
-    onSuccess: () => {
-      setError(null);
-      setCaptchaOpened(true);
-      setNotice(t("sites.notice.opened"));
-    },
-    onError: (err: Error) => setError(err.message),
   });
 
   // 「我已过完」：后端去窗口里抓会话 cookie（值不经过前端）并接上会话。
@@ -148,6 +155,49 @@ export default function Sites() {
     },
     onError: (err: Error) => setError(err.message),
   });
+
+  // M36-S1：订阅后端的「自动完成」事件。事件只是通知——会话已由后端接上（completed）
+  // 或接入失败（failed，窗口仍开着）。只处理**当前面板那个站点**的事件：
+  // 他站/面板已关 ⇒ 忽略；`completed` 之后迟到的重复事件因为面板已清空而幂等忽略。
+  const captchaSiteRef = useRef<SiteRow | null>(null);
+  useEffect(() => {
+    captchaSiteRef.current = captchaSite;
+  }, [captchaSite]);
+  // `t` 只用来取文案：放进 ref，避免语言变化以外任何身份变化导致监听反复重订阅。
+  const tRef = useRef(t);
+  tRef.current = t;
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    void (async () => {
+      const stop = await onCaptchaAutoFinished((event) => {
+        const current = captchaSiteRef.current;
+        if (!current || current.id !== event.siteId) return;
+        if (event.status === "completed") {
+          setError(null);
+          setCaptchaSite(null);
+          setCaptchaOpened(false);
+          setNotice(tRef.current("sites.notice.captchaAutoDone", { name: current.displayName }));
+          void qc.invalidateQueries({ queryKey: ["sites"] });
+          void qc.invalidateQueries({ queryKey: ["stored-keys"] });
+          void qc.invalidateQueries({ queryKey: ["remote-keys"] });
+          void qc.invalidateQueries({ queryKey: ["balance"] });
+        } else {
+          // 失败：面板保留，展示后端给的可读原因（不含凭据）；窗口仍开着。
+          setError(event.message ?? tRef.current("sites.notice.captchaAutoFailed"));
+        }
+      });
+      if (disposed) {
+        stop();
+        return;
+      }
+      unlisten = stop;
+    })();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [qc]);
 
   // 登录账号栏的文案（M9-S2 / B-120）：跟随**当前要登录的那个站点**的约定，
   // 与后端预检同一出处（`SiteRow.loginField`）。
@@ -198,7 +248,7 @@ export default function Sites() {
           <h3>{t("sites.hint.captchaTitle", { name: captchaSite.displayName })}</h3>
           {captchaMode === "cookie" ? (
             <>
-              <p className="muted">{t("sites.hint.captchaBody")}</p>
+              <p className="muted">{t("sites.hint.captchaAutoBody")}</p>
               <div className="row">
                 <button
                   type="button"
@@ -206,7 +256,7 @@ export default function Sites() {
                   disabled={beginCaptcha.isPending}
                   onClick={() => beginCaptcha.mutate(captchaSite.id)}
                 >
-                  {t("sites.btn.openOfficial")}
+                  {t("sites.btn.reopenCaptcha")}
                 </button>
                 <button
                   type="button"
@@ -216,7 +266,7 @@ export default function Sites() {
                 >
                   {finishCaptcha.isPending
                     ? t("sites.btn.connecting")
-                    : t("sites.btn.finishCaptcha")}
+                    : t("sites.btn.manualFinish")}
                 </button>
                 <button
                   type="button"
@@ -233,7 +283,7 @@ export default function Sites() {
             // localStorage 的 access token 经 `tianshu-relay-creds://` 回传；用户**自己**完成
             // 登录与验证码，Tianshu Relay 不替点、不读页面正文/输入框、不绕过验证码。
             <>
-              <p className="muted">{t("sites.hint.captchaBearerBody")}</p>
+              <p className="muted">{t("sites.hint.captchaAutoBody")}</p>
               <div className="row">
                 <button
                   type="button"
@@ -241,7 +291,7 @@ export default function Sites() {
                   disabled={beginCaptcha.isPending}
                   onClick={() => beginCaptcha.mutate(captchaSite.id)}
                 >
-                  {t("sites.btn.openOfficial")}
+                  {t("sites.btn.reopenCaptcha")}
                 </button>
                 <button
                   type="button"
@@ -251,7 +301,7 @@ export default function Sites() {
                 >
                   {finishCaptcha.isPending
                     ? t("sites.btn.connecting")
-                    : t("sites.btn.finishLogin")}
+                    : t("sites.btn.manualFinish")}
                 </button>
                 <button
                   type="button"

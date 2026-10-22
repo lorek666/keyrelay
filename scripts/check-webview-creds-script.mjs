@@ -153,6 +153,99 @@ function check(name, condition, detail = '') {
   check('④ 子 frame ⇒ 不发', env.emitted.length === 0, JSON.stringify(env.emitted));
 }
 
+// ============================================================ M36-S1：keep_open_notice.js
+
+/**
+ * 「请勿关闭」提示脚本（M36-S1）的行为测试。
+ *
+ * 与 `login_script.js` 同样的规矩：用 `node:vm` 造一个**极简假 DOM**，把同一份模板
+ * （与 Rust `include_str!` 的是同一个文件）替换占位符后真实执行，断言：
+ *   ⑤ 顶层 + 本站 origin ⇒ 只挂 1 条 banner，文本/固定定位正确；
+ *   ⑥ 非本站 origin ⇒ 不挂；
+ *   ⑦ 子 frame ⇒ 不挂；
+ *   ⑧ 重复执行幂等（同一个文档里只有一条）。
+ */
+const NOTICE_TEMPLATE = resolve(ROOT, 'crates/tianshu-relay-core/src/site/keep_open_notice.js');
+// 与 Rust `captcha::KEEP_OPEN_NOTICE_TEXT` 一致（模板里的 `__NOTICE_TEXT__` 就替换成它）。
+const NOTICE_TEXT = '请勿关闭此窗口，验证完成后会自动关闭';
+
+function buildNoticeScript(origin) {
+  const lit = (s) => JSON.stringify(s);
+  let js = readFileSync(NOTICE_TEMPLATE, 'utf8').replaceAll('__NOTICE_TEXT__', lit(NOTICE_TEXT));
+  js = js.replaceAll('__ALLOWED_ORIGIN__', lit(origin));
+  if (/__[A-Z_]+__/.test(js)) throw new Error(`banner 模板残留占位符：${js.match(/__[A-Z_]+__/)}`);
+  return js;
+}
+
+/** 极简假 DOM：只提供脚本用到的 createElement / getElementById / appendChild。 */
+function runNotice({ origin = 'https://sub.example.com', pageOrigin = origin, topFrame = true } = {}) {
+  const nodes = new Map();
+  const appended = [];
+  const document = {
+    body: null,
+    documentElement: {
+      appendChild(node) {
+        appended.push(node);
+        nodes.set(node.id, node);
+      },
+    },
+    createElement() {
+      return {
+        id: '',
+        textContent: '',
+        style: {},
+        attrs: {},
+        setAttribute(name, value) {
+          this.attrs[name] = value;
+        },
+      };
+    },
+    getElementById(id) {
+      return nodes.get(id) ?? null;
+    },
+  };
+  const window = {};
+  window.self = window;
+  window.top = topFrame ? window : { different: true };
+  window.location = { origin: pageOrigin };
+  // document-start 兜底用的 API：假实现（不真正定时，进程不会挂着）
+  document.addEventListener = () => {};
+  const context = {
+    window,
+    document,
+    console,
+    setInterval: () => 1,
+    clearInterval: () => {},
+  };
+  vm.createContext(context);
+  const run = () =>
+    vm.runInContext(buildNoticeScript(origin), context, { filename: 'keep_open_notice.js' });
+  run();
+  return { appended, nodes, rerun: run };
+}
+
+{
+  const env = runNotice();
+  check('⑤ 顶层 + 本站 origin ⇒ 挂 1 条 banner', env.appended.length === 1, String(env.appended.length));
+  check('⑤ banner 文本正确', env.appended[0]?.textContent === NOTICE_TEXT, String(env.appended[0]?.textContent));
+  check('⑤ banner 固定顶部', env.appended[0]?.style.position === 'fixed', String(env.appended[0]?.style.position));
+  check('⑤ banner 不拦截点击（pointer-events: none）', env.appended[0]?.style.pointerEvents === 'none');
+}
+{
+  const env = runNotice({ pageOrigin: 'https://evil.example' });
+  check('⑥ 非本站 origin ⇒ 不挂', env.appended.length === 0, String(env.appended.length));
+}
+{
+  const env = runNotice({ topFrame: false });
+  check('⑦ 子 frame ⇒ 不挂', env.appended.length === 0, String(env.appended.length));
+}
+{
+  const env = runNotice();
+  env.rerun();
+  env.rerun();
+  check('⑧ 重复执行幂等：只挂 1 条', env.appended.length === 1, String(env.appended.length));
+}
+
 if (failures.length > 0) {
   console.error(`\n✗ ${failures.length} 项失败：${failures.join('、')}`);
   process.exit(1);
