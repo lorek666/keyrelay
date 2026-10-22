@@ -23,8 +23,8 @@ export default function RebrandNotice({
     <>
       <p className="rebrand-warnings-title">{t("overview.rebrand.warningsTitle")}</p>
       <ul className="rebrand-warnings">
-        {rebrand.warnings.map((warning) => (
-          <li key={warning}>{warning}</li>
+        {rebrand.warnings.map((warning, index) => (
+          <li key={`${index}-${warning}`}>{warning}</li>
         ))}
       </ul>
     </>

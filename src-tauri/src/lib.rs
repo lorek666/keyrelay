@@ -252,9 +252,17 @@ fn build_service_config(
 ///
 /// 只在真机启动路径上跑：钥匙串不可用（用户拒绝、平台不支持）就整体跳过，
 /// 下一次启动再试——**不会**因为迁移失败而阻止 App 启动。
+fn keychain_migration_source() -> tianshu_relay_core::vault::KeychainVault {
+    // M35-S1：生产迁移必须从**旧** service 读。单独抽成函数，让测试能钉住这条不变量；
+    // 直接用 `KeychainVault::new()` 会读新 service、得到空集合，然后把完成标记写死。
+    tianshu_relay_core::vault::KeychainVault::with_service(
+        tianshu_relay_core::vault::KeychainVault::LEGACY_SERVICE,
+    )
+}
+
 fn run_keychain_migration(vault: &tianshu_relay_core::vault::LocalVault, store: &Store) {
     use tianshu_relay_core::vault::migrate::refs_for_migration;
-    use tianshu_relay_core::vault::{migrate_once, KeychainVault, Vault, MIGRATION_MARKER};
+    use tianshu_relay_core::vault::{migrate_once, Vault, MIGRATION_MARKER};
 
     match vault.meta_get(MIGRATION_MARKER) {
         Ok(Some(_)) => return,
@@ -275,7 +283,7 @@ fn run_keychain_migration(vault: &tianshu_relay_core::vault::LocalVault, store: 
 
     // M35-S1：**显式**用旧 service 读。用 `new()`（新 service）会读到空集合，
     // 然后把「已完成」标记写死 ⇒ 旧条目永远迁不过来（spec §7 明确要求）。
-    let keychain = KeychainVault::with_service(KeychainVault::LEGACY_SERVICE);
+    let keychain = keychain_migration_source();
     if let Err(err) = keychain.probe() {
         eprintln!("[tianshu-relay] 系统钥匙串不可用，跳过一次性迁移: {err}");
         return;
@@ -774,5 +782,23 @@ pub fn run() {
     if let Err(err) = result {
         eprintln!("[tianshu-relay] 应用退出: {err}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod rebrand_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn keychain_migration_reads_the_legacy_service() {
+        let source = keychain_migration_source();
+        assert_eq!(
+            source.service(),
+            tianshu_relay_core::vault::KeychainVault::LEGACY_SERVICE
+        );
+        assert_ne!(
+            source.service(),
+            tianshu_relay_core::vault::KeychainVault::DEFAULT_SERVICE
+        );
     }
 }

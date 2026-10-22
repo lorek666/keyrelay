@@ -59,7 +59,7 @@ pub fn home_dir_with(get: impl Fn(&str) -> Option<String>) -> Result<PathBuf> {
 
     Err(Error::Store(format!(
         "无法确定用户主目录：{} / USERPROFILE / HOMEDRIVE+HOMEPATH / HOME 都没有可用取值。\
-         可以显式设置 {HOME_OVERRIDE_ENV} 指定一个目录。",
+         可以显式设置 {HOME_OVERRIDE_ENV}（或旧变量 {LEGACY_HOME_OVERRIDE_ENV}）指定一个目录。",
         HOME_OVERRIDE_ENV
     )))
 }
@@ -103,6 +103,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_override_is_used_when_new_one_is_absent() {
+        // M35-S1 §4.4：旧脚本/旧快捷方式只设 KEYRELAY_HOME 时仍要能启动。
+        let get = env_of(&[
+            (LEGACY_HOME_OVERRIDE_ENV, "/tmp/legacy-home"),
+            ("HOME", "/home/me"),
+        ]);
+        assert_eq!(
+            home_dir_with(get).unwrap(),
+            PathBuf::from("/tmp/legacy-home")
+        );
+    }
+
+    #[test]
+    fn new_override_wins_over_legacy() {
+        let get = env_of(&[
+            (HOME_OVERRIDE_ENV, "/tmp/new-home"),
+            (LEGACY_HOME_OVERRIDE_ENV, "/tmp/legacy-home"),
+        ]);
+        assert_eq!(home_dir_with(get).unwrap(), PathBuf::from("/tmp/new-home"));
+    }
+
+    #[test]
     fn windows_userprofile_is_used_when_home_is_missing() {
         let get = env_of(&[("USERPROFILE", "C:\\Users\\me")]);
         assert_eq!(home_dir_with(get).unwrap(), PathBuf::from("C:\\Users\\me"));
@@ -138,8 +160,8 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("主目录"), "{message}");
         assert!(
-            message.contains(HOME_OVERRIDE_ENV),
-            "错误里要告诉用户怎么显式指定: {message}"
+            message.contains(HOME_OVERRIDE_ENV) && message.contains(LEGACY_HOME_OVERRIDE_ENV),
+            "错误里要同时告诉用户新旧两个变量怎么显式指定: {message}"
         );
     }
 
