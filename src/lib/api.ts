@@ -55,7 +55,7 @@ export type SiteCapabilities = {
    */
   webviewCaptchaSupported: boolean;
   /**
-   * 该站点类型能否用「WebView localStorage → `keyrelay-creds://`」回传会话
+   * 该站点类型能否用「WebView localStorage → `tianshu-relay-creds://`」回传会话
    * （M28-S2 / B-191 B 路，与能力表同源）。
    *
    * `true`（Sub2API）= 后端在官方登录页里注入脚本；用户**自己**完成登录后，站点 SPA
@@ -93,15 +93,37 @@ export type SiteRow = {
   capabilities: SiteCapabilities;
 };
 
+export type RebrandStatus = "noLegacy" | "migrated" | "targetExists" | "failed";
+
+/** M35-S1：旧版 `~/.keyrelay` 数据目录迁移的结果。 */
+export type RebrandDto = {
+  status: RebrandStatus;
+  /** 迁移来源；`noLegacy` / `targetExists` 时可能为 null。 */
+  from?: string | null;
+  /** 本次启动解析出的数据目录（失败时是回退使用的旧目录）。 */
+  to: string;
+  files: number;
+  bytes: number;
+  warnings: string[];
+  /** `failed` 时的脱敏原因。 */
+  error?: string | null;
+};
+
+export type RebrandInfo = RebrandDto;
+
 export type AppInfo = {
   name: string;
   version: string;
   dbPath: string;
+  /** 本次启动实际使用的数据目录（迁移失败时是旧目录）。 */
+  dataDir: string;
   siteCount: number;
   /** 数据库降级原因；非空表示当前跑在内存库上 */
   dbError?: string | null;
   /** 密钥存储后端。`"local-sqlite"` = 本地加密保险库；`"memory"` 表示密钥没落盘（真实运行里即为缺陷）。 */
   vaultBackend: string;
+  /** M35-S1：旧数据目录迁移结果。 */
+  rebrand: RebrandInfo;
 };
 
 export type SiteFingerprint = {
@@ -597,12 +619,22 @@ const MOCK_SITES: SiteRow[] = [
 ];
 
 const MOCK_INFO: AppInfo = {
-  name: "KeyRelay",
+  name: "天枢 Relay",  // i18n:skip
   version: "0.1.0-dev",
   dbPath: "（浏览器预览模式，无本地数据库）",  // i18n:skip
+  dataDir: "（浏览器预览模式）",  // i18n:skip
   siteCount: MOCK_SITES.length,
   dbError: null,
   vaultBackend: "memory",
+  rebrand: {
+    status: "noLegacy",
+    from: null,
+    to: "~/.tianshu-relay",
+    files: 0,
+    bytes: 0,
+    warnings: [],
+    error: null,
+  },
 };
 
 const MOCK_KEYS: KeyRow[] = [
@@ -610,7 +642,7 @@ const MOCK_KEYS: KeyRow[] = [
     remoteId: "12",
     // 示例数据用 FR-2 的规范形态（`<app-id>/<agent-id>/<yyyymmdd>`），
     // 免得预览里又出现一个「看着像规范、其实是占位」的旧名字（B-87）
-    name: "keyrelay/codex/20251009",
+    name: "tianshu-relay/codex/20251009",
     group: "default",
     status: "enabled",
     createdAt: 1_760_000_000,
@@ -730,7 +762,7 @@ function mockUsageDashboard(days: number, siteId: number | null): UsageDashboard
     keyUsage.push({
       keyId: 11,
       siteId: 1,
-      keyName: "keyrelay/codex/20261022",  // i18n:skip
+      keyName: "tianshu-relay/codex/20261022",  // i18n:skip
       requests: Math.round(total / 1200),
       inputTokens: Math.round(total * 0.72),
       outputTokens: Math.round(total * 0.28),
@@ -744,7 +776,7 @@ function mockUsageDashboard(days: number, siteId: number | null): UsageDashboard
     keyUsage.push({
       keyId: 12,
       siteId: 2,
-      keyName: "keyrelay/claude/20261022",  // i18n:skip
+      keyName: "tianshu-relay/claude/20261022",  // i18n:skip
       requests: Math.round(total / 1500),
       inputTokens: Math.round(total * 0.75),
       outputTokens: Math.round(total * 0.25),
@@ -805,7 +837,7 @@ export async function captchaBegin(siteId: number): Promise<CaptchaChallenge> {
  * 「我已过完」（M28-S2 起按能力位分流）：
  *
  * - **cookie 站点**（NewAPI）：后端去窗口里抓会话 cookie 并接上会话；
- * - **Bearer 站点**（Sub2API）：登录凭据已由登录页脚本经 `keyrelay-creds://` 回传，
+ * - **Bearer 站点**（Sub2API）：登录凭据已由登录页脚本经 `tianshu-relay-creds://` 回传，
  *   这里只补 HttpOnly 的 `cf_clearance`，由后端拼成 Bearer 会话。
  *
  * 两路的值都**不经过前端**（从 WebView 直接进核心层）；提交前后端都会先比对页面 origin，
@@ -872,7 +904,7 @@ export async function listStoredKeys(): Promise<StoredKeyRow[]> {
         id: 1,
         siteId: 1,
         remoteId: "12",
-        name: "keyrelay/codex/20251009",
+        name: "tianshu-relay/codex/20251009",
         group: "default",
         status: "enabled",
       },
@@ -882,7 +914,7 @@ export async function listStoredKeys(): Promise<StoredKeyRow[]> {
         id: 2,
         siteId: 2,
         remoteId: "7",
-        name: "keyrelay/claude-code/20251010",
+        name: "tianshu-relay/claude-code/20251010",
         group: null,
         status: "enabled",
       },
@@ -1039,7 +1071,7 @@ export async function applyDelivery(
       channel: args.channel,
       targetPath: MOCK_PLAN.targetPath,
       journalId: "j-mock-0",
-      backupPath: "/Users/you/.keyrelay/backups/j-mock-0/0-auth.json",
+      backupPath: "/Users/you/.tianshu-relay/backups/j-mock-0/0-auth.json",
     });
   }
   return invokeCommand<DeliveryOutcome>("apply_delivery", { args });
@@ -1085,7 +1117,7 @@ export async function listDeliveries(limit = 100): Promise<DeliveryRecord[]> {
         targetPath: "/Users/you/.zshrc",
         appliedAt: 1_760_000_500,
         unboundAt: 1_760_000_600,
-        backupPath: "/Users/you/.keyrelay/backups/j-mock-3/0-.zshrc",
+        backupPath: "/Users/you/.tianshu-relay/backups/j-mock-3/0-.zshrc",
         hasJournal: true,
         rolledBack: false,
         superseded: false,
@@ -1113,7 +1145,7 @@ export async function listDeliveries(limit = 100): Promise<DeliveryRecord[]> {
         targetPath: MOCK_PLAN.targetPath,
         appliedAt: 1_760_000_300,
         unboundAt: null,
-        backupPath: "/Users/you/.keyrelay/backups/j-mock-1/0-auth.json",
+        backupPath: "/Users/you/.tianshu-relay/backups/j-mock-1/0-auth.json",
         hasJournal: true,
         rolledBack: false,
         superseded: true,
@@ -1127,7 +1159,7 @@ export async function listDeliveries(limit = 100): Promise<DeliveryRecord[]> {
         targetPath: "/Users/you/.claude/settings.json",
         appliedAt: 1_760_000_200,
         unboundAt: null,
-        backupPath: "/Users/you/.keyrelay/backups/j-mock-0/0-settings.json",
+        backupPath: "/Users/you/.tianshu-relay/backups/j-mock-0/0-settings.json",
         hasJournal: true,
         rolledBack: true,
         superseded: false,
@@ -1360,7 +1392,7 @@ export async function exportBundle(
 ): Promise<ExportResult> {
   if (!hasTauri) {
     return mock({
-      path: "/Users/you/.keyrelay/exports/keyrelay-export-mock.json",
+      path: "/Users/you/.tianshu-relay/exports/tianshu-relay-export-mock.json",
       encrypted: Boolean(password),
       bytes: 2048,
       registered: true,
@@ -1386,7 +1418,7 @@ export async function pruneBackups(keep: number): Promise<PruneResult> {
 export async function exportDiagnostics(limit?: number): Promise<DiagnosticsResult> {
   if (!hasTauri) {
     return mock({
-      path: "/Users/you/.keyrelay/exports/keyrelay-diagnostics-mock.json",
+      path: "/Users/you/.tianshu-relay/exports/tianshu-relay-diagnostics-mock.json",
       bytes: 4096,
       events: 200,
       registered: true,
@@ -1618,7 +1650,7 @@ export async function rotationPlan(keyId: number): Promise<RotationPlan> {
     return mock({
       keyId,
       siteId: 1,
-      keyName: "keyrelay/codex/20251009",
+      keyName: "tianshu-relay/codex/20251009",
       steps: ["create_new", "reinject_all", "revoke_old"],
       channels: ["codex-auth-json"],
       unmappedTargets: [],
@@ -2134,14 +2166,14 @@ export async function suggestKeyName(
     // 浏览器预览用的 mock（M8-S5B §7.4 / B-102）。
     //
     // **形态与权威实现同形，但不复刻其校验**：年份补足 4 位、月日各 2 位，
-    // 与 `crates/keyrelay-core/src/naming.rs` 的 `{year:04}{month:02}{day:02}` 一致
+    // 与 `crates/tianshu-relay-core/src/naming.rs` 的 `{year:04}{month:02}{day:02}` 一致
     // （此前这里写 `date.year` 不补零，与后端差一位——B-102 报的就是这个）。
     //
     // 段规则（非空 / `[A-Za-z0-9._-]` / ≤64 字节）**不在这里校验**：前端不编译 Rust，
     // 复刻一份校验规则只会多一个漂移源。要校验就走 IPC（`hasTauri` 为真时正是如此）。
     const pad = (n: number) => String(n).padStart(2, "0");
     const year = String(date.year).padStart(4, "0");
-    return `keyrelay/${agentId}/${year}${pad(date.month)}${pad(date.day)}`;
+    return `tianshu-relay/${agentId}/${year}${pad(date.month)}${pad(date.day)}`;
   }
   return invokeCommand<string | null>("suggest_key_name", {
     agentId,
@@ -2203,7 +2235,7 @@ export async function setAutostart(enabled: boolean): Promise<Autostart> {
   if (!hasTauri) {
     return mock({
       state: (enabled ? "enabled" : "disabled") as AutostartState,
-      plan: enabled ? "新建 ~/Library/LaunchAgents/keyrelay-autostart.plist" : "删除自启项",  // i18n:skip
+      plan: enabled ? "新建 ~/Library/LaunchAgents/tianshu-relay-autostart.plist" : "删除自启项",  // i18n:skip
       manualAction: null,
     });
   }

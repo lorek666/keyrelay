@@ -1,28 +1,28 @@
 [package]
-name = "keyrelay"
-description = "KeyRelay 桌面壳（Tauri 2）：只做命令与平台胶水，业务逻辑在 keyrelay-core"
+name = "tianshu-relay"
+description = "TianshuRelay 桌面壳（Tauri 2）：只做命令与平台胶水，业务逻辑在 tianshu-relay-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [lib]
-name = "keyrelay_lib"
+name = "tianshu_relay_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
-name = "keyrelay"
+name = "tianshu-relay"
 path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# 后台刷新任务用 tokio::time::sleep（与 keyrelay-core 同一大版本）；
+# 后台刷新任务用 tokio::time::sleep（与 tianshu-relay-core 同一大版本）；
 # `sync` 是显式加的：`AppState.gateway_op` 用 `tokio::sync::Mutex` 串行化网关启停，
 # 不能靠 `time` 传递启用的 feature 碰运气。
 tokio = { version = "1.53.2", features = ["time", "sync"] }
-keyrelay-core = { workspace = true }
+tianshu-relay-core = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `tray-icon`：M6-S5 的托盘常驻（BACKLOG B-53）。不加这个 feature，

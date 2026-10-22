@@ -2139,3 +2139,46 @@ p.warn[role="status"] {
   text-align: right;
   white-space: nowrap;
 }
+
+/* ===== M35-S1：旧数据目录迁移提示 ===== */
+.rebrand-notice {
+  border-left: 3px solid var(--accent);
+}
+
+.rebrand-notice h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.rebrand-notice p {
+  margin: 4px 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.rebrand-notice p.rebrand-warnings-title {
+  margin-top: 10px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.rebrand-warnings {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.rebrand-failed {
+  border-left-color: var(--danger);
+}
+
+.rebrand-target {
+  border-left-color: var(--warn, var(--muted));
+}

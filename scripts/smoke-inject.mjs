@@ -4,10 +4,10 @@
  *
  * ## 这个脚本现在能跑了（M14-S4 起）
  *
- * 投递与回滚走 KeyRelay 的薄 CLI（`KEYRELAY_CLI` 指向 `keyrelay-cli` 二进制），
- * 它包了 `KeyRelayService::apply_delivery` / `rollback_delivery`。两种模式：
+ * 投递与回滚走 TianshuRelay 的薄 CLI（`TIANSHU_RELAY_CLI` 指向 `tianshu-relay-cli` 二进制），
+ * 它包了 `TianshuRelayService::apply_delivery` / `rollback_delivery`。两种模式：
  *
- * - **真路径**：`KEYRELAY_REAL_KEY`（真 `sk-`）+ 真 agent 在 PATH ⇒ 用真 key 注入、
+ * - **真路径**：`TIANSHU_RELAY_REAL_KEY`（真 `sk-`）+ 真 agent 在 PATH ⇒ 用真 key 注入、
  *   跑真 agent（`codex exec` 等）做一次带认证调用，断言首 token 成功且输出不含密钥形态。
  * - **mock 路径**：缺真 key 或缺真 agent ⇒ 用占位 key 注入、跑 CLI 的 `mock-agent`
  *   子命令（只读解析注入产物、校验密钥字段在）。mock 证明「注入产物可解析 + 密钥字段在」，
@@ -17,11 +17,11 @@
  *
  * - 0 = 三连全过（真或 mock）；
  * - 1 = 断言失败（投递/回滚/字节比对/密钥形态泄漏）；
- * - 2 = 前置不满足（**没跑**，不是失败）——现在只有 `KEYRELAY_CLI` 缺失才会停在这一档。
+ * - 2 = 前置不满足（**没跑**，不是失败）——现在只有 `TIANSHU_RELAY_CLI` 缺失才会停在这一档。
  *
  * ## 密钥从环境变量读
  *
- * 从 `KEYRELAY_REAL_KEY` 读：不进命令行参数（`ps` 看得见）、不进临时文件、
+ * 从 `TIANSHU_RELAY_REAL_KEY` 读：不进命令行参数（`ps` 看得见）、不进临时文件、
  * **不打印**（连长度都不打，只打「已提供 / 未提供」）。mock 路径用脚本内置的占位 key，
  * 不需要用户提供。
  */
@@ -81,7 +81,7 @@ const CHANNEL = {
   pi: "pi",
 };
 /** M14-S1 起 Continue 已删，11 通道均不要求 model（OpenCode 系列的 model 可选）。
- *  M25-S1 起 codex 真路径要 model：env KEYRELAY_REAL_MODEL 优于空表。 */
+ *  M25-S1 起 codex 真路径要 model：env TIANSHU_RELAY_REAL_MODEL 优于空表。 */
 const MODEL = {};
 
 /** 每个 agent 的可执行文件名、冒烟用的最小子命令、目标配置的相对路径。
@@ -127,7 +127,7 @@ function writeCodexConfigToml(home, base, model) {
 }
 
 /** mock 路径用的占位密钥（sk- 形态、长度 ≥ 12；不是任何真实密钥）。 */
-const PLACEHOLDER_KEY = "sk-keyrelay-smoke-mock-0123456789abcdef";
+const PLACEHOLDER_KEY = "sk-tianshu-smoke-mock-0123456789abcdef";
 
 function missing(message) {
   console.error(`✗ 前置不满足：${message}`);
@@ -178,12 +178,12 @@ const root = resolve(here, "..");
 
 // ---------------------------------------------------------------- 前置检查
 
-// ① KeyRelay CLI 可执行文件在（投递/回滚/mock-agent 都靠它）
-const cli = process.env.KEYRELAY_CLI ?? "";
+// ① TianshuRelay CLI 可执行文件在（投递/回滚/mock-agent 都靠它）
+const cli = process.env.TIANSHU_RELAY_CLI ?? "";
 if (!cli || !existsSync(cli)) {
   missing(
-    "找不到 KeyRelay 的 CLI（环境变量 KEYRELAY_CLI 指向 keyrelay-cli 二进制）—— " +
-      "M14-S4 交付的薄 CLI；先 `cargo build -p keyrelay-cli` 再指向 target/.../keyrelay-cli",
+    "找不到 TianshuRelay 的 CLI（环境变量 TIANSHU_RELAY_CLI 指向 tianshu-relay-cli 二进制）—— " +
+      "M14-S4 交付的薄 CLI；先 `cargo build -p tianshu-relay-cli` 再指向 target/.../tianshu-relay-cli",
   );
 }
 info(`CLI: ${cli}`);
@@ -193,7 +193,7 @@ const probe = spawnSync(target.bin, ["--version"], { encoding: "utf8" });
 const realAgentAvailable = !probe.error && probe.status === 0;
 
 // ③ 一把可用的真 sk- 密钥（缺失 ⇒ 落 mock 路径，不退出）
-const realKey = process.env.KEYRELAY_REAL_KEY ?? "";
+const realKey = process.env.TIANSHU_RELAY_REAL_KEY ?? "";
 const realKeyAvailable = realKey.startsWith("sk-") && realKey.length >= 12;
 
 // 模式裁决：真路径需要真 key + 真 agent 且未强制 mock；否则 mock。
@@ -209,14 +209,14 @@ if (!forceMock && realKeyAvailable && !realAgentAvailable) {
 }
 if (forceMock) info(`  --mock 强制 mock 路径`);
 
-// ④ 目标配置所在的 home（默认临时目录；KEYRELAY_SMOKE_HOME 才允许指向真实目录）
+// ④ 目标配置所在的 home（默认临时目录；TIANSHU_RELAY_SMOKE_HOME 才允许指向真实目录）
 const home =
-  process.env.KEYRELAY_SMOKE_HOME ??
-  resolve(tmpdir(), `keyrelay-smoke-${Date.now()}`);
+  process.env.TIANSHU_RELAY_SMOKE_HOME ??
+  resolve(tmpdir(), `tianshu-relay-smoke-${Date.now()}`);
 if (!existsSync(home)) {
   mkdirSync(home, { recursive: true });
 }
-info(`home: ${home}${process.env.KEYRELAY_SMOKE_HOME ? "" : "（临时目录，未设 KEYRELAY_SMOKE_HOME）"}`);
+info(`home: ${home}${process.env.TIANSHU_RELAY_SMOKE_HOME ? "" : "（临时目录，未设 TIANSHU_RELAY_SMOKE_HOME）"}`);
 const configPath = resolve(home, target.config);
 const backupPath = `${configPath}.smoke-backup`;
 if (existsSync(backupPath)) {
@@ -275,17 +275,17 @@ console.log(`\n三连（${mode} 路径）：注入 → agent 冒烟请求 → �
 // ① 注入：CLI apply-delivery --smoke（store/backup 由 --home 派生）
 // CLI 调用不覆盖 HOME：CLI 用 --home flag 解析路径，不读 HOME；让 CLI 看到真实 $HOME，
 // --home=<temp> ≠ $HOME ⇒ --smoke 防呆放行（若覆盖 HOME=temp，--home==HOME 会误触发防呆）。
-// M25-S1：model 优先级：MODEL 表 > KEYRELAY_REAL_MODEL env；codex 真路径用它写 config.toml。
-const realModelFromEnv = process.env.KEYRELAY_REAL_MODEL ?? "";
+// M25-S1：model 优先级：MODEL 表 > TIANSHU_RELAY_REAL_MODEL env；codex 真路径用它写 config.toml。
+const realModelFromEnv = process.env.TIANSHU_RELAY_REAL_MODEL ?? "";
 const modelName = MODEL[agent] ?? (realMode && realModelFromEnv ? realModelFromEnv : "");
 const modelArgs = modelName ? ["--model", modelName] : [];
-const realBaseUrl = process.env.KEYRELAY_REAL_BASE_URL ?? "";
+const realBaseUrl = process.env.TIANSHU_RELAY_REAL_BASE_URL ?? "";
 const inject = spawnSync(
   cli,
   ["apply-delivery", "--channel", channel, "--smoke", "--home", home, ...modelArgs],
   {
     encoding: "utf8",
-    env: { ...process.env, KEYRELAY_REAL_KEY: keyForInject },
+    env: { ...process.env, TIANSHU_RELAY_REAL_KEY: keyForInject },
     timeout: 120_000,
   },
 );
@@ -304,7 +304,7 @@ check("① 注入写出目标文件", true, `${statSync(configPath).size} B；jo
 // M25-S1：codex 真路径要追加写 ~/.codex/config.toml（让 codex 用 NewAPI 的 chat completions）
 if (realMode && agent === "codex") {
   if (!realBaseUrl.startsWith("http")) {
-    fail("codex 真路径需要 KEYRELAY_REAL_BASE_URL（如 https://<relayed-upstream>/v1）");
+    fail("codex 真路径需要 TIANSHU_RELAY_REAL_BASE_URL（如 https://<relayed-upstream>/v1）");
   }
   codexConfigRef = writeCodexConfigToml(home, realBaseUrl, modelName);
   info(`已写 ~/.codex/config.toml（LoongPort 同形 + wire_api=responses）`);

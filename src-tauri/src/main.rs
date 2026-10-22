@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    keyrelay_lib::run();
+    tianshu_relay_lib::run();
 }

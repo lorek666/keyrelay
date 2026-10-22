@@ -24,14 +24,26 @@ describe("agentPrefs", () => {
     });
   });
 
+  it("新前缀没有值时回退旧品牌前缀；写入只写新前缀", () => {
+    localStorage.setItem(
+      "keyrelay.agentPrefs.v1.7",
+      JSON.stringify({ codex: { keyId: 5, model: "legacy-model" } }),
+    );
+    expect(loadAgentPrefs(7)).toEqual({ codex: { keyId: 5, model: "legacy-model" } });
+
+    saveAgentPrefs(7, { codex: { keyId: 5, model: "legacy-model" } });
+    expect(localStorage.getItem("tianshu-relay.agentPrefs.v1.7")).not.toBeNull();
+    expect(localStorage.getItem("keyrelay.agentPrefs.v1.7")).not.toBeNull();
+  });
+
   it("非法 JSON 回空对象，不抛", () => {
-    localStorage.setItem("keyrelay.agentPrefs.v1.7", "{not json");
+    localStorage.setItem("tianshu-relay.agentPrefs.v1.7", "{not json");
     expect(loadAgentPrefs(7)).toEqual({});
   });
 
   it("结构不合法时逐字段回落（非对象 / 负 keyId / 非字符串 model）", () => {
     localStorage.setItem(
-      "keyrelay.agentPrefs.v1.7",
+      "tianshu-relay.agentPrefs.v1.7",
       JSON.stringify({
         a: "nope",
         b: { keyId: -5, model: 42 },

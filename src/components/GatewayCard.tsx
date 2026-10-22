@@ -484,7 +484,7 @@ export default function GatewayCard({
                   ) : (
                     <>
                       {/* 这里显示的是**绑定记录里的**路径（P3-13）。它可能与本次实际写入的
-                          路径不同（例如那条绑定是另一个 KEYRELAY_HOME 下写的），所以显式
+                          路径不同（例如那条绑定是另一个 TIANSHU_RELAY_HOME 下写的），所以显式
                           标成「记录时的路径」；实际写入路径在下面的逐条预览里给。 */}
                       {t("gateway.batch.mapped", {
                         channel,
@@ -507,7 +507,7 @@ export default function GatewayCard({
                 <div key={key}>
                   <strong>{planOf(key).channel ?? t("gateway.batch.unmappedStrong")}</strong>{" "}
                   {/* 这里是**本次实际写入**的路径（来自后端计划），与上面那一行的
-                      「记录时的路径」可能不同（P3-13）：绑定是当年另一个 KEYRELAY_HOME
+                      「记录时的路径」可能不同（P3-13）：绑定是当年另一个 TIANSHU_RELAY_HOME
                       下写的时，两个路径就不一样。两个都标出来，用户才知道写的是哪个文件。 */}
                   <span className="mono">
                     {t("gateway.batch.actualPathLabel")}

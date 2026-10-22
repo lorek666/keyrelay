@@ -172,7 +172,7 @@ describe("M31-S1 Agent 工作台", () => {
     // 模型各自独立（等 400ms 防抖落盘）
     await waitFor(
       () => {
-        const raw = localStorage.getItem(`keyrelay.agentPrefs.v1.${SITE_A}`);
+        const raw = localStorage.getItem(`tianshu-relay.agentPrefs.v1.${SITE_A}`);
         expect(raw).toBeTruthy();
         const parsed = JSON.parse(raw!);
         expect(parsed["claude-code-settings"].model).toBe("model-a");
@@ -184,7 +184,7 @@ describe("M31-S1 Agent 工作台", () => {
 
   it("⑤ 同一站点重新渲染时从 localStorage 恢复", async () => {
     localStorage.setItem(
-      `keyrelay.agentPrefs.v1.${SITE_A}`,
+      `tianshu-relay.agentPrefs.v1.${SITE_A}`,
       JSON.stringify({ "claude-code-settings": { keyId: 102, model: "restored-model" } }),
     );
     renderPage();
@@ -198,11 +198,11 @@ describe("M31-S1 Agent 工作台", () => {
 
   it("⑥ 切换站点加载该站点偏好，不串台", async () => {
     localStorage.setItem(
-      `keyrelay.agentPrefs.v1.${SITE_A}`,
+      `tianshu-relay.agentPrefs.v1.${SITE_A}`,
       JSON.stringify({ "claude-code-settings": { keyId: 101, model: "a" } }),
     );
     localStorage.setItem(
-      `keyrelay.agentPrefs.v1.${SITE_B}`,
+      `tianshu-relay.agentPrefs.v1.${SITE_B}`,
       JSON.stringify({ "claude-code-settings": { keyId: 201, model: "b" } }),
     );
     renderPage();
@@ -305,7 +305,7 @@ describe("M31-S1 Agent 工作台", () => {
 
   it("⑭ 已保存但不在清单的 model 仍作为选中项出现", async () => {
     localStorage.setItem(
-      `keyrelay.agentPrefs.v1.${SITE_A}`,
+      `tianshu-relay.agentPrefs.v1.${SITE_A}`,
       JSON.stringify({ "claude-code-settings": { keyId: 101, model: "legacy-model" } }),
     );
     renderPage();
@@ -342,7 +342,7 @@ describe("M31-S1 Agent 工作台", () => {
 
   it("⑩ 已回收/不存在的 keyId 不拿去查预览", async () => {
     localStorage.setItem(
-      `keyrelay.agentPrefs.v1.${SITE_A}`,
+      `tianshu-relay.agentPrefs.v1.${SITE_A}`,
       JSON.stringify({ "claude-code-settings": { keyId: 999, model: "stale" } }),
     );
     renderPage();
@@ -356,11 +356,11 @@ describe("M31-S1 Agent 工作台", () => {
 
   it("⑪ 切换站点会收起展开行并清空同意勾选", async () => {
     localStorage.setItem(
-      `keyrelay.agentPrefs.v1.${SITE_A}`,
+      `tianshu-relay.agentPrefs.v1.${SITE_A}`,
       JSON.stringify({ "codex-auth-json": { keyId: 101, model: "" } }),
     );
     localStorage.setItem(
-      `keyrelay.agentPrefs.v1.${SITE_B}`,
+      `tianshu-relay.agentPrefs.v1.${SITE_B}`,
       JSON.stringify({ "codex-auth-json": { keyId: 201, model: "" } }),
     );
     renderPage();

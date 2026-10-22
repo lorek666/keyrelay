@@ -14,6 +14,7 @@ import {
   runtimeMode,
 } from "../lib/api";
 import { useTranslation } from "../i18n";
+import RebrandNotice from "../components/RebrandNotice";
 
 export default function Overview() {
   const { t } = useTranslation();
@@ -93,13 +94,17 @@ export default function Overview() {
               ? t("overview.runState.modeTauri")
               : t("overview.runState.modeBrowser")}
           </dd>
+          <dt>{t("overview.runState.dataDir")}</dt>
+          <dd className="mono ellipsis" title={info.data?.dataDir}>
+            {info.data?.dataDir ?? "…"}
+          </dd>
           <dt>{t("overview.runState.db")}</dt>
           <dd className="mono ellipsis" title={info.data?.dbPath}>
             {info.data?.dbPath ?? "…"}
           </dd>
           <dt>{t("overview.runState.version")}</dt>
           <dd className="mono">
-            {info.data ? `${info.data.name} ${info.data.version}` : "…"}
+            {info.data ? `${t("nav.brand")} ${info.data.version}` : "…"}
           </dd>
           <dt>{t("overview.runState.vault")}</dt>
           <dd className="mono">{info.data?.vaultBackend ?? "…"}</dd>
@@ -152,6 +157,8 @@ export default function Overview() {
           </p>
         ) : null}
       </div>
+
+      <RebrandNotice rebrand={info.data?.rebrand} dataDir={info.data?.dataDir} />
 
       {needsLogin.length ? (
         <div className="card">

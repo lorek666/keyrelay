@@ -10,7 +10,7 @@
 //!
 //! - [`has_hidden_flag`]：命令行里有没有 `--hidden`（纯函数，可单测）
 //! - [`menu_labels`]：菜单项 id 与文案的映射（纯函数，可单测）
-//! - `Settings::should_hide_on_close`：关窗该不该隐藏（在 `keyrelay-core`，可单测）
+//! - `Settings::should_hide_on_close`：关窗该不该隐藏（在 `tianshu-relay-core`，可单测）
 //!
 //! [`build`] 本身只做「把上面这些结论装配成 Tauri 对象」，**不得**在其中放任何判定逻辑。
 //! 这样「托盘不工作」时的排查范围就只剩 Tauri 装配这一层。
@@ -35,7 +35,7 @@ pub const MENU_ITEMS: [(&str, &str); 4] = [
     (MENU_SHOW, "显示主窗口"),
     (MENU_GATEWAY_START, "启动本地网关"),
     (MENU_GATEWAY_STOP, "停止本地网关"),
-    (MENU_QUIT, "退出 KeyRelay"),
+    (MENU_QUIT, "退出 天枢 Relay"),
 ];
 
 /// 菜单 id 的集合（供测试断言与前端对齐）。
@@ -74,7 +74,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     refs.push(&separator);
     let menu = Menu::with_items(app, &refs)?;
 
-    let mut builder = tauri::tray::TrayIconBuilder::with_id("keyrelay-tray")
+    let mut builder = tauri::tray::TrayIconBuilder::with_id("tianshu-relay-tray")
         .menu(&menu)
         // 左键点图标直接显示主窗口，不必先开菜单
         .show_menu_on_left_click(false)
@@ -125,8 +125,13 @@ mod tests {
     #[test]
     fn hidden_flag_is_matched_exactly() {
         assert!(has_hidden_flag(["--hidden"]));
-        assert!(has_hidden_flag(["keyrelay", "--hidden"]));
-        assert!(has_hidden_flag(["keyrelay", "--foo", "--hidden", "--bar"]));
+        assert!(has_hidden_flag(["tianshu-relay", "--hidden"]));
+        assert!(has_hidden_flag([
+            "tianshu-relay",
+            "--foo",
+            "--hidden",
+            "--bar"
+        ]));
 
         // 精确匹配：带值的写法与同前缀的写法都不算
         assert!(!has_hidden_flag(["--hidden=1"]));
@@ -134,13 +139,13 @@ mod tests {
         assert!(!has_hidden_flag(["--hidden "]));
         assert!(!has_hidden_flag(["--no-hidden"]));
         assert!(!has_hidden_flag(Vec::<String>::new()));
-        assert!(!has_hidden_flag(["keyrelay"]));
+        assert!(!has_hidden_flag(["tianshu-relay"]));
     }
 
     #[test]
     fn hidden_flag_works_with_string_owned_args() {
         // 真实调用点是 `std::env::args()`，给的是 `String` 而不是 `&str`
-        let owned: Vec<String> = vec!["keyrelay".to_string(), "--hidden".to_string()];
+        let owned: Vec<String> = vec!["tianshu-relay".to_string(), "--hidden".to_string()];
         assert!(has_hidden_flag(owned));
     }
 

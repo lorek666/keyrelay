@@ -1,6 +1,6 @@
 //! Tauri 桌面壳：只做「命令注册 + 状态管理 + 平台胶水」。
 //!
-//! 业务逻辑一律在 `keyrelay-core`，本 crate 不出现 SQL、HTTP、文件改写逻辑。
+//! 业务逻辑一律在 `tianshu-relay-core`，本 crate 不出现 SQL、HTTP、文件改写逻辑。
 //!
 //! `configure` / `configure_with_state` 之所以单独暴露，是为了让 IPC 测试
 //! （`tests/commands.rs`）能用 Tauri 官方 mock runtime 复用同一套命令注册。
@@ -13,22 +13,26 @@ use std::path::PathBuf;
 
 use tauri::Manager;
 
-use keyrelay_core::proxy::{self, ProxyMode};
-use keyrelay_core::service::{KeyRelayService, ServiceConfig};
-use keyrelay_core::settings::Settings;
-use keyrelay_core::site::registry::SiteRegistry;
-use keyrelay_core::site::retry::{RetryPolicy, RetryingTransport};
-use keyrelay_core::site::transport_reqwest::{ReqwestTransport, TransportConfig};
-use keyrelay_core::site::SiteFingerprint;
-use keyrelay_core::store::Store;
-use keyrelay_core::Result;
+use tianshu_relay_core::proxy::{self, ProxyMode};
+use tianshu_relay_core::service::{ServiceConfig, TianshuRelayService};
+use tianshu_relay_core::settings::Settings;
+use tianshu_relay_core::site::registry::SiteRegistry;
+use tianshu_relay_core::site::retry::{RetryPolicy, RetryingTransport};
+use tianshu_relay_core::site::transport_reqwest::{ReqwestTransport, TransportConfig};
+use tianshu_relay_core::site::SiteFingerprint;
+use tianshu_relay_core::store::Store;
+use tianshu_relay_core::Result;
 
 /// 生产装配：真实 reqwest + 重试装饰器
 pub type AppTransport = RetryingTransport<ReqwestTransport>;
 
 pub struct AppState {
-    pub service: KeyRelayService<AppTransport>,
+    pub service: TianshuRelayService<AppTransport>,
     pub db_path: PathBuf,
+    /// 本次启动**实际使用**的数据目录（迁移成功 ⇒ 新目录；失败 ⇒ 旧目录）。
+    pub data_dir: PathBuf,
+    /// 旧数据迁移结果。供 `app_info` 展示，不影响服务本身。
+    pub rebrand: tianshu_relay_core::rebrand::RebrandReport,
     /// 数据库打开失败时的原因（用于在 UI 上明确提示，而不是静默降级）
     pub db_error: Option<String>,
     /// 正在运行的本地网关（同一时刻只允许一个）。
@@ -61,24 +65,33 @@ pub struct AppState {
     pub tray_available: std::sync::atomic::AtomicBool,
 }
 
-/// 用户主目录。解析逻辑在 `keyrelay_core::platform`（按平台处理 `KEYRELAY_HOME` /
+/// 用户主目录。解析逻辑在 `tianshu_relay_core::platform`（按平台处理 `TIANSHU_RELAY_HOME` /
 /// `USERPROFILE` / `HOMEDRIVE`+`HOMEPATH` / `HOME`）。
 ///
 /// 壳层这里只做「解析不出来就明确退出」——**不静默退化成当前目录**
 /// （否则在 Windows 上会把密钥写到 `C:\Program Files\...`，用户找不到）。
 pub fn home_dir() -> PathBuf {
-    match keyrelay_core::platform::home_dir() {
+    match tianshu_relay_core::platform::home_dir() {
         Ok(path) => path,
         Err(err) => {
-            eprintln!("[keyrelay] {err}");
+            eprintln!("[tianshu-relay] {err}");
             std::process::exit(1);
         }
     }
 }
 
-/// `~/.keyrelay/keyrelay.db`
+/// `~/.tianshu-relay/tianshu-relay.db`
+pub fn default_data_dir() -> PathBuf {
+    home_dir().join(tianshu_relay_core::rebrand::APP_DIR_NAME)
+}
+
+/// 某一数据目录下的主库路径。
+pub fn default_db_path_in(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join(tianshu_relay_core::rebrand::DB_FILE_NAME)
+}
+
 pub fn default_db_path() -> PathBuf {
-    home_dir().join(".keyrelay").join("keyrelay.db")
+    default_db_path_in(&default_data_dir())
 }
 
 fn build_transport_with_proxy(proxy: Option<String>) -> AppTransport {
@@ -90,7 +103,7 @@ fn build_transport_with_proxy(proxy: Option<String>) -> AppTransport {
         Ok(inner) => RetryingTransport::new(inner, RetryPolicy::default()),
         Err(err) => {
             // 默认配置理论上不会失败；真失败说明构建环境异常，明确退出而不是静默降级
-            eprintln!("[keyrelay] 构造 HTTP 传输层失败: {err}");
+            eprintln!("[tianshu-relay] 构造 HTTP 传输层失败: {err}");
             std::process::exit(1);
         }
     }
@@ -114,7 +127,7 @@ fn build_probe_transport(proxy: Option<String>) -> ReqwestTransport {
     match ReqwestTransport::new(config) {
         Ok(t) => t,
         Err(err) => {
-            eprintln!("[keyrelay] 构造 probe 传输层失败: {err}");
+            eprintln!("[tianshu-relay] 构造 probe 传输层失败: {err}");
             std::process::exit(1);
         }
     }
@@ -136,7 +149,7 @@ fn build_meta_transport(proxy: Option<String>) -> ReqwestTransport {
     match ReqwestTransport::new(config) {
         Ok(t) => t,
         Err(err) => {
-            eprintln!("[keyrelay] 构造模型元数据传输层失败: {err}");
+            eprintln!("[tianshu-relay] 构造模型元数据传输层失败: {err}");
             std::process::exit(1);
         }
     }
@@ -155,7 +168,7 @@ pub fn resolved_proxy_url(store: &Store) -> Option<String> {
         Ok(None) => None,
         Err(err) => {
             // manual 非法：不退出，告警并直连，让用户能进设置页修
-            eprintln!("[keyrelay] 代理配置非法，本次直连: {err}");
+            eprintln!("[tianshu-relay] 代理配置非法，本次直连: {err}");
             None
         }
     }
@@ -171,41 +184,66 @@ pub async fn detect_only(base_url: &str, proxy: Option<String>) -> Result<SiteFi
         .await
 }
 
-fn state_from_store(store: Store, db_path: PathBuf, db_error: Option<String>) -> AppState {
+fn state_from_store(
+    store: Store,
+    db_path: PathBuf,
+    db_error: Option<String>,
+    data_dir: PathBuf,
+    rebrand: tianshu_relay_core::rebrand::RebrandReport,
+) -> AppState {
     let home = home_dir();
     // 主库降级时不要跑迁移：空的内存库枚举不出引用，会把「已完成」标记写死，
     // 真实库恢复后迁移就被永久跳过了（复审 P1-3）。
-    let config = build_service_config(home, &store, db_error.is_some());
-    state_with_config(store, db_path, db_error, config, OnlineModelMeta::Enabled)
+    let config = build_service_config(home, &data_dir, &store, db_error.is_some());
+    state_with_config(
+        store,
+        db_path,
+        db_error,
+        config,
+        OnlineModelMeta::Enabled,
+        data_dir,
+        rebrand,
+    )
 }
 
 /// 生产保险库装配 + 一次性钥匙串迁移（ADR-0003 / M33-S1）。
 ///
 /// 顺序不能反：**先**迁移、**再**把 vault 交给 service——迁移要用 store 的引用索引，
-/// 而 store 一旦 move 进 `KeyRelayService` 就拿不到了。
-fn build_service_config(home: PathBuf, store: &Store, db_degraded: bool) -> ServiceConfig {
-    let (vault_db, key_file) = keyrelay_core::vault::local::default_paths(&home);
-    match keyrelay_core::vault::LocalVault::open(&vault_db, &key_file) {
+/// 而 store 一旦 move 进 `TianshuRelayService` 就拿不到了。
+fn build_service_config(
+    home: PathBuf,
+    data_dir: &std::path::Path,
+    store: &Store,
+    db_degraded: bool,
+) -> ServiceConfig {
+    let (vault_db, key_file) = tianshu_relay_core::vault::local::default_paths_in(data_dir);
+    match tianshu_relay_core::vault::LocalVault::open(&vault_db, &key_file) {
         Ok(vault) => {
             if !vault.is_device_bound() {
                 eprintln!(
-                    "[keyrelay] 保险库未绑定设备（取不到设备标识）：密钥文件只受文件权限保护"
+                    "[tianshu-relay] 保险库未绑定设备（取不到设备标识）：密钥文件只受文件权限保护"
                 );
             }
             if db_degraded {
-                eprintln!("[keyrelay] 主库已降级为内存库，本次跳过钥匙串迁移");
+                eprintln!("[tianshu-relay] 主库已降级为内存库，本次跳过钥匙串迁移");
             } else {
                 run_keychain_migration(&vault, store);
             }
-            ServiceConfig::with_vault(std::sync::Arc::new(vault), home)
+            ServiceConfig::with_vault_at(std::sync::Arc::new(vault), home, data_dir)
         }
         Err(err) => {
             // 不静默：vaultBackend 会变成 "memory"，Overview 页有红色告警。
             eprintln!(
-                "[keyrelay] 本地保险库不可用（{}），密钥将只存在内存里: {err}",
+                "[tianshu-relay] 本地保险库不可用（{}），密钥将只存在内存里: {err}",
                 vault_db.display()
             );
-            ServiceConfig::in_memory(home)
+            // 保险库打不开时退回内存实现，但备份目录仍必须跟随**本次实际数据目录**：
+            // 迁移失败回退旧目录时，硬拼新目录会让备份与审计跑到另一个目录。
+            ServiceConfig::with_vault_at(
+                std::sync::Arc::new(tianshu_relay_core::vault::MemoryVault::new()),
+                home,
+                data_dir,
+            )
         }
     }
 }
@@ -214,15 +252,15 @@ fn build_service_config(home: PathBuf, store: &Store, db_degraded: bool) -> Serv
 ///
 /// 只在真机启动路径上跑：钥匙串不可用（用户拒绝、平台不支持）就整体跳过，
 /// 下一次启动再试——**不会**因为迁移失败而阻止 App 启动。
-fn run_keychain_migration(vault: &keyrelay_core::vault::LocalVault, store: &Store) {
-    use keyrelay_core::vault::migrate::refs_for_migration;
-    use keyrelay_core::vault::{migrate_once, KeychainVault, Vault, MIGRATION_MARKER};
+fn run_keychain_migration(vault: &tianshu_relay_core::vault::LocalVault, store: &Store) {
+    use tianshu_relay_core::vault::migrate::refs_for_migration;
+    use tianshu_relay_core::vault::{migrate_once, KeychainVault, Vault, MIGRATION_MARKER};
 
     match vault.meta_get(MIGRATION_MARKER) {
         Ok(Some(_)) => return,
         Ok(None) => {}
         Err(err) => {
-            eprintln!("[keyrelay] 读迁移标记失败，跳过迁移: {err}");
+            eprintln!("[tianshu-relay] 读迁移标记失败，跳过迁移: {err}");
             return;
         }
     }
@@ -230,14 +268,16 @@ fn run_keychain_migration(vault: &keyrelay_core::vault::LocalVault, store: &Stor
     let refs = match refs_for_migration(store) {
         Ok(refs) => refs,
         Err(err) => {
-            eprintln!("[keyrelay] 枚举密钥引用失败，跳过迁移: {err}");
+            eprintln!("[tianshu-relay] 枚举密钥引用失败，跳过迁移: {err}");
             return;
         }
     };
 
-    let keychain = KeychainVault::new();
+    // M35-S1：**显式**用旧 service 读。用 `new()`（新 service）会读到空集合，
+    // 然后把「已完成」标记写死 ⇒ 旧条目永远迁不过来（spec §7 明确要求）。
+    let keychain = KeychainVault::with_service(KeychainVault::LEGACY_SERVICE);
     if let Err(err) = keychain.probe() {
-        eprintln!("[keyrelay] 系统钥匙串不可用，跳过一次性迁移: {err}");
+        eprintln!("[tianshu-relay] 系统钥匙串不可用，跳过一次性迁移: {err}");
         return;
     }
 
@@ -245,39 +285,51 @@ fn run_keychain_migration(vault: &keyrelay_core::vault::LocalVault, store: &Stor
         Ok(outcome) if !outcome.already_done => {
             let report = outcome.report;
             eprintln!(
-                "[keyrelay] 钥匙串迁移：导入 {} 条，跳过 {} 条，失败 {} 条",
+                "[tianshu-relay] 钥匙串迁移：导入 {} 条，跳过 {} 条，失败 {} 条",
                 report.imported,
                 report.skipped,
                 report.failed.len()
             );
             for (reference, reason) in report.failed {
                 // 引用不是密钥，可以打；原因由我们自建，也不含密钥材料。
-                eprintln!("[keyrelay] 迁移失败 {reference}: {reason}");
+                eprintln!("[tianshu-relay] 迁移失败 {reference}: {reason}");
             }
         }
         Ok(_) => {}
-        Err(err) => eprintln!("[keyrelay] 钥匙串迁移出错（下次启动重试）: {err}"),
+        Err(err) => eprintln!("[tianshu-relay] 钥匙串迁移出错（下次启动重试）: {err}"),
     }
 }
 
-/// 测试用：内存钥匙串，绝不触碰用户真实钥匙串与 `~/.keyrelay`。
+/// 测试用：内存钥匙串，绝不触碰用户真实钥匙串与 `~/.tianshu-relay`。
 fn state_in_memory(store: Store, db_path: PathBuf) -> AppState {
     // **每个 app 一个独立目录**（进程内自增序号）。
     //
-    // 原先只用 pid：一个测试进程里所有 app 共享同一个 `keyrelay-test-<pid>`，
+    // 原先只用 pid：一个测试进程里所有 app 共享同一个 `tianshu-relay-test-<pid>`，
     // 于是「另一个测试写进 `exports` / `backups` 的文件」会被本测试的审计扫描到——
     // `export_diagnostics_writes_a_package_and_registers_it_for_the_audit` 的
     // 「文件数必须 +1」因此变成一条**看时序**的断言（并发跑时偶发红）。
     // 隔离目录之后，扫描集合只由本 app 自己写过的东西决定。
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let tmp = std::env::temp_dir().join(format!("keyrelay-test-{}-{seq}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("tianshu-relay-test-{}-{seq}", std::process::id()));
+    // 内存态：库路径记作 `:memory:`，迁移状态 `noLegacy`（没有真实旧目录可迁）。
+    let rebrand = tianshu_relay_core::rebrand::RebrandReport {
+        status: tianshu_relay_core::rebrand::RebrandStatus::NoLegacy,
+        from: None,
+        to: tmp.clone(),
+        files: 0,
+        bytes: 0,
+        warnings: Vec::new(),
+        error: None,
+    };
     state_with_config(
         store,
         db_path,
         None,
-        ServiceConfig::in_memory(tmp),
+        ServiceConfig::in_memory(tmp.clone()),
         OnlineModelMeta::Disabled,
+        tmp,
+        rebrand,
     )
 }
 
@@ -302,14 +354,14 @@ enum OnlineModelMeta {
 /// **单一事实来源**（M16-S9 第二步）：总开关是 `Settings::notify_enabled`（默认 `false`）。
 /// 早先那版从裸 KV 键读的兜底路径已删除——留两条路径就会出现「设置页显示关、实际开着」这类
 /// 不可归因的状态。
-fn build_notify_config(store: &Store) -> Option<keyrelay_core::notify::NotifyConfig> {
+fn build_notify_config(store: &Store) -> Option<tianshu_relay_core::notify::NotifyConfig> {
     // 读不出来（老库/损坏）就退回 `None`：不让 app 因为设置读不出来而起不来，
     // 也不静默打开通知（`None` = 不接线 = 与「通知从未接线」逐字相同）。
-    let settings = keyrelay_core::settings::Settings::load_from_store(store).ok()?;
+    let settings = tianshu_relay_core::settings::Settings::load_from_store(store).ok()?;
     if !settings.notify_enabled {
         return None;
     }
-    Some(keyrelay_core::notify::NotifyConfig {
+    Some(tianshu_relay_core::notify::NotifyConfig {
         system_enabled: settings.notify_system_enabled,
         webhook_url: {
             let url = settings.notify_webhook_url.trim();
@@ -330,11 +382,13 @@ fn state_with_config(
     db_error: Option<String>,
     config: ServiceConfig,
     online_model_meta: OnlineModelMeta,
+    data_dir: PathBuf,
+    rebrand: tianshu_relay_core::rebrand::RebrandReport,
 ) -> AppState {
     // 保险库可用性只在启动时探测一次并明确告警；不可用时投递相关能力会各自失败，
     // **不会**静默换成内存实现（ADR-0003）。
     if let Err(err) = config.vault.probe() {
-        eprintln!("[keyrelay] 本地保险库不可用，密钥投递将被禁用: {err}");
+        eprintln!("[tianshu-relay] 本地保险库不可用，密钥投递将被禁用: {err}");
     }
     // 先借用 store 解析代理（M10-S2），再把 store move 进 service——Store 不是 Clone，
     // 顺序不能反。代理非法时 resolved_proxy_url 已 eprintln 告警并返回 None（直连），
@@ -345,7 +399,7 @@ fn state_with_config(
     // M16-S9 / S5 复审 P1-1：通知装配。**必须在 `store` move 进 service 之前**读
     // （`Store` 不是 `Clone`，与上面解析代理同一个理由）。
     let notify = build_notify_config(&store);
-    let service = KeyRelayService::new(store, build_transport_with_proxy(proxy), config)
+    let service = TianshuRelayService::new(store, build_transport_with_proxy(proxy), config)
         .with_probe_transport(build_probe_transport(proxy_for_probe));
     // 总开关关着 ⇒ **不调** `with_notify`（`self.notify` 保持 `None`，与今天逐字相同）。
     let service = match notify {
@@ -361,6 +415,8 @@ fn state_with_config(
     AppState {
         service,
         db_path,
+        data_dir,
+        rebrand,
         db_error,
         gateway: std::sync::Mutex::new(None),
         gateway_op: tokio::sync::Mutex::new(()),
@@ -372,15 +428,48 @@ fn state_with_config(
 
 /// 打开真实数据库；失败时回退内存库并把原因带进状态（不静默降级）。
 pub fn init_state() -> AppState {
-    let db_path = default_db_path();
+    let home = home_dir();
+    // M35-S1：**先**解析数据目录（必要时把旧 `~/.keyrelay` 复制成 `~/.tianshu-relay`），
+    // 再拿解析结果去开库。顺序不能反——反了就会先在旧目录旁边建一个新库。
+    let (data_dir, mut rebrand) = tianshu_relay_core::rebrand::resolve_app_home(&home);
+
+    // 旧版登录自启项：启动时停用一次。**失败不能让启动失败**，只记 warning。
+    //
+    // 迁移失败时**不碰**旧自启项：`apply_files` 的备份 journal 会落进 `data_dir/backups`，
+    // 而失败时 `data_dir` 就是旧目录 `~/.keyrelay`——那会破坏「旧目录只读」的承诺，
+    // 也会让下一次迁移的 `quick_check` 面对一个被我们改过的目录。旧自启项留给用户手动处理，
+    // 这里只把「没停用」如实写进 warning。
+    match rebrand.status {
+        tianshu_relay_core::rebrand::RebrandStatus::Failed => rebrand
+            .warnings
+            .push("旧数据迁移失败，旧版登录自启项未停用（请手动检查）".to_string()),
+        _ => match tianshu_relay_core::rebrand::retire_legacy_autostart(&home, &data_dir) {
+            Ok(Some(warning)) => rebrand.warnings.push(warning),
+            Ok(None) => {}
+            Err(err) => rebrand
+                .warnings
+                .push(format!("停用旧版登录自启项失败: {err}")),
+        },
+    }
+
+    if let Err(err) = std::fs::create_dir_all(&data_dir) {
+        eprintln!(
+            "[tianshu-relay] 创建数据目录失败（{}）: {err}",
+            data_dir.display()
+        );
+    }
+
+    let db_path = default_db_path_in(&data_dir);
     match Store::open(&db_path) {
-        Ok(store) => state_from_store(store, db_path, None),
+        Ok(store) => state_from_store(store, db_path, None, data_dir, rebrand),
         Err(err) => {
-            eprintln!("[keyrelay] 打开本地数据库失败，回退到内存库: {err}");
+            eprintln!("[tianshu-relay] 打开本地数据库失败，回退到内存库: {err}");
             match Store::open_in_memory() {
-                Ok(store) => state_from_store(store, db_path, Some(err.to_string())),
+                Ok(store) => {
+                    state_from_store(store, db_path, Some(err.to_string()), data_dir, rebrand)
+                }
                 Err(fatal) => {
-                    eprintln!("[keyrelay] 内存库也不可用，退出: {fatal}");
+                    eprintln!("[tianshu-relay] 内存库也不可用，退出: {fatal}");
                     std::process::exit(1);
                 }
             }
@@ -388,7 +477,7 @@ pub fn init_state() -> AppState {
     }
 }
 
-/// 测试用：纯内存状态，不触碰用户 `~/.keyrelay`。
+/// 测试用：纯内存状态，不触碰用户 `~/.tianshu-relay`。
 /// 测试用：内存库 + **预置设置**（`pairs` 先落 `settings` 表，再装配）。
 ///
 /// 存在的理由（M16-S9 / S5 复审 P1-1）：通知总开关是在**装配时**读的
@@ -400,13 +489,13 @@ pub fn init_state_in_memory_with_settings(pairs: &[(&str, &str)]) -> AppState {
         Ok(store) => {
             for (key, value) in pairs {
                 if let Err(err) = store.set_setting(key, value) {
-                    eprintln!("[keyrelay] 预置设置失败 {key}: {err}");
+                    eprintln!("[tianshu-relay] 预置设置失败 {key}: {err}");
                 }
             }
             state_in_memory(store, PathBuf::from(":memory:"))
         }
         Err(fatal) => {
-            eprintln!("[keyrelay] 内存库不可用: {fatal}");
+            eprintln!("[tianshu-relay] 内存库不可用: {fatal}");
             std::process::exit(1);
         }
     }
@@ -416,7 +505,7 @@ pub fn init_state_in_memory() -> AppState {
     match Store::open_in_memory() {
         Ok(store) => state_in_memory(store, PathBuf::from(":memory:")),
         Err(fatal) => {
-            eprintln!("[keyrelay] 内存库不可用: {fatal}");
+            eprintln!("[tianshu-relay] 内存库不可用: {fatal}");
             std::process::exit(1);
         }
     }
@@ -521,13 +610,13 @@ pub fn spawn_maintenance_tasks<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     use tauri::Manager;
 
     let Some(state) = app.try_state::<AppState>() else {
-        eprintln!("[keyrelay] 拿不到应用状态，跳过运维任务");
+        eprintln!("[tianshu-relay] 拿不到应用状态，跳过运维任务");
         return;
     };
     let settings = match state.service.settings() {
         Ok(settings) => settings,
         Err(err) => {
-            eprintln!("[keyrelay] 读取设置失败，使用默认值: {err}");
+            eprintln!("[tianshu-relay] 读取设置失败，使用默认值: {err}");
             Default::default()
         }
     };
@@ -537,10 +626,12 @@ pub fn spawn_maintenance_tasks<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
             Ok(reports) => {
                 let drifted = reports.iter().filter(|r| r.state.needs_attention()).count();
                 if drifted > 0 {
-                    eprintln!("[keyrelay] 有 {drifted} 个投递目标被外部改动，详见「变更历史」");
+                    eprintln!(
+                        "[tianshu-relay] 有 {drifted} 个投递目标被外部改动，详见「变更历史」"
+                    );
                 }
             }
-            Err(err) => eprintln!("[keyrelay] 漂移检测失败: {err}"),
+            Err(err) => eprintln!("[tianshu-relay] 漂移检测失败: {err}"),
         }
     }
 
@@ -560,12 +651,12 @@ pub fn spawn_maintenance_tasks<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
                 Some(state) => {
                     if let Err(err) = state.service.refresh_sessions_if_needed().await {
                         // 服务层已按「401 误判 / 网络失败」分流并落了事件；这里只留一行运维日志。
-                        eprintln!("[keyrelay] 会话续期失败（下一轮重试）: {err}");
+                        eprintln!("[tianshu-relay] 会话续期失败（下一轮重试）: {err}");
                     }
                 }
                 None => {
                     // 应用正在退出（或状态尚未装配）：不退出循环，等下一轮再看。
-                    eprintln!("[keyrelay] 会话续期：拿不到应用状态（下一轮重试）");
+                    eprintln!("[tianshu-relay] 会话续期：拿不到应用状态（下一轮重试）");
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -581,20 +672,20 @@ pub fn spawn_maintenance_tasks<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         loop {
             tokio::time::sleep(interval).await;
             let Some(state) = handle.try_state::<AppState>() else {
-                eprintln!("[keyrelay] 后台刷新：拿不到应用状态，退出循环");
+                eprintln!("[tianshu-relay] 后台刷新：拿不到应用状态，退出循环");
                 return;
             };
             match state.service.refresh_all().await {
                 Ok(summary) => {
                     eprintln!(
-                        "[keyrelay] 后台刷新完成: 成功 {} / 失败 {} / 密钥 {} / 告警 {}",
+                        "[tianshu-relay] 后台刷新完成: 成功 {} / 失败 {} / 密钥 {} / 告警 {}",
                         summary.sites_ok,
                         summary.sites_failed,
                         summary.keys_total,
                         summary.balance_alerts.len()
                     );
                 }
-                Err(err) => eprintln!("[keyrelay] 后台刷新失败（下一轮继续）: {err}"),
+                Err(err) => eprintln!("[tianshu-relay] 后台刷新失败（下一轮继续）: {err}"),
             }
         }
     });
@@ -610,7 +701,7 @@ pub fn run() {
             let tray_available = match tray::build(app.handle()) {
                 Ok(()) => true,
                 Err(err) => {
-                    eprintln!("[keyrelay] 托盘图标创建失败（应用继续运行）: {err}");
+                    eprintln!("[tianshu-relay] 托盘图标创建失败（应用继续运行）: {err}");
                     false
                 }
             };
@@ -637,7 +728,7 @@ pub fn run() {
                 }
             } else if hidden_flag || settings.map(|s| s.start_hidden).unwrap_or(false) {
                 eprintln!(
-                    "[keyrelay] 托盘不可用，已忽略「启动时隐藏窗口」的请求：\
+                    "[tianshu-relay] 托盘不可用，已忽略「启动时隐藏窗口」的请求：\
                      隐藏之后没有任何入口能把窗口调回来"
                 );
             }
@@ -681,7 +772,7 @@ pub fn run() {
         .run(tauri::generate_context!());
 
     if let Err(err) = result {
-        eprintln!("[keyrelay] 应用退出: {err}");
+        eprintln!("[tianshu-relay] 应用退出: {err}");
         std::process::exit(1);
     }
 }

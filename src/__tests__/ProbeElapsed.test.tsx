@@ -69,7 +69,7 @@ const KEYS: StoredKeyRow[] = [
     id: KEY_ID,
     siteId: SITE_ID,
     remoteId: "remote-1",
-    name: "keyrelay/test/20261017",
+    name: "tianshu-relay/test/20261017",
     status: "enabled",
   },
 ];

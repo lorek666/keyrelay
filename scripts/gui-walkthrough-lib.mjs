@@ -61,7 +61,7 @@ export async function checkEnvironment(options = {}) {
     tty: process.stdout.isTTY === true,
     term: process.env.TERM || "unknown",
     driver: "none",
-    binary: options.binary || "src-tauri/target/release/keyrelay",
+    binary: options.binary || "src-tauri/target/release/tianshu-relay",
     fixture: options.fixture || "http://127.0.0.1:18999/login",
   };
   const reasons = [];
