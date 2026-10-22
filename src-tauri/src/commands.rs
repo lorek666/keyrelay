@@ -2856,16 +2856,17 @@ async fn watch_cookies_for_auto_complete<R: tauri::Runtime>(
     label: String,
     base_url: String,
     site_id: i64,
-    baseline_snapshot: Option<Vec<(String, String)>>,
 ) {
     const INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
     const MAX_RUNTIME: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
     let deadline = std::time::Instant::now() + MAX_RUNTIME;
-    // **建窗后立刻快照过一次**（见 captcha_begin）：窗口 build 完到第一次 tick 之间
-    // 站点可能已经写入 `new_api_refresh`/`session`；把那一份当基线就会永远不触发。
-    // 快照失败（读不到）才回退到「第一轮读作基线」。
-    let mut baseline: Option<Vec<(String, String)>> = baseline_snapshot;
+    // **从空基线开始**（M36-S1 真机 fixture 修正）：登录页很可能在窗口 build 完成时就
+    // 已经写入 `new_api_refresh`/`session`（或页面打开即带有效 refresh）；任何「建窗后
+    // 快照作基线」都会把这份**唯一的**会话 cookie 当成「变化前」，于是永不触发。
+    // 现在的语义：**出现即尝试**——第一轮轮询看到任何触发名 cookie 就试一次；
+    // 旧 cookie / 登录前 cookie 的噪声由「首败静默」挡掉（P2-2）；cookie 变化才重试。
+    let baseline: Vec<(String, String)> = Vec::new();
     let mut last_attempt: Option<Vec<(String, String)>> = None;
     // 尝试次数：**第一次尝试失败不广播**（视为「用户还没登录 / 基线未稳」，只是早触发了一次），
     // 从第二次起才 emit failed——否则登录页刚打开时的瞬时 cookie 变化会在用户眼前闪一条
@@ -2905,12 +2906,8 @@ async fn watch_cookies_for_auto_complete<R: tauri::Runtime>(
             .filter(|cookie| cookie_belongs_to_site(cookie.domain().unwrap_or(""), &host))
             .map(|cookie| (cookie.name().to_string(), cookie.value().to_string()))
             .collect();
-        // 第一次读到的就是基线（页面加载阶段预置的 cookie 不算「登录完成」）。
-        let Some(base) = baseline.as_ref() else {
-            baseline = Some(pairs);
-            continue;
-        };
-        if !tianshu_relay_core::site::captcha::auto_capture_ready(base, &pairs) {
+        // 空基线：任何触发名 cookie 出现/变化都算「可尝试」（首败静默，见 attempts）。
+        if !tianshu_relay_core::site::captcha::auto_capture_ready(&baseline, &pairs) {
             continue;
         }
         let fingerprint = trigger_cookie_fingerprint(&pairs);
@@ -3139,21 +3136,8 @@ pub async fn captcha_begin<R: tauri::Runtime>(
                 .as_ref()
                 .map(|site| site.base_url.clone())
                 .ok_or_else(|| format!("站点 #{site_id} 不存在"))?;
-            // **先把建窗这一刻的 cookie 快照下来当基线**（同步读，早于任何 tick）：
-            // 站点可能在 build 后几百毫秒内就写入 new_api_refresh/session，晚一拍读到
-            // 就会把它当基线 ⇒ 永远不触发自动接入。读失败 ⇒ None ⇒ watcher 首轮读作基线。
-            let baseline_snapshot: Option<Vec<(String, String)>> =
-                site_host_of(&base_url_for_watch).and_then(|host| {
-                    window.cookies().ok().map(|cookies| {
-                        cookies
-                            .iter()
-                            .filter(|cookie| {
-                                cookie_belongs_to_site(cookie.domain().unwrap_or(""), &host)
-                            })
-                            .map(|cookie| (cookie.name().to_string(), cookie.value().to_string()))
-                            .collect::<Vec<(String, String)>>()
-                    })
-                });
+            // 不再建窗后快照（真机 fixture 证明会把「页面打开即写入的 cookie」当基线 ⇒
+            // 永不触发）。watcher 从**空基线**开始：出现即尝试，首败静默、变化才重试。
             let app_for_watch = app.clone();
             let label_for_watch = label.clone();
             tauri::async_runtime::spawn(async move {
@@ -3162,7 +3146,6 @@ pub async fn captcha_begin<R: tauri::Runtime>(
                     label_for_watch,
                     base_url_for_watch,
                     site_id,
-                    baseline_snapshot,
                 )
                 .await;
             });
