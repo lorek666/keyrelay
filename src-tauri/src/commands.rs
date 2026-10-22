@@ -2867,6 +2867,10 @@ async fn watch_cookies_for_auto_complete<R: tauri::Runtime>(
     // 快照失败（读不到）才回退到「第一轮读作基线」。
     let mut baseline: Option<Vec<(String, String)>> = baseline_snapshot;
     let mut last_attempt: Option<Vec<(String, String)>> = None;
+    // 尝试次数：**第一次尝试失败不广播**（视为「用户还没登录 / 基线未稳」，只是早触发了一次），
+    // 从第二次起才 emit failed——否则登录页刚打开时的瞬时 cookie 变化会在用户眼前闪一条
+    // 「自动接入失败」噪声。窗口、相位、指纹语义都不变。
+    let mut attempts: u32 = 0;
 
     loop {
         tokio::time::sleep(INTERVAL).await;
@@ -2914,6 +2918,7 @@ async fn watch_cookies_for_auto_complete<R: tauri::Runtime>(
             continue; // 指纹没变：不重复尝试
         }
         last_attempt = Some(fingerprint);
+        attempts += 1;
         match complete_captcha_window(&app, &state, site_id).await {
             Ok(()) => {
                 emit_captcha_auto(&app, site_id, "completed", None);
@@ -2922,7 +2927,10 @@ async fn watch_cookies_for_auto_complete<R: tauri::Runtime>(
             Err(message) => {
                 // 失败不关窗、相位留人工态（`complete_captcha_window` 保证）；
                 // 错误串来自完整流程（含 scrub），不含 cookie / token。
-                emit_captcha_auto(&app, site_id, "failed", Some(message));
+                // 第一次失败静默（见 `attempts` 的注释）：只在第二次及以后上报。
+                if attempts > 1 {
+                    emit_captcha_auto(&app, site_id, "failed", Some(message));
+                }
             }
         }
     }
@@ -3087,12 +3095,25 @@ pub async fn captcha_begin<R: tauri::Runtime>(
                                                     "completed",
                                                     None,
                                                 ),
-                                                Err(message) => emit_captcha_auto(
-                                                    &app_for_auto,
-                                                    site_id,
-                                                    "failed",
-                                                    Some(message),
-                                                ),
+                                                Err(message) => {
+                                                    // P2-1：`login_script.js` 的 `sent`
+                                                    // 只在单个 document 内生效——登录后整页跳转
+                                                    // 可能**二次回传**，第二个 spawn 在第一个已成功
+                                                    // 之后才拿到 `captcha_op`，此时相位已 `Idle`，
+                                                    // `complete_captcha_window` 必然失败。这种
+                                                    // 「已经完成/已取消」的失败**不是失败**，
+                                                    // 静默返回，不再 emit failed。
+                                                    if captcha_submit_is_allowed(
+                                                        &state.service.captcha_phase(site_id),
+                                                    ) {
+                                                        emit_captcha_auto(
+                                                            &app_for_auto,
+                                                            site_id,
+                                                            "failed",
+                                                            Some(message),
+                                                        );
+                                                    }
+                                                }
                                             }
                                         }
                                     });
