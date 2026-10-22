@@ -2856,12 +2856,16 @@ async fn watch_cookies_for_auto_complete<R: tauri::Runtime>(
     label: String,
     base_url: String,
     site_id: i64,
+    baseline_snapshot: Option<Vec<(String, String)>>,
 ) {
     const INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
     const MAX_RUNTIME: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
     let deadline = std::time::Instant::now() + MAX_RUNTIME;
-    let mut baseline: Option<Vec<(String, String)>> = None;
+    // **建窗后立刻快照过一次**（见 captcha_begin）：窗口 build 完到第一次 tick 之间
+    // 站点可能已经写入 `new_api_refresh`/`session`；把那一份当基线就会永远不触发。
+    // 快照失败（读不到）才回退到「第一轮读作基线」。
+    let mut baseline: Option<Vec<(String, String)>> = baseline_snapshot;
     let mut last_attempt: Option<Vec<(String, String)>> = None;
 
     loop {
@@ -3110,18 +3114,34 @@ pub async fn captcha_begin<R: tauri::Runtime>(
         // 只在新窗口时启动：同站点重复 `captcha_begin` 走「聚焦已有窗口」分支，
         // 不会叠加 watcher。窗口销毁 / 相位变化 / origin 变化 / 10 分钟上限都会让它结束。
         if mode == CaptchaCaptureMode::Cookies {
-            let app_for_watch = app.clone();
-            let label_for_watch = label.clone();
             let base_url_for_watch = site_row
                 .as_ref()
                 .map(|site| site.base_url.clone())
                 .ok_or_else(|| format!("站点 #{site_id} 不存在"))?;
+            // **先把建窗这一刻的 cookie 快照下来当基线**（同步读，早于任何 tick）：
+            // 站点可能在 build 后几百毫秒内就写入 new_api_refresh/session，晚一拍读到
+            // 就会把它当基线 ⇒ 永远不触发自动接入。读失败 ⇒ None ⇒ watcher 首轮读作基线。
+            let baseline_snapshot: Option<Vec<(String, String)>> =
+                site_host_of(&base_url_for_watch).and_then(|host| {
+                    window.cookies().ok().map(|cookies| {
+                        cookies
+                            .iter()
+                            .filter(|cookie| {
+                                cookie_belongs_to_site(cookie.domain().unwrap_or(""), &host)
+                            })
+                            .map(|cookie| (cookie.name().to_string(), cookie.value().to_string()))
+                            .collect::<Vec<(String, String)>>()
+                    })
+                });
+            let app_for_watch = app.clone();
+            let label_for_watch = label.clone();
             tauri::async_runtime::spawn(async move {
                 watch_cookies_for_auto_complete(
                     app_for_watch,
                     label_for_watch,
                     base_url_for_watch,
                     site_id,
+                    baseline_snapshot,
                 )
                 .await;
             });
