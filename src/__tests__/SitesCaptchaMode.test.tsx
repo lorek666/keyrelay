@@ -96,11 +96,14 @@ const SITE_UNSUPPORTED: SiteRow = {
 };
 
 /** 渲染 → 点站点行的「登录」→ 填账号密码 → 点对话框的「登录」→ 让 loginSite 以验证码错误拒绝。 */
-async function renderAndTriggerCaptcha(site: SiteRow) {
+async function renderAndTriggerCaptcha(site: SiteRow, options: { beginError?: Error } = {}) {
   vi.mocked(listSites).mockResolvedValue([site]);
   vi.mocked(siteBalance).mockRejectedValue(new Error("未登录"));
   vi.mocked(loginSite).mockRejectedValue(new Error("需要人工完成验证码"));
   vi.mocked(captchaBegin).mockResolvedValue({ siteId: site.id, url: "https://example.test/login" });
+  if (options.beginError) {
+    vi.mocked(captchaBegin).mockRejectedValueOnce(options.beginError);
+  }
   autoHandler = null;
 
   const qc = new QueryClient({
@@ -193,6 +196,28 @@ describe("Sites 的人工验证面板（M28-S2：三态来自能力表）", () =
 
   // ============================================================ M36-S1：自动完成事件
 
+  it("自动打开失败：面板保留、显示可读错误、「重新打开」仍可用（P3-3）", async () => {
+    await renderAndTriggerCaptcha(SITE_COOKIE, { beginError: new Error("打开人机验证窗口失败（示例）") });
+
+    // 自动打开被调用了一次，并失败
+    await waitFor(() => expect(captchaBegin).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toContain("打开人机验证窗口失败（示例）"),
+    );
+    // 面板仍在（文案 + 三个兜底动作都在）
+    expect(screen.getByText(zhCN.sites.hint.captchaAutoBody)).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: zhCN.sites.btn.reopenCaptcha }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: zhCN.sites.btn.manualFinish }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: zhCN.common.cancel })).toBeTruthy();
+    // 「重新打开」可点：点一次会再发起一次 captchaBegin（用户手动重试，不算自动那一轮）
+    fireEvent.click(screen.getByRole("button", { name: zhCN.sites.btn.reopenCaptcha }));
+    await waitFor(() => expect(captchaBegin).toHaveBeenCalledTimes(2));
+  });
+
   it("completed 事件：清面板、成功提示、失效四组 query；他站事件忽略", async () => {
     const { qc } = await renderAndTriggerCaptcha(SITE_COOKIE);
     await waitFor(() => expect(autoHandler).not.toBeNull());
@@ -244,5 +269,13 @@ describe("Sites 的人工验证面板（M28-S2：三态来自能力表）", () =
     });
     expect(screen.getByText(/验证完成/).textContent).toBe(noticeText);
     expect(screen.queryByText(zhCN.sites.hint.captchaAutoBody)).toBeNull();
+
+    // P2-1：Bearer 二次回传可能让后端补发一条 failed（第二个 spawn 看到相位已 Idle）。
+    // 面板已经清了，这类迟到失败**不得**再把用户吓一跳。
+    act(() => {
+      autoHandler!({ siteId: SITE_COOKIE.id, status: "failed", message: "该站点当前已不在等待人工验证" });
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText(/验证完成/).textContent).toBe(noticeText);
   });
 });
