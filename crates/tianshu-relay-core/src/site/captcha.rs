@@ -280,6 +280,83 @@ pub(crate) fn origin_of(raw: &str) -> Option<String> {
     Some(format!("{scheme}://{host}{port}"))
 }
 
+// ============================================================ 自动人机验证（M36-S1）
+
+/// 顶部提示的展示文本（注入脚本原样显示；WebView 里是站点页面，不走前端 i18n）。
+pub const KEEP_OPEN_NOTICE_TEXT: &str = "请勿关闭此窗口，验证完成后会自动关闭";
+
+/// 把字符串转成 JSON 字面量（与 `webview_creds::login_script` 同口径）。
+fn json_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// 自动接管时窗口标题（纯函数，便于单测）。
+///
+/// 窗口标题是**兜底提示**：站点 CSP 可能拦掉注入的 banner（spec §9），但标题栏改不了，
+/// 所以「请勿关闭」必须同时出现在这里。
+pub fn captcha_window_title(display_name: &str) -> String {
+    format!("请勿关闭 · 人机验证 · {display_name}")
+}
+
+/// 展示用「请勿关闭」脚本（M36-S1）。
+///
+/// 只在**站点自己的 origin**、**顶层 frame** 挂一条 fixed 顶部提示；脚本只创建/更新
+/// DOM 元素与样式，**不读取**页面文本、输入框、cookie、localStorage，不点击、不提交表单、
+/// 不识别或绕过验证码。
+///
+/// 占位符替换一律走 JSON 字面量（**不是**字符串拼接），origin **最后**替换（防二次扫描）。
+pub fn keep_open_notice_script(base_url: &str) -> Result<String> {
+    let origin = origin_of(base_url).ok_or_else(|| {
+        Error::Transport(format!(
+            "站点地址无法解析出主机名：无法注入「请勿关闭」提示（{}）",
+            super::display_url(base_url)
+        ))
+    })?;
+    let mut script = include_str!("keep_open_notice.js")
+        .replace("__NOTICE_TEXT__", &json_literal(KEEP_OPEN_NOTICE_TEXT));
+    script = script.replace("__ALLOWED_ORIGIN__", &json_literal(&origin));
+    if script.contains("__ALLOWED_ORIGIN__") || script.contains("__NOTICE_TEXT__") {
+        return Err(Error::Transport(
+            "「请勿关闭」提示脚本有未替换的占位符".to_string(),
+        ));
+    }
+    Ok(script)
+}
+
+/// 会话凭据类的 cookie 名（自动接管的唯一触发名单，M36-S1）。
+///
+/// 壳层的「指纹」判断也用这一份，避免两处名单各写各的、将来漏改一处。
+pub const AUTO_CAPTURE_TRIGGERS: [&str; 5] = [
+    "new_api_refresh",
+    "session",
+    "token",
+    "access_token",
+    "auth_token",
+];
+
+/// 自动取数的 cookie 触发判据（纯函数，M36-S1）。
+///
+/// 只有**会话凭据类** cookie **出现**或**值发生变化**才返回 true：
+/// `new_api_refresh` / `session` / `token` / `access_token` / `auth_token`。
+///
+/// - `cf_clearance`、`new_api_has_session` 等**非会话标记**不触发（它们先于登录出现，
+///   拿它们触发会在用户还没登录时就去抓会话）；
+/// - cookie **被删除**不触发；出现但**值为空**也不触发（空值不代表拿到凭据）；
+/// - 值只用于内存比较，**不得打印或写入任何产物**（错误文案里也不能带）。
+pub fn auto_capture_ready(baseline: &[(String, String)], current: &[(String, String)]) -> bool {
+    current.iter().any(|(name, value)| {
+        if value.is_empty() || !AUTO_CAPTURE_TRIGGERS.contains(&name.as_str()) {
+            return false;
+        }
+        match baseline.iter().find(|(n, _)| n == name) {
+            // 基线里没有 ⇒ 新出现
+            None => true,
+            // 基线里相同 ⇒ 未变化（含「被删了但基线本来也没有」的情形）
+            Some((_, old)) => old != value,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,5 +778,124 @@ mod tests {
         assert!(!text.contains(secret), "{text}");
         assert!(!text.contains("cf_clearance"), "{text}");
         assert!(text.contains("2 项"), "{text}");
+    }
+
+    // ============================================================ M36-S1：自动人机验证
+
+    #[test]
+    fn auto_capture_ready_triggers_only_on_session_credential_cookies() {
+        let empty: Vec<(String, String)> = Vec::new();
+
+        // ① 基线空 + new_api_refresh 出现 ⇒ true
+        assert!(auto_capture_ready(
+            &empty,
+            &cookies(&[("new_api_refresh", "r1")])
+        ));
+        // ② 值变化 ⇒ true；值相同 ⇒ false
+        let base = cookies(&[("new_api_refresh", "r1")]);
+        assert!(auto_capture_ready(
+            &base,
+            &cookies(&[("new_api_refresh", "r2")])
+        ));
+        assert!(!auto_capture_ready(
+            &base,
+            &cookies(&[("new_api_refresh", "r1")])
+        ));
+        // ③ session 出现 / 变化 ⇒ true（其余四个触发名逐一覆盖）
+        for name in ["session", "token", "access_token", "auth_token"] {
+            assert!(
+                auto_capture_ready(&empty, &cookies(&[(name, "v1")])),
+                "{name} 出现应触发"
+            );
+            assert!(
+                auto_capture_ready(&cookies(&[(name, "v1")]), &cookies(&[(name, "v2")])),
+                "{name} 变化应触发"
+            );
+        }
+        // ④ cf_clearance 出现 / 变化 ⇒ false
+        assert!(!auto_capture_ready(
+            &empty,
+            &cookies(&[("cf_clearance", "1.2-3")])
+        ));
+        assert!(!auto_capture_ready(
+            &cookies(&[("cf_clearance", "1.2-3")]),
+            &cookies(&[("cf_clearance", "1.2-4")])
+        ));
+        // ⑤ new_api_has_session 出现 / 变化 ⇒ false
+        assert!(!auto_capture_ready(
+            &empty,
+            &cookies(&[("new_api_has_session", "1")])
+        ));
+        assert!(!auto_capture_ready(
+            &cookies(&[("new_api_has_session", "1")]),
+            &cookies(&[("new_api_has_session", "2")])
+        ));
+        // ⑥ cookie 被删除 ⇒ false
+        assert!(!auto_capture_ready(
+            &cookies(&[("session", "s1"), ("new_api_refresh", "r1")]),
+            &cookies(&[("session", "s1")])
+        ));
+        assert!(!auto_capture_ready(&cookies(&[("session", "s1")]), &empty));
+        // ⑦ 空值不触发（即使名字是触发名）
+        assert!(!auto_capture_ready(&empty, &cookies(&[("session", "")])));
+        assert!(!auto_capture_ready(
+            &cookies(&[("session", "s1")]),
+            &cookies(&[("session", "")])
+        ));
+        // 名字是「包含关系」不算命中（精确匹配）
+        assert!(!auto_capture_ready(
+            &empty,
+            &cookies(&[("my_session", "s1")])
+        ));
+    }
+
+    #[test]
+    fn captcha_window_title_mentions_dont_close_and_the_site() {
+        let title = captcha_window_title("示例站");
+        assert!(title.contains("请勿关闭"), "{title}");
+        assert!(title.contains("人机验证"), "{title}");
+        assert!(title.contains("示例站"), "{title}");
+    }
+
+    #[test]
+    fn keep_open_notice_script_is_display_only_and_origin_scoped() {
+        let script = keep_open_notice_script("HTTPS://H.Example.com:443/x").expect("生成脚本");
+        // origin 是 JSON 字面量、已规范化（小写、默认端口省略）
+        assert!(script.contains("\"https://h.example.com\""), "{script}");
+        // 展示文本
+        assert!(script.contains(KEEP_OPEN_NOTICE_TEXT), "{script}");
+        // 双重守卫
+        assert!(script.contains("window.top !== window.self"), "{script}");
+        assert!(
+            script.contains("window.location.origin !== ALLOWED_ORIGIN"),
+            "{script}"
+        );
+        // 只创建/更新 DOM：不得出现读取页面内容 / 存储 / 点击 / 提交的 API。
+        // 注释里可以**提到**这些名字（说明「不读取」），所以先剥掉 `//` 行注释再查。
+        let code: String = script
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "localStorage",
+            "sessionStorage",
+            "document.cookie",
+            ".value",
+            ".click(",
+            ".submit(",
+            "querySelector",
+            "fetch(",
+            "XMLHttpRequest",
+        ] {
+            assert!(!code.contains(forbidden), "脚本不得包含 {forbidden}");
+        }
+        // 固定定位（展示层）
+        assert!(script.contains("'fixed'"), "{script}");
+        // 无残留占位符
+        assert!(!script.contains("__ALLOWED_ORIGIN__"), "{script}");
+        assert!(!script.contains("__NOTICE_TEXT__"), "{script}");
+        // 非法地址 ⇒ Err（不注入到未知 origin）
+        assert!(keep_open_notice_script("not a url").is_err());
     }
 }

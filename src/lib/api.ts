@@ -850,6 +850,44 @@ export async function captchaComplete(siteId: number): Promise<void> {
   return invokeCommand<void>("captcha_complete", { siteId });
 }
 
+// ============================================================ 自动人机验证（M36-S1）
+
+/** 自动人机验证的完成方式。 */
+export type CaptchaAutoStatus = "completed" | "failed";
+
+/** 自动完成事件（**只含站点号与状态**，绝不含 cookie / token）。 */
+export type CaptchaAutoEvent = {
+  siteId: number;
+  status: CaptchaAutoStatus;
+  message: string | null;
+};
+
+/**
+ * 订阅「自动完成」事件（M36-S1，事件名 `captcha-auto-finished`，只发到主窗口）。
+ *
+ * 事件只是**通知**：会话已经由后端接上（`completed`）或接入失败（`failed`，窗口仍开着，
+ * 用户可手动接入或取消）。返回取消订阅函数；浏览器预览下是 no-op。
+ *
+ * 动态 `import("@tauri-apps/api/event")`：**只有本文件**可以引用 `@tauri-apps/api`，
+ * 且浏览器预览下不加载这个模块。
+ */
+export async function onCaptchaAutoFinished(
+  handler: (event: CaptchaAutoEvent) => void,
+): Promise<() => void> {
+  if (!hasTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<CaptchaAutoEvent>("captcha-auto-finished", (event) => {
+    const payload = event.payload as Partial<CaptchaAutoEvent> | null | undefined;
+    if (!payload || typeof payload.siteId !== "number") return;
+    if (payload.status !== "completed" && payload.status !== "failed") return;
+    handler({
+      siteId: payload.siteId,
+      status: payload.status,
+      message: typeof payload.message === "string" ? payload.message : null,
+    });
+  });
+}
+
 /** 取消人工验证（关窗）：相位回空闲态，不保存任何东西。幂等。 */
 export async function captchaCancel(siteId: number): Promise<void> {
   if (!hasTauri) {

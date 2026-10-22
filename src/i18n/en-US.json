@@ -238,6 +238,8 @@
       "add": "Add",
       "login": "Sign in",
       "openOfficial": "Open official page once",
+      "reopenCaptcha": "Reopen verification window",
+      "manualFinish": "Attach manually",
       "finishCaptcha": "Done, attach session",
       "finishLogin": "I've signed in",
       "connecting": "Attaching session…"
@@ -249,10 +251,14 @@
       "loggedIn": "Signed in: {name}",
       "opened": "Official site page opened. Complete the login and captcha yourself in the window, then come back and click \"Done, attach session\".",
       "captchaDone": "Captcha completed, session attached: {name}",
+      "captchaAutoOpening": "The verification window opened automatically. Please keep it open.",
+      "captchaAutoDone": "Verification complete, session attached automatically: {name}",
+      "captchaAutoFailed": "Automatic attach failed. The window is still open—you can attach manually or cancel.",
       "cancelled": "Manual verification cancelled. Click \"Sign in\" again to retry."
     },
     "hint": {
       "fingerprint": "Only the site's public status endpoint is called for fingerprinting; credentials are never persisted, only stored in the local encrypted vault.",
+      "captchaAutoBody": "The verification window opened automatically. Please keep it open; it will close itself and attach the session when done. You can also finish the login there and click \"Attach manually\".",
       "captchaTitle": "Captcha required: {name}",
       "captchaBody": "This site requires a captcha. Tianshu Relay does not bypass captchas—click the button below to open the site's official page and complete the login and captcha yourself; then come back and click \"Done, attach session\". The page in the window is the site's own; we won't click or read it for you.",
       "captchaUnsupportedBody": "This site requires a captcha, but its session uses a bearer access token rather than a cookie—Tianshu Relay's WebView fallback cannot capture such a session. Please connect via API key directly, or retry the login form above.",

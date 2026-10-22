@@ -2794,6 +2794,136 @@ fn cookie_belongs_to_site(domain: &str, host: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 
+// ============================================================== 自动人机验证（M36-S1）
+
+/// 自动完成结果事件（**只发到 `main`**）。payload 只有站点号与状态，绝不含 cookie / token。
+pub const CAPTCHA_AUTO_EVENT: &str = "captcha-auto-finished";
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptchaAutoEvent {
+    site_id: i64,
+    /// `"completed"` | `"failed"`
+    status: String,
+    /// 失败时的可读原因；不得含凭据（来自完整流程的错误串，内部已 scrub）。
+    message: Option<String>,
+}
+
+/// 广播一次自动完成结果。发送失败（主窗口已关）只当没发生——不影响会话落地。
+fn emit_captcha_auto<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    site_id: i64,
+    status: &str,
+    message: Option<String>,
+) {
+    use tauri::Emitter as _;
+    let _ = app.emit_to(
+        "main",
+        CAPTCHA_AUTO_EVENT,
+        CaptchaAutoEvent {
+            site_id,
+            status: status.to_string(),
+            message,
+        },
+    );
+}
+
+/// 触发名 cookie 的指纹（名字 + 值，排序），**只存在内存里**：用于「只有变化才重试」。
+fn trigger_cookie_fingerprint(pairs: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = pairs
+        .iter()
+        .filter(|(name, _)| {
+            tianshu_relay_core::site::captcha::AUTO_CAPTURE_TRIGGERS.contains(&name.as_str())
+        })
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+/// cookie 型站点的自动接管 watcher（M36-S1）。
+///
+/// 每 500ms 读一次窗口 cookie（**按站点 domain 过滤**），用纯函数
+/// [`tianshu_relay_core::site::captcha::auto_capture_ready`] 判断「会话凭据 cookie 出现
+/// 或值发生变化」；命中后走与手工「我已过完」**同一条** [`complete_captcha_window`]
+/// （`captcha_op` 串行）。成功 ⇒ 关窗（由完整流程负责）+ `completed` 事件 + 结束；
+/// 失败 ⇒ **不关窗**、相位留人工态、`failed` 事件，只有 cookie 指纹变化才再次尝试
+/// （避免「每 500ms 撞一次」的高频重试）。
+///
+/// 结束条件：窗口关闭 / 相位离开 `AwaitingHuman` / 站点 origin 变化 / 10 分钟上限。
+async fn watch_cookies_for_auto_complete<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    label: String,
+    base_url: String,
+    site_id: i64,
+) {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+    const MAX_RUNTIME: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+    let deadline = std::time::Instant::now() + MAX_RUNTIME;
+    let mut baseline: Option<Vec<(String, String)>> = None;
+    let mut last_attempt: Option<Vec<(String, String)>> = None;
+
+    loop {
+        tokio::time::sleep(INTERVAL).await;
+        if std::time::Instant::now() >= deadline {
+            break; // 10 分钟上限：不再自动读 cookie，用户仍可手动接入/取消
+        }
+        // 窗口没了 ⇒ 用户关窗（关窗=取消）或已被接上；结束。
+        let Some(window) = app.get_webview_window(&label) else {
+            break;
+        };
+        let Some(state) = app.try_state::<AppState>() else {
+            break; // 应用正在退出
+        };
+        if !captcha_submit_is_allowed(&state.service.captcha_phase(site_id)) {
+            break; // 已被取消 / 已接上 / 相位变了：watcher 不再写任何状态
+        }
+        let Ok(page_url) = window.url() else {
+            break;
+        };
+        if !tianshu_relay_core::site::captcha::origin_matches(&base_url, page_url.as_str()) {
+            // 页面跳到第三方 origin：不抓 cookie、不自动完成（spec §6 最后一行）。
+            break;
+        }
+        let Some(host) = site_host_of(&base_url) else {
+            break;
+        };
+        let Ok(cookies) = window.cookies() else {
+            continue; // 读失败：不关窗，下一轮再试
+        };
+        let pairs: Vec<(String, String)> = cookies
+            .iter()
+            .filter(|cookie| cookie_belongs_to_site(cookie.domain().unwrap_or(""), &host))
+            .map(|cookie| (cookie.name().to_string(), cookie.value().to_string()))
+            .collect();
+        // 第一次读到的就是基线（页面加载阶段预置的 cookie 不算「登录完成」）。
+        let Some(base) = baseline.as_ref() else {
+            baseline = Some(pairs);
+            continue;
+        };
+        if !tianshu_relay_core::site::captcha::auto_capture_ready(base, &pairs) {
+            continue;
+        }
+        let fingerprint = trigger_cookie_fingerprint(&pairs);
+        if last_attempt.as_ref() == Some(&fingerprint) {
+            continue; // 指纹没变：不重复尝试
+        }
+        last_attempt = Some(fingerprint);
+        match complete_captcha_window(&app, &state, site_id).await {
+            Ok(()) => {
+                emit_captcha_auto(&app, site_id, "completed", None);
+                return;
+            }
+            Err(message) => {
+                // 失败不关窗、相位留人工态（`complete_captcha_window` 保证）；
+                // 错误串来自完整流程（含 scrub），不含 cookie / token。
+                emit_captcha_auto(&app, site_id, "failed", Some(message));
+            }
+        }
+    }
+}
+
 /// 一次「等待人工验证」的挑战（M8-S2 §2.1）。
 ///
 /// `url` 恒为**站点自己的**官方页面地址（`captcha_page_url` 的保证：只可能是
@@ -2869,8 +2999,26 @@ pub async fn captcha_begin<R: tauri::Runtime>(
             .map_err(|e| format!("人机验证页面地址无法解析: {e}"))?;
         let mut builder =
             tauri::WebviewWindowBuilder::new(&app, label.clone(), tauri::WebviewUrl::External(url))
-                .title(format!("人机验证 · {display_name}"))
+                // M36-S1：窗口标题也提示「请勿关闭」——站点 CSP 可能拦掉注入的 banner，标题栏改不了。
+                .title(tianshu_relay_core::site::captcha::captcha_window_title(
+                    &display_name,
+                ))
                 .inner_size(1000.0, 760.0);
+
+        // M36-S1：cookie / bearer 两种**可接管**模式都注入「请勿关闭」展示条。
+        // 只在站点自己的 origin、顶层 frame 生效（脚本自带双重守卫），不读页面/输入/cookie。
+        if matches!(
+            mode,
+            CaptchaCaptureMode::Cookies | CaptchaCaptureMode::Bearer
+        ) {
+            let base_url = site_row
+                .as_ref()
+                .map(|site| site.base_url.clone())
+                .ok_or_else(|| format!("站点 #{site_id} 不存在"))?;
+            let notice = tianshu_relay_core::site::captcha::keep_open_notice_script(&base_url)
+                .map_err(|e| e.to_string())?;
+            builder = builder.initialization_script(notice);
+        }
 
         // M28-S2 / B-191 B 路：**只有 Bearer 站点**才加 incognito + 注入脚本 + 导航拦截。
         // Cookies / Unsupported 分支逐项保持 HEAD（不加这三项，最终 build 参数与 HEAD 一致）。
@@ -2915,7 +3063,36 @@ pub async fn captcha_begin<R: tauri::Runtime>(
                             // 成功/失败都拦下这次导航（`tianshu-relay-creds://` 不是可加载的页面）。
                             // store 失败只意味着「窗口里这次登录不被接受」：不 panic、不写日志值。
                             if let Some(state) = app_for_nav.try_state::<AppState>() {
-                                let _ = state.service.store_webview_creds(site_id, creds);
+                                if state.service.store_webview_creds(site_id, creds).is_ok() {
+                                    // M36-S1：**不在导航回调里同步执行**（会阻塞 WebView）。
+                                    // 异步补 cf_clearance → 接上会话 → 成功即 strip + destroy，
+                                    // 再把结果广播给主界面；失败不关窗，用户可手动接入/取消。
+                                    let app_for_auto = app_for_nav.clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        if let Some(state) = app_for_auto.try_state::<AppState>() {
+                                            match complete_captcha_window(
+                                                &app_for_auto,
+                                                &state,
+                                                site_id,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => emit_captcha_auto(
+                                                    &app_for_auto,
+                                                    site_id,
+                                                    "completed",
+                                                    None,
+                                                ),
+                                                Err(message) => emit_captcha_auto(
+                                                    &app_for_auto,
+                                                    site_id,
+                                                    "failed",
+                                                    Some(message),
+                                                ),
+                                            }
+                                        }
+                                    });
+                                }
                             }
                             false
                         }
@@ -2928,6 +3105,27 @@ pub async fn captcha_begin<R: tauri::Runtime>(
         let window = builder
             .build()
             .map_err(|e| format!("打开人机验证窗口失败: {e}"))?;
+
+        // M36-S1：cookie 型站点启动后台 watcher（每 500ms 看一次会话凭据 cookie）。
+        // 只在新窗口时启动：同站点重复 `captcha_begin` 走「聚焦已有窗口」分支，
+        // 不会叠加 watcher。窗口销毁 / 相位变化 / origin 变化 / 10 分钟上限都会让它结束。
+        if mode == CaptchaCaptureMode::Cookies {
+            let app_for_watch = app.clone();
+            let label_for_watch = label.clone();
+            let base_url_for_watch = site_row
+                .as_ref()
+                .map(|site| site.base_url.clone())
+                .ok_or_else(|| format!("站点 #{site_id} 不存在"))?;
+            tauri::async_runtime::spawn(async move {
+                watch_cookies_for_auto_complete(
+                    app_for_watch,
+                    label_for_watch,
+                    base_url_for_watch,
+                    site_id,
+                )
+                .await;
+            });
+        }
 
         // 关窗 = 取消（T6）：相位回 `Idle`，不写缓存 / 钥匙串 / 事件。
         // 只监听 `CloseRequested`（用户发起的关闭）——`destroy()`（我们主动关）不触发它，
@@ -2959,10 +3157,16 @@ pub async fn captcha_begin<R: tauri::Runtime>(
 ///
 /// 值从 WebView 直接进服务层（`complete_captcha`），**不经过前端 JS 堆**——
 /// 这也是线上 `captcha_complete` 不带 `cookies` 参数的原因（S2 实现步 D-9）。
-#[tauri::command]
-pub async fn captcha_complete<R: tauri::Runtime>(
-    app: AppHandle<R>,
-    state: State<'_, AppState>,
+/// 复用既有 `captcha_complete` 的完整流程（M36-S1）：
+/// 相位检查 → 窗口存在 → origin 比对 → 按能力位抓 cookie/Bearer 凭据 → 服务层落地 →
+/// 成功 `destroy()`。
+///
+/// **内部负责 `captcha_op` 串行**：自动 watcher、Bearer 自动完成、手工「我已过完」与
+/// 「取消」全部走同一把锁；后到者看到相位已变 ⇒ 直接失败/无操作，不再写状态。
+/// **失败不关窗**、相位留人工态（留给用户手动重试或取消）。
+async fn complete_captcha_window<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
     site_id: i64,
 ) -> Result<(), String> {
     // P3-15：整段（读相位 → 抓 cookie → 提交）都在锁内。修前这里没有锁，
@@ -3102,6 +3306,17 @@ pub async fn captcha_complete<R: tauri::Runtime>(
     // ⑥ 成功才关窗（`destroy` 不发事件；相位已回 `Idle`）
     let _ = window.destroy();
     Ok(())
+}
+
+/// 「我已过完」：手工兜底入口（M36-S1 起内部复用 [`complete_captcha_window`]，
+/// 与自动完成走同一条流程）。签名与行为与 HEAD 一致。
+#[tauri::command]
+pub async fn captcha_complete<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    site_id: i64,
+) -> Result<(), String> {
+    complete_captcha_window(&app, &state, site_id).await
 }
 
 /// 取消人工验证（关窗）：相位回 `Idle`，窗口关闭。幂等（T6 / T8）。
