@@ -55,6 +55,8 @@ pub const COMMANDS: &[&str] = &[
     "detect_unmanaged_targets",
     // M31-S1：Agent 安装/版本发现（只读）
     "detect_agents",
+    "check_agent_updates",
+    "update_agent",
     // M32-S1：Agent 模型下拉（只读，密钥不落日志）
     "list_key_models",
     "suggest_key_name",
