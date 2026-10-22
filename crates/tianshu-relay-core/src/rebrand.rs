@@ -374,10 +374,16 @@ pub fn retire_legacy_autostart(home: &Path, data_dir: &Path) -> Result<Option<St
         }
 
         let plan = crate::autostart::plan_disable(home, LEGACY_APP_ID)?;
+        let already_disabled = matches!(
+            &plan,
+            crate::platform_env::EnvPlan::Files(patches) if patches.is_empty()
+        );
         // 备份落在**本次实际使用的**数据目录下（旧目录或新目录，取决于迁移结果）。
         plan.apply_files(&data_dir.join("backups"))?;
-        Ok(Some(
-            "旧版登录自启项已停用（文件保留，可手动删除）".to_string(),
-        ))
+        Ok(Some(if already_disabled {
+            "旧版登录自启项已是停用状态（文件保留）".to_string()
+        } else {
+            "旧版登录自启项已停用（文件保留，可手动删除）".to_string()
+        }))
     }
 }

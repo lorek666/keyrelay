@@ -171,6 +171,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn service_names_are_new_and_legacy_distinct() {
+        // M35-S1 §7：M35 的最高风险不变量——生产迁移必须显式读旧 service。
+        assert_eq!(KeychainVault::DEFAULT_SERVICE, "Tianshu Relay");
+        assert_eq!(KeychainVault::LEGACY_SERVICE, "KeyRelay");
+        assert_ne!(
+            KeychainVault::DEFAULT_SERVICE,
+            KeychainVault::LEGACY_SERVICE
+        );
+    }
+
+    #[test]
     fn platform_support_flag_matches_backend_name() {
         let v = KeychainVault::new();
         assert_eq!(v.service(), "Tianshu Relay");
