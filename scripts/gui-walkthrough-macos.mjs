@@ -13,15 +13,15 @@
 // **B-154（M27-S1 订正）**：M16-S7 用 `spawn(opts.binary, ...)` 直接 exec 二进制——
 // shell-spawned child **未挂到 Aqua GUI 会话**，WebContent 子进程虽然出现，但 main process
 // 不在 WindowServer 的进程组里，JS 没真正跑起来（27 次 `ui_ready_at` 零命中、WebContent 12 秒
-// 只烧 0.06s CPU 都是这一现象的副作用，不是宿主能力的边界）。**修法**：用 `--app <KeyRelay.app>`
-// 走 `open -n` 让 LaunchServices 在用户 GUI 会话里启动新实例，env（含 `KEYRELAY_HOME`）从父
+// 只烧 0.06s CPU 都是这一现象的副作用，不是宿主能力的边界）。**修法**：用 `--app <天枢 Relay.app>`
+// 走 `open -n` 让 LaunchServices 在用户 GUI 会话里启动新实例，env（含 `TIANSHU_RELAY_HOME`）从父
 // shell 正常传播。`--app` 模式 3 次重复：`ui_ready_at` 全部落库（623 / 687 / 881 ms；证据
 // `docs/evidence/m16s7-gui.md §16.2`）。`--binary` 模式在当前 Aqua-attached shell 下也能落库
 // （533 / 546 ms；§16.2 反向证据，证明 M16-S7 零命中是当时 shell 上下文的产物）。**`--binary`
 // 模式保留**作为对比口径（与 M16-S7 同形）。
 //
 // 用法（M27-S1 起 `--app` 与 `--binary` 二选一，必填其一）：
-//   node scripts/gui-walkthrough-macos.mjs --app <KeyRelay.app> [--runs 10] [--wait 30]
+//   node scripts/gui-walkthrough-macos.mjs --app <天枢 Relay.app> [--runs 10] [--wait 30]
 //                                        [--out <dir>] [--keep] [--fixture-port 18999]
 //   node scripts/gui-walkthrough-macos.mjs --binary <path>   [同上选项]   # M16-S7 直接 spawn 路径
 //
@@ -31,7 +31,7 @@
 //   （旧版全失败仍 exit 0，且统计退化成 中位=undefined / max=-Infinity —— 那是缺陷）
 //
 // **安全**：只在自己 spawn 的 pid 上操作（不按进程名 `pkill`，避免杀掉用户自己的实例）；
-// 只在临时目录里建 `KEYRELAY_HOME`，绝不碰用户真实 `~/.keyrelay`；默认**不截图**。
+// 只在临时目录里建 `TIANSHU_RELAY_HOME`，绝不碰用户真实 `~/.tianshu-relay`；默认**不截图**。
 
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
@@ -43,7 +43,7 @@ function parseArgs(argv) {
   const opts = {
     runs: 10,
     // 默认 null：M27-S1 起 `--app` 与 `--binary` 二选一必填其一。
-    // 旧默认 `/Volumes/Date/kr-t-gui/release/keyrelay` 是 M16-S7 的开发机路径，
+    // 旧默认 `/Volumes/Date/kr-t-gui/release/tianshu-relay` 是 M16-S7 的开发机路径，
     // 默默继续沿用会让「照文档复跑」跑到一个不存在的二进制 ⇒ 误判环境。
     app: null,
     binary: null,
@@ -64,7 +64,7 @@ function parseArgs(argv) {
     else if (a === "--keep") opts.keep = true;
     else if (a === "--help" || a === "-h") {
       console.log(
-        "用法: node scripts/gui-walkthrough-macos.mjs (--app <KeyRelay.app> | --binary <path>) [--runs N] [--wait SEC] [--out DIR] [--keep] [--fixture-port PORT]\n" +
+        "用法: node scripts/gui-walkthrough-macos.mjs (--app <天枢 Relay.app> | --binary <path>) [--runs N] [--wait SEC] [--out DIR] [--keep] [--fixture-port PORT]\n" +
           "退出码: 0 = 两条口径都有样本；1 = 任一口径 0 样本 / 前置不满足 / 用法错误",
       );
       process.exit(0);
@@ -75,7 +75,7 @@ function parseArgs(argv) {
   }
   // M27-S1：二选一必填
   if (opts.app === null && opts.binary === null) {
-    console.error("用法错误：必须提供 --app <KeyRelay.app> 或 --binary <path> 之一（M27-S1 起强制）");
+    console.error("用法错误：必须提供 --app <天枢 Relay.app> 或 --binary <path> 之一（M27-S1 起强制）");
     process.exit(1);
   }
   if (opts.app !== null && opts.binary !== null) {
@@ -93,7 +93,7 @@ function osa(script, timeoutMs = 15000) {
 /**
  * **按 pid** 拿窗口信息。
  *
- * 为什么不按进程名：用户自己也开着 KeyRelay 时，按名字查到的是**他的**窗口 ⇒ 数字无效
+ * 为什么不按进程名：用户自己也开着天枢 Relay 时，按名字查到的是**他的**窗口 ⇒ 数字无效
  * （M16-S7 复审 P2-5）。另外按名字解析 AX 进程本身还有 ~2.7s 的固定开销，
  * 会把「窗口出现」的量级从 ~0.4s 抬到 ~3s（实测）。
  */
@@ -125,17 +125,22 @@ end tell`;
 const nowMs = () => Date.now();
 
 /**
- * **按进程名** pgrep KeyRelay pid 集合（M27-S1 新增）。
+ * **按进程名** pgrep 天枢 Relay / tianshu-relay pid 集合（M27-S1 新增）。
  *
  * 用途：`--app` 模式下 `open -n` 不直接返回 pid，需 launch 前后做 pgrep diff 找本实例 pid。
- * 用 `pgrep -f KeyRelay`：能匹配到 .app 包内的可执行（路径含 "KeyRelay.app"）以及裸二进制
- * （名称含 "keyrelay" 大小写敏感下不匹配，但 LaunchServices 启动后的进程名是 "KeyRelay"）。
+ * 用 `pgrep -f` 匹配 .app 包路径（`天枢 Relay.app`）与裸二进制名（`tianshu-relay`）两种形态。
  * 返回 Set<string>，pgrep 失败返回空 Set（不抛错，让 diff 逻辑自己处理）。
  */
-function pgrepKeyRelay() {
-  const r = spawnSync("pgrep", ["-f", "KeyRelay"], { encoding: "utf8" });
-  if (r.status !== 0) return new Set();
-  return new Set(r.stdout.trim().split(/\s+/).filter(Boolean));
+function pgrepTianshuRelay() {
+  // `productName` 是中文「天枢 Relay」，包内可执行是 `tianshu-relay`；两种形态都要能匹配。
+  const found = new Set();
+  for (const pattern of ["天枢 Relay.app", "tianshu-relay"]) {
+    const r = spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
+    if (r.status === 0) {
+      for (const pid of r.stdout.trim().split(/\s+/).filter(Boolean)) found.add(pid);
+    }
+  }
+  return found;
 }
 
 /**
@@ -145,7 +150,7 @@ function pgrepKeyRelay() {
  * 新口径立刻命中旧值 ⇒ 数字无意义。
  *
  * 启动方式（M27-S1 订正）：
- *   `--app <KeyRelay.app>`：用 `open -n` 启动 .app 包，挂到 Aqua 会话；env 透传由父 shell
+ *   `--app <天枢 Relay.app>`：用 `open -n` 启动 .app 包，挂到 Aqua 会话；env 透传由父 shell
  *     完成。`open` 不直接给 pid，需 launch 前后 pgrep diff 找本实例 pid（B-154 修法）。
  *   `--binary <path>`：直接 spawn（与 M16-S7 同形）。本模式下若环境不带 Aqua（如非交互
  *     harness），WebContent 不会真正跑 JS —— 这正是 B-154 的现象，保留作为对比口径。
@@ -153,8 +158,8 @@ function pgrepKeyRelay() {
 function coldStartOnce(opts, runIndex) {
   const home = join(tmpdir(), `kr-m16s7-run-${runIndex}`);
   rmSync(home, { recursive: true, force: true });
-  mkdirSync(join(home, ".keyrelay"), { recursive: true });
-  const db = join(home, ".keyrelay", "keyrelay.db");
+  mkdirSync(join(home, ".tianshu-relay"), { recursive: true });
+  const db = join(home, ".tianshu-relay", "tianshu-relay.db");
 
   const t0 = nowMs();
   let pid = null;
@@ -170,9 +175,9 @@ function coldStartOnce(opts, runIndex) {
       console.error(`--app 路径不存在或不是 .app 包: ${opts.app}`);
       process.exit(1);
     }
-    const before = pgrepKeyRelay();
+    const before = pgrepTianshuRelay();
     const r = spawnSync("open", ["-n", opts.app], {
-      env: { ...process.env, KEYRELAY_HOME: home },
+      env: { ...process.env, TIANSHU_RELAY_HOME: home },
       encoding: "utf8",
     });
     if (r.status !== 0) {
@@ -180,7 +185,7 @@ function coldStartOnce(opts, runIndex) {
     } else {
       // launch 后逐 tick pgrep，diff 出新 pid（不属于 launch 前基线的）
       findNewPid = () => {
-        const after = pgrepKeyRelay();
+        const after = pgrepTianshuRelay();
         for (const p of after) if (!before.has(p)) return p;
         return null;
       };
@@ -194,7 +199,7 @@ function coldStartOnce(opts, runIndex) {
   } else {
     // --- `--binary` 模式（M16-S7 同形）---
     child = spawn(opts.binary, [], {
-      env: { ...process.env, KEYRELAY_HOME: home },
+      env: { ...process.env, TIANSHU_RELAY_HOME: home },
       stdio: ["ignore", "ignore", "ignore"],
     });
     pid = child.pid;
@@ -208,11 +213,11 @@ function coldStartOnce(opts, runIndex) {
     let finished = false;
 
     /**
-     * 杀之前先验身份（P2-2 复审建议）：`pgrep -f KeyRelay` 的基线只覆盖 launch 前已存在的
-     * 进程；launch 后若恰有无关进程的命令行含 `KeyRelay`（如 `tail -f …/KeyRelay.app/…`）
+     * 杀之前先验身份（P2-2 复审建议）：`pgrep -f` 的基线只覆盖 launch 前已存在的
+     * 进程；launch 后若恰有无关进程的命令行含 `天枢 Relay`（如 `tail -f …/天枢 Relay.app/…`）
      * 落在同一窗口，diff 会认错 pid。杀前用 `ps -p <pid> -o comm=` 验明 comm 必须是
      * **本 `.app` 包内的可执行**（macOS 上 `comm=` 返回完整可执行路径，如
-     * `<opts.app>/Contents/MacOS/keyrelay`）；不匹配则记 `pidMiss` 不杀。
+     * `<opts.app>/Contents/MacOS/tianshu-relay`）；不匹配则记 `pidMiss` 不杀。
      * `--binary` 模式下 pid 来自 `child.pid`，不需要验（child 是自己 spawn 的）。
      */
     const pidIdentityOk = (p) => {
@@ -308,7 +313,7 @@ async function main() {
   const server = await new Promise((ok) => {
     const s = createServer((_q, res) => {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      res.end("<!doctype html><html><body>KEYRELAY-FIXTURE</body></html>");
+      res.end("<!doctype html><html><body>TIANSHU-RELAY-FIXTURE</body></html>");
     });
     s.listen(opts.fixturePort, "127.0.0.1", () => ok(s));
   });

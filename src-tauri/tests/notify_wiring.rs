@@ -1,6 +1,6 @@
 //! M16-S9：`with_notify` 的生产接线（S5 复审 P1-1）。
 //!
-//! 复审的发现：`KeyRelayService::with_notify` **零生产调用点** ⇒ `self.notify` 恒 `None`
+//! 复审的发现：`TianshuRelayService::with_notify` **零生产调用点** ⇒ `self.notify` 恒 `None`
 //! ⇒ `dispatch_notifications` 在早退处返回 ⇒ **基线永不落库、`ModelsChanged` 永不触发**，
 //! 而 spec §9 写的是「未接线：无」。
 //!
@@ -12,7 +12,7 @@
 //!
 //! 变异（能变红）：把 `lib.rs` 装配里的 `service.with_notify(config)` 去掉 ⇒ 测试 1 红。
 
-use keyrelay_core::notify::BASELINE_SETTING_KEY;
+use tianshu_relay_core::notify::BASELINE_SETTING_KEY;
 
 /// 开关开着 ⇒ 装配把 `with_notify` 接上 ⇒ `refresh_all` 之后基线落库。
 ///
@@ -23,7 +23,7 @@ use keyrelay_core::notify::BASELINE_SETTING_KEY;
 /// **不构造任何通知器**（不会真的弹系统通知、也不会发网络请求）。
 #[test]
 fn notify_enabled_wires_the_service_and_persists_a_baseline() {
-    let state = keyrelay_lib::init_state_in_memory_with_settings(&[
+    let state = tianshu_relay_lib::init_state_in_memory_with_settings(&[
         ("notify_enabled", "true"),
         ("notify_system_enabled", "false"),
     ]);
@@ -56,7 +56,7 @@ fn notify_enabled_wires_the_service_and_persists_a_baseline() {
 /// 早退之后什么都不发生。
 #[test]
 fn notify_disabled_by_default_changes_nothing() {
-    let state = keyrelay_lib::init_state_in_memory();
+    let state = tianshu_relay_lib::init_state_in_memory();
     let store = state.service.store();
 
     tokio::runtime::Runtime::new()
@@ -76,19 +76,19 @@ fn notify_disabled_by_default_changes_nothing() {
 #[test]
 fn baseline_survives_a_new_instance_on_the_same_db() {
     let dir = tempfile::tempdir().expect("临时目录");
-    let db = dir.path().join("keyrelay.db");
+    let db = dir.path().join("tianshu-relay.db");
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
 
-    let config = || keyrelay_core::service::ServiceConfig::in_memory(home.clone());
+    let config = || tianshu_relay_core::service::ServiceConfig::in_memory(home.clone());
     let service_with_notify = || {
-        let store = keyrelay_core::store::Store::open(&db).expect("开库");
-        keyrelay_core::service::KeyRelayService::new(
+        let store = tianshu_relay_core::store::Store::open(&db).expect("开库");
+        tianshu_relay_core::service::TianshuRelayService::new(
             store,
-            keyrelay_core::site::transport::MockTransport::default(),
+            tianshu_relay_core::site::transport::MockTransport::default(),
             config(),
         )
-        .with_notify(keyrelay_core::notify::NotifyConfig {
+        .with_notify(tianshu_relay_core::notify::NotifyConfig {
             system_enabled: false,
             webhook_url: None,
             balance_threshold: 0.0,

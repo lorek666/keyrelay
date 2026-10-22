@@ -10,8 +10,11 @@
 
 export type AgentPref = { keyId: number | null; model: string };
 
-const PREFIX = "keyrelay.agentPrefs.v1.";
+const PREFIX = "tianshu-relay.agentPrefs.v1.";
+/** M35-S1：旧品牌的前缀只读回退；写入永远用新前缀。 */
+const LEGACY_PREFIX = "keyrelay.agentPrefs.v1.";
 const keyFor = (siteId: number): string => `${PREFIX}${siteId}`;
+const legacyKeyFor = (siteId: number): string => `${LEGACY_PREFIX}${siteId}`;
 
 const EMPTY: AgentPref = { keyId: null, model: "" };
 
@@ -30,7 +33,10 @@ function sanitize(raw: unknown): AgentPref {
 /** 读某站点的全部每行偏好。任何异常都回空对象。 */
 export function loadAgentPrefs(siteId: number): Record<string, AgentPref> {
   try {
-    const raw = globalThis.localStorage?.getItem(keyFor(siteId));
+    // 新前缀优先；只有新键完全不存在时才回退旧品牌键。
+    const raw =
+      globalThis.localStorage?.getItem(keyFor(siteId)) ??
+      globalThis.localStorage?.getItem(legacyKeyFor(siteId));
     if (!raw) return {};
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};

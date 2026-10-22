@@ -99,7 +99,7 @@ function parseTsCommands() {
  */
 function parseRustChannels() {
   const source = stripComments(
-    readFileSync(join(root, "crates/keyrelay-core/src/delivery/mod.rs"), "utf8"),
+    readFileSync(join(root, "crates/tianshu-relay-core/src/delivery/mod.rs"), "utf8"),
   );
   // 只取 `as_str()` **函数体内**的臂：同一个文件里 `agent_id()` 也是同形态的 match，
   // 不限定函数就会把两份都抓进来（实测 14 条臂 vs ALL 的 7 个元素）。
@@ -185,7 +185,7 @@ function parseTsAgentChannels() {
 /** 后端 `DeliveryChannel::agent_id()` 的臂（与 `as_str` 同形态，只是函数名不同）。 */
 function parseRustAgentIds() {
   const source = stripComments(
-    readFileSync(join(root, "crates/keyrelay-core/src/delivery/mod.rs"), "utf8"),
+    readFileSync(join(root, "crates/tianshu-relay-core/src/delivery/mod.rs"), "utf8"),
   );
   const fn = source.match(/pub fn agent_id\(self\)[\s\S]*?\n    \}/);
   if (!fn) throw new Error("在 delivery/mod.rs 里找不到 agent_id() 函数");
@@ -432,7 +432,7 @@ if (frontOnlyAgent.length || frontOnlyChannels.length) {
 /** 后端 `(channel, agent)` 的配对表：`as_str()` 与 `agent_id()` 的臂按变体名对齐。 */
 function parseRustChannelAgentPairs() {
   const source = stripComments(
-    readFileSync(join(root, "crates/keyrelay-core/src/delivery/mod.rs"), "utf8"),
+    readFileSync(join(root, "crates/tianshu-relay-core/src/delivery/mod.rs"), "utf8"),
   );
   const armsOf = (fnName) => {
     const fn = source.match(new RegExp(`pub fn ${fnName}\\(self\\)[\\s\\S]*?\\n    \\}`));
@@ -769,6 +769,8 @@ function parseTsInvokeArgs() {
 /** `XxxDto` 在前端叫别的名字的例外（显式声明，加一行即一次可见改动）。 */
 const DTO_ALIASES = {
   KeychainPurgeDto: "KeychainPurgeReport",
+  // M35-S1：DTO 名与前端展示类型同名，但语义是「旧数据迁移结果」
+  RebrandDto: "RebrandDto",
   KeyMetaDto: "KeyRow",
   StoredKeyRowDto: "StoredKeyRow",
   DeliveryHistoryDto: "DeliveryRecord",

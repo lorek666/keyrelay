@@ -5,7 +5,7 @@ import type { SiteCapabilities } from "./api";
  *
  * - `cookie`：会话走 Set-Cookie，`window.cookies()` 抓得到（NewAPI）；
  * - `bearer`：会话是响应体里的 access token，走「WebView localStorage →
- *   `keyrelay-creds://`」回传（Sub2API）；
+ *   `tianshu-relay-creds://`」回传（Sub2API）；
  * - `unsupported`：该类型没有任何 WebView 兜底（Custom / 未知类型）。
  *
  * 判据**只来自后端能力表**（`SiteCapabilities`），页面里**不得**按 `kind` 硬编码——

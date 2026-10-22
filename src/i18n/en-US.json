@@ -19,7 +19,7 @@
     "rateFree": "Free"
   },
   "nav": {
-    "brand": "KeyRelay",
+    "brand": "Tianshu Relay",
     "group": {
       "daily": "Daily",
       "asset": "Assets",
@@ -44,7 +44,7 @@
     },
     "siteFilter": "Site",
     "allSites": "All sites",
-    "scopeHint": "Token counts cover only requests relayed through the local KeyRelay gateway (agent traffic sent directly to a site is not included). Balances come from snapshots written on each refresh.",
+    "scopeHint": "Token counts cover only requests relayed through the local Tianshu Relay gateway (agent traffic sent directly to a site is not included). Balances come from snapshots written on each refresh.",
     "siteFallback": "Site {id}",
     "unknownModel": "Unknown model",
     "loading": "Loading…",
@@ -168,11 +168,21 @@
     "runState": {
       "title": "Runtime status",
       "mode": "Mode",
+      "dataDir": "Data folder",
       "db": "Local database",
       "version": "Version",
       "vault": "Vault",
       "modeTauri": "Tauri (backend connected)",
       "modeBrowser": "Browser preview (backend not connected)"
+    },
+    "rebrand": {
+      "migratedTitle": "Data migrated from the old version",
+      "migratedBody": "Copied {files} files ({bytes} bytes) from {from} to {to}. The old folder was left untouched because rollback history may still reference it; do not delete it.",
+      "failedTitle": "Old data migration failed",
+      "failedBody": "Could not migrate old data: {error}. This run continues to use {dataDir}; no old files were changed.",
+      "targetTitle": "New data folder already has content",
+      "targetBody": "The new folder {to} already contains data, so nothing was migrated. The old folder was left untouched.",
+      "warningsTitle": "Notes"
     },
     "btn": {
       "refreshNow": "Refresh all sites now",
@@ -198,11 +208,11 @@
     },
     "drift": {
       "title": "Delivery targets need attention ({count})",
-      "hint1Pre": "KeyRelay does not auto-overwrite external changes. To restore, re-deliver on the Agent Delivery page. Deleted targets (",
+      "hint1Pre": "Tianshu Relay does not auto-overwrite external changes. To restore, re-deliver on the Agent Delivery page. Deleted targets (",
       "hint1Mid": ") can also be rolled back on the Change History page to their pre-delivery content; modified (",
       "hint1Post": ") rollback will be refused—rollback never overwrites others' changes.",
       "hint2Pre": "Targets you rolled back yourself also appear here",
-      "hint2Post": ": after rollback the file no longer matches KeyRelay's last delivered content, so drift detection still flags it (the corresponding row on the Change History page is marked \"rolled back\"). Do not re-deliver in this case—that would undo your rollback; to stop KeyRelay from managing it, unbind the agent on the Agent Delivery page.",
+      "hint2Post": ": after rollback the file no longer matches Tianshu Relay's last delivered content, so drift detection still flags it (the corresponding row on the Change History page is marked \"rolled back\"). Do not re-deliver in this case—that would undo your rollback; to stop Tianshu Relay from managing it, unbind the agent on the Agent Delivery page.",
       "hint3Pre": "Targets marked ",
       "hint3Mid1": " ",
       "hint3Mid2": "file still exists",
@@ -244,9 +254,9 @@
     "hint": {
       "fingerprint": "Only the site's public status endpoint is called for fingerprinting; credentials are never persisted, only stored in the local encrypted vault.",
       "captchaTitle": "Captcha required: {name}",
-      "captchaBody": "This site requires a captcha. KeyRelay does not bypass captchas—click the button below to open the site's official page and complete the login and captcha yourself; then come back and click \"Done, attach session\". The page in the window is the site's own; we won't click or read it for you.",
-      "captchaUnsupportedBody": "This site requires a captcha, but its session uses a bearer access token rather than a cookie—KeyRelay's WebView fallback cannot capture such a session. Please connect via API key directly, or retry the login form above.",
-      "captchaBearerBody": "This site requires a captcha. Complete the login (including the captcha) in the official page that opens; KeyRelay reads the login credential the site itself saved in order to attach the session—it reads only that credential store, not page text or form inputs, does not click for you, and does not bypass captchas. When you are done, come back and click \"I've signed in\". The credential is never shown in the UI and never written to logs."
+      "captchaBody": "This site requires a captcha. Tianshu Relay does not bypass captchas—click the button below to open the site's official page and complete the login and captcha yourself; then come back and click \"Done, attach session\". The page in the window is the site's own; we won't click or read it for you.",
+      "captchaUnsupportedBody": "This site requires a captcha, but its session uses a bearer access token rather than a cookie—Tianshu Relay's WebView fallback cannot capture such a session. Please connect via API key directly, or retry the login form above.",
+      "captchaBearerBody": "This site requires a captcha. Complete the login (including the captcha) in the official page that opens; Tianshu Relay reads the login credential the site itself saved in order to attach the session—it reads only that credential store, not page text or form inputs, does not click for you, and does not bypass captchas. When you are done, come back and click \"I've signed in\". The credential is never shown in the UI and never written to logs."
     },
     "list": {
       "title": "Added ({count})",
@@ -361,7 +371,7 @@
       "body": "On success the key is written directly to the local encrypted vault; the UI shows only the last 4 digits. Confirm this key's purpose yourself.",
       "nameLabel": "Name",
       "namePlaceholderSuggesting": "Generating default name…",
-      "namePlaceholder": "keyrelay/agent/yyyymmdd",
+      "namePlaceholder": "tianshu-relay/agent/yyyymmdd",
       "nameHintPre": "Default name follows ",
       "nameHintMid": ", using your local today. It's just a label: rename it to anything you recognize.",
       "groupLabel": "Group (optional)",
@@ -571,7 +581,7 @@
     },
     "unbind": {
       "title": "Unbind",
-      "bodyPre": "Unbind only removes the KeyRelay↔agent-config binding; it ",
+      "bodyPre": "Unbind only removes the Tianshu Relay↔agent-config binding; it ",
       "bodyStrong": "does not",
       "bodyPost": " touch the site-side key or delete the local key record—after unbind the target no longer appears in config drift, and history is still queryable.",
       "agentLine": "agent = {agent}",
@@ -613,7 +623,7 @@
       "title": "Unbind {agent}",
       "confirming": "Processing…",
       "confirm": "Unbind",
-      "bodyPre": "Unbind only removes the KeyRelay↔agent-config binding; it ",
+      "bodyPre": "Unbind only removes the Tianshu Relay↔agent-config binding; it ",
       "bodyStrong": "does not",
       "bodyPost": " touch the site-side key. Written file content stays as-is; you can still roll back that delivery on the Change History page.",
       "alsoRevokePre": "Also revoke the site-side key (",
@@ -642,7 +652,7 @@
     },
     "install": {
       "title": "Install {name}",
-      "hint": "Copy the command below into a terminal. KeyRelay never runs any command for you and never installs anything.",
+      "hint": "Copy the command below into a terminal. Tianshu Relay never runs any command for you and never installs anything.",
       "copy": "Copy",
       "copied": "Copied",
       "copyFailed": "Copy failed",
@@ -704,7 +714,7 @@
     "loading": "Loading…",
     "autorefresh": {
       "title": "Auto refresh",
-      "body": "Off by default: KeyRelay does no scheduled networking for you. When on, it refreshes signed-in sites' balances and key lists on a timer; failures only log events and never break the loop.",
+      "body": "Off by default: Tianshu Relay does no scheduled networking for you. When on, it refreshes signed-in sites' balances and key lists on a timer; failures only log events and never break the loop.",
       "off": "Off",
       "min5": "5 min",
       "min15": "15 min",
@@ -749,7 +759,7 @@
       "body": "Balance below threshold, expired sessions, key expiry, and config drift go through these channels. Notification bodies contain no keys and no raw site response text.",
       "system": "System notification (macOS Notification Center / Windows Toast)",
       "webhookUrl": "Webhook URL (empty = off)",
-      "webhookPlaceholder": "https://hooks.example.com/keyrelay",
+      "webhookPlaceholder": "https://hooks.example.com/tianshu-relay",
       "webhookTimeout": "Webhook timeout (seconds; max 60)",
       "webhookHintPre": "If credentials are embedded in the URL (",
       "webhookHintCode": "https://user:pass@…",
@@ -904,7 +914,7 @@
       "persistent": "Stored in local encrypted vault",
       "temporary": "Temporary (vault unavailable)—changes on restart"
     },
-    "hint": "Put the URL and token into the agent's config; or on the Agent Delivery page check \"point at local gateway\" to have KeyRelay write it for you.",
+    "hint": "Put the URL and token into the agent's config; or on the Agent Delivery page check \"point at local gateway\" to have Tianshu Relay write it for you.",
     "persistentHint": "The token lives in the local encrypted vault and persists across restarts—so to switch sites you only restart the gateway, no agent-side change (its config has the gateway URL and this token).",
     "temporaryHintPre": "This run uses a ",
     "temporaryHintStrong": "temporary token",
@@ -916,7 +926,7 @@
       "start": "Start gateway",
       "starting": "Starting…"
     },
-    "copied": "Copied to clipboard; may be captured by clipboard history (system or other apps). KeyRelay won't auto-clear the clipboard—that would fight your own copy operations.",
+    "copied": "Copied to clipboard; may be captured by clipboard history (system or other apps). Tianshu Relay won't auto-clear the clipboard—that would fight your own copy operations.",
     "rotatedWarn": "Token regenerated: the old one fails immediately; gateway-pointing channels need re-delivery, and agents need a restart to read the new config.",
     "rotateConfirm": "Regenerate the gateway token? The old one fails immediately; gateway-pointing channels need one re-delivery.",
     "stopBtn": "Stop gateway",
@@ -974,9 +984,9 @@
   "rollback": {
     "aftermath": {
       "title": "Three things to know after a rollback (it restores the file, not the binding):",
-      "drift": "Overview keeps listing this target as \"needs attention\", and every Overview open logs another \"external change\" alert—the file no longer matches KeyRelay's last delivered content. This is expected; do not re-deliver because of it (that would undo the rollback).",
+      "drift": "Overview keeps listing this target as \"needs attention\", and every Overview open logs another \"external change\" alert—the file no longer matches Tianshu Relay's last delivered content. This is expected; do not re-deliver because of it (that would undo the rollback).",
       "rotation": "Rotating this key rewrites the file; it also stays a candidate when batch re-pointing to the gateway. If this rollback restored the file to a **different** key from an earlier delivery: later rotating or revoking that earlier key will not rewrite this file—come back and deliver a still-valid key, or the agent stays on a revoked key.",
-      "unbind": "To stop KeyRelay from managing it, unbind {agent} on the Agent Delivery page."
+      "unbind": "To stop Tianshu Relay from managing it, unbind {agent} on the Agent Delivery page."
     }
   }
 }

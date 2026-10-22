@@ -8,7 +8,7 @@
  * 断言它在四种情况下「发 / 不发」回传 URL，并把 payload 解回来核对。
  *
  * 判据（spec §2.1.6）：
- *   ① 本站 origin 下写 `auth_token` ⇒ 发出 `keyrelay-creds://ok?d=…`；
+ *   ① 本站 origin 下写 `auth_token` ⇒ 发出 `tianshu-relay-creds://ok?d=…`；
  *   ② 解出的 JSON 含 token 与 UA，且**只有**这两个键；
  *   ③ origin 不匹配 ⇒ 不发；
  *   ④ 子 frame（`window.top !== window.self`）⇒ 不发。
@@ -23,14 +23,14 @@ import { dirname, resolve } from 'node:path';
 import vm from 'node:vm';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const TEMPLATE = resolve(ROOT, 'crates/keyrelay-core/src/site/webview_creds/login_script.js');
-const CALLBACK_PREFIX = 'keyrelay-creds://ok?d=';
+const TEMPLATE = resolve(ROOT, 'crates/tianshu-relay-core/src/site/webview_creds/login_script.js');
+const CALLBACK_PREFIX = 'tianshu-relay-creds://ok?d=';
 
 /** 与 Rust `webview_creds::login_script` 同序替换：origin **最后**（防二次扫描）。 */
 function buildScript(origin) {
   const lit = (s) => JSON.stringify(s);
   let js = readFileSync(TEMPLATE, 'utf8')
-    .replaceAll('__CREDS_SCHEME__', lit('keyrelay-creds'))
+    .replaceAll('__CREDS_SCHEME__', lit('tianshu-relay-creds'))
     .replaceAll('__CREDS_HOST__', lit('ok'))
     .replaceAll('__AUTH_TOKEN_KEY__', lit('auth_token'));
   js = js.replaceAll('__ALLOWED_ORIGIN__', lit(origin));
@@ -113,7 +113,7 @@ function check(name, condition, detail = '') {
   await new Promise((r) => setTimeout(r, 20));
   check('① 写 auth_token ⇒ 发出 1 次', env.emitted.length === 1, JSON.stringify(env.emitted));
   check(
-    '① 回传 URL 形态 = keyrelay-creds://ok?d=…',
+    '① 回传 URL 形态 = tianshu-relay-creds://ok?d=…',
     (env.emitted[0] ?? '').startsWith(CALLBACK_PREFIX),
     JSON.stringify(env.emitted),
   );

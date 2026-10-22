@@ -108,45 +108,45 @@ probe() {
 
 probe \
   "P1-W1-drift" \
-  "crates/keyrelay-core/src/service.rs" \
+  "crates/tianshu-relay-core/src/service.rs" \
   's/drift: drift_by_site\.get\(&site\.id\)\.cloned\(\)\.unwrap_or_default\(\)/drift: Vec::new()/g' \
-  "-p keyrelay-core --test notify_wiring"
+  "-p tianshu-relay-core --test notify_wiring"
 
 probe \
   "P2-W1-rotation" \
-  "crates/keyrelay-core/src/service.rs" \
+  "crates/tianshu-relay-core/src/service.rs" \
   's/rotation_due: rotation_by_site\.get\(&site\.id\)\.cloned\(\)\.unwrap_or_default\(\)/rotation_due: Vec::new()/g' \
-  "-p keyrelay-core --test notify_wiring"
+  "-p tianshu-relay-core --test notify_wiring"
 
 probe \
   "P3-baseline-copies-current" \
-  "crates/keyrelay-core/src/service.rs" \
+  "crates/tianshu-relay-core/src/service.rs" \
   's/sites\.push\(neutral_site\(site\)\);/sites.push(site.clone());/' \
-  "-p keyrelay-core --test notify_wiring"
+  "-p tianshu-relay-core --test notify_wiring"
 
 probe \
   "P4-null-journal-id" \
-  "crates/keyrelay-core/src/store/mod.rs" \
+  "crates/tianshu-relay-core/src/store/mod.rs" \
   "s/COALESCE\(b\.journal_id, ''\) AS journal_id,/b.journal_id,/" \
-  "-p keyrelay-core --test rotation_run"
+  "-p tianshu-relay-core --test rotation_run"
 
 probe \
   "P5-unmapped-refusal" \
-  "crates/keyrelay-core/src/service.rs" \
+  "crates/tianshu-relay-core/src/service.rs" \
   's/if !unmapped\.contains\(&binding\.agent_id\) \{/if false {/' \
-  "-p keyrelay-core --test rotation_run"
+  "-p tianshu-relay-core --test rotation_run"
 
 probe \
   "P6-rotation-export" \
-  "crates/keyrelay-core/src/lib.rs" \
+  "crates/tianshu-relay-core/src/lib.rs" \
   's/^pub mod rotation;$/\/\/ pub mod rotation;/m' \
-  "-p keyrelay-core --test rotation"
+  "-p tianshu-relay-core --test rotation"
 
 probe \
   "P7-missing-site-fill" \
-  "crates/keyrelay-core/src/service.rs" \
+  "crates/tianshu-relay-core/src/service.rs" \
   's/let baseline = filled_baseline\(prev, &snapshot\);/let baseline = prev.unwrap_or(crate::notify::Snapshot { sites: Vec::new() });/' \
-  "-p keyrelay-core --test notify_wiring"
+  "-p tianshu-relay-core --test notify_wiring"
 
 echo "# 全部探针结束"
 echo

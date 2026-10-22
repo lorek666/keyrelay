@@ -5,9 +5,23 @@
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
-use keyrelay_core::delivery::ConsentState;
+use tianshu_relay_core::delivery::ConsentState;
 
 use crate::AppState;
+
+/// 旧数据迁移结果的 IPC 形态（M35-S1 §4.3）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RebrandDto {
+    /// "noLegacy" | "migrated" | "targetExists" | "failed"
+    status: String,
+    from: Option<String>,
+    to: String,
+    files: usize,
+    bytes: u64,
+    warnings: Vec<String>,
+    error: Option<String>,
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -15,11 +29,15 @@ pub struct AppInfoDto {
     name: String,
     version: String,
     db_path: String,
+    /// 本次启动**实际使用**的数据目录（迁移失败时是旧目录）。
+    data_dir: String,
     site_count: usize,
     /// 数据库降级原因（正常为 null）
     db_error: Option<String>,
     /// 钥匙串后端标识。`"memory"` 出现在真实运行里即为缺陷（意味着密钥没进系统钥匙串）。
     vault_backend: String,
+    /// 旧数据迁移结果（`noLegacy` 时前端不渲染任何提示）。
+    rebrand: RebrandDto,
 }
 
 #[derive(Serialize)]
@@ -61,7 +79,7 @@ pub struct SiteCapabilitiesDto {
     /// 界面据此决定「打开官方页面过一次」面板渲染与否；后端 `captcha_complete` 据此
     /// 在 `window.cookies()` 之前直接拒绝（不调 cookies、不进 validate、不关窗）。
     webview_captcha_supported: bool,
-    /// M28-S2 / B-191 B 路：该站点类型能否用「WebView localStorage → `keyrelay-creds://`」
+    /// M28-S2 / B-191 B 路：该站点类型能否用「WebView localStorage → `tianshu-relay-creds://`」
     /// 回传会话（与能力表同源）。`true` 的站点（Sub2API）走注入脚本 + 导航拦截；
     /// 界面据此把「不适用」面板换成「登录后点我已登录」。
     ///
@@ -71,8 +89,8 @@ pub struct SiteCapabilitiesDto {
 }
 
 impl SiteCapabilitiesDto {
-    fn from_kind(kind: keyrelay_core::site::SiteKind) -> Self {
-        let caps = keyrelay_core::site::capability::capabilities(kind);
+    fn from_kind(kind: tianshu_relay_core::site::SiteKind) -> Self {
+        let caps = tianshu_relay_core::site::capability::capabilities(kind);
         Self {
             login: caps.login,
             list_keys: caps.list_keys,
@@ -110,17 +128,17 @@ impl SiteCapabilitiesDto {
 }
 
 impl SiteSummaryDto {
-    fn from_row(row: keyrelay_core::service::SiteSummary) -> Self {
+    fn from_row(row: tianshu_relay_core::service::SiteSummary) -> Self {
         // 只解析一次 `kind`：`capabilities` 与 `login_field` 必须来自**同一个**判断，
         // 两次 `parse` 写两遍就是两处事实（将来改了其中一处就会分叉）。
-        let kind = keyrelay_core::site::SiteKind::parse(&row.kind);
+        let kind = tianshu_relay_core::site::SiteKind::parse(&row.kind);
         let capabilities = match kind {
             Some(kind) => SiteCapabilitiesDto::from_kind(kind),
             None => SiteCapabilitiesDto::none(),
         };
         let login_field = kind
-            .and_then(keyrelay_core::site::login_field::LoginField::of)
-            .map(keyrelay_core::site::login_field::LoginField::as_str);
+            .and_then(tianshu_relay_core::site::login_field::LoginField::of)
+            .map(tianshu_relay_core::site::login_field::LoginField::as_str);
         Self {
             id: row.id,
             kind: row.kind,
@@ -185,7 +203,7 @@ pub struct BalanceDto {
 }
 
 impl BalanceDto {
-    fn from_balance(balance: keyrelay_core::site::Balance) -> Self {
+    fn from_balance(balance: tianshu_relay_core::site::Balance) -> Self {
         // 未知态一律把数值字段置 `null`：不要「反正它是 0」把它们照传——
         // 那等于把「不知道」伪装成「余额为零」，而这两件事在界面上必须能分开。
         let (remaining, used) = if balance.known {
@@ -247,13 +265,13 @@ pub struct DeliveryPlanDto {
     restart_hint: &'static str,
 }
 
-/// [`keyrelay_core::delivery::RestartHint`] 的线格式。
+/// [`tianshu_relay_core::delivery::RestartHint`] 的线格式。
 ///
 /// 为什么这个映射在命令层而不是核心层：核心的 `delivery/mod.rs` 在本波次是
 /// M7-S3 的写域、且正处于复审冻结期；把它放在这里不改变任何语义
 /// （穷举 match 保证新增变体会编译失败），等 `delivery` 解冻后再收进去。
-fn restart_hint_str(hint: keyrelay_core::delivery::RestartHint) -> &'static str {
-    use keyrelay_core::delivery::RestartHint;
+fn restart_hint_str(hint: tianshu_relay_core::delivery::RestartHint) -> &'static str {
+    use tianshu_relay_core::delivery::RestartHint;
     match hint {
         RestartHint::NotNeeded => "notNeeded",
         RestartHint::Needed => "needed",
@@ -433,7 +451,7 @@ pub struct GatewayStartArgs {
 /// 错误的 site/key（令牌轮换的语义是「不换站、不换密钥」，只换本地令牌）。
 /// 前端传来的 `args` 仅作一致性校验：与启动时不一致 ⇒ 拒绝，避免静默切站。
 pub struct GatewayRunning {
-    pub handle: keyrelay_core::gateway::GatewayHandle,
+    pub handle: tianshu_relay_core::gateway::GatewayHandle,
     pub site_id: i64,
     pub key_id: i64,
 }
@@ -454,7 +472,7 @@ pub struct ExportResultDto {
 pub struct ExportArgs {
     /// 空/缺省 = 明文导出
     password: Option<String>,
-    /// 缺省写到 `~/.keyrelay/exports/keyrelay-export-<时间戳>.json`
+    /// 缺省写到 `~/.tianshu-relay/exports/tianshu-relay-export-<时间戳>.json`
     path: Option<String>,
     /// M16-S6a §12 产品裁定：`export_bundle` **保留**「另存为到用户选定路径」这个特性，
     /// 但目标**已存在**时必须显式确认——不传（或 `false`）⇒ 拒绝，绝不静默覆盖。
@@ -496,7 +514,7 @@ pub struct DiagnosticsResultDto {
 pub struct DiagnosticsArgs {
     /// 事件条数上限（缺省 500 = PRD FR-9:196 的口径）。
     limit: Option<usize>,
-    /// 缺省写到 `~/.keyrelay/exports/keyrelay-diagnostics-<时间戳>.json`
+    /// 缺省写到 `~/.tianshu-relay/exports/tianshu-relay-diagnostics-<时间戳>.json`
     path: Option<String>,
 }
 
@@ -552,12 +570,22 @@ pub fn list_sites(state: State<'_, AppState>) -> Result<Vec<SiteSummaryDto>, Str
 pub fn app_info(state: State<'_, AppState>) -> Result<AppInfoDto, String> {
     let site_count = state.service.sites().map_err(|e| e.to_string())?.len();
     Ok(AppInfoDto {
-        name: "KeyRelay".to_string(),
+        name: "天枢 Relay".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         db_path: state.db_path.display().to_string(),
+        data_dir: state.data_dir.display().to_string(),
         site_count,
         db_error: state.db_error.clone(),
         vault_backend: state.service.vault_backend().to_string(),
+        rebrand: RebrandDto {
+            status: state.rebrand.status.as_str().to_string(),
+            from: state.rebrand.from.as_ref().map(|p| p.display().to_string()),
+            to: state.rebrand.to.display().to_string(),
+            files: state.rebrand.files,
+            bytes: state.rebrand.bytes,
+            warnings: state.rebrand.warnings.clone(),
+            error: state.rebrand.error.clone(),
+        },
     })
 }
 
@@ -570,9 +598,9 @@ pub async fn detect_site<R: tauri::Runtime>(
     // 代理从 settings 解析，与生产 transport 同一份逻辑（M10-S2）：
     // 测试连接与实际请求走同一条代理，不再各走各的。
     let proxy = state.service.settings().ok().and_then(|s| {
-        let mode = keyrelay_core::proxy::ProxyMode::parse(&s.proxy_mode)
-            .unwrap_or(keyrelay_core::proxy::ProxyMode::Auto);
-        keyrelay_core::proxy::resolve_proxy(mode, &s.proxy_url)
+        let mode = tianshu_relay_core::proxy::ProxyMode::parse(&s.proxy_mode)
+            .unwrap_or(tianshu_relay_core::proxy::ProxyMode::Auto);
+        tianshu_relay_core::proxy::resolve_proxy(mode, &s.proxy_url)
             .ok()
             .flatten()
             .map(|d| d.url)
@@ -602,7 +630,7 @@ pub async fn add_site(
 
 #[tauri::command]
 pub async fn login_site(state: State<'_, AppState>, args: LoginArgs) -> Result<(), String> {
-    let mut credentials = keyrelay_core::site::Credentials::new(args.username, args.password);
+    let mut credentials = tianshu_relay_core::site::Credentials::new(args.username, args.password);
     if let Some(code) = args.second_factor {
         credentials = credentials.with_second_factor(code);
     }
@@ -645,7 +673,7 @@ pub async fn create_key(
     state: State<'_, AppState>,
     args: CreateKeyArgs,
 ) -> Result<StoredKeyDto, String> {
-    let mut spec = keyrelay_core::site::KeySpec::named(args.name);
+    let mut spec = tianshu_relay_core::site::KeySpec::named(args.name);
     spec.group = args.group;
     spec.group_label = args.group_label;
     state
@@ -673,8 +701,8 @@ pub async fn site_balance(state: State<'_, AppState>, site_id: i64) -> Result<Ba
 
 // ================================================================ 密钥投递（M1-S3）
 
-fn parse_channel(raw: &str) -> Result<keyrelay_core::delivery::DeliveryChannel, String> {
-    keyrelay_core::delivery::DeliveryChannel::parse(raw).map_err(|e| e.to_string())
+fn parse_channel(raw: &str) -> Result<tianshu_relay_core::delivery::DeliveryChannel, String> {
+    tianshu_relay_core::delivery::DeliveryChannel::parse(raw).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -687,14 +715,14 @@ pub async fn delivery_plan(
     // 而不是写出一个指向空地址的配置。
     let mode = parse_delivery_mode(args.mode.as_deref())?;
     let endpoint = match mode {
-        keyrelay_core::delivery::DeliveryMode::Site => None,
-        keyrelay_core::delivery::DeliveryMode::LocalGateway => {
+        tianshu_relay_core::delivery::DeliveryMode::Site => None,
+        tianshu_relay_core::delivery::DeliveryMode::LocalGateway => {
             Some(gateway_endpoint_of(&state, &channel)?)
         }
     };
     let source = match &endpoint {
-        Some(endpoint) => keyrelay_core::delivery::DeliverySource::Gateway(endpoint),
-        None => keyrelay_core::delivery::DeliverySource::Site,
+        Some(endpoint) => tianshu_relay_core::delivery::DeliverySource::Gateway(endpoint),
+        None => tianshu_relay_core::delivery::DeliverySource::Site,
     };
     // M14-S7 §4.2：先把「内置表没覆盖的模型」的在线参数预热进缓存，再走同步的 plan。
     // best-effort：网络失败/超时只是没有参数行，预览照常出（失败不阻断投递）。
@@ -732,8 +760,10 @@ pub async fn delivery_plan(
                 consent_granted_at: granted_at,
                 consent_revoked_at: revoked_at,
                 warnings,
-                restart_hint: restart_hint_str(keyrelay_core::delivery::restart_hint(plan.channel)),
-                endpoint_in_channel: keyrelay_core::delivery::channel_carries_endpoint(
+                restart_hint: restart_hint_str(tianshu_relay_core::delivery::restart_hint(
+                    plan.channel,
+                )),
+                endpoint_in_channel: tianshu_relay_core::delivery::channel_carries_endpoint(
                     plan.channel,
                 ),
             }
@@ -746,7 +776,7 @@ pub async fn delivery_plan(
 /// 只对普通文件给提示（目录不算）。文案里带**文件名**而不是全路径——
 /// 全路径在 UI 上已经显示过了，这里补的是「还有哪个兄弟文件」。
 fn delivery_warnings(target: &std::path::Path) -> Vec<String> {
-    let siblings = keyrelay_core::service::sibling_config_files(target);
+    let siblings = tianshu_relay_core::service::sibling_config_files(target);
     if siblings.is_empty() {
         return Vec::new();
     }
@@ -834,14 +864,14 @@ pub async fn apply_delivery(
     let channel = parse_channel(&args.channel)?;
     let mode = parse_delivery_mode(args.mode.as_deref())?;
     let endpoint = match mode {
-        keyrelay_core::delivery::DeliveryMode::Site => None,
-        keyrelay_core::delivery::DeliveryMode::LocalGateway => {
+        tianshu_relay_core::delivery::DeliveryMode::Site => None,
+        tianshu_relay_core::delivery::DeliveryMode::LocalGateway => {
             Some(gateway_endpoint_of(&state, &channel)?)
         }
     };
     let source = match &endpoint {
-        Some(endpoint) => keyrelay_core::delivery::DeliverySource::Gateway(endpoint),
-        None => keyrelay_core::delivery::DeliverySource::Site,
+        Some(endpoint) => tianshu_relay_core::delivery::DeliverySource::Gateway(endpoint),
+        None => tianshu_relay_core::delivery::DeliverySource::Site,
     };
     // M14-S7 §4.2：同 `delivery_plan`——直接投递（没先预览）时也要拿到在线参数。
     // 缓存已在预览时预热过，这里通常是一次纯读；best-effort，失败不阻断。
@@ -1202,7 +1232,7 @@ pub fn usage_dashboard(
     days: Option<i64>,
     site_id: Option<i64>,
 ) -> Result<UsageDashboardDto, String> {
-    let range_days = keyrelay_core::store::clamp_usage_days(days.unwrap_or(30));
+    let range_days = tianshu_relay_core::store::clamp_usage_days(days.unwrap_or(30));
     let store = state.service.store();
     let daily = store
         .usage_daily(range_days, site_id)
@@ -1258,8 +1288,8 @@ pub fn usage_dashboard(
 
 // ============================================ 漂移 / 设置 / 刷新（M3-S1）
 
-fn settings_from_dto(dto: &SettingsDto) -> keyrelay_core::settings::Settings {
-    keyrelay_core::settings::Settings {
+fn settings_from_dto(dto: &SettingsDto) -> tianshu_relay_core::settings::Settings {
+    tianshu_relay_core::settings::Settings {
         refresh_interval_secs: dto.refresh_interval_secs,
         balance_alert_threshold: dto.balance_alert_threshold,
         drift_check_on_start: dto.drift_check_on_start,
@@ -1286,7 +1316,7 @@ fn settings_from_dto(dto: &SettingsDto) -> keyrelay_core::settings::Settings {
     }
 }
 
-fn settings_to_dto(settings: &keyrelay_core::settings::Settings) -> SettingsDto {
+fn settings_to_dto(settings: &tianshu_relay_core::settings::Settings) -> SettingsDto {
     SettingsDto {
         refresh_interval_secs: settings.refresh_interval_secs,
         balance_alert_threshold: settings.balance_alert_threshold,
@@ -1375,7 +1405,7 @@ pub struct DetectProxyDto {
 /// 失败（探测不到）⇒ `DetectProxyDto { source: None, masked_url: None }`，不报错。
 #[tauri::command]
 pub fn detect_system_proxy() -> DetectProxyDto {
-    match keyrelay_core::proxy::detect_system_proxy() {
+    match tianshu_relay_core::proxy::detect_system_proxy() {
         Some(d) => DetectProxyDto {
             source: Some(d.source.as_str().to_string()),
             masked_url: Some(d.masked_url()),
@@ -1431,8 +1461,8 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
 /// 写下去只会让 agent 连不上）。这不是限制，是把「指向网关」的定义执行到底。
 fn gateway_endpoint_of(
     state: &State<'_, AppState>,
-    channel: &keyrelay_core::delivery::DeliveryChannel,
-) -> Result<keyrelay_core::delivery::GatewayEndpoint, String> {
+    channel: &tianshu_relay_core::delivery::DeliveryChannel,
+) -> Result<tianshu_relay_core::delivery::GatewayEndpoint, String> {
     let guard = state
         .gateway
         .lock()
@@ -1440,8 +1470,11 @@ fn gateway_endpoint_of(
     let run = guard.as_ref().ok_or_else(|| {
         "本地网关没有在运行：请先在「网关」页启动它，再把通道改为指向网关。".to_string()
     })?;
-    Ok(keyrelay_core::delivery::GatewayEndpoint {
-        base_url: keyrelay_core::delivery::gateway_base_url_for(channel, &run.handle.local_url()),
+    Ok(tianshu_relay_core::delivery::GatewayEndpoint {
+        base_url: tianshu_relay_core::delivery::gateway_base_url_for(
+            channel,
+            &run.handle.local_url(),
+        ),
         token: run.handle.token.clone(),
     })
 }
@@ -1450,10 +1483,12 @@ fn gateway_endpoint_of(
 ///
 /// 认不出的取值 ⇒ `Err`，**不**回退成默认：静默回退会让「指向网关」的请求被当成站点投递，
 /// 而用户以为已经切过去了。
-fn parse_delivery_mode(raw: Option<&str>) -> Result<keyrelay_core::delivery::DeliveryMode, String> {
+fn parse_delivery_mode(
+    raw: Option<&str>,
+) -> Result<tianshu_relay_core::delivery::DeliveryMode, String> {
     match raw.map(str::trim) {
-        None | Some("") | Some("site") => Ok(keyrelay_core::delivery::DeliveryMode::Site),
-        Some("gateway") => Ok(keyrelay_core::delivery::DeliveryMode::LocalGateway),
+        None | Some("") | Some("site") => Ok(tianshu_relay_core::delivery::DeliveryMode::Site),
+        Some("gateway") => Ok(tianshu_relay_core::delivery::DeliveryMode::LocalGateway),
         Some(other) => Err(format!(
             "未知的投递模式 {other:?}；只支持 \"site\" 与 \"gateway\""
         )),
@@ -1481,11 +1516,11 @@ const GATEWAY_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 ///
 /// 超时只留一行 stderr，不向上报错：调用方接下来要做的（释放句柄槽、重新 bind）
 /// 都不依赖「在途连接是否收尾完成」。
-async fn stop_gateway(handle: keyrelay_core::gateway::GatewayHandle) {
+async fn stop_gateway(handle: tianshu_relay_core::gateway::GatewayHandle) {
     match tokio::time::timeout(GATEWAY_SHUTDOWN_TIMEOUT, handle.shutdown_and_wait()).await {
         Ok(()) => {}
         Err(_) => eprintln!(
-            "[keyrelay] 等待网关停止超过 {GATEWAY_SHUTDOWN_TIMEOUT:?}（在途连接未收尾）；\
+            "[tianshu-relay] 等待网关停止超过 {GATEWAY_SHUTDOWN_TIMEOUT:?}（在途连接未收尾）；\
              监听端口在此之前已释放，继续。"
         ),
     }
@@ -1533,7 +1568,7 @@ pub async fn gateway_start(
         .gateway_config(args.site_id, args.key_id, port)
         .map_err(|e| e.to_string())?;
 
-    let handle = keyrelay_core::gateway::start(config)
+    let handle = tianshu_relay_core::gateway::start(config)
         .await
         .map_err(|e| e.to_string())?;
     let status = GatewayStatusDto {
@@ -1650,7 +1685,7 @@ pub async fn gateway_rotate_token(
     state.service.drain_gateway_failures();
     state.service.end_gateway_session();
 
-    let handle = keyrelay_core::gateway::start(config)
+    let handle = tianshu_relay_core::gateway::start(config)
         .await
         .map_err(|e| e.to_string())?;
     let status = GatewayStatusDto {
@@ -1707,7 +1742,7 @@ pub fn export_bundle(
 ) -> Result<ExportResultDto, String> {
     // M16-S6a §12：三条护栏（绝对路径 / 不跟随符号链接 / 已存在须显式确认）。
     let path = resolve_bundle_path(
-        state.service.home(),
+        &state.data_dir,
         args.path.as_deref(),
         args.overwrite.unwrap_or(false),
     )?;
@@ -1723,7 +1758,7 @@ pub fn export_bundle(
         .map_err(|e| e.to_string())
 }
 
-/// `~/.keyrelay/exports/<prefix>-<unix 秒>.json`。
+/// `~/.tianshu-relay/exports/<prefix>-<unix 秒>.json`。
 ///
 /// 抽出来是因为配置导出与诊断包**必须落在同一个目录**：两者都会被登记进
 /// 「已知导出物」表、都会被 `audit_redaction` 扫到，散在两个目录只会让用户
@@ -1737,7 +1772,7 @@ fn default_export_path_in(dir: &std::path::Path, prefix: &str) -> std::path::Pat
 }
 
 /// 诊断包导出文件名白名单前缀（P3-18）。
-const DIAGNOSTICS_FILE_PREFIX: &str = "keyrelay-diagnostics";
+const DIAGNOSTICS_FILE_PREFIX: &str = "tianshu-relay-diagnostics";
 
 /// `export_bundle` 的路径护栏（M16-S6a §12 的**产品裁定**）。
 ///
@@ -1748,14 +1783,14 @@ const DIAGNOSTICS_FILE_PREFIX: &str = "keyrelay-diagnostics";
 /// 2. **不跟随符号链接**：目标是链接时拒绝，否则等于允许写到链接指向的任何地方。
 /// 3. **已存在须显式确认**：`overwrite != true` 时拒绝，**绝不静默覆盖**用户的文件。
 fn resolve_bundle_path(
-    home: &std::path::Path,
+    data_dir: &std::path::Path,
     requested: Option<&str>,
     overwrite: bool,
 ) -> Result<std::path::PathBuf, String> {
     let Some(raw) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(default_export_path_in(
-            &home.join(".keyrelay").join("exports"),
-            "keyrelay-export",
+            &data_dir.join("exports"),
+            "tianshu-relay-export",
         ));
     };
 
@@ -1787,17 +1822,17 @@ fn resolve_bundle_path(
 /// 它没有理由写到导出目录之外。
 ///
 /// 允许两种形态：
-/// ① `requested` 为空 ⇒ 默认路径 `<dir>/keyrelay-diagnostics-<stamp>.json`；
-/// ② 给了路径 ⇒ 必须落在**导出目录内**、文件名以 `keyrelay-diagnostics` 开头、
+/// ① `requested` 为空 ⇒ 默认路径 `<dir>/tianshu-relay-diagnostics-<stamp>.json`；
+/// ② 给了路径 ⇒ 必须落在**导出目录内**、文件名以 `tianshu-relay-diagnostics` 开头、
 ///    以 `.json` 结尾，且**不得**含 `..`；目标已存在且是**符号链接**时拒绝（不跟随）。
 ///
 /// 拒绝时返回可读原因（含被拒路径原文）：**不静默改成默认路径**——静默改道会让调用方
 /// 以为文件写到了自己指定的地方，而实际上没有。
 fn resolve_diagnostics_path(
-    home: &std::path::Path,
+    data_dir: &std::path::Path,
     requested: Option<&str>,
 ) -> Result<std::path::PathBuf, String> {
-    let dir = home.join(".keyrelay").join("exports");
+    let dir = data_dir.join("exports");
     let Some(raw) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(default_export_path_in(&dir, DIAGNOSTICS_FILE_PREFIX));
     };
@@ -1871,8 +1906,8 @@ pub fn export_diagnostics(
     // P3-18：`path` 不再是任意路径——收敛到导出目录 + 文件名白名单（越界一律拒绝）。
     //
     // 允许目录取**服务自己的 home**（生产 = `home_dir()`，测试 = 每个 app 独立的临时目录）：
-    // 与 `ServiceConfig.home` 同源，测试因此不必碰真实 `~/.keyrelay`。
-    let path = resolve_diagnostics_path(state.service.home(), args.path.as_deref())?;
+    // 与 `ServiceConfig.home` 同源，测试因此不必碰真实 `~/.tianshu-relay`。
+    let path = resolve_diagnostics_path(&state.data_dir, args.path.as_deref())?;
     state
         .service
         .export_diagnostics_to_file(&path, args.limit.unwrap_or(DEFAULT_DIAGNOSTIC_EVENTS))
@@ -1929,7 +1964,7 @@ pub fn report_ui_ready(state: State<'_, AppState>) -> Result<(), String> {
 /// 脱敏审计：扫描数据库（含 WAL/SHM）、备份目录与事件表，确认零明文。
 #[tauri::command]
 pub fn audit_redaction(state: State<'_, AppState>) -> Result<AuditReportDto, String> {
-    use keyrelay_core::audit::AuditFinding;
+    use tianshu_relay_core::audit::AuditFinding;
 
     state
         .service
@@ -2039,7 +2074,7 @@ pub struct KeySyncDto {
 
 /// 把站点侧已有密钥的明文一次性对齐到本地钥匙串（FR-2）。
 ///
-/// **不返回任何明文**——理由见 `KeyRelayService::sync_site_keys` 的文档。
+/// **不返回任何明文**——理由见 `TianshuRelayService::sync_site_keys` 的文档。
 #[tauri::command]
 pub async fn sync_site_keys(
     state: State<'_, AppState>,
@@ -2181,16 +2216,18 @@ pub async fn rotate_key(
 
     let run = state
         .service
-        .rotate_key(key_id, keyrelay_core::site::KeySpec::named(name))
+        .rotate_key(key_id, tianshu_relay_core::site::KeySpec::named(name))
         .await
         .map_err(|e| e.to_string())?;
     let (revoke, revoke_reason) = match &run.revoke {
-        keyrelay_core::service::RevokeOutcome::Revoked => ("revoked".to_string(), None),
-        keyrelay_core::service::RevokeOutcome::SkippedNoRemoteId => {
+        tianshu_relay_core::service::RevokeOutcome::Revoked => ("revoked".to_string(), None),
+        tianshu_relay_core::service::RevokeOutcome::SkippedNoRemoteId => {
             ("skippedNoRemoteId".to_string(), None)
         }
-        keyrelay_core::service::RevokeOutcome::NotAttempted => ("notAttempted".to_string(), None),
-        keyrelay_core::service::RevokeOutcome::Failed(reason) => {
+        tianshu_relay_core::service::RevokeOutcome::NotAttempted => {
+            ("notAttempted".to_string(), None)
+        }
+        tianshu_relay_core::service::RevokeOutcome::Failed(reason) => {
             ("failed".to_string(), Some(reason.clone()))
         }
     };
@@ -2311,7 +2348,7 @@ async fn restart_gateway_after_rotation(
     state.service.drain_gateway_failures();
     state.service.end_gateway_session();
 
-    let handle = keyrelay_core::gateway::start(config)
+    let handle = tianshu_relay_core::gateway::start(config)
         .await
         .map_err(|e| format!("轮换已成功，但网关重启失败（网关已停，请手动启动）：{e}"))?;
     if let Ok(mut guard) = state.gateway.lock() {
@@ -2337,8 +2374,8 @@ pub struct AutostartDto {
     manual_action: Option<String>,
 }
 
-fn autostart_dto(state: keyrelay_core::autostart::AutostartState) -> AutostartDto {
-    use keyrelay_core::autostart::AutostartState;
+fn autostart_dto(state: tianshu_relay_core::autostart::AutostartState) -> AutostartDto {
+    use tianshu_relay_core::autostart::AutostartState;
     AutostartDto {
         state: match state {
             AutostartState::Enabled => "enabled",
@@ -2362,7 +2399,7 @@ pub fn autostart_status(state: State<'_, AppState>) -> Result<AutostartDto, Stri
 
 /// 开启 / 关闭登录自启（FR-7）。
 ///
-/// `hidden` 固定为 `true`（见 `KeyRelayService::autostart_plan`）：自启的用途就是后台刷新，
+/// `hidden` 固定为 `true`（见 `TianshuRelayService::autostart_plan`）：自启的用途就是后台刷新，
 /// 弹窗会破坏它。`--hidden` 在托盘不可用时会被壳层降级成显示窗口，所以不会出现
 /// 「启动了但没有任何入口」。
 #[tauri::command]
@@ -2387,12 +2424,12 @@ pub fn autostart_set(state: State<'_, AppState>, enabled: bool) -> Result<Autost
 #[tauri::command]
 pub async fn detect_agents(
     state: State<'_, AppState>,
-) -> Result<Vec<keyrelay_core::agents::AgentStatus>, String> {
+) -> Result<Vec<tianshu_relay_core::agents::AgentStatus>, String> {
     // 20 条探测内部已是并行，但每条都要等 `--version`（单条上限 5s）。
     // 放到 blocking 线程池执行，避免占住 IPC/窗口主线程：只克隆一个 PathBuf，
     // 不把 `State` 移进闭包。
     let home = state.service.home().to_path_buf();
-    tauri::async_runtime::spawn_blocking(move || keyrelay_core::agents::detect_agents(&home))
+    tauri::async_runtime::spawn_blocking(move || tianshu_relay_core::agents::detect_agents(&home))
         .await
         .map_err(|error| format!("Agent 探测线程异常退出：{error}"))
 }
@@ -2405,25 +2442,25 @@ pub async fn detect_agents(
 #[tauri::command]
 pub async fn check_agent_updates(
     state: State<'_, AppState>,
-) -> Result<Vec<keyrelay_core::agent_updates::AgentUpdateStatus>, String> {
+) -> Result<Vec<tianshu_relay_core::agent_updates::AgentUpdateStatus>, String> {
     let home = state.service.home().to_path_buf();
     // 代理从 settings 解析，与 `detect_site` / 生产 transport 同一份 `resolve_proxy`（M10-S2）
     let proxy = state.service.settings().ok().and_then(|s| {
-        let mode = keyrelay_core::proxy::ProxyMode::parse(&s.proxy_mode)
-            .unwrap_or(keyrelay_core::proxy::ProxyMode::Auto);
-        keyrelay_core::proxy::resolve_proxy(mode, &s.proxy_url)
+        let mode = tianshu_relay_core::proxy::ProxyMode::parse(&s.proxy_mode)
+            .unwrap_or(tianshu_relay_core::proxy::ProxyMode::Auto);
+        tianshu_relay_core::proxy::resolve_proxy(mode, &s.proxy_url)
             .ok()
             .flatten()
             .map(|d| d.url)
     });
     let detect_home = home.clone();
     let statuses = tauri::async_runtime::spawn_blocking(move || {
-        keyrelay_core::agents::detect_agents(&detect_home)
+        tianshu_relay_core::agents::detect_agents(&detect_home)
     })
     .await
     .map_err(|error| format!("Agent 探测线程异常退出：{error}"))?;
 
-    Ok(keyrelay_core::agent_updates::check_agent_updates(&home, &statuses, proxy).await)
+    Ok(tianshu_relay_core::agent_updates::check_agent_updates(&home, &statuses, proxy).await)
 }
 
 /// 执行一次白名单一键更新（M34-S1）。
@@ -2435,10 +2472,10 @@ pub async fn check_agent_updates(
 pub async fn update_agent(
     state: State<'_, AppState>,
     channel: String,
-) -> Result<keyrelay_core::agent_updates::AgentUpdateOutcome, String> {
+) -> Result<tianshu_relay_core::agent_updates::AgentUpdateOutcome, String> {
     let home = state.service.home().to_path_buf();
     tauri::async_runtime::spawn_blocking(move || {
-        keyrelay_core::agent_updates::update_agent(&home, &channel)
+        tianshu_relay_core::agent_updates::update_agent(&home, &channel)
     })
     .await
     .map_err(|error| format!("更新线程异常退出：{error}"))?
@@ -2468,7 +2505,7 @@ pub async fn list_key_models(
 /// 用户在 Cline / Roo Code 里配了中转站，本产品既不能帮他注入，也不该假装没这回事。
 #[tauri::command]
 pub fn detect_unmanaged_targets(state: State<'_, AppState>) -> Vec<UnmanagedTargetDto> {
-    keyrelay_core::delivery::detect_unmanaged_targets(state.service.home())
+    tianshu_relay_core::delivery::detect_unmanaged_targets(state.service.home())
         .into_iter()
         .map(|target| UnmanagedTargetDto {
             label: target.label.to_string(),
@@ -2501,8 +2538,8 @@ pub struct UnmanagedTargetDto {
 /// 看着像规范、其实是个占位）。
 #[tauri::command]
 pub fn suggest_key_name(agent_id: String, year: i32, month: u32, day: u32) -> Option<String> {
-    keyrelay_core::naming::default_key_name(
-        keyrelay_core::naming::DEFAULT_APP_ID,
+    tianshu_relay_core::naming::default_key_name(
+        tianshu_relay_core::naming::DEFAULT_APP_ID,
         &agent_id,
         (year, month, day),
     )
@@ -2612,8 +2649,8 @@ pub struct RevokeReportDto {
     note: Option<String>,
 }
 
-impl From<keyrelay_core::service::RevokeReport> for RevokeReportDto {
-    fn from(report: keyrelay_core::service::RevokeReport) -> Self {
+impl From<tianshu_relay_core::service::RevokeReport> for RevokeReportDto {
+    fn from(report: tianshu_relay_core::service::RevokeReport) -> Self {
         Self {
             site_id: report.site_id,
             remote_id: report.remote_id,
@@ -2637,8 +2674,8 @@ pub struct UnbindOutcomeDto {
     note: Option<String>,
 }
 
-impl From<keyrelay_core::service::UnbindOutcome> for UnbindOutcomeDto {
-    fn from(outcome: keyrelay_core::service::UnbindOutcome) -> Self {
+impl From<tianshu_relay_core::service::UnbindOutcome> for UnbindOutcomeDto {
+    fn from(outcome: tianshu_relay_core::service::UnbindOutcome) -> Self {
         Self {
             unbound: outcome.unbound,
             already_unbound: outcome.already_unbound,
@@ -2653,7 +2690,7 @@ impl From<keyrelay_core::service::UnbindOutcome> for UnbindOutcomeDto {
 /// 人工验证的**取数方式**（M28-S2 / B-191 B 路；判据只来自能力表）。
 ///
 /// - `Cookies`：会话走 `Set-Cookie`，`window.cookies()` 抓得到（NewAPI）；
-/// - `Bearer`：会话是响应体里的 access token，走「WebView localStorage → `keyrelay-creds://`」
+/// - `Bearer`：会话是响应体里的 access token，走「WebView localStorage → `tianshu-relay-creds://`」
 ///   回传（Sub2API）；
 /// - `Unsupported`：该类型没有任何 WebView 兜底（Custom / 未知类型）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2671,19 +2708,19 @@ enum CaptchaCaptureMode {
 /// Custom）保持 HEAD 的 cookie-only `complete_captcha`，逐字不动。
 ///
 /// 抽成纯函数是为了让这条分支**可被单测钉住**——内联的 `matches!` 只有读代码才能验证。
-fn cookie_login_uses_newapi_exchange(kind: Option<keyrelay_core::site::SiteKind>) -> bool {
-    matches!(kind, Some(keyrelay_core::site::SiteKind::NewApi))
+fn cookie_login_uses_newapi_exchange(kind: Option<tianshu_relay_core::site::SiteKind>) -> bool {
+    matches!(kind, Some(tianshu_relay_core::site::SiteKind::NewApi))
 }
 
 /// 能力位 → 取数方式。**cookie 优先**：两者都为 true 的站点目前不存在，但若将来出现，
 /// 抓 cookie 比注入脚本更保守（不执行任何 JS、不加 incognito）。
 ///
 /// `None`（认不出的 `kind`）⇒ `Unsupported`：fail-closed，绝不猜一条取数路径。
-fn captcha_capture_mode(kind: Option<keyrelay_core::site::SiteKind>) -> CaptchaCaptureMode {
+fn captcha_capture_mode(kind: Option<tianshu_relay_core::site::SiteKind>) -> CaptchaCaptureMode {
     let Some(kind) = kind else {
         return CaptchaCaptureMode::Unsupported;
     };
-    let caps = keyrelay_core::site::capability::capabilities(kind);
+    let caps = tianshu_relay_core::site::capability::capabilities(kind);
     if caps.webview_captcha_supported {
         CaptchaCaptureMode::Cookies
     } else if caps.webview_bearer_supported {
@@ -2695,11 +2732,11 @@ fn captcha_capture_mode(kind: Option<keyrelay_core::site::SiteKind>) -> CaptchaC
 
 /// 导航回传的 origin 闸门（纯函数，便于单测）：当前文档 URL 必须与站点同源。
 ///
-/// 两侧都走 [`keyrelay_core::site::webview_creds::site_origin`]（WHATWG 解析 +
+/// 两侧都走 [`tianshu_relay_core::site::webview_creds::site_origin`]（WHATWG 解析 +
 /// 尾点 / IDN / 默认端口归一），避免 `Url::origin()` 与 `origin_of` 口径不一致——
 /// 尾点 FQDN 的站点在 Bearer 路径会静默 fail-closed。
 fn navigation_origin_allowed(current_url: &str, expected_origin: &str) -> bool {
-    keyrelay_core::site::webview_creds::site_origin(current_url)
+    tianshu_relay_core::site::webview_creds::site_origin(current_url)
         .map(|origin| origin == expected_origin)
         .unwrap_or(false)
 }
@@ -2816,7 +2853,7 @@ pub async fn captcha_begin<R: tauri::Runtime>(
     let mode = captcha_capture_mode(
         site_row
             .as_ref()
-            .and_then(|site| keyrelay_core::site::SiteKind::parse(&site.kind)),
+            .and_then(|site| tianshu_relay_core::site::SiteKind::parse(&site.kind)),
     );
 
     let label = captcha_window_label(site_id);
@@ -2842,9 +2879,9 @@ pub async fn captcha_begin<R: tauri::Runtime>(
                 .as_ref()
                 .map(|site| site.base_url.clone())
                 .ok_or_else(|| format!("站点 #{site_id} 不存在"))?;
-            let script = keyrelay_core::site::webview_creds::login_script(&base_url)
+            let script = tianshu_relay_core::site::webview_creds::login_script(&base_url)
                 .map_err(|e| e.to_string())?;
-            let expected_origin = keyrelay_core::site::webview_creds::site_origin(&base_url)
+            let expected_origin = tianshu_relay_core::site::webview_creds::site_origin(&base_url)
                 .map_err(|e| e.to_string())?;
             let app_for_nav = app.clone();
             let label_for_nav = label.clone();
@@ -2855,7 +2892,9 @@ pub async fn captcha_begin<R: tauri::Runtime>(
                 .on_navigation(move |url| {
                     // ① 不是回传 URL ⇒ 普通导航，放行。
                     let Some(parsed) =
-                        keyrelay_core::site::webview_creds::parse_creds_navigation(url.as_str())
+                        tianshu_relay_core::site::webview_creds::parse_creds_navigation(
+                            url.as_str(),
+                        )
                     else {
                         return true;
                     };
@@ -2873,7 +2912,7 @@ pub async fn captcha_begin<R: tauri::Runtime>(
                     }
                     match parsed {
                         Ok(creds) => {
-                            // 成功/失败都拦下这次导航（`keyrelay-creds://` 不是可加载的页面）。
+                            // 成功/失败都拦下这次导航（`tianshu-relay-creds://` 不是可加载的页面）。
                             // store 失败只意味着「窗口里这次登录不被接受」：不 panic、不写日志值。
                             if let Some(state) = app_for_nav.try_state::<AppState>() {
                                 let _ = state.service.store_webview_creds(site_id, creds);
@@ -2951,7 +2990,7 @@ pub async fn captcha_complete<R: tauri::Runtime>(
         .ok_or_else(|| format!("站点 #{site_id} 不存在"))?;
     let base_url = site_row.base_url.clone();
     let page_url = window.url().map_err(|e| format!("读取窗口地址失败: {e}"))?;
-    if !keyrelay_core::site::captcha::origin_matches(&base_url, page_url.as_str()) {
+    if !tianshu_relay_core::site::captcha::origin_matches(&base_url, page_url.as_str()) {
         return Err(
             "页面已不在该站点的域名下（可能被跳转到了别处）；为避免把别处的 cookie 存进来，\
              本次提交被拒绝。请在窗口里回到该站点页面后重试。"
@@ -2969,10 +3008,10 @@ pub async fn captcha_complete<R: tauri::Runtime>(
     // `kind` 解析与 `commands.rs::SiteSummaryDto::from_row`（`:107`）同形、与
     // `service.rs::kind_of` 同源——见 spec §6.1。`service.rs::kind_of` 报 Store 错，
     // 这里走 fail-closed 文案，是**刻意如此**（认不出类型 ⇒ 绝不渲染兜底面板）。
-    let kind = keyrelay_core::site::SiteKind::parse(&site_row.kind);
+    let kind = tianshu_relay_core::site::SiteKind::parse(&site_row.kind);
     match captcha_capture_mode(kind) {
         // M28-S2 / B-191 B 路：Sub2API 的会话在响应体里（Bearer），`window.cookies()` 抓不到。
-        // 登录页脚本已经通过 `keyrelay-creds://` 把 access_token 交给服务层（captcha_begin 的
+        // 登录页脚本已经通过 `tianshu-relay-creds://` 把 access_token 交给服务层（captcha_begin 的
         // 导航回调里 store_webview_creds）；这里只补 **HttpOnly 的 `cf_clearance`**（JS 读不到），
         // 然后让服务层把两半拼成 Bearer 会话。
         CaptchaCaptureMode::Bearer => {
@@ -2987,7 +3026,8 @@ pub async fn captcha_complete<R: tauri::Runtime>(
                 .filter(|cookie| cookie_belongs_to_site(cookie.domain().unwrap_or(""), &host))
                 .map(|cookie| (cookie.name().to_string(), cookie.value().to_string()))
                 .collect();
-            let cf_clearance = keyrelay_core::site::webview_creds::extract_cf_clearance(&pairs);
+            let cf_clearance =
+                tianshu_relay_core::site::webview_creds::extract_cf_clearance(&pairs);
 
             // ⑤' 与 cookie 路径同口径：读 cookie 跨了 await，提交前再查一次相位。
             if !captcha_submit_is_allowed(&state.service.captcha_phase(site_id)) {
@@ -3003,7 +3043,7 @@ pub async fn captcha_complete<R: tauri::Runtime>(
 
             // ⑥' 成功后清掉页面里的两个续期键（尽力而为：失败不阻断——incognito + destroy
             //     已保证页面存储不落盘），再关窗。失败时**不关窗**、相位留在人工态，可重试。
-            let _ = window.eval(keyrelay_core::site::webview_creds::strip_refresh_keys_js());
+            let _ = window.eval(tianshu_relay_core::site::webview_creds::strip_refresh_keys_js());
             let _ = window.destroy();
             return Ok(());
         }
@@ -3087,10 +3127,10 @@ pub async fn captcha_cancel<R: tauri::Runtime>(
 /// 只有 `AwaitingHuman` 允许：`Idle`（没在等人 / 已被取消 / 已提交过）一律拒绝。
 /// 抽成函数是为了让「取消之后不能再提交」这条**可被单测钉住**——内联的 `matches!`
 /// 只有读代码才能验证。
-fn captcha_submit_is_allowed(phase: &keyrelay_core::site::captcha::CaptchaPhase) -> bool {
+fn captcha_submit_is_allowed(phase: &tianshu_relay_core::site::captcha::CaptchaPhase) -> bool {
     matches!(
         phase,
-        keyrelay_core::site::captcha::CaptchaPhase::AwaitingHuman { .. }
+        tianshu_relay_core::site::captcha::CaptchaPhase::AwaitingHuman { .. }
     )
 }
 
@@ -3114,8 +3154,8 @@ pub struct ProbeRunDto {
     completed_at: Option<i64>,
 }
 
-impl From<keyrelay_core::probe::ProbeRun> for ProbeRunDto {
-    fn from(r: keyrelay_core::probe::ProbeRun) -> Self {
+impl From<tianshu_relay_core::probe::ProbeRun> for ProbeRunDto {
+    fn from(r: tianshu_relay_core::probe::ProbeRun) -> Self {
         Self {
             run_id: r.run_id,
             status: r.status,
@@ -3190,8 +3230,8 @@ pub struct ProbeRunRowDto {
     status: Option<String>,
 }
 
-impl From<keyrelay_core::store::ProbeRunRow> for ProbeRunRowDto {
-    fn from(r: keyrelay_core::store::ProbeRunRow) -> Self {
+impl From<tianshu_relay_core::store::ProbeRunRow> for ProbeRunRowDto {
+    fn from(r: tianshu_relay_core::store::ProbeRunRow) -> Self {
         Self {
             id: r.id,
             run_id: r.run_id,
@@ -3246,9 +3286,9 @@ pub fn get_probe_run(
 /// `autostart_plan` 只会产出 macOS 的 plist。
 fn apply_env_plan(
     state: &State<'_, AppState>,
-    plan: &keyrelay_core::platform_env::EnvPlan,
+    plan: &tianshu_relay_core::platform_env::EnvPlan,
 ) -> Result<(), String> {
-    use keyrelay_core::platform_env::EnvPlan;
+    use tianshu_relay_core::platform_env::EnvPlan;
     match plan {
         EnvPlan::Files(_) => state
             .service
@@ -3265,8 +3305,8 @@ fn apply_env_plan(
 }
 
 #[cfg(windows)]
-fn run_reg_op(op: &keyrelay_core::platform_env::RegOp) -> Result<(), String> {
-    use keyrelay_core::platform_env::REG_EXE;
+fn run_reg_op(op: &tianshu_relay_core::platform_env::RegOp) -> Result<(), String> {
+    use tianshu_relay_core::platform_env::REG_EXE;
     let output = std::process::Command::new(REG_EXE)
         .args(op.to_argv())
         .output()
@@ -3282,7 +3322,7 @@ fn run_reg_op(op: &keyrelay_core::platform_env::RegOp) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn run_reg_op(_op: &keyrelay_core::platform_env::RegOp) -> Result<(), String> {
+fn run_reg_op(_op: &tianshu_relay_core::platform_env::RegOp) -> Result<(), String> {
     // 非 Windows 上不该走到这里：`autostart_plan` 按平台选落点，macOS 产出 plist。
     // 真走到了说明有人把 `EnvScope::WindowsUserEnv` 硬编码进了调用链。
     Err("注册表操作只在 Windows 上可执行（当前平台不支持）".to_string())
@@ -3301,7 +3341,7 @@ mod tests {
     /// 这里把每个 DTO 的线上字段名钉死，改字段名（含 snake_case 回归）会立刻失败。
     #[test]
     fn dtos_serialize_in_camel_case_with_expected_keys() {
-        let summary = SiteSummaryDto::from_row(keyrelay_core::service::SiteSummary {
+        let summary = SiteSummaryDto::from_row(tianshu_relay_core::service::SiteSummary {
             id: 1,
             kind: "newapi".into(),
             base_url: "https://relay.example.com".into(),
@@ -3330,7 +3370,7 @@ mod tests {
         // Sub2API：账号栏是**邮箱**——真实站点只认邮箱形态，用户名必被 400
         // （`api.example.com` 实测，见 M9-S1 证据 §3）。界面据此改标签，
         // 因此这个取值是**用户可见行为**，不是内部字段。
-        let sub2api = SiteSummaryDto::from_row(keyrelay_core::service::SiteSummary {
+        let sub2api = SiteSummaryDto::from_row(tianshu_relay_core::service::SiteSummary {
             id: 3,
             kind: "sub2api".into(),
             base_url: "https://api.example.com".into(),
@@ -3346,7 +3386,7 @@ mod tests {
         assert_eq!(value["capabilities"]["webviewBearerSupported"], true);
 
         // 认不出的站点类型 ⇒ 全部 false（fail-closed：宁可全灰，也不给点了才报错的按钮）。
-        let unknown = SiteSummaryDto::from_row(keyrelay_core::service::SiteSummary {
+        let unknown = SiteSummaryDto::from_row(tianshu_relay_core::service::SiteSummary {
             id: 2,
             kind: "some-future-site".into(),
             base_url: "https://x.example.com".into(),
@@ -3445,25 +3485,38 @@ mod tests {
         assert_eq!(value["remaining"], 1.5);
 
         // M7-S5：未知余额必须**结构上**不可能被渲染成 0.00 —— 数值字段是 null，不是 0。
-        let unknown = BalanceDto::from_balance(keyrelay_core::site::Balance::unknown("USD"));
+        let unknown = BalanceDto::from_balance(tianshu_relay_core::site::Balance::unknown("USD"));
         let value = to_value(&unknown);
         assert_eq!(value["known"], false);
         assert_eq!(value["remaining"], Value::Null, "未知余额不得给 0");
         assert_eq!(value["used"], Value::Null, "未知余额不得给 0");
 
         let info = AppInfoDto {
-            name: "KeyRelay".into(),
+            name: "天枢 Relay".into(),
             version: "0.1.0".into(),
             db_path: ":memory:".into(),
+            data_dir: ":memory:".into(),
             site_count: 0,
             db_error: None,
             vault_backend: "memory".into(),
+            rebrand: RebrandDto {
+                status: "noLegacy".into(),
+                from: None,
+                to: ":memory:".into(),
+                files: 0,
+                bytes: 0,
+                warnings: Vec::new(),
+                error: None,
+            },
         };
         let value = to_value(&info);
+        assert_eq!(value["name"], "天枢 Relay");
         assert_eq!(value["dbPath"], ":memory:");
+        assert_eq!(value["dataDir"], ":memory:");
         assert_eq!(value["siteCount"], 0);
         assert_eq!(value["dbError"], Value::Null);
         assert_eq!(value["vaultBackend"], "memory");
+        assert_eq!(value["rebrand"]["status"], "noLegacy");
     }
 
     /// M34-S1：用量看板 DTO 的线上字段名（前端按 camelCase 读，漏改一侧就是静默空白）。
@@ -3550,7 +3603,7 @@ mod tests {
             target_path: "/home/u/.codex/auth.json".into(),
             target_exists: false,
             // M8-S4 §6.6：模式必须到线上字段名上（界面靠它区分「写的是站点密钥还是本地令牌」）。
-            mode: keyrelay_core::delivery::DeliveryMode::Site
+            mode: tianshu_relay_core::delivery::DeliveryMode::Site
                 .as_str()
                 .to_string(),
             fields: vec![
@@ -3572,13 +3625,13 @@ mod tests {
             warnings: vec!["同目录下还有 auth.jsonc。".into()],
             // M7-S5：生效策略（PRD FR-4:137）。这里取真实值而不是字面量——
             // 若 `restart_hint` 表变了，这条断言跟着变，不会变成一份假的留档。
-            restart_hint: restart_hint_str(keyrelay_core::delivery::restart_hint(
-                keyrelay_core::delivery::DeliveryChannel::CodexAuthJson,
+            restart_hint: restart_hint_str(tianshu_relay_core::delivery::restart_hint(
+                tianshu_relay_core::delivery::DeliveryChannel::CodexAuthJson,
             )),
             // M16-S6a / P2-3：Codex 的 `auth.json` 里**没有** endpoint（改指网关时只换令牌不换地址）。
             // 取真实值而不是字面量——事实表变了这条会跟着变。
-            endpoint_in_channel: keyrelay_core::delivery::channel_carries_endpoint(
-                keyrelay_core::delivery::DeliveryChannel::CodexAuthJson,
+            endpoint_in_channel: tianshu_relay_core::delivery::channel_carries_endpoint(
+                tianshu_relay_core::delivery::DeliveryChannel::CodexAuthJson,
             ),
         };
         let value = to_value(&plan);
@@ -3602,8 +3655,8 @@ mod tests {
 
         // M7-S5：**每个**通道都必须给出一个非空提示——新增通道时穷举 match 会编译失败，
         // 而不是悄悄给一个空串（界面会因此显示「无需重启」这种最危险的假话）。
-        for channel in keyrelay_core::delivery::DeliveryChannel::ALL {
-            let hint = restart_hint_str(keyrelay_core::delivery::restart_hint(channel));
+        for channel in tianshu_relay_core::delivery::DeliveryChannel::ALL {
+            let hint = restart_hint_str(tianshu_relay_core::delivery::restart_hint(channel));
             assert!(
                 !hint.is_empty(),
                 "{} 的 restartHint 不得为空",
@@ -3615,13 +3668,13 @@ mod tests {
             channel: "codex-auth-json".into(),
             target_path: "/home/u/.codex/auth.json".into(),
             journal_id: "j1-0".into(),
-            backup_path: Some("/home/u/.keyrelay/backups/j1-0/0-auth.json".into()),
+            backup_path: Some("/home/u/.tianshu-relay/backups/j1-0/0-auth.json".into()),
         };
         let value = to_value(&outcome);
         assert_eq!(value["journalId"], "j1-0");
         assert_eq!(
             value["backupPath"],
-            "/home/u/.keyrelay/backups/j1-0/0-auth.json"
+            "/home/u/.tianshu-relay/backups/j1-0/0-auth.json"
         );
         assert!(
             !value.to_string().contains("sk-"),
@@ -3754,7 +3807,7 @@ mod tests {
     fn gateway_base_url_for_omits_v1_for_claude_code_only() {
         // P1-5：Claude Code（Anthropic SDK）的 ANTHROPIC_BASE_URL 不带 /v1（SDK 自己拼 /v1/messages），
         // 给它带 /v1 会变成 /v1/v1/messages。其他通道（OpenAI/Codex 等）带 /v1。
-        use keyrelay_core::delivery::{gateway_base_url_for, DeliveryChannel};
+        use tianshu_relay_core::delivery::{gateway_base_url_for, DeliveryChannel};
         let url = "http://127.0.0.1:19387";
         assert_eq!(
             gateway_base_url_for(&DeliveryChannel::ClaudeCodeSettings, url),
@@ -3780,7 +3833,7 @@ mod tests {
     /// 继续走 HEAD 的 cookie-only `complete_captcha`。
     #[test]
     fn cookie_login_uses_newapi_exchange_only_for_newapi() {
-        use keyrelay_core::site::SiteKind;
+        use tianshu_relay_core::site::SiteKind;
         assert!(cookie_login_uses_newapi_exchange(Some(SiteKind::NewApi)));
         assert!(!cookie_login_uses_newapi_exchange(Some(
             SiteKind::CustomOpenAiCompatible
@@ -3797,7 +3850,7 @@ mod tests {
     /// Unsupported（fail-closed，绝不猜一条取数路径）。
     #[test]
     fn captcha_capture_mode_follows_the_capability_table() {
-        use keyrelay_core::site::SiteKind;
+        use tianshu_relay_core::site::SiteKind;
         assert_eq!(
             captcha_capture_mode(Some(SiteKind::NewApi)),
             CaptchaCaptureMode::Cookies,
@@ -3877,13 +3930,17 @@ mod tests {
     #[test]
     fn diagnostics_default_path_is_inside_the_exports_dir() {
         let home = tempfile::tempdir().expect("临时 home");
-        let path = resolve_diagnostics_path(home.path(), None).expect("默认路径必须可用");
+        let path = resolve_diagnostics_path(&home.path().join(".tianshu-relay"), None)
+            .expect("默认路径必须可用");
         assert_eq!(
             path.parent().unwrap(),
-            home.path().join(".keyrelay/exports")
+            home.path().join(".tianshu-relay/exports")
         );
         let name = path.file_name().unwrap().to_str().unwrap();
-        assert!(name.starts_with("keyrelay-diagnostics"), "文件名: {name}");
+        assert!(
+            name.starts_with("tianshu-relay-diagnostics"),
+            "文件名: {name}"
+        );
         assert!(name.ends_with(".json"), "文件名: {name}");
     }
 
@@ -3894,7 +3951,7 @@ mod tests {
     #[test]
     fn diagnostics_rejects_every_out_of_bounds_path() {
         let home = tempfile::tempdir().expect("临时 home");
-        let exports = home.path().join(".keyrelay/exports");
+        let exports = home.path().join(".tianshu-relay/exports");
         std::fs::create_dir_all(&exports).expect("建导出目录");
 
         // ① 目录外（绝对路径）：`~/.zshrc` 与 `/tmp/...` 都在这类
@@ -3902,31 +3959,44 @@ mod tests {
             home.path().join(".zshrc"),
             std::env::temp_dir().join("kr-s6a-outside.json"),
         ] {
-            let err = resolve_diagnostics_path(home.path(), Some(&outside.display().to_string()))
-                .expect_err("目录外路径必须被拒");
+            let err = resolve_diagnostics_path(
+                &home.path().join(".tianshu-relay"),
+                Some(&outside.display().to_string()),
+            )
+            .expect_err("目录外路径必须被拒");
             assert!(err.contains("只能导出到"), "文案: {err}");
         }
 
         // ② 文件名不符（目录对、名字不对）
         let wrong_name = exports.join("other.json");
         assert!(
-            resolve_diagnostics_path(home.path(), Some(&wrong_name.display().to_string())).is_err(),
+            resolve_diagnostics_path(
+                &home.path().join(".tianshu-relay"),
+                Some(&wrong_name.display().to_string())
+            )
+            .is_err(),
             "非白名单文件名必须被拒"
         );
 
         // ③ `..`（哪怕最终落在导出目录里也拒——归一之后就说不清用户到底想写哪儿）
-        let dotted = exports.join("../exports/keyrelay-diagnostics-1.json");
-        let err = resolve_diagnostics_path(home.path(), Some(&dotted.display().to_string()))
-            .expect_err("含 `..` 必须被拒");
+        let dotted = exports.join("../exports/tianshu-relay-diagnostics-1.json");
+        let err = resolve_diagnostics_path(
+            &home.path().join(".tianshu-relay"),
+            Some(&dotted.display().to_string()),
+        )
+        .expect_err("含 `..` 必须被拒");
         assert!(err.contains(".."), "文案: {err}");
 
         // ④ 符号链接：目标已存在且是链接 ⇒ 拒绝跟随
         #[cfg(unix)]
         {
-            let link = exports.join("keyrelay-diagnostics-link.json");
+            let link = exports.join("tianshu-relay-diagnostics-link.json");
             std::os::unix::fs::symlink(home.path().join(".zshrc"), &link).expect("建符号链接");
-            let err = resolve_diagnostics_path(home.path(), Some(&link.display().to_string()))
-                .expect_err("符号链接必须被拒");
+            let err = resolve_diagnostics_path(
+                &home.path().join(".tianshu-relay"),
+                Some(&link.display().to_string()),
+            )
+            .expect_err("符号链接必须被拒");
             assert!(err.contains("符号链接"), "文案: {err}");
         }
     }
@@ -3935,25 +4005,33 @@ mod tests {
     #[test]
     fn diagnostics_accepts_whitelisted_paths() {
         let home = tempfile::tempdir().expect("临时 home");
-        let exports = home.path().join(".keyrelay/exports");
+        let exports = home.path().join(".tianshu-relay/exports");
 
         // 绝对路径 + 白名单文件名
-        let ok = exports.join("keyrelay-diagnostics-1.json");
+        let ok = exports.join("tianshu-relay-diagnostics-1.json");
         assert_eq!(
-            resolve_diagnostics_path(home.path(), Some(&ok.display().to_string())).unwrap(),
+            resolve_diagnostics_path(
+                &home.path().join(".tianshu-relay"),
+                Some(&ok.display().to_string())
+            )
+            .unwrap(),
             ok
         );
 
         // 相对路径（按导出目录解析）
         assert_eq!(
-            resolve_diagnostics_path(home.path(), Some("keyrelay-diagnostics-2.json")).unwrap(),
-            exports.join("keyrelay-diagnostics-2.json")
+            resolve_diagnostics_path(
+                &home.path().join(".tianshu-relay"),
+                Some("tianshu-relay-diagnostics-2.json")
+            )
+            .unwrap(),
+            exports.join("tianshu-relay-diagnostics-2.json")
         );
 
         // 空白串等同「没传」
         assert_eq!(
-            resolve_diagnostics_path(home.path(), Some("   ")).unwrap(),
-            resolve_diagnostics_path(home.path(), None).unwrap()
+            resolve_diagnostics_path(&home.path().join(".tianshu-relay"), Some("   ")).unwrap(),
+            resolve_diagnostics_path(&home.path().join(".tianshu-relay"), None).unwrap()
         );
     }
 
@@ -3961,12 +4039,16 @@ mod tests {
     #[test]
     fn diagnostics_allows_overwriting_a_regular_file() {
         let home = tempfile::tempdir().expect("临时 home");
-        let exports = home.path().join(".keyrelay/exports");
+        let exports = home.path().join(".tianshu-relay/exports");
         std::fs::create_dir_all(&exports).expect("建导出目录");
-        let path = exports.join("keyrelay-diagnostics-3.json");
+        let path = exports.join("tianshu-relay-diagnostics-3.json");
         std::fs::write(&path, "{}").expect("先放一个普通文件");
         assert_eq!(
-            resolve_diagnostics_path(home.path(), Some(&path.display().to_string())).unwrap(),
+            resolve_diagnostics_path(
+                &home.path().join(".tianshu-relay"),
+                Some(&path.display().to_string())
+            )
+            .unwrap(),
             path
         );
     }
@@ -3977,21 +4059,26 @@ mod tests {
     #[test]
     fn bundle_requires_an_absolute_path_and_defaults_inside_the_exports_dir() {
         let home = tempfile::tempdir().expect("临时 home");
-        let err = resolve_bundle_path(home.path(), Some("keyrelay-export.json"), false)
-            .expect_err("相对路径必须被拒");
+        let err = resolve_bundle_path(
+            &home.path().join(".tianshu-relay"),
+            Some("tianshu-relay-export.json"),
+            false,
+        )
+        .expect_err("相对路径必须被拒");
         assert!(err.contains("绝对路径"), "文案: {err}");
 
-        let default = resolve_bundle_path(home.path(), None, false).expect("缺省路径");
+        let default = resolve_bundle_path(&home.path().join(".tianshu-relay"), None, false)
+            .expect("缺省路径");
         assert_eq!(
             default.parent().unwrap(),
-            home.path().join(".keyrelay/exports")
+            home.path().join(".tianshu-relay/exports")
         );
         assert!(default
             .file_name()
             .unwrap()
             .to_str()
             .unwrap()
-            .starts_with("keyrelay-export"));
+            .starts_with("tianshu-relay-export"));
     }
 
     /// ③ 已存在必须显式确认：不传 `overwrite` ⇒ 拒绝；`overwrite=true` ⇒ 放行。
@@ -4005,8 +4092,12 @@ mod tests {
         let target = dir.path().join("backup.json");
         std::fs::write(&target, "old").expect("先放一个已存在的文件");
 
-        let err = resolve_bundle_path(home.path(), Some(&target.display().to_string()), false)
-            .expect_err("已存在且未确认 ⇒ 必须拒绝");
+        let err = resolve_bundle_path(
+            &home.path().join(".tianshu-relay"),
+            Some(&target.display().to_string()),
+            false,
+        )
+        .expect_err("已存在且未确认 ⇒ 必须拒绝");
         assert!(err.contains("目标已存在"), "文案: {err}");
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
@@ -4015,16 +4106,24 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_bundle_path(home.path(), Some(&target.display().to_string()), true).unwrap(),
+            resolve_bundle_path(
+                &home.path().join(".tianshu-relay"),
+                Some(&target.display().to_string()),
+                true
+            )
+            .unwrap(),
             target,
             "显式确认后放行"
         );
 
         // 正向对照：**不**存在的目标无需确认
         let fresh = dir.path().join("fresh.json");
-        assert!(
-            resolve_bundle_path(home.path(), Some(&fresh.display().to_string()), false).is_ok()
-        );
+        assert!(resolve_bundle_path(
+            &home.path().join(".tianshu-relay"),
+            Some(&fresh.display().to_string()),
+            false
+        )
+        .is_ok());
     }
 
     /// ② 符号链接被拒（不跟随）。
@@ -4039,8 +4138,12 @@ mod tests {
         {
             let link = dir.path().join("link.json");
             std::os::unix::fs::symlink(&real, &link).expect("建符号链接");
-            let err = resolve_bundle_path(home.path(), Some(&link.display().to_string()), true)
-                .expect_err("符号链接必须被拒（哪怕显式确认）");
+            let err = resolve_bundle_path(
+                &home.path().join(".tianshu-relay"),
+                Some(&link.display().to_string()),
+                true,
+            )
+            .expect_err("符号链接必须被拒（哪怕显式确认）");
             assert!(err.contains("符号链接"), "文案: {err}");
         }
     }
@@ -4079,8 +4182,8 @@ mod tests {
     /// T8：只有 `AwaitingHuman` 允许提交；`Idle`（含「已被取消」）一律拒绝。
     #[test]
     fn captcha_submit_requires_the_awaiting_human_phase() {
-        use keyrelay_core::site::captcha::CaptchaPhase;
-        use keyrelay_core::site::CaptchaChallenge;
+        use tianshu_relay_core::site::captcha::CaptchaPhase;
+        use tianshu_relay_core::site::CaptchaChallenge;
         let awaiting = CaptchaPhase::AwaitingHuman {
             site_id: 1,
             challenge: CaptchaChallenge {

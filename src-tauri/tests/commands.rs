@@ -29,10 +29,12 @@ fn build_app() -> (
     tauri::App<tauri::test::MockRuntime>,
     tauri::WebviewWindow<tauri::test::MockRuntime>,
 ) {
-    let app =
-        keyrelay_lib::configure_with_state(mock_builder(), keyrelay_lib::init_state_in_memory())
-            .build(tauri::generate_context!())
-            .expect("构建 mock 应用");
+    let app = tianshu_relay_lib::configure_with_state(
+        mock_builder(),
+        tianshu_relay_lib::init_state_in_memory(),
+    )
+    .build(tauri::generate_context!())
+    .expect("构建 mock 应用");
     let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
         .build()
         .expect("构建 mock 窗口");
@@ -115,11 +117,20 @@ fn assert_not_acl_rejection(cmd: &str, err: &Value) {
 fn app_info_returns_expected_shape() {
     let value = invoke("app_info").expect("app_info 应成功");
 
-    assert_eq!(value["name"], "KeyRelay");
+    // M35-S1：产品名（中文）与新增的 dataDir / rebrand
+    assert_eq!(value["name"], "天枢 Relay");
     assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(value["siteCount"], 0);
     assert_eq!(value["dbPath"], ":memory:");
     assert!(value["dbError"].is_null(), "内存库不应带降级原因: {value}");
+    // 内存态：dataDir 是临时目录（存在），迁移状态 noLegacy
+    assert!(
+        value["dataDir"].as_str().is_some_and(|d| !d.is_empty()),
+        "dataDir 必须非空: {value}"
+    );
+    assert_eq!(value["rebrand"]["status"], "noLegacy", "{value}");
+    assert!(value["rebrand"]["to"].as_str().is_some(), "{value}");
+    assert!(value["rebrand"]["warnings"].is_array(), "{value}");
 }
 
 #[test]
@@ -157,7 +168,7 @@ fn unknown_command_is_rejected() {
 /// 参数缺失导致的业务错误不算失败（`detect_site` 需要 `base_url` 等）。
 #[test]
 fn every_declared_command_is_registered_and_allowed() {
-    for cmd in keyrelay_lib::commands_list::COMMANDS {
+    for cmd in tianshu_relay_lib::commands_list::COMMANDS {
         if let Err(err) = invoke(cmd) {
             assert_not_acl_rejection(cmd, &err);
         }
@@ -167,7 +178,7 @@ fn every_declared_command_is_registered_and_allowed() {
 #[test]
 fn capabilities_reference_every_declared_command() {
     let capabilities = include_str!("../capabilities/default.json");
-    for cmd in keyrelay_lib::commands_list::COMMANDS {
+    for cmd in tianshu_relay_lib::commands_list::COMMANDS {
         let permission = format!("allow-{}", cmd.replace('_', "-"));
         assert!(
             capabilities.contains(&permission),
@@ -233,8 +244,8 @@ fn detect_site_reaches_real_transport_layer() {
 /// ⇒ manual 断言红。
 #[test]
 fn resolved_proxy_url_reads_settings_mode_and_url() {
-    use keyrelay_core::store::Store;
-    use keyrelay_lib::resolved_proxy_url;
+    use tianshu_relay_core::store::Store;
+    use tianshu_relay_lib::resolved_proxy_url;
 
     let store = Store::open_in_memory().expect("内存库");
 
@@ -626,7 +637,7 @@ fn export_bundle_with_a_password_is_encrypted() {
     assert_eq!(value["encrypted"], true);
 
     let text = std::fs::read_to_string(&path).expect("读导出文件");
-    assert!(text.contains("keyrelay-export-v1"), "{text}");
+    assert!(text.contains("tianshu-relay-export-v1"), "{text}");
     assert!(!text.contains("\"sites\""), "密文里不该有明文结构");
 }
 
@@ -646,15 +657,16 @@ fn export_diagnostics_writes_a_package_and_registers_it_for_the_audit() {
     let (_app, webview) = build_app();
 
     let before = invoke_on(&webview, "audit_redaction", json!({})).expect("审计应成功");
-    // M16-S6a / P3-18：`path` 已收敛到「服务 home 下的 .keyrelay/exports + 文件名白名单」，
+    // M16-S6a / P3-18：`path` 已收敛到「服务 home 下的 .tianshu-relay/exports + 文件名白名单」，
     // 任意路径（含临时目录）会被拒。这里用**允许目录内的合法文件名**，顺带钉住收敛本身。
     let state = {
         use tauri::Manager;
-        webview.app_handle().state::<keyrelay_lib::AppState>()
+        webview.app_handle().state::<tianshu_relay_lib::AppState>()
     };
-    let exports = state.service.home().join(".keyrelay").join("exports");
+    // M35-S1：导出目录跟着**本次解析出的数据目录**走，不再按 home 硬拼新目录名
+    let exports = state.data_dir.join("exports");
     std::fs::create_dir_all(&exports).expect("建导出目录");
-    let path = exports.join("keyrelay-diagnostics-test.json");
+    let path = exports.join("tianshu-relay-diagnostics-test.json");
 
     let value = invoke_on(
         &webview,
@@ -729,7 +741,7 @@ fn refresh_all_reports_sites_that_need_a_login() {
     use tauri::Manager;
 
     let (_app, webview) = build_app();
-    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
     let store = state.service.store();
 
     let site = store
@@ -766,7 +778,7 @@ fn gateway_stop_then_start_on_the_same_port_succeeds() {
         probe.local_addr().expect("读端口").port()
     };
 
-    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
     let site = state
         .service
         .store()
@@ -835,7 +847,7 @@ fn gateway_stop_is_bounded_even_with_an_in_flight_request() {
         probe.local_addr().expect("读端口").port()
     };
 
-    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
     let site = state
         .service
         .store()
@@ -956,7 +968,7 @@ fn autostart_set_rejects_a_missing_argument() {
 fn rotation_plan_is_local_and_lists_the_fixed_three_steps() {
     use tauri::Manager;
     let (_app, webview) = build_app();
-    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
     let site = state
         .service
         .store()
@@ -1007,7 +1019,7 @@ fn rotate_key_reaches_the_business_path_without_a_session() {
     // 最后停在「没有会话」这条业务错误上。真正的网络路径由 core 层的
     // `tests/rotation_run.rs` 用假传输层覆盖。
     let (_app, webview) = build_app();
-    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
     let site = state
         .service
         .store()
@@ -1135,7 +1147,7 @@ fn gateway_rotate_token_refuses_mismatched_key_and_keeps_gateway_running() {
         probe.local_addr().expect("读端口").port()
     };
 
-    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
     let site = state
         .service
         .store()
@@ -1219,7 +1231,7 @@ fn gateway_rotate_token_restarts_the_running_gateway_with_the_new_token() {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("探端口");
         probe.local_addr().expect("读端口").port()
     };
-    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
     let site = state
         .service
         .store()
@@ -1377,7 +1389,7 @@ fn the_frontend_channel_list_matches_the_backend_channels_exactly() {
     }
     frontend.sort();
 
-    let mut backend: Vec<String> = keyrelay_core::delivery::DeliveryChannel::ALL
+    let mut backend: Vec<String> = tianshu_relay_core::delivery::DeliveryChannel::ALL
         .iter()
         .map(|channel| channel.as_str().to_string())
         .collect();
@@ -1399,15 +1411,15 @@ fn gateway_stop_drains_buffered_failures_into_the_event_log() {
     let (app, webview) = build_app();
     {
         use tauri::Manager;
-        let state = app.state::<keyrelay_lib::AppState>();
-        state
-            .service
-            .record_gateway_failure_for_test(keyrelay_core::gateway::GatewayFailure {
+        let state = app.state::<tianshu_relay_lib::AppState>();
+        state.service.record_gateway_failure_for_test(
+            tianshu_relay_core::gateway::GatewayFailure {
                 site_id: 1,
                 status: 503,
                 model: "gpt-5.6".into(),
                 reason: "上游返回可切换状态码 HTTP 503".into(),
-            });
+            },
+        );
     }
 
     invoke_on(&webview, "gateway_stop", json!({})).expect("停止应成功（没在跑也要幂等）");
@@ -1445,7 +1457,7 @@ fn list_channel_bindings_filters_out_unbound_rows() {
     use tauri::Manager;
 
     let (_app, webview) = build_app();
-    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
 
     let site = state
         .service
@@ -1547,7 +1559,7 @@ fn list_deliveries_returns_newest_first_with_camel_case_fields() {
     use tauri::Manager;
 
     let (_app, webview) = build_app();
-    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
 
     // 先占掉站点 id 1：否则全新内存库里 site = key = 1，`siteId` 与 `keyId` 互换也照样通过（复审 P2-3）
     state
@@ -1633,7 +1645,7 @@ fn report_ui_ready_writes_a_millisecond_timestamp_setting() {
     use tauri::Manager;
 
     let (_app, webview) = build_app();
-    let state = webview.app_handle().state::<keyrelay_lib::AppState>();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
     let store = state.service.store();
 
     // ① 调用之前不存在：这条命令的价值在于「前端显式调过」，自动写等于没证
@@ -1681,7 +1693,7 @@ fn check_agent_updates_returns_twenty_rows_in_specs_order() {
         .iter()
         .map(|row| row["channel"].as_str().expect("channel 必须是字符串"))
         .collect();
-    let expected: Vec<&str> = keyrelay_core::agents::specs()
+    let expected: Vec<&str> = tianshu_relay_core::agents::specs()
         .iter()
         .map(|spec| spec.channel)
         .collect();

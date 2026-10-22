@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keyrelay-core", "crates/keyrelay-cli", "src-tauri"]
+members = ["crates/tianshu-relay-core", "crates/tianshu-relay-cli", "src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,4 +9,4 @@ license = "MIT"
 rust-version = "1.89"
 
 [workspace.dependencies]
-keyrelay-core = { path = "crates/keyrelay-core" }
+tianshu-relay-core = { path = "crates/tianshu-relay-core" }

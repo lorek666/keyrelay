@@ -62,7 +62,7 @@ const NEEDLES = [
 // 两份文件曾写过一把 48 字符真 key，作者脱敏后 NEEDLES 全过，但「通用 `sk-` 形态」当时没守）。
 // 这条单独走**形态匹配**：`sk-` 后跟 ≥ 40 字符（A–Z、a–z、0–9、`-`、`_`）才算真 key。
 // 阈值 40 的理由：实测真 key 后缀 48 位；本仓库所有占位/mock key（`sk-0123…0123…`、
-// `sk-LEAK000…`、`sk-keyrelay-smoke-mock-…`、`sk-PROBE-…`、`sk-xupstream-header-leak-…`）
+// `sk-LEAK000…`、`sk-tianshu-relay-smoke-mock-…`、`sk-PROBE-…`、`sk-xupstream-header-leak-…`）
 // 后缀都 ≤ 36 位 ⇒ 阈值 40 把占位全放行、把真 key 全抓。
 const SECRET_SHAPE_NEEDLES = [
   {

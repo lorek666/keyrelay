@@ -9,7 +9,7 @@
  *
  * 用法：
  *   node scripts/check-mut-isolation.mjs
- *   node scripts/check-mut-isolation.mjs --run -- cargo test -p keyrelay-core --test <目标>
+ *   node scripts/check-mut-isolation.mjs --run -- cargo test -p tianshu-relay-core --test <目标>
  *   node scripts/check-mut-isolation.mjs --target-dir /tmp/mut-target --run -- cargo test …
  *
  * 退出码：0 = 隔离成立且无残留；1 = target 与别的 worktree 共享 / 有残留 / 子命令非 0 / 用法错误
@@ -321,7 +321,7 @@ if (sharing.length > 0) {
       "「旧代码 + 新测试」会报全部通过——结论反转（B-38）。",
   );
   console.error("  做法：给变异探针一个隔离目录，例如");
-  console.error("    CARGO_TARGET_DIR=/tmp/mut-target cargo test -p keyrelay-core --test <目标>");
+  console.error("    CARGO_TARGET_DIR=/tmp/mut-target cargo test -p tianshu-relay-core --test <目标>");
   process.exit(1);
 }
 ok(`有效 target 与另外 ${others.length} 个 worktree 的 target/ 都不重合`);
@@ -354,7 +354,7 @@ const isolated = realpathSoft(
       // 放在仓库里会让「跑一次变异」本身把工作区弄脏 —— 而 `check-clean-gate.mjs`
       // 与 PROCESS.md §3 又要求门禁只在干净树上取数。两个守护互相打架，
       // 结果是操作者要么手工删目录、要么被迫用 `--allow-dirty` 降低取数可信度。
-      join(tmpdir(), `keyrelay-mut-target-${process.pid}`),
+      join(tmpdir(), `tianshu-relay-mut-target-${process.pid}`),
 );
 const isolatedSharing = others.filter((other) => sharesTargetWith(other, isolated));
 if (isolatedSharing.length > 0) {

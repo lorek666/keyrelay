@@ -19,7 +19,7 @@
     "rateFree": "免费"
   },
   "nav": {
-    "brand": "KeyRelay",
+    "brand": "天枢 Relay",
     "group": {
       "daily": "日常",
       "asset": "资产",
@@ -44,7 +44,7 @@
     },
     "siteFilter": "站点",
     "allSites": "全部站点",
-    "scopeHint": "Token 只统计经 KeyRelay 本地网关转发的请求（agent 直连站点的不在此列）；余额来自每轮刷新写入的快照。",
+    "scopeHint": "Token 只统计经 天枢 Relay 本地网关转发的请求（agent 直连站点的不在此列）；余额来自每轮刷新写入的快照。",
     "siteFallback": "站点 {id}",
     "unknownModel": "未知模型",
     "loading": "加载中…",
@@ -168,11 +168,21 @@
     "runState": {
       "title": "运行状态",
       "mode": "运行模式",
+      "dataDir": "数据目录",
       "db": "本地数据库",
       "version": "版本",
       "vault": "本地加密保险库",
       "modeTauri": "Tauri（已连接后端）",
       "modeBrowser": "浏览器预览（未连接后端）"
+    },
+    "rebrand": {
+      "migratedTitle": "已从旧版迁移数据",
+      "migratedBody": "已把 {files} 个文件（{bytes} 字节）从 {from} 复制到 {to}；旧目录原样保留（历史回滚可能仍引用它），请勿删除。",
+      "failedTitle": "旧数据迁移失败",
+      "failedBody": "迁移旧数据失败：{error}。本次继续使用 {dataDir}，没有改动任何旧文件。",
+      "targetTitle": "新数据目录已有内容",
+      "targetBody": "新目录 {to} 已有内容，本次没有执行迁移；旧目录保持原样。",
+      "warningsTitle": "提示"
     },
     "btn": {
       "refreshNow": "立即刷新全部站点",
@@ -198,11 +208,11 @@
     },
     "drift": {
       "title": "投递目标需要处理（{count}）",
-      "hint1Pre": "KeyRelay 不会自动覆盖外部改动。要恢复请到「Agent 投递」页重新投递。被删掉的目标（",
+      "hint1Pre": "天枢 Relay 不会自动覆盖外部改动。要恢复请到「Agent 投递」页重新投递。被删掉的目标（",
       "hint1Mid": "）也可以到「变更历史」页回滚那次投递，恢复成投递之前的内容；被外部改过的（",
       "hint1Post": "）回滚会被拒绝——回滚不会覆盖别人的改动。",
       "hint2Pre": "你自己回滚过的目标也会出现在这里",
-      "hint2Post": "：回滚后文件不再是 KeyRelay 最后一次投递写入的内容，漂移检测照样会报（「变更历史」页里对应那一行标着「已回滚」）。这种情况不要重新投递——那等于撤销回滚；不想再让 KeyRelay 管它，到「Agent 投递」页解绑对应的 agent。",
+      "hint2Post": "：回滚后文件不再是 天枢 Relay 最后一次投递写入的内容，漂移检测照样会报（「变更历史」页里对应那一行标着「已回滚」）。这种情况不要重新投递——那等于撤销回滚；不想再让 天枢 Relay 管它，到「Agent 投递」页解绑对应的 agent。",
       "hint3Pre": "标记为 ",
       "hint3Mid1": " 的目标",
       "hint3Mid2": "文件还在",
@@ -244,9 +254,9 @@
     "hint": {
       "fingerprint": "只会调用站点的公开状态接口做指纹识别；登录凭证不落库，只进本地加密保险库。",
       "captchaTitle": "需要人机验证：{name}",
-      "captchaBody": "该站点要求人机验证。KeyRelay 不绕过验证码——请点下面的按钮打开站点官方页面，由您自己完成登录与验证；过完之后回到这里点「我已过完，接上会话」。窗口里的页面是站点自己的页面，我们不会替您点击、也不会读取页面内容。",
-      "captchaUnsupportedBody": "该站点要求人机验证，但它的会话基于访问令牌（Bearer）而非 Cookie——KeyRelay 的 WebView 兜底抓不到这种会话。请改用 API 密钥直连，或在上方表单完成登录后重试。",
-      "captchaBearerBody": "该站点要求人机验证。请在打开的官方页面里完成登录（包括验证码）；KeyRelay 会读取站点自己保存的登录凭据来接入会话——只读取这份凭据存储，不读取页面文本或输入框、不替您点击、也不绕过验证码。登录完成后回到这里点「我已登录」。凭据不会显示在界面上，也不会写进日志。"
+      "captchaBody": "该站点要求人机验证。天枢 Relay 不绕过验证码——请点下面的按钮打开站点官方页面，由您自己完成登录与验证；过完之后回到这里点「我已过完，接上会话」。窗口里的页面是站点自己的页面，我们不会替您点击、也不会读取页面内容。",
+      "captchaUnsupportedBody": "该站点要求人机验证，但它的会话基于访问令牌（Bearer）而非 Cookie——天枢 Relay 的 WebView 兜底抓不到这种会话。请改用 API 密钥直连，或在上方表单完成登录后重试。",
+      "captchaBearerBody": "该站点要求人机验证。请在打开的官方页面里完成登录（包括验证码）；天枢 Relay 会读取站点自己保存的登录凭据来接入会话——只读取这份凭据存储，不读取页面文本或输入框、不替您点击、也不绕过验证码。登录完成后回到这里点「我已登录」。凭据不会显示在界面上，也不会写进日志。"
     },
     "list": {
       "title": "已接入（{count}）",
@@ -350,7 +360,7 @@
     "emptyStates": {
       "loadingKeys": "加载中…",
       "keysError": "读取失败：{error}",
-      "noKeys": "KeyRelay 本地还没有密钥。点「新建密钥」——新建成功后密钥会直接进本地加密保险库。",
+      "noKeys": "天枢 Relay 本地还没有密钥。点「新建密钥」——新建成功后密钥会直接进本地加密保险库。",
       "noSiteKeys": "这个站点下还没有本地密钥（其他站点共 {count} 把，切换上面的站点查看）。"
     },
     "footnote": "密钥明文只存在于本地加密保险库里；后端从不把明文返回给界面。投递时用的是上表的「本地 id」。",
@@ -361,7 +371,7 @@
       "body": "新建成功后密钥会直接写入本地加密保险库，界面只显示末 4 位。请自行确认这把钥匙的用途。",
       "nameLabel": "名称",
       "namePlaceholderSuggesting": "正在生成默认名…",
-      "namePlaceholder": "keyrelay/agent/yyyymmdd",
+      "namePlaceholder": "tianshu-relay/agent/yyyymmdd",
       "nameHintPre": "默认名按 ",
       "nameHintMid": " 生成，日期用你本机的今天。它只是标签：可以改成任何你认得出的名字。",
       "groupLabel": "分组（可选）",
@@ -571,7 +581,7 @@
     },
     "unbind": {
       "title": "解绑",
-      "bodyPre": "解绑只解除 KeyRelay 与本机 agent 配置的绑定关系，",
+      "bodyPre": "解绑只解除 天枢 Relay 与本机 agent 配置的绑定关系，",
       "bodyStrong": "不会",
       "bodyPost": "动站点侧那把 key，也不会删除本地的密钥记录——解绑之后该目标不再出现在「配置漂移」里，历史仍可查。",
       "agentLine": "agent = {agent}",
@@ -613,7 +623,7 @@
       "title": "解绑 {agent}",
       "confirming": "处理中…",
       "confirm": "解绑",
-      "bodyPre": "解绑只解除 KeyRelay 与本机 agent 配置的绑定关系，",
+      "bodyPre": "解绑只解除 天枢 Relay 与本机 agent 配置的绑定关系，",
       "bodyStrong": "不会",
       "bodyPost": "动站点侧那把 key。已写入的文件内容保持不变，之后仍可用「变更历史」页回滚那次投递。",
       "alsoRevokePre": "同时回收站点侧的这把 key（",
@@ -642,7 +652,7 @@
     },
     "install": {
       "title": "安装 {name}",
-      "hint": "把下面的命令复制到终端执行。KeyRelay 不会自动运行任何命令，也不会替你安装。",
+      "hint": "把下面的命令复制到终端执行。天枢 Relay 不会自动运行任何命令，也不会替你安装。",
       "copy": "复制",
       "copied": "已复制",
       "copyFailed": "复制失败",
@@ -704,7 +714,7 @@
     "loading": "加载中…",
     "autorefresh": {
       "title": "自动刷新",
-      "body": "默认关闭：KeyRelay 不会替你做任何定时联网。开启后会在后台按间隔刷新已登录站点的余额与密钥列表，失败只记事件、不打断循环。",
+      "body": "默认关闭：天枢 Relay 不会替你做任何定时联网。开启后会在后台按间隔刷新已登录站点的余额与密钥列表，失败只记事件、不打断循环。",
       "off": "关闭",
       "min5": "5 分钟",
       "min15": "15 分钟",
@@ -749,7 +759,7 @@
       "body": "余额低于阈值、会话失效、密钥到期与配置漂移会走这里的渠道。通知正文不含密钥，也不含站点返回的原始文案。",
       "system": "系统通知（macOS 通知中心 / Windows Toast）",
       "webhookUrl": "Webhook 地址（留空 = 不启用）",
-      "webhookPlaceholder": "https://hooks.example.com/keyrelay",
+      "webhookPlaceholder": "https://hooks.example.com/tianshu-relay",
       "webhookTimeout": "Webhook 超时（秒，上限 60）",
       "webhookHintPre": "地址里如果内嵌了凭证（",
       "webhookHintCode": "https://user:pass@…",
@@ -904,7 +914,7 @@
       "persistent": "已存入本地加密保险库",
       "temporary": "临时（加密库不可用）——重启后会变"
     },
-    "hint": "把地址与令牌填进 agent 的配置即可；也可以到「Agent 投递」页把通道勾上「指向本地网关」，让 KeyRelay 替你写。",
+    "hint": "把地址与令牌填进 agent 的配置即可；也可以到「Agent 投递」页把通道勾上「指向本地网关」，让 天枢 Relay 替你写。",
     "persistentHint": "令牌存在本地加密保险库里，跨重启不变——所以换站时只要重启网关，agent 侧不用改（它的配置里写的是网关地址与这个令牌）。",
     "temporaryHintPre": "这次用的是",
     "temporaryHintStrong": "临时令牌",
@@ -916,7 +926,7 @@
       "start": "启动网关",
       "starting": "启动中…"
     },
-    "copied": "已复制到剪贴板，可能被剪贴板历史记录（系统或其他应用）带走。KeyRelay 不会自动清空剪贴板——那会跟你自己的复制操作打架。",
+    "copied": "已复制到剪贴板，可能被剪贴板历史记录（系统或其他应用）带走。天枢 Relay 不会自动清空剪贴板——那会跟你自己的复制操作打架。",
     "rotatedWarn": "已换新令牌：旧令牌立即失效，指向网关的通道需要重新投递一次，agent 需要重启才能读到新配置。",
     "rotateConfirm": "重新生成网关令牌？旧令牌立即失效，指向网关的通道需要重新投递一次。",
     "stopBtn": "停止网关",
@@ -974,9 +984,9 @@
   "rollback": {
     "aftermath": {
       "title": "回滚之后还有三件事要知道（回滚只还原文件，不动绑定）：",
-      "drift": "「总览」会一直把这个目标列为「需要处理」，每打开一次总览还会记一条「外部改动」告警——文件已经不是 KeyRelay 最后一次投递写入的内容，这是预期的，不要据此重新投递（那等于撤销这次回滚）。",
-      "rotation": "轮换这把密钥时这个文件会被重新写入；批量改指网关时它也仍在候选里。如果这次回滚把文件还原成了更早一次投递写下的**另一把**密钥：之后轮换或回收那把密钥时，KeyRelay 不会重写这个文件，做完要回来给它投递一把仍然有效的密钥，否则 agent 会留在一把已被回收的密钥上。",
-      "unbind": "不想再让 KeyRelay 管它，到「Agent 投递」页解绑 {agent}。"
+      "drift": "「总览」会一直把这个目标列为「需要处理」，每打开一次总览还会记一条「外部改动」告警——文件已经不是 天枢 Relay 最后一次投递写入的内容，这是预期的，不要据此重新投递（那等于撤销这次回滚）。",
+      "rotation": "轮换这把密钥时这个文件会被重新写入；批量改指网关时它也仍在候选里。如果这次回滚把文件还原成了更早一次投递写下的**另一把**密钥：之后轮换或回收那把密钥时，天枢 Relay 不会重写这个文件，做完要回来给它投递一把仍然有效的密钥，否则 agent 会留在一把已被回收的密钥上。",
+      "unbind": "不想再让 天枢 Relay 管它，到「Agent 投递」页解绑 {agent}。"
     }
   }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生成 KeyRelay 的图标集（M4-S1）。
+"""生成 天枢 Relay 的图标集（M4-S1）。
 
 设计：深色圆角底 + 一把钥匙（环 + 齿）+ 一条「中继」弧线。
 全部用 Pillow 画，**确定性**（无随机数、无外部素材），可重复运行得到同样的字节。
@@ -108,7 +108,7 @@ def main() -> None:
     master.resize((256, 256), Image.LANCZOS).save(f"{OUT}/128x128@2x.png")
 
     # macOS 打包用：iconutil 要求一个 .iconset 目录
-    iconset = "/tmp/keyrelay.iconset"
+    iconset = "/tmp/tianshu-relay.iconset"
     os.makedirs(iconset, exist_ok=True)
     for name, px in (
         ("icon_16x16", 16),

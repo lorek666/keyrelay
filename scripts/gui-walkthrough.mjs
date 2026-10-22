@@ -21,7 +21,7 @@ function parseArgs(argv) {
     report: "./gui-walkthrough-report.json",
     timeout: 30000,
     fixture: "http://127.0.0.1:18999/login",
-    binary: "src-tauri/target/release/keyrelay",
+    binary: "src-tauri/target/release/tianshu-relay",
     force: false,
   };
   for (let i = 2; i < argv.length; i++) {
