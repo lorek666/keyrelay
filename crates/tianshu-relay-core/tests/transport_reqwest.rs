@@ -128,7 +128,7 @@ async fn get_sends_method_path_and_user_agent() {
     );
     let lower = raw.to_lowercase();
     assert!(
-        lower.contains("user-agent: tianshu-relay/"),
+        lower.contains("user-agent: tianshurelay/"),
         "缺少 UA: {raw}"
     );
 }

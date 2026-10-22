@@ -30,7 +30,7 @@ fn binding() -> Binding {
         base_url: "https://newapi.example.com".into(),
         api_key: "sk-must-not-be-written".into(),
         model: Some("gpt-5.6".into()),
-        provider_id: "tianshu-relay".into(),
+        provider_id: "keyrelay".into(),
     }
 }
 
@@ -46,9 +46,7 @@ fn roundtrip_restores_original_bytes_and_keeps_user_content() {
     assert_eq!(patches.len(), 1);
 
     // 计划里必须包含受管键，且不含用户原有 provider 的破坏
-    assert!(patches[0]
-        .after
-        .contains("model_provider = \"tianshu-relay\""));
+    assert!(patches[0].after.contains("model_provider = \"keyrelay\""));
     assert!(patches[0].after.contains("[model_providers.my-own]"));
     assert!(patches[0].after.contains("notify = ["));
     assert!(patches[0].after.contains("# 用户自己的注释"));
