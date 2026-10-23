@@ -1,5 +1,6 @@
 //! 站点适配器契约与共享类型。
 
+pub mod billing;
 pub mod capability;
 pub mod captcha;
 pub mod custom_openai;
@@ -307,6 +308,9 @@ pub struct KeyDailyUsage {
     pub output_tokens: i64,
     pub total_tokens: i64,
     pub cost: f64,
+    /// M43-S2：站点**是否真的给了** `cost`。`false` ⇒ `cost` 只是占位 0，
+    /// 读侧必须当「未知」而不是「免费」（spec §6.1）。
+    pub cost_reported: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

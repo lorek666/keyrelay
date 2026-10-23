@@ -13,6 +13,8 @@ fn sample(date: &str, cost: f64) -> KeyDailyUsage {
         output_tokens: 50,
         total_tokens: 150,
         cost,
+        // M43-S2：夹具是「站点上报了 cost」的形态（缺字段的形态由 m43s2_cost 覆盖）。
+        cost_reported: true,
     }
 }
 

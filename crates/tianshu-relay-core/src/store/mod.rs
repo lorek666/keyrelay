@@ -16,7 +16,7 @@ use crate::site::KeyStatus;
 ///
 /// 版本号只是「将来需要非幂等迁移」的锚点：新表由每次打开的幂等 `DDL` 建出。
 /// M39-S1 之后下一个用版本号的是 M40-S1（顺延为 8）。
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// 「已回收」——**本地**密钥生命周期状态（M7-S4 / FR-2）。
 ///
@@ -261,6 +261,33 @@ CREATE TABLE IF NOT EXISTS site_model_sync(
   empty_streak INTEGER NOT NULL DEFAULT 0,
   last_error TEXT
 );
+-- M43-S2：模型单价表。同一 (model, currency, effective_from) 唯一（= 一个价格版本）。
+CREATE TABLE IF NOT EXISTS model_prices(
+  id               INTEGER PRIMARY KEY,
+  model            TEXT    NOT NULL,
+  input_per_mtok   REAL    NOT NULL,
+  output_per_mtok  REAL    NOT NULL,
+  currency         TEXT    NOT NULL,
+  effective_from   INTEGER NOT NULL,
+  created_at       INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_model_prices_version
+  ON model_prices(model, currency, effective_from);
+CREATE INDEX IF NOT EXISTS idx_model_prices_model
+  ON model_prices(model, currency, effective_from DESC);
+-- M43-S2：站点自报账单（只读导入结果；**不含任何原始日志正文**）。
+CREATE TABLE IF NOT EXISTS site_bills(
+  id         INTEGER PRIMARY KEY,
+  site_id    INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  day        TEXT    NOT NULL,
+  amount     REAL,
+  currency   TEXT,
+  requests   INTEGER,
+  source     TEXT    NOT NULL,
+  fetched_at INTEGER NOT NULL,
+  UNIQUE(site_id, day, source)
+);
+CREATE INDEX IF NOT EXISTS idx_site_bills_site_day ON site_bills(site_id, day DESC);
 "#;
 
 fn now_secs() -> i64 {
@@ -535,7 +562,8 @@ pub struct UsageSampleRow {
 ///
 /// `date` 是**本地时区**的 `YYYY-MM-DD`（`date(ts,'unixepoch','localtime')`）；
 /// `model` 保留空串作为独立分组（网关没解析出模型名时），前端显示「未知模型」。
-#[derive(Clone, Debug, PartialEq, Eq)]
+// 注意：`estimated_cost: Option<f64>` ⇒ 不能 derive `Eq`（浮点没有全序等式）。
+#[derive(Clone, Debug, PartialEq)]
 pub struct UsageDailyRow {
     pub date: String,
     pub site_id: i64,
@@ -548,6 +576,14 @@ pub struct UsageDailyRow {
     pub token_id: Option<i64>,
     /// M43-S1：认证当时的标签快照；`''` = 未归因（旧数据）
     pub agent_label: String,
+    /// M43-S2：本组命中的**价格币种**（同一模型若在不同时段命中不同币种的价格，
+    /// 会按币种**拆成多行**）。行级合计按 `ROUND(单条成本, 6)` 再求和（§4.6）。
+    pub currency: Option<String>,
+    /// M43-S2：本组里**能定价**的用量合计；`None` = 整组都没有价格（未知，不是 0）。
+    pub estimated_cost: Option<f64>,
+    /// M43-S2：本组里**没有价格**的请求数与 token 数（>0 ⇒ 界面标「部分未定价」）。
+    pub unpriced_requests: i64,
+    pub unpriced_tokens: i64,
 }
 
 /// M43-S1：一条 Agent 网关令牌。**只有 hash，没有明文**。
@@ -583,6 +619,45 @@ pub struct UsageSnapshotDailyRow {
     pub samples: i64,
 }
 
+/// M43-S2：一个价格版本（`model_prices` 的一行）。**纯数据**，供 `usage_cost` 纯函数消费。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelPriceRow {
+    pub id: i64,
+    pub model: String,
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    /// `"USD"` | `"CNY"`
+    pub currency: String,
+    pub effective_from: i64,
+    pub created_at: i64,
+}
+
+/// M43-S2：一行站点自报账单。`amount` / `currency` 为 `None` = 站点没给（**不是 0**）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct SiteBillRow {
+    pub id: i64,
+    pub site_id: i64,
+    pub day: String,
+    pub amount: Option<f64>,
+    pub currency: Option<String>,
+    pub requests: Option<i64>,
+    /// `"newapi-log-self"` | `"sub2api-usage-daily"`
+    pub source: String,
+    pub fetched_at: i64,
+}
+
+/// M43-S2：按 agent（`agent_label` 快照）× 币种的成本聚合。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentUsageRow {
+    pub agent_label: String,
+    pub currency: Option<String>,
+    pub requests: i64,
+    pub total_tokens: i64,
+    /// `None` = 该组全部行都没有价格。
+    pub estimated_cost: Option<f64>,
+    pub unpriced_requests: i64,
+}
+
 /// M34-S1：`usage_samples` 按 key 汇总的一行（join `keys` 取名字与币种）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct KeyUsageTotalRow {
@@ -593,7 +668,9 @@ pub struct KeyUsageTotalRow {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
-    pub cost: f64,
+    /// M43-S2：站点自报成本的合计；**`None` = 所有行都没上报**（不是 0——`cost_reported = 0`
+    /// 表示站点没给这个字段，与「真的是 0」不可分，见 spec §6.1）。
+    pub cost: Option<f64>,
     /// `keys.currency`；未记录时为 `None`（不猜币种，与 `Balance.known` 同纪律）。
     pub currency: Option<String>,
 }
@@ -1005,6 +1082,15 @@ impl Store {
             [],
         )
         .map_err(|e| Error::Store(format!("建 gateway_usage_token 索引失败: {e}")))?;
+        // M43-S2（SCHEMA_VERSION 9 → 10）：站点自报 cost 的「有没有上报」标记。
+        // 老行取 0 = **未上报**（不是「真的 0」）；读侧据此显示「未知」，**不回填**
+        //（回填是推断不是观测，与 probe_runs.status 同一条纪律）。
+        add_column_if_missing(
+            &conn,
+            "usage_samples",
+            "cost_reported",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         // 版本号仍然只在升级时写，保留它作为「将来需要非幂等迁移」的锚点。
         if version < SCHEMA_VERSION {
@@ -2302,16 +2388,31 @@ impl Store {
         let cutoff = local_day_start(&conn, days - 1)?;
         let mut stmt = conn
             .prepare(
-                "SELECT date(at, 'unixepoch', 'localtime') AS d, site_id, model,
+                // M43-S2：按**行级**关联「不晚于该行 at 的最新价格版本」，再按币种分组。
+                // `p.currency` 为 NULL = 该行没有可用价格（旧行 / 未配价 / 币种不符）。
+                "SELECT date(u.at, 'unixepoch', 'localtime') AS d, u.site_id, u.model,
                         COUNT(*),
-                        COALESCE(SUM(prompt_tokens), 0),
-                        COALESCE(SUM(completion_tokens), 0),
-                        COALESCE(SUM(total_tokens), 0),
-                        token_id, agent_label
-                 FROM gateway_usage_log
-                 WHERE at >= ?1 AND (?2 IS NULL OR site_id = ?2)
-                 GROUP BY d, site_id, model, token_id, agent_label
-                 ORDER BY d ASC, site_id ASC, model ASC, agent_label ASC",
+                        COALESCE(SUM(u.prompt_tokens), 0),
+                        COALESCE(SUM(u.completion_tokens), 0),
+                        COALESCE(SUM(u.total_tokens), 0),
+                        u.token_id, u.agent_label,
+                        p.currency,
+                        CASE WHEN p.currency IS NULL THEN NULL ELSE
+                          ROUND(SUM(ROUND(u.prompt_tokens / 1000000.0 * p.input_per_mtok
+                                       + u.completion_tokens / 1000000.0 * p.output_per_mtok, 6)), 6)
+                        END,
+                        SUM(CASE WHEN p.currency IS NULL THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN p.currency IS NULL THEN u.total_tokens ELSE 0 END)
+                 FROM gateway_usage_log u
+                 LEFT JOIN model_prices p
+                   ON p.model = u.model
+                  AND p.effective_from = (
+                        SELECT MAX(q.effective_from) FROM model_prices q
+                         WHERE q.model = u.model AND q.effective_from <= u.at
+                      )
+                 WHERE u.at >= ?1 AND (?2 IS NULL OR u.site_id = ?2)
+                 GROUP BY d, u.site_id, u.model, u.token_id, u.agent_label, p.currency
+                 ORDER BY d ASC, u.site_id ASC, u.model ASC, u.agent_label ASC, p.currency ASC",
             )
             .map_err(|e| Error::Store(format!("prepare usage daily: {e}")))?;
         let rows = stmt
@@ -2326,11 +2427,201 @@ impl Store {
                     total_tokens: row.get(6)?,
                     token_id: row.get(7)?,
                     agent_label: row.get(8)?,
+                    currency: row.get(9)?,
+                    estimated_cost: row.get(10)?,
+                    unpriced_requests: row.get(11)?,
+                    unpriced_tokens: row.get(12)?,
                 })
             })
             .map_err(|e| Error::Store(format!("query usage daily: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Store(format!("collect usage daily: {e}")))
+    }
+
+    /// M43-S2：按 agent（认证时的 label 快照）× 币种聚合成本。
+    ///
+    /// 与 [`Self::usage_daily`] 同一套价格关联口径（行级 `effective_from <= at` 取最大，按币种拆行）。
+    pub fn usage_by_agent(&self, days: i64) -> Result<Vec<AgentUsageRow>> {
+        let days = clamp_usage_days(days);
+        let conn = self.lock()?;
+        let cutoff = local_day_start(&conn, days - 1)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT u.agent_label, p.currency,
+                        COUNT(*),
+                        COALESCE(SUM(u.total_tokens), 0),
+                        CASE WHEN p.currency IS NULL THEN NULL ELSE
+                          ROUND(SUM(ROUND(u.prompt_tokens / 1000000.0 * p.input_per_mtok
+                                       + u.completion_tokens / 1000000.0 * p.output_per_mtok, 6)), 6)
+                        END,
+                        SUM(CASE WHEN p.currency IS NULL THEN 1 ELSE 0 END)
+                 FROM gateway_usage_log u
+                 LEFT JOIN model_prices p
+                   ON p.model = u.model
+                  AND p.effective_from = (
+                        SELECT MAX(q.effective_from) FROM model_prices q
+                         WHERE q.model = u.model AND q.effective_from <= u.at
+                      )
+                 WHERE u.at >= ?1
+                 GROUP BY u.agent_label, p.currency
+                 ORDER BY u.agent_label ASC, p.currency ASC",
+            )
+            .map_err(|e| Error::Store(format!("prepare usage by agent: {e}")))?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok(AgentUsageRow {
+                    agent_label: row.get(0)?,
+                    currency: row.get(1)?,
+                    requests: row.get(2)?,
+                    total_tokens: row.get(3)?,
+                    estimated_cost: row.get(4)?,
+                    unpriced_requests: row.get(5)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("query usage by agent: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect usage by agent: {e}")))
+    }
+
+    // ======================================================== M43-S2：模型单价
+
+    /// 全部价格版本（按 model / currency / effective_from 降序）。
+    pub fn model_price_list(&self) -> Result<Vec<ModelPriceRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, model, input_per_mtok, output_per_mtok, currency, effective_from, created_at
+                 FROM model_prices ORDER BY model ASC, currency ASC, effective_from DESC",
+            )
+            .map_err(|e| Error::Store(format!("prepare model price list: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ModelPriceRow {
+                    id: row.get(0)?,
+                    model: row.get(1)?,
+                    input_per_mtok: row.get(2)?,
+                    output_per_mtok: row.get(3)?,
+                    currency: row.get(4)?,
+                    effective_from: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("query model price list: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect model price list: {e}")))
+    }
+
+    /// 写入一个价格版本：同一 `(model, currency, effective_from)` 已存在时**覆盖**价格。
+    ///
+    /// 校验在这一层再做一遍（命令层也校验）：模型名非空且 ≤128；两个单价**有限且 > 0**
+    /// （`0` 不是「免费」的合法表达——免费就不配价格）；币种只接受 `USD` / `CNY`。
+    pub fn model_price_upsert(
+        &self,
+        model: &str,
+        input_per_mtok: f64,
+        output_per_mtok: f64,
+        currency: &str,
+        effective_from: i64,
+    ) -> Result<i64> {
+        let model = model.trim();
+        if model.is_empty() || model.chars().count() > 128 {
+            return Err(Error::Store("模型名不能为空且不超过 128 字符".into()));
+        }
+        for (name, v) in [("input", input_per_mtok), ("output", output_per_mtok)] {
+            if !v.is_finite() || v <= 0.0 {
+                return Err(Error::Store(format!(
+                    "{name} 单价必须是有限的正数（每 1M token，单位与币种一致）"
+                )));
+            }
+        }
+        let currency = currency.trim().to_ascii_uppercase();
+        if currency != "USD" && currency != "CNY" {
+            return Err(Error::Store("币种只支持 USD / CNY（不做汇率换算）".into()));
+        }
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO model_prices(model, input_per_mtok, output_per_mtok, currency, effective_from, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(model, currency, effective_from)
+             DO UPDATE SET input_per_mtok = excluded.input_per_mtok,
+                           output_per_mtok = excluded.output_per_mtok,
+                           created_at = excluded.created_at",
+            params![model, input_per_mtok, output_per_mtok, currency, effective_from, now_secs()],
+        )
+        .map_err(|e| Error::Store(format!("写入模型单价失败: {e}")))?;
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM model_prices WHERE model = ?1 AND currency = ?2 AND effective_from = ?3",
+                params![model, currency, effective_from],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Store(format!("读回模型单价 id 失败: {e}")))?;
+        Ok(id)
+    }
+
+    /// 删除一个价格版本。**允许删除**（估算是展示层：删掉后该时段的成本变回「未知」）。
+    pub fn model_price_delete(&self, id: i64) -> Result<bool> {
+        let conn = self.lock()?;
+        let affected = conn
+            .execute("DELETE FROM model_prices WHERE id = ?1", params![id])
+            .map_err(|e| Error::Store(format!("删除模型单价失败: {e}")))?;
+        Ok(affected > 0)
+    }
+
+    // ======================================================== M43-S2：站点账单
+
+    /// 覆盖写入一天的站点账单（`UNIQUE(site_id, day, source)` 后者胜，不做历史快照）。
+    pub fn site_bill_upsert(
+        &self,
+        site_id: i64,
+        day: &str,
+        amount: Option<f64>,
+        currency: Option<&str>,
+        requests: Option<i64>,
+        source: &str,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO site_bills(site_id, day, amount, currency, requests, source, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(site_id, day, source)
+             DO UPDATE SET amount = excluded.amount,
+                           currency = excluded.currency,
+                           requests = excluded.requests,
+                           fetched_at = excluded.fetched_at",
+            params![site_id, day, amount, currency, requests, source, now_secs()],
+        )
+        .map_err(|e| Error::Store(format!("写入站点账单失败: {e}")))?;
+        Ok(())
+    }
+
+    /// 站点账单（近 `days` 天，按日倒序）。
+    pub fn site_bills(&self, days: i64) -> Result<Vec<SiteBillRow>> {
+        let days = clamp_usage_days(days);
+        let conn = self.lock()?;
+        let cutoff = local_day_ago(&conn, days - 1)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, site_id, day, amount, currency, requests, source, fetched_at
+                 FROM site_bills WHERE day >= ?1 ORDER BY day DESC, site_id ASC",
+            )
+            .map_err(|e| Error::Store(format!("prepare site bills: {e}")))?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok(SiteBillRow {
+                    id: row.get(0)?,
+                    site_id: row.get(1)?,
+                    day: row.get(2)?,
+                    amount: row.get(3)?,
+                    currency: row.get(4)?,
+                    requests: row.get(5)?,
+                    source: row.get(6)?,
+                    fetched_at: row.get(7)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("query site bills: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect site bills: {e}")))
     }
 
     /// M34-S1：近 `days` 天余额快照，按（本地日, 站点）聚合，每天取**最后一条**。
@@ -2403,7 +2694,7 @@ impl Store {
                         COALESCE(SUM(us.input_tokens), 0),
                         COALESCE(SUM(us.output_tokens), 0),
                         COALESCE(SUM(us.total_tokens), 0) AS total,
-                        COALESCE(SUM(us.cost), 0.0),
+                        SUM(CASE WHEN us.cost_reported = 1 THEN us.cost END),
                         k.currency
                  FROM usage_samples us
                  JOIN keys k ON k.id = us.key_id
@@ -2422,7 +2713,7 @@ impl Store {
                     input_tokens: row.get(4)?,
                     output_tokens: row.get(5)?,
                     total_tokens: row.get(6)?,
-                    cost: row.get(7)?,
+                    cost: row.get(7)?, // Option<f64>：全部未上报 ⇒ NULL
                     currency: row.get(8)?,
                 })
             })
@@ -2584,8 +2875,8 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT OR REPLACE INTO usage_samples
-             (key_id, site_id, date, requests, input_tokens, output_tokens, total_tokens, cost, sampled_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (key_id, site_id, date, requests, input_tokens, output_tokens, total_tokens, cost, sampled_at, cost_reported)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 key_id,
                 site_id,
@@ -2595,7 +2886,8 @@ impl Store {
                 sample.output_tokens,
                 sample.total_tokens,
                 sample.cost,
-                now_secs()
+                now_secs(),
+                if sample.cost_reported { 1 } else { 0 }
             ],
         )
         .map_err(|e| Error::Store(format!("upsert usage sample: {e}")))?;
@@ -3891,7 +4183,7 @@ mod tests {
                 (old.as_str(), 9, 900, 900, 9.0),
             ] {
                 conn.execute(
-                    "INSERT INTO usage_samples(key_id, site_id, date, requests, input_tokens, output_tokens, total_tokens, cost, sampled_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    "INSERT INTO usage_samples(key_id, site_id, date, requests, input_tokens, output_tokens, total_tokens, cost, sampled_at, cost_reported) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
                     params![key, site, date, requests, input, output, input + output, cost, now_secs()],
                 )
                 .unwrap();
@@ -3906,7 +4198,8 @@ mod tests {
         assert_eq!(rows[0].input_tokens, 110);
         assert_eq!(rows[0].output_tokens, 55);
         assert_eq!(rows[0].total_tokens, 165);
-        assert!((rows[0].cost - 0.6).abs() < 1e-9);
+        // M43-S2：`cost` 是 `Option<f64>`（`None` = 站点没上报）。该夹具**上报了** cost。
+        assert!((rows[0].cost.expect("已上报") - 0.6).abs() < 1e-9);
         assert_eq!(rows[0].currency.as_deref(), Some("USD"));
         // days=1 ⇒ 10 天前的采样按 `date` 被排除，只剩今天
         let today_rows = store.key_usage_totals(1, None).unwrap();
@@ -4052,7 +4345,7 @@ mod tests {
             .expect("造旧库");
         }
         let store = Store::open(&path).expect("重新打开");
-        assert_eq!(store.schema_version().unwrap(), 9, "M43-S1 之后是 v9");
+        assert_eq!(store.schema_version().unwrap(), 10, "M43-S2 之后是 v10");
         let conn = rusqlite::Connection::open(&path).expect("直连");
         for table in ["site_model_catalog", "site_model_sync"] {
             let n: i64 = conn
@@ -4313,7 +4606,10 @@ mod tests {
 
         let store = Store::open(&path).expect("重新打开 v7 旧库");
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 9, "M43-S1 占用 v9（M40-S1 占 v8）");
+        assert_eq!(
+            SCHEMA_VERSION, 10,
+            "M43-S2 占用 v10（M43-S1 占 v9、M40-S1 占 v8）"
+        );
         let columns = usage_columns(&store);
         for expected in ["at", "key_id", "status", "latency_ms", "attempts", "stream"] {
             assert!(
@@ -4338,19 +4634,19 @@ mod tests {
         // 重复打开幂等（不 duplicate column）。
         drop(store);
         let store = Store::open(&path).expect("再次打开");
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(store.schema_version().unwrap(), 10);
         assert_eq!(usage_columns(&store).len(), 15);
     }
 
     #[test]
     fn schema_v8_fresh_db_has_all_six_columns() {
         let store = Store::open_in_memory().expect("内存库");
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(store.schema_version().unwrap(), 10);
         let columns = usage_columns(&store);
         assert_eq!(
             columns.len(),
             15,
-            "15 列：id/ts/at/site_id/model/3 tokens/key_id/status/latency_ms/attempts/stream/token_id/agent_label"
+            "15 列：id/ts/at/site_id/model/3 tokens/key_id/status/latency_ms/attempts/stream/token_id/agent_label（cost_reported 在 usage_samples 上，不在本表）"
         );
         for expected in ["at", "key_id", "status", "latency_ms", "attempts", "stream"] {
             assert!(

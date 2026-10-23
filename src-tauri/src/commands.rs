@@ -1258,6 +1258,12 @@ pub struct UsageDailyDto {
     prompt_tokens: i64,
     completion_tokens: i64,
     total_tokens: i64,
+    /// M43-S2：本组命中的价格币种（同模型不同时段不同币种 ⇒ 拆成多行）。
+    currency: Option<String>,
+    /// M43-S2：能定价部分的估算成本；`None` = 整组都没有价格（未知，不是 0）。
+    estimated_cost: Option<f64>,
+    unpriced_requests: i64,
+    unpriced_tokens: i64,
 }
 
 /// M34-S1：站点余额快照按（本地日, 站点）聚合的一行（每天取最后一条）。
@@ -1283,7 +1289,8 @@ pub struct KeyUsageTotalDto {
     input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
-    cost: f64,
+    /// M43-S2：站点自报成本合计；`None` = 都没上报（不是 0）。
+    cost: Option<f64>,
     currency: Option<String>,
 }
 
@@ -1298,6 +1305,79 @@ pub struct UsageDashboardDto {
     daily: Vec<UsageDailyDto>,
     snapshots: Vec<UsageSnapshotDailyDto>,
     key_usage: Vec<KeyUsageTotalDto>,
+    /// M43-S2：按 agent × 币种的成本聚合（`agent_label = ''` = 未归因旧数据）。
+    by_agent: Vec<AgentUsageDto>,
+}
+
+/// M43-S2：按 agent（认证时的 label 快照）× 币种。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUsageDto {
+    agent_label: String,
+    currency: Option<String>,
+    requests: i64,
+    total_tokens: i64,
+    estimated_cost: Option<f64>,
+    unpriced_requests: i64,
+}
+
+/// M43-S2：一个价格版本。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPriceDto {
+    pub id: i64,
+    pub model: String,
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    pub currency: String,
+    pub effective_from: i64,
+    pub created_at: i64,
+}
+
+/// M43-S2：写入一个价格版本（`id` 由服务端生成）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPriceInputDto {
+    pub model: String,
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    pub currency: String,
+    pub effective_from: i64,
+}
+
+/// M43-S2：一行站点账单。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteBillDto {
+    pub id: i64,
+    pub site_id: i64,
+    pub day: String,
+    pub amount: Option<f64>,
+    pub currency: Option<String>,
+    pub requests: Option<i64>,
+    pub source: String,
+    pub fetched_at: i64,
+}
+
+/// M43-S2：账单能力探测结果。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BillProbeDto {
+    /// `"supported"` | `"unsupported"` | `"needsLogin"` | `"failed"`
+    pub status: String,
+    pub currency: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// M43-S2：导入结果。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteBillImportDto {
+    pub imported: usize,
+    pub pages: usize,
+    pub partial: bool,
+    pub currency: Option<String>,
+    pub currency_override_used: bool,
 }
 
 /// M34-S1：用量页数据（只读；不写库、不改采集口径）。
@@ -1321,6 +1401,9 @@ pub fn usage_dashboard(
     let key_usage = store
         .key_usage_totals(range_days, site_id)
         .map_err(|e| e.to_string())?;
+    let by_agent = store
+        .usage_by_agent(range_days)
+        .map_err(|e| e.to_string())?;
     Ok(UsageDashboardDto {
         range_days,
         site_id,
@@ -1334,6 +1417,10 @@ pub fn usage_dashboard(
                 prompt_tokens: row.prompt_tokens,
                 completion_tokens: row.completion_tokens,
                 total_tokens: row.total_tokens,
+                currency: row.currency,
+                estimated_cost: row.estimated_cost,
+                unpriced_requests: row.unpriced_requests,
+                unpriced_tokens: row.unpriced_tokens,
             })
             .collect(),
         snapshots: snapshots
@@ -1361,7 +1448,168 @@ pub fn usage_dashboard(
                 currency: row.currency,
             })
             .collect(),
+        by_agent: by_agent
+            .into_iter()
+            .map(|row| AgentUsageDto {
+                agent_label: row.agent_label,
+                currency: row.currency,
+                requests: row.requests,
+                total_tokens: row.total_tokens,
+                estimated_cost: row.estimated_cost,
+                unpriced_requests: row.unpriced_requests,
+            })
+            .collect(),
     })
+}
+
+// ============================================ M43-S2：模型单价与站点账单
+
+/// 全部价格版本（只读）。
+#[tauri::command]
+pub fn model_price_list(state: State<'_, AppState>) -> Result<Vec<ModelPriceDto>, String> {
+    state
+        .service
+        .store()
+        .model_price_list()
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| ModelPriceDto {
+                    id: r.id,
+                    model: r.model,
+                    input_per_mtok: r.input_per_mtok,
+                    output_per_mtok: r.output_per_mtok,
+                    currency: r.currency,
+                    effective_from: r.effective_from,
+                    created_at: r.created_at,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// 写入一个价格版本（同一 `(model, currency, effectiveFrom)` 覆盖价格）。
+#[tauri::command]
+pub fn model_price_upsert(
+    state: State<'_, AppState>,
+    price: ModelPriceInputDto,
+) -> Result<ModelPriceDto, String> {
+    let store = state.service.store();
+    let id = store
+        .model_price_upsert(
+            &price.model,
+            price.input_per_mtok,
+            price.output_per_mtok,
+            &price.currency,
+            price.effective_from,
+        )
+        .map_err(|e| e.to_string())?;
+    store
+        .model_price_list()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|r| r.id == id)
+        .map(|r| ModelPriceDto {
+            id: r.id,
+            model: r.model,
+            input_per_mtok: r.input_per_mtok,
+            output_per_mtok: r.output_per_mtok,
+            currency: r.currency,
+            effective_from: r.effective_from,
+            created_at: r.created_at,
+        })
+        .ok_or_else(|| "写入后读回价格版本失败".to_string())
+}
+
+/// 删除一个价格版本（估算是展示层：删掉后该时段成本变回「未知」）。
+#[tauri::command]
+pub fn model_price_delete(state: State<'_, AppState>, id: i64) -> Result<bool, String> {
+    state
+        .service
+        .store()
+        .model_price_delete(id)
+        .map_err(|e| e.to_string())
+}
+
+/// 只读探测站点账单能力（一次 GET，不写库）。
+#[tauri::command]
+pub async fn site_bill_probe(
+    state: State<'_, AppState>,
+    site_id: i64,
+) -> Result<BillProbeDto, String> {
+    use tianshu_relay_core::site::billing::BillProbe;
+    let probe = state.service.probe_site_billing(site_id).await;
+    Ok(match probe {
+        BillProbe::Supported { currency } => BillProbeDto {
+            status: "supported".to_string(),
+            currency,
+            reason: None,
+        },
+        BillProbe::Unsupported => BillProbeDto {
+            status: "unsupported".to_string(),
+            currency: None,
+            reason: None,
+        },
+        BillProbe::NeedsLogin => BillProbeDto {
+            status: "needsLogin".to_string(),
+            currency: None,
+            reason: None,
+        },
+        BillProbe::Failed { reason } => BillProbeDto {
+            status: "failed".to_string(),
+            currency: None,
+            reason: Some(reason),
+        },
+    })
+}
+
+/// 只读导入站点账单（分页上限 10 / 上限 20；`currency` 只填站点没给币种的洞）。
+#[tauri::command]
+pub async fn site_bill_import(
+    state: State<'_, AppState>,
+    site_id: i64,
+    max_pages: Option<usize>,
+    currency: Option<String>,
+) -> Result<SiteBillImportDto, String> {
+    let (outcome, _rows) = state
+        .service
+        .import_site_billing(site_id, max_pages, currency.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(SiteBillImportDto {
+        imported: outcome.imported,
+        pages: outcome.pages,
+        partial: outcome.partial,
+        currency: outcome.currency,
+        currency_override_used: outcome.currency_override_used,
+    })
+}
+
+/// 近 `days` 天的站点账单（只读）。
+#[tauri::command]
+pub fn site_bills(
+    state: State<'_, AppState>,
+    days: Option<i64>,
+) -> Result<Vec<SiteBillDto>, String> {
+    let days = tianshu_relay_core::store::clamp_usage_days(days.unwrap_or(30));
+    state
+        .service
+        .store()
+        .site_bills(days)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| SiteBillDto {
+                    id: r.id,
+                    site_id: r.site_id,
+                    day: r.day,
+                    amount: r.amount,
+                    currency: r.currency,
+                    requests: r.requests,
+                    source: r.source,
+                    fetched_at: r.fetched_at,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
 }
 
 // ============================================ 漂移 / 设置 / 刷新（M3-S1）
@@ -4560,6 +4808,10 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
+                currency: Some("USD".into()),
+                estimated_cost: Some(0.25),
+                unpriced_requests: 0,
+                unpriced_tokens: 0,
             }],
             snapshots: vec![UsageSnapshotDailyDto {
                 date: "2026-10-21".into(),
@@ -4577,8 +4829,16 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 total_tokens: 15,
-                cost: 0.25,
+                cost: Some(0.25),
                 currency: Some("USD".into()),
+            }],
+            by_agent: vec![AgentUsageDto {
+                agent_label: "codex".into(),
+                currency: Some("USD".into()),
+                requests: 4,
+                total_tokens: 15,
+                estimated_cost: Some(0.25),
+                unpriced_requests: 0,
             }],
         };
         let value = to_value(&dto);
@@ -4604,7 +4864,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
-            cost: 0.0,
+            cost: Some(0.0),
             currency: None,
         });
         assert!(

@@ -30,6 +30,7 @@ pub mod service;
 pub mod settings;
 pub mod site;
 pub mod store;
+pub mod usage_cost;
 pub mod vault;
 
 pub use error::{Error, Result, SecondFactorKind};

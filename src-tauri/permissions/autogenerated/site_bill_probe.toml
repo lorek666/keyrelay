@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-site-bill-probe"
+description = "Enables the site_bill_probe command without any pre-configured scope."
+commands.allow = ["site_bill_probe"]
+
+[[permission]]
+identifier = "deny-site-bill-probe"
+description = "Denies the site_bill_probe command without any pre-configured scope."
+commands.deny = ["site_bill_probe"]
