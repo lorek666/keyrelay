@@ -348,6 +348,10 @@ async fn m11_mode_single_when_route_is_empty() {
         handle.route_is_empty(),
         "legacy 单上游 ⇒ route 为空 ⇒ mode 应为 single"
     );
+    // spec §6.4：单上游 legacy ⇒ **恰好 1 条候选**（health 无数据可依 ⇒ unknown，不编造「健康」）
+    let cands = handle.candidates();
+    assert_eq!(cands.len(), 1, "legacy 单上游必须有且只有一条候选");
+    assert_eq!(cands[0].health, "unknown");
     handle.shutdown_and_wait().await;
 }
 
