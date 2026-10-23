@@ -574,6 +574,36 @@ fn gateway_status_is_stopped_on_a_fresh_install() {
     assert_eq!(value["token"], Value::Null);
 }
 
+/// M40-S2 / D1 + D2（stopped 分支）：新字段在 camelCase 下逐键存在，
+/// 且未运行时是**结构性空值**（不是编造的数字）。
+#[test]
+fn gateway_status_carries_m40s2_metrics_fields_in_camel_case() {
+    let value = invoke("gateway_status").expect("gateway_status 应成功");
+    for key in [
+        "mode",
+        "candidates",
+        "qps",
+        "requestsTotal",
+        "inflight",
+        "failoversTotal",
+        "lastError",
+        "generation",
+    ] {
+        assert!(value.get(key).is_some(), "缺字段 {key}: {value}");
+    }
+    assert!(
+        value.get("requests_total").is_none(),
+        "线上键必须是 camelCase：{value}"
+    );
+    assert_eq!(value["mode"], "stopped");
+    assert_eq!(value["candidates"], json!([]));
+    assert_eq!(value["requestsTotal"], 0);
+    assert_eq!(value["inflight"], 0);
+    assert_eq!(value["failoversTotal"], 0);
+    assert_eq!(value["lastError"], Value::Null);
+    assert_eq!(value["generation"], 0);
+}
+
 #[test]
 fn gateway_stop_is_idempotent() {
     let value = invoke("gateway_stop").expect("未运行时停止也应成功");

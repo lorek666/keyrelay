@@ -437,7 +437,41 @@ export type GatewayStatus = {
    * 这是**降级**，必须显示出来——不说的话用户会以为「换站零改动」成立了，直到 agent 开始 401。
    */
   tokenPersistent: boolean;
+  // —— M40-S2：内存指标（行名逐字对齐 M44 §4.3 / M40-S2 §4.2）——
+  /** **运行态**三值（不是设置值的回声）。 */
+  mode: "single" | "multi" | "stopped";
+  candidates: GatewayCandidate[];
+  /** 最近 60s 滑动；启动不足 3s 时为 0（UI 显示 `—`）。 */
+  qps: number;
+  requestsTotal: number;
+  inflight: number;
+  failoversTotal: number;
+  /** 已脱敏的最近错误；没有则为 null（UI 显示「无」）。 */
+  lastError: string | null;
+  generation: number;
 };
+
+export type GatewayCandidate = {
+  siteId: number;
+  /** 站点显示名（与站点列表同源；不是 base_url）。 */
+  displayName: string;
+  keyId: number | null;
+  health: "healthy" | "unknown" | "exhausted";
+  breaker: "closed" | "open" | "halfOpen" | "unknown";
+};
+
+/** M40-S2：未运行时的**结构性空值**（mock / 错误态复用；UI 不显示它们，见 spec §4.3）。 */
+const stoppedGatewayMetrics = () => ({
+  mode: "stopped" as const,
+  candidates: [] as GatewayCandidate[],
+  qps: 0,
+  requestsTotal: 0,
+  inflight: 0,
+  failoversTotal: 0,
+  lastError: null as string | null,
+  generation: 0,
+});
+
 
 /** 一次回收（站点侧删除）的回报（B-100）。 */
 export type RevokeReport = {
@@ -1437,6 +1471,16 @@ export async function gatewayStatus(): Promise<GatewayStatus> {
       token: null,
       site: null,
       tokenPersistent: false,
+      ...stoppedGatewayMetrics(),
+      // M40-S2：未运行时是**结构性空值**（UI 不显示它们，见 spec §4.3 空态表）
+      mode: "stopped" as const,
+      candidates: [],
+      qps: 0,
+      requestsTotal: 0,
+      inflight: 0,
+      failoversTotal: 0,
+      lastError: null,
+      generation: 0,
     });
   }
   return invokeCommand<GatewayStatus>("gateway_status");
@@ -1455,6 +1499,7 @@ export async function gatewayStart(
       token: "kr-gw-mock0000000000000000000000000",
       site: "示例中转站（mock）",  // i18n:skip
       tokenPersistent: true,
+      ...stoppedGatewayMetrics(),
     });
   }
   return invokeCommand<GatewayStatus>("gateway_start", {
@@ -1472,6 +1517,7 @@ export async function gatewayStop(): Promise<GatewayStatus> {
       token: null,
       site: null,
       tokenPersistent: false,
+      ...stoppedGatewayMetrics(),
     });
   }
   return invokeCommand<GatewayStatus>("gateway_stop");
@@ -1615,6 +1661,7 @@ export async function updateSettings(settings: Settings): Promise<SettingsUpdate
         token: null,
         site: null,
         tokenPersistent: false,
+      ...stoppedGatewayMetrics(),
       },
       gatewayError: null,
     });
@@ -1905,6 +1952,7 @@ export async function gatewayRotateToken(
       token: null,
       site: null,
       tokenPersistent: true,
+      ...stoppedGatewayMetrics(),
     });
   }
   return invokeCommand<GatewayStatus>("gateway_rotate_token", { args: args ?? null });

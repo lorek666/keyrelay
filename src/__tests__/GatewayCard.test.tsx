@@ -40,6 +40,15 @@ const status = (over: Partial<GatewayStatus> = {}): GatewayStatus => ({
   site: null,
   tokenPersistent: false,
   lastExit: null,
+  // M40-S2：未运行 ⇒ 结构性空值（UI 不显示它们）
+  mode: "stopped",
+  candidates: [],
+  qps: 0,
+  requestsTotal: 0,
+  inflight: 0,
+  failoversTotal: 0,
+  lastError: null,
+  generation: 0,
   ...over,
 });
 
@@ -132,5 +141,33 @@ describe("GatewayCard 三态（M41-S1）", () => {
     expect(phaseLine()!.textContent).toContain(
       zhCN.gateway.phase.reasonUnexpected,
     );
+  });
+});
+
+describe("M40-S2 网关指标面板", () => {
+  it("U1 未运行只显示占位，不渲染 0/空表（空态不显示假数据）", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(status());
+    renderCard();
+    expect(await screen.findByText("网关未运行，暂无指标。")).toBeInTheDocument();
+    expect(screen.queryByText("QPS（最近 60 秒）")).toBeNull();
+    expect(screen.queryByText("总请求数")).toBeNull();
+  });
+
+  it("U3 刚启动（requestsTotal<3）时 QPS 显示 —，不显示 0.0", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(
+      status({ running: true, phase: "running", requestsTotal: 1, qps: 0, mode: "single" }),
+    );
+    renderCard();
+    expect(await screen.findByText("QPS（最近 60 秒）")).toBeInTheDocument();
+    expect(screen.getByText("—")).toBeInTheDocument();
+  });
+
+  it("U5 运行中但无候选 ⇒ 显示「单上游模式」，不渲染空表", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(
+      status({ running: true, phase: "running", mode: "single", requestsTotal: 10, qps: 2.5 }),
+    );
+    renderCard();
+    expect(await screen.findByText("单上游模式：无候选列表。")).toBeInTheDocument();
+    expect(screen.queryByRole("table")).toBeNull();
   });
 });
