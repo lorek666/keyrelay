@@ -18,11 +18,16 @@ const ALLOWED: &[&str] = &[
 
 pub fn parse_request(v: &Value) -> Result<ChatRequest, TranslateError> {
     reject_unknown(v, ALLOWED, "Responses")?;
-    if let Some(tc) = v.get("tool_choice").and_then(|x| x.as_str()) {
-        if tc != "auto" && tc != "none" {
+    // (3) tool_choice：字符串 `auto`/`none` 与对象 `{"type":"auto"|"none"}` 都放行；其余 400 点名
+    if let Some(tc) = v.get("tool_choice") {
+        let kind = tc
+            .as_str()
+            .or_else(|| tc.get("type").and_then(|x| x.as_str()))
+            .unwrap_or("<未知>");
+        if kind != "auto" && kind != "none" {
             return Err(TranslateError::new(
                 "unsupported_field",
-                format!("Responses: 不支持字段 `tool_choice: {tc}`（只支持 auto/none）"),
+                format!("Responses: 不支持字段 `tool_choice: {kind}`（只支持 auto/none）"),
             ));
         }
     }
