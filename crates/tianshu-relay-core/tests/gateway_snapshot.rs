@@ -117,6 +117,7 @@ async fn post(handle: &GatewayHandle, token: &str) -> (u16, String) {
 fn upstream(site_id: i64, base_url: &str, key_ref: &str) -> Upstream {
     Upstream {
         site_id,
+        key_id: None,
         base_url: base_url.to_string(),
         key_ref: key_ref.to_string(),
         models: vec![MODEL.to_string()],
@@ -157,6 +158,9 @@ fn base_config(
         on_usage: None,
         upstream_proxy: None,
         legacy_key_ref: None,
+        // M39-S3：单候选 + 默认 guard（快照测试与负载均衡无关）
+        lb_top_n: 1,
+        guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
         runtime: None,
     }
 }

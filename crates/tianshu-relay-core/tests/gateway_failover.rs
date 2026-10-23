@@ -113,6 +113,7 @@ impl FakeUpstream {
     fn upstream(&self, rate: f64) -> Upstream {
         Upstream {
             site_id: self.site_id,
+            key_id: None,
             base_url: self.base_url.clone(),
             key_ref: self.key_ref.clone(),
             models: vec![MODEL.to_string()],
@@ -192,6 +193,9 @@ async fn start_routed_full(
         })),
         upstream_proxy: None,
         legacy_key_ref: None,
+        // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
+        lb_top_n: 1,
+        guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
         runtime: None,
         on_failure: Some(Arc::new(move |f| {
             if let Ok(mut log) = sink.lock() {
@@ -221,6 +225,7 @@ fn dead_port() -> u16 {
 fn dead_upstream(site_id: i64, key_ref: &str, rate: f64) -> Upstream {
     Upstream {
         site_id,
+        key_id: None,
         base_url: format!("http://127.0.0.1:{}", dead_port()),
         key_ref: key_ref.to_string(),
         models: vec![MODEL.to_string()],
@@ -264,6 +269,9 @@ async fn route_and_keys_by_ref_must_agree() {
             on_usage: None,
             upstream_proxy: None,
             legacy_key_ref: None,
+            // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
+            lb_top_n: 1,
+            guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
             runtime: None,
             on_failure: None,
         }
@@ -520,9 +528,21 @@ async fn a_bodyless_get_request_also_fails_over() {
     // M16-S4 / P2-13 之后能触发切换的只剩「连接层失败」与 429，所以本用例的故障源
     // 从「503」换成「连不上的端口」——**测的东西没变**（无 body 也走切换循环），
     // 只是换了一个在计费口径下合法的触发方式。
+    //
+    // M39-S3 适配（**M39-S2 引入的行为变更**）：`GET /v1/models` 在「路由非空 +
+    // 目录非空」时由 M39-S2 **本地聚合**（不向上游发请求），本用例原先的
+    // `models: [MODEL]` 会命中那条分支，于是测不到故障切换。这里把两个上游的
+    // `models` 置空（= 目录未知 ⇒ M39-S2 的 fail-open 原样转发），
+    // **被测性质不变**：无 body 的代理请求仍然要走候选循环与故障切换。
+    // 注：该用例在 M39-S2 合入后的 `a67d2a0` 上就已经是红的（本步接手时实测），
+    // 本步只做这处适配，不改 gateway 的聚合语义。
     let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let mut dead = dead_upstream(1, REF_A, 0.1);
+    dead.models = Vec::new();
+    let mut second = b.upstream(1.0);
+    second.models = Vec::new();
     let (handle, token, _failures, _observations) = start_routed_full(
-        vec![dead_upstream(1, REF_A, 0.1), b.upstream(1.0)],
+        vec![dead, second],
         long_cooldown(),
         UpstreamTimeout::default(),
         None,
@@ -748,6 +768,9 @@ async fn failure_event_scrubs_a_key_shaped_model() {
             on_usage: None,
             upstream_proxy: None,
             legacy_key_ref: None,
+            // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
+            lb_top_n: 1,
+            guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
             runtime: None,
             on_failure: Some(Arc::new(move |f| {
                 if let Ok(mut log) = sink.lock() {
@@ -999,6 +1022,9 @@ async fn a_missing_plaintext_is_refused_at_startup() {
         on_usage: None,
         upstream_proxy: None,
         legacy_key_ref: None,
+        // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
+        lb_top_n: 1,
+        guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
         runtime: None,
         on_failure: None,
     })

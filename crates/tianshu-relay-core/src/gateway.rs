@@ -29,12 +29,16 @@ use std::time::Duration;
 
 use axum::routing::any;
 use axum::Router;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
-use crate::routing::{should_failover, Breaker, BreakerPolicy, BreakerState, RouteTable, Upstream};
+use crate::routing::{
+    model_key, should_failover, site_key, weighted_pick, Breaker, BreakerKey, BreakerPolicy,
+    BreakerState, Candidate, GuardOutcome, RoundRobinState, RouteTable, SiteGuard, SiteGuardPolicy,
+    SiteLease, Upstream,
+};
 
 /// 回传上游响应体的大小上限。
 ///
@@ -339,6 +343,10 @@ pub struct GatewayConfig {
     /// 熔断策略（M7-S1）。熔断**状态**由 `start()` 建在 `AppState` 里（跨请求共享），
     /// 配置里只放策略——策略是纯数据、可 `Clone`，状态不是。
     pub breaker: BreakerPolicy,
+    /// M39-S3 §4.1：参与加权轮转的候选数（`1` = 关掉负载均衡，回到确定性首选）。
+    pub lb_top_n: usize,
+    /// M39-S3 §4.2：每站并发/限速策略。
+    pub guard_policy: SiteGuardPolicy,
     /// `key_ref` → 明文。**仅进程内**；`Debug` 不打印（见下方手写 `Debug`）。
     ///
     /// 值是 [`Zeroizing<String>`]：`GatewayConfig` 在每请求里被 clone，
@@ -529,6 +537,10 @@ impl GatewayConfig {
             site_display_name,
             route: RouteTable::default(),
             breaker: BreakerPolicy::default(),
+            // M39-S3：单上游（legacy）路径保持 `top_n=1` 与默认 guard，
+            // 行为与今天逐字相同（单候选不读轮转计数器）。
+            lb_top_n: 1,
+            guard_policy: SiteGuardPolicy::default(),
             keys_by_ref: HashMap::new(),
             on_failure: None,
             upstream_timeout: UpstreamTimeout::default(),
@@ -836,6 +848,9 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
     let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = AppState {
         breaker: Arc::new(Mutex::new(Breaker::new(config.breaker.clone()))),
+        round_robin: Arc::new(Mutex::new(RoundRobinState::default())),
+        guards: Arc::new(Mutex::new(HashMap::new())),
+        local_rejects: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         config: config.clone(),
         upstream,
         stopping: Arc::clone(&stopping),
@@ -883,6 +898,12 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
 struct AppState {
     config: GatewayConfig,
     upstream: reqwest::Client,
+    /// M39-S3 §4.1：加权轮转计数器（跨请求共享；单候选时不读）。
+    round_robin: Arc<Mutex<RoundRobinState>>,
+    /// M39-S3 §4.2：每站 guard（信号量 + 令牌桶），按 `site_id` 索引。
+    guards: Arc<Mutex<HashMap<i64, Arc<SiteGuard>>>>,
+    /// 本地拒绝计数（不写事件，只做可观测兜底）。
+    local_rejects: Arc<std::sync::atomic::AtomicU64>,
     /// 熔断**状态**：跨请求共享，所以是 `Arc<Mutex<_>>`。
     ///
     /// 不能放进 `config`：axum 的 `State` 每个请求 clone 一份，
@@ -1154,16 +1175,22 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     }
 
     let now = Instant::now();
-    let eligible = eligible_candidates(&state.breaker, &candidates, now);
+    let eligible = eligible_candidates(&state.breaker, &candidates, model.as_deref(), now);
     if eligible.is_empty() {
         // §9 第 2 条：**「一个候选都没发出去」也必须可见**。
         //
         // `status = 0` 是哨兵值（HTTP 里不存在 0），表示「没有任何上游返回过状态码」。
         // **不编一个 503**：那会让事件说谎——读者会以为某个上游真的返回了 503。
         // 文案必须写明原因，否则 0 会被误读成真实状态码。
+        let first_site = candidates[0].site_id;
+        let key = match &model {
+            Some(m) => model_key(first_site, m),
+            None => site_key(first_site),
+        };
         report_failure(
             &state,
-            candidates[0].site_id,
+            &key,
+            first_site,
             0,
             &model.clone().unwrap_or_default(),
             "所有候选上游都在熔断冷却中",
@@ -1191,15 +1218,40 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     // 于是「最后一个真的发得出去的候选」被误判成「不是最后一个」，它的响应被丢掉、
     // 继续往下走 → 最终 502。症状：唯一可用上游返回 `429 + Retry-After`，
     // 用户看到 502（而不是 429），`Retry-After` 被吞掉。
-    let sendable: Vec<&Upstream> = eligible
+    let sendable: Vec<Candidate> = eligible
         .iter()
         .copied()
-        .filter(|u| is_sendable(&state, view.keys(), u))
+        .filter(|c| is_sendable(&state, view.keys(), c.upstream))
         .collect();
 
+    // M39-S3 §4.1：加权轮转只决定**第一个**尝试谁；失败切换仍按确定性顺序走其余候选。
+    // 单候选 / 有探针时不读计数器（`weighted_pick` 内部保证）。
+    let top_n = state.config.lb_top_n;
+    let cursor = if sendable.len() > 1 && !sendable.iter().any(|c| c.probe) {
+        state.round_robin.lock().map(|mut g| g.next()).unwrap_or(0)
+    } else {
+        0
+    };
+    let first = weighted_pick(&sendable, top_n, cursor);
+    let mut order: Vec<&Upstream> = Vec::with_capacity(sendable.len());
+    if let Some(f) = first {
+        order.push(f);
+    }
+    for c in &sendable {
+        if Some(c.upstream) != first {
+            order.push(c.upstream);
+        }
+    }
+
     let mut last_error: Option<String> = None;
-    let attempts = sendable.len();
-    for (index, upstream) in sendable.iter().enumerate() {
+    // M39-S3 §4.5：本次请求里「被本地保护跳过」的候选数（与上游故障分开计）。
+    let mut local_rejected = 0usize;
+    // M39-S3（Lead P2）：先记下「可重放的真实响应」（目前只有 429）。若它之后的候选
+    // 全被本地保护跳过，也要把它原样返回——不能把上游真的回过的 429 变成 502。
+    // 元组里带着 lease：body 还没被读，站点并发要等这条响应真正结束才归还。
+    let mut pending_replay: Option<(reqwest::Response, i64, String, Option<SiteLease>)> = None;
+    let attempts = order.len();
+    for (index, upstream) in order.iter().enumerate() {
         // P3-3：**每一次上游尝试之前**都查停止闸门——信号可能在上一次尝试期间发出。
         // 在途请求允许跑完**当前**这一次（无法安全中断一个已发出的请求），
         // 但绝不再发起新的：那会把下一个站点的密钥也发出去，而用户按下停止
@@ -1208,11 +1260,34 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
             return stopping_response();
         }
         let is_last = index + 1 == attempts;
+        // M39-S3 §4.4：有 model 用 `(site, Some(model))`，无 model 用 `(site, None)`。
+        let breaker_key = if event_model.is_empty() {
+            site_key(upstream.site_id)
+        } else {
+            model_key(upstream.site_id, &event_model)
+        };
         // 这里 `unwrap` 不会 panic：`sendable` 就是按同一个判据过滤出来的。
         // 但仍然写 `let Some(..) else` ——「过滤」与「取用」共用同一个函数
         // （`is_sendable`），所以两者不可能分叉。
         let Some(key) = view.keys().get(&upstream.key_ref) else {
             continue;
+        };
+        // M39-S3 §4.2 / §4.5：**本地保护在发请求之前**——`try_admit` 绝不等待，
+        // 拿不到就切下一个候选。**本地拒绝不是上游故障**：不调 `report_failure`、
+        // 不喂熔断、不写 `GatewayFailure`（否则一个本机限流就能把好站点熔断）。
+        // guard 表锁中毒 ⇒ `None`：放行（可用性优先，行为与没有保护层时相同）。
+        let lease: Option<SiteLease> = match site_guard(&state, upstream.site_id)
+            .map(|guard| guard.try_admit(Instant::now()))
+        {
+            None => None,
+            Some(GuardOutcome::Admitted(lease)) => Some(lease),
+            Some(GuardOutcome::ConcurrencyLimited) | Some(GuardOutcome::RateLimited) => {
+                state
+                    .local_rejects
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                local_rejected += 1;
+                continue;
+            }
         };
         let url = format!("{}{}{}", upstream.base_url, path, query);
         let headers = upstream_headers(&state.config, &inbound, key);
@@ -1241,6 +1316,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                     };
                     report_failure(
                         &state,
+                        &breaker_key,
                         upstream.site_id,
                         status,
                         &event_model,
@@ -1248,16 +1324,25 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                         Instant::now(),
                     );
                 } else {
-                    record_success(&state, upstream.site_id, Instant::now());
+                    record_success(&state, &breaker_key, Instant::now());
                 }
                 // M16-S4 / P2-13：**只有 429 才重放**（上游明确没处理这个请求）。
                 // 其余状态码——含 5xx / 524 / 504 这类可能已经计费的——一律**原样返回**：
                 // 重复计费不可逆，可用性由「熔断 → 下一个请求换上游」承接。
                 // 不可切换的状态、或已经是最后一个候选 ⇒ 同样如实返回（不做 500 兜底）。
                 if replayable && !is_last {
-                    continue; // 丢掉这个 429，试下一个
+                    // 留着这条响应（含 lease），继续试下一个候选；若后面全军覆没，
+                    // 循环末尾会把这条 429 原样返回，而不是编一个 502。
+                    pending_replay = Some((response, upstream.site_id, event_model.clone(), lease));
+                    continue;
                 }
-                return into_upstream_response(&state, response, upstream.site_id, &event_model);
+                return into_upstream_response(
+                    &state,
+                    response,
+                    upstream.site_id,
+                    &event_model,
+                    lease,
+                );
             }
             Err(failure) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
@@ -1279,6 +1364,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                 };
                 report_failure(
                     &state,
+                    &breaker_key,
                     upstream.site_id,
                     502,
                     &event_model,
@@ -1291,6 +1377,26 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                 }
             }
         }
+    }
+
+    // M39-S3（Lead P2）：存在「可重放的真实响应」（429）⇒ 原样返回它。
+    // 典型形态：第一候选回 429，其后的候选都被本地保护跳过。
+    if let Some((response, site_id, model, lease)) = pending_replay {
+        return into_upstream_response(&state, response, site_id, &model, lease);
+    }
+
+    // M39-S3 §4.5：**全部候选都被本地保护跳过** ⇒ 429（不是 502）。
+    // 这里没有任何上游出过错：本地并发/限流拒绝不写事件、不喂熔断，
+    // 客户端据 `kind == "local_rate_limited"` 就能把「本机限流」与「上游 429」分开。
+    if local_rejected > 0 && local_rejected == attempts {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            axum::Json(serde_json::json!({
+                "error": "本地保护：所有候选均被限流",
+                "kind": "local_rate_limited"
+            })),
+        )
+            .into_response();
     }
 
     // §10 第 2 条：**发不出去**的候选也要产生事件。
@@ -1306,10 +1412,16 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     //
     // 文案区分两种原因（缺明文 / 已回收），但**都不写 `key_ref` 原文**：
     // 引用本身是线索（M7-S0 §4.3 的红线）。
-    for upstream in eligible
+    for cand in eligible
         .iter()
-        .filter(|u| !is_sendable(&state, view.keys(), u))
+        .filter(|c| !is_sendable(&state, view.keys(), c.upstream))
     {
+        let upstream = cand.upstream;
+        let key = if event_model.is_empty() {
+            site_key(upstream.site_id)
+        } else {
+            model_key(upstream.site_id, &event_model)
+        };
         let (status, reason) = if is_revoked(&state, upstream) {
             (0u16, "该密钥已被回收，不再使用")
         } else {
@@ -1323,6 +1435,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         }
         report_failure(
             &state,
+            &key,
             upstream.site_id,
             status,
             &event_model,
@@ -1338,6 +1451,22 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         })),
     )
         .into_response()
+}
+
+/// 取该站点的 guard（不存在就按 `config.guard_policy` 建一个）。
+///
+/// 按 **`site_id`** 索引 ⇒ 同站多 key **共享**一个 guard（M39-S3 §4.3）：
+/// 若按 `key_ref` 建，两把 key 会各拿一份「每站 8 并发」，站点上限就翻倍了。
+///
+/// 返回 `None` 仅当 guard 表锁中毒：调用方按「无保护层」放行（可用性优先）。
+fn site_guard(state: &AppState, site_id: i64) -> Option<Arc<SiteGuard>> {
+    let mut guards = state.guards.lock().ok()?;
+    if let Some(guard) = guards.get(&site_id) {
+        return Some(Arc::clone(guard));
+    }
+    let guard = Arc::new(SiteGuard::new(state.config.guard_policy, Instant::now()));
+    guards.insert(site_id, Arc::clone(&guard));
+    Some(guard)
 }
 
 /// 这个上游**能不能真的发出去**：有明文，且该明文没被回收。
@@ -1451,7 +1580,7 @@ async fn forward_to(
 ) -> Response {
     let model = model_from_body(&body).unwrap_or_default();
     match send_once(state, method, url, headers, body).await {
-        Ok(response) => into_upstream_response(state, response, state.config.site_id, &model),
+        Ok(response) => into_upstream_response(state, response, state.config.site_id, &model, None),
         Err(failure) => (
             StatusCode::BAD_GATEWAY,
             axum::Json(serde_json::json!({ "error": failure.message() })),
@@ -1465,11 +1594,27 @@ async fn forward_to(
 /// 流式的理由（M4-S2 复审 P1-2）：整段缓冲会让客户端等上游吐完才见到第一个字节，
 /// 而且响应体没有上限。超过 [`MAX_RESPONSE_BYTES`] 时让流以错误结束、连接随之断开——
 /// 此时响应头已经发出去了，改不了状态码，只能如实断流，不静默截断。
+/// 把 `SiteLease` 绑到响应 body 的生命周期上（M39-S3 §4.2 / Lead P1）。
+///
+/// **只放在 `proxy` 的栈上是不够的**：函数 `return` 时 lease 就被 drop，而 body 还在
+/// 流式回传——站点并发提前减 1，等于「并发上限只覆盖到响应头」。把 lease 捕获进
+/// `map` 的闭包 ⇒ 流结束 / 客户端断开 / 响应被丢弃时才归还。
+fn hold_lease<S>(stream: S, lease: Option<SiteLease>) -> impl futures_util::Stream<Item = S::Item>
+where
+    S: futures_util::Stream + Send + 'static,
+{
+    stream.map(move |item| {
+        let _ = &lease;
+        item
+    })
+}
+
 fn into_upstream_response(
     state: &AppState,
     upstream_response: reqwest::Response,
     site_id: i64,
     model: &str,
+    lease: Option<SiteLease>,
 ) -> Response {
     let status = upstream_response.status();
     let is_success = status.is_success();
@@ -1484,6 +1629,7 @@ fn into_upstream_response(
 
     if !is_success {
         let capped = cap_stream(upstream_response.bytes_stream(), MAX_RESPONSE_BYTES);
+        let capped = hold_lease(capped, lease);
         return builder
             .body(Body::from_stream(capped))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
@@ -1512,6 +1658,7 @@ fn into_upstream_response(
                 }
             },
         );
+        let capped = hold_lease(capped, lease);
         return builder
             .body(Body::from_stream(capped))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
@@ -1541,6 +1688,7 @@ fn into_upstream_response(
             }
         },
     );
+    let capped = hold_lease(capped, lease);
     builder
         .body(Body::from_stream(capped))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
@@ -1551,32 +1699,51 @@ fn into_upstream_response(
 fn eligible_candidates<'a>(
     breaker: &Arc<Mutex<Breaker>>,
     candidates: &[&'a Upstream],
+    model: Option<&str>,
     now: Instant,
-) -> Vec<&'a Upstream> {
+) -> Vec<Candidate<'a>> {
     let Ok(mut guard) = breaker.lock() else {
         // 锁中毒：放行全部候选。可用性优先——一次 panic 不该让网关永久 503。
-        return candidates.to_vec();
+        return candidates
+            .iter()
+            .map(|u| Candidate {
+                upstream: u,
+                probe: false,
+            })
+            .collect();
     };
     let mut out = Vec::with_capacity(candidates.len());
     for upstream in candidates {
-        match guard.state(upstream.site_id, now) {
+        // M39-S3 §4.4：熔断键 `(site_id, Some(model))`；无 model ⇒ `(site_id, None)`。
+        let key = match model {
+            Some(m) => model_key(upstream.site_id, m),
+            None => site_key(upstream.site_id),
+        };
+        match guard.state(&key, now) {
             BreakerState::Open => continue,
             BreakerState::HalfOpen => {
                 // P2-8：第一个拿到探针的请求在 Breaker 里标记，其余并发请求看到标记
                 // 即跳过。探针结果回来后由 record_success / record_failure 清除标记。
-                if guard.try_take_half_open_probe(upstream.site_id, now) {
-                    out.push(*upstream);
+                if guard.try_take_half_open_probe(&key, now) {
+                    // M39-S3 §4.1：探针**不参与加权轮转**，由 `weighted_pick` 优先返回。
+                    out.push(Candidate {
+                        upstream,
+                        probe: true,
+                    });
                 }
             }
-            BreakerState::Closed => out.push(*upstream),
+            BreakerState::Closed => out.push(Candidate {
+                upstream,
+                probe: false,
+            }),
         }
     }
     out
 }
 
-fn record_success(state: &AppState, site_id: i64, now: Instant) {
+fn record_success(state: &AppState, key: &BreakerKey, now: Instant) {
     if let Ok(mut guard) = state.breaker.lock() {
-        guard.record_success(site_id, now);
+        guard.record_success(key, now);
     }
 }
 
@@ -1586,6 +1753,7 @@ fn record_success(state: &AppState, site_id: i64, now: Instant) {
 /// 也让测试能把事件捕获到 `Vec` 里**逐字段**断言白名单。
 fn report_failure(
     state: &AppState,
+    key: &BreakerKey,
     site_id: i64,
     status: u16,
     model: &str,
@@ -1593,7 +1761,7 @@ fn report_failure(
     now: Instant,
 ) {
     if let Ok(mut guard) = state.breaker.lock() {
-        guard.record_failure(site_id, now);
+        guard.record_failure(key, now);
     }
     report_event_only(state, site_id, status, model, reason);
 }
