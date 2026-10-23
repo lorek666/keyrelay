@@ -158,6 +158,21 @@ describe("GatewayCard · Agent 令牌（M43-S1）", () => {
     );
   });
 
+  it("轮换宽限：tokenGraceUntil 有值时显示截止提示（M41-S2）", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue({
+      ...status(),
+      tokenGraceUntil: 1_700_000_300,
+    });
+    vi.mocked(gatewayTokenList).mockResolvedValue([]);
+    renderCard();
+    await waitFor(() =>
+      expect(document.querySelector("[data-token-grace]")).toBeTruthy(),
+    );
+    expect(document.querySelector("[data-token-grace]")!.textContent).toContain(
+      "旧令牌仍可用至",
+    );
+  });
+
   it("吊销：取消不发请求；确认后调用 revoke", async () => {
     vi.mocked(gatewayTokenList).mockResolvedValue([token({ id: 2, label: "codex" })]);
     vi.mocked(gatewayTokenRevoke).mockResolvedValue(

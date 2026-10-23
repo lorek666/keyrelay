@@ -731,6 +731,10 @@
   },
   "settings": {
     "gatewayAutoStart": {
+      "gatewayTokenGrace": {
+        "label": "Token rotation grace period (seconds, 0=off)",
+        "hint": "After rotating the default token, the old token keeps working for this long (default 300s, max 3600). The grace period is runtime-only: after a restart the old token is invalid immediately."
+      },
       "title": "Auto-start gateway on launch",
       "label": "Start the local gateway when the app starts",
       "hint": "Requires the gateway to be enabled, plus a healthy site with an enabled key. It prefers the last successfully used pair, otherwise falls back to the first healthy site. A failure never blocks app startup and is not retried automatically."
@@ -965,6 +969,7 @@
       "createdTitle": "Created — plaintext is shown only once",
       "createdHint": "Copy it now. Once this panel is closed the plaintext is gone (only the hash is stored).",
       "copy": "Copy",
+      "graceUntil": "The old token stays valid until {time}; re-deliver gateway channels in the meantime (after a restart the old token is invalid immediately).",
       "savedIt": "I saved it"
     },
     "metrics": {
