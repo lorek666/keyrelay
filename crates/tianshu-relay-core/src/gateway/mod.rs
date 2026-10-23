@@ -1947,17 +1947,12 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     // 只放行这一个**精确形态**（不是整个 `/v1beta` 前缀）——别把它变成任意路径的入口。
     // (4) Gemini 流式：`:streamGenerateContent` 与 `?alt=sse` 都必须 400 点名 S2b，
     //     不能掉到 404（那是「路径不存在」的语义，会误导用户去查地址）也不能静默当非流式。
-    if path.starts_with("/v1beta/models/")
-        && (path.ends_with(":streamGenerateContent") || query.contains("alt=sse"))
-    {
-        return local_error(
-            StatusCode::BAD_REQUEST,
-            GatewayErrorKind::InvalidRequest,
-            "streaming_not_supported",
-            "Gemini 流式尚未支持（M42-S2b）；请先以 :generateContent 非流式调用",
-        );
-    }
-    let gemini_path = path.starts_with("/v1beta/models/") && path.ends_with(":generateContent");
+    // M42-S2b：Gemini 的流式有**两种**入口——`:streamGenerateContent` 路径与 `?alt=sse` 查询。
+    // 两者都走流式翻译（不再 400）。
+    let gemini_stream = path.starts_with("/v1beta/models/")
+        && (path.ends_with(":streamGenerateContent") || query.contains("alt=sse"));
+    let gemini_path = path.starts_with("/v1beta/models/")
+        && (path.ends_with(":generateContent") || path.ends_with(":streamGenerateContent"));
     if !path.starts_with("/v1/") && path != "/v1" && !gemini_path {
         return local_error(
             StatusCode::NOT_FOUND,
@@ -2011,6 +2006,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     //
     // Chat **零翻译**（不进本分支，body 逐字节不动）；其余三种先解析成 IR，
     // 再序列化成 OpenAI Chat body。**解析失败发生在发请求之前** ⇒ 不可能产生上游计费（ADR D5）。
+    let mut translate_stream = false;
     let (body, translate_proto) = match translate::detect(&method, &path, &inbound) {
         Some(proto)
             if matches!(
@@ -2036,6 +2032,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                             "无法确定模型名：Gemini 需要 /v1beta/models/<model>:generateContent",
                         );
                     }
+                    translate_stream = req.stream || gemini_stream;
                     let json = req.to_upstream_json().to_string();
                     (bytes::Bytes::from(json), Some(proto))
                 }
@@ -2125,6 +2122,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
             body,
             &identity,
             translate_proto,
+            translate_stream,
         )
         .await;
     }
@@ -2351,6 +2349,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                         attempts: index as u32 + 1,
                     },
                     &identity,
+                    translate_stream,
                 )
                 .await;
             }
@@ -2406,6 +2405,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
             pending.lease,
             pending.meta,
             &identity,
+            translate_stream,
         )
         .await;
     }
@@ -2593,6 +2593,7 @@ async fn send_once(
 /// M16-S4：`send_once` 现在返回**分类后**的失败。legacy 路径**没有下一个候选**，
 /// 所以分类不影响这里的行为（两个分支都返回 502 + 同一段文案），
 /// 只是把错误消息取出来——**响应形态与改动前逐字节相同**。
+#[allow(clippy::too_many_arguments)]
 async fn forward_to(
     state: &AppState,
     method: axum::http::Method,
@@ -2601,6 +2602,7 @@ async fn forward_to(
     body: bytes::Bytes,
     identity: &AuthIdentity,
     translate_proto: Option<translate::Protocol>,
+    translate_stream: bool,
 ) -> Response {
     let model = model_from_body(&body).unwrap_or_default();
     let started = Instant::now();
@@ -2627,6 +2629,7 @@ async fn forward_to(
                     attempts: 1,
                 },
                 identity,
+                translate_stream,
             )
             .await
         }
@@ -2662,7 +2665,10 @@ where
 /// 从 `/v1beta/models/<model>:generateContent` 里取出模型名（Gemini 的模型名在路径里）。
 fn gemini_model_from_path(path: &str) -> Option<String> {
     let rest = path.strip_prefix("/v1beta/models/")?;
-    let model = rest.strip_suffix(":generateContent")?;
+    // M42-S2b：流式入口是 `:streamGenerateContent`，非流式是 `:generateContent`
+    let model = rest
+        .strip_suffix(":streamGenerateContent")
+        .or_else(|| rest.strip_suffix(":generateContent"))?;
     (!model.is_empty()).then(|| model.to_string())
 }
 
@@ -2684,6 +2690,7 @@ async fn maybe_translate_response(
     lease: Option<SiteLease>,
     meta: AttemptMeta,
     identity: &AuthIdentity,
+    stream: bool,
 ) -> Response {
     let Some(proto) = proto else {
         return into_upstream_response(
@@ -2706,6 +2713,19 @@ async fn maybe_translate_response(
             lease,
             meta,
             identity,
+        );
+    }
+
+    if stream {
+        return streaming_translate_response(
+            state,
+            proto,
+            upstream_response,
+            site_id,
+            event_model,
+            meta,
+            identity,
+            lease,
         );
     }
 
@@ -2781,6 +2801,122 @@ async fn maybe_translate_response(
     drop(lease);
     let rendered = translate::render_response(proto, &parsed);
     (StatusCode::OK, axum::Json(rendered)).into_response()
+}
+
+/// M42-S2b：流式翻译。把上游 Chat SSE 增量渲染成入站协议的 SSE。
+///
+/// **行为契约**：
+/// - 跨 chunk 由 [`translate::stream::SseDecoder`] 按空行缓冲（不假设事件整块到达）；
+/// - `[DONE]` ⇒ `finish()`，**恰好一次**；
+/// - 上游中途报错 ⇒ 发一个 `event: error` 再关闭（不静默当正常结束，也不挂死）；
+/// - **客户端断开** ⇒ `tx.send` 失败 ⇒ 任务退出（不泄漏、不继续跑）；
+/// - **usage 只记一次**（`include_usage` 的末帧）。
+#[allow(clippy::too_many_arguments)]
+fn streaming_translate_response(
+    state: &AppState,
+    proto: translate::Protocol,
+    mut upstream: reqwest::Response,
+    site_id: i64,
+    event_model: &str,
+    meta: AttemptMeta,
+    identity: &AuthIdentity,
+    lease: Option<SiteLease>,
+) -> Response {
+    use translate::stream::{ChatDelta, SseDecoder, StreamTranslator};
+
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<std::result::Result<bytes::Bytes, std::io::Error>>(16);
+    let on_usage = state.config.on_usage.clone();
+    let model = event_model.to_string();
+    let token_id = identity.token_id;
+    let label = identity.label.clone().unwrap_or_default();
+    let status_code = upstream.status().as_u16();
+
+    tokio::spawn(async move {
+        // 许可跟着流走：流结束（或客户端断开）才归还（spec §4.4）
+        let _lease = lease;
+        let mut dec = SseDecoder::new();
+        let mut tr = StreamTranslator::new(proto);
+        let mut usage_sent = false;
+
+        loop {
+            match upstream.chunk().await {
+                Ok(Some(chunk)) => {
+                    let events = dec.push(&chunk);
+                    for e in &events {
+                        if !usage_sent {
+                            if let (Some(d), Some(sink)) =
+                                (ChatDelta::from_json(&e.data), on_usage.as_ref())
+                            {
+                                if let Some((p, c, t)) = d.usage {
+                                    usage_sent = true;
+                                    sink(GatewayUsage {
+                                        at: unix_now_secs(),
+                                        site_id,
+                                        key_id: meta.key_id,
+                                        model: model.clone(),
+                                        prompt_tokens: p,
+                                        completion_tokens: c,
+                                        total_tokens: t,
+                                        status: status_code,
+                                        latency_ms: meta.latency_ms,
+                                        attempts: meta.attempts,
+                                        stream: true,
+                                        token_id,
+                                        agent_label: label.clone(),
+                                    });
+                                }
+                            }
+                        }
+                        let frames = tr.on_event(e);
+                        if !frames.is_empty()
+                            && tx
+                                .send(Ok(bytes::Bytes::from(frames.concat())))
+                                .await
+                                .is_err()
+                        {
+                            return; // 客户端断开
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let (rest, _truncated) = dec.finish();
+                    for e in &rest {
+                        for f in tr.on_event(e) {
+                            let _ = tx.send(Ok(bytes::Bytes::from(f))).await;
+                        }
+                    }
+                    let tail = tr.finish();
+                    if !tail.is_empty() {
+                        let _ = tx.send(Ok(bytes::Bytes::from(tail.concat()))).await;
+                    }
+                    return;
+                }
+                Err(_) => {
+                    let frame = format!(
+                        "event: error\ndata: {}\n\n",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": { "type": "upstream_error", "message": "上游流中断" }
+                        })
+                    );
+                    let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
+                    return;
+                }
+            }
+        }
+    });
+
+    let body =
+        axum::body::Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 fn into_upstream_response(

@@ -134,6 +134,7 @@ pub fn parse_request(v: &Value) -> Result<ChatRequest, TranslateError> {
             .map(|n| n as u32),
         stop: vec![],
         tools,
+        stream: false,
     })
 }
 
