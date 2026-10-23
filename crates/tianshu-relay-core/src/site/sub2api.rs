@@ -922,6 +922,8 @@ impl<T: HttpTransport + 'static> SiteAdapter for Sub2Api<T> {
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0),
                     cost: item.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    // M43-S2：缺字段 ≠ 0 元。标记「有没有上报」，读侧据此显示「未知」。
+                    cost_reported: item.get("cost").is_some_and(|v| !v.is_null()),
                 });
             }
         }

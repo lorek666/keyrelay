@@ -36,6 +36,54 @@
     "usage": "用量"
   },
   "usage": {
+    "cost": {
+      "title": "成本（估算）",
+      "note": "按你维护的单价表估算，**只覆盖经本地网关的流量**；没有价格的用量显示为未知，不计入合计。",
+      "empty": "还没有可估算的用量（或没有配置单价）。",
+      "bucket": "估算成本（{currency}）",
+      "unknownCurrency": "未知币种",
+      "unpriced": "未知（未定价）",
+      "partial": "另有 {count} 条未定价",
+      "allUnpriced": "{count} 条全部未定价"
+    },
+    "agents": {
+      "title": "按 Agent 成本",
+      "note": "按网关令牌的标签（认证时的快照）归因；空标签是启用归因之前的旧数据。",
+      "empty": "没有可归因的用量。",
+      "agent": "Agent",
+      "currency": "币种",
+      "requests": "请求数",
+      "tokens": "Tokens",
+      "cost": "估算成本",
+      "unattributed": "未归因（旧数据）"
+    },
+    "bills": {
+      "title": "站点账单（站点自报）",
+      "note": "站点侧**全部**流量（含直连 agent），与上面的「估算成本」口径不同、**不可相减**。导入为只读操作。",
+      "site": "站点",
+        "siteLabel": "账单站点",
+      "sitePlaceholder": "选择站点",
+      "currency": "站点币种",
+      "currencyAuto": "自动（站点自报）",
+      "probe": "探测能力",
+      "import": "只读导入",
+      "importHint": "只读：只发 GET，取最近若干页；不会向站点写任何东西。",
+      "importing": "导入中…",
+      "probeSupported": "该站点支持账单导入。",
+      "probeNeedsLogin": "需要先登录该站点。",
+      "probeUnsupported": "该站点不支持账单导入。",
+      "probeFailed": "探测失败：{reason}",
+      "imported": "已导入 {days} 天（{pages} 页）。",
+      "partial": "注意：只导入了最近 {pages} 页。",
+      "currencyUsed": "站点没给币种，按你指定的 {currency} 记录。",
+      "day": "日期",
+      "siteCol": "站点",
+      "amount": "金额",
+      "currencyCol": "币种",
+      "requests": "请求数",
+      "source": "来源",
+      "empty": "还没有导入过账单。"
+    },
     "rangeLabel": "统计范围",
     "range": {
       "d7": "近 7 天",
@@ -730,6 +778,19 @@
     "notice": "已回滚 {target}（变更 {journal}）。"
   },
   "settings": {
+    "prices": {
+      "title": "模型单价",
+      "body": "按 **每 1M token** 的价格估算成本。价格只用于展示估算，不影响转发；没有价格时成本显示「未知」。",
+      "model": "模型名（与站点返回的模型名一致）",
+      "input": "输入单价 / 1M tokens",
+      "output": "输出单价 / 1M tokens",
+      "currency": "币种",
+      "effectiveFrom": "生效日期",
+      "save": "保存价格",
+      "delete": "删除",
+      "hint": "同一模型可以保存多个「生效日期」的版本；用量按它发生时间的价格估算。0 不是合法单价——免费就不要配价格。",
+      "empty": "还没有配置单价。"
+    },
     "gatewayAutoStart": {
       "gatewayTokenGrace": {
         "label": "令牌轮换宽限期（秒，0=关闭）",

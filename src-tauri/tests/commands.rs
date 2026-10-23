@@ -2427,3 +2427,62 @@ fn m41s2_grace_zero_and_restart_kill_the_old_token() {
     );
     assert_eq!(health_status(port, &current), 200, "重启后当前令牌可用");
 }
+
+/// M43-S2：模型单价与站点账单命令在 IPC 层可用，DTO 键是 camelCase，
+/// 且**空态是结构性空值**（`[]` / `null`，不是编造的数字）。
+///
+/// 注意：必须**复用同一个 app/webview**——`invoke_impl` 每次都会新建一个内存库，
+/// 跨调用看不到上一条命令写的行。
+#[test]
+fn m43s2_price_and_bill_commands_are_registered_with_camel_case_dtos() {
+    let (app, webview) = build_app();
+    let invoke_on_app = |cmd: &str, args: Value| invoke_on(&webview, cmd, args);
+    let _ = &app;
+
+    let prices = invoke_on_app("model_price_list", json!({})).expect("model_price_list 应成功");
+    assert_eq!(prices, json!([]), "空库应返回空数组");
+
+    let bills = invoke_on_app("site_bills", json!({ "days": 7 })).expect("site_bills 应成功");
+    assert_eq!(bills, json!([]), "没有账单时返回空数组");
+
+    let created = invoke_on_app(
+        "model_price_upsert",
+        json!({
+            "price": {
+                "model": "gpt-4o",
+                "inputPerMtok": 2.5,
+                "outputPerMtok": 10.0,
+                "currency": "USD",
+                "effectiveFrom": 1_700_000_000i64
+            }
+        }),
+    )
+    .expect("model_price_upsert 应成功");
+    for key in [
+        "id",
+        "model",
+        "inputPerMtok",
+        "outputPerMtok",
+        "currency",
+        "effectiveFrom",
+        "createdAt",
+    ] {
+        assert!(created.get(key).is_some(), "缺字段 {key}: {created}");
+    }
+    assert!(
+        created.get("input_per_mtok").is_none(),
+        "线上键必须 camelCase"
+    );
+    assert_eq!(created["inputPerMtok"], 2.5);
+    let id = created["id"].as_i64().expect("id");
+
+    let after = invoke_on_app("model_price_list", json!({})).expect("再列一次");
+    assert_eq!(after.as_array().map(|a| a.len()), Some(1));
+
+    let deleted = invoke_on_app("model_price_delete", json!({ "id": id })).expect("删除");
+    assert_eq!(deleted, json!(true));
+    assert_eq!(
+        invoke_on_app("model_price_list", json!({})).expect("列"),
+        json!([])
+    );
+}

@@ -36,6 +36,54 @@
     "usage": "Usage"
   },
   "usage": {
+    "cost": {
+      "title": "Cost (estimated)",
+      "note": "Estimated from your price table. **Covers gateway traffic only**; unpriced usage is shown as unknown and excluded from totals.",
+      "empty": "Nothing to estimate yet (or no prices configured).",
+      "bucket": "Estimated cost ({currency})",
+      "unknownCurrency": "Unknown currency",
+      "unpriced": "Unknown (unpriced)",
+      "partial": "{count} more unpriced",
+      "allUnpriced": "All {count} unpriced"
+    },
+    "agents": {
+      "title": "Cost by agent",
+      "note": "Attributed by gateway token label (snapshot at auth time). Empty labels are pre-attribution data.",
+      "empty": "No attributable usage.",
+      "agent": "Agent",
+      "currency": "Currency",
+      "requests": "Requests",
+      "tokens": "Tokens",
+      "cost": "Estimated cost",
+      "unattributed": "Unattributed (old data)"
+    },
+    "bills": {
+      "title": "Site bills (self-reported)",
+      "note": "**All** traffic on the site side (including direct agents). A different scope from the estimate above — they must not be subtracted. Import is read-only.",
+      "site": "Site",
+        "siteLabel": "Bill site",
+      "sitePlaceholder": "Pick a site",
+      "currency": "Site currency",
+      "currencyAuto": "Auto (as reported)",
+      "probe": "Probe capability",
+      "import": "Read-only import",
+      "importHint": "Read-only: GET only, last few pages. Nothing is written to the site.",
+      "importing": "Importing…",
+      "probeSupported": "This site supports bill import.",
+      "probeNeedsLogin": "Log in to this site first.",
+      "probeUnsupported": "This site does not support bill import.",
+      "probeFailed": "Probe failed: {reason}",
+      "imported": "Imported {days} day(s) ({pages} page(s)).",
+      "partial": "Note: only the most recent {pages} page(s) were imported.",
+      "currencyUsed": "The site gave no currency; recorded as {currency} as you chose.",
+      "day": "Date",
+      "siteCol": "Site",
+      "amount": "Amount",
+      "currencyCol": "Currency",
+      "requests": "Requests",
+      "source": "Source",
+      "empty": "No bills imported yet."
+    },
     "rangeLabel": "Range",
     "range": {
       "d7": "Last 7 days",
@@ -730,6 +778,19 @@
     "notice": "Rolled back {target} (change {journal})."
   },
   "settings": {
+    "prices": {
+      "title": "Model prices",
+      "body": "Prices are **per 1M tokens** and only drive the cost estimate (never routing). Without a price, cost shows as unknown.",
+      "model": "Model name (must match the site's model name)",
+      "input": "Input price / 1M tokens",
+      "output": "Output price / 1M tokens",
+      "currency": "Currency",
+      "effectiveFrom": "Effective date",
+      "save": "Save price",
+      "delete": "Delete",
+      "hint": "You can keep multiple effective-date versions per model; usage is priced at the version effective when it happened. 0 is not a valid price — leave it unset for free models.",
+      "empty": "No prices configured yet."
+    },
     "gatewayAutoStart": {
       "gatewayTokenGrace": {
         "label": "Token rotation grace period (seconds, 0=off)",
