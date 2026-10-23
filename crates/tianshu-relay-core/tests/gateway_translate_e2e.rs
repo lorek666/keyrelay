@@ -459,3 +459,76 @@ async fn translated_usage_keeps_token_id_and_agent_label() {
 
     h.shutdown_and_wait().await;
 }
+
+// ---------------------------------------------------------------- 复审 P1-1：Gemini 工具往返
+
+#[tokio::test]
+async fn gemini_tool_result_reaches_the_upstream_as_a_tool_message() {
+    let up = spawn_upstream("200 OK", &chat_response_text("好"));
+    let h = start_legacy(&up).await;
+    let token = h.token.clone();
+    let url = format!("http://{}", h.addr);
+    let body = json!({
+        "contents": [
+            { "role": "user", "parts": [{ "text": "查天气" }] },
+            { "role": "model", "parts": [{ "functionCall": { "name": "get_weather", "args": {"city":"SH"} } }] },
+            { "role": "user", "parts": [{ "functionResponse": { "name": "get_weather", "response": { "temp": 21 } } }] }
+        ]
+    })
+    .to_string();
+
+    let (status, resp) = tokio::task::spawn_blocking(move || {
+        http_post(
+            &url,
+            &token,
+            "/v1beta/models/gemini-2.5-pro:generateContent",
+            &body,
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, 200, "{resp}");
+
+    // 上游必须收到一条 role=tool 的消息，且内容是展开后的文本
+    let sent = up.last_body();
+    let msgs = sent["messages"].as_array().expect("messages");
+    let tool = msgs
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap_or_else(|| panic!("上游没收到 tool 消息: {sent}"));
+    let content = tool["content"].as_str().unwrap_or("");
+    assert!(
+        content.contains("temp: 21"),
+        "工具结果要展开成文本: {content}"
+    );
+
+    h.shutdown_and_wait().await;
+}
+
+// ---------------------------------------------------------------- 复审 P2-4：Gemini 流式 ⇒ 400（不是 404）
+
+#[tokio::test]
+async fn gemini_streaming_is_rejected_with_the_s2b_hint_not_404() {
+    let up = spawn_upstream("200 OK", &chat_response_text("不该被调用"));
+    let h = start_legacy(&up).await;
+    let token = h.token.clone();
+    let url = format!("http://{}", h.addr);
+
+    for path in [
+        "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+        "/v1beta/models/gemini-2.5-pro:generateContent?alt=sse",
+    ] {
+        let (status, resp) = tokio::task::spawn_blocking({
+            let (url, token) = (url.clone(), token.clone());
+            let body = json!({ "contents": [] }).to_string();
+            move || http_post(&url, &token, path, &body)
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, 400, "必须 400（不是 404）: {path} → {resp}");
+        assert!(resp.contains("M42-S2b"), "必须点名 S2b: {resp}");
+    }
+    assert_eq!(up.count(), 0, "流式拒绝不能碰上游");
+
+    h.shutdown_and_wait().await;
+}

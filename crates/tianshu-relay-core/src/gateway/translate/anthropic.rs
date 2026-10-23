@@ -20,6 +20,19 @@ const ALLOWED: &[&str] = &[
 
 pub fn parse_request(v: &Value) -> Result<ChatRequest, TranslateError> {
     reject_unknown(v, ALLOWED, "Anthropic")?;
+    // (3) tool_choice：`{"type":"auto"|"none"}` 放行；`any`/`tool`/未知 ⇒ 400 点名
+    if let Some(tc) = v.get("tool_choice") {
+        let kind = tc
+            .get("type")
+            .and_then(|x| x.as_str())
+            .unwrap_or("<无 type>");
+        if kind != "auto" && kind != "none" {
+            return Err(TranslateError::new(
+                "unsupported_field",
+                format!("Anthropic: 不支持字段 `tool_choice.type: {kind}`（只支持 auto/none）"),
+            ));
+        }
+    }
     let model = v
         .get("model")
         .and_then(|x| x.as_str())
@@ -75,12 +88,29 @@ pub fn parse_request(v: &Value) -> Result<ChatRequest, TranslateError> {
                                 }
                             }
                             Some("image") => {
-                                if let Some(u) = b
-                                    .get("source")
-                                    .and_then(|s| s.get("url"))
-                                    .and_then(|x| x.as_str())
-                                {
-                                    parts.push(ContentPart::ImageUrl(u.to_string()));
+                                // (2) 两种形态：base64（data URI）与 url
+                                let src = b.get("source");
+                                match src.and_then(|s| s.get("type")).and_then(|x| x.as_str()) {
+                                    Some("base64") => {
+                                        let media = src
+                                            .and_then(|s| s.get("media_type"))
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or("image/png");
+                                        let data = src
+                                            .and_then(|s| s.get("data"))
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or("");
+                                        parts.push(ContentPart::ImageUrl(format!(
+                                            "data:{media};base64,{data}"
+                                        )));
+                                    }
+                                    _ => {
+                                        if let Some(u) =
+                                            src.and_then(|s| s.get("url")).and_then(|x| x.as_str())
+                                        {
+                                            parts.push(ContentPart::ImageUrl(u.to_string()));
+                                        }
+                                    }
                                 }
                             }
                             Some("tool_use") => calls.push(ToolCall {
