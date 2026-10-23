@@ -1832,7 +1832,14 @@ fn into_upstream_response(
     }
 
     if !is_success {
-        let capped = cap_stream(upstream_response.bytes_stream(), MAX_RESPONSE_BYTES);
+        // P1（M40-S1 复审）：**非 2xx 的 body 也必须 hold_lease**。M39-S3 的
+        // `SiteLease` 要覆盖整个响应 body（5xx / 429 / pending_replay 都一样）；
+        // 这里若直接 `Body::from_stream`，body 还没读完站点并发就提前归还，
+        // 第二个请求会被错误放进来（本地 429 保护失效、上游并发超限）。
+        let capped = hold_lease(
+            cap_stream(upstream_response.bytes_stream(), MAX_RESPONSE_BYTES),
+            lease,
+        );
         return builder
             .body(Body::from_stream(capped))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());

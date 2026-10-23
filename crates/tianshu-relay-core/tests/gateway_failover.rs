@@ -144,8 +144,16 @@ async fn start_routed(
             (u.key_ref.as_str(), plain)
         })
         .collect();
-    let (handle, token, failures, _) =
-        start_routed_full(ups, breaker, UpstreamTimeout::default(), None, keys, None).await;
+    let (handle, token, failures, _) = start_routed_full(
+        ups,
+        breaker,
+        UpstreamTimeout::default(),
+        None,
+        keys,
+        tianshu_relay_core::routing::SiteGuardPolicy::default(),
+        None,
+    )
+    .await;
     (handle, token, failures)
 }
 
@@ -159,6 +167,7 @@ async fn start_routed_full(
     timeout: UpstreamTimeout,
     revoked: Option<Vec<String>>,
     keys: Vec<(&str, &str)>,
+    guard: tianshu_relay_core::routing::SiteGuardPolicy,
     usage: Option<UsageLog>,
 ) -> (GatewayHandle, String, Failures, Observations) {
     let route = RouteTable::new(upstreams);
@@ -198,7 +207,7 @@ async fn start_routed_full(
         legacy_key_ref: None,
         // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
         lb_top_n: 1,
-        guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
+        guard_policy: guard,
         runtime: None,
         on_failure: Some(Arc::new(move |f| {
             if let Ok(mut log) = sink.lock() {
@@ -466,6 +475,7 @@ async fn a_connect_failure_is_replayed_to_the_next_upstream() {
         UpstreamTimeout::default(),
         None,
         vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+        tianshu_relay_core::routing::SiteGuardPolicy::default(),
         None,
     )
     .await;
@@ -506,6 +516,7 @@ async fn a_read_timeout_is_not_replayed() {
         timeout,
         None,
         vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+        tianshu_relay_core::routing::SiteGuardPolicy::default(),
         None,
     )
     .await;
@@ -553,6 +564,7 @@ async fn a_bodyless_get_request_also_fails_over() {
         UpstreamTimeout::default(),
         None,
         vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+        tianshu_relay_core::routing::SiteGuardPolicy::default(),
         None,
     )
     .await;
@@ -630,6 +642,7 @@ async fn failure_event_carries_only_metadata() {
         UpstreamTimeout::default(),
         None,
         vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+        tianshu_relay_core::routing::SiteGuardPolicy::default(),
         None,
     )
     .await;
@@ -697,6 +710,7 @@ async fn all_connect_failures_still_return_502_with_the_last_reason() {
         UpstreamTimeout::default(),
         None,
         vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+        tianshu_relay_core::routing::SiteGuardPolicy::default(),
         None,
     )
     .await;
@@ -918,7 +932,16 @@ async fn start_routed_with(
         .iter()
         .map(|(u, rate)| u.upstream(*rate))
         .collect();
-    start_routed_full(ups, breaker, timeout, revoked, keys, None).await
+    start_routed_full(
+        ups,
+        breaker,
+        timeout,
+        revoked,
+        keys,
+        tianshu_relay_core::routing::SiteGuardPolicy::default(),
+        None,
+    )
+    .await
 }
 
 fn body_with_model() -> String {
@@ -1443,6 +1466,7 @@ async fn usage_key_id_comes_from_the_hit_upstream() {
         UpstreamTimeout::default(),
         None,
         vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+        tianshu_relay_core::routing::SiteGuardPolicy::default(),
         Some(Arc::clone(&usage)),
     )
     .await;
@@ -1473,5 +1497,148 @@ async fn usage_key_id_comes_from_the_hit_upstream() {
         assert!(!log[0].stream);
         assert!(log[0].at > 0, "at 必须由系统时钟填入");
     }
+    handle.shutdown_and_wait().await;
+}
+
+/// 脚本化假上游（M40-S1 P1 回归测试）：**第一个**连接回 `first_status`，
+/// 但 body 延迟 `delay` 后才写；之后的连接一律 200 + `{"from":"siteN"}`。
+///
+/// 用途：让「非 2xx 的响应 body 还没读完」这个状态可以被确定性地观察到，
+/// 从而验证 lease 是否覆盖了整个 body（M39-S3 的并发保护）。
+fn spawn_upstream_slow_first(
+    site_id: i64,
+    key_ref: &str,
+    first_status: &str,
+    delay: Duration,
+) -> FakeUpstream {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+    let addr = listener.local_addr().expect("读取地址");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let first_status = first_status.to_string();
+
+    thread::spawn(move || {
+        for (index, stream) in listener.incoming().enumerate() {
+            let Ok(mut stream) = stream else { continue };
+            let raw = read_request(&mut stream);
+            if let Ok(mut log) = recorder.lock() {
+                log.push(raw);
+            }
+            if index == 0 {
+                let body = b"slow-500-body";
+                let head = format!(
+                    "HTTP/1.1 {first_status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.flush();
+                // 头已发出、body 还在路上：此刻 lease 必须仍被占用。
+                thread::sleep(delay);
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            } else {
+                let body = format!(r#"{{"from":"site{site_id}"}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+    });
+
+    FakeUpstream {
+        site_id,
+        base_url: format!("http://{addr}"),
+        key_ref: key_ref.to_string(),
+        seen,
+    }
+}
+
+/// 发请求并**只读到响应头**，返回（仍打开的连接, 状态码）。
+fn open_and_read_headers(url: &str, token: &str, path: &str, body: &str) -> (TcpStream, u16) {
+    let without_scheme = url.trim_start_matches("http://");
+    let mut stream = TcpStream::connect(without_scheme).expect("连接网关");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {without_scheme}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("发送请求");
+    stream.flush().ok();
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => buf.push(byte[0]),
+        }
+    }
+    let head = String::from_utf8_lossy(&buf).to_string();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    (stream, status)
+}
+
+/// M40-S1 复审 P1：**非 2xx 的 body 也必须占着站点 lease**，直到 body 读完。
+///
+/// 场景：`max_concurrency = 1`，上游第一次回「慢 500」（头发完、body 延迟 800ms）。
+/// - 第一请求只读头不读 body ⇒ 第二请求必须被本地保护拒绝（429 `local_rate_limited`）；
+/// - 读完第一请求的 body ⇒ lease 归还，第三请求必须被放行（脚本化上游回 200）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_success_body_holds_the_site_lease_until_read() {
+    let a = spawn_upstream_slow_first(
+        1,
+        REF_A,
+        "500 Internal Server Error",
+        Duration::from_millis(800),
+    );
+    let (handle, token, _failures, _obs) = start_routed_full(
+        vec![a.upstream(1.0)],
+        long_cooldown(),
+        UpstreamTimeout::default(),
+        None,
+        vec![(REF_A, KEY_A)],
+        tianshu_relay_core::routing::SiteGuardPolicy {
+            max_concurrency: 1,
+            rate_limit_per_sec: 0,
+        },
+        None,
+    )
+    .await;
+
+    let url = format!("http://{}", handle.addr);
+    let (mut first, status1) =
+        open_and_read_headers(&url, &token, "/v1/chat/completions", &chat_body());
+    assert_eq!(status1, 500, "第一请求应拿到上游的 500");
+
+    // body 还没读完 ⇒ lease 必须仍被占用 ⇒ 第二请求被本地并发保护拒绝。
+    let (status2, body2) = post(&handle, &token, &chat_body()).await;
+    assert_eq!(
+        status2, 429,
+        "body 未读完时第二请求必须被本地保护拒绝: {body2}"
+    );
+    assert!(
+        body2.contains("local_rate_limited"),
+        "必须是本地限流而不是上游 429: {body2}"
+    );
+
+    // 读完第一条 body（lease 归还）。
+    let mut rest = Vec::new();
+    first.read_to_end(&mut rest).expect("读完 body");
+    drop(first);
+
+    // lease 已归还 ⇒ 第三请求放行（脚本化上游第二次起回 200）。
+    let (status3, body3) = post(&handle, &token, &chat_body()).await;
+    assert_eq!(status3, 200, "lease 归还后应放行: {body3}");
+    assert!(body3.contains("site1"), "{body3}");
+
     handle.shutdown_and_wait().await;
 }
