@@ -96,9 +96,10 @@ pub fn import_refs(
                 // 明文只在栈上活很短一段，用完清零。
                 let value = Zeroizing::new(value);
                 if let Err(err) = target.put(reference, value.as_str()) {
-                    report
-                        .failed
-                        .push((reference.clone(), format!("写入失败: {err}")));
+                    report.failed.push((
+                        reference.clone(),
+                        crate::redact::scrub(&format!("写入失败: {err}")),
+                    ));
                     continue;
                 }
                 match target.get(reference) {
@@ -108,21 +109,23 @@ pub fn import_refs(
                             // 不阻塞完成标记（M38-S2：否则每次启动都会重试这条注定删不掉的条目）。
                             report.cleanup_pending.push((
                                 reference.clone(),
-                                format!("已写入但删除源条目失败: {err}"),
+                                crate::redact::scrub(&format!("已写入但删除源条目失败: {err}")),
                             ));
                         } else {
                             report.imported += 1;
                         }
                     }
                     Ok(_) => report.failed.push((reference.clone(), "回读不一致".into())),
-                    Err(err) => report
-                        .failed
-                        .push((reference.clone(), format!("回读失败: {err}"))),
+                    Err(err) => report.failed.push((
+                        reference.clone(),
+                        crate::redact::scrub(&format!("回读失败: {err}")),
+                    )),
                 }
             }
-            Err(err) => report
-                .failed
-                .push((reference.clone(), format!("读取源条目失败: {err}"))),
+            Err(err) => report.failed.push((
+                reference.clone(),
+                crate::redact::scrub(&format!("读取源条目失败: {err}")),
+            )),
         }
     }
     Ok(report)
@@ -133,7 +136,10 @@ pub fn status_for(target: &LocalVault) -> Result<MigrationStatus> {
     let marker = target.meta_get(MIGRATION_MARKER)?;
     let attempts = parse_attempts(target)?;
     let last_at = parse_last_at(target)?;
-    let last_error = target.meta_get(MIGRATION_LAST_ERROR)?;
+    let last_error = target
+        .meta_get(MIGRATION_LAST_ERROR)?
+        .map(|s| crate::redact::scrub(&s))
+        .filter(|s| !s.is_empty());
     let failures = parse_failures(target.meta_get(MIGRATION_FAILURES)?.as_deref());
     let cleanup_pending = parse_failures(target.meta_get(MIGRATION_CLEANUP_PENDING)?.as_deref());
     let phase = if marker.is_some() {
@@ -274,7 +280,7 @@ fn parse_failures(raw: Option<&str>) -> Vec<MigrationFailure> {
         .filter_map(|item| {
             Some(MigrationFailure {
                 reference: item.get("reference")?.as_str()?.to_string(),
-                reason: item.get("reason")?.as_str()?.to_string(),
+                reason: crate::redact::scrub(item.get("reason")?.as_str()?),
             })
         })
         .collect()

@@ -2846,7 +2846,8 @@ fn migration_failure_dtos(pairs: &[(String, String)]) -> Vec<VaultMigrationFailu
         .iter()
         .map(|(reference, reason)| VaultMigrationFailureDto {
             reference: reference.clone(),
-            reason: reason.clone(),
+            // 核心层已 scrub；命令层再过一次，保证旧库/底层错误串不会把密钥形态送到前端。
+            reason: tianshu_relay_core::redact::scrub(reason),
         })
         .collect()
 }
@@ -2859,7 +2860,7 @@ fn migration_status_dto(
             .iter()
             .map(|f| VaultMigrationFailureDto {
                 reference: f.reference.clone(),
-                reason: f.reason.clone(),
+                reason: tianshu_relay_core::redact::scrub(&f.reason),
             })
             .collect::<Vec<_>>()
     };

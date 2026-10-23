@@ -333,6 +333,32 @@ fn a_cleanup_only_failure_still_sets_the_marker() {
 }
 
 #[test]
+fn status_for_scrubs_secret_shapes_already_persisted_in_meta() {
+    let dir = temp_dir();
+    let target = LocalVault::open_temp(dir.path()).unwrap();
+    let secret = "sk-legacy-meta-probe-0123456789";
+    target
+        .meta_set(MIGRATION_LAST_ERROR, &format!("旧失败原因 {secret}"))
+        .unwrap();
+    target
+        .meta_set(
+            MIGRATION_FAILURES,
+            &serde_json::json!([{ "reference": "kr/key/1/secret", "reason": format!("回显 {secret}") }])
+                .to_string(),
+        )
+        .unwrap();
+
+    let status = status_for(&target).unwrap();
+    let text = format!(
+        "{} {:?}",
+        status.last_error.unwrap_or_default(),
+        status.failures
+    );
+    assert!(!text.contains(secret), "状态返回不得含密钥明文: {text}");
+    assert!(text.contains("sk-***"), "应留下脱敏痕迹: {text}");
+}
+
+#[test]
 fn abandon_does_not_overwrite_a_completed_marker() {
     let dir = temp_dir();
     let source = MemoryVault::new();
