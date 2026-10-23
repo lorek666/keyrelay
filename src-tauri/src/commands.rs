@@ -2065,7 +2065,7 @@ pub async fn gateway_rotate_token(
         .gateway_port;
     let _pre_check = state
         .service
-        .gateway_config(site_id, key_id, port)
+        .validate_gateway_target(site_id, key_id)
         .map_err(|e| e.to_string())?;
 
     // M41-S2：先取默认行（`is_default = 1`，不看 label）。没有默认行 ⇒ 走 legacy 路径
@@ -2125,13 +2125,11 @@ pub async fn gateway_rotate_token(
         .rotate_gateway_token()
         .map_err(|e| e.to_string())?;
     // 新明文只在这里用一下（算 hash），不进日志/事件/DTO。
-    let new_plaintext = state
-        .service
-        .gateway_config(site_id, key_id, port)
-        .map_err(|e| {
-            format!("令牌已换，但新令牌无法用于网关（网关仍用旧令牌运行，请重试轮换）：{e}")
-        })?
-        .token;
+    // P1（M41-S2 复审）：不能调 `gateway_config`——那会自增会话代号并替换运行时快照，
+    // 让**正在运行**的旧网关丢掉后续的 usage/failure 事件。只读钥匙串明文。
+    let new_plaintext = state.service.gateway_token_plaintext().map_err(|e| {
+        format!("令牌已换，但新令牌无法读取（网关仍用旧令牌运行，请重试轮换）：{e}")
+    })?;
     let new_hash = tianshu_relay_core::gateway::sha256_hex(&new_plaintext);
     if let Err(err) = state
         .service
@@ -2181,7 +2179,7 @@ pub async fn gateway_rotate_token(
                 }
             }
             // 状态 DTO 的 `token` 是「当前默认令牌明文」：不重启网关时句柄里的那份要手动换新。
-            run.handle.token = new_plaintext;
+            run.handle.token = new_plaintext.to_string();
             run.token_grace_until = grace_until_unix;
         }
     }
