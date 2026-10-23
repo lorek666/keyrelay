@@ -298,3 +298,78 @@ fn streaming_is_accepted_and_marked_on_the_ir() {
         assert_eq!(up["stream_options"]["include_usage"], true, "{proto:?}");
     }
 }
+
+// ---------------------------------------------------------------- 复审 P1-1（曾被误删，恢复）
+
+#[test]
+fn gemini_function_response_becomes_a_tool_message() {
+    let body = json!({
+        "contents": [
+            { "role": "user", "parts": [{ "text": "查天气" }] },
+            { "role": "model", "parts": [{ "functionCall": { "name": "get_weather", "args": {"city":"SH"} } }] },
+            { "role": "user", "parts": [{ "functionResponse": { "name": "get_weather", "response": { "temp": 21, "sky": "晴" } } }] }
+        ]
+    });
+    let req = parse_request(Protocol::GeminiGenerateContent, body.to_string().as_bytes()).unwrap();
+    let up = req.to_upstream_json();
+    let msgs = up["messages"].as_array().unwrap();
+    let tool = msgs
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("必须有 tool 消息");
+    let content = tool["content"].as_str().unwrap();
+    assert!(content.contains("temp: 21"), "对象要展开成 k: v: {content}");
+    assert!(!content.starts_with('{'), "不得整段 JSON 引号: {content}");
+}
+
+// ---------------------------------------------------------------- 复审 P1-2（曾被误删，恢复）
+
+#[test]
+fn anthropic_base64_image_becomes_a_data_uri() {
+    let body = json!({
+        "model": "claude-x", "max_tokens": 8,
+        "messages": [{ "role": "user", "content": [
+            { "type": "text", "text": "看图" },
+            { "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "QUJD" } }
+        ]}]
+    });
+    let req = parse_request(Protocol::AnthropicMessages, body.to_string().as_bytes()).unwrap();
+    let up = req.to_upstream_json();
+    let parts = up["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(parts[1]["type"], "image_url");
+    assert_eq!(parts[1]["image_url"]["url"], "data:image/jpeg;base64,QUJD");
+
+    let body2 = json!({
+        "model": "claude-x", "max_tokens": 8,
+        "messages": [{ "role": "user", "content": [
+            { "type": "image", "source": { "type": "url", "url": "https://x/y.png" } }
+        ]}]
+    });
+    let req2 = parse_request(Protocol::AnthropicMessages, body2.to_string().as_bytes()).unwrap();
+    assert_eq!(
+        req2.to_upstream_json()["messages"][0]["content"][0]["image_url"]["url"],
+        "https://x/y.png"
+    );
+}
+
+// ---------------------------------------------------------------- 复审 P1-3（曾被误删，恢复）
+
+#[test]
+fn tool_choice_objects_are_accepted_for_auto_and_none_only() {
+    for ok in ["auto", "none"] {
+        let body =
+            json!({ "model": "m", "max_tokens": 8, "messages": [], "tool_choice": { "type": ok } });
+        assert!(parse_request(Protocol::AnthropicMessages, body.to_string().as_bytes()).is_ok());
+    }
+    for bad in ["any", "tool", "weird"] {
+        let body = json!({ "model": "m", "max_tokens": 8, "messages": [], "tool_choice": { "type": bad } });
+        let err =
+            parse_request(Protocol::AnthropicMessages, body.to_string().as_bytes()).unwrap_err();
+        assert_eq!(err.code, "unsupported_field");
+        assert!(err.message.contains(bad), "必须点名 {bad}: {}", err.message);
+    }
+    let ok = json!({ "model": "m", "input": [], "tool_choice": { "type": "auto" } });
+    assert!(parse_request(Protocol::OpenAiResponses, ok.to_string().as_bytes()).is_ok());
+    let bad = json!({ "model": "m", "input": [], "tool_choice": { "type": "tool" } });
+    assert!(parse_request(Protocol::OpenAiResponses, bad.to_string().as_bytes()).is_err());
+}

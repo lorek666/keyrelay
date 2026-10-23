@@ -178,6 +178,9 @@ pub struct StreamTranslator {
     block_index: u32,
     /// 已经开过 text block（Anthropic）
     text_block_open: bool,
+    /// 已开过的 tool 块：`index → 累积的 arguments 字符串`（P1-2 状态机）。
+    /// start 只发一次；后续只发增量；Gemini 在 finish 时一次性发完整 functionCall。
+    tool_blocks: std::collections::BTreeMap<u32, String>,
 }
 
 impl StreamTranslator {
@@ -188,6 +191,7 @@ impl StreamTranslator {
             finished: false,
             block_index: 0,
             text_block_open: false,
+            tool_blocks: std::collections::BTreeMap::new(),
         }
     }
 
@@ -212,12 +216,18 @@ impl StreamTranslator {
                     })));
                 }
                 for (idx, id, name, args) in &d.tool_calls {
-                    frames.push(sse_data(&json!({
-                        "type": "response.output_item.added",
-                        "output_index": idx,
-                        "item": { "type": "function_call", "call_id": id, "name": name },
-                    })));
+                    // P1-2：start 只发**一次**（同一个 index 的后续 delta 只发增量）
+                    let fresh = !self.tool_blocks.contains_key(idx);
+                    if fresh {
+                        self.tool_blocks.insert(*idx, String::new());
+                        frames.push(sse_data(&json!({
+                            "type": "response.output_item.added",
+                            "output_index": idx,
+                            "item": { "type": "function_call", "call_id": id, "name": name },
+                        })));
+                    }
                     if !args.is_empty() {
+                        self.tool_blocks.entry(*idx).or_default().push_str(args);
                         frames.push(sse_data(&json!({
                             "type": "response.function_call_arguments.delta",
                             "output_index": idx, "delta": args,
@@ -240,11 +250,16 @@ impl StreamTranslator {
                     })));
                 }
                 for (idx, id, name, args) in &d.tool_calls {
-                    frames.push(sse_data(&json!({
-                        "type": "content_block_start", "index": idx + 1,
-                        "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} },
-                    })));
+                    let fresh = !self.tool_blocks.contains_key(idx);
+                    if fresh {
+                        self.tool_blocks.insert(*idx, String::new());
+                        frames.push(sse_data(&json!({
+                            "type": "content_block_start", "index": idx + 1,
+                            "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} },
+                        })));
+                    }
                     if !args.is_empty() {
+                        self.tool_blocks.entry(*idx).or_default().push_str(args);
                         frames.push(sse_data(&json!({
                             "type": "content_block_delta", "index": idx + 1,
                             "delta": { "type": "input_json_delta", "partial_json": args },
@@ -257,9 +272,9 @@ impl StreamTranslator {
                 if let Some(t) = &d.text {
                     parts.push(json!({ "text": t }));
                 }
-                for (_, _, name, args) in &d.tool_calls {
-                    let parsed: Value = serde_json::from_str(args).unwrap_or(json!({}));
-                    parts.push(json!({ "functionCall": { "name": name, "args": parsed } }));
+                // P1-2：Gemini 的 arguments 是**累积**的，finish 时一次性发完整 functionCall
+                for (idx, _, _, args) in &d.tool_calls {
+                    self.tool_blocks.entry(*idx).or_default().push_str(args);
                 }
                 if !parts.is_empty() {
                     frames.push(sse_data(&json!({
@@ -290,10 +305,30 @@ impl StreamTranslator {
                         "type": "content_block_stop", "index": self.block_index
                     })));
                 }
+                // P1-2：每个已开的 tool 块都要收尾（否则客户端挂住）
+                for idx in self.tool_blocks.keys() {
+                    frames.push(sse_data(&json!({
+                        "type": "content_block_stop", "index": idx + 1
+                    })));
+                }
                 frames.push(sse_data(&json!({ "type": "message_stop" })));
             }
             super::Protocol::GeminiGenerateContent => {
-                // Gemini **没有 [DONE]**：靠流关闭本身表示结束，这里不额外发帧
+                // P1-2：累积的 arguments 在这里一次性发完整 functionCall
+                let parts: Vec<Value> = self
+                    .tool_blocks
+                    .values()
+                    .map(|args| {
+                        let parsed: Value = serde_json::from_str(args).unwrap_or(json!({}));
+                        json!({ "functionCall": { "args": parsed } })
+                    })
+                    .collect();
+                if !parts.is_empty() {
+                    frames.push(sse_data(&json!({
+                        "candidates": [{ "content": { "role": "model", "parts": parts }, "index": 0 }]
+                    })));
+                }
+                // Gemini **没有 [DONE]**：靠流关闭本身表示结束，不额外发结束帧
             }
             super::Protocol::OpenAiChat => frames.push(sse_data_raw("[DONE]")),
         }
