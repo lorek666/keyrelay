@@ -102,7 +102,7 @@ fn the_zeroizing_holder_has_a_hand_written_debug() {
     // 上一条说的是「`Zeroizing` 自己不管 Debug」。那么**持有者**必须管。
     // 本仓目前唯一持有 `Zeroizing<String>` 的生产结构体是 `GatewayConfig`；
     // 它必须是手写 `Debug`，而且 `keys_by_ref` 不得出现在 field 列表里。
-    let gateway = include_str!("../src/gateway.rs");
+    let gateway = include_str!("../src/gateway/mod.rs");
     assert!(
         gateway.contains("impl std::fmt::Debug for GatewayConfig"),
         "GatewayConfig 必须手写 Debug"
@@ -209,7 +209,7 @@ fn the_gateway_config_copy_is_wrapped_too() {
     // 为什么非要有这条守卫：把类型改回裸 `String` 不会让任何**行为**测试变红
     // （`Zeroizing` 的 `Deref` 让所有调用点照旧编译，`key_secret_returns_a_zeroizing_wrapper`
     // 也只看返回类型），所以只有文本断言拦得住它。
-    let gateway = include_str!("../src/gateway.rs");
+    let gateway = include_str!("../src/gateway/mod.rs");
     assert!(
         gateway.contains("pub api_key: Zeroizing<String>"),
         "`GatewayConfig::api_key` 必须是 `Zeroizing<String>`：\
