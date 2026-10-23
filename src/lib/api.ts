@@ -327,6 +327,12 @@ export type Settings = {
   collectModels: boolean;
   /** M14-S1：模型采集最小间隔秒（默认 1800 = 30min）。 */
   modelsMinIntervalSecs: number;
+  /** M39-S3：加权轮询参与的健康候选数（默认 3；1 = 关闭负载均衡）。 */
+  gatewayLbTopN: number;
+  /** M39-S3：每站并发上限（默认 8；0 = 不限）。 */
+  gatewayPerSiteConcurrency: number;
+  /** M39-S3：每站每秒请求上限（默认 0 = 不限速）。 */
+  gatewayPerSiteRateLimit: number;
   // ---- M6-S5：FR-9 界面与隐私 ----
   /** "system" | "light" | "dark" */
   theme: string;
@@ -1535,6 +1541,9 @@ let mockSettings: Settings = {
   gatewayMultiSite: false,
   collectModels: false,
   modelsMinIntervalSecs: 1800,
+  gatewayLbTopN: 3,
+  gatewayPerSiteConcurrency: 8,
+  gatewayPerSiteRateLimit: 0,
   theme: "system",
   language: "zh-CN",
   proxyUrl: "",
