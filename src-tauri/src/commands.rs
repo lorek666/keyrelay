@@ -368,6 +368,7 @@ pub struct SettingsDto {
     gateway_auto_start: bool,
     gateway_last_site_id: i64,
     gateway_last_key_id: i64,
+    gateway_token_grace_secs: u16,
     // M14-S1：多站路由 + 模型采集（B-99）
     gateway_multi_site: bool,
     collect_models: bool,
@@ -466,6 +467,8 @@ pub struct GatewayStatusDto {
     token_persistent: bool,
     /// 最近一次任务结束（`crashed` 且有结束记录时才有值）。
     last_exit: Option<GatewayExitDto>,
+    /// M41-S2：被轮换掉的默认令牌仍可用的截止时刻（unix 秒）。`None` = 无宽限。
+    token_grace_until: Option<i64>,
     /// M42-S1：**实际**监听的地址，例如 `["127.0.0.1:8787", "[::1]:8787"]`。
     /// 网关没在跑时为空 vec（不是「以为在监听」）。
     listen_addrs: Vec<String>,
@@ -518,6 +521,8 @@ pub struct GatewayRunning {
     pub handle: tianshu_relay_core::gateway::GatewayHandle,
     pub site_id: i64,
     pub key_id: i64,
+    /// M41-S2：本轮宽限的截止时刻（unix 秒，仅展示）。只在内存里，stop/重启即丢。
+    pub token_grace_until: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -1372,6 +1377,7 @@ fn settings_from_dto(dto: &SettingsDto) -> tianshu_relay_core::settings::Setting
         gateway_auto_start: dto.gateway_auto_start,
         gateway_last_site_id: dto.gateway_last_site_id,
         gateway_last_key_id: dto.gateway_last_key_id,
+        gateway_token_grace_secs: dto.gateway_token_grace_secs,
         gateway_multi_site: dto.gateway_multi_site,
         collect_models: dto.collect_models,
         models_min_interval_secs: dto.models_min_interval_secs,
@@ -1407,6 +1413,7 @@ fn settings_to_dto(settings: &tianshu_relay_core::settings::Settings) -> Setting
         gateway_auto_start: settings.gateway_auto_start,
         gateway_last_site_id: settings.gateway_last_site_id,
         gateway_last_key_id: settings.gateway_last_key_id,
+        gateway_token_grace_secs: settings.gateway_token_grace_secs,
         gateway_multi_site: settings.gateway_multi_site,
         collect_models: settings.collect_models,
         models_min_interval_secs: settings.models_min_interval_secs,
@@ -1585,6 +1592,7 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
         site: None,
         token_persistent,
         last_exit: None,
+        token_grace_until: None,
         // M42-S1：没在跑 ⇒ 没有监听地址（不要凭空写 127.0.0.1:port）。
         listen_addrs: Vec::new(),
         ipv6_degraded: false,
@@ -1662,6 +1670,7 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             site: Some(run.handle.site_display_name.clone()),
             token_persistent,
             last_exit,
+            token_grace_until: run.token_grace_until,
             listen_addrs,
             ipv6_degraded,
             ipv6_note,
@@ -1687,6 +1696,7 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             site: None,
             token_persistent,
             last_exit,
+            token_grace_until: None,
             // 任务已死 ⇒ 端口已释放：不再报任何监听地址。
             listen_addrs: Vec::new(),
             ipv6_degraded: false,
@@ -1943,6 +1953,7 @@ pub(crate) async fn start_gateway_locked(
             handle,
             site_id,
             key_id,
+            token_grace_until: None,
         });
     }
     // M41-S1：成功启动后记下这一组（auto-start 的首选）。写失败只记日志、不回滚网关。
@@ -2057,45 +2068,122 @@ pub async fn gateway_rotate_token(
         .gateway_config(site_id, key_id, port)
         .map_err(|e| e.to_string())?;
 
-    // 校验通过才换令牌。失败即中止（没 take、没 stop，网关继续跑旧令牌）。
+    // M41-S2：先取默认行（`is_default = 1`，不看 label）。没有默认行 ⇒ 走 legacy 路径
+    // （registry 空 ⇒ 只认 `config.token`，宽限无从表达，保持既有重启语义、零宽限）。
+    let default_row = state
+        .service
+        .store()
+        .default_gateway_token()
+        .map_err(|e| e.to_string())?;
+    let Some(default_row) = default_row else {
+        state
+            .service
+            .rotate_gateway_token()
+            .map_err(|e| e.to_string())?;
+        let config = state
+            .service
+            .gateway_config(site_id, key_id, port)
+            .map_err(|e| {
+                format!("令牌已换，但新令牌无法用于网关（网关仍用旧令牌运行，请重启网关）：{e}")
+            })?;
+        let run = state
+            .gateway
+            .lock()
+            .map_err(|_| "网关状态锁失效（需要重启应用）".to_string())?
+            .take()
+            .ok_or_else(|| "网关已不在运行".to_string())?;
+        stop_gateway(run.handle).await;
+        state.service.drain_gateway_usage();
+        state.service.drain_gateway_failures();
+        state.service.end_gateway_session();
+        let handle = tianshu_relay_core::gateway::start(config)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Ok(mut guard) = state.gateway.lock() {
+            *guard = Some(GatewayRunning {
+                handle,
+                site_id,
+                key_id,
+                token_grace_until: None,
+            });
+        }
+        return Ok(gateway_status_of(&state));
+    };
+
+    // 写序硬约束：钥匙串 → DB → 内存（DB 失败时运行态绝不先换新令牌，否则重启后旧 hash 复活）。
+    let grace_secs = state
+        .service
+        .settings()
+        .map_err(|e| e.to_string())?
+        .gateway_token_grace_secs;
+    let old_hash = default_row.token_hash.clone();
+    let default_id = default_row.id;
+    let default_label = default_row.label.clone();
+
     state
         .service
         .rotate_gateway_token()
         .map_err(|e| e.to_string())?;
-
-    // P2-7 / DEBUG-REPORT-v3 §2-7：rotate 之后重新构造 config——gateway_token() 这
-    // 次读到的是新令牌。否则 start 用 rotate 之前那份 config（旧令牌），运行中的网关
-    // 仍认旧令牌，而指向网关的 agent 已用新令牌 ⇒ 永久 401/502，直到手动重启。
-    // rotate 前已校验 key 状态，这里不会因 key 被回收而失败。
-    let config = state
+    // 新明文只在这里用一下（算 hash），不进日志/事件/DTO。
+    let new_plaintext = state
         .service
         .gateway_config(site_id, key_id, port)
         .map_err(|e| {
-            format!("令牌已换，但新令牌无法用于网关（网关仍用旧令牌运行，请重启网关）：{e}")
-        })?;
+            format!("令牌已换，但新令牌无法用于网关（网关仍用旧令牌运行，请重试轮换）：{e}")
+        })?
+        .token;
+    let new_hash = tianshu_relay_core::gateway::sha256_hex(&new_plaintext);
+    if let Err(err) = state
+        .service
+        .store()
+        .update_gateway_token_hash(default_id, &new_hash)
+    {
+        return Err(format!(
+            "令牌已换但入库失败（网关仍用旧令牌运行；重启后会自动对账到新令牌，也可重试轮换）：{err}"
+        ));
+    }
 
-    // take + stop + start（用运行态的 site_id/key_id，与启动时相同）。
-    let run = state
-        .gateway
-        .lock()
-        .map_err(|_| "网关状态锁失效（需要重启应用）".to_string())?
-        .take()
-        .ok_or_else(|| "网关已不在运行".to_string())?;
-    stop_gateway(run.handle).await;
-    // M40-S1：先落旧会话的用量，再落失败，最后作废会话（顺序是硬要求）。
-    state.service.drain_gateway_usage();
-    state.service.drain_gateway_failures();
-    state.service.end_gateway_session();
-
-    let handle = tianshu_relay_core::gateway::start(config)
-        .await
-        .map_err(|e| e.to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let grace_until_unix = if grace_secs > 0 {
+        Some(now + i64::from(grace_secs))
+    } else {
+        None
+    };
     if let Ok(mut guard) = state.gateway.lock() {
-        *guard = Some(GatewayRunning {
-            handle,
-            site_id,
-            key_id,
-        });
+        if let Some(run) = guard.as_mut() {
+            let registry = run.handle.token_registry();
+            if let Ok(mut entries) = registry.write() {
+                // 只保留「上一代」宽限：先清掉旧的宽限条目（registry 不膨胀）。
+                entries.retain(|entry| entry.grace_until.is_none());
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.id == default_id) {
+                    entry.token_hash = new_hash.clone();
+                } else {
+                    entries.push(tianshu_relay_core::gateway::GatewayTokenEntry {
+                        id: default_id,
+                        token_hash: new_hash,
+                        label: default_label.clone(),
+                        grace_until: None,
+                    });
+                }
+                if grace_secs > 0 {
+                    entries.push(tianshu_relay_core::gateway::GatewayTokenEntry {
+                        id: default_id,
+                        token_hash: old_hash,
+                        label: default_label,
+                        grace_until: Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(u64::from(grace_secs)),
+                        ),
+                    });
+                }
+            }
+            // 状态 DTO 的 `token` 是「当前默认令牌明文」：不重启网关时句柄里的那份要手动换新。
+            run.handle.token = new_plaintext;
+            run.token_grace_until = grace_until_unix;
+        }
     }
     Ok(gateway_status_of(&state))
 }
@@ -2732,6 +2820,7 @@ async fn restart_gateway_after_rotation(
             handle,
             site_id,
             key_id: new_key_id,
+            token_grace_until: None,
         });
     }
     Ok(RotationGatewayRestart::Restarted)

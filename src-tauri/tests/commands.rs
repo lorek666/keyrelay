@@ -2288,3 +2288,142 @@ fn m43_t9_label_validation_rejects_the_four_bad_shapes() {
         .expect_err("重名必须被拒");
     assert!(err.to_string().contains("同名"), "{err}");
 }
+
+// ============================================================ M41-S2：令牌轮换宽限期
+
+/// 原始 HTTP `GET /health`：返回状态码（401/200）。不引 reqwest（壳层 dev-deps 没有）。
+fn health_status(port: u16, token: &str) -> u16 {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("连接网关");
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).expect("写请求");
+    let mut buf = String::new();
+    let _ = stream.read_to_string(&mut buf);
+    buf.split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("非法响应: {buf}"))
+}
+
+fn set_grace(webview: &tauri::WebviewWindow<tauri::test::MockRuntime>, secs: u16) {
+    let mut payload = read_settings(webview);
+    payload["gatewayTokenGraceSecs"] = json!(secs);
+    invoke_on(
+        webview,
+        "update_settings",
+        json!({"args": {"settings": payload}}),
+    )
+    .expect("保存宽限期");
+}
+
+/// 旧令牌在 grace 内 200、过期 401、新令牌立即 200；默认行 id/label 不变。
+#[test]
+fn m41s2_grace_rotation_keeps_the_old_token_until_expiry() {
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let port = free_port();
+    enable_gateway(&webview, port);
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    let old_token = started["token"].as_str().expect("旧令牌").to_string();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
+    let default_before = state
+        .service
+        .store()
+        .default_gateway_token()
+        .expect("默认行")
+        .expect("网关启动应已迁移默认行");
+    assert_eq!(health_status(port, &old_token), 200);
+
+    set_grace(&webview, 1);
+    let rotated = invoke_on(&webview, "gateway_rotate_token", json!({"args": null})).expect("轮换");
+    let new_token = rotated["token"].as_str().expect("新令牌").to_string();
+    assert_ne!(old_token, new_token, "必须是新令牌");
+    let grace = rotated["tokenGraceUntil"]
+        .as_i64()
+        .expect("必须返回 tokenGraceUntil");
+    assert!(grace > 0);
+
+    // 默认行原地更新：id / label 不变，hash 已换。
+    let default_after = state
+        .service
+        .store()
+        .default_gateway_token()
+        .expect("读默认行")
+        .expect("默认行仍在");
+    assert_eq!(default_after.id, default_before.id, "默认行 id 不得变");
+    assert_eq!(
+        default_after.label, default_before.label,
+        "默认行 label 不得变"
+    );
+    assert_ne!(
+        default_after.token_hash, default_before.token_hash,
+        "hash 应已换新"
+    );
+
+    // 新令牌立即 200；旧令牌在 grace 内仍 200。
+    assert_eq!(health_status(port, &new_token), 200, "新令牌必须立即生效");
+    assert_eq!(health_status(port, &old_token), 200, "宽限内旧令牌应仍可用");
+
+    // 过期 ⇒ 旧 401、新 200。
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    assert_eq!(
+        health_status(port, &old_token),
+        401,
+        "宽限到期后旧令牌必须 401"
+    );
+    assert_eq!(health_status(port, &new_token), 200);
+}
+
+/// grace=0 ⇒ 旧令牌立即失效；重启后旧令牌同样失效（宽限不落库）。
+#[test]
+fn m41s2_grace_zero_and_restart_kill_the_old_token() {
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let port = free_port();
+    enable_gateway(&webview, port);
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    let first_token = started["token"].as_str().expect("旧令牌").to_string();
+
+    set_grace(&webview, 0);
+    let rotated = invoke_on(&webview, "gateway_rotate_token", json!({"args": null})).expect("轮换");
+    let second_token = rotated["token"].as_str().expect("新令牌").to_string();
+    assert_eq!(
+        rotated["tokenGraceUntil"],
+        Value::Null,
+        "grace=0 时不该有宽限"
+    );
+    assert_eq!(
+        health_status(port, &first_token),
+        401,
+        "grace=0 ⇒ 旧令牌立即 401"
+    );
+    assert_eq!(health_status(port, &second_token), 200);
+
+    // 重启（stop → start）：宽限是运行态，重启后旧令牌必然 401。
+    invoke_on(&webview, "gateway_stop", json!({})).expect("停止");
+    let restarted = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("重启");
+    let current = restarted["token"].as_str().expect("令牌").to_string();
+    assert_eq!(
+        health_status(port, &first_token),
+        401,
+        "重启后旧令牌必须 401"
+    );
+    assert_eq!(health_status(port, &current), 200, "重启后当前令牌可用");
+}

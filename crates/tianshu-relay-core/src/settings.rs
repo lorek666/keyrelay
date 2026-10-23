@@ -29,6 +29,9 @@ pub const MODELS_MIN_INTERVAL_SECS: u64 = 30;
 /// 采集间隔的上限（秒）。
 pub const MODELS_MAX_INTERVAL_SECS: u64 = 86_400;
 
+/// M41-S2：令牌轮换宽限期的上限（秒）。`0` = 关闭。
+pub const MAX_GATEWAY_TOKEN_GRACE_SECS: u16 = 3600;
+
 // M39-S3 §4.6：三个新设置的合法范围（`Settings::validate` 与 `from_pairs` 共用）
 pub const GATEWAY_LB_TOP_N_MIN: usize = 1;
 pub const GATEWAY_LB_TOP_N_MAX: usize = 20;
@@ -52,6 +55,8 @@ const KEY_GATEWAY_MULTI_SITE: &str = "gateway_multi_site";
 const KEY_GATEWAY_AUTO_START: &str = "gateway_auto_start";
 const KEY_GATEWAY_LAST_SITE_ID: &str = "gateway_last_site_id";
 const KEY_GATEWAY_LAST_KEY_ID: &str = "gateway_last_key_id";
+// M41-S2：轮换默认令牌时旧令牌的宽限期（秒，0 = 关闭）
+const KEY_GATEWAY_TOKEN_GRACE_SECS: &str = "gateway_token_grace_secs";
 const KEY_COLLECT_MODELS: &str = "collect_models";
 const KEY_MODELS_MIN_INTERVAL: &str = "models_min_interval_secs";
 // M39-S3：负载均衡与每站保护（三个新设置）
@@ -97,6 +102,9 @@ pub struct Settings {
     pub gateway_last_site_id: i64,
     /// 「上次成功运行」的密钥行号（M41-S1）。`0` = 无。
     pub gateway_last_key_id: i64,
+    /// M41-S2：轮换默认令牌时旧令牌继续可用的秒数。`0` = 关闭宽限（立即失效）。
+    /// 默认 300，上限 3600。宽限期是**运行态**概念：重启后旧令牌立即失效。
+    pub gateway_token_grace_secs: u16,
     /// 多站路由开关（M14-S1 / B-99）：关时 `gateway_config` 走 `single_upstream`
     ///（M8-S4 §6.5 换站语义）；开时走 `build_gateway_route`（多站聚合，按模型选路）。
     /// **默认 false**——PRD FR-6 多站聚合是 V1.1 可选，默认不破坏换站语义。
@@ -184,6 +192,7 @@ impl Default for Settings {
             gateway_auto_start: false,
             gateway_last_site_id: 0,
             gateway_last_key_id: 0,
+            gateway_token_grace_secs: 300,
             // M14-S1：多站路由默认关（保住 M8-S4 换站语义）；采集默认关（不替用户打带密钥请求）
             gateway_multi_site: false,
             collect_models: false,
@@ -281,6 +290,12 @@ impl Settings {
                 "未知语言「{}」（可选：{}）",
                 self.language,
                 LANGUAGES.join(" / ")
+            )));
+        }
+        // M41-S2：宽限期 0..=3600（0 = 关闭）。
+        if self.gateway_token_grace_secs > MAX_GATEWAY_TOKEN_GRACE_SECS {
+            return Err(Error::Store(format!(
+                "令牌轮换宽限期最多 {MAX_GATEWAY_TOKEN_GRACE_SECS} 秒"
             )));
         }
         // M41-S1：last_* 是行号，负数没有意义（0 = 无）。
@@ -480,6 +495,13 @@ impl Settings {
                         }
                     }
                 }
+                KEY_GATEWAY_TOKEN_GRACE_SECS => {
+                    if let Ok(secs) = value.parse::<u16>() {
+                        if secs <= MAX_GATEWAY_TOKEN_GRACE_SECS {
+                            settings.gateway_token_grace_secs = secs;
+                        }
+                    }
+                }
                 // M14-S1：多站路由 + 模型采集
                 KEY_GATEWAY_MULTI_SITE => {
                     if let Some(flag) = parse_bool(value) {
@@ -643,6 +665,10 @@ impl Settings {
                 KEY_GATEWAY_LAST_KEY_ID,
                 self.gateway_last_key_id.to_string(),
             ),
+            (
+                KEY_GATEWAY_TOKEN_GRACE_SECS,
+                self.gateway_token_grace_secs.to_string(),
+            ),
             // M14-S1：多站路由 + 模型采集
             (KEY_GATEWAY_MULTI_SITE, self.gateway_multi_site.to_string()),
             (KEY_COLLECT_MODELS, self.collect_models.to_string()),
@@ -699,7 +725,7 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 30] = [
+    pub const KEYS: [&'static str; 31] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
@@ -710,6 +736,7 @@ impl Settings {
         KEY_GATEWAY_AUTO_START,
         KEY_GATEWAY_LAST_SITE_ID,
         KEY_GATEWAY_LAST_KEY_ID,
+        KEY_GATEWAY_TOKEN_GRACE_SECS,
         KEY_GATEWAY_MULTI_SITE,
         KEY_COLLECT_MODELS,
         KEY_MODELS_MIN_INTERVAL,
@@ -1052,6 +1079,7 @@ mod tests {
             gateway_auto_start: true,
             gateway_last_site_id: 11,
             gateway_last_key_id: 22,
+            gateway_token_grace_secs: 300,
             gateway_multi_site: false,
             collect_models: false,
             models_min_interval_secs: 1800,

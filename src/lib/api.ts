@@ -329,6 +329,8 @@ export type Settings = {
   gatewayLastSiteId: number;
   /** M41-S1：「上次成功运行」的密钥行号（0 = 无）。 */
   gatewayLastKeyId: number;
+  /** M41-S2：轮换默认令牌时旧令牌的宽限期（秒，0 = 关闭；默认 300，上限 3600）。 */
+  gatewayTokenGraceSecs: number;
   /** M14-S1：多站路由开关（默认关，保住换站语义）。 */
   gatewayMultiSite: boolean;
   /** M14-S1：模型清单采集开关（默认关）。 */
@@ -428,6 +430,8 @@ export type GatewayStatus = {
   phase: "running" | "stopped" | "crashed";
   /** 最近一次任务结束（crashed 且发生过结束时才有值）。 */
   lastExit?: GatewayExit | null;
+  /** M41-S2：被轮换掉的默认令牌仍可用的截止时刻（unix 秒）；null = 无宽限。 */
+  tokenGraceUntil?: number | null;
   /** M43-S1：令牌列表（无明文；与 gatewayTokenList 同形）。 */
   tokens?: GatewayToken[];
   url?: string | null;
@@ -1625,6 +1629,7 @@ let mockSettings: Settings = {
   gatewayAutoStart: false,
   gatewayLastSiteId: 0,
   gatewayLastKeyId: 0,
+  gatewayTokenGraceSecs: 300,
   gatewayMultiSite: false,
   collectModels: false,
   modelsMinIntervalSecs: 1800,

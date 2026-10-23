@@ -731,6 +731,10 @@
   },
   "settings": {
     "gatewayAutoStart": {
+      "gatewayTokenGrace": {
+        "label": "令牌轮换宽限期（秒，0=关闭）",
+        "hint": "轮换默认令牌后，旧令牌在这段时间内仍可用（默认 300 秒，最多 3600）。宽限期只在本次运行有效：重启后旧令牌立即失效。"
+      },
       "title": "应用启动时自动启动网关",
       "label": "启动应用后自动启动本地网关",
       "hint": "需要已启用网关，且有「健康」站点与启用中的密钥；优先使用上次成功运行的那组，否则回退到第一个健康站点。启动失败不影响应用启动，也不会自动重试。"
@@ -944,6 +948,31 @@
     }
   },
   "gateway": {
+    "tokens": {
+      "title": "Agent 令牌",
+      "body": "给每个 agent 发一把独立令牌：库里只存 hash，明文只在创建时显示一次；吊销后下一请求立即 401（不用重启网关）。用量按标签归因。",
+      "loading": "加载中…",
+      "loadFailed": "读取令牌列表失败：{error}",
+      "empty": "还没有 Agent 令牌；创建后把令牌配到对应 agent 的网关地址上。",
+      "defaultBadge": "默认令牌",
+      "revokedBadge": "已吊销",
+      "defaultHint": "默认令牌不能吊销；要换它请用上面的「重新生成令牌」（轮换）。",
+      "createdAt": "创建于 {time}",
+      "lastUsedAt": "最近使用 {time}",
+      "neverUsed": "从未使用",
+      "revoke": "吊销",
+      "revokeTitle": "吊销这把令牌？",
+      "revokeBody": "「{label}」将立即失效，使用它的 agent 下一次请求就会 401。此操作不可撤销。",
+      "revokeConfirm": "确认吊销",
+      "labelPlaceholder": "令牌标签（例如 agent 名，最多 64 字符）",
+      "create": "创建令牌",
+      "creating": "创建中…",
+      "createdTitle": "已创建——明文只显示这一次",
+      "createdHint": "现在复制走。关掉这块之后就再也看不到明文了（库里只有 hash）。",
+      "copy": "复制",
+      "graceUntil": "旧令牌仍可用至 {time}；请在此期间重新投递指向网关的通道（重启后旧令牌立即失效）。",
+      "savedIt": "我已保存"
+    },
     "metrics": {
       "title": "网关指标",
       "notRunning": "网关未运行，暂无指标。",
