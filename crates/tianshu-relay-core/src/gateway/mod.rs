@@ -2032,7 +2032,11 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                             "无法确定模型名：Gemini 需要 /v1beta/models/<model>:generateContent",
                         );
                     }
-                    translate_stream = req.stream || gemini_stream;
+                    // P1-1（复审）：**先**把流式意图写回 IR，再序列化——
+                    // 否则 `to_upstream_json()` 读的还是 `req.stream`（false），
+                    // 上游收到的是非流式请求，整个流式路径形同虚设。
+                    req.stream = req.stream || gemini_stream;
+                    translate_stream = req.stream;
                     let json = req.to_upstream_json().to_string();
                     (bytes::Bytes::from(json), Some(proto))
                 }
@@ -2838,12 +2842,29 @@ fn streaming_translate_response(
         let mut dec = SseDecoder::new();
         let mut tr = StreamTranslator::new(proto);
         let mut usage_sent = false;
+        let mut saw_done = false;
 
         loop {
             match upstream.chunk().await {
                 Ok(Some(chunk)) => {
                     let events = dec.push(&chunk);
                     for e in &events {
+                        // P2（复审）：`[DONE]` 之外、解析不出增量的事件 ⇒ 明确报错并关闭，
+                        // 不静默跳过（静默跳过 = 客户端拿到残缺回答却以为完整）。
+                        let is_done = e.data.trim() == "[DONE]";
+                        if is_done {
+                            saw_done = true;
+                        } else if ChatDelta::from_json(&e.data).is_none() {
+                            let frame = format!(
+                                "event: error\ndata: {}\n\n",
+                                serde_json::json!({
+                                    "type": "error",
+                                    "error": { "type": "upstream_error", "message": "上游事件无法解析" }
+                                })
+                            );
+                            let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
+                            return;
+                        }
                         if !usage_sent {
                             if let (Some(d), Some(sink)) =
                                 (ChatDelta::from_json(&e.data), on_usage.as_ref())
@@ -2880,11 +2901,25 @@ fn streaming_translate_response(
                     }
                 }
                 Ok(None) => {
-                    let (rest, _truncated) = dec.finish();
+                    let (rest, truncated) = dec.finish();
                     for e in &rest {
                         for f in tr.on_event(e) {
                             let _ = tx.send(Ok(bytes::Bytes::from(f))).await;
                         }
+                    }
+                    // P2（复审）：**干净 EOF 但没收到 `[DONE]`**（或残留半截事件）⇒
+                    // 发错误事件并**跳过正常收尾**。否则客户端会收到一个「看起来完整」的
+                    // 收尾标记，而实际上回答被截断了。
+                    if !saw_done || truncated {
+                        let frame = format!(
+                            "event: error\ndata: {}\n\n",
+                            serde_json::json!({
+                                "type": "error",
+                                "error": { "type": "upstream_error", "message": "上游流未正常结束（缺少 [DONE]）" }
+                            })
+                        );
+                        let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
+                        return;
                     }
                     let tail = tr.finish();
                     if !tail.is_empty() {

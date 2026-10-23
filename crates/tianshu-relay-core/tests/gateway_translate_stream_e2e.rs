@@ -238,6 +238,14 @@ async fn gemini_streaming_e2e_via_alt_sse() {
     assert!(text.contains("\"text\":\"答\""), "{text}");
     assert!(!text.contains("[DONE]"), "Gemini 不该有 [DONE]: {text}");
     assert_eq!(up.body()["model"], "gemini-2.5-pro");
+    // P1-1（复审）：`alt=sse` 入站也必须在**上游请求**里带 stream:true，
+    // 否则上游回的是普通 JSON，整个流式路径形同虚设。
+    assert_eq!(
+        up.body()["stream"],
+        true,
+        "上游必须收到 stream:true: {}",
+        up.body()
+    );
     h.shutdown_and_wait().await;
 }
 

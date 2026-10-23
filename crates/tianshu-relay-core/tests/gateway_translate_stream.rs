@@ -139,9 +139,15 @@ fn tool_call_delta_is_rendered_per_protocol() {
     assert!(f.iter().any(|x| x.contains("tool_use")));
     assert!(f.iter().any(|x| x.contains("input_json_delta")));
 
+    // P1-2：Gemini 的 arguments 是累积的，on_event 不发、finish 时一次性发完整 functionCall
     let mut g = StreamTranslator::new(Protocol::GeminiGenerateContent);
     let f = g.on_event(&ev());
-    assert!(f.iter().any(|x| x.contains("functionCall")), "{f:?}");
+    assert!(
+        !f.iter().any(|x| x.contains("functionCall")),
+        "不该边收边发: {f:?}"
+    );
+    let fin = g.finish();
+    assert!(fin.iter().any(|x| x.contains("functionCall")), "{fin:?}");
 }
 
 // ---------------------------------------------------------------- usage 解析
@@ -153,4 +159,82 @@ fn usage_is_read_from_the_final_chunk() {
     )
     .unwrap();
     assert_eq!(d.usage, Some((5, 2, 7)));
+}
+
+// ---------------------------------------------------------------- P1-2 状态机：两个 tool_calls 跨多个 delta
+
+#[test]
+fn two_tool_calls_across_multiple_deltas_start_once_each() {
+    use tianshu_relay_core::gateway::translate::stream::SseEvent;
+    let mk = |data: &str| SseEvent {
+        event: None,
+        data: data.to_string(),
+    };
+
+    // 3 个 delta：第 1 个开两个块（各带首段 args），第 2/3 个只补 args
+    let d1 = r#"{"choices":[{"delta":{"tool_calls":[
+        {"index":0,"id":"c1","function":{"name":"f1","arguments":"{\"a\":"}},
+        {"index":1,"id":"c2","function":{"name":"f2","arguments":"{\"b\":"}}]}}]}"#;
+    let d2 =
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}"#;
+    let d3 =
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]}}]}"#;
+
+    // Anthropic：两个 content_block_start 只出现一次，后面只有 delta，finish 两个 stop
+    let mut a = StreamTranslator::new(Protocol::AnthropicMessages);
+    let mut starts = 0;
+    let mut deltas = 0;
+    for d in [d1, d2, d3] {
+        for f in a.on_event(&mk(d)) {
+            if f.contains("content_block_start") && f.contains("tool_use") {
+                starts += 1;
+            }
+            if f.contains("input_json_delta") {
+                deltas += 1;
+            }
+        }
+    }
+    assert_eq!(starts, 2, "每个 index 只开一次");
+    assert_eq!(deltas, 4, "d1 有 2 个带 args 的 call + d2/d3 各 1 ⇒ 4");
+    let fin = a.finish();
+    let stops = fin
+        .iter()
+        .filter(|f| f.contains("content_block_stop"))
+        .count();
+    assert_eq!(stops, 2, "两个 tool 块都要收尾: {fin:?}");
+
+    // Responses：added 只出现一次
+    let mut r = StreamTranslator::new(Protocol::OpenAiResponses);
+    let mut added = 0;
+    for d in [d1, d2, d3] {
+        for f in r.on_event(&mk(d)) {
+            if f.contains("response.output_item.added") {
+                added += 1;
+            }
+        }
+    }
+    assert_eq!(added, 2, "每个 index 只 added 一次");
+
+    // Gemini：finish 时两个 functionCall 且 args 完整
+    let mut g = StreamTranslator::new(Protocol::GeminiGenerateContent);
+    for d in [d1, d2, d3] {
+        let _ = g.on_event(&mk(d));
+    }
+    let fin = g.finish();
+    let joined = fin.concat();
+    assert!(joined.contains("functionCall"), "{joined}");
+    let v: serde_json::Value = serde_json::from_str(
+        joined
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .expect("data 行"),
+    )
+    .expect("JSON");
+    let parts = v["candidates"][0]["content"]["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 2, "{v}");
+    assert_eq!(
+        parts[0]["functionCall"]["args"]["a"], 1,
+        "args 必须累积完整: {v}"
+    );
+    assert_eq!(parts[1]["functionCall"]["args"]["b"], 2, "{v}");
 }
