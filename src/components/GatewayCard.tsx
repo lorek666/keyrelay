@@ -266,10 +266,32 @@ export default function GatewayCard({
   });
 
   const running = status.data?.running ?? false;
+  // M41-S1：三态 + 结束记录。`running` 只作兼容字段，展示以 `phase` 为准。
+  const phase = status.data?.phase ?? "stopped";
+  const lastExit = status.data?.lastExit ?? null;
+  const lastExitReason = lastExit
+    ? lastExit.reason === "panicked"
+      ? t("gateway.phase.reasonPanicked")
+      : lastExit.reason === "requested"
+        ? t("gateway.phase.reasonRequested")
+        : t("gateway.phase.reasonUnexpected")
+    : null;
 
   return (
     <div className="card">
       <h3>{t("gateway.title")}</h3>
+      <p className="muted" data-gateway-phase={phase}>
+        {phase === "running"
+          ? t("gateway.phase.running")
+          : phase === "crashed"
+            ? t("gateway.phase.crashed", {
+                time: lastExit
+                  ? new Date(lastExit.at * 1000).toLocaleString()
+                  : "—",
+                reason: lastExitReason ?? "",
+              })
+            : t("gateway.phase.stopped")}
+      </p>
       <p className="muted">
         {t("gateway.bodyPre")}<span className="mono">{t("gateway.bodyMid", { port })}</span>{t("gateway.bodyPost")}
       </p>
