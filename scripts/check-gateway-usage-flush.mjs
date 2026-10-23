@@ -13,8 +13,10 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = new URL("..", import.meta.url).pathname;
+// 仓库路径可能含中文/空格；`URL.pathname` 会保留百分号编码，必须解码后再拼路径。
+const root = fileURLToPath(new URL("..", import.meta.url));
 const commands = readFileSync(join(root, "src-tauri/src/commands.rs"), "utf8");
 const lib = readFileSync(join(root, "src-tauri/src/lib.rs"), "utf8");
 
