@@ -4653,6 +4653,8 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         }
         // ③ 已回收集合：网关只**查**它，不新开取密钥路径。
         config.site_id = site_id;
+        // M40-S1：legacy 单上游的 key 归因（多站路由的 key 归因在 `Upstream.key_id`）。
+        config.key_id = Some(key_id);
         config.revoked_refs = Some(Arc::clone(&self.revoked_refs));
         // M10-S2：上游客户端走解析后的代理。每次 `gateway_config` 都重读 settings，
         // 因此系统代理变更「重启网关即生效」（站点适配器 transport 仍需重启 app）。
@@ -4736,13 +4738,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             .gateway_usage_dropped
             .swap(0, std::sync::atomic::Ordering::Relaxed);
         for usage in &drained {
-            let _ = self.store.insert_gateway_usage(
-                usage.site_id,
-                &usage.model,
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                usage.total_tokens,
-            );
+            let _ = self.store.insert_gateway_usage(usage);
         }
         if dropped_this_round > 0 {
             self.log(observability::event_with_payload(
@@ -4753,6 +4749,17 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 ),
                 serde_json::json!({ "dropped": dropped_this_round }),
             ));
+        }
+    }
+
+    /// 仅测试用：往用量缓冲里塞一条账目（M40-S1 的 flush 调用点测试）。
+    ///
+    /// 只做与 `on_usage` sink 相同的 push，不触发任何 IO——用来模拟「网关已经
+    /// 产生了用量、但还没 drain」的状态。
+    #[doc(hidden)]
+    pub fn push_gateway_usage_for_test(&self, usage: crate::gateway::GatewayUsage) {
+        if let Ok(mut buffer) = self.gateway_usage_buffer.lock() {
+            buffer.push(usage);
         }
     }
 

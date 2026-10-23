@@ -850,7 +850,20 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!())
+        .map(|app| {
+            // M40-S1：应用退出前把网关缓冲里的**用量**与失败落库（best-effort）。
+            // 关窗到托盘不会走到这里；只有真正退出（Cmd+Q / 托盘「退出」）才触发。
+            // 拿不到 state（已在拆解）就跳过——退出路径不允许因为落库失败被阻断。
+            app.run(|app_handle, event| {
+                if let tauri::RunEvent::Exit = event {
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        state.service.drain_gateway_usage();
+                        state.service.drain_gateway_failures();
+                    }
+                }
+            });
+        });
 
     if let Err(err) = result {
         eprintln!("[tianshu-relay] 应用退出: {err}");

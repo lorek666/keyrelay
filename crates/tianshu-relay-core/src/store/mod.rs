@@ -16,7 +16,7 @@ use crate::site::KeyStatus;
 ///
 /// 版本号只是「将来需要非幂等迁移」的锚点：新表由每次打开的幂等 `DDL` 建出。
 /// M39-S1 之后下一个用版本号的是 M40-S1（顺延为 8）。
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// 「已回收」——**本地**密钥生命周期状态（M7-S4 / FR-2）。
 ///
@@ -147,12 +147,18 @@ CREATE INDEX IF NOT EXISTS idx_bindings_target ON bindings(target_path);
 -- M13-S1：网关 token 用量日志（逐请求）。
 CREATE TABLE IF NOT EXISTS gateway_usage_log(
   id INTEGER PRIMARY KEY,
-  ts INTEGER NOT NULL,
+  ts INTEGER NOT NULL,                 -- 插入时刻（审计；M40 起不再是账目日期口径）
+  at INTEGER NOT NULL DEFAULT 0,       -- M40-S1：请求完成时刻
   site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
   model TEXT NOT NULL DEFAULT '',
   prompt_tokens INTEGER NOT NULL DEFAULT 0,
   completion_tokens INTEGER NOT NULL DEFAULT 0,
-  total_tokens INTEGER NOT NULL DEFAULT 0
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  key_id INTEGER,                      -- M40-S1：实际命中的 key（可空：legacy/未知）
+  status INTEGER NOT NULL DEFAULT 0,
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 1,
+  stream INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_gateway_usage_ts ON gateway_usage_log(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_gateway_usage_site ON gateway_usage_log(site_id, ts DESC);
@@ -875,6 +881,51 @@ impl Store {
         // 老行留 NULL 而**不回填**：「有 verdict ⇒ completed」是推断不是观测，
         // 历史行当时到底跑没跑完没人知道——NULL 就是「没记过」，界面显示 "—"。
         add_column_if_missing(&conn, "probe_runs", "status", "TEXT")?;
+        // M40-S1（SCHEMA_VERSION 7 → 8）：网关用量账本六列。
+        add_column_if_missing(
+            &conn,
+            "gateway_usage_log",
+            "at",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(&conn, "gateway_usage_log", "key_id", "INTEGER")?;
+        add_column_if_missing(
+            &conn,
+            "gateway_usage_log",
+            "status",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "gateway_usage_log",
+            "latency_ms",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "gateway_usage_log",
+            "attempts",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "gateway_usage_log",
+            "stream",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // 索引必须在 `at` 列补齐**之后**建：老库的 DDL 阶段还没有 at 列，
+        // 把 CREATE INDEX 放进 DDL 批会报 `no such column: at`（新库/老库都得走这里）。
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gateway_usage_at ON gateway_usage_log(at DESC)",
+            [],
+        )
+        .map_err(|e| Error::Store(format!("建 gateway_usage_at 索引失败: {e}")))?;
+        if version < 8 {
+            // 一次性回填：旧行的 at 取 ts（**近似，不是观测**——当时没记完成时刻）。
+            // 不回填成 0：否则看板会把旧账显示成 1970。
+            conn.execute("UPDATE gateway_usage_log SET at = ts WHERE at = 0", [])
+                .map_err(|e| Error::Store(format!("回填 gateway_usage_log.at 失败: {e}")))?;
+        }
 
         // 版本号仍然只在升级时写，保留它作为「将来需要非幂等迁移」的锚点。
         if version < SCHEMA_VERSION {
@@ -1931,19 +1982,30 @@ impl Store {
             .map_err(|e| Error::Store(format!("读取导出行失败: {e}")))
     }
 
-    /// M13-S1: insert gateway usage
-    pub fn insert_gateway_usage(
-        &self,
-        site_id: i64,
-        model: &str,
-        prompt_tokens: i64,
-        completion_tokens: i64,
-        total_tokens: i64,
-    ) -> Result<()> {
+    /// 一条网关用量账目（M40-S1）。
+    ///
+    /// `ts` 由本方法取 `now_secs()`（**插入时刻**，审计用）；其余 11 列全部来自 `usage`
+    /// （`at` 是请求完成时刻）。直接吃 `GatewayUsage` 而不是 11 个标量参数：账目只有一个
+    /// 结构，参数化只能靠位置对齐，`model` 写进 `key_id` 这种错位编译器抓不到。
+    pub fn insert_gateway_usage(&self, usage: &crate::gateway::GatewayUsage) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![now_secs(), site_id, model, prompt_tokens, completion_tokens, total_tokens],
+            "INSERT INTO gateway_usage_log(ts, at, site_id, key_id, model, prompt_tokens, completion_tokens, total_tokens, status, latency_ms, attempts, stream) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                now_secs(),
+                usage.at,
+                usage.site_id,
+                usage.key_id,
+                usage.model,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+                i64::from(usage.status),
+                usage.latency_ms as i64,
+                i64::from(usage.attempts),
+                i64::from(usage.stream),
+            ],
         ).map_err(|e| Error::Store(format!("gateway usage insert: {e}")))?;
         Ok(())
     }
@@ -1953,7 +2015,7 @@ impl Store {
         let hours = hours.max(1);
         let cutoff = now_secs() - hours * 3600;
         let conn = self.lock()?;
-        let mut stmt = conn.prepare("SELECT id, ts, site_id, model, prompt_tokens, completion_tokens, total_tokens FROM gateway_usage_log WHERE ts >= ?1 ORDER BY ts DESC LIMIT 1000").map_err(|e| Error::Store(format!("prepare: {e}")))?;
+        let mut stmt = conn.prepare("SELECT id, ts, site_id, model, prompt_tokens, completion_tokens, total_tokens FROM gateway_usage_log WHERE at >= ?1 ORDER BY at DESC LIMIT 1000").map_err(|e| Error::Store(format!("prepare: {e}")))?;
         let rows = stmt
             .query_map(params![cutoff], |row| {
                 Ok(GatewayUsageRow {
@@ -2017,7 +2079,7 @@ impl Store {
         let conn = self.lock()?;
         let n = conn
             .execute(
-                "DELETE FROM gateway_usage_log WHERE ts < ?1",
+                "DELETE FROM gateway_usage_log WHERE at < ?1",
                 params![cutoff],
             )
             .map_err(|e| Error::Store(format!("prune gateway usage: {e}")))?;
@@ -2049,13 +2111,13 @@ impl Store {
         let cutoff = local_day_start(&conn, days - 1)?;
         let mut stmt = conn
             .prepare(
-                "SELECT date(ts, 'unixepoch', 'localtime') AS d, site_id, model,
+                "SELECT date(at, 'unixepoch', 'localtime') AS d, site_id, model,
                         COUNT(*),
                         COALESCE(SUM(prompt_tokens), 0),
                         COALESCE(SUM(completion_tokens), 0),
                         COALESCE(SUM(total_tokens), 0)
                  FROM gateway_usage_log
-                 WHERE ts >= ?1 AND (?2 IS NULL OR site_id = ?2)
+                 WHERE at >= ?1 AND (?2 IS NULL OR site_id = ?2)
                  GROUP BY d, site_id, model
                  ORDER BY d ASC, site_id ASC, model ASC",
             )
@@ -3333,12 +3395,12 @@ mod tests {
         let conn = store.lock().unwrap();
         let now = now_secs();
         conn.execute(
-            "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?3, 100, 50, 150)",
+            "INSERT INTO gateway_usage_log(ts, at, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?1, ?2, ?3, 100, 50, 150)",
             params![now - 60, site_id, "gpt-4"],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?3, 200, 100, 300)",
+            "INSERT INTO gateway_usage_log(ts, at, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?1, ?2, ?3, 200, 100, 300)",
             params![now, site_id, "gpt-4"],
         )
         .unwrap();
@@ -3362,7 +3424,7 @@ mod tests {
         let conn = store.lock().unwrap();
         let old_ts = now_secs() - 7200;
         conn.execute(
-            "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?3, 1, 1, 2)",
+            "INSERT INTO gateway_usage_log(ts, at, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?1, ?2, ?3, 1, 1, 2)",
             params![old_ts, site_id, "gpt-4"],
         )
         .unwrap();
@@ -3407,12 +3469,26 @@ mod tests {
         let conn = store.lock().unwrap();
         let old_ts = now_secs() - 86400 * 100; // 100 天前
         conn.execute(
-            "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?, 1, 1, 2)",
+            "INSERT INTO gateway_usage_log(ts, at, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?1, ?2, ?, 1, 1, 2)",
             params![old_ts, site_id, "old"],
         )
         .unwrap();
         drop(conn);
-        store.insert_gateway_usage(site_id, "new", 1, 1, 2).unwrap();
+        store
+            .insert_gateway_usage(&crate::gateway::GatewayUsage {
+                at: now_secs(),
+                site_id,
+                key_id: None,
+                model: "new".into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+                status: 200,
+                latency_ms: 5,
+                attempts: 1,
+                stream: false,
+            })
+            .unwrap();
         let deleted = store.prune_gateway_usage_log(90).unwrap();
         assert_eq!(deleted, 1, "应删除 1 条 90 天前的记录");
         let rows = store.recent_gateway_usage(24).unwrap();
@@ -3475,7 +3551,7 @@ mod tests {
             let conn = store.lock().unwrap();
             let insert = |site: i64, model: &str, ts: i64, prompt: i64, completion: i64| {
                 conn.execute(
-                    "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO gateway_usage_log(ts, at, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6)",
                     params![ts, site, model, prompt, completion, prompt + completion],
                 )
                 .unwrap();
@@ -3519,7 +3595,7 @@ mod tests {
             let conn = store.lock().unwrap();
             for (site, ts) in [(site_a, base), (site_b, base), (site_a, base - 3 * 86400)] {
                 conn.execute(
-                    "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, 'm', 1, 1, 2)",
+                    "INSERT INTO gateway_usage_log(ts, at, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?1, ?2, 'm', 1, 1, 2)",
                     params![ts, site],
                 )
                 .unwrap();
@@ -3656,7 +3732,7 @@ mod tests {
             let conn = store.lock().unwrap();
             for ts in [midnight, midnight - 1] {
                 conn.execute(
-                    "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?2, 'm', 1, 1, 2)",
+                    "INSERT INTO gateway_usage_log(ts, at, site_id, model, prompt_tokens, completion_tokens, total_tokens) VALUES (?1, ?1, ?2, 'm', 1, 1, 2)",
                     params![ts, site],
                 )
                 .unwrap();
@@ -3780,7 +3856,7 @@ mod tests {
             .expect("造旧库");
         }
         let store = Store::open(&path).expect("重新打开");
-        assert_eq!(store.schema_version().unwrap(), 7, "M39-S1 之后是 v7");
+        assert_eq!(store.schema_version().unwrap(), 8, "M40-S1 之后是 v8");
         let conn = rusqlite::Connection::open(&path).expect("直连");
         for table in ["site_model_catalog", "site_model_sync"] {
             let n: i64 = conn
@@ -3973,5 +4049,215 @@ mod tests {
         );
         let all = store.site_model_catalog().unwrap();
         assert_eq!(all.get(&site), Some(&models(&["alpha", "mike", "zeta"])));
+    }
+
+    // ---------- M40-S1：网关用量账本（schema v8 + `at` 口径） ----------
+
+    fn usage_fixture(site_id: i64, at: i64, total: i64) -> crate::gateway::GatewayUsage {
+        crate::gateway::GatewayUsage {
+            at,
+            site_id,
+            key_id: Some(9),
+            model: "m40".to_string(),
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: total,
+            status: 200,
+            latency_ms: 33,
+            attempts: 1,
+            stream: false,
+        }
+    }
+
+    fn usage_columns(store: &Store) -> Vec<String> {
+        let conn = store.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('gateway_usage_log') ORDER BY name")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    #[test]
+    fn schema_v8_migrates_v7_db_and_backfills_at() {
+        // 造一个 v7 老库：先按当前 DDL 建库，再把 M40 的六列与索引去掉、版本号写回 7。
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("tianshu-relay.db");
+        let store = Store::open(&path).expect("建库");
+        let site_id = store
+            .upsert_site("newapi", "https://m40.example.com", "测试")
+            .expect("upsert_site");
+        {
+            let conn = store.lock().unwrap();
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_gateway_usage_at;
+                 ALTER TABLE gateway_usage_log DROP COLUMN at;
+                 ALTER TABLE gateway_usage_log DROP COLUMN key_id;
+                 ALTER TABLE gateway_usage_log DROP COLUMN status;
+                 ALTER TABLE gateway_usage_log DROP COLUMN latency_ms;
+                 ALTER TABLE gateway_usage_log DROP COLUMN attempts;
+                 ALTER TABLE gateway_usage_log DROP COLUMN stream;
+                 PRAGMA user_version = 7;",
+            )
+            .expect("模拟 v7 老库");
+            conn.execute(
+                "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens) \
+                 VALUES (1700000000, ?1, 'legacy', 3, 4, 7)",
+                params![site_id],
+            )
+            .expect("写一行旧数据");
+        }
+        drop(store);
+
+        let store = Store::open(&path).expect("重新打开 v7 旧库");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 8, "M40-S1 占用 v8（M39-S1 占 v7）");
+        let columns = usage_columns(&store);
+        for expected in ["at", "key_id", "status", "latency_ms", "attempts", "stream"] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "老库必须补出 {expected} 列"
+            );
+        }
+
+        // 旧行语义：at = ts（近似，非观测），其余新列取默认值（未记录）。
+        {
+            let conn = store.lock().unwrap();
+            let row: (i64, Option<i64>, i64, i64, i64, i64) = conn
+                .query_row(
+                    "SELECT at, key_id, status, latency_ms, attempts, stream FROM gateway_usage_log",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .expect("读旧行");
+            assert_eq!(row, (1_700_000_000, None, 0, 0, 1, 0));
+        }
+
+        // 重复打开幂等（不 duplicate column）。
+        drop(store);
+        let store = Store::open(&path).expect("再次打开");
+        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(usage_columns(&store).len(), 13);
+    }
+
+    #[test]
+    fn schema_v8_fresh_db_has_all_six_columns() {
+        let store = Store::open_in_memory().expect("内存库");
+        assert_eq!(store.schema_version().unwrap(), 8);
+        let columns = usage_columns(&store);
+        assert_eq!(
+            columns.len(),
+            13,
+            "13 列：id/ts/at/site_id/model/3 tokens/key_id/status/latency_ms/attempts/stream"
+        );
+        for expected in ["at", "key_id", "status", "latency_ms", "attempts", "stream"] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "新库必须直接带 {expected} 列"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_gateway_usage_round_trips_new_columns() {
+        let store = Store::open_in_memory().expect("内存库");
+        let site_id = store
+            .upsert_site("newapi", "https://m40.example.com", "测试")
+            .expect("upsert_site");
+        store
+            .insert_gateway_usage(&usage_fixture(site_id, 1_700_000_123, 42))
+            .expect("insert");
+        let conn = store.lock().unwrap();
+        let row: (i64, Option<i64>, String, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT at, key_id, model, total_tokens, status, latency_ms, attempts, stream FROM gateway_usage_log",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+            )
+            .expect("读回");
+        assert_eq!(
+            row,
+            (1_700_000_123, Some(9), "m40".into(), 42, 200, 33, 1, 0)
+        );
+    }
+
+    #[test]
+    fn usage_daily_groups_by_at_not_ts() {
+        let store = Store::open_in_memory().expect("内存库");
+        let site_id = store
+            .upsert_site("newapi", "https://m40.example.com", "测试")
+            .expect("upsert_site");
+        let now = now_secs();
+        // 故意让 ts 与 at 的「日期」相反：分组若还看 ts，两条会被归到错误的日。
+        let day_of = |at: i64| -> String {
+            let conn = store.lock().unwrap();
+            conn.query_row(
+                "SELECT date(?1, 'unixepoch', 'localtime')",
+                params![at],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let today = day_of(now);
+        let yesterday = day_of(now - 86_400);
+        {
+            let conn = store.lock().unwrap();
+            // A：ts 今天、at 昨天；B：ts 昨天、at 今天。
+            conn.execute(
+                "INSERT INTO gateway_usage_log(ts, at, site_id, model, total_tokens) VALUES (?1, ?2, ?3, 'a', 1)",
+                params![now, now - 86_400, site_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO gateway_usage_log(ts, at, site_id, model, total_tokens) VALUES (?1, ?2, ?3, 'b', 2)",
+                params![now - 86_400, now, site_id],
+            )
+            .unwrap();
+        }
+        let rows = store.usage_daily(2, Some(site_id)).expect("usage_daily");
+        assert_eq!(rows.len(), 2, "两个不同 at 日期 ⇒ 两行");
+        let a = rows.iter().find(|r| r.model == "a").expect("a");
+        assert_eq!(a.date, yesterday, "a 必须按 at 归到昨天（不是 ts 的今天）");
+        let b = rows.iter().find(|r| r.model == "b").expect("b");
+        assert_eq!(b.date, today, "b 必须按 at 归到今天（不是 ts 的昨天）");
+    }
+
+    #[test]
+    fn prune_gateway_usage_log_uses_at() {
+        let store = Store::open_in_memory().expect("内存库");
+        let site_id = store
+            .upsert_site("newapi", "https://m40.example.com", "测试")
+            .expect("upsert_site");
+        let now = now_secs();
+        {
+            let conn = store.lock().unwrap();
+            // 旧账：at 100 天前，但 ts 是现在 ⇒ 必须按 at 裁掉。
+            conn.execute(
+                "INSERT INTO gateway_usage_log(ts, at, site_id, model) VALUES (?1, ?2, ?3, 'old')",
+                params![now, now - 100 * 86_400, site_id],
+            )
+            .unwrap();
+            // 新账：at 现在，但 ts 100 天前 ⇒ 必须保留（按 at）。
+            conn.execute(
+                "INSERT INTO gateway_usage_log(ts, at, site_id, model) VALUES (?1, ?2, ?3, 'fresh')",
+                params![now - 100 * 86_400, now, site_id],
+            )
+            .unwrap();
+        }
+        let removed = store.prune_gateway_usage_log(90).expect("prune");
+        assert_eq!(removed, 1, "只裁 at 超窗的那条");
+        let conn = store.lock().unwrap();
+        let models: Vec<String> = conn
+            .prepare("SELECT model FROM gateway_usage_log")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(models, vec!["fresh".to_string()]);
     }
 }

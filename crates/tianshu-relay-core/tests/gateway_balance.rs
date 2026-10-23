@@ -225,6 +225,7 @@ fn config(
     let config = GatewayConfig {
         port: 0,
         token: "local-token-for-balance-tests".to_string(),
+        key_id: None,
         site_id: 0,
         base_url: String::new(),
         api_key: Zeroizing::new(String::new()),

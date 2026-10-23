@@ -125,6 +125,7 @@ impl FakeUpstream {
 }
 
 type Failures = Arc<Mutex<Vec<GatewayFailure>>>;
+type UsageLog = Arc<Mutex<Vec<tianshu_relay_core::gateway::GatewayUsage>>>;
 type Observations = Arc<Mutex<Vec<tianshu_relay_core::gateway::UpstreamObservation>>>;
 
 /// 起一个**路由模式**的网关。`rate` 决定排序：小的排前面（首选）。
@@ -144,7 +145,7 @@ async fn start_routed(
         })
         .collect();
     let (handle, token, failures, _) =
-        start_routed_full(ups, breaker, UpstreamTimeout::default(), None, keys).await;
+        start_routed_full(ups, breaker, UpstreamTimeout::default(), None, keys, None).await;
     (handle, token, failures)
 }
 
@@ -158,6 +159,7 @@ async fn start_routed_full(
     timeout: UpstreamTimeout,
     revoked: Option<Vec<String>>,
     keys: Vec<(&str, &str)>,
+    usage: Option<UsageLog>,
 ) -> (GatewayHandle, String, Failures, Observations) {
     let route = RouteTable::new(upstreams);
     let mut map = std::collections::HashMap::new();
@@ -172,6 +174,7 @@ async fn start_routed_full(
     let handle = start(GatewayConfig {
         port: 0,
         token: generate_token(),
+        key_id: None,
         site_id: 0,
         // 路由非空时 `base_url` 不被使用；留空正好证明这一点（`start()` 只在空表时要求它非空）
         base_url: String::new(),
@@ -202,7 +205,13 @@ async fn start_routed_full(
                 log.push(f);
             }
         })),
-        on_usage: None,
+        on_usage: usage.map(|log| {
+            Arc::new(move |u: tianshu_relay_core::gateway::GatewayUsage| {
+                if let Ok(mut log) = log.lock() {
+                    log.push(u);
+                }
+            }) as Arc<dyn Fn(tianshu_relay_core::gateway::GatewayUsage) + Send + Sync>
+        }),
     })
     .await
     .expect("网关应能启动");
@@ -250,6 +259,7 @@ async fn route_and_keys_by_ref_must_agree() {
         GatewayConfig {
             port: 0,
             token: generate_token(),
+            key_id: None,
             site_id: 0,
             base_url: String::new(),
             api_key: Zeroizing::new(String::new()),
@@ -456,6 +466,7 @@ async fn a_connect_failure_is_replayed_to_the_next_upstream() {
         UpstreamTimeout::default(),
         None,
         vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+        None,
     )
     .await;
 
@@ -495,6 +506,7 @@ async fn a_read_timeout_is_not_replayed() {
         timeout,
         None,
         vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+        None,
     )
     .await;
 
@@ -541,6 +553,7 @@ async fn a_bodyless_get_request_also_fails_over() {
         UpstreamTimeout::default(),
         None,
         vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+        None,
     )
     .await;
 
@@ -617,6 +630,7 @@ async fn failure_event_carries_only_metadata() {
         UpstreamTimeout::default(),
         None,
         vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+        None,
     )
     .await;
 
@@ -683,6 +697,7 @@ async fn all_connect_failures_still_return_502_with_the_last_reason() {
         UpstreamTimeout::default(),
         None,
         vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+        None,
     )
     .await;
 
@@ -748,6 +763,7 @@ async fn failure_event_scrubs_a_key_shaped_model() {
         let handle = start(GatewayConfig {
             port: 0,
             token: generate_token(),
+            key_id: None,
             site_id: 0,
             base_url: String::new(),
             api_key: zeroize::Zeroizing::new(String::new()),
@@ -902,7 +918,7 @@ async fn start_routed_with(
         .iter()
         .map(|(u, rate)| u.upstream(*rate))
         .collect();
-    start_routed_full(ups, breaker, timeout, revoked, keys).await
+    start_routed_full(ups, breaker, timeout, revoked, keys, None).await
 }
 
 fn body_with_model() -> String {
@@ -999,6 +1015,7 @@ async fn a_missing_plaintext_is_refused_at_startup() {
     let err = start(GatewayConfig {
         port: 0,
         token: generate_token(),
+        key_id: None,
         site_id: 0,
         base_url: String::new(),
         api_key: Zeroizing::new(String::new()),
@@ -1360,5 +1377,101 @@ async fn health_endpoint_checks_token_like_proxy() {
     let (none_status, _) = health_get(&handle, None).await;
     assert_eq!(none_status, 401, "缺失令牌应拒 /health");
 
+    handle.shutdown_and_wait().await;
+}
+
+/// 起一个回**自定义 body** 的假上游（M40-S1：验证 usage 归因时 body 里必须带 usage）。
+fn spawn_upstream_with_body(
+    site_id: i64,
+    key_ref: &str,
+    status_line: &str,
+    body: String,
+) -> FakeUpstream {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+    let addr = listener.local_addr().expect("读取地址");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let status_line = status_line.to_string();
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let raw = read_request(&mut stream);
+            if let Ok(mut log) = recorder.lock() {
+                log.push(raw);
+            }
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    FakeUpstream {
+        site_id,
+        base_url: format!("http://{addr}"),
+        key_ref: key_ref.to_string(),
+        seen,
+    }
+}
+
+/// M40-S1：`key_id` 必须来自**实际命中的上游**，而不是启动参数里的 config 那把。
+///
+/// 场景：首选 A（`Upstream.key_id = 101`）回 429 被重放；真正命中的是 B
+/// （`Upstream.key_id = 202`）⇒ usage 的 `key_id` 必须是 202，`attempts = 2`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn usage_key_id_comes_from_the_hit_upstream() {
+    let a = spawn_upstream_always(1, REF_A, "429 Too Many Requests");
+    let b = spawn_upstream_with_body(
+        2,
+        REF_B,
+        "200 OK",
+        r#"{"usage":{"prompt_tokens":5,"completion_tokens":6,"total_tokens":11}}"#.to_string(),
+    );
+    let mut up_a = a.upstream(0.1);
+    up_a.key_id = Some(101);
+    let mut up_b = b.upstream(1.0);
+    up_b.key_id = Some(202);
+
+    let usage: UsageLog = Arc::new(Mutex::new(Vec::new()));
+    let (handle, token, _failures, _observations) = start_routed_full(
+        vec![up_a, up_b],
+        long_cooldown(),
+        UpstreamTimeout::default(),
+        None,
+        vec![(REF_A, KEY_A), (REF_B, KEY_B)],
+        Some(Arc::clone(&usage)),
+    )
+    .await;
+
+    let (status, body) = post(&handle, &token, &chat_body()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(a.request_count(), 1, "首选应当先被尝试");
+    assert_eq!(b.request_count(), 1, "429 之后应当重放到第二站");
+
+    // flush 发生在网关读完上游 body 时；客户端读完后最多等 1 秒。
+    for _ in 0..50 {
+        if !usage.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    {
+        let log = usage.lock().unwrap();
+        assert_eq!(log.len(), 1, "必须恰好一条 usage");
+        assert_eq!(
+            log[0].key_id,
+            Some(202),
+            "必须是**实际命中的第二站**的 key（不是 config 的 101）"
+        );
+        assert_eq!(log[0].site_id, 2);
+        assert_eq!(log[0].attempts, 2, "命中的是第二个候选");
+        assert_eq!(log[0].status, 200);
+        assert!(!log[0].stream);
+        assert!(log[0].at > 0, "at 必须由系统时钟填入");
+    }
     handle.shutdown_and_wait().await;
 }

@@ -1585,6 +1585,8 @@ pub async fn gateway_start(
         stop_gateway(previous.handle).await;
         // 与 `gateway_stop` 同一条理由（M7-S5 复审 P2-1）：换网关之前先把**旧网关**的
         // 失败落库，否则它们会被归到新会话的时间线上。
+        // M40-S1：用量同样先落库（在下一行 `gateway_config` 自增会话代号之前）。
+        state.service.drain_gateway_usage();
         state.service.drain_gateway_failures();
     }
 
@@ -1708,6 +1710,8 @@ pub async fn gateway_rotate_token(
         .take()
         .ok_or_else(|| "网关已不在运行".to_string())?;
     stop_gateway(run.handle).await;
+    // M40-S1：先落旧会话的用量，再落失败，最后作废会话（顺序是硬要求）。
+    state.service.drain_gateway_usage();
     state.service.drain_gateway_failures();
     state.service.end_gateway_session();
 
@@ -1753,6 +1757,8 @@ pub async fn gateway_stop(state: State<'_, AppState>) -> Result<GatewayStatusDto
     // 为什么在**停止**时（而不是退出时）：退出钩子拿不到 `AppState` 的可靠时机，
     // 而 `gateway_stop` 是「这一次会话结束了」的天然边界——失败归给产生它的那次会话，
     // 顺带解决复审指出的**归因错位**（旧会话的失败被记成当前会话的）。
+    // M40-S1：用量先落库（同样在 `end_gateway_session` 之前）。
+    state.service.drain_gateway_usage();
     state.service.drain_gateway_failures();
     // M8-S1 §11.1：drain **之后**作废会话。顺序是硬要求——
     // 先 drain 才能把「属于被停止那次会话」的失败收走；再作废，于是 stop 之后
