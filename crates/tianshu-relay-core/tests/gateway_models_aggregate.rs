@@ -170,6 +170,7 @@ fn base_config(
     GatewayConfig {
         port: 0,
         token: TOKEN.to_string(),
+        key_id: None,
         site_id: 0,
         base_url: String::new(),
         api_key: Zeroizing::new(String::new()),
