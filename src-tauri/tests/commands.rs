@@ -471,12 +471,19 @@ fn update_settings_round_trips_and_rejects_bad_values() {
     payload["rotationMaxAgeDays"] = json!(45);
     payload["rotationWarnBeforeDays"] = json!(10);
 
-    let updated = invoke_on(
+    let result = invoke_on(
         &webview,
         "update_settings",
         json!({"args": {"settings": payload}}),
     )
     .expect("update_settings 应成功");
+    // M41-S1：返回形状变成 `{settings, gateway, gatewayError}`——设置的断言看 `settings`。
+    assert!(
+        result["gatewayError"].is_null(),
+        "本次没有网关动作: {result}"
+    );
+    assert_eq!(result["gateway"]["phase"], "stopped", "{result}");
+    let updated = result["settings"].clone();
     assert_eq!(updated["refreshIntervalSecs"], 600);
     assert_eq!(updated["balanceAlertThreshold"], 3.5);
     assert_eq!(updated["driftCheckOnStart"], false);
@@ -1805,4 +1812,219 @@ fn gateway_stop_flushes_buffered_usage() {
         .expect("查询");
     assert_eq!(rows.len(), 1, "gateway_stop 必须把缓冲里的用量落库");
     assert_eq!(rows[0].total_tokens, 3);
+}
+
+// ============================================================ M41-S1：设置同步与 supervisor
+
+/// 建「站点 + 启用密钥」（网关只需要配置完整，不要求站点健康）。
+fn seed_gateway_site(webview: &tauri::WebviewWindow<tauri::test::MockRuntime>) -> (i64, i64) {
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
+    let site = state
+        .service
+        .store()
+        .upsert_site("newapi", "https://relay.example.com", "M41 网关站")
+        .expect("写站点");
+    let key_id = state
+        .service
+        .store_key_material(
+            site,
+            "codex/daily",
+            Some("12"),
+            None,
+            None,
+            "sk-m41s1-0123456789abcdef",
+        )
+        .expect("写密钥")
+        .id;
+    (site, key_id)
+}
+
+fn free_port() -> u16 {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("探端口");
+    probe.local_addr().expect("读端口").port()
+}
+
+fn connect_ok(port: u16) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+}
+
+fn read_settings(webview: &tauri::WebviewWindow<tauri::test::MockRuntime>) -> Value {
+    invoke_on(webview, "get_settings", json!({})).expect("读设置")
+}
+
+/// M41-S1 §7.2-1：关 `gateway_enabled` ⇒ **返回后端口不再监听** + `phase == "stopped"`。
+#[test]
+fn update_settings_disabling_the_gateway_stops_the_port() {
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let port = free_port();
+    enable_gateway(&webview, port);
+
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    assert_eq!(started["phase"], "running", "{started}");
+    assert!(connect_ok(port), "启动后端口 {port} 应可连接");
+
+    let mut payload = read_settings(&webview);
+    payload["gatewayEnabled"] = json!(false);
+    let result = invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": payload}}),
+    )
+    .expect("保存设置");
+
+    assert_eq!(result["gateway"]["phase"], "stopped", "{result}");
+    assert_eq!(result["gateway"]["running"], false, "{result}");
+    assert!(result["gatewayError"].is_null(), "关开关不该报错: {result}");
+    assert!(!connect_ok(port), "关开关返回后端口 {port} 必须不再监听");
+
+    let status = invoke_on(&webview, "gateway_status", json!({})).expect("读状态");
+    assert_eq!(status["phase"], "stopped", "{status}");
+    assert_eq!(status["running"], false, "{status}");
+}
+
+/// M41-S1 §7.2-2：运行中改端口 ⇒ 旧端口关、新端口开，且站点/密钥仍是**运行态**那一组。
+#[test]
+fn update_settings_port_change_restarts_on_the_new_port() {
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let old_port = free_port();
+    let new_port = free_port();
+    enable_gateway(&webview, old_port);
+
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    assert_eq!(started["phase"], "running", "{started}");
+    assert!(connect_ok(old_port), "旧端口应可连接");
+
+    let mut payload = read_settings(&webview);
+    payload["gatewayPort"] = json!(new_port);
+    let result = invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": payload}}),
+    )
+    .expect("保存设置");
+
+    assert!(result["gatewayError"].is_null(), "重启应成功: {result}");
+    assert_eq!(result["gateway"]["phase"], "running", "{result}");
+    assert_eq!(
+        result["gateway"]["url"],
+        format!("http://127.0.0.1:{new_port}"),
+        "网关应落在新端口: {result}"
+    );
+    assert_eq!(
+        result["gateway"]["site"], "M41 网关站",
+        "站点应保持运行态那一组"
+    );
+    assert!(!connect_ok(old_port), "旧端口 {old_port} 必须已关闭");
+    assert!(connect_ok(new_port), "新端口 {new_port} 应可连接");
+
+    // 设置里也已经是新端口（重启用的是新设置）
+    let saved = read_settings(&webview);
+    assert_eq!(saved["gatewayPort"], json!(new_port), "{saved}");
+}
+
+/// M41-S1 §7.2-3：restart 失败（新端口被占）⇒ `Ok` + `gatewayError` + `phase=="stopped"`
+/// 且**设置已保存**（不允许「保存成功但网关静默死掉」）。
+#[test]
+fn update_settings_restart_failure_reports_error_and_keeps_settings() {
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let old_port = free_port();
+    let busy_port = free_port();
+    enable_gateway(&webview, old_port);
+
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    assert_eq!(started["phase"], "running", "{started}");
+
+    // 占住新端口：网关 bind 会失败（AddrInUse）。
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", busy_port)).expect("占端口");
+
+    let mut payload = read_settings(&webview);
+    payload["gatewayPort"] = json!(busy_port);
+    let result = invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": payload}}),
+    )
+    .expect("保存设置（restart 失败也应返回 Ok）");
+
+    assert_eq!(result["gateway"]["phase"], "stopped", "{result}");
+    assert_eq!(result["gateway"]["running"], false, "{result}");
+    let message = result["gatewayError"]
+        .as_str()
+        .unwrap_or_else(|| panic!("必须有可读的 gatewayError: {result}"));
+    assert!(
+        message.contains("设置已保存"),
+        "文案必须说明设置已保存: {message}"
+    );
+    assert!(
+        message.contains("网关未能"),
+        "文案必须说明网关没重启: {message}"
+    );
+    // 设置确实保存了（新端口可读回）
+    let saved = read_settings(&webview);
+    assert_eq!(saved["gatewayPort"], json!(busy_port), "{saved}");
+    assert!(!connect_ok(old_port), "旧网关应已停止");
+    drop(squatter);
+}
+
+/// M41-S1 §7.2-4：`gateway_status` 不能把已死的任务报成 running。
+///
+/// **为什么没有「crashed 端到端」用例**：mock runtime 下没有让网关任务「死掉但句柄还在」
+/// 的公共路径——`GatewayHandle` 只能由 `start()` 产出，而 `shutdown()` / `shutdown_and_wait()`
+/// 都会**消费**句柄；IPC 也没有「杀掉网关」的命令。因此「句柄在、任务已死」这一状态
+/// 在测试里构造不出来，`crashed` 的判据由两处共同保证：
+/// ① core 的 `alive_and_last_exit_track_the_task_lifecycle`（真网关 stop 后 alive=false +
+///    `last_exit.reason == Requested`）；
+/// ② `gateway_status_of` 的实现（`alive()` 为假 ⇒ 绝不报 running）。
+/// 这里钉住的是「正常停止之后**不会**报 running，也不会谎报 crashed」。
+#[test]
+fn gateway_status_never_reports_a_stopped_gateway_as_running() {
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let port = free_port();
+    enable_gateway(&webview, port);
+
+    invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    let stopped = invoke_on(&webview, "gateway_stop", json!({})).expect("停止网关");
+    assert_eq!(stopped["phase"], "stopped", "{stopped}");
+    assert_eq!(stopped["running"], false, "{stopped}");
+
+    let status = invoke_on(&webview, "gateway_status", json!({})).expect("读状态");
+    assert_eq!(status["running"], false, "{status}");
+    assert_eq!(status["phase"], "stopped", "{status}");
+    // 正常停止后句柄已被 take，没有结束记录可报 ⇒ 不应出现 crashed。
+    assert!(status["lastExit"].is_null(), "{status}");
+    // 端口释放是异步任务收尾的最后一刻（mock runtime 下可能比命令返回晚几毫秒）：
+    // 用有界轮询而不是「立即成立」，仍然钉住「最终不再监听」。
+    let mut released = false;
+    for _ in 0..50 {
+        if !connect_ok(port) {
+            released = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(released, "停止后端口 {port} 必须最终不再监听");
 }
