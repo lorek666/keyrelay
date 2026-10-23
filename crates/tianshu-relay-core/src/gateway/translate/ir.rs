@@ -14,6 +14,9 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     pub stop: Vec<String>,
     pub tools: Vec<ToolSpec>,
+    /// M42-S2b：入站是否要流式。为真时上游必须是 `stream: true`，
+    /// 响应按 SSE 增量渲染回入站协议。
+    pub stream: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -150,6 +153,11 @@ impl ChatRequest {
         }
         if !self.stop.is_empty() {
             body["stop"] = json!(self.stop);
+        }
+        if self.stream {
+            body["stream"] = json!(true);
+            // 让上游在最后一个 chunk 带上 usage（否则流式下拿不到 token 数）
+            body["stream_options"] = json!({ "include_usage": true });
         }
         if !self.tools.is_empty() {
             body["tools"] = Value::Array(

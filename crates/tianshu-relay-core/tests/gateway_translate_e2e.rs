@@ -350,8 +350,8 @@ async fn parse_failure_and_stream_never_touch_the_upstream() {
     assert_eq!(status, 400, "{resp}");
     assert!(resp.contains("reasoning"), "必须点名: {resp}");
 
-    // ② stream:true
-    let body = json!({ "model": "m", "max_tokens": 1, "messages": [], "stream": true }).to_string();
+    // ② 另一个不支持字段（流式已由 M42-S2b 支持，不再是拒绝理由）
+    let body = json!({ "model": "m", "max_tokens": 1, "messages": [], "thinking": {} }).to_string();
     let (status, resp) = tokio::task::spawn_blocking({
         let (url, token) = (url.clone(), token.clone());
         move || http_post(&url, &token, "/v1/messages", &body)
@@ -359,7 +359,7 @@ async fn parse_failure_and_stream_never_touch_the_upstream() {
     .await
     .unwrap();
     assert_eq!(status, 400, "{resp}");
-    assert!(resp.contains("M42-S2b"), "必须点名 S2b: {resp}");
+    assert!(resp.contains("thinking"), "必须点名: {resp}");
 
     assert_eq!(
         up.count(),

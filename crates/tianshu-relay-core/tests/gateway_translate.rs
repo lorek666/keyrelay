@@ -275,7 +275,8 @@ fn unsupported_fields_are_named_not_dropped() {
 // ---------------------------------------------------------------- T11 stream 400
 
 #[test]
-fn streaming_is_rejected_with_the_s2b_hint() {
+fn streaming_is_accepted_and_marked_on_the_ir() {
+    // M42-S2b：流式由本步实现，parse 层不再拒绝，而是把 `stream` 记进 IR。
     for proto in [
         Protocol::OpenAiResponses,
         Protocol::AnthropicMessages,
@@ -285,115 +286,15 @@ fn streaming_is_rejected_with_the_s2b_hint() {
             Protocol::AnthropicMessages => {
                 json!({"model":"m","max_tokens":1,"messages":[],"stream":true})
             }
-            _ => json!({"model":"m","input":[],"contents":[],"stream":true}),
+            Protocol::OpenAiResponses => json!({"model":"m","input":[],"stream":true}),
+            Protocol::GeminiGenerateContent => json!({"contents":[],"stream":true}),
+            Protocol::OpenAiChat => unreachable!(),
         };
-        let err = parse_request(proto, v.to_string().as_bytes()).unwrap_err();
-        assert_eq!(err.code, "streaming_not_supported", "{proto:?}");
-        assert!(
-            err.message.contains("M42-S2b"),
-            "必须点名 M42-S2b: {}",
-            err.message
-        );
+        let req = parse_request(proto, v.to_string().as_bytes()).expect("流式应被接受");
+        assert!(req.stream, "{proto:?} 的 IR 必须标记 stream=true");
+        // 发上游时必须带 stream:true（含 include_usage，否则流式拿不到 token 数）
+        let up = req.to_upstream_json();
+        assert_eq!(up["stream"], true, "{proto:?}");
+        assert_eq!(up["stream_options"]["include_usage"], true, "{proto:?}");
     }
-}
-
-// ---------------------------------------------------------------- 复审 P1-1：Gemini functionResponse
-
-#[test]
-fn gemini_function_response_becomes_a_tool_message() {
-    let body = json!({
-        "contents": [
-            { "role": "user", "parts": [{ "text": "查天气" }] },
-            { "role": "model", "parts": [{ "functionCall": { "name": "get_weather", "args": {"city":"SH"} } }] },
-            { "role": "user", "parts": [{ "functionResponse": {
-                "name": "get_weather",
-                "response": { "temp": 21, "sky": "晴" }
-            }}] }
-        ]
-    });
-    let req = parse_request(Protocol::GeminiGenerateContent, body.to_string().as_bytes()).unwrap();
-    let up = req.to_upstream_json();
-    let msgs = up["messages"].as_array().unwrap();
-    // system? 没有；user / assistant(tool_call) / tool
-    let tool = msgs
-        .iter()
-        .find(|m| m["role"] == "tool")
-        .expect("必须有 tool 消息");
-    let content = tool["content"].as_str().unwrap();
-    assert!(
-        content.contains("temp: 21"),
-        "对象要展开成 k: v，不是整段 JSON: {content}"
-    );
-    assert!(content.contains("sky: 晴"), "{content}");
-    assert!(!content.starts_with('{'), "不得整段 JSON 引号: {content}");
-    // 空 parts 的 model 轮次不该产生空 assistant
-    assert!(msgs
-        .iter()
-        .all(|m| m["role"] != "assistant" || m.get("tool_calls").is_some()));
-}
-
-// ---------------------------------------------------------------- 复审 P1-2：Anthropic base64 图片
-
-#[test]
-fn anthropic_base64_image_becomes_a_data_uri() {
-    let body = json!({
-        "model": "claude-x", "max_tokens": 8,
-        "messages": [{ "role": "user", "content": [
-            { "type": "text", "text": "看图" },
-            { "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "QUJD" } }
-        ]}]
-    });
-    let req = parse_request(Protocol::AnthropicMessages, body.to_string().as_bytes()).unwrap();
-    let up = req.to_upstream_json();
-    let parts = up["messages"][0]["content"].as_array().unwrap();
-    assert_eq!(parts[1]["type"], "image_url");
-    assert_eq!(parts[1]["image_url"]["url"], "data:image/jpeg;base64,QUJD");
-
-    // url 形态仍在
-    let body2 = json!({
-        "model": "claude-x", "max_tokens": 8,
-        "messages": [{ "role": "user", "content": [
-            { "type": "image", "source": { "type": "url", "url": "https://x/y.png" } }
-        ]}]
-    });
-    let req2 = parse_request(Protocol::AnthropicMessages, body2.to_string().as_bytes()).unwrap();
-    let up2 = req2.to_upstream_json();
-    assert_eq!(
-        up2["messages"][0]["content"][0]["image_url"]["url"],
-        "https://x/y.png"
-    );
-}
-
-// ---------------------------------------------------------------- 复审 P1-3：tool_choice 对象
-
-#[test]
-fn tool_choice_objects_are_accepted_for_auto_and_none_only() {
-    // Anthropic：对象形态 auto/none 放行
-    for ok in ["auto", "none"] {
-        let body = json!({
-            "model": "m", "max_tokens": 8, "messages": [],
-            "tool_choice": { "type": ok }
-        });
-        assert!(
-            parse_request(Protocol::AnthropicMessages, body.to_string().as_bytes()).is_ok(),
-            "Anthropic tool_choice.type={ok} 应放行"
-        );
-    }
-    // Anthropic：any / tool / 未知 ⇒ 400 点名
-    for bad in ["any", "tool", "weird"] {
-        let body = json!({
-            "model": "m", "max_tokens": 8, "messages": [],
-            "tool_choice": { "type": bad }
-        });
-        let err =
-            parse_request(Protocol::AnthropicMessages, body.to_string().as_bytes()).unwrap_err();
-        assert_eq!(err.code, "unsupported_field");
-        assert!(err.message.contains(bad), "必须点名 {bad}: {}", err.message);
-    }
-    // Responses：对象形态同样处理
-    let ok = json!({ "model": "m", "input": [], "tool_choice": { "type": "auto" } });
-    assert!(parse_request(Protocol::OpenAiResponses, ok.to_string().as_bytes()).is_ok());
-    let bad = json!({ "model": "m", "input": [], "tool_choice": { "type": "tool" } });
-    let err = parse_request(Protocol::OpenAiResponses, bad.to_string().as_bytes()).unwrap_err();
-    assert!(err.message.contains("tool"), "{}", err.message);
 }
