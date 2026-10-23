@@ -847,7 +847,8 @@ export default function GatewayCard({
       <div className="card">
         <h4>{t("gateway.tokens.title")}</h4>
         <p className="muted">{t("gateway.tokens.body")}</p>
-        {status.data?.tokenGraceUntil ? (
+        {status.data?.tokenGraceUntil &&
+        status.data.tokenGraceUntil * 1000 > Date.now() ? (
           <p className="muted" data-token-grace>
             {t("gateway.tokens.graceUntil", {
               time: new Date(status.data.tokenGraceUntil * 1000).toLocaleString(),

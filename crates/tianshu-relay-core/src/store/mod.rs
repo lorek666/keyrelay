@@ -2160,6 +2160,17 @@ impl Store {
         Ok(())
     }
 
+    /// M41-S2 复审 P2：对账时复位默认行的 `revoked_at`（只用于手工吊销后的自愈）。
+    pub fn restore_gateway_token(&self, id: i64) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE gateway_tokens SET revoked_at = NULL WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| Error::Store(format!("恢复令牌 #{id} 失败: {e}")))?;
+        Ok(())
+    }
+
     /// M41-S2 的轮换接口：**原地**改默认行的 hash（保留 id/label/created_at/is_default）。
     pub fn update_gateway_token_hash(&self, id: i64, token_hash: &str) -> Result<()> {
         let conn = self.lock()?;

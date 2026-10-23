@@ -4587,11 +4587,18 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             }
             let expected = crate::gateway::sha256_hex(&current);
             let row = self.store.default_gateway_token()?.expect("上面刚判过");
+            let mut changed = false;
+            // 手工吊销过的默认行：对账把它恢复（spec §4.6/T-13），否则钥匙串里的
+            // 默认令牌永远 401，连轮换都救不回。
+            if row.revoked_at.is_some() {
+                self.store.restore_gateway_token(row.id)?;
+                changed = true;
+            }
             if row.token_hash != expected {
                 self.store.update_gateway_token_hash(row.id, &expected)?;
-                return Ok(true);
+                changed = true;
             }
-            return Ok(false);
+            return Ok(changed);
         }
         // 锁屏 / ACL：读失败时 `gateway_token()` 内部按「拿不到」处理；空令牌同样跳过。
         let (current, _) = self.gateway_token();

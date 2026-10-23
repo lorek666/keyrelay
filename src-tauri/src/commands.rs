@@ -1574,6 +1574,14 @@ pub fn detect_system_proxy() -> DetectProxyDto {
 
 // ============================================ 网关 / 导出 / 备份清理（M4-S2）
 
+/// Unix 秒（仅用于把运行态宽限截止时间与「现在」比较；不参与持久化）。
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
     // 「令牌是不是持久的」两个分支都用**同一个来源**：服务上「最近一次装配 / 轮换」的结果。
     // 网关没在跑时它不是「没意义」，而是「最近一次的结果」——冷启动时可能是 `false`
@@ -1670,7 +1678,7 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             site: Some(run.handle.site_display_name.clone()),
             token_persistent,
             last_exit,
-            token_grace_until: run.token_grace_until,
+            token_grace_until: run.token_grace_until.filter(|t| *t > unix_now_secs()),
             listen_addrs,
             ipv6_degraded,
             ipv6_note,

@@ -161,7 +161,8 @@ describe("GatewayCard · Agent 令牌（M43-S1）", () => {
   it("轮换宽限：tokenGraceUntil 有值时显示截止提示（M41-S2）", async () => {
     vi.mocked(gatewayStatus).mockResolvedValue({
       ...status(),
-      tokenGraceUntil: 1_700_000_300,
+      // 必须是**未来**时间：过期提示按 spec 不显示（避免展示已过去的时间）。
+      tokenGraceUntil: Math.floor(Date.now() / 1000) + 300,
     });
     vi.mocked(gatewayTokenList).mockResolvedValue([]);
     renderCard();
