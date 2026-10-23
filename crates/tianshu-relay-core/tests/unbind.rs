@@ -201,8 +201,8 @@ fn opening_a_v2_database_adds_the_unbound_column_without_losing_data() {
 
     assert_eq!(
         store.schema_version().unwrap(),
-        9,
-        "版本号升到 9（M39-S1 是 7，M40-S1 是 8，M43-S1 新增 gateway_tokens 与 usage token 归因）"
+        10,
+        "版本号升到 10（M39-S1 是 7，M40-S1 是 8，M43-S1 是 9，M43-S2 新增 model_prices/site_bills）"
     );
     let rows = store.bindings_of_agent("codex").unwrap();
     assert_eq!(rows.len(), 1, "老数据必须还在");
@@ -224,7 +224,7 @@ fn reopening_a_migrated_database_is_idempotent() {
 
     for round in 1..=3 {
         let store = Store::open(&path).unwrap_or_else(|e| panic!("第 {round} 次打开失败: {e}"));
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(store.schema_version().unwrap(), 10);
     }
 }
 

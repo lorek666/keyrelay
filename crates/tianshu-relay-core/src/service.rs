@@ -4579,13 +4579,19 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// M41-S2 的轮换会原地 UPDATE 这一行的 `token_hash`；本函数同时承担「钥匙串 → DB」
     /// 的对账（DB 更新失败后重启时把默认行收敛到钥匙串当前令牌）。
     pub fn ensure_default_token_migrated(&self) -> Result<bool> {
+        let (current, _) = self.gateway_token();
+        self.ensure_default_token_migrated_with(&current)
+    }
+
+    /// 内部版本：用**已经读到**的令牌做对账，避免 `gateway_config` 为同一份令牌读两次钥匙串
+    /// （第二次读失败会把一次瞬时故障放大成「临时令牌」，M16-S4 的读失败语义被改变）。
+    fn ensure_default_token_migrated_with(&self, current: &str) -> Result<bool> {
         if self.store.default_gateway_token()?.is_some() {
             // M41-S2：对账——默认行 hash 与钥匙串不一致时**原地**更新（保留 id/label/created_at）。
-            let (current, _) = self.gateway_token();
             if current.trim().is_empty() {
                 return Ok(false);
             }
-            let expected = crate::gateway::sha256_hex(&current);
+            let expected = crate::gateway::sha256_hex(current);
             let row = self.store.default_gateway_token()?.expect("上面刚判过");
             let mut changed = false;
             // 手工吊销过的默认行：对账把它恢复（spec §4.6/T-13），否则钥匙串里的
@@ -4601,11 +4607,10 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             return Ok(changed);
         }
         // 锁屏 / ACL：读失败时 `gateway_token()` 内部按「拿不到」处理；空令牌同样跳过。
-        let (current, _) = self.gateway_token();
         if current.trim().is_empty() {
             return Ok(false);
         }
-        let hash = crate::gateway::sha256_hex(&current);
+        let hash = crate::gateway::sha256_hex(current);
         match self.store.insert_gateway_token(&hash, "默认（迁移）", true) {
             Ok(_) => Ok(true),
             // 并发：唯一约束命中 ⇒ 视为已迁移。
@@ -4670,8 +4675,6 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         key_id: i64,
         port: u16,
     ) -> Result<crate::gateway::GatewayConfig> {
-        // M43-S1：装配前做一次迁移/对账（幂等；失败不阻断——最坏是回退 legacy）。
-        let _ = self.ensure_default_token_migrated();
         let site = self.site(site_id)?;
         let row = self
             .store
@@ -4701,6 +4704,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let (token, token_persistent) = self.gateway_token();
         self.gateway_token_persistent
             .store(token_persistent, std::sync::atomic::Ordering::SeqCst);
+        // M43-S1：装配前做一次迁移/对账（幂等；失败不阻断——最坏是回退 legacy）。
+        // 用刚读到的令牌，避免同一次装配为同一份令牌读两次钥匙串。
+        let _ = self.ensure_default_token_migrated_with(&token);
 
         let mut config = crate::gateway::GatewayConfig::single_upstream(
             port,
