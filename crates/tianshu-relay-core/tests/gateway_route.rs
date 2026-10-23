@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use tianshu_relay_core::routing::{
-    should_failover, Breaker, BreakerPolicy, BreakerState, RouteTable, Upstream,
+    should_failover, site_key, Breaker, BreakerPolicy, BreakerState, RouteTable, Upstream,
 };
 
 const MODEL: &str = "gpt-5.6";
@@ -13,6 +13,7 @@ const MODEL: &str = "gpt-5.6";
 fn up(site_id: i64, rate: Option<f64>, balance: Option<f64>, latency: Option<u64>) -> Upstream {
     Upstream {
         site_id,
+        key_id: None,
         base_url: format!("http://site{site_id}.example.com"),
         key_ref: format!("kr/key/{site_id}/secret"),
         models: vec![MODEL.to_string()],
@@ -238,30 +239,42 @@ fn breaker_opens_at_threshold() {
     let now = Instant::now();
     let mut breaker = Breaker::new(policy(3, 60));
 
-    assert_eq!(breaker.record_failure(1, now), BreakerState::Closed);
-    assert_eq!(breaker.record_failure(1, now), BreakerState::Closed);
-    assert_eq!(breaker.record_failure(1, now), BreakerState::Open);
-    assert_eq!(breaker.state(1, now), BreakerState::Open);
+    assert_eq!(
+        breaker.record_failure(&site_key(1), now),
+        BreakerState::Closed
+    );
+    assert_eq!(
+        breaker.record_failure(&site_key(1), now),
+        BreakerState::Closed
+    );
+    assert_eq!(
+        breaker.record_failure(&site_key(1), now),
+        BreakerState::Open
+    );
+    assert_eq!(breaker.state(&site_key(1), now), BreakerState::Open);
 }
 
 #[test]
 fn half_opens_after_cooldown() {
     let now = Instant::now();
     let mut breaker = Breaker::new(policy(1, 60));
-    assert_eq!(breaker.record_failure(1, now), BreakerState::Open);
+    assert_eq!(
+        breaker.record_failure(&site_key(1), now),
+        BreakerState::Open
+    );
 
     // 冷却未到
     assert_eq!(
-        breaker.state(1, now + Duration::from_secs(59)),
+        breaker.state(&site_key(1), now + Duration::from_secs(59)),
         BreakerState::Open
     );
     // 冷却已到 ⇒ HalfOpen（允许一个探活）
     assert_eq!(
-        breaker.state(1, now + Duration::from_secs(60)),
+        breaker.state(&site_key(1), now + Duration::from_secs(60)),
         BreakerState::HalfOpen
     );
     assert_eq!(
-        breaker.state(1, now + Duration::from_secs(600)),
+        breaker.state(&site_key(1), now + Duration::from_secs(600)),
         BreakerState::HalfOpen
     );
 }
@@ -270,47 +283,56 @@ fn half_opens_after_cooldown() {
 fn success_resets_to_closed() {
     let now = Instant::now();
     let mut breaker = Breaker::new(policy(2, 60));
-    breaker.record_failure(1, now);
-    breaker.record_failure(1, now);
-    assert_eq!(breaker.state(1, now), BreakerState::Open);
+    breaker.record_failure(&site_key(1), now);
+    breaker.record_failure(&site_key(1), now);
+    assert_eq!(breaker.state(&site_key(1), now), BreakerState::Open);
 
-    breaker.record_success(1, now);
-    assert_eq!(breaker.state(1, now), BreakerState::Closed);
+    breaker.record_success(&site_key(1), now);
+    assert_eq!(breaker.state(&site_key(1), now), BreakerState::Closed);
     // 清零：再失败一次不足以重新打开
-    assert_eq!(breaker.record_failure(1, now), BreakerState::Closed);
+    assert_eq!(
+        breaker.record_failure(&site_key(1), now),
+        BreakerState::Closed
+    );
 }
 
 #[test]
 fn breaker_state_is_read_only() {
     let now = Instant::now();
     let mut breaker = Breaker::new(policy(1, 60));
-    breaker.record_failure(1, now);
+    breaker.record_failure(&site_key(1), now);
 
     // 连查两次（其中一次已过冷却）不得改变状态：
     // 如果 `state()` 顺手把 HalfOpen「用掉」了，第二次查询就会与第一次不同
-    let first = breaker.state(1, now + Duration::from_secs(120));
-    let second = breaker.state(1, now + Duration::from_secs(120));
+    let first = breaker.state(&site_key(1), now + Duration::from_secs(120));
+    let second = breaker.state(&site_key(1), now + Duration::from_secs(120));
     assert_eq!(first, BreakerState::HalfOpen);
     assert_eq!(second, BreakerState::HalfOpen);
     // 冷却内的站点也不受影响
-    assert_eq!(breaker.state(2, now), BreakerState::Closed);
+    assert_eq!(breaker.state(&site_key(2), now), BreakerState::Closed);
 }
 
 #[test]
 fn breaker_is_per_site() {
     let now = Instant::now();
     let mut breaker = Breaker::new(policy(2, 60));
-    breaker.record_failure(1, now);
-    breaker.record_failure(1, now);
-    assert_eq!(breaker.state(1, now), BreakerState::Open);
+    breaker.record_failure(&site_key(1), now);
+    breaker.record_failure(&site_key(1), now);
+    assert_eq!(breaker.state(&site_key(1), now), BreakerState::Open);
 
     // 另一个站点不受影响
-    assert_eq!(breaker.state(2, now), BreakerState::Closed);
-    assert_eq!(breaker.record_failure(2, now), BreakerState::Closed);
+    assert_eq!(breaker.state(&site_key(2), now), BreakerState::Closed);
+    assert_eq!(
+        breaker.record_failure(&site_key(2), now),
+        BreakerState::Closed
+    );
 }
 
 #[test]
 fn unknown_site_is_closed() {
     let breaker = Breaker::new(BreakerPolicy::default());
-    assert_eq!(breaker.state(42, Instant::now()), BreakerState::Closed);
+    assert_eq!(
+        breaker.state(&site_key(42), Instant::now()),
+        BreakerState::Closed
+    );
 }

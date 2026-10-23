@@ -4622,7 +4622,14 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         // M14-S1：多站路由开关（B-99）。关时（默认）走 single_upstream——config.base_url
         // / api_key 是所选站点，M8-S4 §6.5 换站语义逐字不变；开时用 build_gateway_route
         // 填非空 route + keys_by_ref，网关按模型选路（多站聚合，FR-6 V1.1 可选）。
-        if self.settings()?.gateway_multi_site {
+        let settings = self.settings()?;
+        // M39-S3 §4.6：负载均衡与每站保护策略（**下次启动网关生效**；不在请求路径热切换）。
+        config.lb_top_n = settings.gateway_lb_top_n;
+        config.guard_policy = crate::routing::SiteGuardPolicy {
+            max_concurrency: settings.gateway_per_site_concurrency,
+            rate_limit_per_sec: settings.gateway_per_site_rate_limit,
+        };
+        if settings.gateway_multi_site {
             let (route, keys) = self.build_gateway_route()?;
             config.route = route;
             config.keys_by_ref = keys;
@@ -4883,32 +4890,33 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             std::collections::HashMap::new();
 
         for site in self.store.list_sites()? {
-            let Some(row) = self.pick_gateway_key(site.id)? else {
-                continue;
-            };
-            if row.status == crate::store::KEY_STATUS_REVOKED {
-                continue;
-            }
-            // 走 `secret_for_row`（唯一的明文出口），**不新开取密钥路径**。
-            let Ok(secret) = self.secret_for_row(&row) else {
-                // 本地记录在、明文没了：这把 key **用不了**。
-                // 跳过这一把是对的（该站点不进路由表），跳过整个站点是错的。
-                continue;
-            };
             let obs = observations.get(&site.id).cloned().unwrap_or_default();
-            facts.push(crate::routing::SiteFacts {
-                site_id: site.id,
-                base_url: site.base_url.clone(),
-                // 目录里没有该站 ⇒ 空 vec = 「未知 ⇒ 通配」（M8-S1 §4.2 的既有语义）。
-                models: catalog.get(&site.id).cloned().unwrap_or_default(),
-                rate: obs.rate,
-                // **余额未知 ⇒ None**，绝不 `unwrap_or(0.0)`（那会把「不知道」变成「已耗尽」）。
-                balance_usd: obs.balance_usd,
-                latency_ms: obs.latency_ms,
-                key_ref: row.secret_ref.clone(),
-            });
-            if !revoked.contains(&row.secret_ref) {
-                keys.insert(row.secret_ref.clone(), secret);
+            // 目录里没有该站 ⇒ 空 vec = 「未知 ⇒ 通配」（M8-S1 §4.2 的既有语义）。
+            let models = catalog.get(&site.id).cloned().unwrap_or_default();
+            // M39-S3 §4.3：**每站每把可用 key 一个 `Upstream`**（同站共享
+            // `rate` / `balance_usd` / `latency_ms` / `models`；guard 与熔断按 site_id 共享，
+            // 所以多一把 key 不会让站点上限翻倍）。
+            for row in self.usable_gateway_keys(site.id)? {
+                // 走 `secret_for_row`（唯一的明文出口），**不新开取密钥路径**。
+                let Ok(secret) = self.secret_for_row(&row) else {
+                    // 本地记录在、明文没了：这把 key **用不了**。
+                    // 跳过这一把是对的（该站点不进路由表），跳过整个站点是错的。
+                    continue;
+                };
+                facts.push(crate::routing::SiteFacts {
+                    site_id: site.id,
+                    base_url: site.base_url.clone(),
+                    models: models.clone(),
+                    rate: obs.rate,
+                    // **余额未知 ⇒ None**，绝不 `unwrap_or(0.0)`（那会把「不知道」变成「已耗尽」）。
+                    balance_usd: obs.balance_usd,
+                    latency_ms: obs.latency_ms,
+                    key_ref: row.secret_ref.clone(),
+                    key_id: Some(row.id),
+                });
+                if !revoked.contains(&row.secret_ref) {
+                    keys.insert(row.secret_ref.clone(), secret);
+                }
             }
         }
 
@@ -5151,6 +5159,27 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
 
     /// 该站点用来出网的 key：**未回收**且未禁用/耗尽里 id 最大的那一条（最新的一把）。
     /// B-99 接线后启用（M14-S1 接线）：被 `build_gateway_route` 与 `refresh_all` 采集段调用（取每站最新可用 key）。
+    /// 该站点**所有可用**的 key（M39-S3 §4.3）：未回收、未禁用、未耗尽，按 id 升序。
+    ///
+    /// 与 [`Self::pick_gateway_key`] 同一组过滤条件——那个是「挑一把」（采集/legacy），
+    /// 这个是「全都要」（多站路由的每 key 一个上游）。两条判据必须同源，否则
+    /// 「路由里有的 key」与「采集用的 key」会分叉。
+    fn usable_gateway_keys(&self, site_id: i64) -> Result<Vec<crate::store::KeyRow>> {
+        let mut rows: Vec<crate::store::KeyRow> = self
+            .store
+            .list_keys()?
+            .into_iter()
+            .filter(|row| row.site_id == site_id)
+            .filter(|row| row.status != crate::store::KEY_STATUS_REVOKED)
+            .filter(|row| {
+                row.status != crate::site::KeyStatus::Disabled.as_str()
+                    && row.status != crate::site::KeyStatus::Exhausted.as_str()
+            })
+            .collect();
+        rows.sort_by_key(|row| row.id);
+        Ok(rows)
+    }
+
     fn pick_gateway_key(&self, site_id: i64) -> Result<Option<crate::store::KeyRow>> {
         Ok(self
             .store

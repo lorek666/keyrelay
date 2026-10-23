@@ -113,6 +113,7 @@ impl FakeUpstream {
     fn upstream(&self, rate: f64) -> Upstream {
         Upstream {
             site_id: self.site_id,
+            key_id: None,
             base_url: self.base_url.clone(),
             key_ref: self.key_ref.clone(),
             models: vec![MODEL.to_string()],
@@ -192,6 +193,9 @@ async fn start_routed_full(
         })),
         upstream_proxy: None,
         legacy_key_ref: None,
+        // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
+        lb_top_n: 1,
+        guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
         runtime: None,
         on_failure: Some(Arc::new(move |f| {
             if let Ok(mut log) = sink.lock() {
@@ -221,6 +225,7 @@ fn dead_port() -> u16 {
 fn dead_upstream(site_id: i64, key_ref: &str, rate: f64) -> Upstream {
     Upstream {
         site_id,
+        key_id: None,
         base_url: format!("http://127.0.0.1:{}", dead_port()),
         key_ref: key_ref.to_string(),
         models: vec![MODEL.to_string()],
@@ -264,6 +269,9 @@ async fn route_and_keys_by_ref_must_agree() {
             on_usage: None,
             upstream_proxy: None,
             legacy_key_ref: None,
+            // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
+            lb_top_n: 1,
+            guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
             runtime: None,
             on_failure: None,
         }
@@ -754,6 +762,9 @@ async fn failure_event_scrubs_a_key_shaped_model() {
             on_usage: None,
             upstream_proxy: None,
             legacy_key_ref: None,
+            // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
+            lb_top_n: 1,
+            guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
             runtime: None,
             on_failure: Some(Arc::new(move |f| {
                 if let Ok(mut log) = sink.lock() {
@@ -1005,6 +1016,9 @@ async fn a_missing_plaintext_is_refused_at_startup() {
         on_usage: None,
         upstream_proxy: None,
         legacy_key_ref: None,
+        // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
+        lb_top_n: 1,
+        guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
         runtime: None,
         on_failure: None,
     })
