@@ -2319,7 +2319,7 @@ pub async fn gateway_rotate_token(
         .settings()
         .map_err(|e| e.to_string())?
         .gateway_port;
-    let _pre_check = state
+    state
         .service
         .validate_gateway_target(site_id, key_id)
         .map_err(|e| e.to_string())?;
