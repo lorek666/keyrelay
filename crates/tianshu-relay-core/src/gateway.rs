@@ -30,7 +30,6 @@ use std::time::Duration;
 use axum::routing::any;
 use axum::Router;
 use futures_util::{StreamExt, TryStreamExt};
-use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
@@ -61,8 +60,11 @@ pub const BIND_RETRY_ATTEMPTS: u32 = 20;
 /// 两次 bind 尝试之间的间隔（配合 [`BIND_RETRY_ATTEMPTS`]，最坏 ≈1000ms）。
 pub const BIND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// 请求体上限（与之前一致，只是抽成常量）。
-const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+/// 请求体上限的默认值（M42-S1：可由 Settings 覆盖，范围 1..=64 MiB）。
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+/// 请求体上限的**硬上限**（M42-S1 §4.4）：Settings 只能配到 64 MiB。
+pub const MAX_REQUEST_BYTES_LIMIT: usize = 64 * 1024 * 1024;
 
 /// 上游响应里**不**回传给本地调用方的头。
 ///
@@ -461,6 +463,8 @@ where
 #[derive(Clone)]
 pub struct GatewayConfig {
     pub port: u16,
+    /// M42-S1：请求体上限（字节）。`single_upstream` 用 [`DEFAULT_MAX_REQUEST_BYTES`]。
+    pub max_request_bytes: usize,
     /// 本地令牌。**不是**站点密钥。
     pub token: String,
     /// 绑定的站点 id（M13-S1）：用于 token 用量出口的 `site_id`。
@@ -684,6 +688,7 @@ impl GatewayConfig {
     ) -> Self {
         Self {
             port,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             token,
             site_id: 0,
             key_id: None,
@@ -858,14 +863,37 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// IPv6 回环监听状态（M42-S1 §4.5）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ipv6State {
+    /// `[::1]:port` 已监听。
+    Listening,
+    /// 未监听，附原因（OS 不支持 / 端口被占用 / port 0 测试路径）。
+    Degraded { reason: String },
+}
+
+/// v6 绑定的测试注入模式（`#[doc(hidden)]`，只给集成测试用）。
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum V6BindMode {
+    /// 生产：真的绑 `[::1]:port`。
+    Real,
+    /// 测试：模拟一个指定 kind 的绑定错误（验证降级 / 端口占用两条路径）。
+    Fail(std::io::ErrorKind),
+}
+
 pub struct GatewayHandle {
     pub addr: SocketAddr,
+    /// M42-S1：实际监听的地址（v4 必有；v6 可能缺席）。
+    pub addrs: Vec<SocketAddr>,
+    /// M42-S1：IPv6 回环状态。
+    pub ipv6: Ipv6State,
     pub token: String,
     pub site_display_name: String,
-    shutdown: oneshot::Sender<()>,
-    /// 服务任务。`shutdown_and_wait` 等它结束；`shutdown()` 只是把它丢掉
-    /// （drop 一个 `JoinHandle` 是 **detach**，不会 abort 任务——既有调用点的行为因此不变）。
-    finished: tokio::task::JoinHandle<()>,
+    /// M42-S1：两个 listener 共用一个停止信号（`oneshot` 只能 await 一次）。
+    shutdown: tokio::sync::watch::Sender<bool>,
+    /// 服务任务（v4 必有；v6 可能缺席）。`shutdown_and_wait` 等**全部**结束。
+    finished: Vec<tokio::task::JoinHandle<()>>,
     /// 与 `AppState` 共享的「正在停止」标志（M16-S4 / P3-3）。
     stopping: Arc<std::sync::atomic::AtomicBool>,
     /// 任务结束记录（M41-S1）：任务体结束时回写，`alive()` 为假之后才可能有值。
@@ -891,7 +919,7 @@ impl GatewayHandle {
     /// M41-S1：`gateway_status` 用这个而不是「`Option` 是不是 `Some`」——
     /// 一个已经 panic 的句柄绝不能继续被报成「运行中」。
     pub fn alive(&self) -> bool {
-        !self.finished.is_finished()
+        self.finished.iter().any(|task| !task.is_finished())
     }
 
     /// 任务结束记录（还活着 ⇒ `None`）。
@@ -913,7 +941,7 @@ impl GatewayHandle {
     pub fn shutdown(self) {
         self.stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.shutdown.send(());
+        let _ = self.shutdown.send(true);
     }
 
     /// 停止网关并**等待监听套接字真正释放**。幂等。
@@ -937,8 +965,10 @@ impl GatewayHandle {
         } = self;
         // P3-3：置位在信号之前——顺序反了的话，在途请求可能在这两步之间发起新尝试。
         stopping.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = shutdown.send(());
-        let _ = finished.await;
+        let _ = shutdown.send(true);
+        for task in finished {
+            let _ = task.await;
+        }
     }
 }
 
@@ -973,6 +1003,28 @@ async fn bind_loopback(port: u16) -> std::io::Result<tokio::net::TcpListener> {
     tokio::net::TcpListener::bind(("127.0.0.1", port)).await
 }
 
+/// 绑 `[::1]:port`（M42-S1）。
+///
+/// 绑定的是**具体**的 `::1` 而不是通配 `::`：具体的 v6 地址天生不会接管 v4 的回环
+/// （`IPV6_V6ONLY` 只对 `::` 有意义，tokio 的 `TcpSocket` 也没有暴露该开关），
+/// 所以这里不需要额外的 only_v6 设置——语义与 spec §4.5 一致（不吞 v4）。
+async fn bind_ipv6(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(("::1", port)).await
+}
+
+/// v6 失败一律降级（M42-S1 §4.5 / Lead 裁决 2）：**IPv6 永远不阻断 v4**。
+fn classify_ipv6_error(error: &std::io::Error) -> Ipv6State {
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        Ipv6State::Degraded {
+            reason: "IPv6 回环端口被占用，仅监听 127.0.0.1".to_string(),
+        }
+    } else {
+        Ipv6State::Degraded {
+            reason: format!("IPv6 回环不可用，仅监听 127.0.0.1：{error}"),
+        }
+    }
+}
+
 /// bind 失败的错误文案。
 ///
 /// `AddrInUse` 单独一条：既要说清「端口 + 占用 + 实际端口号」，也要点明
@@ -990,8 +1042,14 @@ fn bind_error_message(port: u16, e: &std::io::Error) -> String {
     }
 }
 
-/// 启动网关。**只绑定 `127.0.0.1`**（配置里没有别的选项）。
+/// 启动网关（M42-S1：v4 必绑；v6 `[::1]` 同端口，失败降级）。
 pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
+    start_with_v6(config, V6BindMode::Real).await
+}
+
+/// 启动网关（可注入 v6 绑定行为的测试入口；生产走 [`start`]）。
+#[doc(hidden)]
+pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result<GatewayHandle> {
     // 单上游（`route` 为空）时 `base_url` 是**唯一**的转发目标，必须非空——与既有行为一致。
     // 路由非空时 `base_url` 不再被使用（每个上游自带 `base_url`），因此不再强制。
     if config.route.is_empty() && config.base_url.trim().is_empty() {
@@ -1100,40 +1158,99 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
             "网关绑定到了非回环地址 {addr}，拒绝启动"
         )));
     }
+    let port = addr.port();
 
-    let (tx, rx) = oneshot::channel::<()>();
-    // M41-S1：录一次「任务怎么结束的」。serve 再包一层 spawn——外层能拿到 `JoinError`
-    // （panic），`is_finished()` 只能回答「结束了吗」，回答不了「正常停止 / panic / 自己提前返回」。
+    // M42-S1 §4.5：同端口再绑 `[::1]`。**任何 v6 失败都降级**（Lead 裁决 2）——
+    // v4 已经是可用的，IPv6 只是兼容性增强，不能让它阻断启动。
+    // 判**请求的**端口（`config.port`），不是内核分配出来的那个：
+    // `port 0` 的语义是「测试路径不绑 v6」，而 `addr.port()` 此时已经是一个真实端口（永不为 0）。
+    let (v6_listener, ipv6) = if config.port == 0 {
+        (
+            None,
+            Ipv6State::Degraded {
+                reason: "端口 0 由内核分配，跳过 IPv6 监听（仅测试路径）".to_string(),
+            },
+        )
+    } else {
+        match v6_mode {
+            V6BindMode::Fail(kind) => (None, classify_ipv6_error(&std::io::Error::from(kind))),
+            V6BindMode::Real => match bind_listener_with(port, bind_ipv6).await {
+                Ok(listener6) => {
+                    let addr6 = listener6
+                        .local_addr()
+                        .map_err(|e| Error::Store(format!("读取网关 IPv6 地址失败: {e}")))?;
+                    if !addr6.ip().is_loopback() {
+                        return Err(Error::Store(format!(
+                            "网关 IPv6 绑定到了非回环地址 {addr6}，拒绝启动"
+                        )));
+                    }
+                    (Some(listener6), Ipv6State::Listening)
+                }
+                Err(error) => (None, classify_ipv6_error(&error)),
+            },
+        }
+    };
+    let mut addrs = vec![addr];
+    if let Some(listener6) = &v6_listener {
+        if let Ok(addr6) = listener6.local_addr() {
+            addrs.push(addr6);
+        }
+    }
+
+    // M42-S1：两个 listener 共用一个停止信号（`oneshot` 只能 await 一次 ⇒ 改 `watch`）。
+    let (tx, rx) = tokio::sync::watch::channel(false);
     let exit: Arc<std::sync::Mutex<Option<GatewayExit>>> = Arc::new(std::sync::Mutex::new(None));
-    let stopping_for_task = Arc::clone(&stopping);
-    let exit_for_task = Arc::clone(&exit);
-    let finished = tokio::spawn(async move {
-        let served = tokio::spawn(async move {
-            let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = rx.await;
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // v4 是**主任务**：`GatewayExit` 由它记录（M41-S1 的 alive/last_exit 语义不变）。
+    {
+        let app_v4 = app.clone();
+        let mut rx_v4 = rx.clone();
+        let stopping_for_task = Arc::clone(&stopping);
+        let exit_for_task = Arc::clone(&exit);
+        tasks.push(tokio::spawn(async move {
+            let served = tokio::spawn(async move {
+                let _ = axum::serve(listener, app_v4)
+                    .with_graceful_shutdown(async move {
+                        let _ = rx_v4.changed().await;
+                    })
+                    .await;
+            })
+            .await;
+            let reason = classify_gateway_exit(
+                stopping_for_task.load(std::sync::atomic::Ordering::SeqCst),
+                served.is_err(),
+            );
+            if let Ok(mut slot) = exit_for_task.lock() {
+                *slot = Some(GatewayExit {
+                    at: now_secs(),
+                    reason,
+                });
+            }
+        }));
+    }
+
+    // v6 是**尽力而为**：失败已在上面的绑定段降级，这里只负责跑起来与一起停。
+    if let Some(listener6) = v6_listener {
+        let app_v6 = app;
+        let mut rx_v6 = rx.clone();
+        tasks.push(tokio::spawn(async move {
+            let _ = axum::serve(listener6, app_v6)
+                .with_graceful_shutdown(async move {
+                    let _ = rx_v6.changed().await;
                 })
                 .await;
-        })
-        .await;
-        let reason = classify_gateway_exit(
-            stopping_for_task.load(std::sync::atomic::Ordering::SeqCst),
-            served.is_err(),
-        );
-        if let Ok(mut slot) = exit_for_task.lock() {
-            *slot = Some(GatewayExit {
-                at: now_secs(),
-                reason,
-            });
-        }
-    });
+        }));
+    }
 
     Ok(GatewayHandle {
         addr,
+        addrs,
+        ipv6,
         token: config.token,
         site_display_name: config.site_display_name,
         shutdown: tx,
-        finished,
+        finished: tasks,
         stopping,
         exit,
     })
@@ -1208,12 +1325,74 @@ fn constant_time_eq(a: Option<&str>, b: &str) -> bool {
     }
 }
 
+// ============================================================ M42-S1：本地错误信封
+
+/// OpenAI 兼容的本地错误对象（M42-S1 §4.1）。**只用于网关自己生成的错误**；
+/// 上游的响应体逐字节透传，不进这里。
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct GatewayErrorBody {
+    pub message: String,
+    /// `invalid_request_error` | `authentication_error` | `rate_limit_error` | `api_error`
+    pub r#type: &'static str,
+    /// 恒为 `None`（OpenAI 用它在字段级错误上指字段名；本地错误没有字段可指）。
+    pub param: Option<String>,
+    pub code: &'static str,
+}
+
+/// 线格式：`{"error": {message, type, param, code}}`。
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct GatewayErrorResponse {
+    pub error: GatewayErrorBody,
+}
+
+/// 错误类型（决定 `type` 字段）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayErrorKind {
+    InvalidRequest,
+    Authentication,
+    RateLimit,
+    Api,
+}
+
+impl GatewayErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GatewayErrorKind::InvalidRequest => "invalid_request_error",
+            GatewayErrorKind::Authentication => "authentication_error",
+            GatewayErrorKind::RateLimit => "rate_limit_error",
+            GatewayErrorKind::Api => "api_error",
+        }
+    }
+}
+
+/// **全文件唯一**构造本地错误响应的地方（M42-S1 §4.1）。
+///
+/// 新增本地错误必须走这里；`rg 'json!\(\{\s*"error"\s*:\s*"' gateway.rs` 应为 0 命中。
+pub(crate) fn local_error(
+    status: StatusCode,
+    kind: GatewayErrorKind,
+    code: &'static str,
+    message: impl Into<String>,
+) -> Response {
+    let body = GatewayErrorResponse {
+        error: GatewayErrorBody {
+            message: message.into(),
+            r#type: kind.as_str(),
+            param: None,
+            code,
+        },
+    };
+    (status, axum::Json(body)).into_response()
+}
+
+/// 本地 401（保留函数名，调用点不变；M42-S1 起走统一信封）。
 fn unauthorized(message: &str) -> Response {
-    (
+    local_error(
         StatusCode::UNAUTHORIZED,
-        axum::Json(serde_json::json!({ "error": message })),
+        GatewayErrorKind::Authentication,
+        "invalid_api_key",
+        message,
     )
-        .into_response()
 }
 
 /// 网关**正在停止**时对「新的上游尝试」的统一拒绝（M16-S4 / P3-3）。
@@ -1222,13 +1401,12 @@ fn unauthorized(message: &str) -> Response {
 /// 否则用户会去查一个没问题的上游。为什么是 503：请求此刻确实无法完成，
 /// 但**重启网关后重试即可**（客户端按 5xx 处理即可）。
 fn stopping_response() -> Response {
-    (
+    local_error(
         StatusCode::SERVICE_UNAVAILABLE,
-        axum::Json(serde_json::json!({
-            "error": "网关正在停止，不再向上游发起新请求；请重启网关后重试"
-        })),
+        GatewayErrorKind::Api,
+        "gateway_stopping",
+        "网关正在停止，不再向上游发起新请求；请重启网关后重试",
     )
-        .into_response()
 }
 
 /// 网关是否正在停止（P3-3）。
@@ -1293,22 +1471,20 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
 
     // ② 只转发 `/v1/*`，且路径里不许有「向上跳」的段
     if !path.starts_with("/v1/") && path != "/v1" {
-        return (
+        return local_error(
             StatusCode::NOT_FOUND,
-            axum::Json(serde_json::json!({
-                "error": "网关只转发 /v1/*；健康检查用 /health"
-            })),
-        )
-            .into_response();
+            GatewayErrorKind::InvalidRequest,
+            "not_found",
+            "网关只转发 /v1/*；健康检查用 /health",
+        );
     }
     if !path_is_safe(&path) || query.contains(['\r', '\n', '\0']) {
-        return (
+        return local_error(
             StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({
-                "error": "路径里含「向上跳」的段或控制字符，拒绝转发"
-            })),
-        )
-            .into_response();
+            GatewayErrorKind::InvalidRequest,
+            "invalid_path",
+            "路径里含「向上跳」的段或控制字符，拒绝转发",
+        );
     }
 
     let method = request.method().clone();
@@ -1316,14 +1492,30 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     // 但「丢掉带本地令牌的头」这条规则对每个上游都一样。
     let inbound = request.headers().clone();
 
-    let body = match axum::body::to_bytes(request.into_body(), MAX_REQUEST_BYTES).await {
+    let max_request_bytes = state.config.max_request_bytes;
+    let body = match axum::body::to_bytes(request.into_body(), max_request_bytes).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            return (
+            // M42-S1 §4.2 #5：超限是 413，不是 400——判定用 `LengthLimitError` 精确区分，
+            // 非超限的读取错误仍是 400。超限时不读完整 body、不连上游。
+            // axum 0.8：`to_bytes` 的 Err 是 `axum::Error`，超限原因在 `source()` 链上
+            // 的 `LengthLimitError`（axum 官方示例同口径：`source.is::<LengthLimitError>()`）。
+            let too_large = std::error::Error::source(&e)
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+            if too_large {
+                return local_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    GatewayErrorKind::InvalidRequest,
+                    "request_too_large",
+                    format!("请求体超过上限 {} MiB", max_request_bytes / (1024 * 1024)),
+                );
+            }
+            return local_error(
                 StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({ "error": format!("读取请求体失败: {e}") })),
-            )
-                .into_response()
+                GatewayErrorKind::InvalidRequest,
+                "invalid_request_body",
+                format!("读取请求体失败: {e}"),
+            );
         }
     };
 
@@ -1382,14 +1574,12 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                     &model,
                     "该密钥已被回收（可能刚做过一键轮换）；网关需要重启才会用上新密钥",
                 );
-                return (
+                return local_error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    axum::Json(serde_json::json!({
-                        "error": "这把密钥已被回收（可能刚做过一键轮换）；\
-                                  请重启网关，让它读到新密钥"
-                    })),
-                )
-                    .into_response();
+                    GatewayErrorKind::Api,
+                    "key_revoked",
+                    "这把密钥已被回收（可能刚做过一键轮换）；请重启网关，让它读到新密钥",
+                );
             }
         }
         let url = format!("{}{}{}", state.config.base_url, path, query);
@@ -1407,16 +1597,15 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         None => view.route().all_candidates(),
     };
     if candidates.is_empty() {
-        return (
+        return local_error(
             StatusCode::NOT_FOUND,
-            axum::Json(serde_json::json!({
-                "error": format!(
-                    "没有可服务模型 {} 的上游",
-                    model.as_deref().unwrap_or("(请求里未指定)")
-                )
-            })),
-        )
-            .into_response();
+            GatewayErrorKind::InvalidRequest,
+            "model_not_found",
+            format!(
+                "没有可服务模型 {} 的上游",
+                model.as_deref().unwrap_or("(请求里未指定)")
+            ),
+        );
     }
 
     let now = Instant::now();
@@ -1441,13 +1630,12 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
             "所有候选上游都在熔断冷却中",
             Instant::now(),
         );
-        return (
+        return local_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({
-                "error": "所有候选上游都在熔断冷却中，请稍后重试"
-            })),
-        )
-            .into_response();
+            GatewayErrorKind::Api,
+            "breaker_open",
+            "所有候选上游都在熔断冷却中，请稍后重试",
+        );
     }
 
     // 别名命中时才改写 body 里的 `model`；未命中时 body 逐字节原样转发。
@@ -1666,14 +1854,12 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     // 这里没有任何上游出过错：本地并发/限流拒绝不写事件、不喂熔断，
     // 客户端据 `kind == "local_rate_limited"` 就能把「本机限流」与「上游 429」分开。
     if local_rejected > 0 && local_rejected == attempts {
-        return (
+        return local_error(
             StatusCode::TOO_MANY_REQUESTS,
-            axum::Json(serde_json::json!({
-                "error": "本地保护：所有候选均被限流",
-                "kind": "local_rate_limited"
-            })),
-        )
-            .into_response();
+            GatewayErrorKind::RateLimit,
+            "local_rate_limited",
+            "本地保护：所有候选均被限流",
+        );
     }
 
     // §10 第 2 条：**发不出去**的候选也要产生事件。
@@ -1721,13 +1907,12 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         );
     }
 
-    (
+    local_error(
         StatusCode::BAD_GATEWAY,
-        axum::Json(serde_json::json!({
-            "error": last_error.unwrap_or_else(|| "所有候选上游都失败了".to_string())
-        })),
+        GatewayErrorKind::Api,
+        "all_upstreams_failed",
+        last_error.unwrap_or_else(|| "所有候选上游都失败了".to_string()),
     )
-        .into_response()
 }
 
 /// 取该站点的 guard（不存在就按 `config.guard_policy` 建一个）。
@@ -1874,11 +2059,12 @@ async fn forward_to(
                 },
             )
         }
-        Err(failure) => (
+        Err(failure) => local_error(
             StatusCode::BAD_GATEWAY,
-            axum::Json(serde_json::json!({ "error": failure.message() })),
-        )
-            .into_response(),
+            GatewayErrorKind::Api,
+            "upstream_failed",
+            failure.message(),
+        ),
     }
 }
 
@@ -2739,15 +2925,67 @@ mod tests {
         assert!(freed, "shutdown() 之后端口 {port} 最终必须释放");
     }
 
-    /// 幂等：服务已经停了（oneshot 接收端没了、任务已结束）时，
+    /// M42-S1 §7.1：信封形状（OpenAI 兼容）。
+    #[test]
+    fn local_error_shape_is_openai_compatible() {
+        use axum::body::to_bytes;
+        use axum::http::StatusCode;
+
+        let response = local_error(
+            StatusCode::UNAUTHORIZED,
+            GatewayErrorKind::Authentication,
+            "invalid_api_key",
+            "缺少或错误的本地令牌",
+        );
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let bytes = runtime
+            .block_on(to_bytes(response.into_body(), 64 * 1024))
+            .expect("读 body");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        let err = value.get("error").expect("有 error");
+        assert!(err.is_object(), "error 必须是对象，不是字符串: {value}");
+        assert_eq!(err["type"], "authentication_error");
+        assert_eq!(err["code"], "invalid_api_key");
+        assert_eq!(err["message"], "缺少或错误的本地令牌");
+        assert!(err["param"].is_null(), "param 必须是 null: {value}");
+    }
+
+    /// M42-S1 §7.1：四个 kind → OpenAI type 字符串。
+    #[test]
+    fn error_kind_maps_to_openai_types() {
+        assert_eq!(
+            GatewayErrorKind::InvalidRequest.as_str(),
+            "invalid_request_error"
+        );
+        assert_eq!(
+            GatewayErrorKind::Authentication.as_str(),
+            "authentication_error"
+        );
+        assert_eq!(GatewayErrorKind::RateLimit.as_str(), "rate_limit_error");
+        assert_eq!(GatewayErrorKind::Api.as_str(), "api_error");
+    }
+
+    /// 幂等：服务已经停了（接收端没了、任务已结束）时，
     /// `shutdown_and_wait` 必须立即返回，不 panic、不挂。
+    ///
+    /// M42-S1：停止信号从 `oneshot` 换成 `watch`（两个 listener 要共用一次停止），
+    /// 所以这里按新的句柄形状构造。
     #[tokio::test]
     async fn shutdown_and_wait_on_an_already_stopped_server_returns() {
-        let (tx, rx) = oneshot::channel::<()>();
+        let (tx, rx) = tokio::sync::watch::channel(false);
         drop(rx); // 接收端已消失：send 会失败，若实现里 unwrap 就会炸
-        let finished = tokio::spawn(async {});
+        let finished = vec![tokio::spawn(async {})];
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("地址可解析");
         let handle = GatewayHandle {
-            addr: "127.0.0.1:0".parse().expect("地址可解析"),
+            addr,
+            addrs: vec![addr],
+            ipv6: Ipv6State::Degraded {
+                reason: "单测：未监听 v6".to_string(),
+            },
             token: "t".into(),
             site_display_name: "已停的站点".into(),
             shutdown: tx,

@@ -246,6 +246,8 @@ fn config(
         on_usage: None,
         upstream_proxy: None,
         legacy_key_ref: None,
+        // M42-S1：请求体上限（既有用例用默认 16 MiB）
+        max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
         runtime: None,
     };
     (config, failures)
@@ -567,7 +569,7 @@ async fn all_candidates_locally_rejected_returns_429() {
         .find(|(status, _)| *status == 429)
         .expect("有 429");
     assert!(
-        rejected.1.contains("\"kind\":\"local_rate_limited\""),
+        rejected.1.contains("\"code\":\"local_rate_limited\""),
         "错误体必须可判定（不是 502）: {}",
         rejected.1
     );

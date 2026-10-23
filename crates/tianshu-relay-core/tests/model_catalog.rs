@@ -538,3 +538,29 @@ async fn the_mirror_follows_the_catalog_and_clears_only_with_it() {
         Some(&Vec::<String>::new())
     );
 }
+
+/// M42-S1 §7.1：`gateway_config` 把 `gateway_max_request_mib` 映射成 `max_request_bytes`。
+#[test]
+fn gateway_config_carries_max_request_bytes() {
+    let svc = setup(1, std::time::Duration::ZERO);
+    svc.service
+        .store()
+        .set_setting("gateway_max_request_mib", "32")
+        .expect("写设置");
+    let (site, key_id) = first_key(&svc);
+    let config = svc.service.gateway_config(site, key_id, 0).expect("装配");
+    assert_eq!(
+        config.max_request_bytes,
+        32 * 1024 * 1024,
+        "32 MiB ⇒ 32 * 1024 * 1024 字节"
+    );
+
+    // 默认（没写过设置）⇒ 16 MiB
+    let svc2 = setup(1, std::time::Duration::ZERO);
+    let (site2, key2) = first_key(&svc2);
+    let config2 = svc2.service.gateway_config(site2, key2, 0).expect("装配");
+    assert_eq!(
+        config2.max_request_bytes,
+        tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES
+    );
+}
