@@ -5007,6 +5007,82 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         Ok((table, keys))
     }
 
+    // ======================================================== M43-S2：站点账单（只读）
+
+    /// M43-S2：只读探测该站点是否支持账单导入（一次 GET、不写库）。
+    pub async fn probe_site_billing(&self, site_id: i64) -> crate::site::billing::BillProbe {
+        let site = match self.site(site_id) {
+            Ok(site) => site,
+            Err(err) => {
+                return crate::site::billing::BillProbe::Failed {
+                    reason: err.to_string(),
+                }
+            }
+        };
+        let session = match self.session(site_id) {
+            Ok(session) => session,
+            Err(_) => return crate::site::billing::BillProbe::NeedsLogin,
+        };
+        let target = crate::site::billing::SiteBilling {
+            site_id,
+            base_url: &site.base_url,
+            quota_per_unit: crate::site::newapi::DEFAULT_QUOTA_PER_UNIT,
+        };
+        crate::site::billing::probe_bill_import(&self.transport, &target, &session).await
+    }
+
+    /// M43-S2：只读导入站点账单。解析出的按天账单由**本方法**写库（命令层只做 DTO）。
+    ///
+    /// `partial` 如实返回；**失败不写任何行**（解析/分页失败时 `?` 提前返回）。
+    pub async fn import_site_billing(
+        &self,
+        site_id: i64,
+        max_pages: Option<usize>,
+        currency: Option<&str>,
+    ) -> Result<(
+        crate::site::billing::ImportOutcome,
+        Vec<crate::site::billing::RawBill>,
+    )> {
+        let site = self.site(site_id)?;
+        let session = self.session(site_id)?;
+        let target = crate::site::billing::SiteBilling {
+            site_id,
+            base_url: &site.base_url,
+            quota_per_unit: crate::site::newapi::DEFAULT_QUOTA_PER_UNIT,
+        };
+        let mut rows: Vec<crate::site::billing::RawBill> = Vec::new();
+        let outcome = crate::site::billing::import_site_bills(
+            &self.transport,
+            &target,
+            &session,
+            max_pages,
+            currency,
+            &mut |bill| rows.push(bill),
+        )
+        .await?;
+        for bill in &rows {
+            self.store.site_bill_upsert(
+                site_id,
+                &bill.day,
+                bill.amount,
+                outcome.currency.as_deref(),
+                bill.requests,
+                "newapi-log-self",
+            )?;
+        }
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "site",
+            format!("站点账单导入：{} 天", outcome.imported),
+            serde_json::json!({
+                "site_id": site_id,
+                "pages": outcome.pages,
+                "partial": outcome.partial,
+            }),
+        ));
+        Ok((outcome, rows))
+    }
+
     /// **一趟**模型目录采集（M39-S1 §4.5）。
     ///
     /// 与 `refresh_all` **完全解耦**：可以单独调用（测试直接调它；`src-tauri/src/lib.rs`

@@ -83,6 +83,12 @@ pub const COMMANDS: &[&str] = &[
     "recent_key_usage",
     // M34-S1：用量看板（站点 / 模型 / 天聚合，只读）
     "usage_dashboard",
+    "model_price_list",
+    "model_price_upsert",
+    "model_price_delete",
+    "site_bill_probe",
+    "site_bill_import",
+    "site_bills",
     // M14-S1：模型别名映射（B-110）
     "list_alias_map",
     "upsert_alias",

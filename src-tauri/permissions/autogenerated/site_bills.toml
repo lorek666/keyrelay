@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-site-bills"
+description = "Enables the site_bills command without any pre-configured scope."
+commands.allow = ["site_bills"]
+
+[[permission]]
+identifier = "deny-site-bills"
+description = "Denies the site_bills command without any pre-configured scope."
+commands.deny = ["site_bills"]

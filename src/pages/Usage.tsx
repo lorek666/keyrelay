@@ -1,6 +1,13 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { listSites, usageDashboard } from "../lib/api";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  listSites,
+  siteBillImport,
+  siteBillProbe,
+  siteBills,
+  usageDashboard,
+} from "../lib/api";
+import { formatEstimate, isFullyUnpriced, isPartiallyPriced, sumByCurrency } from "../lib/usageCost";
 import {
   formatCost,
   formatShare,
@@ -46,7 +53,41 @@ export default function Usage() {
   const [days, setDays] = useState<RangeDays>(30);
   const [siteId, setSiteId] = useState<number | null>(null);
 
+  const qc = useQueryClient();
   const sites = useQuery({ queryKey: ["sites"], queryFn: listSites });
+  const [billSite, setBillSite] = useState<number | null>(null);
+  const [billCurrency, setBillCurrency] = useState("");
+  const [billMsg, setBillMsg] = useState<string | null>(null);
+  const bills = useQuery({ queryKey: ["site-bills", days], queryFn: () => siteBills(days) });
+  const probe = useMutation({
+    mutationFn: () => siteBillProbe(billSite!),
+    onSuccess: (p) =>
+      setBillMsg(
+        p.status === "supported"
+          ? t("usage.bills.probeSupported")
+          : p.status === "needsLogin"
+            ? t("usage.bills.probeNeedsLogin")
+            : p.status === "unsupported"
+              ? t("usage.bills.probeUnsupported")
+              : t("usage.bills.probeFailed", { reason: p.reason ?? "" }),
+      ),
+    onError: (err: Error) => setBillMsg(err.message),
+  });
+  const importBill = useMutation({
+    mutationFn: () =>
+      siteBillImport(billSite!, undefined, billCurrency === "" ? undefined : billCurrency),
+    onSuccess: async (o) => {
+      setBillMsg(
+        t("usage.bills.imported", { days: o.imported, pages: o.pages }) +
+          (o.partial ? t("usage.bills.partial", { pages: o.pages }) : "") +
+          (o.currencyOverrideUsed && o.currency
+            ? t("usage.bills.currencyUsed", { currency: o.currency })
+            : ""),
+      );
+      await qc.invalidateQueries({ queryKey: ["site-bills"] });
+    },
+    onError: (err: Error) => setBillMsg(err.message),
+  });
   const dashboard = useQuery({
     queryKey: ["usage-dashboard", days, siteId],
     queryFn: () => usageDashboard(days, siteId),
@@ -65,6 +106,16 @@ export default function Usage() {
     siteList.find((site) => site.id === id)?.capabilities;
 
   const daily = dashboard.data?.daily ?? [];
+  const byAgent = dashboard.data?.byAgent ?? [];
+  // M43-S2：成本卡按**币种**分桶（跨币种永不合并；未知币种单独一桶）。
+  const costBuckets = sumByCurrency(
+    daily.map((row) => ({
+      currency: row.currency,
+      estimatedCost: row.estimatedCost,
+      requests: row.requests,
+      unpricedRequests: row.unpricedRequests,
+    })),
+  );
   const snapshots = dashboard.data?.snapshots ?? [];
   const keyUsage = dashboard.data?.keyUsage ?? [];
   const totals = sumTotals(daily);
@@ -172,6 +223,39 @@ export default function Usage() {
           label={t("usage.cards.models")}
           value={cardValue(byModel.length)}
         />
+      </div>
+
+      <div className="card">
+        <h3>{t("usage.cost.title")}</h3>
+        <p className="muted usage-note">{t("usage.cost.note")}</p>
+        {costBuckets.length === 0 ? (
+          <p className="muted">{t("usage.cost.empty")}</p>
+        ) : (
+          <div className="cards">
+            {costBuckets.map((bucket) => (
+              <Stat
+                key={bucket.currency ?? "__unknown__"}
+                label={
+                  bucket.currency
+                    ? t("usage.cost.bucket", { currency: bucket.currency })
+                    : t("usage.cost.unknownCurrency")
+                }
+                value={
+                  isFullyUnpriced(bucket)
+                    ? t("usage.cost.unpriced")
+                    : formatEstimate(bucket.estimated, bucket.currency)
+                }
+                hint={
+                  isPartiallyPriced(bucket)
+                    ? t("usage.cost.partial", { count: bucket.unpricedRequests })
+                    : isFullyUnpriced(bucket)
+                      ? t("usage.cost.allUnpriced", { count: bucket.unpricedRequests })
+                      : undefined
+                }
+              />
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="card">
@@ -309,6 +393,134 @@ export default function Usage() {
       </div>
 
       <div className="card">
+        <h3>{t("usage.agents.title")}</h3>
+        <p className="muted usage-note">{t("usage.agents.note")}</p>
+        {byAgent.length === 0 ? (
+          <p className="muted">{t("usage.agents.empty")}</p>
+        ) : (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>{t("usage.agents.agent")}</th>
+                <th>{t("usage.agents.currency")}</th>
+                <th>{t("usage.agents.requests")}</th>
+                <th>{t("usage.agents.tokens")}</th>
+                <th>{t("usage.agents.cost")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {byAgent.map((row) => (
+                <tr key={`${row.agentLabel}-${row.currency ?? "?"}`}>
+                  <td>
+                    {row.agentLabel === ""
+                      ? t("usage.agents.unattributed")
+                      : row.agentLabel}
+                  </td>
+                  <td>{row.currency ?? t("usage.cost.unknownCurrency")}</td>
+                  <td>{row.requests.toLocaleString()}</td>
+                  <td>{formatTokens(row.totalTokens)}</td>
+                  <td>
+                    {row.estimatedCost === null
+                      ? t("usage.cost.unpriced")
+                      : formatEstimate(row.estimatedCost, row.currency)}
+                    {row.unpricedRequests > 0 ? (
+                      <span className="muted">
+                        {" "}
+                        {t("usage.cost.partial", { count: row.unpricedRequests })}
+                      </span>
+                    ) : null}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="card">
+        <h3>{t("usage.bills.title")}</h3>
+        <p className="muted usage-note">{t("usage.bills.note")}</p>
+        <div className="row">
+          <label className="field-inline">
+            <span>{t("usage.bills.siteLabel")}</span>
+            <select
+              className="input"
+              value={billSite ?? ""}
+              onChange={(e) => {
+                setBillMsg(null);
+                setBillSite(e.target.value === "" ? null : Number(e.target.value));
+              }}
+            >
+              <option value="">{t("usage.bills.sitePlaceholder")}</option>
+              {siteList.map((site) => (
+                <option key={site.id} value={site.id}>
+                  {site.displayName}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field-inline">
+            <span>{t("usage.bills.currency")}</span>
+            <select
+              className="input"
+              value={billCurrency}
+              onChange={(e) => setBillCurrency(e.target.value)}
+            >
+              <option value="">{t("usage.bills.currencyAuto")}</option>
+              <option value="USD">USD</option>
+              <option value="CNY">CNY</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            className="btn"
+            disabled={billSite === null || probe.isPending}
+            onClick={() => probe.mutate()}
+          >
+            {t("usage.bills.probe")}
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            disabled={billSite === null || importBill.isPending}
+            title={t("usage.bills.importHint")}
+            onClick={() => importBill.mutate()}
+          >
+            {importBill.isPending ? t("usage.bills.importing") : t("usage.bills.import")}
+          </button>
+        </div>
+        {billMsg ? <p className="muted">{billMsg}</p> : null}
+        {bills.data && bills.data.length > 0 ? (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>{t("usage.bills.day")}</th>
+                <th>{t("usage.bills.siteCol")}</th>
+                <th>{t("usage.bills.amount")}</th>
+                <th>{t("usage.bills.currencyCol")}</th>
+                <th>{t("usage.bills.requests")}</th>
+                <th>{t("usage.bills.source")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {bills.data.map((row) => (
+                <tr key={row.id}>
+                  <td className="mono">{row.day}</td>
+                  <td>{siteName(row.siteId)}</td>
+                  <td>{row.amount === null ? t("usage.cost.unpriced") : formatEstimate(row.amount, row.currency)}</td>
+                  <td>{row.currency ?? t("usage.cost.unknownCurrency")}</td>
+                  <td>{row.requests === null ? t("usage.cost.unpriced") : row.requests.toLocaleString()}</td>
+                  <td className="mono">{row.source}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p className="muted">{t("usage.bills.empty")}</p>
+        )}
+      </div>
+
+      <div className="card">
         <h3>{t("usage.keys.title", { days: dashboard.data?.rangeDays ?? days })}</h3>
         <p className="muted usage-note">{t("usage.keys.note")}</p>
         {!capsReady ? (
@@ -339,9 +551,13 @@ export default function Usage() {
                     {formatTokens(row.outputTokens)}
                   </td>
                   <td className="mono">
-                    {row.currency
-                      ? `${formatCost(row.cost)} ${row.currency}`
-                      : formatCost(row.cost)}
+                    {row.cost === null ? (
+                      t("usage.cost.unpriced")
+                    ) : row.currency ? (
+                      `${formatCost(row.cost)} ${row.currency}`
+                    ) : (
+                      formatCost(row.cost)
+                    )}
                   </td>
                 </tr>
               ))}
@@ -362,13 +578,23 @@ export default function Usage() {
   );
 }
 
-function Stat({ label, value }: { label: string; value: number | string }) {
+function Stat({
+  label,
+  value,
+  hint,
+}: {
+  label: string;
+  value: number | string;
+  /** M43-S2：补充说明（例如「部分未定价 N 条」），不替代数值。 */
+  hint?: string;
+}) {
   return (
     <div className="stat">
       <div className="stat-label">
         <span>{label}</span>
       </div>
       <div className="stat-value">{value}</div>
+      {hint ? <div className="muted usage-note">{hint}</div> : null}
     </div>
   );
 }

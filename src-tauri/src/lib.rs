@@ -618,6 +618,12 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::recent_key_usage,
             // M34-S1：用量看板（站点 / 模型 / 天聚合，只读）
             commands::usage_dashboard,
+            commands::model_price_list,
+            commands::model_price_upsert,
+            commands::model_price_delete,
+            commands::site_bill_probe,
+            commands::site_bill_import,
+            commands::site_bills,
             // M14-S1：模型别名映射（B-110）
             commands::list_alias_map,
             commands::upsert_alias,
