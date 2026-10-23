@@ -35,7 +35,9 @@ pub fn detect(method: &Method, path: &str, headers: &HeaderMap) -> Option<Protoc
     }
     // /v1beta/models/<model>:generateContent
     if let Some(rest) = path.strip_prefix("/v1beta/models/") {
-        if rest.ends_with(":generateContent") {
+        // M42-S2b：`:streamGenerateContent`（`?alt=sse`）也是 Gemini 协议，
+        // 由调用方按流式处理；这里只负责认出它。
+        if rest.ends_with(":generateContent") || rest.ends_with(":streamGenerateContent") {
             return Some(Protocol::GeminiGenerateContent);
         }
     }

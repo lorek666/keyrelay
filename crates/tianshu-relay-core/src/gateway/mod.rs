@@ -1947,17 +1947,12 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     // 只放行这一个**精确形态**（不是整个 `/v1beta` 前缀）——别把它变成任意路径的入口。
     // (4) Gemini 流式：`:streamGenerateContent` 与 `?alt=sse` 都必须 400 点名 S2b，
     //     不能掉到 404（那是「路径不存在」的语义，会误导用户去查地址）也不能静默当非流式。
-    if path.starts_with("/v1beta/models/")
-        && (path.ends_with(":streamGenerateContent") || query.contains("alt=sse"))
-    {
-        return local_error(
-            StatusCode::BAD_REQUEST,
-            GatewayErrorKind::InvalidRequest,
-            "streaming_not_supported",
-            "Gemini 流式尚未支持（M42-S2b）；请先以 :generateContent 非流式调用",
-        );
-    }
-    let gemini_path = path.starts_with("/v1beta/models/") && path.ends_with(":generateContent");
+    // M42-S2b：Gemini 的流式有**两种**入口——`:streamGenerateContent` 路径与 `?alt=sse` 查询。
+    // 两者都走流式翻译（不再 400）。
+    let gemini_stream = path.starts_with("/v1beta/models/")
+        && (path.ends_with(":streamGenerateContent") || query.contains("alt=sse"));
+    let gemini_path = path.starts_with("/v1beta/models/")
+        && (path.ends_with(":generateContent") || path.ends_with(":streamGenerateContent"));
     if !path.starts_with("/v1/") && path != "/v1" && !gemini_path {
         return local_error(
             StatusCode::NOT_FOUND,
@@ -2037,7 +2032,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                             "无法确定模型名：Gemini 需要 /v1beta/models/<model>:generateContent",
                         );
                     }
-                    translate_stream = req.stream;
+                    translate_stream = req.stream || gemini_stream;
                     let json = req.to_upstream_json().to_string();
                     (bytes::Bytes::from(json), Some(proto))
                 }
@@ -2670,7 +2665,10 @@ where
 /// 从 `/v1beta/models/<model>:generateContent` 里取出模型名（Gemini 的模型名在路径里）。
 fn gemini_model_from_path(path: &str) -> Option<String> {
     let rest = path.strip_prefix("/v1beta/models/")?;
-    let model = rest.strip_suffix(":generateContent")?;
+    // M42-S2b：流式入口是 `:streamGenerateContent`，非流式是 `:generateContent`
+    let model = rest
+        .strip_suffix(":streamGenerateContent")
+        .or_else(|| rest.strip_suffix(":generateContent"))?;
     (!model.is_empty()).then(|| model.to_string())
 }
 
