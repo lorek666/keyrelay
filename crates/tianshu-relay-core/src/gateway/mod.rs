@@ -16,6 +16,8 @@
 //! 的调用方必须用 [`GatewayHandle::shutdown_and_wait`]；`start()` 另外对 bind 的
 //! `AddrInUse` 做有界退避重试（见 [`BIND_RETRY_ATTEMPTS`] / [`BIND_RETRY_DELAY`]）。
 
+pub mod translate;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -1941,7 +1943,10 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         .unwrap_or_default();
 
     // ② 只转发 `/v1/*`，且路径里不许有「向上跳」的段
-    if !path.starts_with("/v1/") && path != "/v1" {
+    // M42-S2a：Gemini 的路径是 `/v1beta/models/<model>:generateContent`，不在 `/v1/*` 下。
+    // 只放行这一个**精确形态**（不是整个 `/v1beta` 前缀）——别把它变成任意路径的入口。
+    let gemini_path = path.starts_with("/v1beta/models/") && path.ends_with(":generateContent");
+    if !path.starts_with("/v1/") && path != "/v1" && !gemini_path {
         return local_error(
             StatusCode::NOT_FOUND,
             GatewayErrorKind::InvalidRequest,
@@ -1988,6 +1993,51 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                 format!("读取请求体失败: {e}"),
             );
         }
+    };
+
+    // ④′ M42-S2a：协议翻译（非流式 MVP）。
+    //
+    // Chat **零翻译**（不进本分支，body 逐字节不动）；其余三种先解析成 IR，
+    // 再序列化成 OpenAI Chat body。**解析失败发生在发请求之前** ⇒ 不可能产生上游计费（ADR D5）。
+    let (body, translate_proto) = match translate::detect(&method, &path, &inbound) {
+        Some(proto)
+            if matches!(
+                proto,
+                translate::Protocol::OpenAiResponses
+                    | translate::Protocol::AnthropicMessages
+                    | translate::Protocol::GeminiGenerateContent
+            ) =>
+        {
+            match translate::parse_request(proto, &body) {
+                Ok(mut req) => {
+                    // Gemini 的模型名在**路径**里，不在 body（spec §4.3）。
+                    if req.model.is_empty() {
+                        if let Some(model) = gemini_model_from_path(&path) {
+                            req.model = model;
+                        }
+                    }
+                    if req.model.is_empty() {
+                        return local_error(
+                            StatusCode::BAD_REQUEST,
+                            GatewayErrorKind::InvalidRequest,
+                            "invalid_request",
+                            "无法确定模型名：Gemini 需要 /v1beta/models/<model>:generateContent",
+                        );
+                    }
+                    let json = req.to_upstream_json().to_string();
+                    (bytes::Bytes::from(json), Some(proto))
+                }
+                Err(e) => {
+                    return local_error(
+                        StatusCode::BAD_REQUEST,
+                        GatewayErrorKind::InvalidRequest,
+                        e.code,
+                        e.message,
+                    );
+                }
+            }
+        }
+        _ => (body, None),
     };
 
     // M39-S1：**每请求只取一次**路由视图（克隆一次 `Arc<GatewaySnapshot>` 就放锁）。
@@ -2055,7 +2105,16 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         }
         let url = format!("{}{}{}", state.config.base_url, path, query);
         let headers = upstream_headers(&state.config, &inbound, &state.config.api_key);
-        return forward_to(&state, method, &url, headers, body, &identity).await;
+        return forward_to(
+            &state,
+            method,
+            &url,
+            headers,
+            body,
+            &identity,
+            translate_proto,
+        )
+        .await;
     }
 
     // ④ 路由非空：选候选（首位即首选，顺序由 `RouteTable` 保证确定）
@@ -2266,8 +2325,9 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                     });
                     continue;
                 }
-                return into_upstream_response(
+                return maybe_translate_response(
                     &state,
+                    translate_proto,
                     response,
                     upstream.site_id,
                     &event_model,
@@ -2279,7 +2339,8 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                         attempts: index as u32 + 1,
                     },
                     &identity,
-                );
+                )
+                .await;
             }
             Err(failure) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
@@ -2324,15 +2385,17 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     // M39-S3（Lead P2）：存在「可重放的真实响应」（429）⇒ 原样返回它。
     // 典型形态：第一候选回 429，其后的候选都被本地保护跳过。
     if let Some(pending) = pending_replay {
-        return into_upstream_response(
+        return maybe_translate_response(
             &state,
+            translate_proto,
             pending.response,
             pending.site_id,
             &pending.model,
             pending.lease,
             pending.meta,
             &identity,
-        );
+        )
+        .await;
     }
 
     // M39-S3 §4.5：**全部候选都被本地保护跳过** ⇒ 429（不是 502）。
@@ -2525,6 +2588,7 @@ async fn forward_to(
     headers: HeaderMap,
     body: bytes::Bytes,
     identity: &AuthIdentity,
+    translate_proto: Option<translate::Protocol>,
 ) -> Response {
     let model = model_from_body(&body).unwrap_or_default();
     let started = Instant::now();
@@ -2537,8 +2601,10 @@ async fn forward_to(
                 latency_ms,
             );
             // legacy 单上游：`key_id` 回退到启动参数（M40-S1 §4.1）。
-            into_upstream_response(
+            // M42-S2a：翻译协议在 legacy 单上游上同样生效（Chat 仍是零翻译直通）。
+            maybe_translate_response(
                 state,
+                translate_proto,
                 response,
                 state.config.site_id,
                 &model,
@@ -2550,6 +2616,7 @@ async fn forward_to(
                 },
                 identity,
             )
+            .await
         }
         Err(failure) => local_error(
             StatusCode::BAD_GATEWAY,
@@ -2578,6 +2645,123 @@ where
         let _ = &lease;
         item
     })
+}
+
+/// 从 `/v1beta/models/<model>:generateContent` 里取出模型名（Gemini 的模型名在路径里）。
+fn gemini_model_from_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/v1beta/models/")?;
+    let model = rest.strip_suffix(":generateContent")?;
+    (!model.is_empty()).then(|| model.to_string())
+}
+
+/// M42-S2a：翻译协议的响应渲染。
+///
+/// - `proto == None`（Chat / 未识别）⇒ 完全走既有透传（**零翻译**）；
+/// - 非 2xx ⇒ **原样透传**（不翻译上游错误语义，spec §4.5）；
+/// - 2xx ⇒ 缓冲上游 Chat JSON（受 `MAX_RESPONSE_BYTES` 上限）→ IR → 渲染回入站协议。
+///
+/// **usage**：按上游 Chat 的 `usage` 记**一次**（`site_id` / `key_id` / 原始 prompt/completion），
+/// 与被替换掉的 `into_upstream_response` 内部 `UsageCapture` 等价——**不重复计费**。
+#[allow(clippy::too_many_arguments)]
+async fn maybe_translate_response(
+    state: &AppState,
+    proto: Option<translate::Protocol>,
+    upstream_response: reqwest::Response,
+    site_id: i64,
+    event_model: &str,
+    lease: Option<SiteLease>,
+    meta: AttemptMeta,
+    identity: &AuthIdentity,
+) -> Response {
+    let Some(proto) = proto else {
+        return into_upstream_response(
+            state,
+            upstream_response,
+            site_id,
+            event_model,
+            lease,
+            meta,
+            identity,
+        );
+    };
+    let status = upstream_response.status();
+    if !status.is_success() {
+        return into_upstream_response(
+            state,
+            upstream_response,
+            site_id,
+            event_model,
+            lease,
+            meta,
+            identity,
+        );
+    }
+
+    let bytes = match upstream_response.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            return local_error(
+                StatusCode::BAD_GATEWAY,
+                GatewayErrorKind::Api,
+                "upstream_read_failed",
+                format!("读取上游响应失败: {e}"),
+            )
+        }
+    };
+    if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+        return local_error(
+            StatusCode::BAD_GATEWAY,
+            GatewayErrorKind::Api,
+            "upstream_too_large",
+            "上游响应超过网关上限，无法翻译",
+        );
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return local_error(
+                StatusCode::BAD_GATEWAY,
+                GatewayErrorKind::Api,
+                "render_failed",
+                format!("上游响应不是 JSON，无法按 {:?} 渲染: {e}", proto),
+            )
+        }
+    };
+    let parsed = match translate::ChatResponse::from_upstream_json(&value) {
+        Ok(p) => p,
+        Err(e) => {
+            return local_error(
+                StatusCode::BAD_GATEWAY,
+                GatewayErrorKind::Api,
+                "render_failed",
+                format!("上游响应无法按 {:?} 渲染: {e}", proto),
+            )
+        }
+    };
+
+    // usage：与既有 UsageCapture 同口径——只在 2xx 记一次
+    if let (Some(sink), Some(u)) = (&state.config.on_usage, parsed.usage) {
+        sink(GatewayUsage {
+            at: unix_now_secs(),
+            site_id,
+            key_id: meta.key_id,
+            model: event_model.to_string(),
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            status: status.as_u16(),
+            // 与既有 UsageCapture 同口径：翻译路径是「非流式、一次尝试成功」的形态，
+            // 但 latency/attempts 仍取真实值（meta 里就是本次命中的那次尝试）。
+            latency_ms: meta.latency_ms,
+            attempts: meta.attempts,
+            stream: false,
+            token_id: identity.token_id,
+            agent_label: identity.label.clone().unwrap_or_default(),
+        });
+    }
+    drop(lease);
+    let rendered = translate::render_response(proto, &parsed);
+    (StatusCode::OK, axum::Json(rendered)).into_response()
 }
 
 fn into_upstream_response(
