@@ -637,7 +637,8 @@ async fn snapshot_models_come_from_the_collection() {
     ]);
     let mut settings = f.service.settings().expect("设置");
     settings.collect_models = true;
-    settings.models_min_interval_secs = 0; // 本轮就采
+    // M39-S2 起下限是 30 秒（0 会被 validate 拒）；用合法最小值让本轮就采。
+    settings.models_min_interval_secs = 30;
     f.service.update_settings(&settings).expect("写设置");
     // ① 采集（不需要 session：它只带 key 打 `/v1/models`）
     f.service.refresh_model_catalog_once().await.expect("采集");

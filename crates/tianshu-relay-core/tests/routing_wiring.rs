@@ -19,6 +19,7 @@ fn facts(site_id: i64, balance: Option<f64>, rate: Option<f64>, latency: Option<
         balance_usd: balance,
         latency_ms: latency,
         key_ref: format!("kr/key/{site_id}/secret"),
+        key_id: None,
     }
 }
 
@@ -33,11 +34,14 @@ fn build_route_table_maps_every_field() {
         balance_usd: Some(12.5),
         latency_ms: Some(180),
         key_ref: "kr/key/42/secret".to_string(),
+        key_id: Some(7),
     };
     let table = build_route_table(std::slice::from_ref(&f));
     let up = table.preferred().expect("非空表应有首选");
 
     assert_eq!(up.site_id, f.site_id);
+    // M39-S3：多 key 的 key_id 字段必须透传（每站每把 key 一个上游）
+    assert_eq!(up.key_id, Some(7), "key_id 必须从 SiteFacts 透传");
     assert_eq!(up.base_url, f.base_url);
     assert_eq!(up.models, f.models);
     assert_eq!(up.rate, f.rate);
