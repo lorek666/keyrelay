@@ -628,20 +628,24 @@ async fn snapshot_models_come_from_the_collection() {
     // `collect_models` 开 + 该站有可用 key ⇒ 刷新时采集一次 `/v1/models`；
     // 采集结果必须进 `SiteSnapshot.models`（此前恒 `None` ⇒ `ModelsChanged` 永不触发）。
     let f = fixture(vec![
+        // M39-S1：采集已独立于 `refresh_all`（60s 循环驱动）⇒ 这里先单独跑一趟采集，
+        // 所以 `/v1/models` 的响应排在**最前**，登录三连排在后面。
+        json_ok(json!({"object": "list", "data": [{"id": "gpt-5.6"}]})),
         login_response(&jwt_with_exp(9_999_999_999)),
         sub2api_ok(json!({"balance": 100.0, "total_recharged": 100.0})),
         sub2api_ok(json!([])),
-        // `/v1/models`（采集）：Sub2API 的兼容响应形态
-        json_ok(json!({"object": "list", "data": [{"id": "gpt-5.6"}]})),
     ]);
-    f.service
-        .login(f.site_id, Credentials::new("me@example.com", "pw-12345678"))
-        .await
-        .expect("登录");
     let mut settings = f.service.settings().expect("设置");
     settings.collect_models = true;
     settings.models_min_interval_secs = 0; // 本轮就采
     f.service.update_settings(&settings).expect("写设置");
+    // ① 采集（不需要 session：它只带 key 打 `/v1/models`）
+    f.service.refresh_model_catalog_once().await.expect("采集");
+    // ② 登录（refresh_all 的前置）
+    f.service
+        .login(f.site_id, Credentials::new("me@example.com", "pw-12345678"))
+        .await
+        .expect("登录");
 
     let service = f
         .service

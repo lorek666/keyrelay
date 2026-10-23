@@ -1,7 +1,13 @@
 //! 模型清单采集测试（M14-S1 / B-99 ①）。
 //!
 //! M1-M4：`site::fetch_models` 纯函数层（解析 `data[].id` / Bearer key / 错误形态 / HTTP 错误）。
-//! M5-M8：`refresh_all` 的采集接线（开关 / 节流 / 每轮 1 站 / 失败静默）。
+//! M5-M8：采集接线（开关 / 节流 / 失败静默）。
+//!
+//! **M39-S1 适配**：采集已从 `refresh_all` 移到 `refresh_model_catalog_once()`
+//! （独立 60s 循环驱动，与刷新定时器解耦；见 `docs/specs/M39-S1-模型目录持久化与热更新.md`）。
+//! 因此 M5-M8 的调用点从 `refresh_all()` 换成 `refresh_model_catalog_once()`；
+//! 其中 M7 的语义**有意改变**：旧实现「每轮最多采 1 站」是为了不在一次刷新里打出一串
+//! 带密钥请求，新实现用**有界并发 2** 达成同一目的 ⇒ 3 个站一轮内都会采到。
 
 use std::sync::Arc;
 
@@ -141,7 +147,7 @@ fn setup_with_sites(site_count: usize) -> Svc {
 async fn disabled_collection_never_fetches() {
     let svc = setup_with_sites(2);
     // collect_models 默认 false，不 push 任何响应
-    svc.service.refresh_all().await.unwrap();
+    svc.service.refresh_model_catalog_once().await.unwrap();
     assert_eq!(
         count_models_requests(&svc.transport),
         0,
@@ -159,16 +165,16 @@ async fn throttle_respects_min_interval() {
         .unwrap();
     // 默认 models_min_interval_secs = 1800
     svc.transport.push(models_response(&["gpt-4"]));
-    svc.service.refresh_all().await.unwrap();
+    svc.service.refresh_model_catalog_once().await.unwrap();
     assert_eq!(
         count_models_requests(&svc.transport),
         1,
         "第一次采（last=None ⇒ should_collect=true）"
     );
 
-    // 第二次立即跑（interval 内）⇒ 不采
+    // 第二次立即跑（interval 内）⇒ 不采（节流锚点 = last_attempt_at）
     svc.transport.push(models_response(&["gpt-4o"]));
-    svc.service.refresh_all().await.unwrap();
+    svc.service.refresh_model_catalog_once().await.unwrap();
     assert_eq!(
         count_models_requests(&svc.transport),
         1,
@@ -176,21 +182,25 @@ async fn throttle_respects_min_interval() {
     );
 }
 
-/// M7：3 个站点都该采 ⇒ 每轮最多采 1 个（id 最小那个）。
+/// M7（M39-S1 改写）：3 个站点都到期 ⇒ **一趟内都采**（有界并发 2），不是「每轮 1 个」。
+///
+/// 旧断言（每轮恰好 1 站）钉的是「别一次打出一串带密钥请求」这个**目的**；
+/// 新实现用有界并发 2 达成同一目的，3 个站就该都采到（否则节流期内永远轮不到后两个）。
 #[tokio::test]
-async fn one_site_per_refresh_round() {
+async fn all_due_sites_are_collected_in_one_pass() {
     let svc = setup_with_sites(3);
     svc.service
         .store()
         .set_setting("collect_models", "true")
         .unwrap();
-    // 只 push 1 个响应：若采超过 1 个，第二个 `request` 会 `Err`（无响应），但失败静默
-    svc.transport.push(models_response(&["gpt-4"]));
-    svc.service.refresh_all().await.unwrap();
+    for _ in 0..3 {
+        svc.transport.push(models_response(&["gpt-4"]));
+    }
+    svc.service.refresh_model_catalog_once().await.unwrap();
     assert_eq!(
         count_models_requests(&svc.transport),
-        1,
-        "每次刷新最多采 1 个站点"
+        3,
+        "一趟内 3 个到期站点都要采（有界并发 2）"
     );
 }
 
@@ -204,7 +214,7 @@ async fn failed_fetch_keeps_previous_models() {
         .unwrap();
     // 第一次成功
     svc.transport.push(models_response(&["gpt-4"]));
-    svc.service.refresh_all().await.unwrap();
+    svc.service.refresh_model_catalog_once().await.unwrap();
 
     // 第二次失败（500）
     svc.transport
@@ -214,8 +224,15 @@ async fn failed_fetch_keeps_previous_models() {
         .store()
         .set_setting("models_min_interval_secs", "0")
         .unwrap();
-    let summary = svc.service.refresh_all().await;
-    assert!(summary.is_ok(), "采集失败不阻塞 refresh_all");
+    let summary = svc.service.refresh_model_catalog_once().await;
+    assert!(summary.is_ok(), "采集失败不阻塞采集（返回摘要）");
+    // 失败不清空已有目录（旧断言只查事件，这里补上目录本身）
+    let site = svc.service.store().list_sites().unwrap()[0].id;
+    assert_eq!(
+        svc.service.store().site_models(site).unwrap(),
+        vec!["gpt-4".to_string()],
+        "失败不得清空已采到的目录"
+    );
 
     // 失败静默留痕：Debug 事件含「模型清单采集失败」
     let events = svc.service.store().list_events(50).unwrap();

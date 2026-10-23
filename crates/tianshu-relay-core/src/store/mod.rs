@@ -12,7 +12,11 @@ use crate::error::{Error, Result};
 use crate::inject::Journal;
 use crate::site::KeyStatus;
 
-const SCHEMA_VERSION: i64 = 6;
+/// 当前 schema 版本（M39-S1：6 → 7，新增 `site_model_catalog` / `site_model_sync`）。
+///
+/// 版本号只是「将来需要非幂等迁移」的锚点：新表由每次打开的幂等 `DDL` 建出。
+/// M39-S1 之后下一个用版本号的是 M40-S1（顺延为 8）。
+const SCHEMA_VERSION: i64 = 7;
 
 /// 「已回收」——**本地**密钥生命周期状态（M7-S4 / FR-2）。
 ///
@@ -213,6 +217,25 @@ CREATE TABLE IF NOT EXISTS probe_runs(
   status TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_probe_runs_recorded ON probe_runs(recorded_at DESC);
+-- M39-S1：站点模型目录（持久化的「该站点当前服务哪些模型」）。
+-- 与 sites 级联删除：站点没了，它的目录行也不该留着。
+-- 主键 (site_id, model) 以 site_id 为前导列 ⇒ `WHERE site_id = ?` 与 `ORDER BY model`
+-- 都走同一条索引，不需要额外的二级索引。
+CREATE TABLE IF NOT EXISTS site_model_catalog(
+  site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  model TEXT NOT NULL,
+  first_seen_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  PRIMARY KEY(site_id, model)
+);
+-- M39-S1：采集同步状态（每站一行）：节流锚点 + 连续空计数 + 最近错误（已脱敏、截断）。
+CREATE TABLE IF NOT EXISTS site_model_sync(
+  site_id INTEGER PRIMARY KEY REFERENCES sites(id) ON DELETE CASCADE,
+  last_success_at INTEGER,
+  last_attempt_at INTEGER,
+  empty_streak INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT
+);
 "#;
 
 fn now_secs() -> i64 {
@@ -232,6 +255,37 @@ pub const USAGE_MAX_DAYS: i64 = 90;
 /// 避免「命令回显 90、实际查了 30」这种两处夹取不一致。
 pub fn clamp_usage_days(days: i64) -> i64 {
     days.clamp(1, USAGE_MAX_DAYS)
+}
+
+// ---- M39-S1：站点模型目录的返回类型与阈值 ----
+
+/// 连续多少次「成功但空」才清空该站目录（M39-S1 §5.2）。
+///
+/// 取 2 的理由：一次空响应可能是站点瞬时的上游抖动/超时半开；连续两次才当作「真的没有模型」。
+pub const EMPTY_STREAK_TO_CLEAR: i64 = 2;
+
+/// `site_model_sync.last_error` 的入库长度上限（字符，不是字节；M39-S1 §4.4 / §12）。
+///
+/// 截断是红线的一部分：一条异常（例如带上整段 HTML 错误页）不该把这行撑爆。
+pub const MODEL_SYNC_ERROR_MAX_CHARS: usize = 500;
+
+/// 一次「成功但空」的结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmptyOutcome {
+    /// 自增后的连续空计数。
+    pub streak: i64,
+    /// 本次是否清空了该站目录（`streak >= EMPTY_STREAK_TO_CLEAR`）。
+    pub cleared: bool,
+}
+
+/// 单站的采集同步状态（诊断 / 测试 / 节流读取）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiteModelSync {
+    pub site_id: i64,
+    pub last_success_at: Option<i64>,
+    pub last_attempt_at: Option<i64>,
+    pub empty_streak: i64,
+    pub last_error: Option<String>,
 }
 
 /// 本地时区「今天往前 `days_ago` 天」的日零点 epoch（秒）。
@@ -2360,6 +2414,206 @@ impl Store {
             .map_err(|e| Error::Store(format!("prune usage samples: {e}")))?;
         Ok(n)
     }
+
+    // ---- M39-S1：站点模型目录 ----
+
+    /// 成功且**非空**：替换该站集合（删掉不在 `models` 里的行；保留行的 `first_seen_at` 不动、
+    /// `last_seen_at = now`；新行 `first_seen_at = last_seen_at = now`），并把 sync 行置为
+    /// `(last_attempt_at = now, last_success_at = now, empty_streak = 0, last_error = NULL)`。
+    ///
+    /// **单事务**：中途失败不会留下「删了一半」的目录（那会让路由少一半上游）。
+    /// 空列表**必须**走 [`Self::record_site_models_empty`]——静默清空正是 M39-S1 要消灭的
+    /// 「瞬时空响应删目录」入口。
+    pub fn replace_site_models(&self, site_id: i64, models: &[String], now: i64) -> Result<usize> {
+        let mut normalized: Vec<String> = Vec::new();
+        for raw in models {
+            let model = raw.trim();
+            if model.is_empty() {
+                continue;
+            }
+            if !normalized.iter().any(|kept| kept == model) {
+                normalized.push(model.to_string());
+            }
+        }
+        if normalized.is_empty() {
+            return Err(Error::Store(
+                "replace_site_models 被空列表调用：空结果必须走 record_site_models_empty".into(),
+            ));
+        }
+
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Store(format!("begin: {e}")))?;
+
+        let existing: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT model FROM site_model_catalog WHERE site_id = ?1")
+                .map_err(|e| Error::Store(format!("prepare catalog: {e}")))?;
+            let rows = stmt
+                .query_map(params![site_id], |row| row.get::<_, String>(0))
+                .map_err(|e| Error::Store(format!("query catalog: {e}")))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::Store(format!("collect catalog: {e}")))?
+        };
+        for stale in existing
+            .iter()
+            .filter(|old| !normalized.iter().any(|new| new == *old))
+        {
+            tx.execute(
+                "DELETE FROM site_model_catalog WHERE site_id = ?1 AND model = ?2",
+                params![site_id, stale],
+            )
+            .map_err(|e| Error::Store(format!("delete catalog row: {e}")))?;
+        }
+        for model in &normalized {
+            // `DO UPDATE` 只刷 `last_seen_at`：`first_seen_at` 是「这个模型第一次在这站出现」，
+            // 替换语义下它不该被重置（那等于把目录当重建）。
+            tx.execute(
+                "INSERT INTO site_model_catalog(site_id, model, first_seen_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT(site_id, model) DO UPDATE SET last_seen_at = excluded.last_seen_at",
+                params![site_id, model, now],
+            )
+            .map_err(|e| Error::Store(format!("upsert catalog row: {e}")))?;
+        }
+        tx.execute(
+            "INSERT INTO site_model_sync(
+                 site_id, last_success_at, last_attempt_at, empty_streak, last_error)
+             VALUES (?1, ?2, ?2, 0, NULL)
+             ON CONFLICT(site_id) DO UPDATE SET
+                 last_success_at = excluded.last_success_at,
+                 last_attempt_at = excluded.last_attempt_at,
+                 empty_streak = 0,
+                 last_error = NULL",
+            params![site_id, now],
+        )
+        .map_err(|e| Error::Store(format!("upsert model sync: {e}")))?;
+        tx.commit()
+            .map_err(|e| Error::Store(format!("commit: {e}")))?;
+        Ok(normalized.len())
+    }
+
+    /// 成功但**空**：`empty_streak += 1`，同步 `last_attempt_at` / `last_success_at = now`；
+    /// 达到 [`EMPTY_STREAK_TO_CLEAR`] 时**在同一事务里**清空该站目录。
+    pub fn record_site_models_empty(&self, site_id: i64, now: i64) -> Result<EmptyOutcome> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Store(format!("begin: {e}")))?;
+        tx.execute(
+            "INSERT INTO site_model_sync(
+                 site_id, last_success_at, last_attempt_at, empty_streak, last_error)
+             VALUES (?1, ?2, ?2, 1, NULL)
+             ON CONFLICT(site_id) DO UPDATE SET
+                 last_success_at = excluded.last_success_at,
+                 last_attempt_at = excluded.last_attempt_at,
+                 empty_streak = site_model_sync.empty_streak + 1",
+            params![site_id, now],
+        )
+        .map_err(|e| Error::Store(format!("bump empty streak: {e}")))?;
+        let streak: i64 = tx
+            .query_row(
+                "SELECT empty_streak FROM site_model_sync WHERE site_id = ?1",
+                params![site_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Store(format!("read empty streak: {e}")))?;
+        let cleared = streak >= EMPTY_STREAK_TO_CLEAR;
+        if cleared {
+            tx.execute(
+                "DELETE FROM site_model_catalog WHERE site_id = ?1",
+                params![site_id],
+            )
+            .map_err(|e| Error::Store(format!("clear catalog: {e}")))?;
+        }
+        tx.commit()
+            .map_err(|e| Error::Store(format!("commit: {e}")))?;
+        Ok(EmptyOutcome { streak, cleared })
+    }
+
+    /// 失败：只写 `last_attempt_at = now` 与 `last_error`；**不动**目录、**不动**
+    /// `empty_streak`、**不动** `last_success_at`（失败不是「站点说没有模型」的证据）。
+    ///
+    /// **红线（M39-S1 §12）**：错误文本在这里**再**脱敏 + 截断到
+    /// [`MODEL_SYNC_ERROR_MAX_CHARS`]——调用方已 scrub 也幂等；store 是最后一道。
+    pub fn record_site_models_failure(&self, site_id: i64, now: i64, error: &str) -> Result<()> {
+        let scrubbed = crate::redact::scrub(error);
+        let text: String = scrubbed.chars().take(MODEL_SYNC_ERROR_MAX_CHARS).collect();
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO site_model_sync(
+                 site_id, last_success_at, last_attempt_at, empty_streak, last_error)
+             VALUES (?1, NULL, ?2, 0, ?3)
+             ON CONFLICT(site_id) DO UPDATE SET
+                 last_attempt_at = excluded.last_attempt_at,
+                 last_error = excluded.last_error",
+            params![site_id, now, text],
+        )
+        .map_err(|e| Error::Store(format!("record model sync failure: {e}")))?;
+        Ok(())
+    }
+
+    /// 全量目录：`site_id → 模型名（按字节序升序）`。只有**有行**的站点出现在结果里。
+    ///
+    /// 这是路由构建的唯一模型来源（M39-S1 §5.3）：每次建路由/发布快照都现读，
+    /// 因此不存在「内存缓存与表不一致」，也不需要「启动时加载」这一步。
+    pub fn site_model_catalog(&self) -> Result<std::collections::BTreeMap<i64, Vec<String>>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT site_id, model FROM site_model_catalog ORDER BY site_id ASC, model ASC",
+            )
+            .map_err(|e| Error::Store(format!("prepare catalog: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| Error::Store(format!("query catalog: {e}")))?;
+        let mut out: std::collections::BTreeMap<i64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let (site_id, model) =
+                row.map_err(|e| Error::Store(format!("collect catalog: {e}")))?;
+            out.entry(site_id).or_default().push(model);
+        }
+        Ok(out)
+    }
+
+    /// 单站目录（升序）。没有行 ⇒ 空 vec（**不是** `None`：空与「没有这个站」在路由层同义）。
+    pub fn site_models(&self, site_id: i64) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT model FROM site_model_catalog WHERE site_id = ?1 ORDER BY model ASC")
+            .map_err(|e| Error::Store(format!("prepare site models: {e}")))?;
+        let rows = stmt
+            .query_map(params![site_id], |row| row.get::<_, String>(0))
+            .map_err(|e| Error::Store(format!("query site models: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect site models: {e}")))
+    }
+
+    /// 单站同步状态。没有行 ⇒ `Ok(None)`。
+    pub fn site_model_sync(&self, site_id: i64) -> Result<Option<SiteModelSync>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT site_id, last_success_at, last_attempt_at, empty_streak, last_error
+             FROM site_model_sync WHERE site_id = ?1",
+            params![site_id],
+            |row| {
+                Ok(SiteModelSync {
+                    site_id: row.get(0)?,
+                    last_success_at: row.get(1)?,
+                    last_attempt_at: row.get(2)?,
+                    empty_streak: row.get(3)?,
+                    last_error: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| Error::Store(format!("read model sync: {e}")))
+    }
 }
 
 #[cfg(test)]
@@ -3487,5 +3741,237 @@ mod tests {
             assert_eq!(row.group_name, None, "不知道就落 NULL，不许猜：{row:?}");
             assert_eq!(row.group_id, None, "没有站点主键就落 NULL：{row:?}");
         }
+    }
+
+    // ---- M39-S1：站点模型目录 ----
+
+    fn model_store() -> (tempfile::TempDir, Store, i64) {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let store = Store::open(&dir.path().join("tianshu-relay.db")).expect("建库");
+        let site = store
+            .upsert_site("newapi", "https://relay.example.com", "目录站")
+            .expect("写站点");
+        (dir, store, site)
+    }
+
+    fn models(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// M39-S1 §5.4：**真的旧库**（`user_version = 6`、没有这两张表）打开后必须补建，
+    /// 版本走到 7，既有数据不受影响。
+    #[test]
+    fn migrate_creates_site_model_tables_on_an_existing_database() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("tianshu-relay.db");
+        {
+            let store = Store::open(&path).expect("首次建库");
+            let _ = store
+                .upsert_site("newapi", "https://old.example.com", "旧站")
+                .expect("旧数据");
+        }
+        {
+            // 造「v6 旧库」：删掉两张新表 + 把版本退回 6
+            let conn = rusqlite::Connection::open(&path).expect("直连");
+            conn.execute_batch(
+                "DROP TABLE site_model_catalog; DROP TABLE site_model_sync;
+                 PRAGMA user_version = 6;",
+            )
+            .expect("造旧库");
+        }
+        let store = Store::open(&path).expect("重新打开");
+        assert_eq!(store.schema_version().unwrap(), 7, "M39-S1 之后是 v7");
+        let conn = rusqlite::Connection::open(&path).expect("直连");
+        for table in ["site_model_catalog", "site_model_sync"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .expect("查表");
+            assert_eq!(n, 1, "旧库必须补建 {table}");
+        }
+        assert_eq!(
+            store.list_sites().expect("旧数据还在").len(),
+            1,
+            "迁移不得动既有数据"
+        );
+    }
+
+    #[test]
+    fn replace_site_models_deletes_removed_and_keeps_first_seen() {
+        let (_dir, store, site) = model_store();
+        store
+            .replace_site_models(site, &models(&["a", "b"]), 100)
+            .expect("首次替换");
+        assert_eq!(store.site_models(site).unwrap(), models(&["a", "b"]));
+
+        let n = store
+            .replace_site_models(site, &models(&["b", "c"]), 200)
+            .expect("二次替换");
+        assert_eq!(n, 2);
+        assert_eq!(
+            store.site_models(site).unwrap(),
+            models(&["b", "c"]),
+            "**替换**语义：下架的 a 必须消失（不是只增不删）"
+        );
+
+        // first_seen_at 不被刷新：b 的第一见是 100，c 的是 200
+        let conn = rusqlite::Connection::open(store.path().expect("文件库")).expect("直连");
+        let b_first: i64 = conn
+            .query_row(
+                "SELECT first_seen_at FROM site_model_catalog WHERE site_id=?1 AND model='b'",
+                params![site],
+                |r| r.get(0),
+            )
+            .expect("b 的行");
+        let c_first: i64 = conn
+            .query_row(
+                "SELECT first_seen_at FROM site_model_catalog WHERE site_id=?1 AND model='c'",
+                params![site],
+                |r| r.get(0),
+            )
+            .expect("c 的行");
+        assert_eq!(
+            b_first, 100,
+            "b 是第一次就在的：first_seen_at 不得被替换刷新"
+        );
+        assert_eq!(c_first, 200);
+        let b_last: i64 = conn
+            .query_row(
+                "SELECT last_seen_at FROM site_model_catalog WHERE site_id=?1 AND model='b'",
+                params![site],
+                |r| r.get(0),
+            )
+            .expect("b 的行");
+        assert_eq!(b_last, 200, "last_seen_at 要刷新");
+    }
+
+    #[test]
+    fn replace_site_models_rejects_an_empty_list() {
+        let (_dir, store, site) = model_store();
+        let err = store
+            .replace_site_models(site, &[], 1)
+            .expect_err("空列表必须被拒（走 record_site_models_empty）");
+        assert!(
+            format!("{err}").contains("record_site_models_empty"),
+            "{err}"
+        );
+        assert_eq!(store.site_models(site).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn one_empty_pass_does_not_clear_the_catalog() {
+        let (_dir, store, site) = model_store();
+        store
+            .replace_site_models(site, &models(&["a"]), 10)
+            .expect("首次替换");
+        let outcome = store.record_site_models_empty(site, 20).expect("记空");
+        assert_eq!(outcome.streak, 1);
+        assert!(!outcome.cleared, "一次空不得清空");
+        assert_eq!(
+            store.site_models(site).unwrap(),
+            models(&["a"]),
+            "目录必须还在"
+        );
+    }
+
+    #[test]
+    fn two_consecutive_empty_passes_clear_the_catalog() {
+        let (_dir, store, site) = model_store();
+        store
+            .replace_site_models(site, &models(&["a", "b"]), 10)
+            .expect("首次替换");
+        store.record_site_models_empty(site, 20).expect("第一次空");
+        let outcome = store.record_site_models_empty(site, 30).expect("第二次空");
+        assert_eq!(outcome.streak, 2);
+        assert!(outcome.cleared, "连续两次空必须清空");
+        assert_eq!(store.site_models(site).unwrap(), Vec::<String>::new());
+        // 再空一次不 panic、streak 继续涨、仍为空
+        let again = store.record_site_models_empty(site, 40).expect("第三次空");
+        assert_eq!(again.streak, 3);
+        assert!(again.cleared);
+    }
+
+    #[test]
+    fn a_non_empty_success_resets_the_empty_streak() {
+        let (_dir, store, site) = model_store();
+        store.record_site_models_empty(site, 10).expect("空一次");
+        store
+            .replace_site_models(site, &models(&["a"]), 20)
+            .expect("成功");
+        let sync = store.site_model_sync(site).unwrap().expect("有行");
+        assert_eq!(sync.empty_streak, 0, "非空成功必须把连续空计数清零");
+        assert_eq!(sync.last_error, None);
+    }
+
+    #[test]
+    fn a_failed_collection_leaves_catalog_and_streak_untouched() {
+        let (_dir, store, site) = model_store();
+        store
+            .replace_site_models(site, &models(&["a"]), 10)
+            .expect("首次替换");
+        store.record_site_models_empty(site, 20).expect("空一次");
+
+        // 密钥形状的文本必须被脱敏；超长必须截断（红线）
+        let long = format!("boom {} {}", "sk-0123456789abcdef", "x".repeat(2000));
+        store
+            .record_site_models_failure(site, 30, &long)
+            .expect("记失败");
+
+        assert_eq!(
+            store.site_models(site).unwrap(),
+            models(&["a"]),
+            "失败不得动目录"
+        );
+        let sync = store.site_model_sync(site).unwrap().expect("有行");
+        assert_eq!(sync.empty_streak, 1, "失败不得动连续空计数");
+        assert_eq!(sync.last_attempt_at, Some(30));
+        // 20 那次「成功但空」也算一次成功（站点回了 200 + 空列表）⇒ last_success_at = 20；
+        // 失败（30）不得把它往后推。
+        assert_eq!(sync.last_success_at, Some(20), "失败不是一次成功");
+        let err = sync.last_error.expect("有错误文本");
+        assert!(
+            !err.contains("sk-0123456789abcdef"),
+            "错误文本必须脱敏: {err}"
+        );
+        assert!(
+            err.chars().count() <= MODEL_SYNC_ERROR_MAX_CHARS,
+            "错误文本必须截断到 {} 字符，实际 {}",
+            MODEL_SYNC_ERROR_MAX_CHARS,
+            err.chars().count()
+        );
+    }
+
+    #[test]
+    fn deleting_a_site_cascades_its_catalog_and_sync_rows() {
+        let (_dir, store, site) = model_store();
+        store
+            .replace_site_models(site, &models(&["a"]), 10)
+            .expect("替换");
+        store.delete_site(site).expect("删站点");
+        assert_eq!(store.site_models(site).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            store.site_model_sync(site).unwrap(),
+            None,
+            "sync 行也要级联删"
+        );
+    }
+
+    #[test]
+    fn site_model_catalog_returns_models_sorted_by_bytes() {
+        let (_dir, store, site) = model_store();
+        // 入参顺序打乱；存的是集合，读出来必须升序
+        store
+            .replace_site_models(site, &models(&["zeta", "alpha", "mike"]), 10)
+            .expect("替换");
+        assert_eq!(
+            store.site_models(site).unwrap(),
+            models(&["alpha", "mike", "zeta"]),
+            "读取必须按字节序升序（确定性）"
+        );
+        let all = store.site_model_catalog().unwrap();
+        assert_eq!(all.get(&site), Some(&models(&["alpha", "mike", "zeta"])));
     }
 }
