@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Plus, RefreshCw } from "lucide-react";
+import { AlertTriangle, LogOut, Plus, RefreshCw } from "lucide-react";
 import {
   addSite,
   captchaBegin,
@@ -12,6 +12,7 @@ import {
   isCaptchaRequired,
   listSites,
   loginSite,
+  logoutSite,
   siteBalance,
   type Balance,
   type SiteRow,
@@ -36,6 +37,8 @@ export default function Sites() {
   const [captchaSite, setCaptchaSite] = useState<SiteRow | null>(null);
   /** 官方页面窗口是否已打开（打开后才能提交「我已过完」）。 */
   const [captchaOpened, setCaptchaOpened] = useState(false);
+  /** M38-S1：待确认「退出登录」的站点。 */
+  const [logoutTarget, setLogoutTarget] = useState<SiteRow | null>(null);
 
   const sites = useQuery({ queryKey: ["sites"], queryFn: listSites });
   // M28-S2 / B-191 B 路：面板三态只来自能力表（不按 kind 硬编码）。
@@ -154,6 +157,26 @@ export default function Sites() {
       setCaptchaOpened(false);
     },
     onError: (err: Error) => setError(err.message),
+  });
+
+  // M38-S1：退出登录——清内存会话 + 删本地保险库条目（站点侧不受影响）。
+  // 失败时关闭确认框并在页面顶部给出可读错误（spec §4.3「或关闭后显示错误」）。
+  const logout = useMutation({
+    mutationFn: (siteId: number) => logoutSite(siteId),
+    onSuccess: async () => {
+      setError(null);
+      setNotice(t("sites.notice.loggedOut", { name: logoutTarget?.displayName ?? "" }));
+      setLogoutTarget(null);
+      // 与「登录成功」「验证码完成」同一组失效：会话状态、远端/本地密钥、余额。
+      await qc.invalidateQueries({ queryKey: ["sites"] });
+      await qc.invalidateQueries({ queryKey: ["stored-keys"] });
+      await qc.invalidateQueries({ queryKey: ["remote-keys"] });
+      await qc.invalidateQueries({ queryKey: ["balance"] });
+    },
+    onError: (err: Error) => {
+      setLogoutTarget(null);
+      setError(err.message);
+    },
   });
 
   // M36-S1：订阅后端的「自动完成」事件。事件只是通知——会话已由后端接上（completed）
@@ -370,6 +393,11 @@ export default function Sites() {
                 <SiteRowView
                   key={site.id}
                   site={site}
+                  onLogout={() => {
+                    setError(null);
+                    setNotice(null);
+                    setLogoutTarget(site);
+                  }}
                   onLogin={() => {
                     setError(null);
                     setNotice(null);
@@ -430,6 +458,21 @@ export default function Sites() {
           />
         </label>
       </ConfirmDialog>
+
+      <ConfirmDialog
+        open={logoutTarget !== null}
+        title={t("sites.logout.title", { name: logoutTarget?.displayName ?? "" })}
+        confirmLabel={
+          logout.isPending ? t("sites.logout.confirming") : t("sites.logout.confirm")
+        }
+        confirmDisabled={logout.isPending}
+        onCancel={() => setLogoutTarget(null)}
+        onConfirm={() => {
+          if (logoutTarget) logout.mutate(logoutTarget.id);
+        }}
+      >
+        <p className="muted">{t("sites.logout.body")}</p>
+      </ConfirmDialog>
     </section>
   );
 }
@@ -481,7 +524,15 @@ function healthClass(health: string): string {
   }
 }
 
-function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) {
+function SiteRowView({
+  site,
+  onLogin,
+  onLogout,
+}: {
+  site: SiteRow;
+  onLogin: () => void;
+  onLogout: () => void;
+}) {
   const { t } = useTranslation();
   // 能力集为 false 的站点**连请求都不发**：后端也会提前拒绝（`Error::Unsupported`），
   // 但先发一次注定失败的请求只会让余额列闪一下「（需登录）」这种错的原因。
@@ -522,6 +573,13 @@ function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) 
           <span className="status-dot" aria-hidden />
           {healthLabel(site.health)}
         </span>
+        {/* M38-S1：会话已落本地加密保险库（重启可免登）。判据只来自后端字段，
+            不按 kind / capabilities 猜。`!== true` ⇒ 不显示（旧夹具/未知状态都不显示）。 */}
+        {site.sessionPersisted === true ? (
+          <span className="session-badge" title={t("sites.session.persistedHint")}>
+            {t("sites.session.persisted")}
+          </span>
+        ) : null}
       </td>
       <td
         className="mono"
@@ -530,16 +588,25 @@ function SiteRowView({ site, onLogin }: { site: SiteRow; onLogin: () => void }) 
         {balanceText}
       </td>
       <td>
-        {/* 能力驱动的灰显（W5）：站点类型不支持登录时，这个按钮点了只会报
-            「不需要登录」之类的别的原因。文案与判断都来自 `capabilities`。 */}
-        <CapButton
-          allowed={site.capabilities.login}
-          reason={t("sites.capReason.noLogin")}
-          className="btn btn-ghost"
-          onClick={onLogin}
-        >
-          {t("sites.btn.login")}
-        </CapButton>
+        <div className="row">
+          {/* 能力驱动的灰显（W5）：站点类型不支持登录时，这个按钮点了只会报
+              「不需要登录」之类的别的原因。文案与判断都来自 `capabilities`。 */}
+          <CapButton
+            allowed={site.capabilities.login}
+            reason={t("sites.capReason.noLogin")}
+            className="btn btn-ghost"
+            onClick={onLogin}
+          >
+            {t("sites.btn.login")}
+          </CapButton>
+          {/* M38-S1：「退出登录」**不依赖** `capabilities.login`（spec §4.3）——
+              会话已经存在时，清除本地状态总是允许的。只在有持久化会话时出现。 */}
+          {site.sessionPersisted === true ? (
+            <button type="button" className="btn btn-ghost" onClick={onLogout}>
+              <LogOut size={14} aria-hidden /> {t("sites.btn.logout")}
+            </button>
+          ) : null}
+        </div>
       </td>
     </tr>
   );

@@ -1556,6 +1556,20 @@ p.warn[role="status"] {
   color: var(--muted);
 }
 
+/* M38-S1：会话已持久化徽标（Sites「会话状态」列）。
+   与 health 文案同一行块级排列：用 pill + 强调色软底，和 -- muted 的 kind-badge 区分开。 */
+.session-badge {
+  display: inline-block;
+  margin-top: var(--space-1);
+  padding: 1px var(--space-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: var(--accent-faint);
+  color: var(--accent);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
 /* ---------------------------------------------------------------- Keys */
 .keys-toolbar {
   gap: var(--space-3);

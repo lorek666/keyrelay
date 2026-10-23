@@ -62,6 +62,11 @@ pub struct SiteSummaryDto {
     /// 界面用它灰显按钮，**不得**在页面里按 `kind` 硬编码判断——否则新增站点类型时
     /// 每加一个页面都要改一次，而漏掉的那一处会给出一个点了才报错的按钮。
     capabilities: SiteCapabilitiesDto,
+    /// M38-S1：该站会话是否已持久化到本地加密保险库（后端只用 `Vault::has` 看存在性，
+    /// 不读明文）。界面据此显示「已保存会话 · 重启免登」徽标与「退出登录」按钮。
+    session_persisted: bool,
+    /// M38-S1：当前内存会话的 JWT `exp`（秒）；无会话 / 非 JWT ⇒ `null`。
+    session_expires_at: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -147,6 +152,8 @@ impl SiteSummaryDto {
             health: row.health,
             login_field,
             capabilities,
+            session_persisted: row.session_persisted,
+            session_expires_at: row.session_expires_at,
         }
     }
 }
@@ -555,6 +562,15 @@ pub struct CreateKeyArgs {
     /// 落库的 `keys.group_name` 会变成 `"2"`——密钥表显示一个无意义的数字，
     /// 而且按分组名查倍率会落空（网关的倍率排序随之退化）。
     group_label: Option<String>,
+}
+
+/// 退出登录（M38-S1）：清内存会话 + 删本地加密保险库条目 + health 回 `unknown`。
+///
+/// 复用既有 `TianshuRelayService::logout`（幂等：站点不存在也不报错）。
+/// 删除失败返回错误（`Error::Vault`），调用方据此显示可读原因。
+#[tauri::command]
+pub fn logout_site(state: State<'_, AppState>, site_id: i64) -> Result<(), String> {
+    state.service.logout(site_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3586,6 +3602,8 @@ mod tests {
             base_url: "https://relay.example.com".into(),
             display_name: "测试站".into(),
             health: "unknown".into(),
+            session_persisted: false,
+            session_expires_at: None,
         });
         let value = to_value(&summary);
         assert_eq!(value["id"], 1);
@@ -3605,6 +3623,9 @@ mod tests {
         assert_eq!(value["capabilities"]["webviewBearerSupported"], false);
         // M9-S2 / B-120：登录账号栏的约定也随站点类型下发（NewAPI 是用户名）。
         assert_eq!(value["loginField"], "username");
+        // M38-S1：会话持久化两字段的线格式（camelCase；无会话 ⇒ null）。
+        assert_eq!(value["sessionPersisted"], false);
+        assert!(value["sessionExpiresAt"].is_null());
 
         // Sub2API：账号栏是**邮箱**——真实站点只认邮箱形态，用户名必被 400
         // （`api.example.com` 实测，见 M9-S1 证据 §3）。界面据此改标签，
@@ -3615,6 +3636,8 @@ mod tests {
             base_url: "https://api.example.com".into(),
             display_name: "Sub2API 站".into(),
             health: "unknown".into(),
+            session_persisted: false,
+            session_expires_at: None,
         });
         let value = to_value(&sub2api);
         assert_eq!(value["loginField"], "email");
@@ -3631,6 +3654,8 @@ mod tests {
             base_url: "https://x.example.com".into(),
             display_name: String::new(),
             health: "unknown".into(),
+            session_persisted: false,
+            session_expires_at: None,
         });
         let value = to_value(&unknown);
         assert_eq!(value["capabilities"]["listKeys"], false);

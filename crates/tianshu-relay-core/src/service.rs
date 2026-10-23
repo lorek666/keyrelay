@@ -396,6 +396,11 @@ pub struct SiteSummary {
     pub base_url: String,
     pub display_name: String,
     pub health: String,
+    /// 保险库里是否存在该站的持久化会话（M38-S1）：只看 `Vault::has` 的**存在性**，
+    /// 不读明文；读失败按 `false` 处理（列表不因单个条目读失败整页失败）。
+    pub session_persisted: bool,
+    /// 当前**内存**会话的 JWT `exp`（复用 `session_expiry`）；无会话 / 非 JWT ⇒ `None`。
+    pub session_expires_at: Option<i64>,
 }
 
 /// 轮换预览（M6-S5 / FR-7）。**只读**，不含密钥。
@@ -469,18 +474,6 @@ impl RotationRun {
     /// 那是「本来就没得回收」，不是失败；界面仍要把它单独说明。
     pub fn completed(&self) -> bool {
         self.stopped_at.is_none()
-    }
-}
-
-impl From<SiteRow> for SiteSummary {
-    fn from(row: SiteRow) -> Self {
-        Self {
-            id: row.id,
-            kind: row.kind,
-            base_url: row.base_url,
-            display_name: row.display_name,
-            health: row.health,
-        }
     }
 }
 
@@ -1125,7 +1118,21 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             .store
             .list_sites()?
             .into_iter()
-            .map(Into::into)
+            .map(|row| {
+                let id = row.id;
+                SiteSummary {
+                    id,
+                    kind: row.kind,
+                    base_url: row.base_url,
+                    display_name: row.display_name,
+                    health: row.health,
+                    // M38-S1：只看存在性。`Err` ⇒ false（不删条目、不让列表失败）——
+                    // 宁可不显示「已保存」徽标，也不给用户错误的安全感。
+                    session_persisted: matches!(self.vault.has(&self.session_ref(id)), Ok(true)),
+                    // 只读内存会话的 JWT `exp`；无会话 / 非 JWT ⇒ None。
+                    session_expires_at: self.session_expiry(id).map(|e| e.expires_at),
+                }
+            })
             .collect())
     }
 
@@ -1158,6 +1165,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             base_url: base_url.to_string(),
             display_name: fingerprint.display_name,
             health: "unknown".to_string(),
+            // 新站点还没有会话：固定 false / None（spec §4.1）。
+            session_persisted: false,
+            session_expires_at: None,
         })
     }
 
@@ -8113,5 +8123,147 @@ mod tests {
             "错误文案不得原样带出站点原文里的密钥形态：{text}"
         );
         assert!(text.contains("sk-***"), "应当留下脱敏痕迹：{text}");
+    }
+
+    // ============================================================ M38-S1：会话持久化收口
+
+    /// `sites()` 的持久化判定用 `Vault::has`（存在性），并把内存会话的 JWT `exp` 带出来。
+    #[tokio::test]
+    async fn sites_reports_session_persisted_and_expiry() {
+        let service = service_with(vec![status_response()]).await;
+        let site = service
+            .add_site("https://relay.example.com")
+            .await
+            .expect("add_site");
+
+        // add_site 的新行固定 false / None（spec §4.1）
+        assert!(!site.session_persisted, "新站点不该有持久化会话");
+        assert_eq!(site.session_expires_at, None, "新站点没有内存会话");
+
+        let exp = 9_999_999_999_i64;
+        service
+            .sessions
+            .put(
+                site.id,
+                Session {
+                    cookies: vec![],
+                    access_token: Some(newapi_jwt(exp)),
+                    user_id: None,
+                    user_agent: None,
+                },
+            )
+            .expect("塞内存会话");
+        service
+            .vault
+            .put(
+                &service.session_ref(site.id),
+                r#"{"cookies":[],"access_token":"x","user_id":null}"#,
+            )
+            .expect("写持久化会话");
+
+        let rows = service.sites().expect("列站点");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].session_persisted, "保险库有条目 ⇒ 必须报 persisted");
+        assert_eq!(rows[0].session_expires_at, Some(exp), "exp 必须来自 JWT");
+
+        // 条目被删 ⇒ persisted 立刻回到 false（徽标消失），exp 仍来自内存会话
+        service
+            .vault
+            .delete(&service.session_ref(site.id))
+            .expect("删持久化会话");
+        let rows = service.sites().expect("列站点");
+        assert!(!rows[0].session_persisted, "条目删掉后必须 false");
+        assert_eq!(rows[0].session_expires_at, Some(exp), "内存会话仍在");
+    }
+
+    /// 保险库 `has` 读失败 ⇒ 该行 false，但 `sites()` 仍 Ok（不删条目、不整页失败）。
+    #[tokio::test]
+    async fn sites_reports_session_not_persisted_when_vault_has_errors() {
+        /// 只让 `has` 报错的 Vault：模拟钥匙串被锁 / ACL 拒绝。
+        struct HasFailingVault;
+
+        impl crate::vault::Vault for HasFailingVault {
+            fn backend_name(&self) -> &'static str {
+                "has-failing"
+            }
+            fn probe(&self) -> Result<()> {
+                Ok(())
+            }
+            fn put(&self, _key: &str, _secret: &str) -> Result<()> {
+                Ok(())
+            }
+            fn get(&self, _key: &str) -> Result<Option<String>> {
+                Ok(None)
+            }
+            fn has(&self, _key: &str) -> Result<bool> {
+                Err(Error::Vault("模拟钥匙串读取失败".to_string()))
+            }
+            fn delete(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let store = Store::open_in_memory().expect("内存库");
+        let service = TianshuRelayService::new(
+            store,
+            MockTransport::new(vec![status_response()]),
+            ServiceConfig {
+                vault: Arc::new(HasFailingVault),
+                ..test_config()
+            },
+        );
+        let site = service
+            .add_site("https://relay.example.com")
+            .await
+            .expect("add_site");
+
+        let rows = service.sites().expect("has 读失败不得让 sites() 失败");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, site.id);
+        assert!(
+            !rows[0].session_persisted,
+            "读失败必须按 false 处理（宁可不显示徽标）"
+        );
+    }
+
+    /// 退出登录：删保险库条目 + 清内存会话 + health 回 unknown。
+    #[tokio::test]
+    async fn logout_site_removes_persisted_session_and_resets_health() {
+        let service = service_with(vec![status_response()]).await;
+        let site = service
+            .add_site("https://relay.example.com")
+            .await
+            .expect("add_site");
+        let reference = service.session_ref(site.id);
+        service
+            .sessions
+            .put(site.id, login_session())
+            .expect("塞内存会话");
+        service
+            .vault
+            .put(&reference, r#"{"cookies":[],"access_token":"tok"}"#)
+            .expect("写持久化会话");
+        service
+            .store
+            .set_site_health(site.id, "ok")
+            .expect("置 health");
+        assert!(
+            service.sites().expect("列站点")[0].session_persisted,
+            "前置：应当先看到持久化会话"
+        );
+
+        service.logout(site.id).expect("退出登录");
+
+        assert!(
+            !service.vault_has_for_test(&reference).expect("vault.has"),
+            "退出登录必须删除保险库条目"
+        );
+        assert!(
+            service.session_expiry(site.id).is_none(),
+            "退出登录必须清掉内存会话"
+        );
+        let rows = service.sites().expect("列站点");
+        assert!(!rows[0].session_persisted, "退出后 persisted 必须 false");
+        assert_eq!(rows[0].health, "unknown", "health 必须回到 unknown");
     }
 }

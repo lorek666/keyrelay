@@ -242,7 +242,8 @@
       "manualFinish": "Attach manually",
       "finishCaptcha": "Done, attach session",
       "finishLogin": "I've signed in",
-      "connecting": "Attaching session…"
+      "connecting": "Attaching session…",
+      "logout": "Sign out"
     },
     "notice": {
       "detected": "Detected: {name} ({kind} {version})",
@@ -254,7 +255,8 @@
       "captchaAutoOpening": "The verification window opened automatically. Please keep it open.",
       "captchaAutoDone": "Verification complete, session attached automatically: {name}",
       "captchaAutoFailed": "Automatic attach failed. The window is still open—you can attach manually or cancel.",
-      "cancelled": "Manual verification cancelled. Click \"Sign in\" again to retry."
+      "cancelled": "Manual verification cancelled. Click \"Sign in\" again to retry.",
+      "loggedOut": "Signed out of {name} (local session cleared)"
     },
     "hint": {
       "fingerprint": "Only the site's public status endpoint is called for fingerprinting; credentials are never persisted, only stored in the local encrypted vault.",
@@ -302,6 +304,16 @@
       "email": "Email",
       "username": "Username",
       "account": "Account"
+    },
+    "session": {
+      "persisted": "Session saved · stays signed in",
+      "persistedHint": "This site's session is encrypted and stored locally, so you stay signed in after a restart. Use \"Sign out\" to clear it."
+    },
+    "logout": {
+      "title": "Sign out of {name}",
+      "body": "Only the local in-memory session and the local encrypted vault entry are cleared; the session and tokens on the site are unaffected. After a restart you will need to sign in to this site again.",
+      "confirm": "Sign out",
+      "confirming": "Signing out…"
     }
   },
   "keys": {
