@@ -428,6 +428,8 @@ export type GatewayStatus = {
   phase: "running" | "stopped" | "crashed";
   /** 最近一次任务结束（crashed 且发生过结束时才有值）。 */
   lastExit?: GatewayExit | null;
+  /** M43-S1：令牌列表（无明文；与 gatewayTokenList 同形）。 */
+  tokens?: GatewayToken[];
   url?: string | null;
   /** 本地令牌：只在界面上显示给用户，用于配置 agent 连本地网关 */
   token?: string | null;
@@ -2658,4 +2660,52 @@ export async function vaultMigrationAbandon(): Promise<VaultMigrationStatus> {
     });
   }
   return invokeCommand<VaultMigrationStatus>("vault_migration_abandon");
+}
+
+// ============================================================ M43-S1：Agent 网关令牌
+
+/** 一条 Agent 网关令牌（**永不含明文**）。 */
+export type GatewayToken = {
+  id: number;
+  label: string;
+  createdAt: number;
+  revokedAt: number | null;
+  lastUsedAt: number | null;
+  active: boolean;
+  isDefault: boolean;
+};
+
+/** 创建返回：明文**只出现这一次**。 */
+export type CreatedGatewayToken = {
+  id: number;
+  label: string;
+  token: string;
+  createdAt: number;
+};
+
+export async function gatewayTokenCreate(label: string): Promise<CreatedGatewayToken> {
+  if (!hasTauri) {
+    return mock({ id: 1, label, token: "kr-gw-preview", createdAt: 0 });
+  }
+  return invokeCommand<CreatedGatewayToken>("gateway_token_create", { label });
+}
+
+export async function gatewayTokenList(): Promise<GatewayToken[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<GatewayToken[]>("gateway_token_list");
+}
+
+export async function gatewayTokenRevoke(id: number): Promise<GatewayToken> {
+  if (!hasTauri) {
+    return mock({
+      id,
+      label: "preview",
+      createdAt: 0,
+      revokedAt: 0,
+      lastUsedAt: null,
+      active: false,
+      isDefault: false,
+    });
+  }
+  return invokeCommand<GatewayToken>("gateway_token_revoke", { id });
 }
