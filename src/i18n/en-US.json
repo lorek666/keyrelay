@@ -731,6 +731,10 @@
   },
   "settings": {
     "gatewayAutoStart": {
+      "gatewayTokenGrace": {
+        "label": "Token rotation grace period (seconds, 0=off)",
+        "hint": "After rotating the default token, the old token keeps working for this long (default 300s, max 3600). The grace period is runtime-only: after a restart the old token is invalid immediately."
+      },
       "title": "Auto-start gateway on launch",
       "label": "Start the local gateway when the app starts",
       "hint": "Requires the gateway to be enabled, plus a healthy site with an enabled key. It prefers the last successfully used pair, otherwise falls back to the first healthy site. A failure never blocks app startup and is not retried automatically."
@@ -944,6 +948,31 @@
     }
   },
   "gateway": {
+    "tokens": {
+      "title": "Agent tokens",
+      "body": "Give each agent its own token: only a hash is stored, the plaintext is shown once at creation; after revoking, the next request is 401 immediately (no gateway restart). Usage is attributed by label.",
+      "loading": "Loading…",
+      "loadFailed": "Failed to load tokens: {error}",
+      "empty": "No agent tokens yet. Create one and put it in the corresponding agent's gateway config.",
+      "defaultBadge": "Default token",
+      "revokedBadge": "Revoked",
+      "defaultHint": "The default token cannot be revoked; use \"Regenerate token\" above (rotation) to replace it.",
+      "createdAt": "Created {time}",
+      "lastUsedAt": "Last used {time}",
+      "neverUsed": "Never used",
+      "revoke": "Revoke",
+      "revokeTitle": "Revoke this token?",
+      "revokeBody": "\"{label}\" will stop working immediately; the agent using it gets 401 on its next request. This cannot be undone.",
+      "revokeConfirm": "Revoke",
+      "labelPlaceholder": "Token label (e.g. agent name, max 64 chars)",
+      "create": "Create token",
+      "creating": "Creating…",
+      "createdTitle": "Created — plaintext is shown only once",
+      "createdHint": "Copy it now. Once this panel is closed the plaintext is gone (only the hash is stored).",
+      "copy": "Copy",
+      "graceUntil": "The old token stays valid until {time}; re-deliver gateway channels in the meantime (after a restart the old token is invalid immediately).",
+      "savedIt": "I saved it"
+    },
     "metrics": {
       "title": "Gateway metrics",
       "notRunning": "Gateway is not running — no metrics.",

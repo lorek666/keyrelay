@@ -973,6 +973,25 @@ export default function SettingsPage() {
               <span>{t("settings.gatewayAutoStart.label")}</span>
             </label>
             <p className="muted">{t("settings.gatewayAutoStart.hint")}</p>
+            <label className="field">
+              <span>{t("settings.gatewayTokenGrace.label")}</span>
+              <input
+                type="number"
+                min={0}
+                max={3600}
+                value={draft.gatewayTokenGraceSecs}
+                onChange={(e) => {
+                  const parsed = Number.parseInt(e.target.value, 10);
+                  setDraft({
+                    ...draft,
+                    gatewayTokenGraceSecs: Number.isFinite(parsed)
+                      ? Math.max(0, Math.min(3600, parsed))
+                      : 0,
+                  });
+                }}
+              />
+            </label>
+            <p className="muted">{t("settings.gatewayTokenGrace.hint")}</p>
           </div>
           <GatewayCard
             enabled={draft.gatewayEnabled}
