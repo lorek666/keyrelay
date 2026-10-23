@@ -33,6 +33,7 @@ fn main() -> ExitCode {
 }
 
 /// CLI 错误：携带退出码与已脱敏的文案。
+#[derive(Debug)]
 struct CliError {
     code: u8,
     message: String,
@@ -68,9 +69,10 @@ const USAGE: &str = "用法:\n\
   tianshu-relay-cli grant-consent --key-id <N> --channel <C> [--home <H>] [--store <S>]\n\
   tianshu-relay-cli list-channels\n\
   tianshu-relay-cli list-keys [--store <S>]\n\
-  tianshu-relay-cli mock-agent --channel <C> [--home <H>]";
+  tianshu-relay-cli mock-agent --channel <C> [--home <H>]\n\
+  tianshu-relay-cli migrate-vault [--home <H>] [--store <S>] [--abandon]";
 
-fn run(args: &[String]) -> Result<(), CliError> {
+pub(crate) fn run(args: &[String]) -> Result<(), CliError> {
     if args.len() < 2 {
         return Err(CliError::usage(format!("未给子命令。\n{USAGE}")));
     }
@@ -83,6 +85,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         "list-channels" => list_channels(rest),
         "list-keys" => list_keys(rest),
         "mock-agent" => mock_agent(rest),
+        "migrate-vault" => migrate_vault(rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(())
@@ -276,6 +279,72 @@ fn mock_agent(args: &[String]) -> Result<(), CliError> {
     }
 }
 
+// ================================================================ migrate-vault（M38-S2 / B-216）
+
+/// `migrate-vault`：显式重试钥匙串迁移；`--abandon` 只写放弃标记（不 probe 钥匙串）。
+///
+/// 退出码：0 成功 / 1 有未迁移条目（或运行失败）/ 2 参数或前置不满足。
+fn migrate_vault(args: &[String]) -> Result<(), CliError> {
+    let flags = Flags::parse(args)?;
+    let home = resolve_home(&flags, false)?;
+    let store_path = resolve_store(&flags, &home);
+    let data_dir = home.join(".tianshu-relay");
+    let (db_path, key_path) = tianshu_relay_core::vault::local::default_paths_in(&data_dir);
+
+    if flags.bool("abandon") {
+        // 只写 marker：**不 probe、不读钥匙串**。前置：本地保险库能打开。
+        let vault = tianshu_relay_core::vault::LocalVault::open(&db_path, &key_path)
+            .map_err(|e| CliError::usage(format!("打开本地保险库失败: {e}")))?;
+        tianshu_relay_core::vault::abandon_migration(&vault)
+            .map_err(|e| CliError::runtime(format!("写放弃标记失败: {e}")))?;
+        println!("abandoned");
+        return Ok(());
+    }
+
+    if !store_path.exists() {
+        return Err(CliError::usage(format!(
+            "本地库不存在：{}（请先完成初始化）",
+            store_path.display()
+        )));
+    }
+    let vault = tianshu_relay_core::vault::LocalVault::open(&db_path, &key_path)
+        .map_err(|e| CliError::usage(format!("打开本地保险库失败: {e}")))?;
+    let store =
+        Store::open(&store_path).map_err(|e| CliError::runtime(format!("打开本地库失败: {e}")))?;
+    let refs = tianshu_relay_core::vault::migrate::refs_for_migration(&store)
+        .map_err(|e| CliError::runtime(format!("枚举密钥引用失败: {e}")))?;
+
+    // M35-S1 的不变量：迁移源必须是**旧** service（`new()` 会读到空集合）。
+    let source = tianshu_relay_core::vault::KeychainVault::with_service(
+        tianshu_relay_core::vault::KeychainVault::LEGACY_SERVICE,
+    );
+    tianshu_relay_core::vault::Vault::probe(&source)
+        .map_err(|e| CliError::usage(format!("系统钥匙串不可用: {e}")))?;
+
+    let outcome = tianshu_relay_core::vault::retry_migration(&source, &vault, refs)
+        .map_err(|e| CliError::runtime(format!("迁移失败: {e}")))?;
+    let report = outcome.report;
+    println!("imported: {}", report.imported);
+    println!("skipped: {}", report.skipped);
+    println!("cleanup_pending: {}", report.cleanup_pending.len());
+    for (reference, reason) in &report.cleanup_pending {
+        // 引用不是密钥；原因自建且已 scrub。
+        println!("  cleanup_pending {reference}: {}", redact::scrub(reason));
+    }
+    println!("failed: {}", report.failed.len());
+    for (reference, reason) in &report.failed {
+        println!("  failed {reference}: {}", redact::scrub(reason));
+    }
+    if report.failed.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::runtime(format!(
+            "{} 条密钥未能迁移（见上面的引用）",
+            report.failed.len()
+        )))
+    }
+}
+
 // ================================================================ 参数解析 helpers
 
 /// 解析 `--flag value` 与 `--bool` 标志。未知 `--x` ⇒ exit 2。
@@ -292,7 +361,7 @@ impl Flags {
         while i < args.len() {
             let a = &args[i];
             if let Some(name) = a.strip_prefix("--") {
-                if name == "smoke" || name == "i-know-this-is-real-home" {
+                if name == "smoke" || name == "i-know-this-is-real-home" || name == "abandon" {
                     bools.insert(name.to_string());
                     i += 1;
                     continue;
@@ -383,4 +452,65 @@ fn resolve_backup_dir(flags: &Flags, home: &std::path::Path) -> PathBuf {
         .value("backup-dir")
         .map(PathBuf::from)
         .unwrap_or_else(|| default_backup_dir(home))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M38-S2：`migrate-vault --abandon` 只写放弃标记（不 probe 钥匙串），attempts 不变。
+    #[test]
+    fn migrate_vault_abandon_writes_marker_without_touching_keychain() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let home = dir.path();
+        let args: Vec<String> = vec![
+            "tianshu-relay-cli".to_string(),
+            "migrate-vault".to_string(),
+            "--home".to_string(),
+            home.display().to_string(),
+            "--abandon".to_string(),
+        ];
+        run(&args).expect("--abandon 应成功");
+
+        let (db_path, key_path) =
+            tianshu_relay_core::vault::local::default_paths_in(&home.join(".tianshu-relay"));
+        let vault =
+            tianshu_relay_core::vault::LocalVault::open(&db_path, &key_path).expect("打开保险库");
+        let marker = vault
+            .meta_get(tianshu_relay_core::vault::MIGRATION_MARKER)
+            .expect("读标记");
+        assert!(
+            marker
+                .as_deref()
+                .is_some_and(|m| m.starts_with("abandoned:")),
+            "marker 应为 abandoned:*，实际 {marker:?}"
+        );
+        let attempts = vault
+            .meta_get(tianshu_relay_core::vault::MIGRATION_ATTEMPTS)
+            .expect("读 attempts");
+        assert_eq!(attempts, None, "放弃不是一次迁移尝试 ⇒ attempts 不应被写");
+        // --abandon 不读钥匙串：即使本机钥匙串不可用也成功（上面已成功）。
+    }
+
+    /// 参数错误 / 前置不满足 ⇒ exit 2。
+    #[test]
+    fn migrate_vault_rejects_missing_store_and_bad_flags() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let home = dir.path();
+        let missing_store = vec![
+            "tianshu-relay-cli".to_string(),
+            "migrate-vault".to_string(),
+            "--home".to_string(),
+            home.display().to_string(),
+        ];
+        let err = run(&missing_store).expect_err("本地库不存在 ⇒ 前置错误");
+        assert_eq!(err.code(), 2, "{:?}", err.message());
+        let bad_flag = vec![
+            "tianshu-relay-cli".to_string(),
+            "migrate-vault".to_string(),
+            "--nope".to_string(),
+        ];
+        let err = run(&bad_flag).expect_err("未知参数 ⇒ 用法错误");
+        assert_eq!(err.code(), 2, "{:?}", err.message());
+    }
 }

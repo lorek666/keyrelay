@@ -21,6 +21,7 @@ import {
   type Settings,
 } from "../lib/api";
 import GatewayCard from "../components/GatewayCard";
+import VaultMigrationCard from "../components/VaultMigrationCard";
 import UpdateChecker from "../components/UpdateChecker";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { useTranslation, translate, getCurrentDict } from "../i18n";
@@ -566,6 +567,7 @@ export default function SettingsPage() {
       ) : (
         <>
           <div className="settings-grid">
+            <VaultMigrationCard />
             <div className="card">
               <h3>{t("settings.autorefresh.title")}</h3>
               <p className="muted">{t("settings.autorefresh.body")}</p>

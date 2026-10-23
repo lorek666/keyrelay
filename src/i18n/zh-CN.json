@@ -730,6 +730,29 @@
     "notice": "已回滚 {target}（变更 {journal}）。"
   },
   "settings": {
+    "vaultMigration": {
+      "title": "钥匙串迁移",
+      "body": "把系统钥匙串里的旧凭据搬到本地加密保险库。自动迁移最多试 2 次；之后可在这里手动重试或放弃（放弃不会删除钥匙串里的旧条目）。",
+      "phasePending": "待迁移",
+      "phaseDone": "已完成",
+      "phaseRetryExhausted": "自动重试次数已用尽",
+      "phaseAbandoned": "已放弃",
+      "attempts": "已尝试 {count} 次",
+      "failures": "{count} 条未迁移",
+      "cleanupPending": "{count} 条已迁移但旧条目未删除（仅诊断）",
+      "lastAt": "上次尝试：{time}",
+      "firstFailure": "首条未迁移：{reference}（{reason}）",
+      "retry": "重试迁移",
+      "retrying": "迁移中…",
+      "abandon": "放弃迁移",
+      "abandonTitle": "放弃钥匙串迁移？",
+      "abandonBody": "放弃后应用不再自动尝试迁移；钥匙串里的旧条目不会被删除，之后仍可手动重试。",
+      "abandonConfirm": "确认放弃",
+      "abandoned": "已放弃自动迁移。",
+      "retryDone": "迁移完成。",
+      "retryFailed": "仍有条目未迁移，可查看失败原因后重试。",
+      "loadFailed": "读取迁移状态失败：{error}"
+    },
     "intro": "所有设置都存在本地数据库里，不上传任何地方。",
     "loading": "加载中…",
     "autorefresh": {

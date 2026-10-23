@@ -2458,3 +2458,82 @@ export async function listKeyModels(keyId: number): Promise<string[]> {
   if (!hasTauri) return mock(["gpt-4o-mini", "claude-sonnet-4"]);
   return invokeCommand<string[]>("list_key_models", { keyId });
 }
+
+// ============================================================ 钥匙串迁移（M38-S2 / B-219）
+
+/** 迁移状态的四态。 */
+export type VaultMigrationPhase = "pending" | "done" | "retryExhausted" | "abandoned";
+
+export type VaultMigrationFailure = { reference: string; reason: string };
+
+export type VaultMigrationStatus = {
+  phase: VaultMigrationPhase;
+  attempts: number;
+  lastAt: number | null;
+  lastError: string | null;
+  failures: VaultMigrationFailure[];
+  cleanupPending: VaultMigrationFailure[];
+};
+
+export type VaultMigrationReport = {
+  imported: number;
+  skipped: number;
+  cleanupPending: VaultMigrationFailure[];
+  failed: VaultMigrationFailure[];
+  status: VaultMigrationStatus;
+};
+
+/** 钥匙串迁移状态（只读）。 */
+export async function vaultMigrationStatus(): Promise<VaultMigrationStatus> {
+  if (!hasTauri) {
+    return mock({
+      phase: "pending",
+      attempts: 0,
+      lastAt: null,
+      lastError: null,
+      failures: [],
+      cleanupPending: [],
+    });
+  }
+  return invokeCommand<VaultMigrationStatus>("vault_migration_status");
+}
+
+/**
+ * 显式重试迁移（忽略自动重试上限；已放弃会先清标记）。
+ *
+ * 迁移源与启动路径同一个 `KeychainVault::with_service(LEGACY_SERVICE)`——前端无从选择来源。
+ */
+export async function vaultMigrationRetry(): Promise<VaultMigrationReport> {
+  if (!hasTauri) {
+    return mock({
+      imported: 0,
+      skipped: 0,
+      cleanupPending: [],
+      failed: [],
+      status: {
+        phase: "done",
+        attempts: 1,
+        lastAt: null,
+        lastError: null,
+        failures: [],
+        cleanupPending: [],
+      },
+    });
+  }
+  return invokeCommand<VaultMigrationReport>("vault_migration_retry");
+}
+
+/** 放弃迁移：写 `abandoned:<unix>`，不删源条目（之后启动不自动重试）。 */
+export async function vaultMigrationAbandon(): Promise<VaultMigrationStatus> {
+  if (!hasTauri) {
+    return mock({
+      phase: "abandoned",
+      attempts: 0,
+      lastAt: null,
+      lastError: null,
+      failures: [],
+      cleanupPending: [],
+    });
+  }
+  return invokeCommand<VaultMigrationStatus>("vault_migration_abandon");
+}

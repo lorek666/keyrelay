@@ -56,6 +56,10 @@ pub const COMMANDS: &[&str] = &[
     "detect_unmanaged_targets",
     // M31-S1：Agent 安装/版本发现（只读）
     "detect_agents",
+    // M38-S2：钥匙串迁移（状态 / 显式重试 / 放弃）
+    "vault_migration_status",
+    "vault_migration_retry",
+    "vault_migration_abandon",
     "check_agent_updates",
     "update_agent",
     // M32-S1：Agent 模型下拉（只读，密钥不落日志）

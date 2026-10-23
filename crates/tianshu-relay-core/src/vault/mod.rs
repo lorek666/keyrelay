@@ -24,7 +24,12 @@ use crate::error::{Error, Result};
 
 pub use keychain::KeychainVault;
 pub use local::LocalVault;
-pub use migrate::{import_refs, migrate_once, MigrationOutcome, MigrationReport, MIGRATION_MARKER};
+pub use migrate::{
+    abandon_migration, import_refs, migrate_once, retry_migration, should_auto_retry, status_for,
+    MigrationFailure, MigrationOutcome, MigrationReport, MigrationStatus, MIGRATION_ATTEMPTS,
+    MIGRATION_CLEANUP_PENDING, MIGRATION_FAILURES, MIGRATION_LAST_AT, MIGRATION_LAST_ERROR,
+    MIGRATION_MARKER, MIGRATION_MAX_AUTO_ATTEMPTS,
+};
 
 /// 引用命名规则：`kr/<scope>/<id>/<field>`
 ///

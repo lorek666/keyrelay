@@ -730,6 +730,29 @@
     "notice": "Rolled back {target} (change {journal})."
   },
   "settings": {
+    "vaultMigration": {
+      "title": "Keychain migration",
+      "body": "Move legacy credentials from the system keychain into the local encrypted vault. Automatic migration is attempted at most twice; afterwards you can retry or abandon it here (abandoning never deletes the old keychain entries).",
+      "phasePending": "Pending",
+      "phaseDone": "Done",
+      "phaseRetryExhausted": "Automatic retries exhausted",
+      "phaseAbandoned": "Abandoned",
+      "attempts": "{count} attempt(s)",
+      "failures": "{count} item(s) not migrated",
+      "cleanupPending": "{count} item(s) migrated but old entry not deleted (diagnostic only)",
+      "lastAt": "Last attempt: {time}",
+      "firstFailure": "First failure: {reference} ({reason})",
+      "retry": "Retry migration",
+      "retrying": "Migrating…",
+      "abandon": "Abandon migration",
+      "abandonTitle": "Abandon keychain migration?",
+      "abandonBody": "After abandoning, the app will no longer retry automatically. Old keychain entries are kept, and you can still retry manually later.",
+      "abandonConfirm": "Abandon",
+      "abandoned": "Automatic migration abandoned.",
+      "retryDone": "Migration completed.",
+      "retryFailed": "Some items were still not migrated; check the reason and retry.",
+      "loadFailed": "Failed to read migration status: {error}"
+    },
     "intro": "All settings are stored locally in the database; nothing is uploaded.",
     "loading": "Loading…",
     "autorefresh": {

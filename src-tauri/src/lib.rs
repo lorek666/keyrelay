@@ -252,7 +252,7 @@ fn build_service_config(
 ///
 /// 只在真机启动路径上跑：钥匙串不可用（用户拒绝、平台不支持）就整体跳过，
 /// 下一次启动再试——**不会**因为迁移失败而阻止 App 启动。
-fn keychain_migration_source() -> tianshu_relay_core::vault::KeychainVault {
+pub(crate) fn keychain_migration_source() -> tianshu_relay_core::vault::KeychainVault {
     // M35-S1：生产迁移必须从**旧** service 读。单独抽成函数，让测试能钉住这条不变量；
     // 直接用 `KeychainVault::new()` 会读新 service、得到空集合，然后把完成标记写死。
     tianshu_relay_core::vault::KeychainVault::with_service(
@@ -269,6 +269,25 @@ fn run_keychain_migration(vault: &tianshu_relay_core::vault::LocalVault, store: 
         Ok(None) => {}
         Err(err) => {
             eprintln!("[tianshu-relay] 读迁移标记失败，跳过迁移: {err}");
+            return;
+        }
+    }
+
+    // M38-S2（B-219）：自动重试有硬上限。达到上限 / 已放弃 ⇒ **不碰钥匙串**——
+    // 不 probe、不枚举、不迁移。用户可在设置页显式重试或放弃。
+    let attempts = tianshu_relay_core::vault::status_for(vault)
+        .map(|s| s.attempts)
+        .unwrap_or(0);
+    match tianshu_relay_core::vault::should_auto_retry(vault) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!(
+                "[tianshu-relay] 钥匙串迁移已失败 {attempts} 次，跳过自动重试；请在设置页重试或放弃"
+            );
+            return;
+        }
+        Err(err) => {
+            eprintln!("[tianshu-relay] 读迁移状态失败，跳过自动重试: {err}");
             return;
         }
     }
@@ -575,6 +594,9 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::purge_keychain,
             commands::detect_unmanaged_targets,
             commands::detect_agents,
+            commands::vault_migration_status,
+            commands::vault_migration_retry,
+            commands::vault_migration_abandon,
             commands::check_agent_updates,
             commands::update_agent,
             commands::list_key_models,
