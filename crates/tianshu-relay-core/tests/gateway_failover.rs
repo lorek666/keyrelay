@@ -513,13 +513,19 @@ async fn a_read_timeout_is_not_replayed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bodyless_get_request_also_fails_over() {
-    // P2-9 / B-98 / DEBUG-REPORT-v3 §2-9：GET /v1/models 无 body，旧实现只用
-    // preferred() 的单个候选——首选挂了就 502，不切别的上游。现在用 all_candidates()，
-    // 无 body 请求也走故障切换循环。
+    // P2-9 / B-98 / DEBUG-REPORT-v3 §2-9：无 body 的 GET，旧实现只用 preferred() 的
+    // 单个候选——首选挂了就 502，不切别的上游。现在用 all_candidates()，无 body 请求
+    // 也走故障切换循环。
     //
     // M16-S4 / P2-13 之后能触发切换的只剩「连接层失败」与 429，所以本用例的故障源
     // 从「503」换成「连不上的端口」——**测的东西没变**（无 body 也走切换循环），
     // 只是换了一个在计费口径下合法的触发方式。
+    //
+    // **M39-S2 适配**：样本从 `GET /v1/models` 换成 `GET /v1/files`。
+    // `/v1/models` 在非空路由 + 目录非空时已改为**本地聚合**（上游零命中，见
+    // `tests/gateway_models_aggregate.rs`），它不再是一条「会走到上游」的无 body 请求；
+    // `GET /v1/files` 同为无 body 的 GET、`model_from_body` 为 None、网关无特殊处理，
+    // 因此仍能覆盖「无 body 也走切换循环」。**断言不变**。
     let b = spawn_upstream_always(2, REF_B, "200 OK");
     let (handle, token, _failures, _observations) = start_routed_full(
         vec![dead_upstream(1, REF_A, 0.1), b.upstream(1.0)],
@@ -530,7 +536,7 @@ async fn a_bodyless_get_request_also_fails_over() {
     )
     .await;
 
-    let (status, body) = get(&handle, &token, "/v1/models").await;
+    let (status, body) = get(&handle, &token, "/v1/files").await;
 
     assert_eq!(status, 200, "无 body 请求也应当切到第二个上游: {body}");
     assert!(body.contains("site2"), "响应应当来自第二个上游: {body}");
