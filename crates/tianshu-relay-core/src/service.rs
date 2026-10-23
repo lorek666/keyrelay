@@ -5084,6 +5084,15 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         Vec<crate::site::billing::RawBill>,
     )> {
         let site = self.site(site_id)?;
+        // M43-S2：账单导入只对 NewAPI 的 `/api/log/self` 有意义；能力门必须在
+        // `session()` 之前，否则 custom-openai-compatible 会报「请先登录」而不是
+        // 「不支持账单导入」（M7-S5 复审 P1-1 的同一条纪律）。
+        let kind = self.kind_of(&site)?;
+        capability_gate(
+            kind,
+            matches!(kind, crate::site::SiteKind::NewApi),
+            "账单导入",
+        )?;
         let session = self.session(site_id)?;
         let target = crate::site::billing::SiteBilling {
             site_id,
