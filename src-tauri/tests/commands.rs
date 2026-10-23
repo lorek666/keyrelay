@@ -2046,3 +2046,25 @@ fn gateway_status_never_reports_a_stopped_gateway_as_running() {
     }
     assert!(released, "停止后端口 {port} 必须最终不再监听");
 }
+
+// ============================================ M42-S1：网关状态 DTO 的监听字段
+
+/// `gateway_status` 必须带 `listenAddrs` / `ipv6Degraded` / `ipv6Note` 三个 camelCase 键。
+///
+/// 没在跑的网关**不得**凭空报一个监听地址（空数组 + false + null 才是「没在听」）。
+#[test]
+fn gateway_status_exposes_listen_fields_in_camel_case() {
+    let (_app, webview) = build_app();
+    let value = invoke_on(&webview, "gateway_status", json!({})).expect("gateway_status 应成功");
+    assert_eq!(
+        value["listenAddrs"],
+        json!([]),
+        "没在跑 ⇒ 空数组，不得编造地址: {value}"
+    );
+    assert_eq!(value["ipv6Degraded"], false, "没在跑 ⇒ 未降级: {value}");
+    assert!(
+        value.get("ipv6Note").is_some_and(|v| v.is_null()),
+        "没在跑 ⇒ ipv6Note 为 null: {value}"
+    );
+    assert_eq!(value["phase"], "stopped");
+}

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import GatewayCard from "../components/GatewayCard";
@@ -43,7 +43,9 @@ const status = (over: Partial<GatewayStatus> = {}): GatewayStatus => ({
   ...over,
 });
 
-function renderCard() {
+function renderCard(
+  over: { maxRequestMib?: number; onMaxRequestMibChange?: () => void } = {},
+) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -61,11 +63,13 @@ function renderCard() {
       multiSite={false}
       collectModels={false}
       modelsMinIntervalSecs={1800}
+      maxRequestMib={over.maxRequestMib ?? 16}
       onToggle={vi.fn()}
       onPortChange={vi.fn()}
       onMultiSiteChange={vi.fn()}
       onCollectModelsChange={vi.fn()}
       onModelsIntervalChange={vi.fn()}
+      onMaxRequestMibChange={over.onMaxRequestMibChange ?? vi.fn()}
       settingsDirty={false}
     />,
     { wrapper },
@@ -132,5 +136,66 @@ describe("GatewayCard 三态（M41-S1）", () => {
     expect(phaseLine()!.textContent).toContain(
       zhCN.gateway.phase.reasonUnexpected,
     );
+  });
+});
+
+describe("M42-S1：监听地址 / IPv6 降级 / 请求体上限", () => {
+  it("running：显示监听地址行；未降级时不显示降级提示", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(
+      status({
+        running: true,
+        phase: "running",
+        url: "http://127.0.0.1:8787",
+        token: "kr-gw-test",
+        site: "示例站",
+        tokenPersistent: true,
+        listenAddrs: ["127.0.0.1:8787", "[::1]:8787"],
+        ipv6Degraded: false,
+        ipv6Note: null,
+      }),
+    );
+    renderCard();
+    await waitFor(() => expect(phaseLine()?.dataset.gatewayPhase).toBe("running"));
+    const row = document.querySelector("[data-gateway-listen-addrs]");
+    expect(row?.textContent).toContain("127.0.0.1:8787");
+    expect(row?.textContent).toContain("[::1]:8787");
+    expect(document.querySelector("[data-gateway-ipv6='degraded']")).toBeNull();
+  });
+
+  it("running + ipv6Degraded：显示降级文案（含原因），且不是 role=alert 的错误条", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(
+      status({
+        running: true,
+        phase: "running",
+        url: "http://127.0.0.1:8787",
+        token: "kr-gw-test",
+        site: "示例站",
+        tokenPersistent: true,
+        listenAddrs: ["127.0.0.1:8787"],
+        ipv6Degraded: true,
+        ipv6Note: "IPv6 回环端口被占用，仅监听 127.0.0.1",
+      }),
+    );
+    renderCard();
+    await waitFor(() => expect(phaseLine()?.dataset.gatewayPhase).toBe("running"));
+    const warn = document.querySelector("[data-gateway-ipv6='degraded']");
+    expect(warn).not.toBeNull();
+    expect(warn!.textContent).toContain("IPv6 回环端口被占用");
+    expect(warn!.getAttribute("role")).not.toBe("alert");
+  });
+
+  it("请求体上限：输入 65 不触发回调；输入 32 触发一次", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(status({ phase: "stopped" }));
+    const onChange = vi.fn();
+    renderCard({ onMaxRequestMibChange: onChange });
+    const input = screen.getByLabelText(
+      zhCN.gateway.maxRequestLabel,
+    ) as HTMLInputElement;
+    expect(input.value).toBe("16");
+    fireEvent.change(input, { target: { value: "65" } });
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: "32" } });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith(32);
   });
 });

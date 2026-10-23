@@ -27,11 +27,14 @@ type Props = {
   collectModels: boolean;
   /** 采集节流间隔（秒，M39-S2）：30..=86400。 */
   modelsMinIntervalSecs: number;
+  /** 网关**请求体**上限（MiB，M42-S1）：1..=64。 */
+  maxRequestMib: number;
   onToggle: (enabled: boolean) => void;
   onPortChange: (port: number) => void;
   onMultiSiteChange: (enabled: boolean) => void;
   onCollectModelsChange: (enabled: boolean) => void;
   onModelsIntervalChange: (secs: number) => void;
+  onMaxRequestMibChange: (mib: number) => void;
   /** 设置还没保存时提示用户先保存（端口要保存后才生效） */
   settingsDirty: boolean;
 };
@@ -49,11 +52,13 @@ export default function GatewayCard({
   multiSite,
   collectModels,
   modelsMinIntervalSecs,
+  maxRequestMib,
   onToggle,
   onPortChange,
   onMultiSiteChange,
   onCollectModelsChange,
   onModelsIntervalChange,
+  onMaxRequestMibChange,
   settingsDirty,
 }: Props) {
   const { t } = useTranslation();
@@ -385,6 +390,30 @@ export default function GatewayCard({
         <p className="muted">{t("gateway.portDirtyHint")}</p>
       ) : null}
 
+      {/*
+        M42-S1：请求体上限（MiB）。**只**限制请求体——响应体上限是固定 64 MiB 常量，
+        与这里无关（两个 64 数值相同纯属巧合）。保存后下次启动网关生效。
+      */}
+      <label className="field">
+        <span>{t("gateway.maxRequestLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={1}
+          max={64}
+          step={1}
+          value={maxRequestMib}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            // 与端口输入框同口径：越界/非整数不更新受控值（后端 validate 是第二道）
+            if (Number.isInteger(n) && n >= 1 && n <= 64) {
+              onMaxRequestMibChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.maxRequestHint")}</p>
+
       {running ? (
         <>
           <dl className="kv">
@@ -398,6 +427,10 @@ export default function GatewayCard({
             <dd className="mono ellipsis" title={status.data?.token ?? ""}>
               {status.data?.token}
             </dd>
+            <dt>{t("gateway.kv.listenAddrs")}</dt>
+            <dd className="mono" data-gateway-listen-addrs>
+              {(status.data?.listenAddrs ?? []).join("、") || "—"}
+            </dd>
             <dt>{t("gateway.kv.tokenStorage")}</dt>
             <dd>
               {status.data?.tokenPersistent ? (
@@ -407,6 +440,11 @@ export default function GatewayCard({
               )}
             </dd>
           </dl>
+          {status.data?.ipv6Degraded ? (
+            <p className="warn" data-gateway-ipv6="degraded">
+              {t("gateway.ipv6Degraded", { note: status.data?.ipv6Note ?? "" })}
+            </p>
+          ) : null}
           <p className="muted">{t("gateway.hint")}</p>
           {status.data?.tokenPersistent ? (
             <p className="muted">{t("gateway.persistentHint")}</p>

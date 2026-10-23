@@ -36,11 +36,16 @@ pub const GATEWAY_PER_SITE_CONCURRENCY_MIN: usize = 1;
 pub const GATEWAY_PER_SITE_CONCURRENCY_MAX: usize = 128;
 pub const GATEWAY_PER_SITE_RATE_LIMIT_MAX: u32 = 10_000;
 
+/// 网关请求体上限的默认值 / 硬上限（MiB，M42-S1 §4.4）。
+pub const DEFAULT_GATEWAY_MAX_REQUEST_MIB: u16 = 16;
+pub const MAX_GATEWAY_MAX_REQUEST_MIB: u16 = 64;
+
 const KEY_REFRESH_INTERVAL: &str = "refresh_interval_secs";
 const KEY_BALANCE_THRESHOLD: &str = "balance_alert_threshold";
 const KEY_DRIFT_ON_START: &str = "drift_check_on_start";
 const KEY_GATEWAY_ENABLED: &str = "gateway_enabled";
 const KEY_GATEWAY_PORT: &str = "gateway_port";
+const KEY_GATEWAY_MAX_REQUEST_MIB: &str = "gateway_max_request_mib";
 // M14-S1：多站路由 + 模型采集（B-99）
 const KEY_GATEWAY_MULTI_SITE: &str = "gateway_multi_site";
 // M41-S1：自动启动 + 「上次成功运行」的那组 site/key（0 = 无）
@@ -81,6 +86,9 @@ pub struct Settings {
     pub gateway_enabled: bool,
     /// 网关端口。只绑 `127.0.0.1`。
     pub gateway_port: u16,
+    /// 网关**请求体**上限（MiB，M42-S1）：默认 16、范围 1..=64。
+    /// 注意与响应上限 `MAX_RESPONSE_BYTES`（64 MiB 常量）无关，两者不配对。
+    pub gateway_max_request_mib: u16,
     /// 应用启动时是否自动启动网关（M41-S1）。**默认 false**：自动监听端口是显式选择。
     /// 只有 `gateway_auto_start && gateway_enabled` 且能确定站点/密钥时才尝试；
     /// 失败不阻断启动（只记日志）。
@@ -171,6 +179,7 @@ impl Default for Settings {
             // 网关会监听端口，默认关闭
             gateway_enabled: false,
             gateway_port: 8787,
+            gateway_max_request_mib: DEFAULT_GATEWAY_MAX_REQUEST_MIB,
             // M41-S1：默认不自动启动；没有「上次成功运行」的组
             gateway_auto_start: false,
             gateway_last_site_id: 0,
@@ -225,6 +234,14 @@ impl Settings {
             return Err(Error::Store(
                 "网关端口必须在 1024..=65535 之间（1024 以下需要管理员权限）".to_string(),
             ));
+        }
+        // M42-S1：请求体上限 1..=64 MiB（UI 钳制之外的第二道）。
+        if self.gateway_max_request_mib < 1
+            || self.gateway_max_request_mib > MAX_GATEWAY_MAX_REQUEST_MIB
+        {
+            return Err(Error::Store(format!(
+                "网关请求体上限必须在 1..={MAX_GATEWAY_MAX_REQUEST_MIB} MiB 之间"
+            )));
         }
         // M39-S2：采集间隔的范围校验（防直接 IPC 绕过 UI 设 0 / 超大值）。
         if self.models_min_interval_secs < MODELS_MIN_INTERVAL_SECS
@@ -343,6 +360,7 @@ impl Settings {
             "drift_check_on_start": self.drift_check_on_start,
             "gateway_enabled": self.gateway_enabled,
             "gateway_port": self.gateway_port,
+            "gateway_max_request_mib": self.gateway_max_request_mib,
             "gateway_multi_site": self.gateway_multi_site,
             "collect_models": self.collect_models,
             "models_min_interval_secs": self.models_min_interval_secs,
@@ -435,6 +453,12 @@ impl Settings {
                         if port >= 1024 {
                             settings.gateway_port = port;
                         }
+                    }
+                }
+                KEY_GATEWAY_MAX_REQUEST_MIB => {
+                    // 解析层只做类型转换；范围由 `validate()` 统一拒绝（与端口同口径）
+                    if let Ok(mib) = value.parse::<u16>() {
+                        settings.gateway_max_request_mib = mib;
                     }
                 }
                 KEY_GATEWAY_AUTO_START => {
@@ -606,6 +630,10 @@ impl Settings {
             (KEY_DRIFT_ON_START, self.drift_check_on_start.to_string()),
             (KEY_GATEWAY_ENABLED, self.gateway_enabled.to_string()),
             (KEY_GATEWAY_PORT, self.gateway_port.to_string()),
+            (
+                KEY_GATEWAY_MAX_REQUEST_MIB,
+                self.gateway_max_request_mib.to_string(),
+            ),
             (KEY_GATEWAY_AUTO_START, self.gateway_auto_start.to_string()),
             (
                 KEY_GATEWAY_LAST_SITE_ID,
@@ -671,12 +699,13 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 29] = [
+    pub const KEYS: [&'static str; 30] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
         KEY_GATEWAY_ENABLED,
         KEY_GATEWAY_PORT,
+        KEY_GATEWAY_MAX_REQUEST_MIB,
         // M41-S1
         KEY_GATEWAY_AUTO_START,
         KEY_GATEWAY_LAST_SITE_ID,
@@ -986,6 +1015,30 @@ mod tests {
         assert_eq!(s.notify_timeout_secs, 1, "1 是合法下界");
     }
 
+    /// M42-S1 §7.1：请求体上限的默认值与范围（1..=64），以及 KV 往返。
+    #[test]
+    fn settings_gateway_max_request_mib_default_and_bounds() {
+        let mut s = Settings::default();
+        assert_eq!(s.gateway_max_request_mib, 16, "默认 16 MiB");
+        s.gateway_max_request_mib = 1;
+        assert!(s.validate().is_ok(), "1 是合法下界");
+        s.gateway_max_request_mib = 64;
+        assert!(s.validate().is_ok(), "64 是合法上界");
+        s.gateway_max_request_mib = 0;
+        assert!(s.validate().is_err(), "0 必须被拒");
+        s.gateway_max_request_mib = 65;
+        assert!(s.validate().is_err(), "65 必须被拒");
+
+        s.gateway_max_request_mib = 32;
+        let pairs = s.to_pairs();
+        let back = Settings::from_pairs(pairs.iter().map(|(k, v)| (*k, v.as_str())));
+        assert_eq!(back.gateway_max_request_mib, 32, "KV 往返一致");
+
+        // 旧配置缺这个键 ⇒ 回落默认 16
+        let old = Settings::from_pairs(Vec::<(&str, &str)>::new());
+        assert_eq!(old.gateway_max_request_mib, 16);
+    }
+
     #[test]
     fn pairs_round_trip() {
         let s = Settings {
@@ -995,6 +1048,7 @@ mod tests {
             notify_enabled: true,
             gateway_enabled: true,
             gateway_port: 9999,
+            gateway_max_request_mib: 16,
             gateway_auto_start: true,
             gateway_last_site_id: 11,
             gateway_last_key_id: 22,
