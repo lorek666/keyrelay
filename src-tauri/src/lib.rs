@@ -637,6 +637,9 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
 /// 2. 任务体里**不出现 `unwrap`**：任何失败都转成事件，绝不 panic、绝不退出循环。
 ///
 /// 漂移检测只读本地文件，默认在启动时跑一次。
+/// 模型目录采集循环的醒来间隔（M39-S1）。真正的节流在每站的 `should_collect_models`。
+const MODEL_CATALOG_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub fn spawn_maintenance_tasks<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     use tauri::Manager;
 
@@ -691,6 +694,53 @@ pub fn spawn_maintenance_tasks<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+
+    // M39-S1：模型目录采集循环（**独立于**上面的刷新定时器）。
+    //
+    // 60s tick 只是「醒来看看」，真正的节流是逐站的 `should_collect_models`
+    // （锚点 = `site_model_sync.last_attempt_at`）——所以改 `models_min_interval_secs`
+    // 不需要重启循环。
+    //
+    // 门槛只有 `collect_models` 一个：循环里先判一次，不满足就**连一趟空转都不调**；
+    // 单趟采集内部还会再判一次（纵深防御，开关关时 0 请求 0 写入）。
+    // `gateway_multi_site` **不在此列**：它只决定网关路由用不用目录（见 `gateway_config`）。
+    let catalog_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(MODEL_CATALOG_TICK).await;
+            let Some(state) = catalog_handle.try_state::<AppState>() else {
+                continue;
+            };
+            let Ok(settings) = state.service.settings() else {
+                continue;
+            };
+            // 只看 `collect_models`：它是 M14-S1 的**独立**开关（服务 `ModelsChanged` 通知），
+            // 与「网关是否用目录」(`gateway_multi_site`) 解耦——绑定会让只开采集的用户
+            // 收不到通知（行为回归）。
+            if !settings.collect_models {
+                continue;
+            }
+            match state.service.refresh_model_catalog_once().await {
+                Ok(summary) => {
+                    if summary.attempted > 0 {
+                        eprintln!(
+                            "[tianshu-relay] 模型目录采集: 尝试 {} / 替换 {} / 空 {} / 失败 {} / 清空 {} / 发布 {}（代号 {}）",
+                            summary.attempted,
+                            summary.replaced,
+                            summary.empty,
+                            summary.failed,
+                            summary.cleared.len(),
+                            summary.published,
+                            summary.generation
+                        );
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[tianshu-relay] 模型目录采集失败（下一轮继续）: {err}")
+                }
+            }
         }
     });
 

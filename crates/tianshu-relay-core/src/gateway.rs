@@ -379,6 +379,16 @@ pub struct GatewayConfig {
     /// `None` = 不校验（[`GatewayConfig::single_upstream`] 的默认 ⇒ 既有调用方行为逐字不变）。
     /// **由 `service.rs::gateway_config` 填充**（M16-S4 spec §12 W-3，道⑤/Lead 合并期打）。
     pub legacy_key_ref: Option<String>,
+    /// **热更新句柄**（M39-S1）。`None` ⇒ 每个请求直接用本结构的 `route` / `keys_by_ref`
+    /// （**与加这个字段之前逐字相同**：`single_upstream` 与所有既有测试都走这条）。
+    ///
+    /// `Some` ⇒ 请求在进入时**克隆一次**快照（[`RouteView`]），此后整条请求路径只读那份快照；
+    /// `service.rs` 在模型目录变化时 `*runtime.write() = 新 Arc`，在途请求继续用它启动时
+    /// 拿到的那一份，直到最后一个引用释放（换指针不撕裂）。
+    ///
+    /// 用 `std::sync::RwLock`（不是 tokio 的）：读侧只在**同步段**里 `read()` + `clone()` +
+    /// 立刻放锁，**不跨 `await` 持锁**；写侧只做一次指针替换。
+    pub runtime: Option<Arc<std::sync::RwLock<Arc<GatewaySnapshot>>>>,
 }
 
 /// 上游请求的两段超时。
@@ -530,6 +540,104 @@ impl GatewayConfig {
             // `None` ⇒ legacy 路径的已回收守卫不生效，行为与改动前逐字相同；
             // 服务层要启用它，就构造完再赋值（spec §12 W-3）。
             legacy_key_ref: None,
+            // M39-S1：构造器不建热更新句柄（`None` ⇒ 请求直接用上面的 route / keys_by_ref，
+            // 行为与加这个字段之前逐字相同）。服务层的 `gateway_config` 在构造完再赋值。
+            runtime: None,
+        }
+    }
+}
+
+/// 一次「路由 + 密钥」的**不可变**快照（M39-S1）。
+///
+/// 为什么是不可变 + `Arc`：请求处理**每请求克隆一次** [`Arc<GatewaySnapshot>`] 就再也不碰锁，
+/// 于是「热更新」只是换一个指针；在途请求继续用它启动时拿到的那一份，直到最后一个引用释放
+/// （不会出现「一半请求按旧路由、一半按新路由读到同一个字段」的矛盾）。
+///
+/// **不含** `load_balance` / `guards`：那是 M39-S3 的字段，届时新增字段即可
+/// （本结构的构造点只有 `service.rs` 与新测试，新增字段是源码兼容的变更）。
+/// **不含** `aliases`：别名今天已经活在 [`RouteTable`] 里（`with_alias` / `resolve_model`），
+/// 再拿一份等于把同一个事实存两处，必然分叉。
+#[derive(Clone)]
+pub struct GatewaySnapshot {
+    /// 单调递增（同一运行态内）。首个快照 = 1；每次发布 +1。
+    pub generation: u64,
+    pub route: RouteTable,
+    /// `key_ref` → 明文。与 [`GatewayConfig::keys_by_ref`] **同一类型**（`Zeroizing`），
+    /// 这样请求路径的「取密钥」只有一种写法。
+    pub keys_by_ref: HashMap<String, Zeroizing<String>>,
+}
+
+impl GatewaySnapshot {
+    pub fn new(
+        generation: u64,
+        route: RouteTable,
+        keys_by_ref: HashMap<String, Zeroizing<String>>,
+    ) -> Self {
+        Self {
+            generation,
+            route,
+            keys_by_ref,
+        }
+    }
+}
+
+/// 手写 `Debug`：**不打印任何密钥**（与 `GatewayConfig` 同一条红线）。
+impl std::fmt::Debug for GatewaySnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewaySnapshot")
+            .field("generation", &self.generation)
+            .field("route_is_empty", &self.route.is_empty())
+            .field("key_refs", &self.keys_by_ref.len())
+            .finish()
+    }
+}
+
+/// 一次请求看到的路由视图（M39-S1）：要么是静态配置（兼容路径），要么是一份快照。
+///
+/// 存在的理由：请求路径上有好几处要读 `route` / `keys_by_ref`；如果每处各写一次
+/// 「有 runtime 就取快照、没有就用配置」，那一定会分叉（一半读新、一半读旧）。
+/// 统一在这里取一次，之后只读 `view`。
+pub enum RouteView<'a> {
+    Static(&'a GatewayConfig),
+    Snapshot(Arc<GatewaySnapshot>),
+}
+
+impl RouteView<'_> {
+    pub fn route(&self) -> &RouteTable {
+        match self {
+            RouteView::Static(config) => &config.route,
+            RouteView::Snapshot(snapshot) => &snapshot.route,
+        }
+    }
+
+    pub fn keys(&self) -> &HashMap<String, Zeroizing<String>> {
+        match self {
+            RouteView::Static(config) => &config.keys_by_ref,
+            RouteView::Snapshot(snapshot) => &snapshot.keys_by_ref,
+        }
+    }
+
+    /// 静态路径返回 0（便于日志/测试区分「有没有热更新」）。
+    pub fn generation(&self) -> u64 {
+        match self {
+            RouteView::Static(_) => 0,
+            RouteView::Snapshot(snapshot) => snapshot.generation,
+        }
+    }
+}
+
+impl GatewayConfig {
+    /// 取本请求的路由视图（M39-S1）：**克隆一次** `Arc` 就放锁，不跨 `await` 持锁。
+    ///
+    /// `runtime == None`（`single_upstream` / 既有测试）⇒ 借用静态配置，行为与今天逐字相同。
+    /// 锁中毒时退回静态配置：可用性优先，而且「快照读不出来」不该让每个请求 500。
+    pub fn view(&self) -> RouteView<'_> {
+        match &self.runtime {
+            Some(runtime) => match runtime.read() {
+                Ok(guard) => RouteView::Snapshot(Arc::clone(&guard)),
+                Err(_) => RouteView::Static(self),
+            },
+            None => RouteView::Static(self),
         }
     }
 }
@@ -669,18 +777,34 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
             .as_ref()
             .and_then(|refs| refs.lock().ok().map(|set| set.clone()))
             .unwrap_or_default();
-        let missing: Vec<&str> = config
-            .route
-            .key_refs()
-            .into_iter()
-            .filter(|r| !config.keys_by_ref.contains_key(*r) && !revoked_set.contains(*r))
-            .collect();
-        if !missing.is_empty() {
-            return Err(Error::Store(format!(
-                "网关启动被拒绝：路由表里有 {} 个上游的密钥既不在 keys_by_ref 里、\
+        // M39-S1：同一条不变式要覆盖**两套**路由——静态配置（兼容路径）与运行时快照
+        // （热更新路径）。发布路径是本步新写的，若是它构造出「路由引用了不存在的明文」，
+        // 症状与 M7 审计 D-2 一模一样（每个上游静默跳过 → 502），所以守卫放在 `start()`。
+        let check = |label: &str,
+                     route: &RouteTable,
+                     keys: &HashMap<String, Zeroizing<String>>|
+         -> Result<()> {
+            let missing: Vec<&str> = route
+                .key_refs()
+                .into_iter()
+                .filter(|r| !keys.contains_key(*r) && !revoked_set.contains(*r))
+                .collect();
+            if missing.is_empty() {
+                return Ok(());
+            }
+            Err(Error::Store(format!(
+                "网关启动被拒绝：{label}里有 {} 个上游的密钥既不在 keys_by_ref 里、\
                  也没有被标记为已回收——构造方忘了填密钥映射（在第一个请求上会表现成 502）",
                 missing.len()
-            )));
+            )))
+        };
+        check("路由表", &config.route, &config.keys_by_ref)?;
+        if let Some(runtime) = &config.runtime {
+            if let Ok(guard) = runtime.read() {
+                let snapshot = Arc::clone(&guard);
+                drop(guard);
+                check("运行时快照", &snapshot.route, &snapshot.keys_by_ref)?;
+            }
         }
     }
 
@@ -915,12 +1039,17 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         }
     };
 
+    // M39-S1：**每请求只取一次**路由视图（克隆一次 `Arc<GatewaySnapshot>` 就放锁）。
+    // 之后所有 route / keys_by_ref 的读取都走 `view`——否则会分叉成「一半按新路由、
+    // 一半按旧路由」。`runtime == None` 时它借用 `config`，与加这个字段之前逐字相同。
+    let view = state.config.view();
+
     // ③ 空路由表 ⇒ 单上游时代的**逐字节相同**行为：不解析 body、不查 `keys_by_ref`、
     //    不查熔断、不写失败事件、只发一次请求。
     //
     //    M16-S4 / P3-3 的唯一增量：**停止信号已发出时一个字节都不发**。
     //    这不是「上游失败」，是本地状态 ⇒ 不写事件、不改响应形态（只在停止期间生效）。
-    if state.config.route.is_empty() {
+    if view.route().is_empty() {
         if is_stopping(&state) {
             return stopping_response();
         }
@@ -972,11 +1101,11 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     // ④ 路由非空：选候选（首位即首选，顺序由 `RouteTable` 保证确定）
     let model = model_from_body(&body);
     let candidates: Vec<&Upstream> = match &model {
-        Some(m) => state.config.route.candidates(m),
+        Some(m) => view.route().candidates(m),
         // 没有 body（`GET /v1/models`）或 body 里没有 `model`：用**所有**上游的有序
         // 列表，而不是 `preferred()` 的单个——否则首选挂了就 502，不切别的上游
         // （B-98 / P2-9）。开了路由不该把一个 PRD 端点变成 404。
-        None => state.config.route.all_candidates(),
+        None => view.route().all_candidates(),
     };
     if candidates.is_empty() {
         return (
@@ -1018,7 +1147,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
 
     // 别名命中时才改写 body 里的 `model`；未命中时 body 逐字节原样转发。
     let outbound = match &model {
-        Some(m) => rewrite_model(&body, m, &state.config.route),
+        Some(m) => rewrite_model(&body, m, view.route()),
         None => body,
     };
     let event_model = model.unwrap_or_default();
@@ -1032,7 +1161,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     let sendable: Vec<&Upstream> = eligible
         .iter()
         .copied()
-        .filter(|u| is_sendable(&state, u))
+        .filter(|u| is_sendable(&state, view.keys(), u))
         .collect();
 
     let mut last_error: Option<String> = None;
@@ -1049,7 +1178,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         // 这里 `unwrap` 不会 panic：`sendable` 就是按同一个判据过滤出来的。
         // 但仍然写 `let Some(..) else` ——「过滤」与「取用」共用同一个函数
         // （`is_sendable`），所以两者不可能分叉。
-        let Some(key) = state.config.keys_by_ref.get(&upstream.key_ref) else {
+        let Some(key) = view.keys().get(&upstream.key_ref) else {
             continue;
         };
         let url = format!("{}{}{}", upstream.base_url, path, query);
@@ -1144,7 +1273,10 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     //
     // 文案区分两种原因（缺明文 / 已回收），但**都不写 `key_ref` 原文**：
     // 引用本身是线索（M7-S0 §4.3 的红线）。
-    for upstream in eligible.iter().filter(|u| !is_sendable(&state, u)) {
+    for upstream in eligible
+        .iter()
+        .filter(|u| !is_sendable(&state, view.keys(), u))
+    {
         let (status, reason) = if is_revoked(&state, upstream) {
             (0u16, "该密钥已被回收，不再使用")
         } else {
@@ -1178,8 +1310,12 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
 /// 这个上游**能不能真的发出去**：有明文，且该明文没被回收。
 ///
 /// 「过滤」与「取用」共用这一个函数——两处各写一份判据正是 M7 那类分叉的来源。
-fn is_sendable(state: &AppState, upstream: &Upstream) -> bool {
-    !is_revoked(state, upstream) && state.config.keys_by_ref.contains_key(&upstream.key_ref)
+fn is_sendable(
+    state: &AppState,
+    keys: &HashMap<String, Zeroizing<String>>,
+    upstream: &Upstream,
+) -> bool {
+    !is_revoked(state, upstream) && keys.contains_key(&upstream.key_ref)
 }
 
 /// 该上游的密钥是否**已被回收**（§3.5-5）。

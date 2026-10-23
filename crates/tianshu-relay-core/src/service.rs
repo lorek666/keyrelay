@@ -364,6 +364,41 @@ pub struct RefreshSummary {
     pub needs_login: Vec<i64>,
 }
 
+/// 一趟模型目录采集的摘要（M39-S1）。**可安全打印**：不含密钥、不含响应正文。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelCatalogSummary {
+    /// 真的发出 `/v1/models` 请求的站点数（受开关 / 到期 / 有可用 key 三重过滤之后）。
+    pub attempted: usize,
+    /// 成功且非空的站点数（**替换**了该站集合）。
+    pub replaced: usize,
+    /// 成功但空的站点数（其中达到阈值而被清空的计入 `cleared`）。
+    pub empty: usize,
+    /// 失败的站点数（目录不变，只记 `last_attempt_at` / `last_error`）。
+    pub failed: usize,
+    /// 本次因连续空被清空的站点 id（升序）。
+    pub cleared: Vec<i64>,
+    /// 本次是否发布了新快照。
+    pub published: bool,
+    /// 当前快照代号（未发布 = 发布前的代号；没有运行态 = 0）。
+    pub generation: u64,
+}
+
+/// 一趟采集里**同时在途**的站点数上限（M39-S1 §4.5 / §12）。
+///
+/// 写成常量而不是设置项：这是「别把 20 个站点同时打一遍」的保护，不是用户可调策略。
+/// 语义是**实际在途上限**（`buffer_unordered` 的语义），不是「每批 2 个、批间无等待」。
+pub const MODEL_CATALOG_CONCURRENCY: usize = 2;
+
+/// 镜像决策（M39-S1，纯函数）：该站的内存模型镜像要不要被本轮目录事实覆盖。
+///
+/// - 表里有该站的行 ⇒ **覆盖**（正常替换）；
+/// - 表里没有行、但该站**成功采集过**（`last_success_at` 有值）⇒ 覆盖成空（目录真被清空）；
+/// - 两者都没有（从没采过，例如 `collect_models` 刚打开）⇒ **保留旧值**。
+///   把「还没采」当成「模型全没了」，会让通知侧的 `ModelsChanged` 误报。
+fn should_overwrite_model_mirror(catalog_has_rows: bool, last_success: Option<i64>) -> bool {
+    catalog_has_rows || last_success.is_some()
+}
+
 /// 一次「站点侧密钥对齐到本地」的结果（M6-S5 / FR-2）。
 ///
 /// **不含任何密钥明文，也不含 `secret_ref`**——它会被序列化到 UI。
@@ -767,6 +802,15 @@ pub struct TianshuRelayService<T: HttpTransport + Clone + 'static> {
     /// `revoke_key` 成功后插进来，`gateway_config` 把它交给网关。
     /// 这样网关**不新开取密钥路径**，只查一个由 `ensure_not_revoked` 那条路径维护的集合。
     revoked_refs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// **热更新句柄**（M39-S1）：当前运行态的快照容器。`None` = 没有网关在跑
+    /// （或最近一次装配走的是 legacy 单上游路径）。`gateway_config()` 每次新建并替换它，
+    /// `publish_gateway_snapshot()` 往里面写新的 `Arc<GatewaySnapshot>`。
+    ///
+    /// 为什么是 `Mutex<Option<…>>` 而不是 `OnceLock`：每次 `gateway_start` 都换一个新的容器
+    /// （旧的由最后一个在途请求释放）；`gateway_stop` 不强制清理也无害——
+    /// 没有读者的旧容器即使被误发布一次也不会被任何人看到，下一次 start 会替换。
+    gateway_runtime:
+        std::sync::Mutex<Option<Arc<std::sync::RwLock<Arc<crate::gateway::GatewaySnapshot>>>>>,
     /// 最近一次 `gateway_config` 用的令牌**是不是**持久化的（M8-S4 §6.4）。
     ///
     /// 放在服务上而不是 `GatewayHandle` 上：`gateway.rs` 的结构白名单与
@@ -910,6 +954,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             site_facts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             revoked_refs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             gateway_token_persistent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            gateway_runtime: std::sync::Mutex::new(None),
             captcha_phases: Mutex::new(HashMap::new()),
             webview_creds: Mutex::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
@@ -2642,57 +2687,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             }),
         ));
 
-        // M14-S1：模型清单采集（B-99 ①）。按节流，每轮最多 1 站，失败静默。
-        // 放在快照与通知之间：采集只更新 `site_facts[*].models`（路由表用），
-        // 不进 snapshot（notify 的 models 字段本轮仍 None，与既有行为一致）。
-        if settings.collect_models {
-            let now = unix_now_secs();
-            let policy = crate::notify::ModelsPolicy {
-                enabled: true,
-                min_interval_secs: settings.models_min_interval_secs,
-            };
-            for site in self.store.list_sites()? {
-                // 该站有没有可用 key（没有就跳过——采集要带 key）
-                let Some(row) = self.pick_gateway_key(site.id).ok().flatten() else {
-                    continue;
-                };
-                let Ok(secret) = self.secret_for_row(&row) else {
-                    continue;
-                };
-                // 节流判定（should_collect_models 是纯函数，已含时钟回拨与边界处理）
-                let last = self
-                    .site_facts
-                    .lock()
-                    .ok()
-                    .and_then(|m| m.get(&site.id).and_then(|o| o.models_collected_at));
-                if !crate::notify::should_collect_models(policy, last, now) {
-                    continue;
-                }
-                // 采集：每轮最多 1 站（M8-S1 §5.2），命中第一个该采的就采然后 break。
-                match crate::site::fetch_models(&self.transport, &site.base_url, &secret).await {
-                    Ok(fetched) => {
-                        if let Ok(mut map) = self.site_facts.lock() {
-                            let obs = map.entry(site.id).or_default();
-                            obs.models = crate::notify::merge_models(&obs.models, Some(&fetched));
-                            obs.models_collected_at = Some(now);
-                        }
-                    }
-                    Err(err) => {
-                        // 失败静默：只记 Debug 事件，不阻塞刷新、不清空已有 models
-                        self.log(observability::event_with_payload(
-                            Level::Debug,
-                            "app",
-                            format!(
-                                "模型清单采集失败: {}",
-                                crate::redact::scrub(&err.to_string())
-                            ),
-                            serde_json::json!({ "site_id": site.id }),
-                        ));
-                    }
-                }
-                break;
-            }
-        }
+        // M39-S1：采集已从这里**移走**——目录采集由 `refresh_model_catalog_once()` 独立完成
+        // （60s 循环驱动，见 `src-tauri/src/lib.rs`），与刷新定时器解耦。
+        // 本函数只负责余额/倍率/延迟与通知；`site_facts.models` 由采集路径单向镜像。
         // B-80 / DEBUG-REPORT-v3 §2-9：把**已采集过**的模型清单喂进快照。
         //
         // 采集本身在上面（M14-S1 的节流与开关，`should_collect_models`），本步只做**回填**：
@@ -4629,6 +4626,23 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             let (route, keys) = self.build_gateway_route()?;
             config.route = route;
             config.keys_by_ref = keys;
+            // M39-S1：非空路由 ⇒ 装一个热更新句柄（首个快照 generation = 1）。
+            // 空路由（没有可用站点）不装：那时网关走 legacy 路径，快照没有读者。
+            if !config.route.is_empty() {
+                let snapshot = crate::gateway::GatewaySnapshot::new(
+                    1,
+                    config.route.clone(),
+                    config.keys_by_ref.clone(),
+                );
+                let runtime = Arc::new(std::sync::RwLock::new(Arc::new(snapshot)));
+                if let Ok(mut slot) = self.gateway_runtime.lock() {
+                    *slot = Some(Arc::clone(&runtime));
+                }
+                config.runtime = Some(runtime);
+            }
+        } else if let Ok(mut slot) = self.gateway_runtime.lock() {
+            // 单站/legacy：清掉上一次的句柄——避免 publish 往一个没人读的旧容器里写。
+            *slot = None;
         }
         // ③ 已回收集合：网关只**查**它，不新开取密钥路径。
         config.site_id = site_id;
@@ -4854,6 +4868,10 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             .lock()
             .map(|map| map.clone())
             .unwrap_or_default();
+        // M39-S1：模型清单的唯一事实来源是**表**（持久化 + 采集替换语义）。
+        // 每次建路由现读：不存在「内存缓存与表不一致」，也就不需要「启动时加载」这一步。
+        // `rate` / `balance_usd` / `latency_ms` 仍是内存观测（不落库，M8-S1 D-4 不变）。
+        let catalog = self.store.site_model_catalog()?;
         let revoked = self
             .revoked_refs
             .lock()
@@ -4881,7 +4899,8 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             facts.push(crate::routing::SiteFacts {
                 site_id: site.id,
                 base_url: site.base_url.clone(),
-                models: obs.models,
+                // 目录里没有该站 ⇒ 空 vec = 「未知 ⇒ 通配」（M8-S1 §4.2 的既有语义）。
+                models: catalog.get(&site.id).cloned().unwrap_or_default(),
                 rate: obs.rate,
                 // **余额未知 ⇒ None**，绝不 `unwrap_or(0.0)`（那会把「不知道」变成「已耗尽」）。
                 balance_usd: obs.balance_usd,
@@ -4900,6 +4919,234 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             .iter()
             .fold(table, |t, (alias, real)| t.with_alias(alias, real));
         Ok((table, keys))
+    }
+
+    /// **一趟**模型目录采集（M39-S1 §4.5）。
+    ///
+    /// 与 `refresh_all` **完全解耦**：可以单独调用（测试直接调它；`src-tauri/src/lib.rs`
+    /// 的 60s 循环也调它）。开关关着 ⇒ 立刻返回全零摘要，**一个请求都不发、一行都不写**。
+    ///
+    /// 语义（§5.2）：成功非空 ⇒ 替换；成功空 ⇒ 连续 2 次才清空；失败 ⇒ 目录不变。
+    pub async fn refresh_model_catalog_once(&self) -> Result<ModelCatalogSummary> {
+        let mut summary = ModelCatalogSummary::default();
+        let settings = self.settings()?;
+        // 采集的**唯一**门槛是 `collect_models`（M14-S1 的独立开关，服务 `ModelsChanged` 通知）。
+        // `gateway_multi_site` 只决定目录要不要进网关路由（`gateway_config` 里判），
+        // **不得**把两者绑定：那会让「开采集、没开多站」的用户收不到模型变化通知（行为回归）。
+        if !settings.collect_models {
+            summary.generation = self.gateway_snapshot_generation();
+            return Ok(summary);
+        }
+        let now = unix_now_secs();
+        let policy = crate::notify::ModelsPolicy {
+            enabled: true,
+            min_interval_secs: settings.models_min_interval_secs,
+        };
+
+        // ① 选出「到期 + 有可用 key」的站点。**同步段，不 await**（拿明文与判据都在这里）。
+        struct CatalogJob {
+            site_id: i64,
+            base_url: String,
+            secret: zeroize::Zeroizing<String>,
+        }
+        let revoked = self
+            .revoked_refs
+            .lock()
+            .map(|set| set.clone())
+            .unwrap_or_default();
+        let mut jobs: Vec<CatalogJob> = Vec::new();
+        for site in self.store.list_sites()? {
+            let Some(row) = self.pick_gateway_key(site.id)? else {
+                continue;
+            };
+            if revoked.contains(&row.secret_ref) {
+                continue;
+            }
+            // 节流锚点用 `last_attempt_at`：**失败也节流**——不给坏站点「每轮都重试」的风暴。
+            let last_attempt = self
+                .store
+                .site_model_sync(site.id)?
+                .and_then(|sync| sync.last_attempt_at);
+            if !crate::notify::should_collect_models(policy, last_attempt, now) {
+                continue;
+            }
+            let Ok(secret) = self.secret_for_row(&row) else {
+                continue;
+            };
+            jobs.push(CatalogJob {
+                site_id: site.id,
+                base_url: site.base_url.clone(),
+                secret,
+            });
+        }
+        if jobs.is_empty() {
+            summary.generation = self.gateway_snapshot_generation();
+            return Ok(summary);
+        }
+
+        // ② 有界并发：`buffer_unordered` 的语义是**实际在途 ≤ N**（不是「每批 N 个、批间无等待」）。
+        let transport = &self.transport;
+        let results = futures_util::stream::iter(jobs.into_iter().map(|job| async move {
+            let fetched = crate::site::fetch_models(transport, &job.base_url, &job.secret).await;
+            (job.site_id, fetched)
+        }))
+        .buffer_unordered(MODEL_CATALOG_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        // ③ 落库（串行）：写库不并发，避免自造锁竞争；每站独立，顺序不影响结果。
+        let mut changed = false;
+        for (site_id, result) in results {
+            summary.attempted += 1;
+            match result {
+                Ok(models) if models.is_empty() => {
+                    summary.empty += 1;
+                    match self.store.record_site_models_empty(site_id, now) {
+                        Ok(outcome) if outcome.cleared => {
+                            summary.cleared.push(site_id);
+                            changed = true;
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            self.log(observability::event_with_payload(
+                                Level::Debug,
+                                "app",
+                                format!(
+                                    "模型目录写入失败（空响应）: {}",
+                                    crate::redact::scrub(&err.to_string())
+                                ),
+                                serde_json::json!({ "site_id": site_id }),
+                            ));
+                        }
+                    }
+                }
+                Ok(models) => {
+                    summary.replaced += 1;
+                    changed = true;
+                    if let Err(err) = self.store.replace_site_models(site_id, &models, now) {
+                        self.log(observability::event_with_payload(
+                            Level::Debug,
+                            "app",
+                            format!(
+                                "模型目录写入失败（替换）: {}",
+                                crate::redact::scrub(&err.to_string())
+                            ),
+                            serde_json::json!({ "site_id": site_id }),
+                        ));
+                    }
+                }
+                Err(err) => {
+                    summary.failed += 1;
+                    let text = crate::redact::scrub(&err.to_string());
+                    self.log(observability::event_with_payload(
+                        Level::Debug,
+                        "app",
+                        format!("模型清单采集失败: {text}"),
+                        serde_json::json!({ "site_id": site_id }),
+                    ));
+                    // store 内部还会再 scrub + 截断一次（红线：store 是最后一道）。
+                    if let Err(store_err) =
+                        self.store.record_site_models_failure(site_id, now, &text)
+                    {
+                        self.log(observability::event_with_payload(
+                            Level::Debug,
+                            "app",
+                            format!(
+                                "模型目录同步状态写入失败: {}",
+                                crate::redact::scrub(&store_err.to_string())
+                            ),
+                            serde_json::json!({ "site_id": site_id }),
+                        ));
+                    }
+                }
+            }
+        }
+        summary.cleared.sort_unstable();
+
+        // ④ 通知侧的镜像（B-80 的 `ModelsChanged` 读 `site_facts.models`；表才是唯一事实来源）。
+        self.mirror_catalog_into_site_facts()?;
+        if changed {
+            summary.published = self.publish_gateway_snapshot()? > 0;
+        }
+        summary.generation = self.gateway_snapshot_generation();
+        Ok(summary)
+    }
+
+    /// **诊断 / 测试用**：当前 `site_facts` 里的模型镜像。
+    ///
+    /// 表是唯一事实来源（路由读表）；这里只是既有通知路径（B-80 `ModelsChanged`）的镜像。
+    pub fn site_model_mirror(&self) -> std::collections::BTreeMap<i64, Vec<String>> {
+        self.site_facts
+            .lock()
+            .map(|map| {
+                map.iter()
+                    .map(|(site_id, obs)| (*site_id, obs.models.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 把目录镜像进 `site_facts`（**只为既有通知路径** B-80 服务；路由读的是表）。
+    ///
+    /// 单向：表 → 内存。`models_collected_at` 取该站 `last_success_at`（重启后仍然成立），
+    /// 于是 `dispatch_notifications` 的 `Some(list)` / `None` 语义与 M14-S1 保持一致。
+    fn mirror_catalog_into_site_facts(&self) -> Result<()> {
+        let catalog = self.store.site_model_catalog()?;
+        let mut map = self
+            .site_facts
+            .lock()
+            .map_err(|_| Error::Store("站点观测表已中毒".into()))?;
+        for site in self.store.list_sites()? {
+            let last_success = self
+                .store
+                .site_model_sync(site.id)?
+                .and_then(|s| s.last_success_at);
+            let obs = map.entry(site.id).or_default();
+            // **只在有事实时覆盖**：表里有该站的目录行 ⇒ 用表；该站有过成功采集但表里
+            // 没行（真被清空）⇒ 空；两者都没有（从没采过，例如 `collect_models` 刚打开）
+            // ⇒ **保留旧值**。否则会把「还没采」误当成「模型全没了」，
+            // 通知侧的 `ModelsChanged` 会误报。
+            if should_overwrite_model_mirror(catalog.contains_key(&site.id), last_success) {
+                obs.models = catalog.get(&site.id).cloned().unwrap_or_default();
+            }
+            if let Some(success) = last_success {
+                obs.models_collected_at = Some(success);
+            }
+        }
+        Ok(())
+    }
+
+    /// 重建 `(RouteTable, keys_by_ref)` 并**发布**到当前运行态（M39-S1 §4.5）。
+    ///
+    /// 网关没在跑（`gateway_runtime == None`）⇒ 不报错，返回 0：目录已经落库，
+    /// 下一次 `gateway_config()` 自然会读到它。
+    pub fn publish_gateway_snapshot(&self) -> Result<u64> {
+        let (route, keys) = self.build_gateway_route()?;
+        let slot = self
+            .gateway_runtime
+            .lock()
+            .map_err(|_| Error::Store("网关运行态锁已中毒".into()))?;
+        let Some(runtime) = slot.as_ref() else {
+            return Ok(0);
+        };
+        // 读旧代号 + 写新快照在同一把写锁内完成：两个发布者不会拿到同一个 generation。
+        let mut guard = runtime
+            .write()
+            .map_err(|_| Error::Store("网关快照锁已中毒".into()))?;
+        let next = guard.generation.saturating_add(1);
+        *guard = Arc::new(crate::gateway::GatewaySnapshot::new(next, route, keys));
+        Ok(next)
+    }
+
+    /// 当前运行态的快照代号；没有运行态 ⇒ 0。
+    pub fn gateway_snapshot_generation(&self) -> u64 {
+        let Ok(slot) = self.gateway_runtime.lock() else {
+            return 0;
+        };
+        let Some(runtime) = slot.as_ref() else {
+            return 0;
+        };
+        runtime.read().map(|guard| guard.generation).unwrap_or(0)
     }
 
     /// 该站点用来出网的 key：**未回收**且未禁用/耗尽里 id 最大的那一条（最新的一把）。
@@ -5742,6 +5989,18 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
 
 #[cfg(test)]
 mod tests {
+
+    /// M39-S1：镜像决策——「还没采过」不得被当成「模型全没了」。
+    #[test]
+    fn model_mirror_is_only_overwritten_when_there_is_a_fact() {
+        // 表里有行 ⇒ 覆盖（正常替换）
+        assert!(should_overwrite_model_mirror(true, None));
+        assert!(should_overwrite_model_mirror(true, Some(10)));
+        // 没行但成功采集过 ⇒ 覆盖成空（目录真被清空）
+        assert!(should_overwrite_model_mirror(false, Some(10)));
+        // 没行、也从没采过 ⇒ **保留旧值**（否则通知侧 ModelsChanged 会误报）
+        assert!(!should_overwrite_model_mirror(false, None));
+    }
     use super::*;
     use crate::site::transport::{HttpResponse, MockTransport};
     use serde_json::json;

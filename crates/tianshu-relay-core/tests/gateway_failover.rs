@@ -192,6 +192,7 @@ async fn start_routed_full(
         })),
         upstream_proxy: None,
         legacy_key_ref: None,
+        runtime: None,
         on_failure: Some(Arc::new(move |f| {
             if let Ok(mut log) = sink.lock() {
                 log.push(f);
@@ -263,6 +264,7 @@ async fn route_and_keys_by_ref_must_agree() {
             on_usage: None,
             upstream_proxy: None,
             legacy_key_ref: None,
+            runtime: None,
             on_failure: None,
         }
     }
@@ -746,6 +748,7 @@ async fn failure_event_scrubs_a_key_shaped_model() {
             on_usage: None,
             upstream_proxy: None,
             legacy_key_ref: None,
+            runtime: None,
             on_failure: Some(Arc::new(move |f| {
                 if let Ok(mut log) = sink.lock() {
                     log.push(f);
@@ -996,6 +999,7 @@ async fn a_missing_plaintext_is_refused_at_startup() {
         on_usage: None,
         upstream_proxy: None,
         legacy_key_ref: None,
+        runtime: None,
         on_failure: None,
     })
     .await
