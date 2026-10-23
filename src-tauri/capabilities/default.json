@@ -9,6 +9,7 @@
     "core:default",
     "core:window:allow-set-theme",
     "allow-list-sites",
+    "allow-logout-site",
     "allow-app-info",
     "allow-detect-site",
     "allow-add-site",

@@ -242,7 +242,8 @@
       "manualFinish": "手动接入",
       "finishCaptcha": "我已过完，接上会话",
       "finishLogin": "我已登录",
-      "connecting": "接上会话中…"
+      "connecting": "接上会话中…",
+      "logout": "退出登录"
     },
     "notice": {
       "detected": "识别成功：{name}（{kind} {version}）",
@@ -254,7 +255,8 @@
       "captchaAutoOpening": "已自动打开验证窗口，请勿关闭。",
       "captchaAutoDone": "验证完成，会话已自动接入：{name}",
       "captchaAutoFailed": "自动接入失败：窗口仍开着，您可以手动接入或取消。",
-      "cancelled": "已取消人工验证。需要时重新点「登录」即可再试一次。"
+      "cancelled": "已取消人工验证。需要时重新点「登录」即可再试一次。",
+      "loggedOut": "已退出登录：{name}（本地会话已清除）"
     },
     "hint": {
       "fingerprint": "只会调用站点的公开状态接口做指纹识别；登录凭证不落库，只进本地加密保险库。",
@@ -302,6 +304,16 @@
       "email": "邮箱",
       "username": "用户名",
       "account": "账号"
+    },
+    "session": {
+      "persisted": "已保存会话 · 重启免登",
+      "persistedHint": "该站会话已加密保存在本地，重启 App 后无需重新登录；点「退出登录」可清除本地会话。"
+    },
+    "logout": {
+      "title": "退出登录：{name}",
+      "body": "只会清除本地的内存会话与本地加密保险库条目；站点上的会话与令牌不受影响。之后重启 App 需要重新登录该站点。",
+      "confirm": "退出登录",
+      "confirming": "退出中…"
     }
   },
   "keys": {

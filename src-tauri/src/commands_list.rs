@@ -10,6 +10,7 @@
 
 pub const COMMANDS: &[&str] = &[
     "list_sites",
+    "logout_site",
     "app_info",
     "detect_site",
     "add_site",

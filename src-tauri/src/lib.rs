@@ -530,6 +530,7 @@ pub fn configure_with_state<R: tauri::Runtime>(
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::list_sites,
+            commands::logout_site,
             commands::app_info,
             commands::detect_site,
             commands::add_site,

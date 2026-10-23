@@ -79,6 +79,15 @@ export type SiteRow = {
    */
   health: string;
   /**
+   * M38-S1：该站会话是否已持久化到本地加密保险库（后端只用 `Vault::has` 看存在性，
+   * 不读明文）。`true` ⇒ 界面显示「已保存会话 · 重启免登」与「退出登录」。
+   *
+   * 可选：既有测试夹具不必补字段（缺省 = 未知/未持久化，按 `!== true` 判断）。
+   */
+  sessionPersisted?: boolean;
+  /** M38-S1：当前内存会话的 JWT `exp`（秒）；无会话 / 非 JWT ⇒ `null`。 */
+  sessionExpiresAt?: number | null;
+  /**
    * 登录账号栏的**输入约定**（M9-S2 / B-120）：`"username"` | `"email"` | `null`。
    *
    * 判据**只**来自后端那张表（`site::login_field`）——页面里不得出现
@@ -818,6 +827,17 @@ export async function addSite(baseUrl: string): Promise<SiteRow> {
 export async function loginSite(args: LoginArgs): Promise<void> {
   if (!hasTauri) return mock(undefined);
   return invokeCommand<void>("login_site", { args });
+}
+
+/**
+ * 退出登录（M38-S1）：清内存会话 + 删本地加密保险库条目 + 健康位回 `unknown`。
+ *
+ * 只清**本地**状态：站点侧的会话/令牌不受影响（确认框里会写明）。
+ * 幂等：站点不存在也不报错。
+ */
+export async function logoutSite(siteId: number): Promise<void> {
+  if (!hasTauri) return mock(undefined);
+  return invokeCommand<void>("logout_site", { siteId });
 }
 
 /**
