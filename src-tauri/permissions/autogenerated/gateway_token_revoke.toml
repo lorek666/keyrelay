@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gateway-token-revoke"
+description = "Enables the gateway_token_revoke command without any pre-configured scope."
+commands.allow = ["gateway_token_revoke"]
+
+[[permission]]
+identifier = "deny-gateway-token-revoke"
+description = "Denies the gateway_token_revoke command without any pre-configured scope."
+commands.deny = ["gateway_token_revoke"]

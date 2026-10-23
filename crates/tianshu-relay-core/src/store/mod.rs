@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension as _};
 
 use crate::error::{Error, Result};
 use crate::inject::Journal;
@@ -16,7 +16,7 @@ use crate::site::KeyStatus;
 ///
 /// 版本号只是「将来需要非幂等迁移」的锚点：新表由每次打开的幂等 `DDL` 建出。
 /// M39-S1 之后下一个用版本号的是 M40-S1（顺延为 8）。
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// 「已回收」——**本地**密钥生命周期状态（M7-S4 / FR-2）。
 ///
@@ -158,8 +158,27 @@ CREATE TABLE IF NOT EXISTS gateway_usage_log(
   status INTEGER NOT NULL DEFAULT 0,
   latency_ms INTEGER NOT NULL DEFAULT 0,
   attempts INTEGER NOT NULL DEFAULT 1,
-  stream INTEGER NOT NULL DEFAULT 0
+  stream INTEGER NOT NULL DEFAULT 0,
+  token_id INTEGER REFERENCES gateway_tokens(id) ON DELETE SET NULL,
+  agent_label TEXT NOT NULL DEFAULT ''
 );
+-- M43-S1：Agent 级网关令牌。**只存 hash**；明文只在创建时返回一次，永不落库。
+CREATE TABLE IF NOT EXISTS gateway_tokens(
+  id           INTEGER PRIMARY KEY,
+  token_hash   TEXT    NOT NULL UNIQUE,   -- sha256(明文) 的 64 位小写 hex
+  label        TEXT    NOT NULL,          -- agent 标签（用户输入，展示前过 scrub）
+  created_at   INTEGER NOT NULL,          -- unix 秒
+  revoked_at   INTEGER,                   -- NULL = 有效
+  last_used_at INTEGER,                   -- NULL = 从没用过
+  is_default   INTEGER NOT NULL DEFAULT 0 -- 1 = 钥匙串那把默认令牌对应的行（**身份事实，不看 label**）
+);
+-- 非吊销的 label 唯一：归因按标签聚合，重名会混账。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gateway_tokens_label_live
+  ON gateway_tokens(label) WHERE revoked_at IS NULL;
+-- 最多一个默认行（部分唯一索引）：默认令牌是身份事实，不允许两份。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gateway_tokens_one_default
+  ON gateway_tokens(is_default) WHERE is_default = 1;
+CREATE INDEX IF NOT EXISTS idx_gateway_tokens_created ON gateway_tokens(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_gateway_usage_ts ON gateway_usage_log(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_gateway_usage_site ON gateway_usage_log(site_id, ts DESC);
 -- M13-S1：站点余额快照（每轮刷新时写一条）。
@@ -525,6 +544,29 @@ pub struct UsageDailyRow {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    /// M43-S1：命中的令牌行；`None` = 未归因（旧数据）
+    pub token_id: Option<i64>,
+    /// M43-S1：认证当时的标签快照；`''` = 未归因（旧数据）
+    pub agent_label: String,
+}
+
+/// M43-S1：一条 Agent 网关令牌。**只有 hash，没有明文**。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayTokenRow {
+    pub id: i64,
+    pub token_hash: String,
+    pub label: String,
+    pub created_at: i64,
+    pub revoked_at: Option<i64>,
+    pub last_used_at: Option<i64>,
+    pub is_default: bool,
+}
+
+impl GatewayTokenRow {
+    /// 是否有效（未吊销）。
+    pub fn active(&self) -> bool {
+        self.revoked_at.is_none()
+    }
 }
 
 /// M34-S1：站点余额快照按（本地日, 站点）聚合的一行。
@@ -751,6 +793,18 @@ const WAL_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 /// （那条由 [`WAL_LOCK_BUDGET`] 单独管，见 `open_with_budget` 的注释）。
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn map_gateway_token_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GatewayTokenRow> {
+    Ok(GatewayTokenRow {
+        id: row.get(0)?,
+        token_hash: row.get(1)?,
+        label: row.get(2)?,
+        created_at: row.get(3)?,
+        revoked_at: row.get(4)?,
+        last_used_at: row.get(5)?,
+        is_default: row.get::<_, i64>(6)? != 0,
+    })
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_budget(path, WAL_LOCK_BUDGET)
@@ -926,6 +980,31 @@ impl Store {
             conn.execute("UPDATE gateway_usage_log SET at = ts WHERE at = 0", [])
                 .map_err(|e| Error::Store(format!("回填 gateway_usage_log.at 失败: {e}")))?;
         }
+        // M43-S1（SCHEMA_VERSION 8 → 9）：令牌表与 usage 归因两列。
+        // `gateway_tokens` 由 DDL 一次建全（新库）；预发布构建可能建过没有 is_default 的旧表 ⇒ 补列。
+        add_column_if_missing(
+            &conn,
+            "gateway_tokens",
+            "is_default",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "gateway_usage_log",
+            "token_id",
+            "INTEGER REFERENCES gateway_tokens(id) ON DELETE SET NULL",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "gateway_usage_log",
+            "agent_label",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gateway_usage_token ON gateway_usage_log(token_id, ts DESC)",
+            [],
+        )
+        .map_err(|e| Error::Store(format!("建 gateway_usage_token 索引失败: {e}")))?;
 
         // 版本号仍然只在升级时写，保留它作为「将来需要非幂等迁移」的锚点。
         if version < SCHEMA_VERSION {
@@ -1982,6 +2061,100 @@ impl Store {
             .map_err(|e| Error::Store(format!("读取导出行失败: {e}")))
     }
 
+    // ============================================================ M43-S1：Agent 网关令牌
+
+    /// 插入一行令牌（**只收 hash**）。返回新行 id。
+    ///
+    /// 唯一约束：`token_hash` 全表唯一；`label` 非吊销内唯一；`is_default=1` 全局最多一行。
+    pub fn insert_gateway_token(
+        &self,
+        token_hash: &str,
+        label: &str,
+        is_default: bool,
+    ) -> Result<i64> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO gateway_tokens(token_hash, label, created_at, is_default) VALUES(?1, ?2, ?3, ?4)",
+            params![token_hash, label, now_secs(), i64::from(is_default)],
+        )
+        .map_err(|e| Error::Store(format!("插入网关令牌失败: {e}")))?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 全部令牌，按 `created_at DESC, id DESC`（列表口径）。
+    pub fn list_gateway_tokens(&self) -> Result<Vec<GatewayTokenRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, token_hash, label, created_at, revoked_at, last_used_at, is_default
+                 FROM gateway_tokens ORDER BY created_at DESC, id DESC",
+            )
+            .map_err(|e| Error::Store(format!("准备令牌列表失败: {e}")))?;
+        let rows = stmt
+            .query_map([], map_gateway_token_row)
+            .map_err(|e| Error::Store(format!("查询令牌列表失败: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("读取令牌行失败: {e}")))
+    }
+
+    pub fn gateway_token_by_id(&self, id: i64) -> Result<Option<GatewayTokenRow>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, token_hash, label, created_at, revoked_at, last_used_at, is_default
+             FROM gateway_tokens WHERE id = ?1",
+            params![id],
+            map_gateway_token_row,
+        )
+        .optional()
+        .map_err(|e| Error::Store(format!("查询令牌 #{id} 失败: {e}")))
+    }
+
+    /// 默认行（`is_default = 1`）——**不看 label、不看 revoked_at**（身份事实）。
+    pub fn default_gateway_token(&self) -> Result<Option<GatewayTokenRow>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, token_hash, label, created_at, revoked_at, last_used_at, is_default
+             FROM gateway_tokens WHERE is_default = 1",
+            [],
+            map_gateway_token_row,
+        )
+        .optional()
+        .map_err(|e| Error::Store(format!("查询默认令牌失败: {e}")))
+    }
+
+    /// 吊销（幂等：已吊销不动 `revoked_at`）。
+    pub fn revoke_gateway_token(&self, id: i64) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE gateway_tokens SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+            params![id, now_secs()],
+        )
+        .map_err(|e| Error::Store(format!("吊销令牌 #{id} 失败: {e}")))?;
+        Ok(())
+    }
+
+    /// 记录一次使用（调用方负责节流；见 service 的 `touch_gateway_token`）。
+    pub fn touch_gateway_token(&self, id: i64) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE gateway_tokens SET last_used_at = ?2 WHERE id = ?1",
+            params![id, now_secs()],
+        )
+        .map_err(|e| Error::Store(format!("更新令牌 #{id} 使用时间失败: {e}")))?;
+        Ok(())
+    }
+
+    /// M41-S2 的轮换接口：**原地**改默认行的 hash（保留 id/label/created_at/is_default）。
+    pub fn update_gateway_token_hash(&self, id: i64, token_hash: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE gateway_tokens SET token_hash = ?2 WHERE id = ?1",
+            params![id, token_hash],
+        )
+        .map_err(|e| Error::Store(format!("更新令牌 #{id} hash 失败: {e}")))?;
+        Ok(())
+    }
+
     /// 一条网关用量账目（M40-S1）。
     ///
     /// `ts` 由本方法取 `now_secs()`（**插入时刻**，审计用）；其余 11 列全部来自 `usage`
@@ -1990,8 +2163,8 @@ impl Store {
     pub fn insert_gateway_usage(&self, usage: &crate::gateway::GatewayUsage) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO gateway_usage_log(ts, at, site_id, key_id, model, prompt_tokens, completion_tokens, total_tokens, status, latency_ms, attempts, stream) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO gateway_usage_log(ts, at, site_id, key_id, model, prompt_tokens, completion_tokens, total_tokens, status, latency_ms, attempts, stream, token_id, agent_label) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 now_secs(),
                 usage.at,
@@ -2005,6 +2178,8 @@ impl Store {
                 usage.latency_ms as i64,
                 i64::from(usage.attempts),
                 i64::from(usage.stream),
+                usage.token_id,
+                usage.agent_label,
             ],
         ).map_err(|e| Error::Store(format!("gateway usage insert: {e}")))?;
         Ok(())
@@ -2115,11 +2290,12 @@ impl Store {
                         COUNT(*),
                         COALESCE(SUM(prompt_tokens), 0),
                         COALESCE(SUM(completion_tokens), 0),
-                        COALESCE(SUM(total_tokens), 0)
+                        COALESCE(SUM(total_tokens), 0),
+                        token_id, agent_label
                  FROM gateway_usage_log
                  WHERE at >= ?1 AND (?2 IS NULL OR site_id = ?2)
-                 GROUP BY d, site_id, model
-                 ORDER BY d ASC, site_id ASC, model ASC",
+                 GROUP BY d, site_id, model, token_id, agent_label
+                 ORDER BY d ASC, site_id ASC, model ASC, agent_label ASC",
             )
             .map_err(|e| Error::Store(format!("prepare usage daily: {e}")))?;
         let rows = stmt
@@ -2132,6 +2308,8 @@ impl Store {
                     prompt_tokens: row.get(4)?,
                     completion_tokens: row.get(5)?,
                     total_tokens: row.get(6)?,
+                    token_id: row.get(7)?,
+                    agent_label: row.get(8)?,
                 })
             })
             .map_err(|e| Error::Store(format!("query usage daily: {e}")))?;
@@ -3476,6 +3654,8 @@ mod tests {
         drop(conn);
         store
             .insert_gateway_usage(&crate::gateway::GatewayUsage {
+                token_id: None,
+                agent_label: String::new(),
                 at: now_secs(),
                 site_id,
                 key_id: None,
@@ -3856,7 +4036,7 @@ mod tests {
             .expect("造旧库");
         }
         let store = Store::open(&path).expect("重新打开");
-        assert_eq!(store.schema_version().unwrap(), 8, "M40-S1 之后是 v8");
+        assert_eq!(store.schema_version().unwrap(), 9, "M43-S1 之后是 v9");
         let conn = rusqlite::Connection::open(&path).expect("直连");
         for table in ["site_model_catalog", "site_model_sync"] {
             let n: i64 = conn
@@ -4066,6 +4246,8 @@ mod tests {
             latency_ms: 33,
             attempts: 1,
             stream: false,
+            token_id: None,
+            agent_label: String::new(),
         }
     }
 
@@ -4115,7 +4297,7 @@ mod tests {
 
         let store = Store::open(&path).expect("重新打开 v7 旧库");
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 8, "M40-S1 占用 v8（M39-S1 占 v7）");
+        assert_eq!(SCHEMA_VERSION, 9, "M43-S1 占用 v9（M40-S1 占 v8）");
         let columns = usage_columns(&store);
         for expected in ["at", "key_id", "status", "latency_ms", "attempts", "stream"] {
             assert!(
@@ -4140,19 +4322,19 @@ mod tests {
         // 重复打开幂等（不 duplicate column）。
         drop(store);
         let store = Store::open(&path).expect("再次打开");
-        assert_eq!(store.schema_version().unwrap(), 8);
-        assert_eq!(usage_columns(&store).len(), 13);
+        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(usage_columns(&store).len(), 15);
     }
 
     #[test]
     fn schema_v8_fresh_db_has_all_six_columns() {
         let store = Store::open_in_memory().expect("内存库");
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
         let columns = usage_columns(&store);
         assert_eq!(
             columns.len(),
-            13,
-            "13 列：id/ts/at/site_id/model/3 tokens/key_id/status/latency_ms/attempts/stream"
+            15,
+            "15 列：id/ts/at/site_id/model/3 tokens/key_id/status/latency_ms/attempts/stream/token_id/agent_label"
         );
         for expected in ["at", "key_id", "status", "latency_ms", "attempts", "stream"] {
             assert!(

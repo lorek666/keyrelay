@@ -4569,12 +4569,69 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// ① 为**所有**有可用密钥的站点建 `SiteFacts`（含当前这个），推导路由表；
     /// ② 把每个上游的明文填进 `keys_by_ref`（否则网关会静默 `continue` → 502）；
     /// ③ 交给网关一个**已回收集合**与一个会话代号。
+    /// M43-S1 / M41-S2：默认令牌的**迁移 + 对账**（幂等）。
+    ///
+    /// 判据是 **`is_default = 1`**（身份事实），**不看 label、不看「表是否为空」**：
+    /// - 已有默认行 ⇒ 什么都不做；
+    /// - 钥匙串读失败 ⇒ 什么都不做、不报错（网关回退 legacy `token` 路径）；
+    /// - 否则把钥匙串里那把登记成默认行（**只写 hash**，钥匙串条目保留不动）。
+    ///
+    /// M41-S2 的轮换会原地 UPDATE 这一行的 `token_hash`；本函数同时承担「钥匙串 → DB」
+    /// 的对账（DB 更新失败后重启时把默认行收敛到钥匙串当前令牌）。
+    pub fn ensure_default_token_migrated(&self) -> Result<bool> {
+        if self.store.default_gateway_token()?.is_some() {
+            // M41-S2：对账——默认行 hash 与钥匙串不一致时**原地**更新（保留 id/label/created_at）。
+            let (current, _) = self.gateway_token();
+            if current.trim().is_empty() {
+                return Ok(false);
+            }
+            let expected = crate::gateway::sha256_hex(&current);
+            let row = self.store.default_gateway_token()?.expect("上面刚判过");
+            if row.token_hash != expected {
+                self.store.update_gateway_token_hash(row.id, &expected)?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        // 锁屏 / ACL：读失败时 `gateway_token()` 内部按「拿不到」处理；空令牌同样跳过。
+        let (current, _) = self.gateway_token();
+        if current.trim().is_empty() {
+            return Ok(false);
+        }
+        let hash = crate::gateway::sha256_hex(&current);
+        match self.store.insert_gateway_token(&hash, "默认（迁移）", true) {
+            Ok(_) => Ok(true),
+            // 并发：唯一约束命中 ⇒ 视为已迁移。
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// M43-S1：把库里**有效**的令牌读成运行态集合（`start()` 之后播种）。
+    ///
+    /// 空 ⇒ 网关回退 legacy `token`（行为与今天逐字相同）。
+    pub fn gateway_tokens_for_registry(&self) -> Result<Vec<crate::gateway::GatewayTokenEntry>> {
+        Ok(self
+            .store
+            .list_gateway_tokens()?
+            .into_iter()
+            .filter(|row| row.active())
+            .map(|row| crate::gateway::GatewayTokenEntry {
+                id: row.id,
+                token_hash: row.token_hash,
+                label: row.label,
+                grace_until: None,
+            })
+            .collect())
+    }
+
     pub fn gateway_config(
         &self,
         site_id: i64,
         key_id: i64,
         port: u16,
     ) -> Result<crate::gateway::GatewayConfig> {
+        // M43-S1：装配前做一次迁移/对账（幂等；失败不阻断——最坏是回退 legacy）。
+        let _ = self.ensure_default_token_migrated();
         let site = self.site(site_id)?;
         let row = self
             .store

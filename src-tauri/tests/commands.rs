@@ -1780,6 +1780,8 @@ fn gateway_stop_flushes_buffered_usage() {
     state
         .service
         .push_gateway_usage_for_test(tianshu_relay_core::gateway::GatewayUsage {
+            token_id: None,
+            agent_label: String::new(),
             at: 1_700_000_000,
             site_id,
             key_id: Some(7),
