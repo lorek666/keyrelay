@@ -474,7 +474,9 @@
       "keyPlaceholder": "（选择一把）",
       "revokedHidden": "已隐藏 {count} 把已回收的密钥（站点上已经没了，不该再被投递）",
       "modelLoading": "加载模型…",
-      "modelFetchFailed": "模型清单获取失败，可手动输入",
+      "modelFetchFailed": "模型清单获取失败，可手动输入；若刚登录站点，可点重试",
+      "modelRetry": "重试",
+      "modelRetrying": "重试中…",
       "modelEmpty": "该分组没有可用模型，可手动输入"
     },
     "gatewayMode": {

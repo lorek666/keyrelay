@@ -340,6 +340,51 @@ describe("M31-S1 Agent 工作台", () => {
     expect(arg).toMatchObject({ keyId: 101, channel: "claude-code-settings", model: "manual-model" });
   });
 
+  it("⑯ 失败态点重试 ⇒ 查询中禁用并显示「重试中…」，成功后出现下拉（M37-S1）", async () => {
+    const { listKeyModels } = await import("../lib/api");
+    const mock = listKeyModels as unknown as {
+      mockRejectedValueOnce: (e: Error) => void;
+      mockImplementationOnce: (fn: () => Promise<string[]>) => void;
+    };
+    mock.mockRejectedValueOnce(new Error("boom"));
+    // 第二次调用挂起，直到测试手动放行 ⇒ 能确定性地断言「重试中」状态
+    let resolveRetry: (models: string[]) => void = () => {};
+    mock.mockImplementationOnce(
+      () =>
+        new Promise<string[]>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+
+    renderPage();
+    await waitFor(() => expect(keySelect("claude-code-settings")).not.toBeNull());
+    fireEvent.change(keySelect("claude-code-settings"), { target: { value: "101" } });
+
+    // 失败态：输入框 + 提示 + 「重试」按钮
+    await waitFor(() =>
+      expect(row("claude-code-settings").textContent).toContain(zhCN.agents.select.modelFetchFailed),
+    );
+    expect(row("claude-code-settings").querySelector("input.agent-row-model")).not.toBeNull();
+    // 每次重新查询 DOM（重渲染可能换节点，持有旧引用会读到过期的 disabled）
+    const retryButton = () =>
+      row("claude-code-settings").querySelector<HTMLButtonElement>(".agent-row-model-retry");
+    expect(retryButton()).not.toBeNull();
+    expect(retryButton()!.textContent).toContain(zhCN.agents.select.modelRetry);
+    expect(retryButton()!.disabled).toBe(false);
+
+    fireEvent.click(retryButton()!);
+
+    // 重试进行中：按钮禁用 + 文案变「重试中…」
+    await waitFor(() => expect(retryButton()!.disabled).toBe(true));
+    expect(retryButton()!.textContent).toContain(zhCN.agents.select.modelRetrying);
+
+    // 放行第二次请求 ⇒ 下拉出现且选项正确（不再停在手填）
+    resolveRetry(["model-a", "model-b"]);
+    await waitFor(() => expect(modelSelect("claude-code-settings")).not.toBeNull());
+    expect(optionValues("claude-code-settings")).toEqual(["", "model-a", "model-b"]);
+    expect(row("claude-code-settings").querySelector(".agent-row-model-retry")).toBeNull();
+  });
+
   it("⑩ 已回收/不存在的 keyId 不拿去查预览", async () => {
     localStorage.setItem(
       `tianshu-relay.agentPrefs.v1.${SITE_A}`,

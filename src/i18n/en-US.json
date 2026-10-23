@@ -474,7 +474,9 @@
       "keyPlaceholder": "(pick one)",
       "revokedHidden": "{count} revoked key(s) hidden (they are gone on the site and must not be delivered again)",
       "modelLoading": "Loading models…",
-      "modelFetchFailed": "Could not load the model list; you can type one manually",
+      "modelFetchFailed": "Could not load the model list; you can type one manually, or retry after signing in",
+      "modelRetry": "Retry",
+      "modelRetrying": "Retrying…",
       "modelEmpty": "This group has no available models; you can type one manually"
     },
     "gatewayMode": {
