@@ -532,11 +532,16 @@ export default function SettingsPage() {
         };
       }
     },
-    onSuccess: async ({ saved, autostart, autostartError }) => {
+    onSuccess: async ({ saved, autostart, autostartError, gatewayError, gateway }) => {
       setError(null);
+      // M41-S1 复审 P1：网关动作失败也是「设置已保存」之后的事实，**必须**显示；
+      // 同时把卡片缓存改成后端返回的当前状态，避免旧缓存继续显示「运行中/旧 URL」。
+      qc.setQueryData(["gateway"], gateway);
       // 两件事分开说（M8-S5B §6.10）：设置**已保存**（这是事实，先讲清楚），
-      // 自启的同步结果是另一件事——失败或状态不一致都单独说一句。
-      if (autostartError !== null) {
+      // 自启/网关的同步结果是另一件事——失败或状态不一致都单独说一句。
+      if (gatewayError !== null) {
+        setNotice(t("settings.save.gatewayFail", { error: gatewayError }));
+      } else if (autostartError !== null) {
         setNotice(t("settings.save.autostartFail", { error: autostartError }));
       } else if (autostart) {
         const wanted = saved.autostartEnabled ? "enabled" : "disabled";
@@ -551,6 +556,7 @@ export default function SettingsPage() {
       }
       setDraft(saved);
       await qc.invalidateQueries({ queryKey: ["settings"] });
+      await qc.invalidateQueries({ queryKey: ["gateway"] });
       // 重读系统里的实际状态，让上面那句「系统里的实际状态」立刻跟上
       await qc.invalidateQueries({ queryKey: ["autostart-status"] });
     },

@@ -851,7 +851,8 @@
       "dirty": "Unsaved changes",
       "ok": "Saved. Refresh-interval changes take effect on next launch.",
       "autostartFail": "Settings saved, but login-autostart didn't sync: {error}",
-      "autostartMismatch": "Settings saved, but the actual autostart state is \"{state}\", inconsistent with the setting."
+      "autostartMismatch": "Settings saved, but the actual autostart state is \"{state}\", inconsistent with the setting.",
+      "gatewayFail": "Settings saved, but the gateway failed to restart with the new settings (stopped): {error}"
     },
     "validate": {
       "refresh": "Refresh interval must be an integer between 0 and 86400 seconds (0 = off).",
@@ -947,7 +948,11 @@
       "title": "Gateway metrics",
       "notRunning": "Gateway is not running — no metrics.",
       "mode": "Routing mode",
-      "modeValue": { "single": "Single upstream", "multi": "Multi-site routing", "stopped": "Not running" },
+      "modeValue": {
+        "single": "Single upstream",
+        "multi": "Multi-site routing",
+        "stopped": "Not running"
+      },
       "qps": "QPS (last 60s)",
       "requests": "Requests",
       "inflight": "In flight",
@@ -956,9 +961,23 @@
       "lastError": "Last error",
       "none": "None",
       "singleUpstream": "Single-upstream mode: no candidate list.",
-      "candidate": { "site": "Site", "key": "Key", "health": "Health", "breaker": "Breaker" },
-      "health": { "healthy": "Healthy", "unknown": "Unknown", "exhausted": "Exhausted" },
-      "breaker": { "closed": "Closed", "open": "Open", "halfOpen": "Half-open", "unknown": "Unknown" }
+      "candidate": {
+        "site": "Site",
+        "key": "Key",
+        "health": "Health",
+        "breaker": "Breaker"
+      },
+      "health": {
+        "healthy": "Healthy",
+        "unknown": "Unknown",
+        "exhausted": "Exhausted"
+      },
+      "breaker": {
+        "closed": "Closed",
+        "open": "Open",
+        "halfOpen": "Half-open",
+        "unknown": "Unknown"
+      }
     },
     "phase": {
       "running": "Status: running",
