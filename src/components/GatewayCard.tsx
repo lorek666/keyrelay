@@ -63,7 +63,8 @@ function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
     );
   }
   const candidates = status.candidates ?? [];
-  const qps = status.requestsTotal < 3 ? null : status.qps;
+  const requestsTotal = status.requestsTotal ?? 0;
+  const qps = requestsTotal < 3 ? null : status.qps;
   const badge = (kind: "ok" | "warn" | "danger") => `badge badge-${kind}`;
   return (
     <div className="gateway-metrics">
@@ -74,7 +75,7 @@ function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
         <dt>{t("gateway.metrics.qps")}</dt>
         <dd className="mono">{qps === null ? "—" : qps.toFixed(1)}</dd>
         <dt>{t("gateway.metrics.requests")}</dt>
-        <dd className="mono">{status.requestsTotal}</dd>
+        <dd className="mono">{requestsTotal}</dd>
         <dt>{t("gateway.metrics.inflight")}</dt>
         <dd className="mono">{status.inflight}</dd>
         <dt>{t("gateway.metrics.failovers")}</dt>

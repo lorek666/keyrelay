@@ -1086,6 +1086,9 @@ pub struct GatewayHandle {
     breaker: Arc<Mutex<Breaker>>,
     /// M40-S2：候选列表的来源（`runtime` 为 `None` 时用装配时的 route）。
     route: RouteTable,
+    /// M40-S2：legacy 单上游的站点/密钥 id（`route` 为空时作为唯一候选）。
+    legacy_site_id: i64,
+    legacy_key_id: Option<i64>,
 }
 
 impl std::fmt::Debug for GatewayHandle {
@@ -1147,6 +1150,16 @@ impl GatewayHandle {
             None => self.route.clone(),
         };
         let now = Instant::now();
+        if route.is_empty() {
+            // spec §6.4：**单上游 legacy ⇒ 恰好 1 条候选**（siteId/keyId 来自启动参数）。
+            // health 无数据可依 ⇒ "unknown"（不编造「健康」）。
+            return vec![GatewayCandidateSnapshot {
+                site_id: self.legacy_site_id,
+                key_id: self.legacy_key_id,
+                health: "unknown",
+                breaker: breaker_label(&self.breaker, self.legacy_site_id, now),
+            }];
+        }
         route
             .all_candidates()
             .into_iter()
@@ -1412,6 +1425,8 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
         runtime: runtime_for_handle,
         breaker,
         route: route_for_handle,
+        legacy_site_id: config.site_id,
+        legacy_key_id: config.key_id,
     })
 }
 
@@ -3086,6 +3101,8 @@ mod tests {
             runtime: None,
             breaker: Arc::new(Mutex::new(Breaker::new(BreakerPolicy::default()))),
             route: RouteTable::default(),
+            legacy_site_id: 0,
+            legacy_key_id: None,
         };
         handle.shutdown_and_wait().await;
     }
