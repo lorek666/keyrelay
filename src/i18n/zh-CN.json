@@ -1018,7 +1018,12 @@
       "appliedOk": "已改指网关",
       "unmappedStrong": "无法识别通道"
     },
-    "copyFail": "复制失败（{error}）——请手动选中上面的令牌文本。"
+    "copyFail": "复制失败（{error}）——请手动选中上面的令牌文本。",
+    "collectModelsLabel": "采集站点模型目录（用于模型变化通知与跨站选路）",
+    "collectModelsHint": "独立开关：多站路由关闭时仍会采集（供模型变化通知），但网关不使用模型目录。",
+    "modelsIntervalLabel": "采集间隔（秒，30–86400）",
+    "modelsIntervalHint": "每个站点两次采集之间的最短间隔；越界的输入会在失焦时被钳制到 30–86400。",
+    "modelsIntervalClamped": "输入超出范围，已钳制到 30–86400。"
   },
   "confirm": {
     "cancel": "取消",

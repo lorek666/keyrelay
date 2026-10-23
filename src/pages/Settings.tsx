@@ -944,10 +944,18 @@ export default function SettingsPage() {
             enabled={draft.gatewayEnabled}
             port={draft.gatewayPort}
             multiSite={draft.gatewayMultiSite}
+            collectModels={draft.collectModels}
+            modelsMinIntervalSecs={draft.modelsMinIntervalSecs}
             onToggle={(enabled) => setDraft({ ...draft, gatewayEnabled: enabled })}
             onPortChange={(port) => setDraft({ ...draft, gatewayPort: port })}
             onMultiSiteChange={(multiSite) =>
               setDraft({ ...draft, gatewayMultiSite: multiSite })
+            }
+            onCollectModelsChange={(collectModels) =>
+              setDraft({ ...draft, collectModels })
+            }
+            onModelsIntervalChange={(modelsMinIntervalSecs) =>
+              setDraft({ ...draft, modelsMinIntervalSecs })
             }
             settingsDirty={dirty}
           />

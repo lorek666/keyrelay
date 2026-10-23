@@ -98,6 +98,47 @@ impl RouteTable {
         ordered(self.upstreams.iter())
     }
 
+    /// 该路由表**能枚举出来**的模型名（升序、去重）。M39-S2 §4.1。
+    ///
+    /// **这是「枚举」而不是「可达性判据」**：`models` 为空的站点（= 目录未知，M8-S1 §4.2 的
+    /// fail-open）不贡献任何模型名，但它**依然是候选**——所以「列表里没有 `m`」不等于
+    /// 「`m` 会 404」。可达性判据只看 [`Self::supports_model`]。
+    pub fn available_models(&self) -> Vec<String> {
+        let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for upstream in &self.upstreams {
+            out.extend(upstream.models.iter().cloned());
+        }
+        for (alias, real) in &self.aliases {
+            // 别名与它的真实名都只在**可服务**时列出：指向不存在模型的别名列出来
+            // 就是伪造候选（M39-S2 §6）。
+            let serviceable = self
+                .upstreams
+                .iter()
+                .any(|u| u.models.is_empty() || u.models.iter().any(|m| m == real));
+            if !serviceable {
+                continue;
+            }
+            out.insert(alias.clone());
+            // 真实名只为「有明确目录」的上游列出：通配（空 models）站点没有可枚举的名字。
+            if self
+                .upstreams
+                .iter()
+                .any(|u| u.models.iter().any(|m| m == real))
+            {
+                out.insert(real.clone());
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// 该模型**是否可能**被服务（M39-S2 §4.1）：**与 [`Self::candidates`] 同源**。
+    ///
+    /// `true` ⇒ 至少一个上游可能服务它（含**目录未知**的上游——fail-open）；
+    /// `false` ⇒ 每个上游都有明确目录且都不含它（这时调用方才可以 404）。
+    pub fn supports_model(&self, model: &str) -> bool {
+        !self.candidates(model).is_empty()
+    }
+
     /// 表里出现过的全部 `key_ref`（**去重**，按首次出现顺序）。
     ///
     /// 用途（M16-S4 / P3-9）：`gateway::start()` 的集合不变式——
@@ -556,5 +597,76 @@ mod tests {
             !b.try_take_half_open_probe(1, t0),
             "Open（冷却未过）不放探针"
         );
+    }
+
+    // ============================================================ M39-S2：available_models / supports_model
+
+    fn upstream_of(site_id: i64, models: &[&str]) -> Upstream {
+        Upstream {
+            site_id,
+            base_url: format!("https://s{site_id}.example.com"),
+            key_ref: format!("kr/key/{site_id}/secret"),
+            models: models.iter().map(|m| (*m).to_string()).collect(),
+            rate: None,
+            balance_usd: None,
+            latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn available_models_unions_dedupes_and_sorts() {
+        let route = RouteTable::new(vec![
+            upstream_of(1, &["b", "a"]),
+            upstream_of(2, &["a", "c"]),
+        ])
+        .with_alias("fast", "c");
+        assert_eq!(
+            route.available_models(),
+            vec!["a", "b", "c", "fast"],
+            "并集 + 去重 + 字节序；别名（可服务）要列出"
+        );
+    }
+
+    #[test]
+    fn available_models_includes_only_serviceable_aliases() {
+        let route = RouteTable::new(vec![upstream_of(1, &["a"])]).with_alias("old", "retired");
+        assert_eq!(route.available_models(), vec!["a"], "不可服务的别名不列");
+        assert!(!route.supports_model("old"), "不可服务的别名不路由");
+        assert!(route.supports_model("a"));
+        assert!(
+            !route.supports_model("zzz"),
+            "全部目录明确且不含 ⇒ 不可服务"
+        );
+    }
+
+    #[test]
+    fn available_models_is_empty_for_an_empty_route() {
+        assert!(RouteTable::new(vec![]).available_models().is_empty());
+    }
+
+    /// 关键语义（M39-S2 §4.1/§4.3）：**空 models = 未知 ⇒ 通配**。
+    /// 空目录站点不贡献名字，但它让**任何**模型都「可能可服务」⇒ 不能本地 404。
+    #[test]
+    fn an_unknown_catalog_site_makes_every_model_maybe_serviceable() {
+        let route = RouteTable::new(vec![upstream_of(1, &["a"]), upstream_of(2, &[])]);
+        assert_eq!(route.available_models(), vec!["a"], "通配站点不贡献名字");
+        assert!(
+            route.supports_model("zzz"),
+            "有未知目录上游 ⇒ 任何模型都可能可服务（fail-open）"
+        );
+        assert_eq!(route.candidates("zzz").len(), 1, "候选里就是那个空目录站点");
+    }
+
+    #[test]
+    fn supports_model_follows_the_same_matching_as_candidates() {
+        let route = RouteTable::new(vec![upstream_of(1, &["a"]), upstream_of(2, &["b"])])
+            .with_alias("alias-b", "b");
+        for model in ["a", "b", "alias-b", "zzz", ""] {
+            assert_eq!(
+                !route.candidates(model).is_empty(),
+                route.supports_model(model),
+                "两处判据必须同源：{model}"
+            );
+        }
     }
 }

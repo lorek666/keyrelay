@@ -987,6 +987,28 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
     .into_response()
 }
 
+/// M39-S2：`GET /v1/models` 的本地聚合响应（标准 OpenAI list 形状）。
+///
+/// **只有** `id` / `object` / `created` / `owned_by` 四个键：
+/// 不含站点 id、域名、显示名、倍率、余额、`key_ref`（安全红线，逐键断言在
+/// `tests/gateway_models.rs::models_payload_has_only_id_object_created_owned_by`）。
+/// `created: 0` = 未知（本产品不掌握模型的真实创建时间，**不编**时间戳）。
+/// 不写事件、不打日志：模型目录不该成为可观测的拓扑面。
+fn models_list_response(models: &[String]) -> axum::response::Response {
+    let data: Vec<serde_json::Value> = models
+        .iter()
+        .map(|id| {
+            serde_json::json!({
+                "id": id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "tianshu-relay",
+            })
+        })
+        .collect();
+    axum::Json(serde_json::json!({ "object": "list", "data": data })).into_response()
+}
+
 async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     // ① 令牌校验：不通过就**不转发**
     if !constant_time_eq(
@@ -1043,6 +1065,17 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     // 之后所有 route / keys_by_ref 的读取都走 `view`——否则会分叉成「一半按新路由、
     // 一半按旧路由」。`runtime == None` 时它借用 `config`，与加这个字段之前逐字相同。
     let view = state.config.view();
+
+    // ②′ M39-S2：`GET /v1/models` 在**非空路由 + 目录非空**时**本地聚合**（不向上游发请求）。
+    //
+    // 判定顺序（spec §4.2）：非该路径 → 空路由（走 legacy）→ 目录为空（回退到既有透传）→ 聚合。
+    // 目录为空时的「旧透传」= 落到下面的 ④（`all_candidates()` 的第一个），与加本分支之前逐字一致。
+    if method == axum::http::Method::GET && path == "/v1/models" && !view.route().is_empty() {
+        let models = view.route().available_models();
+        if !models.is_empty() {
+            return models_list_response(&models);
+        }
+    }
 
     // ③ 空路由表 ⇒ 单上游时代的**逐字节相同**行为：不解析 body、不查 `keys_by_ref`、
     //    不查熔断、不写失败事件、只发一次请求。

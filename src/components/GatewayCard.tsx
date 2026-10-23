@@ -23,9 +23,15 @@ type Props = {
   port: number;
   /** 跨站选路开关（M16-S6b：此前只有 DTO 字段，界面不可达）。 */
   multiSite: boolean;
+  /** 模型目录采集开关（M39-S2）：独立于 multiSite，同时服务 ModelsChanged 通知与网关目录。 */
+  collectModels: boolean;
+  /** 采集节流间隔（秒，M39-S2）：30..=86400。 */
+  modelsMinIntervalSecs: number;
   onToggle: (enabled: boolean) => void;
   onPortChange: (port: number) => void;
   onMultiSiteChange: (enabled: boolean) => void;
+  onCollectModelsChange: (enabled: boolean) => void;
+  onModelsIntervalChange: (secs: number) => void;
   /** 设置还没保存时提示用户先保存（端口要保存后才生效） */
   settingsDirty: boolean;
 };
@@ -41,9 +47,13 @@ export default function GatewayCard({
   enabled,
   port,
   multiSite,
+  collectModels,
+  modelsMinIntervalSecs,
   onToggle,
   onPortChange,
   onMultiSiteChange,
+  onCollectModelsChange,
+  onModelsIntervalChange,
   settingsDirty,
 }: Props) {
   const { t } = useTranslation();
@@ -57,6 +67,15 @@ export default function GatewayCard({
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [rotated, setRotated] = useState(false);
+  // 采集间隔的**输入框草稿**：允许用户先输 `5` 再输 `50`，失焦时才钳制到 [30, 86400]。
+  const [intervalText, setIntervalText] = useState(String(modelsMinIntervalSecs));
+  const [clamped, setClamped] = useState(false);
+  // M39-S2 复审补充：后端重新加载 / 保存成功后 `modelsMinIntervalSecs` 会变，
+  // 输入框必须跟着走（否则显示的是首次挂载时的旧值）。钳制提示同时复位。
+  useEffect(() => {
+    setIntervalText(String(modelsMinIntervalSecs));
+    setClamped(false);
+  }, [modelsMinIntervalSecs]);
 
   const token = status.data?.token ?? "";
 
@@ -279,6 +298,47 @@ export default function GatewayCard({
         <span>{t("gateway.multiSiteLabel")}</span>
       </label>
       <p className="muted">{t("gateway.multiSiteHint")}</p>
+
+      {/*
+        模型目录采集（M39-S2）。**独立开关**：它同时服务两件事——
+        ① `ModelsChanged` 通知（M14-S1 起就有）；② 网关的跨站选路目录（M39-S1）。
+        所以多站关闭时**仍然采集**（只是网关不用目录），这里不静默禁用、也不写
+        「仅多站模式下生效」——那会误导用户以为关掉多站就没必要采集。
+      */}
+      <label className="checkline">
+        <input
+          type="checkbox"
+          checked={collectModels}
+          onChange={(e) => onCollectModelsChange(e.target.checked)}
+        />
+        <span>{t("gateway.collectModelsLabel")}</span>
+      </label>
+      <p className="muted">{t("gateway.collectModelsHint")}</p>
+
+      <label className="field">
+        <span>{t("gateway.modelsIntervalLabel")}</span>
+        <input
+          className="input settings-inline-field"
+          type="number"
+          min={30}
+          max={86400}
+          step={1}
+          value={intervalText}
+          onChange={(e) => setIntervalText(e.target.value)}
+          // 越界/非数字 ⇒ **失焦时钳制**并提示（不边打边改，否则用户输 `5` 想输 `50` 会被打断）
+          onBlur={() => {
+            const parsed = Number(intervalText);
+            const clamped = Number.isFinite(parsed)
+              ? Math.min(86400, Math.max(30, Math.trunc(parsed)))
+              : 1800;
+            setIntervalText(String(clamped));
+            setClamped(clamped !== parsed || String(clamped) !== intervalText);
+            if (clamped !== modelsMinIntervalSecs) onModelsIntervalChange(clamped);
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.modelsIntervalHint")}</p>
+      {clamped ? <p className="muted">{t("gateway.modelsIntervalClamped")}</p> : null}
 
       <label className="field">
         <span>{t("gateway.portLabel")}</span>
