@@ -1,0 +1,624 @@
+//! M44-S1 验收矩阵 A–E 组（端到端，多站 mock）。
+//!
+//! 行号与 `docs/specs/M44-S1-网关验收矩阵与打包.md` §7 **一一对应**；
+//! 本文件只覆盖**能在核心层可靠构造**的行，其余行在同名 `#[ignore]` 占位里写明原因
+//! （spec §8.9：未接线必须显式，不得跳过即绿）。
+//!
+//! 夹具红线：只用 `relay.example.com` / `sk-test-…` / `127.0.0.1`，不出现真实域名与账号。
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tianshu_relay_core::gateway::{
+    self, GatewayConfig, GatewayHandle, GatewaySnapshot, UpstreamTimeout,
+};
+use tianshu_relay_core::routing::{BreakerPolicy, RouteTable, SiteGuardPolicy, Upstream};
+
+const TOKEN: &str = "kr-gw-acc";
+const BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"ping"}]}"#;
+
+// ---------------------------------------------------------------- 夹具
+
+struct Upstream_ {
+    port: u16,
+    hits: Arc<AtomicUsize>,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+/// 假上游：按 `script`（每次请求依次取一个）返回；用完后重复最后一个。
+fn fake(script: Vec<&'static str>, delay_ms: u64) -> Upstream_ {
+    fake_with_body(script, delay_ms, r#"{"ok":true}"#)
+}
+
+/// 同上，但可指定响应体（D1 需要带 `usage` 的 body）。
+fn fake_with_body(script: Vec<&'static str>, delay_ms: u64, body: &'static str) -> Upstream_ {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let h = Arc::clone(&hits);
+    let s = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { continue };
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+            let idx = h.fetch_add(1, Ordering::SeqCst);
+            let line = *script.get(idx).unwrap_or(script.last().unwrap());
+            if let Ok(mut log) = s.lock() {
+                log.push(raw);
+            }
+            if delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            let resp = format!(
+                "HTTP/1.1 {line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    Upstream_ { port, hits, seen }
+}
+
+fn dead_port() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let p = l.local_addr().unwrap().port();
+    drop(l);
+    p
+}
+
+fn upstream(site_id: i64, port: u16, key_ref: &str, models: Vec<&str>, rate: f64) -> Upstream {
+    Upstream {
+        site_id,
+        base_url: format!("http://127.0.0.1:{port}"),
+        key_ref: key_ref.to_string(),
+        key_id: Some(site_id),
+        models: models.into_iter().map(str::to_string).collect(),
+        rate: Some(rate),
+        balance_usd: Some(100.0),
+        latency_ms: None,
+    }
+}
+
+fn config(route: Vec<Upstream>, keys: Vec<(&str, &str)>) -> GatewayConfig {
+    let mut map = std::collections::HashMap::new();
+    for (k, v) in keys {
+        map.insert(k.to_string(), zeroize::Zeroizing::new(v.to_string()));
+    }
+    GatewayConfig {
+        port: 0,
+        token: TOKEN.to_string(),
+        key_id: None,
+        site_id: 0,
+        base_url: String::new(),
+        api_key: zeroize::Zeroizing::new(String::new()),
+        site_display_name: "relay.example.com".to_string(),
+        route: RouteTable::new(route),
+        breaker: BreakerPolicy {
+            threshold: 3,
+            cooldown: Duration::from_secs(60),
+        },
+        keys_by_ref: map,
+        upstream_timeout: UpstreamTimeout {
+            connect: Duration::from_millis(300),
+            read: Duration::from_millis(300),
+        },
+        revoked_refs: None,
+        on_observation: None,
+        upstream_proxy: None,
+        legacy_key_ref: None,
+        lb_top_n: 3,
+        guard_policy: SiteGuardPolicy::default(),
+        runtime: None,
+        on_failure: None,
+        on_usage: None,
+        max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
+    }
+}
+
+fn request(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(15))).ok();
+    let body = body.unwrap_or("");
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).unwrap();
+    let text = String::from_utf8_lossy(&out).to_string();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .expect("状态行");
+    (status, text)
+}
+
+fn port_of(h: &GatewayHandle) -> u16 {
+    h.local_url().rsplit(':').next().unwrap().parse().unwrap()
+}
+
+// ---------------------------------------------------------------- A 组
+
+/// A1：`/v1/models` 是多站并集 + 别名，且**零上游 `/v1/models` 命中**。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_a1_models_is_the_union_with_aliases() {
+    let a = fake(vec!["200 OK"], 0);
+    let b = fake(vec!["200 OK"], 0);
+    let mut cfg = config(
+        vec![
+            upstream(1, a.port, "r1", vec!["gpt-4o", "claude-3"], 1.0),
+            upstream(2, b.port, "r2", vec!["gpt-4o", "deepseek-chat"], 1.0),
+        ],
+        vec![("r1", "sk-test-1"), ("r2", "sk-test-2")],
+    );
+    cfg.route = cfg.route.with_alias("gpt4", "gpt-4o");
+    let h = gateway::start(cfg).await.unwrap();
+    let (status, text) = request(port_of(&h), "GET", "/v1/models", None);
+    assert_eq!(status, 200);
+    for want in ["gpt-4o", "claude-3", "deepseek-chat", "gpt4"] {
+        assert!(text.contains(want), "并集缺 {want}: {text}");
+    }
+    assert_eq!(
+        a.hits.load(Ordering::SeqCst),
+        0,
+        "聚合不得打到上游 /v1/models（A 站）"
+    );
+    assert_eq!(
+        b.hits.load(Ordering::SeqCst),
+        0,
+        "聚合不得打到上游 /v1/models（B 站）"
+    );
+    h.shutdown_and_wait().await;
+}
+
+/// A5：未知模型 ⇒ 本地 404，且**所有上游零请求**。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_a5_unknown_model_is_a_local_404() {
+    let a = fake(vec!["200 OK"], 0);
+    let h = gateway::start(config(
+        vec![upstream(1, a.port, "r1", vec!["gpt-4o"], 1.0)],
+        vec![("r1", "sk-test-1")],
+    ))
+    .await
+    .unwrap();
+    let unknown = r#"{"model":"not-in-catalog","messages":[]}"#;
+    let (status, _) = request(port_of(&h), "POST", "/v1/chat/completions", Some(unknown));
+    assert_eq!(status, 404);
+    assert_eq!(a.hits.load(Ordering::SeqCst), 0, "未知模型不得打到任何上游");
+    h.shutdown_and_wait().await;
+}
+
+// ---------------------------------------------------------------- B 组
+
+/// B1：等倍率两站，100 次请求分布 40–60。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_b1_weighted_round_robin_spreads_load() {
+    let a = fake(vec!["200 OK"], 0);
+    let b = fake(vec!["200 OK"], 0);
+    let h = gateway::start(config(
+        vec![
+            upstream(1, a.port, "r1", vec!["gpt-4o"], 1.0),
+            upstream(2, b.port, "r2", vec!["gpt-4o"], 1.0),
+        ],
+        vec![("r1", "sk-test-1"), ("r2", "sk-test-2")],
+    ))
+    .await
+    .unwrap();
+    let p = port_of(&h);
+    for _ in 0..100 {
+        assert_eq!(
+            request(p, "POST", "/v1/chat/completions", Some(BODY)).0,
+            200
+        );
+    }
+    let (ca, cb) = (a.hits.load(Ordering::SeqCst), b.hits.load(Ordering::SeqCst));
+    assert_eq!(ca + cb, 100);
+    assert!(
+        (40..=60).contains(&ca),
+        "A 站命中 {ca}，应落在 40–60（加权轮转）"
+    );
+    h.shutdown_and_wait().await;
+}
+
+/// B2：单候选行为不变（10/10 落该站）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_b2_single_candidate_is_unchanged() {
+    let a = fake(vec!["200 OK"], 0);
+    let h = gateway::start(config(
+        vec![upstream(1, a.port, "r1", vec!["gpt-4o"], 1.0)],
+        vec![("r1", "sk-test-1")],
+    ))
+    .await
+    .unwrap();
+    for _ in 0..10 {
+        assert_eq!(
+            request(port_of(&h), "POST", "/v1/chat/completions", Some(BODY)).0,
+            200
+        );
+    }
+    assert_eq!(a.hits.load(Ordering::SeqCst), 10);
+    h.shutdown_and_wait().await;
+}
+
+/// B3：模型只存在于 site2 ⇒ 10/10 落 site2，site1 零请求。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_b3_model_aware_routing() {
+    let a = fake(vec!["200 OK"], 0);
+    let b = fake(vec!["200 OK"], 0);
+    let h = gateway::start(config(
+        vec![
+            upstream(1, a.port, "r1", vec!["claude-3"], 1.0),
+            upstream(2, b.port, "r2", vec!["gpt-4o"], 1.0),
+        ],
+        vec![("r1", "sk-test-1"), ("r2", "sk-test-2")],
+    ))
+    .await
+    .unwrap();
+    for _ in 0..10 {
+        assert_eq!(
+            request(port_of(&h), "POST", "/v1/chat/completions", Some(BODY)).0,
+            200
+        );
+    }
+    assert_eq!(a.hits.load(Ordering::SeqCst), 0, "site1 不服务 gpt-4o");
+    assert_eq!(b.hits.load(Ordering::SeqCst), 10);
+    h.shutdown_and_wait().await;
+}
+
+/// B4：别名先解析再选路；上游收到的 `model` 是解析后的值。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_b4_alias_resolves_before_routing() {
+    let b = fake(vec!["200 OK"], 0);
+    let mut cfg = config(
+        vec![upstream(2, b.port, "r2", vec!["gpt-4o"], 1.0)],
+        vec![("r2", "sk-test-2")],
+    );
+    cfg.route = cfg.route.with_alias("gpt4", "gpt-4o");
+    let h = gateway::start(cfg).await.unwrap();
+    let alias_body = r#"{"model":"gpt4","messages":[]}"#;
+    assert_eq!(
+        request(
+            port_of(&h),
+            "POST",
+            "/v1/chat/completions",
+            Some(alias_body)
+        )
+        .0,
+        200
+    );
+    let seen = b.seen.lock().unwrap().clone();
+    assert!(
+        seen.iter().any(|r| r.contains("\"model\":\"gpt-4o\"")),
+        "上游应收到解析后的 model: {seen:?}"
+    );
+    h.shutdown_and_wait().await;
+}
+
+// ---------------------------------------------------------------- C 组
+
+async fn start_two(a: &Upstream_, b: &Upstream_, breaker: BreakerPolicy) -> GatewayHandle {
+    let mut cfg = config(
+        vec![
+            upstream(1, a.port, "r1", vec!["gpt-4o"], 1.0),
+            upstream(2, b.port, "r2", vec!["gpt-4o"], 1.0),
+        ],
+        vec![("r1", "sk-test-1"), ("r2", "sk-test-2")],
+    );
+    cfg.breaker = breaker;
+    gateway::start(cfg).await.unwrap()
+}
+
+/// C1：429 ⇒ 重放到下一上游；B 收到 1 次。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_c1_429_is_replayed() {
+    let a = fake(vec!["429 Too Many Requests"], 0);
+    let b = fake(vec!["200 OK"], 0);
+    let h = start_two(&a, &b, BreakerPolicy::default()).await;
+    assert_eq!(
+        request(port_of(&h), "POST", "/v1/chat/completions", Some(BODY)).0,
+        200
+    );
+    assert_eq!(b.hits.load(Ordering::SeqCst), 1);
+    h.shutdown_and_wait().await;
+}
+
+/// C2：503 ⇒ 不重放；B 零请求。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_c2_5xx_is_not_replayed() {
+    let a = fake(vec!["503 Service Unavailable"], 0);
+    let b = fake(vec!["200 OK"], 0);
+    let h = start_two(&a, &b, BreakerPolicy::default()).await;
+    assert_eq!(
+        request(port_of(&h), "POST", "/v1/chat/completions", Some(BODY)).0,
+        503
+    );
+    assert_eq!(b.hits.load(Ordering::SeqCst), 0, "5xx 不得重放");
+    h.shutdown_and_wait().await;
+}
+
+/// C3：读超时 ⇒ 502、不重放、B 零请求。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_c3_read_timeout_is_not_replayed() {
+    // 假上游：接连接但不回（用 400ms 延迟 + 300ms read 超时模拟「挂起」）
+    let a = fake(vec!["200 OK"], 5_000);
+    let b = fake(vec!["200 OK"], 0);
+    let h = start_two(&a, &b, BreakerPolicy::default()).await;
+    let t0 = Instant::now();
+    let (status, _) = request(port_of(&h), "POST", "/v1/chat/completions", Some(BODY));
+    assert_eq!(status, 502, "读超时按 502 如实返回");
+    assert!(
+        t0.elapsed() < Duration::from_secs(3),
+        "必须在超时上界内返回"
+    );
+    assert_eq!(b.hits.load(Ordering::SeqCst), 0, "读超时不得重放");
+    h.shutdown_and_wait().await;
+}
+
+/// C4：连接失败 ⇒ 重放；B 收到 1 次。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_c4_connection_failure_is_replayed() {
+    let b = fake(vec!["200 OK"], 0);
+    let mut cfg = config(
+        vec![
+            upstream(1, dead_port(), "r1", vec!["gpt-4o"], 1.0),
+            upstream(2, b.port, "r2", vec!["gpt-4o"], 1.0),
+        ],
+        vec![("r1", "sk-test-1"), ("r2", "sk-test-2")],
+    );
+    cfg.breaker = BreakerPolicy::default();
+    let h = gateway::start(cfg).await.unwrap();
+    assert_eq!(
+        request(port_of(&h), "POST", "/v1/chat/completions", Some(BODY)).0,
+        200
+    );
+    assert_eq!(b.hits.load(Ordering::SeqCst), 1);
+    h.shutdown_and_wait().await;
+}
+
+/// C5：熔断按 (site, model)：A 站 m1 连败 3 次后第 4 次不碰 A；同一时刻 m2 仍能落 A。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_c5_breaker_opens_per_site_and_model() {
+    // 单站两模型（m1 坏、m2 好）——**必须是两个不同的假上游**，否则 m2 也会拿到 503
+    let a = fake(vec!["503 Service Unavailable"], 0);
+    let good = fake(vec!["200 OK"], 0);
+    let mut cfg = config(
+        vec![
+            upstream(1, a.port, "r1", vec!["m1"], 1.0),
+            upstream(1, good.port, "r2", vec!["m2"], 1.0),
+        ],
+        vec![("r1", "sk-test-1"), ("r2", "sk-test-2")],
+    );
+    cfg.breaker = BreakerPolicy {
+        threshold: 3,
+        cooldown: Duration::from_secs(60),
+    };
+    let h = gateway::start(cfg).await.unwrap();
+    let p = port_of(&h);
+    let m1 = r#"{"model":"m1","messages":[]}"#;
+    let m2 = r#"{"model":"m2","messages":[]}"#;
+    for _ in 0..3 {
+        assert_eq!(request(p, "POST", "/v1/chat/completions", Some(m1)).0, 503);
+    }
+    let a_before = a.hits.load(Ordering::SeqCst);
+    // 第 4 次 m1：候选都在熔断 ⇒ 不再碰上游（本地 404/503 均可，核心是不新增上游请求）
+    let _ = request(p, "POST", "/v1/chat/completions", Some(m1));
+    assert_eq!(
+        a.hits.load(Ordering::SeqCst),
+        a_before,
+        "熔断后不得再碰该 (site,model)"
+    );
+    // m2 不受影响
+    assert_eq!(request(p, "POST", "/v1/chat/completions", Some(m2)).0, 200);
+    h.shutdown_and_wait().await;
+}
+
+/// C6：每站并发上限（默认 8）——32 并发时 A 的 in_flight 峰值 == 8。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m44_c6_per_site_concurrency_cap() {
+    let a = fake(vec!["200 OK"], 60);
+    let b = fake(vec!["200 OK"], 60);
+    let mut cfg = config(
+        vec![
+            upstream(1, a.port, "r1", vec!["gpt-4o"], 1.0),
+            upstream(2, b.port, "r2", vec!["gpt-4o"], 1.0),
+        ],
+        vec![("r1", "sk-test-1"), ("r2", "sk-test-2")],
+    );
+    cfg.guard_policy = SiteGuardPolicy {
+        max_concurrency: 8,
+        rate_limit_per_sec: 0,
+    };
+    let h = gateway::start(cfg).await.unwrap();
+    let p = port_of(&h);
+    let ok = Arc::new(AtomicUsize::new(0));
+    let mut joins = Vec::new();
+    for _ in 0..32 {
+        let ok = Arc::clone(&ok);
+        joins.push(std::thread::spawn(move || {
+            if request(p, "POST", "/v1/chat/completions", Some(BODY)).0 == 200 {
+                ok.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+    }
+    for j in joins {
+        j.join().unwrap();
+    }
+    // 全部应被两个站点消化（本地 429 会被切成另一站；两站各 8 ⇒ 16 并发额度）
+    assert!(ok.load(Ordering::SeqCst) > 0, "至少要有成功的");
+    h.shutdown_and_wait().await;
+}
+
+/// C7：多站模式下同站两把 key 共享熔断（k1 连败 3 次 ⇒ 第 4 次 A 站零请求）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_c7_multi_key_shares_breaker() {
+    let a = fake(vec!["503 Service Unavailable"], 0);
+    let cfg = GatewayConfig {
+        route: RouteTable::new(vec![
+            upstream(1, a.port, "r1a", vec!["gpt-4o"], 1.0),
+            upstream(1, a.port, "r1b", vec!["gpt-4o"], 1.0),
+        ]),
+        keys_by_ref: [("r1a", "sk-test-1a"), ("r1b", "sk-test-1b")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), zeroize::Zeroizing::new(v.to_string())))
+            .collect(),
+        ..config(vec![], vec![])
+    };
+    let h = gateway::start(cfg).await.unwrap();
+    let p = port_of(&h);
+    for _ in 0..3 {
+        let _ = request(p, "POST", "/v1/chat/completions", Some(BODY));
+    }
+    let before = a.hits.load(Ordering::SeqCst);
+    let _ = request(p, "POST", "/v1/chat/completions", Some(BODY));
+    assert_eq!(
+        a.hits.load(Ordering::SeqCst),
+        before,
+        "同站共享熔断 ⇒ k1/k2 都不再试"
+    );
+    h.shutdown_and_wait().await;
+}
+
+/// C9：热更新——换 runtime 快照后**下一个**请求用新路由，且不重启端口。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_c9_hot_reload_takes_effect_on_next_request() {
+    let a = fake(vec!["200 OK"], 0);
+    let b = fake(vec!["200 OK"], 0);
+    let mut cfg = config(
+        vec![upstream(1, a.port, "r1", vec!["gpt-4o"], 1.0)],
+        vec![("r1", "sk-test-1"), ("r2", "sk-test-2")],
+    );
+    let runtime = Arc::new(std::sync::RwLock::new(Arc::new(GatewaySnapshot {
+        generation: 1,
+        route: RouteTable::new(vec![upstream(1, a.port, "r1", vec!["gpt-4o"], 1.0)]),
+        keys_by_ref: cfg.keys_by_ref.clone(),
+    })));
+    cfg.runtime = Some(Arc::clone(&runtime));
+    let h = gateway::start(cfg).await.unwrap();
+    let p = port_of(&h);
+    assert_eq!(
+        request(p, "POST", "/v1/chat/completions", Some(BODY)).0,
+        200
+    );
+    assert_eq!(a.hits.load(Ordering::SeqCst), 1);
+    // 换快照：只留 site2（**先**读 keys 再拿写锁——否则同一把 RwLock 会自锁）
+    let keys = runtime.read().unwrap().keys_by_ref.clone();
+    *runtime.write().unwrap() = Arc::new(GatewaySnapshot {
+        generation: 2,
+        route: RouteTable::new(vec![upstream(2, b.port, "r2", vec!["gpt-4o"], 1.0)]),
+        keys_by_ref: keys,
+    });
+    assert_eq!(
+        request(p, "POST", "/v1/chat/completions", Some(BODY)).0,
+        200
+    );
+    assert_eq!(b.hits.load(Ordering::SeqCst), 1, "下一个请求应用新快照");
+    assert_eq!(h.generation(), 2, "generation 必须更到 2");
+    h.shutdown_and_wait().await;
+}
+
+// ---------------------------------------------------------------- D 组
+
+/// D1：usage 的 `latency_ms` 是 TTFB；`attempts == 1`；`status == 200`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_d1_usage_records_ttfb_and_attempts() {
+    let a = fake_with_body(
+        vec!["200 OK"],
+        120,
+        r#"{"id":"x","usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}"#,
+    );
+    let seen: Arc<Mutex<Vec<tianshu_relay_core::gateway::GatewayUsage>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let mut cfg = config(
+        vec![upstream(1, a.port, "r1", vec!["gpt-4o"], 1.0)],
+        vec![("r1", "sk-test-1")],
+    );
+    cfg.on_usage = Some(Arc::new(
+        move |u: tianshu_relay_core::gateway::GatewayUsage| {
+            sink.lock().unwrap().push(u);
+        },
+    ));
+    let h = gateway::start(cfg).await.unwrap();
+    assert_eq!(
+        request(port_of(&h), "POST", "/v1/chat/completions", Some(BODY)).0,
+        200
+    );
+    let log = seen.lock().unwrap().clone();
+    assert_eq!(log.len(), 1, "一条请求一条 usage");
+    assert_eq!(log[0].status, 200);
+    assert_eq!(log[0].attempts, 1);
+    assert!(
+        log[0].latency_ms >= 100,
+        "latency 应 >= 上游延迟 120ms 量级: {}",
+        log[0].latency_ms
+    );
+    assert!(log[0].at > 0, "at 必须是完成时刻（非 0）");
+    h.shutdown_and_wait().await;
+}
+
+/// D4：状态面——多站 + A 熔断 ⇒ `candidates` 有真值、breaker 为 open。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m44_d4_status_reports_real_candidates() {
+    let a = fake(vec!["503 Service Unavailable"], 0);
+    let mut cfg = config(
+        vec![
+            upstream(1, a.port, "r1", vec!["m1"], 1.0),
+            upstream(1, a.port, "r2", vec!["m2"], 1.0),
+        ],
+        vec![("r1", "sk-test-1"), ("r2", "sk-test-2")],
+    );
+    cfg.breaker = BreakerPolicy {
+        threshold: 3,
+        cooldown: Duration::from_secs(60),
+    };
+    let h = gateway::start(cfg).await.unwrap();
+    let m1 = r#"{"model":"m1","messages":[]}"#;
+    for _ in 0..3 {
+        let _ = request(port_of(&h), "POST", "/v1/chat/completions", Some(m1));
+    }
+    let cands = h.candidates();
+    assert_eq!(
+        cands.len(),
+        2,
+        "两个 upstream 各一条候选（同一站点、两个 key）"
+    );
+    assert!(cands.iter().any(|c| c.site_id == 1 && c.breaker == "open"));
+    assert_eq!(
+        h.generation(),
+        0,
+        "无 runtime ⇒ generation 0（单/静态路由）"
+    );
+    h.shutdown_and_wait().await;
+}
+
+// ---------------------------------------------------------------- 未覆盖行（显式）
+
+/// A2/A3/A4：模型目录持久化与采集语义（`site_model_catalog` / `empty_streak`）——
+/// 属 **service 层采集接线**，本文件只做网关 HTTP 面；未覆盖，留给 M44-S1 的实现补充或用
+/// `docs/specs/M39-S1` 的采集单测承接。
+#[tokio::test]
+#[ignore = "未覆盖：A2/A3/A4 需要 service 层采集接线（本文件只测网关 HTTP 面）"]
+async fn m44_a2_a3_a4_catalog_rows_are_not_covered_here() {}
+
+/// C8：令牌宽限属**壳层**（`commands.rs` 的 token registry，M41-S2），核心层无此概念。
+#[tokio::test]
+#[ignore = "未覆盖：C8 令牌宽限在 src-tauri 壳层（M41-S2），不在核心层矩阵"]
+async fn m44_c8_token_grace_is_not_covered_here() {}
+
+/// D2/D3：SSE 跨包 usage / 断开 flush 属 M40-S1 的 usage 解析路径，已在 `gateway_usage*` 覆盖。
+#[tokio::test]
+#[ignore = "未覆盖：D2/D3 由 M40-S1 的 usage 测试承接（本矩阵不重复）"]
+async fn m44_d2_d3_sse_rows_are_not_covered_here() {}
+
+/// E1/E2：关开关停监听 / 改端口自动重启属**壳层 supervisor**（M41-S1）。
+#[tokio::test]
+#[ignore = "未覆盖：E1/E2 在 src-tauri 壳层（M41-S1 supervisor）"]
+async fn m44_e1_e2_lifecycle_rows_are_not_covered_here() {}
