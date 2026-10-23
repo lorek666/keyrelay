@@ -350,8 +350,8 @@ async fn parse_failure_and_stream_never_touch_the_upstream() {
     assert_eq!(status, 400, "{resp}");
     assert!(resp.contains("reasoning"), "必须点名: {resp}");
 
-    // ② stream:true
-    let body = json!({ "model": "m", "max_tokens": 1, "messages": [], "stream": true }).to_string();
+    // ② 另一个不支持字段（流式已由 M42-S2b 支持，不再是拒绝理由）
+    let body = json!({ "model": "m", "max_tokens": 1, "messages": [], "thinking": {} }).to_string();
     let (status, resp) = tokio::task::spawn_blocking({
         let (url, token) = (url.clone(), token.clone());
         move || http_post(&url, &token, "/v1/messages", &body)
@@ -359,7 +359,7 @@ async fn parse_failure_and_stream_never_touch_the_upstream() {
     .await
     .unwrap();
     assert_eq!(status, 400, "{resp}");
-    assert!(resp.contains("M42-S2b"), "必须点名 S2b: {resp}");
+    assert!(resp.contains("thinking"), "必须点名: {resp}");
 
     assert_eq!(
         up.count(),
@@ -507,28 +507,4 @@ async fn gemini_tool_result_reaches_the_upstream_as_a_tool_message() {
 
 // ---------------------------------------------------------------- 复审 P2-4：Gemini 流式 ⇒ 400（不是 404）
 
-#[tokio::test]
-async fn gemini_streaming_is_rejected_with_the_s2b_hint_not_404() {
-    let up = spawn_upstream("200 OK", &chat_response_text("不该被调用"));
-    let h = start_legacy(&up).await;
-    let token = h.token.clone();
-    let url = format!("http://{}", h.addr);
-
-    for path in [
-        "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
-        "/v1beta/models/gemini-2.5-pro:generateContent?alt=sse",
-    ] {
-        let (status, resp) = tokio::task::spawn_blocking({
-            let (url, token) = (url.clone(), token.clone());
-            let body = json!({ "contents": [] }).to_string();
-            move || http_post(&url, &token, path, &body)
-        })
-        .await
-        .unwrap();
-        assert_eq!(status, 400, "必须 400（不是 404）: {path} → {resp}");
-        assert!(resp.contains("M42-S2b"), "必须点名 S2b: {resp}");
-    }
-    assert_eq!(up.count(), 0, "流式拒绝不能碰上游");
-
-    h.shutdown_and_wait().await;
-}
+// （`?alt=sse` 的 400 断言已由 M42-S2b 取代：现在真的走流式，见 gateway_translate_stream_e2e.rs）

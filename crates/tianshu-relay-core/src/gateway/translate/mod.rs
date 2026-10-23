@@ -11,6 +11,7 @@ pub mod detect;
 pub mod gemini;
 pub mod ir;
 pub mod responses;
+pub mod stream;
 
 pub use detect::{detect, Protocol};
 pub use ir::*;
@@ -54,19 +55,17 @@ pub(crate) fn reject_unknown(
 pub fn parse_request(protocol: Protocol, body: &[u8]) -> Result<ChatRequest, TranslateError> {
     let v: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| TranslateError::new("invalid_json", format!("请求体不是 JSON: {e}")))?;
-    if v.get("stream").and_then(|x| x.as_bool()) == Some(true) {
-        return Err(TranslateError::new(
-            "streaming_not_supported",
-            "流式尚未支持（M42-S2b）；请先以 stream:false 调用",
-        ));
-    }
-    match protocol {
+    let want_stream = v.get("stream").and_then(|x| x.as_bool()) == Some(true);
+    let mut req = match protocol {
         Protocol::OpenAiResponses => responses::parse_request(&v),
         Protocol::AnthropicMessages => anthropic::parse_request(&v),
         Protocol::GeminiGenerateContent => gemini::parse_request(&v),
         // Chat 不进本模块；真进来了就按「无需翻译」处理
         Protocol::OpenAiChat => Err(TranslateError::new("internal", "Chat 请求不应进入翻译层")),
-    }
+    }?;
+    // M42-S2b：流式由入站 body 的 `stream:true`（Gemini 是 `?alt=sse`）决定。
+    req.stream = req.stream || want_stream;
+    Ok(req)
 }
 
 /// IR → 入站协议的响应 JSON。
