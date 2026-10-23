@@ -776,6 +776,7 @@ fn refresh_all_reports_sites_that_need_a_login() {
 
 #[test]
 fn gateway_stop_then_start_on_the_same_port_succeeds() {
+    let _serial = gateway_test_guard();
     use tauri::Manager;
 
     let (_app, webview) = build_app();
@@ -828,6 +829,7 @@ fn gateway_stop_then_start_on_the_same_port_succeeds() {
 
 #[test]
 fn gateway_stop_is_bounded_even_with_an_in_flight_request() {
+    let _serial = gateway_test_guard();
     // 处置 M5-S4 复审 P2-1：`shutdown_and_wait()` 没有上界 ——
     // 上游卡住且仍有客户端在等时，它要等在途连接收尾才返回，而命令层
     // 正握着 `gateway_op` 操作锁，会把后续 start/stop 一起挂死。
@@ -1145,6 +1147,7 @@ fn gateway_rotate_token_reaches_the_business_path() {
 
 #[test]
 fn gateway_rotate_token_refuses_mismatched_key_and_keeps_gateway_running() {
+    let _serial = gateway_test_guard();
     // P1-6 完整修复：网关在跑时，rotate 用运行态记录的 site_id/key_id，不用命令参数。
     // 切页后 args 带错的密钥 ⇒ 一致性校验拒绝，且网关不被停（令牌没换、继续跑）。
     use tauri::Manager;
@@ -1229,6 +1232,7 @@ fn gateway_rotate_token_refuses_mismatched_key_and_keeps_gateway_running() {
 
 #[test]
 fn gateway_rotate_token_restarts_the_running_gateway_with_the_new_token() {
+    let _serial = gateway_test_guard();
     // P2-7 / DEBUG-REPORT-v3 §2-7：rotate 之后运行中的网关要用**新令牌**。旧实现在
     // rotate 之前构造 config，start 用旧令牌，网关仍认旧令牌 ⇒ 指向网关的 agent
     //（新令牌）401/502，直到手动重启。现在 rotate 后重新构造 config。
@@ -1844,6 +1848,16 @@ fn free_port() -> u16 {
     probe.local_addr().expect("读端口").port()
 }
 
+/// 串行化**真正绑定监听端口**的网关测试。
+///
+/// `free_port()` 是「绑 0 → 读端口 → 放掉」：两个并发测试可能先后拿到同一个端口，
+/// 后启动的那个会把前一个的 `!connect_ok()` 断言打红（M41-S1 合入主仓后实测到一次）。
+/// 这里用进程内互斥把窗口关掉；不改变生产代码，也不影响其余不碰端口的测试。
+fn gateway_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn connect_ok(port: u16) -> bool {
     std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
 }
@@ -1855,6 +1869,7 @@ fn read_settings(webview: &tauri::WebviewWindow<tauri::test::MockRuntime>) -> Va
 /// M41-S1 §7.2-1：关 `gateway_enabled` ⇒ **返回后端口不再监听** + `phase == "stopped"`。
 #[test]
 fn update_settings_disabling_the_gateway_stops_the_port() {
+    let _serial = gateway_test_guard();
     let (_app, webview) = build_app();
     let (site, key_id) = seed_gateway_site(&webview);
     let port = free_port();
@@ -1891,6 +1906,7 @@ fn update_settings_disabling_the_gateway_stops_the_port() {
 /// M41-S1 §7.2-2：运行中改端口 ⇒ 旧端口关、新端口开，且站点/密钥仍是**运行态**那一组。
 #[test]
 fn update_settings_port_change_restarts_on_the_new_port() {
+    let _serial = gateway_test_guard();
     let (_app, webview) = build_app();
     let (site, key_id) = seed_gateway_site(&webview);
     let old_port = free_port();
@@ -1938,6 +1954,7 @@ fn update_settings_port_change_restarts_on_the_new_port() {
 /// 且**设置已保存**（不允许「保存成功但网关静默死掉」）。
 #[test]
 fn update_settings_restart_failure_reports_error_and_keeps_settings() {
+    let _serial = gateway_test_guard();
     let (_app, webview) = build_app();
     let (site, key_id) = seed_gateway_site(&webview);
     let old_port = free_port();
@@ -1996,6 +2013,7 @@ fn update_settings_restart_failure_reports_error_and_keeps_settings() {
 /// 这里钉住的是「正常停止之后**不会**报 running，也不会谎报 crashed」。
 #[test]
 fn gateway_status_never_reports_a_stopped_gateway_as_running() {
+    let _serial = gateway_test_guard();
     let (_app, webview) = build_app();
     let (site, key_id) = seed_gateway_site(&webview);
     let port = free_port();

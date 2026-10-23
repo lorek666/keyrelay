@@ -43,6 +43,8 @@ const checks = [
   {
     label: "gateway_stop",
     body: blockAfter(commands, "pub async fn gateway_stop", "gateway_stop"),
+    // M41-S1 把「停网关 + drain」收敛到 stop_gateway_locked；这里只要求命令走到该出口。
+    token: "stop_gateway_locked",
   },
   {
     label: "gateway_rotate_token",
@@ -51,32 +53,41 @@ const checks = [
       "pub async fn gateway_rotate_token",
       "gateway_rotate_token",
     ),
+    token: "drain_gateway_usage()",
   },
   {
-    // `gateway_start` 的「替换已运行实例」分支：停止旧网关后、构造新 config 前。
+    // `gateway_start` 的「替换已运行实例」分支：M41-S1 后统一走 stop_gateway_locked(false)。
     label: "gateway_start(replace previous)",
-    body: blockAfter(
-      commands,
-      "if let Some(previous) = previous",
-      "gateway_start 替换分支",
-    ),
+    body: blockAfter(commands, "pub async fn gateway_start", "gateway_start"),
+    token: "stop_gateway_locked(&state, false)",
+  },
+  {
+    // 公共停止出口：真正落库的地方。四个边界都必须经过它。
+    label: "stop_gateway_locked",
+    body: blockAfter(commands, "async fn stop_gateway_locked", "stop_gateway_locked"),
+    token: "drain_gateway_usage()",
   },
   {
     // 应用退出：`RunEvent::Exit` 处理块。
     label: "lib.rs RunEvent::Exit",
     body: blockAfter(lib, "if let tauri::RunEvent::Exit = event", "RunEvent::Exit"),
+    token: "drain_gateway_usage()",
   },
 ];
 
-const missing = checks.filter((c) => !c.body.includes("drain_gateway_usage()"));
+const missing = checks.filter((c) => !c.body.includes(c.token));
 
 if (missing.length > 0) {
-  console.error("✗ 网关用量 flush 调用点缺失（M40-S1）：");
+  console.error("✗ 网关用量 flush 调用点缺失（M40-S1 / M41-S1）：");
   for (const c of missing) {
-    console.error(`  - ${c.label}：缺少 drain_gateway_usage()`);
+    console.error(`  - ${c.label}：缺少 ${c.token}`);
   }
-  console.error("  这四个边界都必须 drain（顺序在 end_gateway_session / 新 config 之前）。");
+  console.error(
+    "  停止/轮换/换网关/退出都必须 drain；停止类统一走 stop_gateway_locked。",
+  );
   process.exit(1);
 }
 
-console.log(`✓ 网关用量 flush 调用点齐全（${checks.length}/4：${checks.map((c) => c.label).join(" / ")}）`);
+console.log(
+  `✓ 网关用量 flush 调用点齐全（${checks.length}/${checks.length}：${checks.map((c) => c.label).join(" / ")}）`,
+);
