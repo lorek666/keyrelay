@@ -730,6 +730,11 @@
     "notice": "已回滚 {target}（变更 {journal}）。"
   },
   "settings": {
+    "gatewayAutoStart": {
+      "title": "应用启动时自动启动网关",
+      "label": "启动应用后自动启动本地网关",
+      "hint": "需要已启用网关，且有「健康」站点与启用中的密钥；优先使用上次成功运行的那组，否则回退到第一个健康站点。启动失败不影响应用启动，也不会自动重试。"
+    },
     "vaultMigration": {
       "title": "钥匙串迁移",
       "body": "把系统钥匙串里的旧凭据搬到本地加密保险库。自动迁移最多试 2 次；之后可在这里手动重试或放弃（放弃不会删除钥匙串里的旧条目）。",
@@ -938,6 +943,14 @@
     }
   },
   "gateway": {
+    "phase": {
+      "running": "状态：运行中",
+      "stopped": "状态：已停止",
+      "crashed": "状态：异常退出（{time}；{reason}）",
+      "reasonRequested": "已停止",
+      "reasonPanicked": "任务崩溃",
+      "reasonUnexpected": "任务提前结束"
+    },
     "title": "本地网关",
     "bodyPre": "让任何支持 OpenAI 兼容接口的 agent 把 base_url 指向",
     "bodyMid": " http://127.0.0.1:{port}/v1 ",
