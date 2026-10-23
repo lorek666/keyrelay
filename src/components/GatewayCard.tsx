@@ -8,6 +8,9 @@ import {
   gatewayStart,
   gatewayStatus,
   gatewayStop,
+  gatewayTokenCreate,
+  gatewayTokenList,
+  gatewayTokenRevoke,
   listChannelBindings,
   listSites,
   listStoredKeys,
@@ -15,8 +18,11 @@ import {
   type ChannelBinding,
   type DeliveryPlan,
   type GatewayStatus,
+  type CreatedGatewayToken as GatewayTokenCreated,
+  type GatewayToken,
 } from "../lib/api";
 import { maskRemovedValues } from "../lib/deliveryView";
+import ConfirmDialog from "./ConfirmDialog";
 import { useTranslation } from "../i18n";
 
 type Props = {
@@ -276,6 +282,39 @@ export default function GatewayCard({
       targetPath: found?.binding.targetPath ?? "",
     };
   }
+
+  // ---- M43-S1：Agent 令牌（创建 / 列表 / 吊销）----
+  const tokenList = useQuery({
+    queryKey: ["gateway-tokens"],
+    queryFn: gatewayTokenList,
+  });
+  const [newTokenLabel, setNewTokenLabel] = useState("");
+  const [createdToken, setCreatedToken] = useState<GatewayTokenCreated | null>(
+    null,
+  );
+  const [revokeTarget, setRevokeTarget] = useState<GatewayToken | null>(null);
+  const createToken = useMutation({
+    mutationFn: (label: string) => gatewayTokenCreate(label),
+    onSuccess: async (created) => {
+      setNewTokenLabel("");
+      setCreatedToken(created);
+      await qc.invalidateQueries({ queryKey: ["gateway-tokens"] });
+      await qc.invalidateQueries({ queryKey: ["gateway"] });
+    },
+    onError: (err: Error) => setError(err.message),
+  });
+  const revokeToken = useMutation({
+    mutationFn: (id: number) => gatewayTokenRevoke(id),
+    onSuccess: async () => {
+      setRevokeTarget(null);
+      await qc.invalidateQueries({ queryKey: ["gateway-tokens"] });
+      await qc.invalidateQueries({ queryKey: ["gateway"] });
+    },
+    onError: (err: Error) => {
+      setRevokeTarget(null);
+      setError(err.message);
+    },
+  });
 
   const batchBindings = useQuery({
     queryKey: ["channel-bindings"],
@@ -803,6 +842,121 @@ export default function GatewayCard({
           ))}
         </div>
       ) : null}
+
+      {/* M43-S1：Agent 令牌区块 */}
+      <div className="card">
+        <h4>{t("gateway.tokens.title")}</h4>
+        <p className="muted">{t("gateway.tokens.body")}</p>
+        {tokenList.isLoading ? (
+          <p className="muted">{t("gateway.tokens.loading")}</p>
+        ) : tokenList.isError ? (
+          <p className="error" role="alert">
+            {t("gateway.tokens.loadFailed", {
+              error: (tokenList.error as Error).message,
+            })}
+          </p>
+        ) : (tokenList.data ?? []).length === 0 ? (
+          <p className="muted">{t("gateway.tokens.empty")}</p>
+        ) : (
+          <ul className="gateway-token-list">
+            {(tokenList.data ?? []).map((token) => (
+              <li key={token.id} className="gateway-token-row">
+                <div className="gateway-token-head">
+                  <strong>{token.label}</strong>
+                  {token.isDefault ? (
+                    <span className="badge">{t("gateway.tokens.defaultBadge")}</span>
+                  ) : null}
+                  {!token.active ? (
+                    <span className="badge">{t("gateway.tokens.revokedBadge")}</span>
+                  ) : null}
+                </div>
+                <div className="muted gateway-token-meta">
+                  {t("gateway.tokens.createdAt", {
+                    time: new Date(token.createdAt * 1000).toLocaleString(),
+                  })}
+                  {" · "}
+                  {token.lastUsedAt
+                    ? t("gateway.tokens.lastUsedAt", {
+                        time: new Date(token.lastUsedAt * 1000).toLocaleString(),
+                      })
+                    : t("gateway.tokens.neverUsed")}
+                </div>
+                {token.isDefault ? (
+                  <p className="muted">{t("gateway.tokens.defaultHint")}</p>
+                ) : token.active ? (
+                  <button
+                    type="button"
+                    className="btn btn-ghost"
+                    disabled={revokeToken.isPending}
+                    onClick={() => setRevokeTarget(token)}
+                  >
+                    {t("gateway.tokens.revoke")}
+                  </button>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        )}
+
+        <div className="row">
+          <input
+            value={newTokenLabel}
+            placeholder={t("gateway.tokens.labelPlaceholder")}
+            onChange={(e) => setNewTokenLabel(e.target.value)}
+            maxLength={64}
+          />
+          <button
+            type="button"
+            className="btn btn-primary"
+            disabled={createToken.isPending || newTokenLabel.trim().length === 0}
+            onClick={() => createToken.mutate(newTokenLabel.trim())}
+          >
+            {createToken.isPending
+              ? t("gateway.tokens.creating")
+              : t("gateway.tokens.create")}
+          </button>
+        </div>
+      </div>
+
+      {createdToken ? (
+        <div className="card" data-created-token>
+          <h4>{t("gateway.tokens.createdTitle")}</h4>
+          <p className="muted">{t("gateway.tokens.createdHint")}</p>
+          <p className="mono gateway-token-plaintext">{createdToken.token}</p>
+          <div className="row">
+            <button
+              type="button"
+              className="btn"
+              onClick={() => {
+                void navigator.clipboard?.writeText(createdToken.token);
+              }}
+            >
+              {t("gateway.tokens.copy")}
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => setCreatedToken(null)}
+            >
+              {t("gateway.tokens.savedIt")}
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      <ConfirmDialog
+        open={revokeTarget !== null}
+        title={t("gateway.tokens.revokeTitle")}
+        danger
+        confirmLabel={t("gateway.tokens.revokeConfirm")}
+        confirmDisabled={revokeToken.isPending}
+        onCancel={() => setRevokeTarget(null)}
+        onConfirm={() => {
+          if (revokeTarget) revokeToken.mutate(revokeTarget.id);
+        }}
+      >
+        <p>{t("gateway.tokens.revokeBody", { label: revokeTarget?.label ?? "" })}</p>
+      </ConfirmDialog>
 
       {error ? <p className="error" role="alert">{error}</p> : null}
     </div>

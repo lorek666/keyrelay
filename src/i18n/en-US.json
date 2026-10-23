@@ -943,6 +943,30 @@
     }
   },
   "gateway": {
+    "tokens": {
+      "title": "Agent tokens",
+      "body": "Give each agent its own token: only a hash is stored, the plaintext is shown once at creation; after revoking, the next request is 401 immediately (no gateway restart). Usage is attributed by label.",
+      "loading": "Loading…",
+      "loadFailed": "Failed to load tokens: {error}",
+      "empty": "No agent tokens yet. Create one and put it in the corresponding agent's gateway config.",
+      "defaultBadge": "Default token",
+      "revokedBadge": "Revoked",
+      "defaultHint": "The default token cannot be revoked; use \"Regenerate token\" above (rotation) to replace it.",
+      "createdAt": "Created {time}",
+      "lastUsedAt": "Last used {time}",
+      "neverUsed": "Never used",
+      "revoke": "Revoke",
+      "revokeTitle": "Revoke this token?",
+      "revokeBody": "\"{label}\" will stop working immediately; the agent using it gets 401 on its next request. This cannot be undone.",
+      "revokeConfirm": "Revoke",
+      "labelPlaceholder": "Token label (e.g. agent name, max 64 chars)",
+      "create": "Create token",
+      "creating": "Creating…",
+      "createdTitle": "Created — plaintext is shown only once",
+      "createdHint": "Copy it now. Once this panel is closed the plaintext is gone (only the hash is stored).",
+      "copy": "Copy",
+      "savedIt": "I saved it"
+    },
     "metrics": {
       "title": "Gateway metrics",
       "notRunning": "Gateway is not running — no metrics.",
