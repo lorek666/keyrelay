@@ -139,6 +139,14 @@ impl LocalVault {
         Ok(())
     }
 
+    /// 删除一条 `vault_meta`。**幂等**：键不存在也返回 `Ok`（清 `abandoned:` 标记用）。
+    pub fn meta_delete(&self, key: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM vault_meta WHERE key = ?1", params![key])
+            .map_err(|e| Error::Vault(format!("删除保险库元信息失败: {e}")))?;
+        Ok(())
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.conn
             .lock()

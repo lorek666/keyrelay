@@ -2810,6 +2810,151 @@ fn cookie_belongs_to_site(domain: &str, host: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 
+// ============================================================== 钥匙串迁移（M38-S2 / B-219）
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultMigrationFailureDto {
+    reference: String,
+    reason: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultMigrationStatusDto {
+    /// `done | pending | retryExhausted | abandoned`
+    phase: String,
+    attempts: u32,
+    last_at: Option<i64>,
+    last_error: Option<String>,
+    failures: Vec<VaultMigrationFailureDto>,
+    cleanup_pending: Vec<VaultMigrationFailureDto>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultMigrationReportDto {
+    imported: usize,
+    skipped: usize,
+    cleanup_pending: Vec<VaultMigrationFailureDto>,
+    failed: Vec<VaultMigrationFailureDto>,
+    status: VaultMigrationStatusDto,
+}
+
+fn migration_failure_dtos(pairs: &[(String, String)]) -> Vec<VaultMigrationFailureDto> {
+    pairs
+        .iter()
+        .map(|(reference, reason)| VaultMigrationFailureDto {
+            reference: reference.clone(),
+            reason: reason.clone(),
+        })
+        .collect()
+}
+
+fn migration_status_dto(
+    status: tianshu_relay_core::vault::MigrationStatus,
+) -> VaultMigrationStatusDto {
+    let map = |items: &[tianshu_relay_core::vault::MigrationFailure]| {
+        items
+            .iter()
+            .map(|f| VaultMigrationFailureDto {
+                reference: f.reference.clone(),
+                reason: f.reason.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+    VaultMigrationStatusDto {
+        phase: match status.phase {
+            "done" => "done",
+            "retry_exhausted" => "retryExhausted",
+            "abandoned" => "abandoned",
+            _ => "pending",
+        }
+        .to_string(),
+        attempts: status.attempts,
+        last_at: status.last_at,
+        last_error: status.last_error,
+        failures: map(&status.failures),
+        cleanup_pending: map(&status.cleanup_pending),
+    }
+}
+
+/// 迁移命令共用：按 `data_dir`/`db_path` **重新打开** LocalVault + Store（短连接）。
+///
+/// - `db_error` 有值 ⇒ 数据库不可用，明确报错（**不**创建空库）；
+/// - `db_path` 不存在 ⇒ 同样报错（否则 `Store::open` 会建出一个空库，
+///   迁移就会「成功」于一个空引用集合，把完成标记写死）。
+fn open_migration_handles(
+    state: &AppState,
+) -> Result<
+    (
+        tianshu_relay_core::vault::LocalVault,
+        tianshu_relay_core::store::Store,
+    ),
+    String,
+> {
+    if let Some(err) = &state.db_error {
+        return Err(format!(
+            "数据库当前不可用（{err}）：无法执行迁移。请先修复数据库后重启应用。"
+        ));
+    }
+    if !state.db_path.exists() {
+        return Err("数据库文件不存在：请先完成初始化，再执行钥匙串迁移。".to_string());
+    }
+    let (db_path, key_path) = tianshu_relay_core::vault::local::default_paths_in(&state.data_dir);
+    let vault = tianshu_relay_core::vault::LocalVault::open(&db_path, &key_path)
+        .map_err(|e| e.to_string())?;
+    let store =
+        tianshu_relay_core::store::Store::open(&state.db_path).map_err(|e| e.to_string())?;
+    Ok((vault, store))
+}
+
+/// 迁移状态（设置页卡片 / CLI 同源口径）。
+#[tauri::command]
+pub fn vault_migration_status(
+    state: State<'_, AppState>,
+) -> Result<VaultMigrationStatusDto, String> {
+    let (vault, _store) = open_migration_handles(&state)?;
+    let status = tianshu_relay_core::vault::status_for(&vault).map_err(|e| e.to_string())?;
+    Ok(migration_status_dto(status))
+}
+
+/// 显式重试（忽略自动重试上限；`abandoned:` 会先清标记）。
+#[tauri::command]
+pub fn vault_migration_retry(
+    state: State<'_, AppState>,
+) -> Result<VaultMigrationReportDto, String> {
+    let (vault, store) = open_migration_handles(&state)?;
+    let refs = tianshu_relay_core::vault::migrate::refs_for_migration(&store)
+        .map_err(|e| e.to_string())?;
+    // 迁移源必须是**旧** service（M35-S1 的不变量）——与启动路径同一个 helper。
+    // 与启动路径同口径：先 probe，钥匙串不可用就整体失败（不逐条尝试、不触发多轮授权）。
+    let source = crate::keychain_migration_source();
+    tianshu_relay_core::vault::Vault::probe(&source)
+        .map_err(|e| format!("系统钥匙串不可用：{e}"))?;
+    let outcome = tianshu_relay_core::vault::retry_migration(&source, &vault, refs)
+        .map_err(|e| e.to_string())?;
+    let status = tianshu_relay_core::vault::status_for(&vault).map_err(|e| e.to_string())?;
+    Ok(VaultMigrationReportDto {
+        imported: outcome.report.imported,
+        skipped: outcome.report.skipped,
+        cleanup_pending: migration_failure_dtos(&outcome.report.cleanup_pending),
+        failed: migration_failure_dtos(&outcome.report.failed),
+        status: migration_status_dto(status),
+    })
+}
+
+/// 放弃迁移：写 `abandoned:<unix>`，不删源条目（之后启动不自动重试）。
+#[tauri::command]
+pub fn vault_migration_abandon(
+    state: State<'_, AppState>,
+) -> Result<VaultMigrationStatusDto, String> {
+    let (vault, _store) = open_migration_handles(&state)?;
+    tianshu_relay_core::vault::abandon_migration(&vault).map_err(|e| e.to_string())?;
+    let status = tianshu_relay_core::vault::status_for(&vault).map_err(|e| e.to_string())?;
+    Ok(migration_status_dto(status))
+}
+
 // ============================================================== 自动人机验证（M36-S1）
 
 /// 自动完成结果事件（**只发到 `main`**）。payload 只有站点号与状态，绝不含 cookie / token。

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-vault-migration-abandon"
+description = "Enables the vault_migration_abandon command without any pre-configured scope."
+commands.allow = ["vault_migration_abandon"]
+
+[[permission]]
+identifier = "deny-vault-migration-abandon"
+description = "Denies the vault_migration_abandon command without any pre-configured scope."
+commands.deny = ["vault_migration_abandon"]
