@@ -405,7 +405,7 @@ fn abandon_blocks_auto_retry_and_retry_clears_it() {
     assert!(!outcome.already_done);
     assert_eq!(outcome.report.imported, 1);
     assert_eq!(status_for(&target).unwrap().phase, "done");
-    assert!(should_auto_retry(&target).unwrap() == false);
+    assert!(!should_auto_retry(&target).unwrap());
 }
 
 #[test]
