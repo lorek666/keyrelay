@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use tauri::ipc::{CallbackFn, InvokeBody};
 use tauri::test::{get_ipc_response, mock_builder, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
+use tauri::Manager;
 
 /// 建一个应用实例，并把 `main` 窗口也建好。
 ///
@@ -1749,4 +1750,59 @@ fn update_agent_on_unsupported_channel_reports_business_error() {
             "{channel} 的拒绝文案不对: {message}"
         );
     }
+}
+
+// ---------- M40-S1：gateway_stop 必须先 flush 用量 ----------
+
+/// 停止网关时，缓冲里的用量必须**当场落库**（不能等到下一次 `refresh_all`）。
+///
+/// 用测试注入点模拟「网关已经产生了用量、但还没 drain」的状态；`gateway_stop` 在
+/// 没有运行中的网关时也会走 drain（空跑 stop + drain），所以这条用例同时钉住了
+/// 「drain 在 end_gateway_session 之前」的顺序（会话作废后 sink 会拒收，但缓冲里
+/// 已有的记录仍然能被 drain 收走）。
+#[test]
+fn gateway_stop_flushes_buffered_usage() {
+    let (app, webview) = build_app();
+    let state = app.state::<tianshu_relay_lib::AppState>();
+    let site_id = state
+        .service
+        .store()
+        .upsert_site("newapi", "https://m40.example.test", "M40 测试站")
+        .expect("建站点");
+
+    state
+        .service
+        .push_gateway_usage_for_test(tianshu_relay_core::gateway::GatewayUsage {
+            at: 1_700_000_000,
+            site_id,
+            key_id: Some(7),
+            model: "m40".to_string(),
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+            status: 200,
+            latency_ms: 5,
+            attempts: 1,
+            stream: false,
+        });
+    assert!(
+        state
+            .service
+            .store()
+            .recent_gateway_usage(24 * 365 * 100)
+            .expect("查询")
+            .is_empty(),
+        "前置：尚未 drain 时库里应为空"
+    );
+
+    let status = invoke_on(&webview, "gateway_stop", json!({})).expect("gateway_stop");
+    assert_eq!(status["running"], false);
+
+    let rows = state
+        .service
+        .store()
+        .recent_gateway_usage(24 * 365 * 100)
+        .expect("查询");
+    assert_eq!(rows.len(), 1, "gateway_stop 必须把缓冲里的用量落库");
+    assert_eq!(rows[0].total_tokens, 3);
 }
