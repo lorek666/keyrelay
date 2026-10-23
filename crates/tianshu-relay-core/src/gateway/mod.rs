@@ -1943,7 +1943,10 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         .unwrap_or_default();
 
     // ② 只转发 `/v1/*`，且路径里不许有「向上跳」的段
-    if !path.starts_with("/v1/") && path != "/v1" {
+    // M42-S2a：Gemini 的路径是 `/v1beta/models/<model>:generateContent`，不在 `/v1/*` 下。
+    // 只放行这一个**精确形态**（不是整个 `/v1beta` 前缀）——别把它变成任意路径的入口。
+    let gemini_path = path.starts_with("/v1beta/models/") && path.ends_with(":generateContent");
+    if !path.starts_with("/v1/") && path != "/v1" && !gemini_path {
         return local_error(
             StatusCode::NOT_FOUND,
             GatewayErrorKind::InvalidRequest,
@@ -2102,7 +2105,16 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         }
         let url = format!("{}{}{}", state.config.base_url, path, query);
         let headers = upstream_headers(&state.config, &inbound, &state.config.api_key);
-        return forward_to(&state, method, &url, headers, body, &identity).await;
+        return forward_to(
+            &state,
+            method,
+            &url,
+            headers,
+            body,
+            &identity,
+            translate_proto,
+        )
+        .await;
     }
 
     // ④ 路由非空：选候选（首位即首选，顺序由 `RouteTable` 保证确定）
@@ -2576,6 +2588,7 @@ async fn forward_to(
     headers: HeaderMap,
     body: bytes::Bytes,
     identity: &AuthIdentity,
+    translate_proto: Option<translate::Protocol>,
 ) -> Response {
     let model = model_from_body(&body).unwrap_or_default();
     let started = Instant::now();
@@ -2588,8 +2601,10 @@ async fn forward_to(
                 latency_ms,
             );
             // legacy 单上游：`key_id` 回退到启动参数（M40-S1 §4.1）。
-            into_upstream_response(
+            // M42-S2a：翻译协议在 legacy 单上游上同样生效（Chat 仍是零翻译直通）。
+            maybe_translate_response(
                 state,
+                translate_proto,
                 response,
                 state.config.site_id,
                 &model,
@@ -2601,6 +2616,7 @@ async fn forward_to(
                 },
                 identity,
             )
+            .await
         }
         Err(failure) => local_error(
             StatusCode::BAD_GATEWAY,
