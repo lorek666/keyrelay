@@ -1945,6 +1945,18 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     // ② 只转发 `/v1/*`，且路径里不许有「向上跳」的段
     // M42-S2a：Gemini 的路径是 `/v1beta/models/<model>:generateContent`，不在 `/v1/*` 下。
     // 只放行这一个**精确形态**（不是整个 `/v1beta` 前缀）——别把它变成任意路径的入口。
+    // (4) Gemini 流式：`:streamGenerateContent` 与 `?alt=sse` 都必须 400 点名 S2b，
+    //     不能掉到 404（那是「路径不存在」的语义，会误导用户去查地址）也不能静默当非流式。
+    if path.starts_with("/v1beta/models/")
+        && (path.ends_with(":streamGenerateContent") || query.contains("alt=sse"))
+    {
+        return local_error(
+            StatusCode::BAD_REQUEST,
+            GatewayErrorKind::InvalidRequest,
+            "streaming_not_supported",
+            "Gemini 流式尚未支持（M42-S2b）；请先以 :generateContent 非流式调用",
+        );
+    }
     let gemini_path = path.starts_with("/v1beta/models/") && path.ends_with(":generateContent");
     if !path.starts_with("/v1/") && path != "/v1" && !gemini_path {
         return local_error(
@@ -2697,25 +2709,32 @@ async fn maybe_translate_response(
         );
     }
 
-    let bytes = match upstream_response.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
+    // (5) **带上限的流式收集**：超 64 MiB 立刻中止，不先整段进内存再判上限。
+    let mut collected: Vec<u8> = Vec::new();
+    let mut stream = upstream_response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                return local_error(
+                    StatusCode::BAD_GATEWAY,
+                    GatewayErrorKind::Api,
+                    "upstream_read_failed",
+                    format!("读取上游响应失败: {e}"),
+                )
+            }
+        };
+        if collected.len() as u64 + chunk.len() as u64 > MAX_RESPONSE_BYTES {
             return local_error(
                 StatusCode::BAD_GATEWAY,
                 GatewayErrorKind::Api,
-                "upstream_read_failed",
-                format!("读取上游响应失败: {e}"),
-            )
+                "upstream_too_large",
+                "上游响应超过网关上限，无法翻译",
+            );
         }
-    };
-    if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-        return local_error(
-            StatusCode::BAD_GATEWAY,
-            GatewayErrorKind::Api,
-            "upstream_too_large",
-            "上游响应超过网关上限，无法翻译",
-        );
+        collected.extend_from_slice(&chunk);
     }
+    let bytes = bytes::Bytes::from(collected);
     let value: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
