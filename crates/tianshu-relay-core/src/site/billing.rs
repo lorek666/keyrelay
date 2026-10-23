@@ -254,11 +254,11 @@ pub async fn import_site_bills(
             let Some((day, amount, requests)) = parse_item(item, quota_per_unit) else {
                 continue;
             };
-            let entry = per_day.entry(day).or_insert((0.0, 0, false));
+            let entry = per_day.entry(day).or_insert((0.0, 0, true));
             *entry = (
                 entry.0 + amount.unwrap_or(0.0),
                 entry.1 + requests.unwrap_or(1),
-                true,
+                entry.2 && amount.is_some(),
             );
         }
         if items.is_empty() {
@@ -276,10 +276,11 @@ pub async fn import_site_bills(
     let currency_override_used = site_currency_value.is_none() && override_currency.is_some();
     let final_currency = site_currency_value.or(override_currency);
     let imported = per_day.len();
-    for (day, (amount, requests, reported)) in per_day {
+    for (day, (amount, requests, all_amounts_present)) in per_day {
         sink(RawBill {
             day,
-            amount: if reported && amount > 0.0 {
+            // 任一 item 缺金额 ⇒ 该日合计未知，不能把缺的部分当 0（spec §4.6）。
+            amount: if all_amounts_present {
                 Some(amount)
             } else {
                 None
