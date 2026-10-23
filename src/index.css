@@ -2226,3 +2226,8 @@ p.warn[role="status"] {
   overflow-wrap: anywhere;
   font-size: 13px;
 }
+
+/* M39-S2：设置页里「采集间隔」这类窄输入（与字段标签同一行） */
+.settings-inline-field {
+  max-width: 160px;
+}

@@ -1018,7 +1018,12 @@
       "appliedOk": "Re-pointed to gateway",
       "unmappedStrong": "Can't identify channel"
     },
-    "copyFail": "Copy failed ({error})—select the token text above manually."
+    "copyFail": "Copy failed ({error})—select the token text above manually.",
+    "collectModelsLabel": "Collect site model catalog (for model-change notifications and multi-site routing)",
+    "collectModelsHint": "Independent switch: collection still runs when multi-site routing is off (for model-change notifications); the gateway just doesn't use the catalog.",
+    "modelsIntervalLabel": "Collection interval (seconds, 30–86400)",
+    "modelsIntervalHint": "Minimum interval between two collections of the same site; out-of-range input is clamped to 30–86400 on blur.",
+    "modelsIntervalClamped": "Input was out of range and has been clamped to 30–86400."
   },
   "confirm": {
     "cancel": "Cancel",

@@ -22,6 +22,13 @@ pub const THEMES: [&str; 3] = ["system", "light", "dark"];
 /// 允许的语言取值。第一个是默认值。
 pub const LANGUAGES: [&str; 2] = ["zh-CN", "en-US"];
 
+/// 模型目录采集间隔的下限（秒）。M39-S2：与设置页 UI 的钳制同口径。
+///
+/// 30 秒是「别把站点打爆」的下限；上限 24 小时。直接走 IPC 绕过 UI 也必须被这条挡住。
+pub const MODELS_MIN_INTERVAL_SECS: u64 = 30;
+/// 采集间隔的上限（秒）。
+pub const MODELS_MAX_INTERVAL_SECS: u64 = 86_400;
+
 const KEY_REFRESH_INTERVAL: &str = "refresh_interval_secs";
 const KEY_BALANCE_THRESHOLD: &str = "balance_alert_threshold";
 const KEY_DRIFT_ON_START: &str = "drift_check_on_start";
@@ -179,6 +186,14 @@ impl Settings {
             return Err(Error::Store(
                 "网关端口必须在 1024..=65535 之间（1024 以下需要管理员权限）".to_string(),
             ));
+        }
+        // M39-S2：采集间隔的范围校验（防直接 IPC 绕过 UI 设 0 / 超大值）。
+        if self.models_min_interval_secs < MODELS_MIN_INTERVAL_SECS
+            || self.models_min_interval_secs > MODELS_MAX_INTERVAL_SECS
+        {
+            return Err(Error::Store(format!(
+                "模型采集间隔必须在 {MODELS_MIN_INTERVAL_SECS}..={MODELS_MAX_INTERVAL_SECS} 秒之间"
+            )));
         }
         if !THEMES.contains(&self.theme.as_str()) {
             return Err(Error::Store(format!(
@@ -652,6 +667,33 @@ mod tests {
         assert!(by_setting.should_start_hidden(false, true), "设置项生效");
         assert!(!by_setting.should_start_hidden(false, false));
         assert!(by_setting.should_start_hidden(true, true));
+    }
+
+    /// M39-S2：采集间隔越界必须被 `validate()` 拒绝（UI 钳制之外的第二道）。
+    #[test]
+    fn validate_rejects_out_of_range_models_interval() {
+        for bad in [
+            0u64,
+            1,
+            MODELS_MIN_INTERVAL_SECS - 1,
+            MODELS_MAX_INTERVAL_SECS + 1,
+        ] {
+            let settings = Settings {
+                models_min_interval_secs: bad,
+                ..Settings::default()
+            };
+            assert!(
+                matches!(settings.validate(), Err(Error::Store(_))),
+                "采集间隔 {bad} 必须被拒绝"
+            );
+        }
+        for good in [MODELS_MIN_INTERVAL_SECS, 1800, MODELS_MAX_INTERVAL_SECS] {
+            let settings = Settings {
+                models_min_interval_secs: good,
+                ..Settings::default()
+            };
+            assert!(settings.validate().is_ok(), "采集间隔 {good} 应当被接受");
+        }
     }
 
     #[test]
