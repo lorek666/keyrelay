@@ -858,6 +858,212 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+// ============================================================ 内存指标（M40-S2）
+
+/// 一个站点最近一次尝试的指标。**只有数字与已脱敏文本** —— 不含站点名 / 域名 / token / key_ref（红线）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SiteMetrics {
+    /// 打到这个站点的**尝试次数**（一次请求重放到两个站点 ⇒ 两边各 +1）。
+    pub requests: u64,
+    pub failovers: u64,
+    /// 最近一次尝试的 TTFB（毫秒）。
+    pub last_latency_ms: Option<u64>,
+    pub last_status: Option<u16>,
+    /// 已 `scrub` 且截断到 200 字符。
+    pub last_error: Option<String>,
+    pub last_error_at: Option<i64>,
+}
+
+/// 给 DTO / 测试用的冻结快照（不含原子类型与锁）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayMetricsSnapshot {
+    pub uptime_secs: u64,
+    pub requests_total: u64,
+    pub inflight: u64,
+    pub by_status: std::collections::BTreeMap<u16, u64>,
+    pub failovers_total: u64,
+    /// 最近 60 秒的滑动 QPS；进程启动不足 3 秒时**恒为 0**（样本不足，见 M40-S2 §6.3）。
+    pub qps: f64,
+    pub per_site: std::collections::BTreeMap<i64, SiteMetrics>,
+}
+
+/// 60 个 1 秒槽的 QPS 环。
+#[derive(Debug)]
+struct QpsRing {
+    slots: [u64; 60],
+    epoch: Option<Instant>,
+    current: usize,
+}
+
+impl Default for QpsRing {
+    fn default() -> Self {
+        Self {
+            slots: [0; 60],
+            epoch: None,
+            current: 0,
+        }
+    }
+}
+
+impl QpsRing {
+    /// 推进到 `now` 对应的槽（按 `Instant`，系统改墙钟不影响）。
+    fn advance(&mut self, now: Instant) {
+        let epoch = *self.epoch.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(epoch).as_secs() as usize;
+        let target = elapsed % 60;
+        if elapsed / 60 > 0 {
+            // 跨过整圈：全部清零（保守：宁可少算，也不把一圈前的数当现在）
+            self.slots = [0; 60];
+            self.current = target;
+            self.epoch = Some(now - std::time::Duration::from_secs((elapsed % 60) as u64));
+            return;
+        }
+        while self.current != target {
+            self.current = (self.current + 1) % 60;
+            self.slots[self.current] = 0;
+        }
+    }
+    fn bump(&mut self, now: Instant) {
+        self.advance(now);
+        self.slots[self.current] += 1;
+    }
+    fn qps(&self) -> f64 {
+        let sum: u64 = self.slots.iter().sum();
+        let epoch = match self.epoch {
+            Some(e) => e,
+            None => return 0.0,
+        };
+        let uptime = epoch.elapsed().as_secs();
+        if uptime < 3 {
+            return 0.0;
+        }
+        sum as f64 / uptime.clamp(1, 60) as f64
+    }
+}
+
+/// 网关实例的内存指标（M40-S2 §4.1）。
+///
+/// **红线**：只以 `site_id`（数字）为键；不含 token / key_ref / base_url / display_name。
+/// **不写事件表**：本结构里没有任何 `log()` / 存储层调用。
+#[derive(Debug)]
+pub struct GatewayMetrics {
+    started_at: Instant,
+    requests_total: std::sync::atomic::AtomicU64,
+    inflight: std::sync::atomic::AtomicI64,
+    by_status: Mutex<std::collections::BTreeMap<u16, u64>>,
+    failovers_total: std::sync::atomic::AtomicU64,
+    per_site: Mutex<HashMap<i64, SiteMetrics>>,
+    qps: Mutex<QpsRing>,
+}
+
+impl GatewayMetrics {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started_at: Instant::now(),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            inflight: std::sync::atomic::AtomicI64::new(0),
+            by_status: Mutex::new(std::collections::BTreeMap::new()),
+            failovers_total: std::sync::atomic::AtomicU64::new(0),
+            per_site: Mutex::new(HashMap::new()),
+            qps: Mutex::new(QpsRing::default()),
+        })
+    }
+
+    fn on_request_started(self: &Arc<Self>) -> InflightGuard {
+        self.requests_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inflight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        InflightGuard {
+            metrics: Arc::clone(self),
+        }
+    }
+
+    fn on_request_finished(&self, status: u16) {
+        if let Ok(mut map) = self.by_status.lock() {
+            *map.entry(status).or_insert(0) += 1;
+        }
+        if let Ok(mut ring) = self.qps.lock() {
+            ring.bump(Instant::now());
+        }
+    }
+
+    /// 一次上游尝试（成功或失败都记）。`latency_ms` = TTFB。
+    fn record_attempt(&self, site_id: i64, status: u16, latency_ms: u64) {
+        if let Ok(mut map) = self.per_site.lock() {
+            let e = map.entry(site_id).or_default();
+            e.requests += 1;
+            e.last_latency_ms = Some(latency_ms);
+            e.last_status = Some(status);
+        }
+    }
+
+    /// 一次失败（原因已由调用方给出，这里再 scrub + 截断）。
+    fn record_failure(&self, site_id: i64, status: u16, reason: &str) {
+        let cleaned: String = crate::redact::scrub(reason).chars().take(200).collect();
+        if let Ok(mut map) = self.per_site.lock() {
+            let e = map.entry(site_id).or_default();
+            e.requests += 1;
+            e.last_status = Some(status);
+            e.last_error = Some(cleaned);
+            e.last_error_at = Some(now_unix_secs());
+        }
+    }
+
+    fn record_failover(&self, from_site_id: i64) {
+        self.failovers_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut map) = self.per_site.lock() {
+            map.entry(from_site_id).or_default().failovers += 1;
+        }
+    }
+
+    fn snapshot(&self) -> GatewayMetricsSnapshot {
+        let by_status = self.by_status.lock().map(|m| m.clone()).unwrap_or_default();
+        let per_site = self.per_site.lock().map(|m| m.clone()).unwrap_or_default();
+        let qps = self.qps.lock().map(|r| r.qps()).unwrap_or(0.0);
+        GatewayMetricsSnapshot {
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            requests_total: self
+                .requests_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            inflight: self
+                .inflight
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .max(0) as u64,
+            by_status: by_status.into_iter().collect(),
+            failovers_total: self
+                .failovers_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            qps,
+            per_site: per_site.into_iter().collect(),
+        }
+    }
+}
+
+/// `inflight` 的 RAII guard：**panic 也会 dec**（M40-S2 §6.1）。
+pub struct InflightGuard {
+    metrics: Arc<GatewayMetrics>,
+}
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 一个候选的**只读**视图（供 DTO 组装；health/breaker 都是字符串）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayCandidateSnapshot {
+    pub site_id: i64,
+    pub key_id: Option<i64>,
+    /// `healthy | unknown | exhausted`（只由 [`crate::routing::health_label`] 派生）
+    pub health: &'static str,
+    /// `closed | open | halfOpen`（只由 [`BreakerState`] 派生）
+    pub breaker: &'static str,
+}
+
 pub struct GatewayHandle {
     pub addr: SocketAddr,
     pub token: String,
@@ -870,6 +1076,16 @@ pub struct GatewayHandle {
     stopping: Arc<std::sync::atomic::AtomicBool>,
     /// 任务结束记录（M41-S1）：任务体结束时回写，`alive()` 为假之后才可能有值。
     exit: Arc<std::sync::Mutex<Option<GatewayExit>>>,
+    /// M40-S2：内存指标（与 `AppState` 共享同一个 Arc）。
+    metrics: Arc<GatewayMetrics>,
+    /// M40-S2：装配时的路由是否为空（`runtime` 为 `None` 时的 fallback）。
+    initial_route_is_empty: bool,
+    /// M39-S1 的运行时快照（热更新后会变）；`mode` 按它取**当前**真实路由。
+    runtime: Option<Arc<std::sync::RwLock<Arc<GatewaySnapshot>>>>,
+    /// M40-S2：候选列表要读熔断状态 ⇒ 与 `AppState` 共享同一个 `Breaker`。
+    breaker: Arc<Mutex<Breaker>>,
+    /// M40-S2：候选列表的来源（`runtime` 为 `None` 时用装配时的 route）。
+    route: RouteTable,
 }
 
 impl std::fmt::Debug for GatewayHandle {
@@ -892,6 +1108,55 @@ impl GatewayHandle {
     /// 一个已经 panic 的句柄绝不能继续被报成「运行中」。
     pub fn alive(&self) -> bool {
         !self.finished.is_finished()
+    }
+
+    /// M40-S2：一份当前指标快照。
+    pub fn metrics(&self) -> GatewayMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// M40-S2：M39-S1 的运行时 generation（单上游 / 无 runtime ⇒ 0）。
+    pub fn generation(&self) -> u64 {
+        match &self.runtime {
+            Some(rt) => match rt.read() {
+                Ok(guard) => guard.generation,
+                Err(_) => 0,
+            },
+            None => 0,
+        }
+    }
+
+    /// M40-S2：`mode` 的**运行态**依据——`true` = 当前路由为空（走 legacy 单上游）。
+    pub fn route_is_empty(&self) -> bool {
+        match &self.runtime {
+            Some(rt) => match rt.read() {
+                Ok(guard) => guard.route.is_empty(),
+                Err(_) => self.initial_route_is_empty,
+            },
+            None => self.initial_route_is_empty,
+        }
+    }
+
+    /// M40-S2：候选列表（`health`/`breaker` 都从唯一出处派生；不含 display_name——那由壳层查 store）。
+    pub fn candidates(&self) -> Vec<GatewayCandidateSnapshot> {
+        let route = match &self.runtime {
+            Some(rt) => match rt.read() {
+                Ok(guard) => guard.route.clone(),
+                Err(_) => self.route.clone(),
+            },
+            None => self.route.clone(),
+        };
+        let now = Instant::now();
+        route
+            .all_candidates()
+            .into_iter()
+            .map(|u| GatewayCandidateSnapshot {
+                site_id: u.site_id,
+                key_id: u.key_id,
+                health: crate::routing::health_label(u.balance_usd),
+                breaker: breaker_label(&self.breaker, u.site_id, now),
+            })
+            .collect()
     }
 
     /// 任务结束记录（还活着 ⇒ `None`）。
@@ -1072,8 +1337,14 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
     // P3-3：停止闸门。`AppState` 与 `GatewayHandle` 共享同一个标志——
     // 句柄置位（停止信号发出之前），请求路径读取。
     let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let metrics = GatewayMetrics::new();
+    let breaker = Arc::new(Mutex::new(Breaker::new(config.breaker.clone())));
+    let runtime_for_handle = config.runtime.clone();
+    let route_for_handle = config.route.clone();
+    let initial_route_is_empty = config.route.is_empty();
     let state = AppState {
-        breaker: Arc::new(Mutex::new(Breaker::new(config.breaker.clone()))),
+        metrics: Arc::clone(&metrics),
+        breaker: Arc::clone(&breaker),
         round_robin: Arc::new(Mutex::new(RoundRobinState::default())),
         guards: Arc::new(Mutex::new(HashMap::new())),
         local_rejects: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1136,11 +1407,18 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
         finished,
         stopping,
         exit,
+        metrics,
+        initial_route_is_empty,
+        runtime: runtime_for_handle,
+        breaker,
+        route: route_for_handle,
     })
 }
 
 #[derive(Clone)]
 struct AppState {
+    /// M40-S2：内存指标（与 `GatewayHandle` 共享同一个 Arc）。
+    metrics: Arc<GatewayMetrics>,
     config: GatewayConfig,
     upstream: reqwest::Client,
     /// M39-S3 §4.1：加权轮转计数器（跨请求共享；单候选时不读）。
@@ -1276,6 +1554,16 @@ fn models_list_response(models: &[String]) -> axum::response::Response {
 }
 
 async fn proxy(State(state): State<AppState>, request: Request) -> Response {
+    // M40-S2：全局计数与「在途」在这里进出（status 取**最终返回给客户端**的那个）。
+    let _inflight = state.metrics.on_request_started();
+    let response = proxy_inner(State(state.clone()), request).await;
+    state
+        .metrics
+        .on_request_finished(response.status().as_u16());
+    response
+}
+
+async fn proxy_inner(State(state): State<AppState>, request: Request) -> Response {
     // ① 令牌校验：不通过就**不转发**
     if !constant_time_eq(
         presented_token(request.headers()).as_deref(),
@@ -1540,6 +1828,8 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                     .local_rejects
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 local_rejected += 1;
+                // M40-S2：本地限流「切到下一个候选」也计一次失败切换（与 429 同口径）。
+                state.metrics.record_failover(upstream.site_id);
                 continue;
             }
         };
@@ -1557,6 +1847,9 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                     latency_ms,
                     !should_failover(status),
                 );
+                state
+                    .metrics
+                    .record_attempt(upstream.site_id, status, latency_ms);
                 let replayable = status_allows_replay(status);
                 if should_failover(status) {
                     // §3.5-1：`opened_at` 必须是**失败发生**的时刻，不是请求开始的时刻。
@@ -1585,6 +1878,8 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                 // 重复计费不可逆，可用性由「熔断 → 下一个请求换上游」承接。
                 // 不可切换的状态、或已经是最后一个候选 ⇒ 同样如实返回（不做 500 兜底）。
                 if replayable && !is_last {
+                    // M40-S2：真的切了候选 ⇒ 计一次失败切换（只数 429/连接层/本地限流）。
+                    state.metrics.record_failover(upstream.site_id);
                     // 留着这条响应（含 lease），继续试下一个候选；若后面全军覆没，
                     // 循环末尾会把这条 429 原样返回，而不是编一个 502。
                     pending_replay = Some(PendingReplay {
@@ -1617,6 +1912,9 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
             Err(failure) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 observe(&state, upstream.site_id, latency_ms, false);
+                state
+                    .metrics
+                    .record_attempt(upstream.site_id, 502, latency_ms);
                 let replayable = failure.is_replayable();
                 let message = failure.message().to_string();
                 // 传输层失败没有 HTTP 状态码：按 502 记（与 legacy 路径的错误码一致）。
@@ -1645,6 +1943,8 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                 if !replayable || is_last {
                     break;
                 }
+                // M40-S2：连接层失败且还有候选 ⇒ 切下一个（计一次失败切换）。
+                state.metrics.record_failover(upstream.site_id);
             }
         }
     }
@@ -1860,6 +2160,11 @@ async fn forward_to(
     match send_once(state, method, url, headers, body).await {
         Ok(response) => {
             let latency_ms = started.elapsed().as_millis() as u64;
+            state.metrics.record_attempt(
+                state.config.site_id,
+                response.status().as_u16(),
+                latency_ms,
+            );
             // legacy 单上游：`key_id` 回退到启动参数（M40-S1 §4.1）。
             into_upstream_response(
                 state,
@@ -2006,6 +2311,24 @@ fn eligible_candidates<'a>(
     out
 }
 
+/// M40-S2：`BreakerState` → DTO 字符串（唯一出处）。
+fn breaker_label(breaker: &Arc<Mutex<Breaker>>, site_id: i64, now: Instant) -> &'static str {
+    match breaker.lock().map(|g| g.worst_state_for_site(site_id, now)) {
+        Ok(BreakerState::Closed) => "closed",
+        Ok(BreakerState::Open) => "open",
+        Ok(BreakerState::HalfOpen) => "halfOpen",
+        Err(_) => "unknown",
+    }
+}
+
+/// Unix 秒（墙钟；只用于「最近错误发生在什么时候」这类展示，不参与任何判定）。
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn record_success(state: &AppState, key: &BreakerKey, now: Instant) {
     if let Ok(mut guard) = state.breaker.lock() {
         guard.record_success(key, now);
@@ -2025,6 +2348,9 @@ fn report_failure(
     reason: &str,
     now: Instant,
 ) {
+    // M40-S2：失败原因落到内存指标（scrub + 截断在 `record_failure` 里）；
+    // **事件表照旧只由 `on_failure` 出口写**，指标路径不写事件。
+    state.metrics.record_failure(site_id, status, reason);
     if let Ok(mut guard) = state.breaker.lock() {
         guard.record_failure(key, now);
     }
@@ -2754,6 +3080,12 @@ mod tests {
             finished,
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             exit: Arc::new(std::sync::Mutex::new(None)),
+            // M40-S2：测试用句柄的指标占位（不参与本用例断言）
+            metrics: GatewayMetrics::new(),
+            initial_route_is_empty: true,
+            runtime: None,
+            breaker: Arc::new(Mutex::new(Breaker::new(BreakerPolicy::default()))),
+            route: RouteTable::default(),
         };
         handle.shutdown_and_wait().await;
     }

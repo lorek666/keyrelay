@@ -464,6 +464,31 @@ pub struct GatewayStatusDto {
     token_persistent: bool,
     /// 最近一次任务结束（`crashed` 且有结束记录时才有值）。
     last_exit: Option<GatewayExitDto>,
+
+    // —— M40-S2：八个新字段（字段名逐字对齐 M44 §4.3 / M40-S2 §4.2）——
+    /// **运行态**三值：`single | multi | stopped`（不是设置值的回声）。
+    mode: String,
+    candidates: Vec<GatewayCandidateDto>,
+    /// 最近 60s 滑动；启动不足 3s 时为 0（UI 显示 `—`）。
+    qps: f64,
+    requests_total: u64,
+    inflight: u64,
+    failovers_total: u64,
+    last_error: Option<String>,
+    generation: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayCandidateDto {
+    site_id: i64,
+    /// 站点显示名（与站点列表同源；**不是** `base_url`，不从 URL 现算）。
+    display_name: String,
+    key_id: Option<i64>,
+    /// `healthy | unknown | exhausted`
+    health: String,
+    /// `closed | open | halfOpen | unknown`
+    breaker: String,
 }
 
 #[derive(Deserialize)]
@@ -1533,6 +1558,7 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
     // 反过来，如果这里硬编码 `false`，一次成功的「重新生成令牌」就会在停止状态下
     // 被报成「临时令牌」——那才是真的在说假话。
     let token_persistent = state.service.gateway_token_persistent();
+    // M40-S2：未运行 ⇒ `mode="stopped"`，其余字段是**结构性空值**（UI 不显示它们）
     let stopped = GatewayStatusDto {
         running: false,
         phase: "stopped".to_string(),
@@ -1541,6 +1567,14 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
         site: None,
         token_persistent,
         last_exit: None,
+        mode: "stopped".to_string(),
+        candidates: Vec::new(),
+        qps: 0.0,
+        requests_total: 0,
+        inflight: 0,
+        failovers_total: 0,
+        last_error: None,
+        generation: 0,
     };
     let Ok(guard) = state.gateway.lock() else {
         return stopped;
@@ -1553,6 +1587,37 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
         reason: exit.reason.as_str().to_string(),
     });
     if run.handle.alive() {
+        let m = run.handle.metrics();
+        let route_is_empty = run.handle.route_is_empty();
+        // 站点 id → 显示名（与站点列表**同源**；查不到就不显示该候选）
+        let names: std::collections::HashMap<i64, String> = state
+            .service
+            .sites()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.id, s.display_name))
+            .collect();
+        let candidates = run
+            .handle
+            .candidates()
+            .into_iter()
+            .filter_map(|c| {
+                names.get(&c.site_id).map(|name| GatewayCandidateDto {
+                    site_id: c.site_id,
+                    display_name: name.clone(),
+                    key_id: c.key_id,
+                    health: c.health.to_string(),
+                    breaker: c.breaker.to_string(),
+                })
+            })
+            .collect();
+        // M40-S2：**最近**一条错误（按 per_site 的 last_error_at 取最大；无则 None）
+        let last_error = m
+            .per_site
+            .values()
+            .filter(|v| v.last_error.is_some())
+            .max_by_key(|v| v.last_error_at.unwrap_or(0))
+            .and_then(|v| v.last_error.clone());
         GatewayStatusDto {
             running: true,
             phase: "running".to_string(),
@@ -1561,6 +1626,14 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             site: Some(run.handle.site_display_name.clone()),
             token_persistent,
             last_exit,
+            mode: if route_is_empty { "single" } else { "multi" }.to_string(),
+            candidates,
+            qps: m.qps,
+            requests_total: m.requests_total,
+            inflight: m.inflight,
+            failovers_total: m.failovers_total,
+            last_error,
+            generation: run.handle.generation(),
         }
     } else {
         // M41-S1：已死的句柄**绝不**报 running（url/token/site 一并清空，避免 UI 展示假地址）。
@@ -1572,6 +1645,15 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             site: None,
             token_persistent,
             last_exit,
+            // M40-S2：已死 ⇒ 与未运行同口径（stopped + 结构性空值）
+            mode: "stopped".to_string(),
+            candidates: Vec::new(),
+            qps: 0.0,
+            requests_total: 0,
+            inflight: 0,
+            failovers_total: 0,
+            last_error: None,
+            generation: 0,
         }
     }
 }
