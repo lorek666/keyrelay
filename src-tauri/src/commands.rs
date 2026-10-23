@@ -362,6 +362,10 @@ pub struct SettingsDto {
     drift_check_on_start: bool,
     gateway_enabled: bool,
     gateway_port: u16,
+    // M41-S1：自动启动 + 上次成功运行的那组 site/key（0 = 无）
+    gateway_auto_start: bool,
+    gateway_last_site_id: i64,
+    gateway_last_key_id: i64,
     // M14-S1：多站路由 + 模型采集（B-99）
     gateway_multi_site: bool,
     collect_models: bool,
@@ -434,8 +438,20 @@ pub struct UpdateSettingsArgs {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GatewayExitDto {
+    /// 结束时刻（unix 秒）。
+    at: i64,
+    /// `requested` | `panicked` | `unexpected`
+    reason: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GatewayStatusDto {
+    /// 兼容字段：等价于 `phase == "running"`。
     running: bool,
+    /// `running` | `stopped` | `crashed`
+    phase: String,
     url: Option<String>,
     /// 本地令牌：**只在这里返回给 UI 显示**，不写日志、不入库。
     token: Option<String>,
@@ -446,6 +462,8 @@ pub struct GatewayStatusDto {
     /// 降级必须说出来：不说的话用户会以为「换站零改动」成立了，直到 agent 开始 401。
     /// 取值是**最近一次**装配 / 轮换的结果（网关没在跑时也照报）。
     token_persistent: bool,
+    /// 最近一次任务结束（`crashed` 且有结束记录时才有值）。
+    last_exit: Option<GatewayExitDto>,
 }
 
 #[derive(Deserialize)]
@@ -1315,6 +1333,9 @@ fn settings_from_dto(dto: &SettingsDto) -> tianshu_relay_core::settings::Setting
         drift_check_on_start: dto.drift_check_on_start,
         gateway_enabled: dto.gateway_enabled,
         gateway_port: dto.gateway_port,
+        gateway_auto_start: dto.gateway_auto_start,
+        gateway_last_site_id: dto.gateway_last_site_id,
+        gateway_last_key_id: dto.gateway_last_key_id,
         gateway_multi_site: dto.gateway_multi_site,
         collect_models: dto.collect_models,
         models_min_interval_secs: dto.models_min_interval_secs,
@@ -1346,6 +1367,9 @@ fn settings_to_dto(settings: &tianshu_relay_core::settings::Settings) -> Setting
         drift_check_on_start: settings.drift_check_on_start,
         gateway_enabled: settings.gateway_enabled,
         gateway_port: settings.gateway_port,
+        gateway_auto_start: settings.gateway_auto_start,
+        gateway_last_site_id: settings.gateway_last_site_id,
+        gateway_last_key_id: settings.gateway_last_key_id,
         gateway_multi_site: settings.gateway_multi_site,
         collect_models: settings.collect_models,
         models_min_interval_secs: settings.models_min_interval_secs,
@@ -1368,6 +1392,17 @@ fn settings_to_dto(settings: &tianshu_relay_core::settings::Settings) -> Setting
         close_to_tray: settings.close_to_tray,
         start_hidden: settings.start_hidden,
     }
+}
+
+/// 保存设置的返回（M41-S1 §4.2）：设置 + 网关状态 + 网关动作的失败原因。
+///
+/// `gateway_error` 有值 **也意味着设置已保存**——UI 必须同时说清这两件事。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsUpdateResultDto {
+    settings: SettingsDto,
+    gateway: GatewayStatusDto,
+    gateway_error: Option<String>,
 }
 
 #[tauri::command]
@@ -1402,16 +1437,62 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<SettingsDto, String> {
 }
 
 #[tauri::command]
-pub fn update_settings(
+pub async fn update_settings(
     state: State<'_, AppState>,
     args: UpdateSettingsArgs,
-) -> Result<SettingsDto, String> {
-    let settings = settings_from_dto(&args.settings);
+) -> Result<SettingsUpdateResultDto, String> {
+    // M41-S1：**从读旧设置之前就拿锁**，一直持到 stop/restart 结束（不是只锁 restart）。
+    // 只锁 restart 的话，并发 `gateway_start` 会基于旧设置起一次网关，再被本函数的
+    // restart 抢先——最终运行的那份既不是旧设置也不是新设置。
+    let _op = state.gateway_op.lock().await;
+
+    let prev = state.service.settings().map_err(|e| e.to_string())?;
+    let next = settings_from_dto(&args.settings);
+    // 保存失败 ⇒ Err，网关不动（设置是唯一真相，但没保存成功就谈不上对齐）。
     state
         .service
-        .update_settings(&settings)
+        .update_settings(&next)
         .map_err(|e| e.to_string())?;
-    Ok(settings_to_dto(&settings))
+
+    let running = state
+        .gateway
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|run| run.handle.alive()))
+        .unwrap_or(false);
+    let transition = gateway_transition(&prev, &next, running);
+
+    let mut gateway_error: Option<String> = None;
+    match transition {
+        GatewayTransition::None => {}
+        GatewayTransition::Stop => {
+            stop_gateway_locked(&state, true).await;
+        }
+        GatewayTransition::Restart => {
+            // 用**运行态**的 site/key（不取命令参数、不取切页默认值）。
+            let target = state
+                .gateway
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|run| (run.site_id, run.key_id)));
+            stop_gateway_locked(&state, false).await;
+            if let Some((site_id, key_id)) = target {
+                if let Err(err) = start_gateway_locked(&state, site_id, key_id).await {
+                    // 设置已保存，但网关没起来：明确返回 stopped + 可读原因，
+                    // 绝不「保存成功但网关静默死掉」。
+                    gateway_error =
+                        Some(format!("设置已保存；网关未能按新设置重启（已停止）：{err}"));
+                }
+            }
+        }
+    }
+
+    let settings = state.service.settings().map_err(|e| e.to_string())?;
+    Ok(SettingsUpdateResultDto {
+        settings: settings_to_dto(&settings),
+        gateway: gateway_status_of(&state),
+        gateway_error,
+    })
 }
 
 /// `detect_system_proxy` 的返回：auto 模式下探测到的系统代理（已脱敏）。
@@ -1452,25 +1533,123 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
     // 反过来，如果这里硬编码 `false`，一次成功的「重新生成令牌」就会在停止状态下
     // 被报成「临时令牌」——那才是真的在说假话。
     let token_persistent = state.service.gateway_token_persistent();
-    let empty = GatewayStatusDto {
+    let stopped = GatewayStatusDto {
         running: false,
+        phase: "stopped".to_string(),
         url: None,
         token: None,
         site: None,
         token_persistent,
+        last_exit: None,
     };
     let Ok(guard) = state.gateway.lock() else {
-        return empty;
+        return stopped;
     };
-    match guard.as_ref() {
-        Some(run) => GatewayStatusDto {
+    let Some(run) = guard.as_ref() else {
+        return stopped;
+    };
+    let last_exit = run.handle.last_exit().map(|exit| GatewayExitDto {
+        at: exit.at,
+        reason: exit.reason.as_str().to_string(),
+    });
+    if run.handle.alive() {
+        GatewayStatusDto {
             running: true,
+            phase: "running".to_string(),
             url: Some(run.handle.local_url()),
             token: Some(run.handle.token.clone()),
             site: Some(run.handle.site_display_name.clone()),
             token_persistent,
-        },
-        None => empty,
+            last_exit,
+        }
+    } else {
+        // M41-S1：已死的句柄**绝不**报 running（url/token/site 一并清空，避免 UI 展示假地址）。
+        GatewayStatusDto {
+            running: false,
+            phase: "crashed".to_string(),
+            url: None,
+            token: None,
+            site: None,
+            token_persistent,
+            last_exit,
+        }
+    }
+}
+
+/// auto-start 的选组（M41-S1 §4.4.1，纯函数便于单测）。
+///
+/// ① 优先「上次成功运行」的 `(last_site_id, last_key_id)`，但四项校验全过才用：
+///    站点存在、`health == "ok"`、密钥存在、`status == "enabled"`、且 `key.site_id == site_id`；
+///    任一不满足 ⇒ **整体放弃**这组（不混用旧 site + 新 key）。
+/// ② 回退：第一个 `health == "ok"` 的站点 + 该站点第一把 `enabled` 密钥（按 id 升序）。
+/// ③ 都没有 ⇒ `None`（调用方跳过并记日志，不重试）。
+pub(crate) fn auto_start_target(
+    sites: &[tianshu_relay_core::service::SiteSummary],
+    keys: &[tianshu_relay_core::store::KeyRow],
+    last_site_id: i64,
+    last_key_id: i64,
+) -> Option<(i64, i64)> {
+    if last_site_id > 0 && last_key_id > 0 {
+        let site_ok = sites
+            .iter()
+            .any(|site| site.id == last_site_id && site.health == "ok");
+        let key_ok = keys.iter().any(|key| {
+            key.id == last_key_id && key.site_id == last_site_id && key.status == "enabled"
+        });
+        if site_ok && key_ok {
+            return Some((last_site_id, last_key_id));
+        }
+    }
+    let site = sites
+        .iter()
+        .filter(|site| site.health == "ok")
+        .min_by_key(|site| site.id)?;
+    let key = keys
+        .iter()
+        .filter(|key| key.site_id == site.id && key.status == "enabled")
+        .min_by_key(|key| key.id)?;
+    Some((site.id, key.id))
+}
+
+/// 设置变更需要网关做什么（M41-S1 §4.3 的纯函数，单测钉住矩阵）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewayTransition {
+    None,
+    Stop,
+    Restart,
+}
+
+/// 判据是**白名单**：只有端口 / 多站 / 代理模式 / 代理地址的变化才重启。
+///
+/// 新增设置字段默认不触发重启，除非显式加进这里（复审要点）。
+fn gateway_transition(
+    prev: &tianshu_relay_core::settings::Settings,
+    next: &tianshu_relay_core::settings::Settings,
+    running: bool,
+) -> GatewayTransition {
+    if !next.gateway_enabled {
+        // 关总开关 ⇒ 必须停（未运行就是无操作）。
+        return if running {
+            GatewayTransition::Stop
+        } else {
+            GatewayTransition::None
+        };
+    }
+    if !prev.gateway_enabled {
+        // 打开开关**不**自动启动：用户点「启动」（auto-start 只用于应用启动）。
+        return GatewayTransition::None;
+    }
+    if !running {
+        return GatewayTransition::None;
+    }
+    if prev.gateway_port != next.gateway_port
+        || prev.gateway_multi_site != next.gateway_multi_site
+        || prev.proxy_mode != next.proxy_mode
+        || prev.proxy_url != next.proxy_url
+    {
+        GatewayTransition::Restart
+    } else {
+        GatewayTransition::None
     }
 }
 
@@ -1552,6 +1731,68 @@ async fn stop_gateway(handle: tianshu_relay_core::gateway::GatewayHandle) {
     }
 }
 
+/// 停掉当前网关并等端口释放，再按 M40/M7 的顺序把用量与失败落库。
+///
+/// `end_session`：`true` = 这次停止结束当前会话（`gateway_stop` / 设置里关开关 /
+/// 令牌轮换）；`false` = 只是「换一个网关」（`gateway_start` / 设置变更重启）——
+/// 后者随后调用的 `gateway_config` 会自增会话代号，行为与 M40-S1 逐字一致。
+///
+/// 调用方**必须**已持有 `gateway_op`（本函数不加锁，避免重入死锁）。
+async fn stop_gateway_locked(state: &AppState, end_session: bool) {
+    let previous = match state.gateway.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => None,
+    };
+    if let Some(run) = previous {
+        // 等端口真正释放再返回：否则紧接着 start 会撞 AddrInUse。
+        stop_gateway(run.handle).await;
+    }
+    // M40-S1：用量先落库（同样在 `end_gateway_session` 之前）。
+    state.service.drain_gateway_usage();
+    // M7-S5 复审 P2-1：旧网关的失败必须归给产生它的那次会话。
+    state.service.drain_gateway_failures();
+    if end_session {
+        // M8-S1 §11.1：drain 之后作废会话（顺序是硬要求）。
+        state.service.end_gateway_session();
+    }
+}
+
+/// 用指定站点/密钥启动网关，并把「上次成功运行」写进设置。
+///
+/// 调用方**必须**已持有 `gateway_op`。这是**成功启动的唯一出口**——手动启动、自动启动、
+/// 设置变更重启、令牌轮换都走这里，保证 `gateway_last_*` 不会漏写。
+pub(crate) async fn start_gateway_locked(
+    state: &AppState,
+    site_id: i64,
+    key_id: i64,
+) -> Result<(), String> {
+    let settings = state.service.settings().map_err(|e| e.to_string())?;
+    let config = state
+        .service
+        .gateway_config(site_id, key_id, settings.gateway_port)
+        .map_err(|e| e.to_string())?;
+    let handle = tianshu_relay_core::gateway::start(config)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Ok(mut guard) = state.gateway.lock() {
+        *guard = Some(GatewayRunning {
+            handle,
+            site_id,
+            key_id,
+        });
+    }
+    // M41-S1：成功启动后记下这一组（auto-start 的首选）。写失败只记日志、不回滚网关。
+    if settings.gateway_last_site_id != site_id || settings.gateway_last_key_id != key_id {
+        let mut next = settings;
+        next.gateway_last_site_id = site_id;
+        next.gateway_last_key_id = key_id;
+        if let Err(err) = state.service.update_settings(&next) {
+            eprintln!("[tianshu-relay] 记录上次成功运行的站点/密钥失败（不影响网关）: {err}");
+        }
+    }
+    Ok(())
+}
+
 /// 启动本地网关。同一时刻只允许一个：启动前会先停掉旧的。
 #[tauri::command]
 pub async fn gateway_start(
@@ -1575,45 +1816,12 @@ pub async fn gateway_start(
     // 注意是**异步**锁（`std::sync::MutexGuard` 不能跨 `await`，不是 `Send`）。
     let _op = state.gateway_op.lock().await;
 
-    // 先停旧的，并**等端口真正释放**：`shutdown()` 只发信号就返回，
-    // 立刻 bind 会撞上还没释放的监听套接字 —— 这正是 B-64 的现象。
-    let previous = match state.gateway.lock() {
-        Ok(mut guard) => guard.take(),
-        Err(_) => None,
-    };
-    if let Some(previous) = previous {
-        stop_gateway(previous.handle).await;
-        // 与 `gateway_stop` 同一条理由（M7-S5 复审 P2-1）：换网关之前先把**旧网关**的
-        // 失败落库，否则它们会被归到新会话的时间线上。
-        // M40-S1：用量同样先落库（在下一行 `gateway_config` 自增会话代号之前）。
-        state.service.drain_gateway_usage();
-        state.service.drain_gateway_failures();
-    }
-
-    let port = settings.gateway_port;
-    let config = state
-        .service
-        .gateway_config(args.site_id, args.key_id, port)
-        .map_err(|e| e.to_string())?;
-
-    let handle = tianshu_relay_core::gateway::start(config)
-        .await
-        .map_err(|e| e.to_string())?;
-    let status = GatewayStatusDto {
-        running: true,
-        url: Some(handle.local_url()),
-        token: Some(handle.token.clone()),
-        site: Some(handle.site_display_name.clone()),
-        token_persistent: state.service.gateway_token_persistent(),
-    };
-    if let Ok(mut guard) = state.gateway.lock() {
-        *guard = Some(GatewayRunning {
-            handle,
-            site_id: args.site_id,
-            key_id: args.key_id,
-        });
-    }
-    Ok(status)
+    // 先停旧的（并等端口真正释放：`shutdown()` 只发信号就返回，立刻 bind 会撞 B-64）；
+    // 用量/失败的落库顺序与 M40-S1 一致（end_session=false：换网关不结束会话，
+    // 下一行 `gateway_config` 会自增会话代号）。
+    stop_gateway_locked(&state, false).await;
+    start_gateway_locked(&state, args.site_id, args.key_id).await?;
+    Ok(gateway_status_of(&state))
 }
 
 /// **显式轮换**网关本地令牌（M8-S4 §6.4 第 4 条）。
@@ -1718,13 +1926,6 @@ pub async fn gateway_rotate_token(
     let handle = tianshu_relay_core::gateway::start(config)
         .await
         .map_err(|e| e.to_string())?;
-    let status = GatewayStatusDto {
-        running: true,
-        url: Some(handle.local_url()),
-        token: Some(handle.token.clone()),
-        site: Some(handle.site_display_name.clone()),
-        token_persistent: state.service.gateway_token_persistent(),
-    };
     if let Ok(mut guard) = state.gateway.lock() {
         *guard = Some(GatewayRunning {
             handle,
@@ -1732,7 +1933,7 @@ pub async fn gateway_rotate_token(
             key_id,
         });
     }
-    Ok(status)
+    Ok(gateway_status_of(&state))
 }
 
 /// 停止网关。与 `gateway_start` 共用同一把操作锁，避免「停」与「启」交错。
@@ -1740,30 +1941,9 @@ pub async fn gateway_rotate_token(
 pub async fn gateway_stop(state: State<'_, AppState>) -> Result<GatewayStatusDto, String> {
     let _op = state.gateway_op.lock().await;
 
-    let running = match state.gateway.lock() {
-        Ok(mut guard) => guard.take(),
-        Err(_) => None,
-    };
-    if let Some(run) = running {
-        // 等端口真正释放再返回：否则调用方紧接着 start 会撞 AddrInUse
-        stop_gateway(run.handle).await;
-    }
-    // M7-S5 复审 P2-1：把网关攒下的失败**在这里落库一次**。
-    //
-    // 为什么必须在停止时落：`drain_gateway_failures` 的生产调用点原本只有 `refresh_all`，
-    // 于是「网关刚报失败、用户随即关掉应用」会让那条失败**永远进不了事件表**——
-    // 而它正是「网关为什么切换了上游」的唯一线索。
-    //
-    // 为什么在**停止**时（而不是退出时）：退出钩子拿不到 `AppState` 的可靠时机，
-    // 而 `gateway_stop` 是「这一次会话结束了」的天然边界——失败归给产生它的那次会话，
-    // 顺带解决复审指出的**归因错位**（旧会话的失败被记成当前会话的）。
-    // M40-S1：用量先落库（同样在 `end_gateway_session` 之前）。
-    state.service.drain_gateway_usage();
-    state.service.drain_gateway_failures();
-    // M8-S1 §11.1：drain **之后**作废会话。顺序是硬要求——
-    // 先 drain 才能把「属于被停止那次会话」的失败收走；再作废，于是 stop 之后
-    // **在途**请求才产生的失败会看到代号不匹配而被丢弃，不会被记到下一个会话上。
-    state.service.end_gateway_session();
+    // 停网关 + 等端口释放 + 用量/失败落库 + 作废会话（顺序见 `stop_gateway_locked`；
+    // 这是「这一次会话结束了」的天然边界，M7-S5/M8-S1/M40-S1 的理由不变）。
+    stop_gateway_locked(&state, true).await;
     Ok(gateway_status_of(&state))
 }
 
@@ -4620,5 +4800,190 @@ mod tests {
         assert!(captcha_submit_is_allowed(&awaiting));
         // 取消之后相位回 `Idle` ⇒ 提交必须被拒（修前这条竞态会让会话被接上）
         assert!(!captcha_submit_is_allowed(&CaptchaPhase::Idle));
+    }
+}
+
+#[cfg(test)]
+mod m41s1_tests {
+    use super::*;
+    use tianshu_relay_core::settings::Settings;
+
+    fn settings() -> Settings {
+        Settings::default()
+    }
+
+    /// §6.2 的矩阵（11 行 → 关键分支全覆盖）。
+    #[test]
+    fn gateway_transition_matrix() {
+        // 1) 关开关（运行中）⇒ Stop
+        let prev = Settings {
+            gateway_enabled: true,
+            ..settings()
+        };
+        let next = Settings {
+            gateway_enabled: false,
+            ..settings()
+        };
+        assert_eq!(
+            gateway_transition(&prev, &next, true),
+            GatewayTransition::Stop
+        );
+        // 2) 关开关（未运行）⇒ None
+        assert_eq!(
+            gateway_transition(&prev, &next, false),
+            GatewayTransition::None
+        );
+        // 3) 打开开关 ⇒ None（不自动启动）
+        assert_eq!(
+            gateway_transition(&next, &prev, false),
+            GatewayTransition::None
+        );
+        // 4) 运行中改端口 ⇒ Restart
+        let enabled = Settings {
+            gateway_enabled: true,
+            gateway_port: 8787,
+            ..settings()
+        };
+        let port = Settings {
+            gateway_port: 9898,
+            ..enabled.clone()
+        };
+        assert_eq!(
+            gateway_transition(&enabled, &port, true),
+            GatewayTransition::Restart
+        );
+        // 5) 未运行改端口 ⇒ None
+        assert_eq!(
+            gateway_transition(&enabled, &port, false),
+            GatewayTransition::None
+        );
+        // 6) 多站 / 7) 代理模式 / 8) 代理地址 各一条
+        let multi = Settings {
+            gateway_multi_site: true,
+            ..enabled.clone()
+        };
+        assert_eq!(
+            gateway_transition(&enabled, &multi, true),
+            GatewayTransition::Restart
+        );
+        let proxy_mode = Settings {
+            proxy_mode: "manual".into(),
+            ..enabled.clone()
+        };
+        assert_eq!(
+            gateway_transition(&enabled, &proxy_mode, true),
+            GatewayTransition::Restart
+        );
+        let proxy_url = Settings {
+            proxy_url: "socks5://127.0.0.1:1080".into(),
+            ..enabled.clone()
+        };
+        assert_eq!(
+            gateway_transition(&enabled, &proxy_url, true),
+            GatewayTransition::Restart
+        );
+        // 9) 白名单外字段 ⇒ None（主题 / 语言 / 自动启动 / last_*）
+        let theme = Settings {
+            theme: "dark".into(),
+            ..enabled.clone()
+        };
+        assert_eq!(
+            gateway_transition(&enabled, &theme, true),
+            GatewayTransition::None
+        );
+        let auto = Settings {
+            gateway_auto_start: true,
+            ..enabled.clone()
+        };
+        assert_eq!(
+            gateway_transition(&enabled, &auto, true),
+            GatewayTransition::None
+        );
+        let last = Settings {
+            gateway_last_site_id: 9,
+            gateway_last_key_id: 9,
+            ..enabled.clone()
+        };
+        assert_eq!(
+            gateway_transition(&enabled, &last, true),
+            GatewayTransition::None
+        );
+        // 10) 运行中关开关同时改端口 ⇒ Stop（优先级最高）
+        let both = Settings {
+            gateway_enabled: false,
+            gateway_port: 9898,
+            ..settings()
+        };
+        assert_eq!(
+            gateway_transition(&enabled, &both, true),
+            GatewayTransition::Stop
+        );
+    }
+
+    fn site(id: i64, health: &str) -> tianshu_relay_core::service::SiteSummary {
+        tianshu_relay_core::service::SiteSummary {
+            id,
+            kind: "newapi".into(),
+            base_url: "https://example.test".into(),
+            display_name: format!("站点 {id}"),
+            health: health.into(),
+            session_persisted: false,
+            session_expires_at: None,
+        }
+    }
+
+    fn key(id: i64, site_id: i64, status: &str) -> tianshu_relay_core::store::KeyRow {
+        tianshu_relay_core::store::KeyRow {
+            id,
+            site_id,
+            remote_id: None,
+            name: format!("key {id}"),
+            group_name: None,
+            group_id: None,
+            secret_ref: format!("kr/key/{id}/secret"),
+            status: status.into(),
+            created_at: 0,
+            quota_used: None,
+            quota_limit: None,
+            currency: None,
+        }
+    }
+
+    #[test]
+    fn auto_start_prefers_last_run_when_all_four_checks_pass() {
+        let sites = vec![site(1, "ok"), site(2, "ok")];
+        let keys = vec![key(10, 1, "enabled"), key(20, 2, "enabled")];
+        assert_eq!(auto_start_target(&sites, &keys, 2, 20), Some((2, 20)));
+    }
+
+    #[test]
+    fn auto_start_falls_back_when_last_run_is_invalid() {
+        let sites = vec![site(1, "ok"), site(2, "ok")];
+        let keys = vec![key(10, 1, "enabled"), key(20, 2, "enabled")];
+        // 站点不存在
+        assert_eq!(auto_start_target(&sites, &keys, 99, 20), Some((1, 10)));
+        // 密钥不存在
+        assert_eq!(auto_start_target(&sites, &keys, 2, 99), Some((1, 10)));
+        // 密钥不属于该站（不混用）
+        assert_eq!(auto_start_target(&sites, &keys, 2, 10), Some((1, 10)));
+        // 密钥非 enabled
+        let disabled = vec![key(10, 1, "enabled"), key(20, 2, "revoked")];
+        assert_eq!(auto_start_target(&sites, &disabled, 2, 20), Some((1, 10)));
+        // 站点 health 非 ok
+        let sick = vec![site(1, "ok"), site(2, "error")];
+        assert_eq!(auto_start_target(&sick, &keys, 2, 20), Some((1, 10)));
+        // 0 = 无 ⇒ 直接兜底
+        assert_eq!(auto_start_target(&sites, &keys, 0, 0), Some((1, 10)));
+    }
+
+    #[test]
+    fn auto_start_returns_none_when_no_healthy_site_or_no_enabled_key() {
+        let sites = vec![site(1, "error")];
+        let keys = vec![key(10, 1, "enabled")];
+        assert_eq!(auto_start_target(&sites, &keys, 0, 0), None);
+        let healthy = vec![site(1, "ok")];
+        let no_keys = vec![key(10, 1, "revoked")];
+        assert_eq!(auto_start_target(&healthy, &no_keys, 0, 0), None);
+        assert_eq!(auto_start_target(&[], &[], 0, 0), None);
     }
 }

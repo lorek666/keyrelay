@@ -321,6 +321,12 @@ export type Settings = {
   gatewayEnabled: boolean;
   /** 网关端口（只绑 127.0.0.1） */
   gatewayPort: number;
+  /** M41-S1：应用启动时自动启动网关（默认 false）。 */
+  gatewayAutoStart: boolean;
+  /** M41-S1：「上次成功运行」的站点行号（0 = 无；auto-start 的首选组）。 */
+  gatewayLastSiteId: number;
+  /** M41-S1：「上次成功运行」的密钥行号（0 = 无）。 */
+  gatewayLastKeyId: number;
   /** M14-S1：多站路由开关（默认关，保住换站语义）。 */
   gatewayMultiSite: boolean;
   /** M14-S1：模型清单采集开关（默认关）。 */
@@ -404,8 +410,22 @@ export type AuditReport = {
   summary: string;
 };
 
+export type GatewayExitReason = "requested" | "panicked" | "unexpected";
+
+/** M41-S1：任务结束记录（`crashed` 时才有）。 */
+export type GatewayExit = {
+  /** unix 秒 */
+  at: number;
+  reason: GatewayExitReason;
+};
+
 export type GatewayStatus = {
+  /** 兼容字段：等价于 `phase === "running"`。 */
   running: boolean;
+  /** M41-S1 三态：running | stopped | crashed（crashed 涵盖 panic 与 task 提前结束）。 */
+  phase: "running" | "stopped" | "crashed";
+  /** 最近一次任务结束（crashed 且发生过结束时才有值）。 */
+  lastExit?: GatewayExit | null;
   url?: string | null;
   /** 本地令牌：只在界面上显示给用户，用于配置 agent 连本地网关 */
   token?: string | null;
@@ -1411,6 +1431,8 @@ export async function gatewayStatus(): Promise<GatewayStatus> {
   if (!hasTauri) {
     return mock({
       running: false,
+      phase: "stopped" as const,
+      lastExit: null,
       url: null,
       token: null,
       site: null,
@@ -1427,6 +1449,8 @@ export async function gatewayStart(
   if (!hasTauri) {
     return mock({
       running: true,
+      phase: "running" as const,
+      lastExit: null,
       url: "http://127.0.0.1:8787",
       token: "kr-gw-mock0000000000000000000000000",
       site: "示例中转站（mock）",  // i18n:skip
@@ -1442,6 +1466,8 @@ export async function gatewayStop(): Promise<GatewayStatus> {
   if (!hasTauri) {
     return mock({
       running: false,
+      phase: "stopped" as const,
+      lastExit: null,
       url: null,
       token: null,
       site: null,
@@ -1538,6 +1564,9 @@ let mockSettings: Settings = {
   driftCheckOnStart: true,
   gatewayEnabled: false,
   gatewayPort: 8787,
+  gatewayAutoStart: false,
+  gatewayLastSiteId: 0,
+  gatewayLastKeyId: 0,
   gatewayMultiSite: false,
   collectModels: false,
   modelsMinIntervalSecs: 1800,
@@ -1561,12 +1590,36 @@ let mockSettings: Settings = {
   startHidden: false,
 };
 
-export async function updateSettings(settings: Settings): Promise<Settings> {
+/**
+ * 保存设置（M41-S1）。返回设置 + 网关状态 + 网关动作的失败原因。
+ *
+ * `gatewayError` 有值**也意味着设置已保存**——界面必须同时显示这两件事，
+ * 不能因为网关没重启就说「保存失败」（用户会重复保存）。
+ */
+export type SettingsUpdateResult = {
+  settings: Settings;
+  gateway: GatewayStatus;
+  gatewayError: string | null;
+};
+
+export async function updateSettings(settings: Settings): Promise<SettingsUpdateResult> {
   if (!hasTauri) {
     mockSettings = { ...settings };
-    return mock(mockSettings);
+    return mock({
+      settings: mockSettings,
+      gateway: {
+        running: false,
+        phase: "stopped" as const,
+        lastExit: null,
+        url: null,
+        token: null,
+        site: null,
+        tokenPersistent: false,
+      },
+      gatewayError: null,
+    });
   }
-  return invokeCommand<Settings>("update_settings", { args: { settings } });
+  return invokeCommand<SettingsUpdateResult>("update_settings", { args: { settings } });
 }
 
 /** `detect_system_proxy` 的返回（M10-S2）：auto 模式下探测到的系统代理（已脱敏）。 */
@@ -1846,6 +1899,8 @@ export async function gatewayRotateToken(
   if (!hasTauri) {
     return mock({
       running: false,
+      phase: "stopped" as const,
+      lastExit: null,
       url: null,
       token: null,
       site: null,
