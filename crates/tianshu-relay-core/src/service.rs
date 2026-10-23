@@ -4796,6 +4796,14 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             .swap(0, std::sync::atomic::Ordering::Relaxed);
         for usage in &drained {
             let _ = self.store.insert_gateway_usage(usage);
+            // M43-S1：归因到的令牌记一次 last_used_at（每分钟最多一次；失败静默）。
+            if let Some(token_id) = usage.token_id {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let _ = self.store.touch_gateway_token_throttled(token_id, now);
+            }
         }
         if dropped_this_round > 0 {
             self.log(observability::event_with_payload(

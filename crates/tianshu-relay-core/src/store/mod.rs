@@ -2133,6 +2133,22 @@ impl Store {
         Ok(())
     }
 
+    /// M43-S1：记录一次使用，**按「每分钟最多一次」节流**（SQL 原子判定，多进程安全）。
+    ///
+    /// 返回是否真的写入了（供测试断言节流生效）。
+    pub fn touch_gateway_token_throttled(&self, id: i64, now: i64) -> Result<bool> {
+        let conn = self.lock()?;
+        let changed = conn
+            .execute(
+                "UPDATE gateway_tokens SET last_used_at = ?2
+                 WHERE id = ?1
+                   AND (last_used_at IS NULL OR last_used_at <= ?2 - 60)",
+                params![id, now],
+            )
+            .map_err(|e| Error::Store(format!("更新令牌 #{id} 使用时间失败: {e}")))?;
+        Ok(changed > 0)
+    }
+
     /// 记录一次使用（调用方负责节流；见 service 的 `touch_gateway_token`）。
     pub fn touch_gateway_token(&self, id: i64) -> Result<()> {
         let conn = self.lock()?;

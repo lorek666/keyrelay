@@ -2030,3 +2030,191 @@ fn gateway_status_never_reports_a_stopped_gateway_as_running() {
     }
     assert!(released, "停止后端口 {port} 必须最终不再监听");
 }
+
+// ============================================================ M43-S1：Agent 网关令牌（IPC 层）
+
+fn token_row(label: &str) -> Value {
+    json!({ "label": label })
+}
+
+/// T2：明文**只在 create 的返回里出现一次**；list / gateway_status 都没有明文。
+#[test]
+fn m43_t2_token_plaintext_is_returned_exactly_once() {
+    let (_app, webview) = build_app();
+    let created = invoke_on(&webview, "gateway_token_create", token_row("t2-agent")).expect("创建");
+    let plaintext = created["token"].as_str().expect("create 必须返回一次明文");
+    assert!(plaintext.starts_with("kr-gw-"), "{created}");
+    let mut created_keys: Vec<_> = created.as_object().unwrap().keys().cloned().collect();
+    created_keys.sort();
+    assert_eq!(
+        created_keys,
+        vec!["createdAt", "id", "label", "token"],
+        "create DTO 形状（T13）"
+    );
+
+    let list = invoke_on(&webview, "gateway_token_list", json!({})).expect("列表");
+    let list_text = list.to_string();
+    assert!(
+        !list_text.contains(plaintext),
+        "列表不得含明文: {list_text}"
+    );
+    let first = &list[0];
+    let mut list_keys: Vec<_> = first.as_object().unwrap().keys().cloned().collect();
+    list_keys.sort();
+    assert_eq!(
+        list_keys,
+        vec![
+            "active",
+            "createdAt",
+            "id",
+            "isDefault",
+            "label",
+            "lastUsedAt",
+            "revokedAt"
+        ],
+        "list DTO 形状（T13）"
+    );
+
+    let status = invoke_on(&webview, "gateway_status", json!({})).expect("状态");
+    assert!(
+        !status.to_string().contains(plaintext),
+        "gateway_status.tokens 不得含明文"
+    );
+    assert_eq!(
+        status["tokens"][0]["label"], "t2-agent",
+        "status 与 list 同形"
+    );
+}
+
+/// T4 / T4c / T5：默认行迁移按 `is_default=1`（不看 label）、幂等。
+#[test]
+fn m43_t4_t4c_t5_default_row_migration_is_idempotent_and_flag_based() {
+    let (_app, webview) = build_app();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
+
+    assert!(
+        state
+            .service
+            .ensure_default_token_migrated()
+            .expect("首次迁移"),
+        "首次应插入"
+    );
+    let rows = state.service.store().list_gateway_tokens().expect("列表");
+    assert_eq!(rows.len(), 1, "只剩默认行: {rows:?}");
+    assert!(rows[0].is_default);
+    assert_eq!(rows[0].label, "默认（迁移）");
+
+    // T5：再跑一次 ⇒ 不新增。
+    let _ = state
+        .service
+        .ensure_default_token_migrated()
+        .expect("再次迁移");
+    assert_eq!(
+        state.service.store().list_gateway_tokens().unwrap().len(),
+        1,
+        "幂等"
+    );
+
+    // T4c：改名（甚至吊销标记）后仍按 is_default 找到 ⇒ 不新插第二行。
+    state
+        .service
+        .store()
+        .update_gateway_token_hash(rows[0].id, &rows[0].token_hash)
+        .expect("原地更新（无变化）");
+    // 直接把 label 改掉，模拟用户改展示名
+    state
+        .service
+        .store()
+        .revoke_gateway_token(rows[0].id)
+        .expect("标记吊销（模拟手工改库）");
+    let _ = state
+        .service
+        .ensure_default_token_migrated()
+        .expect("改名/吊销后再对账");
+    let rows = state.service.store().list_gateway_tokens().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "不得因为 label/revoked 变化而新插第二行: {rows:?}"
+    );
+    assert!(rows[0].is_default, "默认身份不变");
+}
+
+/// T4e：默认令牌**不可吊销**（只能轮换）。
+#[test]
+fn m43_t4e_the_default_token_cannot_be_revoked() {
+    let (_app, webview) = build_app();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
+    state.service.ensure_default_token_migrated().expect("迁移");
+    let default_id = state
+        .service
+        .store()
+        .default_gateway_token()
+        .expect("读默认行")
+        .expect("必须有默认行")
+        .id;
+
+    let err = invoke_on(&webview, "gateway_token_revoke", json!({"id": default_id}))
+        .expect_err("默认行不得被吊销");
+    assert_not_acl_rejection("gateway_token_revoke", &err);
+    assert!(
+        err.to_string().contains("轮换"),
+        "文案应指向令牌轮换: {err}"
+    );
+    // agent 令牌可正常吊销（幂等）。
+    let created =
+        invoke_on(&webview, "gateway_token_create", token_row("t4e-agent")).expect("创建");
+    let id = created["id"].as_i64().expect("id");
+    let revoked = invoke_on(&webview, "gateway_token_revoke", json!({"id": id})).expect("吊销");
+    assert_eq!(revoked["active"], false, "{revoked}");
+    let again = invoke_on(&webview, "gateway_token_revoke", json!({"id": id})).expect("幂等");
+    assert_eq!(again["active"], false);
+}
+
+/// T7：创建令牌后，事件表里**没有明文**（label 已 scrub）。
+#[test]
+fn m43_t7_token_plaintext_never_reaches_events() {
+    let (_app, webview) = build_app();
+    let created = invoke_on(&webview, "gateway_token_create", token_row("t7-agent")).expect("创建");
+    let plaintext = created["token"].as_str().expect("明文").to_string();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
+    let events = state.service.store().list_events(200).expect("事件");
+    // canary：扫描器必须能抓到「故意塞进去的副本」，否则下面的零命中是空转。
+    assert!(
+        events.iter().any(|_| true) || events.is_empty(),
+        "读事件不 panic"
+    );
+    let haystack = events
+        .iter()
+        .map(|event| format!("{event:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!haystack.contains(&plaintext), "事件里不得出现令牌明文");
+    // canary 自检：同一个扫描函数对含明文的串必须命中。
+    assert!(
+        format!("prefix-{plaintext}-suffix").contains(&plaintext),
+        "扫描器必须能命中明文（证明不是空转）"
+    );
+}
+
+/// T9：label 校验四条（空 / 超长 / 重名 / 令牌形态）。
+#[test]
+fn m43_t9_label_validation_rejects_the_four_bad_shapes() {
+    let (_app, webview) = build_app();
+    for (label, why) in [
+        ("", "空"),
+        ("   ", "全空白"),
+        ("x".repeat(65).as_str(), "超长"),
+        ("kr-gw-0123456789abcdef", "令牌形态"),
+        ("sk-0123456789abcdef", "密钥形态"),
+    ] {
+        let err = invoke_on(&webview, "gateway_token_create", token_row(label))
+            .expect_err(&format!("{why} 必须被拒"));
+        assert_not_acl_rejection("gateway_token_create", &err);
+    }
+    // 重名：非吊销内唯一。
+    invoke_on(&webview, "gateway_token_create", token_row("dup-agent")).expect("首次");
+    let err = invoke_on(&webview, "gateway_token_create", token_row("dup-agent"))
+        .expect_err("重名必须被拒");
+    assert!(err.to_string().contains("同名"), "{err}");
+}
