@@ -851,7 +851,8 @@
       "dirty": "有未保存的修改",
       "ok": "已保存。定时刷新间隔的变更在下次启动生效。",
       "autostartFail": "设置已保存，但登录自启没能同步：{error}",
-      "autostartMismatch": "设置已保存，但登录自启的实际状态是「{state}」，与设置不一致。"
+      "autostartMismatch": "设置已保存，但登录自启的实际状态是「{state}」，与设置不一致。",
+      "gatewayFail": "设置已保存，但网关未能按新设置重启（已停止）：{error}"
     },
     "validate": {
       "refresh": "定时刷新间隔必须是 0 到 86400 之间的整数秒（0 = 关闭）。",
@@ -947,7 +948,11 @@
       "title": "网关指标",
       "notRunning": "网关未运行，暂无指标。",
       "mode": "路由模式",
-      "modeValue": { "single": "单上游", "multi": "多站路由", "stopped": "未运行" },
+      "modeValue": {
+        "single": "单上游",
+        "multi": "多站路由",
+        "stopped": "未运行"
+      },
       "qps": "QPS（最近 60 秒）",
       "requests": "总请求数",
       "inflight": "在途请求",
@@ -956,9 +961,23 @@
       "lastError": "最近错误",
       "none": "无",
       "singleUpstream": "单上游模式：无候选列表。",
-      "candidate": { "site": "站点", "key": "密钥", "health": "健康", "breaker": "熔断" },
-      "health": { "healthy": "健康", "unknown": "未知", "exhausted": "额度耗尽" },
-      "breaker": { "closed": "正常", "open": "熔断中", "halfOpen": "探活中", "unknown": "未知" }
+      "candidate": {
+        "site": "站点",
+        "key": "密钥",
+        "health": "健康",
+        "breaker": "熔断"
+      },
+      "health": {
+        "healthy": "健康",
+        "unknown": "未知",
+        "exhausted": "额度耗尽"
+      },
+      "breaker": {
+        "closed": "正常",
+        "open": "熔断中",
+        "halfOpen": "探活中",
+        "unknown": "未知"
+      }
     },
     "phase": {
       "running": "状态：运行中",

@@ -931,6 +931,38 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// 指标里的失败原因：**先剥掉 URL，再 scrub、截断**（M40-S2 复审 P1）。
+///
+/// `reqwest::Error` 的 Display 会带 `for url (https://站点域名/...)`；`redact::scrub`
+/// 只掩 URL 里的 userinfo，不掩 host/path。`lastError` 会直接显示在网关卡片上，
+/// 而 spec §6.2 的红线是「不含 URL/域名」。这里在指标入口做一次结构性剥离，
+/// 不依赖调用方是否记得脱敏；事件路径不受影响（事件有自己的脱敏口径）。
+fn sanitize_metric_error(reason: &str) -> String {
+    let mut out = String::with_capacity(reason.len());
+    let mut rest = reason;
+    loop {
+        let next = [rest.find("https://"), rest.find("http://")]
+            .into_iter()
+            .flatten()
+            .min();
+        let Some(start) = next else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        out.push_str("<url>");
+        let tail = &rest[start..];
+        // URL 在 reqwest 的文案里通常以 `)` 收尾；空白、引号、逗号、分号、括号都算边界。
+        let end = tail
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, ')' | ']' | '}' | ',' | ';' | '"' | '\'')
+            })
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    crate::redact::scrub(&out).chars().take(200).collect()
+}
+
 /// IPv6 回环监听状态（M42-S1 §4.5）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ipv6State {
@@ -1090,9 +1122,9 @@ impl GatewayMetrics {
         }
     }
 
-    /// 一次失败（原因已由调用方给出，这里再 scrub + 截断）。
+    /// 一次失败（原因先剥 URL，再 scrub + 截断；M40-S2 复审 P1）。
     fn record_failure(&self, site_id: i64, status: u16, reason: &str) {
-        let cleaned: String = crate::redact::scrub(reason).chars().take(200).collect();
+        let cleaned = sanitize_metric_error(reason);
         if let Ok(mut map) = self.per_site.lock() {
             let e = map.entry(site_id).or_default();
             e.requests += 1;
@@ -2890,6 +2922,25 @@ pub fn generate_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M40-S2 复审 P1：`lastError` 不得带 URL/域名，且仍保留分类与状态码。
+    #[test]
+    fn metric_error_strips_urls_and_secrets() {
+        let reason = "传输层失败（不可重放）: 转发到上游失败: error sending request for url (https://relay.example.com/v1/chat/completions?key=sk-secret-0123456789abcdef)";
+        let cleaned = sanitize_metric_error(reason);
+        assert!(!cleaned.contains("relay.example.com"), "{cleaned}");
+        assert!(!cleaned.contains("https://"), "{cleaned}");
+        assert!(cleaned.contains("<url>"), "{cleaned}");
+        assert!(cleaned.contains("传输层失败"), "{cleaned}");
+        assert!(!cleaned.contains("sk-secret"), "{cleaned}");
+    }
+
+    /// 无 URL 的原因原样保留（除了 scrub 既有规则）。
+    #[test]
+    fn metric_error_keeps_plain_reason() {
+        let cleaned = sanitize_metric_error("上游返回 HTTP 500（可能已计费）");
+        assert_eq!(cleaned, "上游返回 HTTP 500（可能已计费）");
+    }
 
     /// M9-S3 §5：`connect` 有真实站点标定，取值来自实测上界 1.15s + 约 4.3 倍余量。
     ///

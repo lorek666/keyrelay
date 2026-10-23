@@ -1484,7 +1484,11 @@ pub async fn update_settings(
     let _op = state.gateway_op.lock().await;
 
     let prev = state.service.settings().map_err(|e| e.to_string())?;
-    let next = settings_from_dto(&args.settings);
+    let mut next = settings_from_dto(&args.settings);
+    // M41-S1 复审 P2-1：last_* 是服务端写的「上次成功运行」，不是用户设置。
+    // 前端页面可能持有启动前的旧快照，回传会把新值覆盖回 0/旧值；这里强制沿用 prev。
+    next.gateway_last_site_id = prev.gateway_last_site_id;
+    next.gateway_last_key_id = prev.gateway_last_key_id;
     // 保存失败 ⇒ Err，网关不动（设置是唯一真相，但没保存成功就谈不上对齐）。
     state
         .service
@@ -1894,6 +1898,15 @@ pub(crate) async fn start_gateway_locked(
     key_id: i64,
 ) -> Result<(), String> {
     let settings = state.service.settings().map_err(|e| e.to_string())?;
+    // M41-S1 复审 P2-3：总开关检查必须在**唯一启动出口**里再做一次。
+    // `gateway_start` 的入口检查在 `gateway_op` 之外；并发「关开关」拿到锁后，
+    // 旧检查仍可能放行一次启动，留下「设置已关但端口在听」。
+    if !settings.gateway_enabled {
+        return Err(
+            "本地网关总开关是关的。请到「设置」页勾选「允许启动本地网关」并保存后再启动。"
+                .to_string(),
+        );
+    }
     let config = state
         .service
         .gateway_config(site_id, key_id, settings.gateway_port)
