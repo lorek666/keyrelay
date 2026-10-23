@@ -823,6 +823,11 @@ function mockUsageDashboard(days: number, siteId: number | null): UsageDashboard
           promptTokens: prompt,
           completionTokens: total - prompt,
           totalTokens: total,
+          // M43-S2：mock 里也演示「有价 / 未定价」两条路径（不编造真实价格）。
+          currency: index === 0 ? "USD" : null,
+          estimatedCost: index === 0 ? Math.round(total * 0.000002 * 1e6) / 1e6 : null,
+          unpricedRequests: index === 0 ? 0 : Math.max(1, Math.round(total / 900)),
+          unpricedTokens: index === 0 ? 0 : total,
         });
         totalsBySite.set(site, (totalsBySite.get(site) ?? 0) + total);
       });
@@ -870,7 +875,7 @@ function mockUsageDashboard(days: number, siteId: number | null): UsageDashboard
     });
   }
 
-  return { rangeDays, siteId, daily, snapshots, keyUsage };
+  return { rangeDays, siteId, daily, snapshots, keyUsage, byAgent: [] };
 }
 
 function mock<T>(value: T): Promise<T> {
@@ -1380,6 +1385,23 @@ export type UsageDaily = {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  /** M43-S2：本组命中的价格币种；同一模型不同时段不同币种 ⇒ 拆成多行。 */
+  currency: string | null;
+  /** M43-S2：能定价部分的估算成本；`null` = 整组没有价格（未知，**不是 0**）。 */
+  estimatedCost: number | null;
+  /** M43-S2：没有价格的请求数 / token 数（>0 ⇒ 界面标「部分未定价」）。 */
+  unpricedRequests: number;
+  unpricedTokens: number;
+};
+
+/** M43-S2：按 agent（认证时的 label 快照）× 币种的成本聚合。 */
+export type AgentUsage = {
+  agentLabel: string;
+  currency: string | null;
+  requests: number;
+  totalTokens: number;
+  estimatedCost: number | null;
+  unpricedRequests: number;
 };
 
 /** M34-S1：站点余额快照按（本地日, 站点）聚合的一行；每天取最后一条。 */
@@ -1402,7 +1424,8 @@ export type KeyUsageTotal = {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
-  cost: number;
+  /** M43-S2：站点自报成本合计；`null` = 都没上报（**不是 0**）。 */
+  cost: number | null;
   /** `keys.currency`；未记录时为 `null`（不猜币种）。 */
   currency: string | null;
 };
@@ -1416,6 +1439,8 @@ export type UsageDashboard = {
   daily: UsageDaily[];
   snapshots: UsageSnapshotDaily[];
   keyUsage: KeyUsageTotal[];
+  /** M43-S2：按 agent × 币种。 */
+  byAgent: AgentUsage[];
 };
 
 /**
@@ -1429,6 +1454,100 @@ export async function usageDashboard(
 ): Promise<UsageDashboard> {
   if (!hasTauri) return mock(mockUsageDashboard(days, siteId));
   return invokeCommand<UsageDashboard>("usage_dashboard", { days, siteId });
+}
+
+/** M43-S2：一个价格版本（每 1M token 单价 + 币种 + 生效时间）。 */
+export type ModelPrice = {
+  id: number;
+  model: string;
+  inputPerMtok: number;
+  outputPerMtok: number;
+  /** `"USD"` | `"CNY"` */
+  currency: string;
+  effectiveFrom: number;
+  createdAt: number;
+};
+
+export type ModelPriceInput = {
+  model: string;
+  inputPerMtok: number;
+  outputPerMtok: number;
+  currency: string;
+  effectiveFrom: number;
+};
+
+/** M43-S2：一行站点自报账单（`amount` / `currency` 为 `null` = 站点没给，不是 0）。 */
+export type SiteBill = {
+  id: number;
+  siteId: number;
+  day: string;
+  amount: number | null;
+  currency: string | null;
+  requests: number | null;
+  source: string;
+  fetchedAt: number;
+};
+
+/** M43-S2：账单能力探测结果（五分类压成四态 + reason）。 */
+export type BillProbe = {
+  status: "supported" | "unsupported" | "needsLogin" | "failed";
+  currency: string | null;
+  reason: string | null;
+};
+
+/** M43-S2：账单导入结果（`partial` 必须如实显示）。 */
+export type SiteBillImport = {
+  imported: number;
+  pages: number;
+  partial: boolean;
+  currency: string | null;
+  currencyOverrideUsed: boolean;
+};
+
+export async function modelPriceList(): Promise<ModelPrice[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<ModelPrice[]>("model_price_list");
+}
+
+export async function modelPriceUpsert(price: ModelPriceInput): Promise<ModelPrice> {
+  if (!hasTauri) return mock({ ...price, id: 1, createdAt: 0 });
+  return invokeCommand<ModelPrice>("model_price_upsert", { price });
+}
+
+export async function modelPriceDelete(id: number): Promise<boolean> {
+  if (!hasTauri) return mock(true);
+  return invokeCommand<boolean>("model_price_delete", { id });
+}
+
+export async function siteBillProbe(siteId: number): Promise<BillProbe> {
+  if (!hasTauri) return mock({ status: "unsupported", currency: null, reason: null });
+  return invokeCommand<BillProbe>("site_bill_probe", { siteId });
+}
+
+export async function siteBillImport(
+  siteId: number,
+  maxPages?: number,
+  currency?: string,
+): Promise<SiteBillImport> {
+  if (!hasTauri) {
+    return mock({
+      imported: 0,
+      pages: 0,
+      partial: false,
+      currency: currency ?? null,
+      currencyOverrideUsed: false,
+    });
+  }
+  return invokeCommand<SiteBillImport>("site_bill_import", {
+    siteId,
+    maxPages: maxPages ?? null,
+    currency: currency ?? null,
+  });
+}
+
+export async function siteBills(days = 30): Promise<SiteBill[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<SiteBill[]>("site_bills", { days });
 }
 
 /** M14-S1：模型别名映射（B-110）—— agent 侧模型名 → 真实模型名。 */
