@@ -197,34 +197,182 @@ fn extract_usage_from_json(body: &[u8]) -> Option<(i64, i64, i64)> {
     Some((prompt, completion, total))
 }
 
-/// 从一个 SSE chunk 的文本行里提取 `usage`（M13-S1）。
+/// 一次**已命中上游**的元数据（M40-S1）：usage 归因所需的三项。
 ///
-/// 扫描 chunk 里所有 `data:` 行，逐行尝试解析 JSON 并找 `usage`。
-fn extract_usage_from_chunk(chunk: &[u8]) -> Option<(i64, i64, i64)> {
-    let text = std::str::from_utf8(chunk).ok()?;
-    for line in text.lines() {
-        let line = match line.strip_prefix("data: ") {
-            Some(s) => s,
-            None => match line.strip_prefix("data:") {
-                Some(s) => s,
-                None => continue,
-            },
-        };
-        if line.trim() == "[DONE]" {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(usage) = value.get("usage") {
-                let prompt = usage.get("prompt_tokens").and_then(|v| v.as_i64());
-                let completion = usage.get("completion_tokens").and_then(|v| v.as_i64());
-                let total = usage.get("total_tokens").and_then(|v| v.as_i64());
-                if let (Some(p), Some(c), Some(t)) = (prompt, completion, total) {
-                    return Some((p, c, t));
-                }
-            }
+/// 单独成结构是为了让 `into_upstream_response` 的参数表保持在可读范围
+/// （key/latency/attempts 是同一件事的三个面，一起传/一起忘）。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AttemptMeta {
+    /// 实际命中的上游 key（多站 = `Upstream.key_id`；legacy = `GatewayConfig.key_id`）。
+    pub key_id: Option<i64>,
+    /// send → 响应头（TTFB）。
+    pub latency_ms: u64,
+    /// 本次请求成功前的尝试次数（1 = 第一次就成功）。
+    pub attempts: u32,
+}
+
+/// SSE carry 上限（M40-S1 §4.3）：单个未成行的片段最多 64 KiB；超限丢弃到下一个换行再继续。
+pub(crate) const MAX_USAGE_CARRY_BYTES: usize = 64 * 1024;
+
+/// 系统时钟（Unix 秒）——`UsageCapture` 的生产时钟实现。
+///
+/// 抽成函数是为了让 `UsageCapture::new` 能注入 `Arc<dyn Fn() -> i64>`：
+/// 测试用固定/递增时钟可确定性地断言 `at`，不依赖墙上时间（M40-S1 §4.2）。
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 一次响应的用量采集器（M40-S1）。
+///
+/// 职责：
+/// 1. **SSE 跨 chunk 行缓冲**：chunk 边界与 SSE 事件边界无关，按 `\n` 拼行后再解析；
+///    单行上限 [`MAX_USAGE_CARRY_BYTES`]，超限丢到下一个换行（防畸形流撑爆内存）。
+/// 2. **幂等 flush**：正常结束 / 流错误 / 客户端断开（`Drop`）三路合计**恰好一次**，
+///    由 `emitted: AtomicBool` 的 `swap(true)` 保证。
+/// 3. 只把 [`GatewayUsage`] 交给 `sink`（内存 push，不做 IO、不 panic）。
+pub(crate) struct UsageCapture {
+    sink: Option<Arc<dyn Fn(GatewayUsage) + Send + Sync>>,
+    /// 时钟注入：生产 = [`unix_now_secs`]；测试 = 固定/递增。
+    now: Arc<dyn Fn() -> i64 + Send + Sync>,
+    site_id: i64,
+    key_id: Option<i64>,
+    model: String,
+    status: u16,
+    latency_ms: u64,
+    attempts: u32,
+    stream: bool,
+    /// SSE 未成行的字节（不含已消费的完整行）。
+    carry: Vec<u8>,
+    /// 因超过 `MAX_USAGE_CARRY_BYTES` 进入「丢弃到下一个 \n」模式。
+    discarding: bool,
+    /// 已见到 `[DONE]`：之后不再解析任何 `data:` 行（仍允许 flush 已见的 `last_usage`）。
+    done: bool,
+    /// 最后一个含 usage 的 SSE 事件（后出现的覆盖前面的）。
+    last_usage: Option<(i64, i64, i64)>,
+    /// 非流式累积（受流层 `MAX_RESPONSE_BYTES` 约束）。
+    body: Vec<u8>,
+    /// 幂等闸：`swap(true)` 为 true 的那一次才真正 emit。
+    emitted: std::sync::atomic::AtomicBool,
+}
+
+impl UsageCapture {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        sink: Option<Arc<dyn Fn(GatewayUsage) + Send + Sync>>,
+        site_id: i64,
+        key_id: Option<i64>,
+        model: String,
+        status: u16,
+        latency_ms: u64,
+        attempts: u32,
+        stream: bool,
+        now: Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Self {
+        Self {
+            sink,
+            now,
+            site_id,
+            key_id,
+            model,
+            status,
+            latency_ms,
+            attempts,
+            stream,
+            carry: Vec::new(),
+            discarding: false,
+            done: false,
+            last_usage: None,
+            body: Vec::new(),
+            emitted: std::sync::atomic::AtomicBool::new(false),
         }
     }
-    None
+
+    /// 每收到一个 chunk 调用一次：SSE 走行缓冲；非流式追加到 body。
+    pub(crate) fn feed(&mut self, chunk: &[u8]) {
+        if !self.stream {
+            self.body.extend_from_slice(chunk);
+            return;
+        }
+        self.carry.extend_from_slice(chunk);
+        let mut start = 0usize;
+        while let Some(rel) = self.carry[start..].iter().position(|b| *b == b'\n') {
+            let end = start + rel;
+            let line = String::from_utf8_lossy(&self.carry[start..end]).into_owned();
+            start = end + 1;
+            if self.discarding {
+                // 超限后重同步：吃到第一个换行就恢复解析。
+                self.discarding = false;
+                continue;
+            }
+            if self.done {
+                continue;
+            }
+            let line = line.strip_suffix('\r').unwrap_or(&line);
+            let Some(rest) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let rest = rest.trim();
+            if rest.is_empty() {
+                continue;
+            }
+            if rest == "[DONE]" {
+                self.done = true;
+                continue;
+            }
+            if let Some(usage) = extract_usage_from_json(rest.as_bytes()) {
+                // 后出现的覆盖前面的：OpenAI 兼容的 usage 在最后一个事件里。
+                self.last_usage = Some(usage);
+            }
+        }
+        if start > 0 {
+            self.carry.drain(0..start);
+        }
+        if self.carry.len() > MAX_USAGE_CARRY_BYTES {
+            // 不记日志、不落库：只丢数据并重同步。
+            self.carry.clear();
+            self.discarding = true;
+        }
+    }
+
+    /// 幂等 flush：第一次调用（正常结束 / 流错误 / Drop）才 emit；之后是 no-op。
+    pub(crate) fn flush(&mut self) {
+        if self.emitted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let usage = if self.stream {
+            self.last_usage
+        } else {
+            extract_usage_from_json(&self.body)
+        };
+        let Some((prompt_tokens, completion_tokens, total_tokens)) = usage else {
+            return;
+        };
+        if let Some(sink) = &self.sink {
+            sink(GatewayUsage {
+                at: (self.now)(),
+                site_id: self.site_id,
+                key_id: self.key_id,
+                model: self.model.clone(),
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                status: self.status,
+                latency_ms: self.latency_ms,
+                attempts: self.attempts,
+                stream: self.stream,
+            });
+        }
+    }
+}
+
+impl Drop for UsageCapture {
+    fn drop(&mut self) {
+        // 客户端断开（响应体流被 drop）时走这里：把已经看到的 usage 补记上。
+        self.flush();
+    }
 }
 
 /// 判断响应是否为 SSE 流（`Content-Type: text/event-stream`）。
@@ -271,50 +419,40 @@ where
 ///
 /// 与 `cap_stream` 相同，但在流正常结束后把收集到的 chunk（最多最后 8 个）
 /// 传给 `on_complete` 回调，用于提取 `usage`。
-fn cap_stream_with_usage<S, E, F>(
+fn cap_stream_with_usage<S, E>(
     stream: S,
     limit: u64,
-    on_complete: F,
+    capture: UsageCapture,
 ) -> impl futures_util::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>
 where
     S: futures_util::Stream<Item = std::result::Result<bytes::Bytes, E>> + Send + 'static,
     E: std::fmt::Display + 'static,
-    F: FnOnce(Vec<bytes::Bytes>) + Send + 'static,
 {
-    use std::sync::{Arc, Mutex};
-    let collected: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
-    let on_complete: Arc<Mutex<Option<F>>> = Arc::new(Mutex::new(Some(on_complete)));
-
+    // 正常结束 / 流错误两条路径显式 flush；流被客户端 drop（断开）时由
+    // `UsageCapture::drop` 兜底。三条路径合计恰好一次（`emitted` 幂等闸）。
     futures_util::stream::try_unfold(
-        (Box::pin(stream), 0u64, collected, on_complete),
-        move |(mut stream, sent, collected, on_complete)| async move {
+        (Box::pin(stream), 0u64, capture),
+        move |(mut stream, sent, mut capture)| async move {
             match stream.try_next().await {
                 Ok(None) => {
-                    let chunks = collected.lock().map(|g| g.clone()).unwrap_or_default();
-                    if let Ok(mut guard) = on_complete.lock() {
-                        if let Some(cb) = guard.take() {
-                            cb(chunks);
-                        }
-                    }
+                    capture.flush();
                     Ok(None)
                 }
                 Ok(Some(chunk)) => {
                     let total = sent + chunk.len() as u64;
                     if total > limit {
+                        capture.flush();
                         return Err(std::io::Error::other(format!(
                             "上游响应体超过上限 {limit} 字节"
                         )));
                     }
-                    if let Ok(mut guard) = collected.lock() {
-                        if guard.len() >= 8 {
-                            let drain_count = guard.len() - 7;
-                            guard.drain(0..drain_count);
-                        }
-                        guard.push(chunk.clone());
-                    }
-                    Ok(Some((chunk, (stream, total, collected, on_complete))))
+                    capture.feed(&chunk);
+                    Ok(Some((chunk, (stream, total, capture))))
                 }
-                Err(e) => Err(std::io::Error::other(e.to_string())),
+                Err(e) => {
+                    capture.flush();
+                    Err(std::io::Error::other(e.to_string()))
+                }
             }
         },
     )
@@ -328,6 +466,9 @@ pub struct GatewayConfig {
     /// 绑定的站点 id（M13-S1）：用于 token 用量出口的 `site_id`。
     /// `single_upstream` 默认 `0`（legacy 兼容）。
     pub site_id: i64,
+    /// M40-S1：legacy 单上游路径使用的本地 key id（多站路由的 key 归因在 `Upstream.key_id`）。
+    /// `single_upstream` 默认 `None`（行为与既有逐字相同）。
+    pub key_id: Option<i64>,
     /// 转发目标（站点根，无尾斜杠）。`route` 为空时**只**用它。
     pub base_url: String,
     /// 站点密钥（从钥匙串取）。`route` 为空时**只**用它。
@@ -467,12 +608,25 @@ pub struct UpstreamObservation {
 /// 装不下响应正文、密钥或本地令牌。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewayUsage {
+    /// 请求**完成**时刻（Unix 秒）。SSE：流结束或被客户端断开的那一刻；非流式：body 读完那一刻。
+    /// 由 [`UsageCapture`] 构造时注入的时钟取值（生产 = 系统时钟；测试 = 固定/递增）。
+    pub at: i64,
     pub site_id: i64,
+    /// 本次请求**实际命中的上游**所用的本地 key 行（多站 = `Upstream.key_id`；legacy = `GatewayConfig.key_id`）。
+    pub key_id: Option<i64>,
     /// 调用方自由文本，**脱敏在值被创造的地方完成**（与 `GatewayFailure.model` 同口径）。
     pub model: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    /// 上游 HTTP 状态码（只有 2xx 才可能产生 usage）。
+    pub status: u16,
+    /// 从发起 send 到**收到响应头**的耗时（TTFB，首字节时间；不是总耗时）。
+    pub latency_ms: u64,
+    /// 本次请求成功前尝试过的上游次数（1 = 第一次就成功；失败切换后成功 = 命中的候选序号）。
+    pub attempts: u32,
+    /// 响应是否为 SSE。
+    pub stream: bool,
 }
 
 /// 一次「因可切换状态而放弃当前上游」的元数据。
@@ -532,6 +686,7 @@ impl GatewayConfig {
             port,
             token,
             site_id: 0,
+            key_id: None,
             base_url,
             api_key,
             site_display_name,
@@ -1249,7 +1404,16 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     // M39-S3（Lead P2）：先记下「可重放的真实响应」（目前只有 429）。若它之后的候选
     // 全被本地保护跳过，也要把它原样返回——不能把上游真的回过的 429 变成 502。
     // 元组里带着 lease：body 还没被读，站点并发要等这条响应真正结束才归还。
-    let mut pending_replay: Option<(reqwest::Response, i64, String, Option<SiteLease>)> = None;
+    // M40-S1：同时保留「这条响应对应的命中事实」（site/model/lease/key/latency/attempts），
+    // 以便循环末尾统一走 `into_upstream_response` 时 usage 归因正确。
+    struct PendingReplay {
+        response: reqwest::Response,
+        site_id: i64,
+        model: String,
+        lease: Option<SiteLease>,
+        meta: AttemptMeta,
+    }
+    let mut pending_replay: Option<PendingReplay> = None;
     let attempts = order.len();
     for (index, upstream) in order.iter().enumerate() {
         // P3-3：**每一次上游尝试之前**都查停止闸门——信号可能在上一次尝试期间发出。
@@ -1333,7 +1497,17 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                 if replayable && !is_last {
                     // 留着这条响应（含 lease），继续试下一个候选；若后面全军覆没，
                     // 循环末尾会把这条 429 原样返回，而不是编一个 502。
-                    pending_replay = Some((response, upstream.site_id, event_model.clone(), lease));
+                    pending_replay = Some(PendingReplay {
+                        response,
+                        site_id: upstream.site_id,
+                        model: event_model.clone(),
+                        lease,
+                        meta: AttemptMeta {
+                            key_id: upstream.key_id,
+                            latency_ms,
+                            attempts: index as u32 + 1,
+                        },
+                    });
                     continue;
                 }
                 return into_upstream_response(
@@ -1342,6 +1516,12 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                     upstream.site_id,
                     &event_model,
                     lease,
+                    // M40-S1：key_id 取**实际命中的上游**（不是 config 那把）。
+                    AttemptMeta {
+                        key_id: upstream.key_id,
+                        latency_ms,
+                        attempts: index as u32 + 1,
+                    },
                 );
             }
             Err(failure) => {
@@ -1381,8 +1561,15 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
 
     // M39-S3（Lead P2）：存在「可重放的真实响应」（429）⇒ 原样返回它。
     // 典型形态：第一候选回 429，其后的候选都被本地保护跳过。
-    if let Some((response, site_id, model, lease)) = pending_replay {
-        return into_upstream_response(&state, response, site_id, &model, lease);
+    if let Some(pending) = pending_replay {
+        return into_upstream_response(
+            &state,
+            pending.response,
+            pending.site_id,
+            &pending.model,
+            pending.lease,
+            pending.meta,
+        );
     }
 
     // M39-S3 §4.5：**全部候选都被本地保护跳过** ⇒ 429（不是 502）。
@@ -1579,8 +1766,24 @@ async fn forward_to(
     body: bytes::Bytes,
 ) -> Response {
     let model = model_from_body(&body).unwrap_or_default();
+    let started = Instant::now();
     match send_once(state, method, url, headers, body).await {
-        Ok(response) => into_upstream_response(state, response, state.config.site_id, &model, None),
+        Ok(response) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            // legacy 单上游：`key_id` 回退到启动参数（M40-S1 §4.1）。
+            into_upstream_response(
+                state,
+                response,
+                state.config.site_id,
+                &model,
+                None,
+                AttemptMeta {
+                    key_id: state.config.key_id,
+                    latency_ms,
+                    attempts: 1,
+                },
+            )
+        }
         Err(failure) => (
             StatusCode::BAD_GATEWAY,
             axum::Json(serde_json::json!({ "error": failure.message() })),
@@ -1615,6 +1818,7 @@ fn into_upstream_response(
     site_id: i64,
     model: &str,
     lease: Option<SiteLease>,
+    meta: AttemptMeta,
 ) -> Response {
     let status = upstream_response.status();
     let is_success = status.is_success();
@@ -1628,65 +1832,36 @@ fn into_upstream_response(
     }
 
     if !is_success {
-        let capped = cap_stream(upstream_response.bytes_stream(), MAX_RESPONSE_BYTES);
-        let capped = hold_lease(capped, lease);
-        return builder
-            .body(Body::from_stream(capped))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-    }
-
-    if !is_sse {
-        // 非流式 2xx：读完 body，提取 usage，再回传
-        let on_usage = state.config.on_usage.clone();
-        let model_scrubbed = crate::redact::scrub(model).to_string();
-        let capped = cap_stream_with_usage(
-            upstream_response.bytes_stream(),
-            MAX_RESPONSE_BYTES,
-            move |chunks: Vec<bytes::Bytes>| {
-                // 非流式：把所有 chunk 拼起来当 JSON 解析
-                let combined: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
-                if let Some((p, c, t)) = extract_usage_from_json(&combined) {
-                    if let Some(sink) = &on_usage {
-                        sink(GatewayUsage {
-                            site_id,
-                            model: model_scrubbed.clone(),
-                            prompt_tokens: p,
-                            completion_tokens: c,
-                            total_tokens: t,
-                        });
-                    }
-                }
-            },
+        // P1（M40-S1 复审）：**非 2xx 的 body 也必须 hold_lease**。M39-S3 的
+        // `SiteLease` 要覆盖整个响应 body（5xx / 429 / pending_replay 都一样）；
+        // 这里若直接 `Body::from_stream`，body 还没读完站点并发就提前归还，
+        // 第二个请求会被错误放进来（本地 429 保护失效、上游并发超限）。
+        let capped = hold_lease(
+            cap_stream(upstream_response.bytes_stream(), MAX_RESPONSE_BYTES),
+            lease,
         );
-        let capped = hold_lease(capped, lease);
         return builder
             .body(Body::from_stream(capped))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
 
-    // 流式 SSE 2xx：边转发边扫 chunk，流结束后提取最后的 usage
-    let on_usage = state.config.on_usage.clone();
-    let model_scrubbed = crate::redact::scrub(model).to_string();
+    // M40-S1：2xx 用统一的 `UsageCapture`——SSE 走跨 chunk 行缓冲，非流式累积 body；
+    // 正常结束 / 流错误 / 客户端断开（Drop）三路合计恰好 flush 一次。
+    let capture = UsageCapture::new(
+        state.config.on_usage.clone(),
+        site_id,
+        meta.key_id,
+        crate::redact::scrub(model).to_string(),
+        status.as_u16(),
+        meta.latency_ms,
+        meta.attempts,
+        is_sse,
+        Arc::new(unix_now_secs),
+    );
     let capped = cap_stream_with_usage(
         upstream_response.bytes_stream(),
         MAX_RESPONSE_BYTES,
-        move |chunks: Vec<bytes::Bytes>| {
-            // 从最后一个 chunk 往前找
-            for chunk in chunks.iter().rev() {
-                if let Some((p, c, t)) = extract_usage_from_chunk(chunk) {
-                    if let Some(sink) = &on_usage {
-                        sink(GatewayUsage {
-                            site_id,
-                            model: model_scrubbed.clone(),
-                            prompt_tokens: p,
-                            completion_tokens: c,
-                            total_tokens: t,
-                        });
-                    }
-                    return;
-                }
-            }
-        },
+        capture,
     );
     let capped = hold_lease(capped, lease);
     builder
@@ -2601,86 +2776,220 @@ mod tests {
         assert_eq!(extract_usage_from_json(b"not json"), None);
     }
 
-    #[test]
-    fn extract_usage_from_chunk_finds_usage_in_sse_data() {
-        let chunk = b"data: {\"id\":\"x\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n";
-        assert_eq!(extract_usage_from_chunk(chunk), Some((10, 5, 15)));
+    // ---------- M40-S1：用量采集（SSE 跨 chunk / Drop flush / 注入时钟） ----------
+
+    use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
+
+    /// 记录型 sink + 固定时钟的便捷构造。
+    fn capture_for(
+        stream: bool,
+        now: Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> (UsageCapture, Arc<Mutex<Vec<GatewayUsage>>>) {
+        let log: Arc<Mutex<Vec<GatewayUsage>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_log = Arc::clone(&log);
+        let sink: Arc<dyn Fn(GatewayUsage) + Send + Sync> =
+            Arc::new(move |usage| sink_log.lock().unwrap().push(usage));
+        (
+            UsageCapture::new(
+                Some(sink),
+                7,
+                Some(42),
+                "m".to_string(),
+                200,
+                123,
+                2,
+                stream,
+                now,
+            ),
+            log,
+        )
+    }
+
+    fn fixed_clock(at: i64) -> Arc<dyn Fn() -> i64 + Send + Sync> {
+        Arc::new(move || at)
     }
 
     #[test]
-    fn extract_usage_from_chunk_returns_none_without_usage() {
-        let chunk = b"data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
-        assert_eq!(extract_usage_from_chunk(chunk), None);
+    fn sse_usage_survives_chunk_split_mid_json() {
+        let (mut capture, log) = capture_for(true, fixed_clock(1_700_000_000));
+        capture.feed(b"data: {\"usa");
+        assert!(log.lock().unwrap().is_empty(), "第一块还不成行，不能解析");
+        capture
+            .feed(b"ge\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n");
+        capture.flush();
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1, "跨包拼行后必须记一条");
+        assert_eq!(
+            (
+                log[0].prompt_tokens,
+                log[0].completion_tokens,
+                log[0].total_tokens
+            ),
+            (10, 5, 15)
+        );
+        assert!(log[0].stream);
+        assert_eq!(log[0].at, 1_700_000_000);
+        assert_eq!(log[0].site_id, 7);
+        assert_eq!(log[0].key_id, Some(42));
+        assert_eq!(log[0].status, 200);
+        assert_eq!(log[0].latency_ms, 123);
+        assert_eq!(log[0].attempts, 2);
     }
 
     #[test]
-    fn extract_usage_from_chunk_returns_none_on_non_utf8() {
-        assert_eq!(extract_usage_from_chunk(b"\xff\xfe"), None);
+    fn sse_usage_accepts_data_without_space_and_crlf() {
+        let (mut capture, log) = capture_for(true, fixed_clock(1));
+        capture.feed(b"data:{\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\r\n\r\n");
+        capture.flush();
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!((log[0].prompt_tokens, log[0].total_tokens), (1, 3));
+    }
+
+    #[test]
+    fn sse_usage_takes_the_last_usage_and_ignores_done() {
+        let (mut capture, log) = capture_for(true, fixed_clock(1));
+        capture.feed(b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n");
+        capture.feed(b"data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n");
+        capture.feed(b"data: [DONE]\n\n");
+        capture.flush();
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            (
+                log[0].prompt_tokens,
+                log[0].completion_tokens,
+                log[0].total_tokens
+            ),
+            (3, 4, 7),
+            "最后一个 usage 胜"
+        );
+    }
+
+    #[test]
+    fn sse_usage_after_done_is_ignored() {
+        let (mut capture, log) = capture_for(true, fixed_clock(1));
+        capture.feed(b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n");
+        capture.feed(b"data: [DONE]\n\n");
+        // [DONE] 之后即便还有 usage 行，也不再解析（M40-S1 §4.3 规则 3）。
+        capture.feed(b"data: {\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":9,\"total_tokens\":18}}\n\n");
+        capture.flush();
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].total_tokens, 2, "done 之后的 usage 必须被忽略");
+    }
+
+    #[test]
+    fn sse_carry_drops_oversized_line_and_resyncs() {
+        let (mut capture, log) = capture_for(true, fixed_clock(1));
+        // 一条超长、无换行的片段 ⇒ carry 被清空并进入 discarding。
+        capture.feed(&vec![b'x'; MAX_USAGE_CARRY_BYTES + 1]);
+        assert!(log.lock().unwrap().is_empty(), "超限片段不得产生账目");
+        // 下一个换行完成重同步；随后正常行仍能解析。
+        capture.feed(b"\n");
+        capture.feed(b"data: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":5,\"total_tokens\":9}}\n\n");
+        capture.flush();
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1, "重同步后必须恢复解析");
+        assert_eq!(log[0].total_tokens, 9);
     }
 
     #[tokio::test]
-    async fn cap_stream_with_usage_collects_chunks_and_calls_callback() {
+    async fn usage_capture_flushes_exactly_once_on_normal_end() {
         use futures_util::StreamExt;
+        let (capture, log) = capture_for(true, fixed_clock(1));
         let chunks = vec![
-            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"hello")),
-            Ok(bytes::Bytes::from_static(b" ")),
-            Ok(bytes::Bytes::from_static(b"world")),
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"data: {\"usage\":{\"prompt_tokens\":2,",
+            )),
+            Ok(bytes::Bytes::from_static(
+                b"\"completion_tokens\":3,\"total_tokens\":5}}\n\n",
+            )),
         ];
-        let stream = futures_util::stream::iter(chunks);
-        let collected = Arc::new(Mutex::new(Vec::<bytes::Bytes>::new()));
-        let cb_collected = Arc::clone(&collected);
-        let capped = cap_stream_with_usage(stream, 1024, move |chs| {
-            *cb_collected.lock().unwrap() = chs;
-        });
-        let mut capped = Box::pin(capped);
-        let mut got = Vec::new();
-        while let Some(item) = capped.next().await {
-            got.extend_from_slice(&item.unwrap());
-        }
-        assert_eq!(&got, b"hello world");
-        let collected = collected.lock().unwrap();
-        assert_eq!(collected.len(), 3, "应收集全部 3 个 chunk");
-        assert_eq!(collected[0], b"hello".as_slice());
-        assert_eq!(collected[2], b"world".as_slice());
-    }
-
-    #[tokio::test]
-    async fn cap_stream_with_usage_keeps_only_last_8_chunks() {
-        use futures_util::StreamExt;
-        let chunks: Vec<std::result::Result<bytes::Bytes, std::io::Error>> = (0..12)
-            .map(|i| Ok(bytes::Bytes::from(format!("chunk{i}"))))
-            .collect();
-        let stream = futures_util::stream::iter(chunks);
-        let collected = Arc::new(Mutex::new(Vec::<bytes::Bytes>::new()));
-        let cb_collected = Arc::clone(&collected);
-        let capped = cap_stream_with_usage(stream, 1024, move |chs| {
-            *cb_collected.lock().unwrap() = chs;
-        });
+        let capped = cap_stream_with_usage(futures_util::stream::iter(chunks), 1024, capture);
         let mut capped = Box::pin(capped);
         while capped.next().await.is_some() {}
-        let collected = collected.lock().unwrap();
-        assert_eq!(collected.len(), 8, "最多保留 8 个 chunk");
-        assert_eq!(collected[0], b"chunk4".as_slice());
-        assert_eq!(collected[7], b"chunk11".as_slice());
+        assert_eq!(log.lock().unwrap().len(), 1, "正常结束恰好 flush 一次");
     }
 
     #[tokio::test]
-    async fn cap_stream_with_usage_errors_on_limit_exceeded() {
+    async fn usage_capture_flushes_on_drop_mid_stream() {
         use futures_util::StreamExt;
+        let (capture, log) = capture_for(true, fixed_clock(1));
         let chunks = vec![
-            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"hello")),
-            Ok(bytes::Bytes::from_static(b"!!!")),
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"data: {\"usage\":{\"prompt_tokens\":2,",
+            )),
+            Ok(bytes::Bytes::from_static(
+                b"\"completion_tokens\":3,\"total_tokens\":5}}\n\n",
+            )),
+            Ok(bytes::Bytes::from_static(b"data: {\"choices\":[]}\n\n")),
         ];
-        let stream = futures_util::stream::iter(chunks);
-        let capped = cap_stream_with_usage(stream, 5, |_| {});
+        let capped = cap_stream_with_usage(futures_util::stream::iter(chunks), 1024, capture);
         let mut capped = Box::pin(capped);
-        // 第一个 chunk（5 字节）正好不超限
-        let first = capped.next().await.unwrap().unwrap();
-        assert_eq!(first.as_ref(), &b"hello"[..]);
-        // 第二个 chunk 让累计超过 5 字节 ⇒ 错误
-        let second = capped.next().await;
-        assert!(second.is_some(), "第二个 chunk 超限应产生错误");
-        assert!(second.unwrap().is_err());
+        // 读两块让 usage 成行（第二块带换行），随后 drop 模拟客户端断开。
+        let _ = capped.next().await;
+        let _ = capped.next().await;
+        drop(capped);
+        assert_eq!(
+            log.lock().unwrap().len(),
+            1,
+            "断开时 Drop 必须 flush 已见 usage"
+        );
+    }
+
+    #[test]
+    fn usage_capture_never_double_flushes() {
+        let (mut capture, log) = capture_for(false, fixed_clock(1));
+        capture
+            .feed(b"{\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}");
+        capture.flush();
+        capture.flush();
+        drop(capture);
+        assert_eq!(log.lock().unwrap().len(), 1, "三路合计恰一次");
+    }
+
+    #[test]
+    fn usage_capture_silent_when_no_usage_seen() {
+        let (mut capture, log) = capture_for(true, fixed_clock(1));
+        capture.feed(b"data: {\"choices\":[]}\n\n");
+        capture.feed(b"data: [DONE]\n\n");
+        capture.flush();
+        drop(capture);
+        assert!(log.lock().unwrap().is_empty(), "没有 usage 不得调用 sink");
+    }
+
+    #[test]
+    fn usage_capture_uses_injected_clock() {
+        let counter = Arc::new(AtomicI64::new(1_000));
+        let c = Arc::clone(&counter);
+        let now: Arc<dyn Fn() -> i64 + Send + Sync> =
+            Arc::new(move || c.fetch_add(1, AtomicOrdering::SeqCst));
+        let (mut capture, log) = capture_for(false, now);
+        capture
+            .feed(b"{\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}");
+        capture.flush();
+        assert_eq!(log.lock().unwrap()[0].at, 1_000, "at 必须来自注入时钟");
+    }
+
+    #[test]
+    fn non_stream_usage_still_parses_from_body() {
+        let (mut capture, log) = capture_for(false, fixed_clock(55));
+        capture.feed(b"{\"id\":\"x\",\"usage\":{\"prompt_tokens\":7,");
+        capture.feed(b"\"completion_tokens\":8,\"total_tokens\":15}}");
+        capture.flush();
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            (
+                log[0].prompt_tokens,
+                log[0].completion_tokens,
+                log[0].total_tokens
+            ),
+            (7, 8, 15)
+        );
+        assert!(!log[0].stream);
+        assert_eq!(log[0].at, 55);
     }
 
     // ---------- M16-S4 / P2-13：重放安全性的分类 ----------

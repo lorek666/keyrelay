@@ -143,6 +143,7 @@ fn base_config(
     GatewayConfig {
         port: 0,
         token: "local-token-for-snapshot-tests".to_string(),
+        key_id: None,
         site_id: 0,
         // 路由非空时不被使用；置空正好证明这一点。
         base_url: String::new(),
