@@ -7812,6 +7812,8 @@ mod tests {
         let models = service.models_for_key(key_id).await.expect("取模型");
         assert_eq!(models, vec!["m1".to_string(), "m2".to_string()]);
         assert_eq!(models_requests(&mock), 1, "只发一次 /v1/models");
+        // M37-S1 复审 P3-1：本地有明文 ⇒ 不得走恢复分支（直接钉子）。
+        assert_eq!(reveal_requests(&mock), 0, "本地有明文不得回读");
         // 请求头必须带这把 key 的 Bearer（不是别人的）
         let req = mock
             .requests()
@@ -7961,6 +7963,96 @@ mod tests {
                 .expect("vault.has"),
             "失败后 vault 仍应没有条目"
         );
+    }
+
+    /// M37-S1 复审 P2-1：key 不存在 ⇒ 在任何网络请求之前 `NotFound`。
+    #[tokio::test]
+    async fn models_for_key_missing_key_is_not_found_without_network() {
+        let (service, _key_id, mock) = missing_secret_fixture(vec![models_response(&["m1"])]).await;
+        let err = service
+            .models_for_key(999_999)
+            .await
+            .expect_err("不存在的 key 必须报错");
+        assert!(matches!(err, Error::NotFound(_)), "{err}");
+        assert_eq!(reveal_requests(&mock), 0, "不存在的 key 不得回读");
+        assert_eq!(models_requests(&mock), 0, "不存在的 key 不得查模型");
+    }
+
+    /// 只让 `kr/key/` 的 `get` 失败的 Vault（M37-S1 复审 P2-1：读失败不得当成没有）。
+    struct KeyGetFailingVault {
+        inner: crate::vault::MemoryVault,
+    }
+    impl KeyGetFailingVault {
+        fn new() -> Self {
+            Self {
+                inner: crate::vault::MemoryVault::new(),
+            }
+        }
+    }
+    impl crate::vault::Vault for KeyGetFailingVault {
+        fn backend_name(&self) -> &'static str {
+            "key-get-failing"
+        }
+        fn probe(&self) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn put(&self, key: &str, secret: &str) -> crate::error::Result<()> {
+            self.inner.put(key, secret)
+        }
+        fn get(&self, key: &str) -> crate::error::Result<Option<String>> {
+            if key.starts_with("kr/key/") {
+                Err(crate::error::Error::Vault("模拟钥匙串读取失败".into()))
+            } else {
+                self.inner.get(key)
+            }
+        }
+        fn has(&self, key: &str) -> crate::error::Result<bool> {
+            self.inner.has(key)
+        }
+        fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// M37-S1 复审 P2-1：保险库**读失败**（不是条目不存在）⇒ 原样上抛，
+    /// 不得触发 reveal、不得当成「缺明文」去回读。
+    #[tokio::test]
+    async fn models_for_key_vault_read_error_does_not_restore() {
+        let store = Store::open_in_memory().expect("内存库");
+        let mock = MockTransport::new(vec![status_response()]);
+        let service = TianshuRelayService::new(
+            store,
+            mock.clone(),
+            ServiceConfig {
+                vault: Arc::new(KeyGetFailingVault::new()),
+                ..test_config()
+            },
+        );
+        let site = service
+            .add_site("https://relay.example.com")
+            .await
+            .expect("add_site");
+        let reference = crate::vault::secret_ref("key", 1, "secret");
+        service
+            .vault
+            .put(&reference, "sk-test-secret-12345678")
+            .expect("vault.put");
+        let key_id = service
+            .store
+            .insert_key(site.id, "k", &reference, Some("remote-1"), None)
+            .expect("insert_key");
+        service
+            .sessions
+            .put(site.id, login_session())
+            .expect("塞会话");
+
+        let err = service
+            .models_for_key(key_id)
+            .await
+            .expect_err("读失败必须上抛");
+        assert!(matches!(err, Error::Vault(_)), "{err}");
+        assert_eq!(reveal_requests(&mock), 0, "读失败不得回读明文");
+        assert_eq!(models_requests(&mock), 0, "读失败不得查模型");
     }
 
     #[tokio::test]
