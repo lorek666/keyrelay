@@ -29,6 +29,13 @@ pub const MODELS_MIN_INTERVAL_SECS: u64 = 30;
 /// 采集间隔的上限（秒）。
 pub const MODELS_MAX_INTERVAL_SECS: u64 = 86_400;
 
+// M39-S3 §4.6：三个新设置的合法范围（`Settings::validate` 与 `from_pairs` 共用）
+pub const GATEWAY_LB_TOP_N_MIN: usize = 1;
+pub const GATEWAY_LB_TOP_N_MAX: usize = 20;
+pub const GATEWAY_PER_SITE_CONCURRENCY_MIN: usize = 1;
+pub const GATEWAY_PER_SITE_CONCURRENCY_MAX: usize = 128;
+pub const GATEWAY_PER_SITE_RATE_LIMIT_MAX: u32 = 10_000;
+
 const KEY_REFRESH_INTERVAL: &str = "refresh_interval_secs";
 const KEY_BALANCE_THRESHOLD: &str = "balance_alert_threshold";
 const KEY_DRIFT_ON_START: &str = "drift_check_on_start";
@@ -38,6 +45,10 @@ const KEY_GATEWAY_PORT: &str = "gateway_port";
 const KEY_GATEWAY_MULTI_SITE: &str = "gateway_multi_site";
 const KEY_COLLECT_MODELS: &str = "collect_models";
 const KEY_MODELS_MIN_INTERVAL: &str = "models_min_interval_secs";
+// M39-S3：负载均衡与每站保护（三个新设置）
+const KEY_GATEWAY_LB_TOP_N: &str = "gateway_lb_top_n";
+const KEY_GATEWAY_PER_SITE_CONCURRENCY: &str = "gateway_per_site_concurrency";
+const KEY_GATEWAY_PER_SITE_RATE_LIMIT: &str = "gateway_per_site_rate_limit";
 const KEY_THEME: &str = "theme";
 const KEY_LANGUAGE: &str = "language";
 const KEY_PROXY_URL: &str = "proxy_url";
@@ -75,6 +86,14 @@ pub struct Settings {
     pub collect_models: bool,
     /// 模型采集最小间隔秒（M14-S1）：**默认 1800（30min）**。`0` = 不节流（仅测试用）。
     pub models_min_interval_secs: u64,
+    /// 参与加权轮转的健康候选数（M39-S3 §4.6）：**默认 3**，范围 `1..=20`。
+    /// `1` = 关掉负载均衡（永远首选，与 M39-S3 之前逐字相同）。
+    pub gateway_lb_top_n: usize,
+    /// 每站同时在飞的上游请求上限（M39-S3 §4.6）：**默认 8**，范围 `1..=128`。
+    pub gateway_per_site_concurrency: usize,
+    /// 每站**每秒**请求上限（M39-S3 §4.6）：**默认 0（不限速）**，范围 `0..=10000`。
+    /// 单位是**每秒**——不是每分钟（Lead 裁决，界面文案必须写清）。
+    pub gateway_per_site_rate_limit: u32,
 
     // ---- M6-S5：FR-9 界面与隐私 ----
     /// 主题：`system` / `light` / `dark`。
@@ -144,6 +163,10 @@ impl Default for Settings {
             gateway_multi_site: false,
             collect_models: false,
             models_min_interval_secs: 1800,
+            // M39-S3：默认「前 3 个候选轮转 + 每站 8 并发 + 不限速」
+            gateway_lb_top_n: 3,
+            gateway_per_site_concurrency: 8,
+            gateway_per_site_rate_limit: 0,
 
             theme: "system".to_string(),
             language: "zh-CN".to_string(),
@@ -193,6 +216,24 @@ impl Settings {
         {
             return Err(Error::Store(format!(
                 "模型采集间隔必须在 {MODELS_MIN_INTERVAL_SECS}..={MODELS_MAX_INTERVAL_SECS} 秒之间"
+            )));
+        }
+        // M39-S3：三个新设置的取值范围（越界 ⇒ Err 且不落库，与既有设置同口径）
+        if !(GATEWAY_LB_TOP_N_MIN..=GATEWAY_LB_TOP_N_MAX).contains(&self.gateway_lb_top_n) {
+            return Err(Error::Store(format!(
+                "网关负载均衡候选数必须在 {GATEWAY_LB_TOP_N_MIN}..={GATEWAY_LB_TOP_N_MAX} 之间（1 = 关掉负载均衡）"
+            )));
+        }
+        if !(GATEWAY_PER_SITE_CONCURRENCY_MIN..=GATEWAY_PER_SITE_CONCURRENCY_MAX)
+            .contains(&self.gateway_per_site_concurrency)
+        {
+            return Err(Error::Store(format!(
+                "每站并发上限必须在 {GATEWAY_PER_SITE_CONCURRENCY_MIN}..={GATEWAY_PER_SITE_CONCURRENCY_MAX} 之间"
+            )));
+        }
+        if self.gateway_per_site_rate_limit > GATEWAY_PER_SITE_RATE_LIMIT_MAX {
+            return Err(Error::Store(format!(
+                "每站每秒请求上限必须在 0..={GATEWAY_PER_SITE_RATE_LIMIT_MAX} 之间（0 = 不限速；单位是每秒）"
             )));
         }
         if !THEMES.contains(&self.theme.as_str()) {
@@ -283,6 +324,10 @@ impl Settings {
             "gateway_multi_site": self.gateway_multi_site,
             "collect_models": self.collect_models,
             "models_min_interval_secs": self.models_min_interval_secs,
+            // M39-S3：负载均衡与每站保护
+            "gateway_lb_top_n": self.gateway_lb_top_n,
+            "gateway_per_site_concurrency": self.gateway_per_site_concurrency,
+            "gateway_per_site_rate_limit": self.gateway_per_site_rate_limit,
             "theme": self.theme,
             "language": self.language,
             "telemetry_enabled": self.telemetry_enabled,
@@ -384,6 +429,30 @@ impl Settings {
                 KEY_MODELS_MIN_INTERVAL => {
                     if let Ok(secs) = value.parse::<u64>() {
                         settings.models_min_interval_secs = secs;
+                    }
+                }
+                // M39-S3：三个字段各自按范围过滤（读路径的纵深防御；写路径由 `validate` 拒）
+                KEY_GATEWAY_LB_TOP_N => {
+                    if let Ok(n) = value.parse::<usize>() {
+                        if (GATEWAY_LB_TOP_N_MIN..=GATEWAY_LB_TOP_N_MAX).contains(&n) {
+                            settings.gateway_lb_top_n = n;
+                        }
+                    }
+                }
+                KEY_GATEWAY_PER_SITE_CONCURRENCY => {
+                    if let Ok(n) = value.parse::<usize>() {
+                        if (GATEWAY_PER_SITE_CONCURRENCY_MIN..=GATEWAY_PER_SITE_CONCURRENCY_MAX)
+                            .contains(&n)
+                        {
+                            settings.gateway_per_site_concurrency = n;
+                        }
+                    }
+                }
+                KEY_GATEWAY_PER_SITE_RATE_LIMIT => {
+                    if let Ok(n) = value.parse::<u32>() {
+                        if n <= GATEWAY_PER_SITE_RATE_LIMIT_MAX {
+                            settings.gateway_per_site_rate_limit = n;
+                        }
                     }
                 }
                 KEY_THEME => {
@@ -503,6 +572,16 @@ impl Settings {
                 KEY_MODELS_MIN_INTERVAL,
                 self.models_min_interval_secs.to_string(),
             ),
+            // M39-S3：负载均衡与每站保护
+            (KEY_GATEWAY_LB_TOP_N, self.gateway_lb_top_n.to_string()),
+            (
+                KEY_GATEWAY_PER_SITE_CONCURRENCY,
+                self.gateway_per_site_concurrency.to_string(),
+            ),
+            (
+                KEY_GATEWAY_PER_SITE_RATE_LIMIT,
+                self.gateway_per_site_rate_limit.to_string(),
+            ),
             (KEY_THEME, self.theme.clone()),
             (KEY_LANGUAGE, self.language.clone()),
             (KEY_PROXY_URL, self.proxy_url.clone()),
@@ -542,7 +621,7 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 23] = [
+    pub const KEYS: [&'static str; 26] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
@@ -551,6 +630,9 @@ impl Settings {
         KEY_GATEWAY_MULTI_SITE,
         KEY_COLLECT_MODELS,
         KEY_MODELS_MIN_INTERVAL,
+        KEY_GATEWAY_LB_TOP_N,
+        KEY_GATEWAY_PER_SITE_CONCURRENCY,
+        KEY_GATEWAY_PER_SITE_RATE_LIMIT,
         KEY_THEME,
         KEY_LANGUAGE,
         KEY_PROXY_URL,
@@ -862,6 +944,9 @@ mod tests {
             gateway_multi_site: false,
             collect_models: false,
             models_min_interval_secs: 1800,
+            gateway_lb_top_n: 3,
+            gateway_per_site_concurrency: 8,
+            gateway_per_site_rate_limit: 0,
             theme: "dark".to_string(),
             language: "en-US".to_string(),
             proxy_url: "socks5://127.0.0.1:1080".to_string(),

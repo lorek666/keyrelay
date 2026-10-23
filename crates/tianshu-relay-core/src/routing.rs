@@ -13,12 +13,20 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// 一个可被路由到的上游。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Upstream {
     pub site_id: i64,
+    /// 该上游使用的**本地 key id**（M39-S3 §4.3）。
+    ///
+    /// `None` = 旧单 key 路径（`single_upstream` / legacy `gateway_config`）——
+    /// 那条路径的签名与行为逐字不变；多 key 展开只在 `service::build_gateway_route` 的
+    /// 多站路径里发生（每站每把可用 key 一个 `Upstream`，同站共享 guard 与熔断键）。
+    pub key_id: Option<i64>,
     pub base_url: String,
     pub key_ref: String,          // 钥匙串引用，**不是**密钥明文
     pub models: Vec<String>,      // 该上游可服务的模型名（精确匹配）
@@ -178,6 +186,11 @@ pub struct SiteFacts {
     pub latency_ms: Option<u64>,
     /// 钥匙串引用。**不是**密钥明文。
     pub key_ref: String,
+    /// 该事实使用的**本地 key id**（M39-S3 §4.3）。
+    ///
+    /// `None` = 旧单 key 路径（`build_route_table` 之外的历史构造点）；
+    /// 多站路径里 `service::build_gateway_route` 会给每把可用 key 各产出一条事实。
+    pub key_id: Option<i64>,
 }
 
 /// 从站点事实推导路由表。**纯函数**（不读钥匙串、不联网、不读时钟）。
@@ -194,6 +207,7 @@ pub fn build_route_table(facts: &[SiteFacts]) -> RouteTable {
             .iter()
             .map(|f| Upstream {
                 site_id: f.site_id,
+                key_id: f.key_id,
                 base_url: f.base_url.clone(),
                 key_ref: f.key_ref.clone(),
                 models: f.models.clone(),
@@ -332,12 +346,12 @@ impl Default for BreakerPolicy {
 #[derive(Clone, Debug, Default)]
 pub struct Breaker {
     policy: BreakerPolicy,
-    sites: HashMap<i64, Entry>,
+    entries: HashMap<BreakerKey, Entry>,
     /// P2-8 / DEBUG-REPORT-v3 §2-8：HalfOpen 探针已放出的站点。冷却一过所有并发
     /// 请求都会看到 HalfOpen（`state` 只读不改），不限流就全部去试坏上游。第一个
     /// 放进探针的请求在这里标记，其余看到标记即跳过，等探针结果回来
     /// （`record_success` / `record_failure` 清除）。
-    probe_in_flight: HashSet<i64>,
+    probe_in_flight: HashSet<BreakerKey>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -351,7 +365,7 @@ impl Breaker {
     pub fn new(policy: BreakerPolicy) -> Self {
         Self {
             policy,
-            sites: HashMap::new(),
+            entries: HashMap::new(),
             probe_in_flight: HashSet::new(),
         }
     }
@@ -361,10 +375,10 @@ impl Breaker {
     /// 调用方**只应**在 `should_failover(status)` 为真时调用——否则一个 400 就能把健康上游打成 `Open`。
     ///
     /// `policy.threshold == 0` 的含义是「首次失败即打开」（`0 >= 0`），它不是一个「关闭熔断」的开关。
-    pub fn record_failure(&mut self, site_id: i64, now: Instant) -> BreakerState {
+    pub fn record_failure(&mut self, key: &BreakerKey, now: Instant) -> BreakerState {
         // P2-8：探针结果回来（失败），清除「探针在飞」标记。
-        self.probe_in_flight.remove(&site_id);
-        let entry = self.sites.entry(site_id).or_default();
+        self.probe_in_flight.remove(key);
+        let entry = self.entries.entry(key.clone()).or_default();
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         if entry.consecutive_failures >= self.policy.threshold {
             // 只在「首次打开」或「冷却已过（HalfOpen 探针失败）」时设 `opened_at`。
@@ -384,15 +398,15 @@ impl Breaker {
     }
 
     /// 记一次成功：无论此前什么状态，一律回 `Closed` 并清零计数。
-    pub fn record_success(&mut self, site_id: i64, _now: Instant) {
-        self.sites.remove(&site_id);
+    pub fn record_success(&mut self, key: &BreakerKey, _now: Instant) {
+        self.entries.remove(key);
         // P2-8：探针成功，清除「探针在飞」标记。
-        self.probe_in_flight.remove(&site_id);
+        self.probe_in_flight.remove(key);
     }
 
     /// 只读查询，**不**改状态。`Open` 且冷却已过 ⇒ `HalfOpen`（允许一个探活请求）。
-    pub fn state(&self, site_id: i64, now: Instant) -> BreakerState {
-        let Some(entry) = self.sites.get(&site_id) else {
+    pub fn state(&self, key: &BreakerKey, now: Instant) -> BreakerState {
+        let Some(entry) = self.entries.get(key) else {
             return BreakerState::Closed;
         };
         match entry.opened_at {
@@ -410,12 +424,125 @@ impl Breaker {
     /// HalfOpen）。**会改状态**——与 [`Self::state`] 的只读不同：`state` 谁调都看到
     /// HalfOpen，本方法只有第一个调用者拿到探针，其余并发请求看到标记即跳过，
     /// 不会全部涌向坏上游。探针结果回来后由 `record_success` / `record_failure` 清除。
-    pub fn try_take_half_open_probe(&mut self, site_id: i64, now: Instant) -> bool {
-        if self.state(site_id, now) == BreakerState::HalfOpen {
-            self.probe_in_flight.insert(site_id)
+    pub fn try_take_half_open_probe(&mut self, key: &BreakerKey, now: Instant) -> bool {
+        if self.state(key, now) == BreakerState::HalfOpen {
+            self.probe_in_flight.insert(key.clone())
         } else {
             false
         }
+    }
+}
+
+/// 每站保护策略（M39-S3 §4.2）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SiteGuardPolicy {
+    /// 每站同时在飞的上游请求上限。`0` ⇒ 不限（不推荐）。
+    pub max_concurrency: usize,
+    /// 每站每秒允许的新请求数。`0` ⇒ 不限速。
+    pub rate_limit_per_sec: u32,
+}
+
+impl Default for SiteGuardPolicy {
+    fn default() -> Self {
+        Self {
+            max_concurrency: 8,
+            rate_limit_per_sec: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum GuardOutcome {
+    /// 拿到并发许可（可能还拿了令牌）；`lease` 必须被 drop 归还。
+    Admitted(SiteLease),
+    /// 并发满了 ⇒ 本地拒绝。
+    ConcurrencyLimited,
+    /// 令牌桶空了 ⇒ 本地拒绝。
+    RateLimited,
+}
+
+/// 每站一个：并发计数 + 令牌桶（多 key **共享**，见 §4.3）。
+#[derive(Debug)]
+pub struct SiteGuard {
+    policy: SiteGuardPolicy,
+    in_flight: Arc<AtomicUsize>,
+    bucket: Mutex<TokenBucket>,
+}
+
+#[derive(Debug)]
+struct TokenBucket {
+    tokens: f64,
+    last: Instant,
+}
+
+/// 一次并发许可。`Drop` 时归还（panic 也归还）。
+#[derive(Debug)]
+pub struct SiteLease {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for SiteLease {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+    }
+}
+
+impl SiteGuard {
+    pub fn new(policy: SiteGuardPolicy, now: Instant) -> Self {
+        Self {
+            policy,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            bucket: Mutex::new(TokenBucket {
+                tokens: policy.rate_limit_per_sec as f64,
+                last: now,
+            }),
+        }
+    }
+
+    pub fn policy(&self) -> SiteGuardPolicy {
+        self.policy
+    }
+
+    /// **非阻塞**：要么立刻拿到，要么立刻返回拒绝。
+    pub fn try_admit(&self, now: Instant) -> GuardOutcome {
+        // ① 并发
+        if self.policy.max_concurrency > 0 {
+            let prev = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst);
+            if prev >= self.policy.max_concurrency {
+                self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+                return GuardOutcome::ConcurrencyLimited;
+            }
+        } else {
+            self.in_flight.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+
+        // ② 令牌桶（`0` ⇒ 不建桶 = 恒放行）
+        if self.policy.rate_limit_per_sec > 0 {
+            let mut b = match self.bucket.lock() {
+                Ok(b) => b,
+                Err(_) => {
+                    // 锁中毒：放行（可用性优先），不把并发许可漏掉。
+                    return GuardOutcome::Admitted(SiteLease {
+                        in_flight: Arc::clone(&self.in_flight),
+                    });
+                }
+            };
+            let cap = self.policy.rate_limit_per_sec as f64;
+            let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
+            // 每秒补满：`cap` 个/秒
+            b.tokens = (b.tokens + elapsed * cap).min(cap);
+            b.last = now;
+            if b.tokens < 1.0 {
+                drop(b);
+                self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+                return GuardOutcome::RateLimited;
+            }
+            b.tokens -= 1.0;
+        }
+
+        GuardOutcome::Admitted(SiteLease {
+            in_flight: Arc::clone(&self.in_flight),
+        })
     }
 }
 
@@ -434,6 +561,107 @@ pub fn should_failover(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
 }
 
+/// 熔断键（M39-S3 §4.4）：`(site_id, model)`。
+///
+/// - 有 model 的请求 ⇒ `(site_id, Some(model))`：站点 A 的 `gpt-x` 失败**不**熔断 A 的 `claude-y`；
+/// - 无 model 的请求（`GET /v1/models`、无 body）⇒ `(site_id, None)`，**仍按站点熔断**，
+///   与 M39-S3 之前的行为逐字相同。
+pub type BreakerKey = (i64, Option<String>);
+
+/// 按站点熔断的键（无 model 请求 / 兼容路径）。
+pub fn site_key(site_id: i64) -> BreakerKey {
+    (site_id, None)
+}
+
+/// 按 (站点, 模型) 熔断的键。
+pub fn model_key(site_id: i64, model: &str) -> BreakerKey {
+    (site_id, Some(model.to_string()))
+}
+
+/// 参与本次请求的候选（M39-S3 §4.1）。
+///
+/// `probe = true` 表示「这是 HalfOpen 冷却后的探针」——**必须优先尝试**：
+/// 如果探针被加权轮转跳过，这个熔断键就永远恢复不了（冷却到点后每次都轮不到它）。
+#[derive(Clone, Copy, Debug)]
+pub struct Candidate<'a> {
+    pub upstream: &'a Upstream,
+    pub probe: bool,
+}
+
+/// 一个候选的轮转权重（M39-S3 §4.1）。
+///
+/// `rate` 是站点倍率；`None`（未知）按 1.0 处理。
+/// 权重 = `1/max(rate, 0.01)`：**倍率越低（越便宜）权重越高**。
+/// 这是「组内未归一」的原始 unit，归一在 [`weighted_pick`] 里做（需要组内最小值）。
+pub fn rotation_weight(rate: Option<f64>) -> f64 {
+    let r = match rate {
+        Some(x) if x.is_finite() && x > 0.0 => x,
+        _ => 1.0,
+    };
+    1.0 / r.max(0.01)
+}
+
+/// 轮转计数器（每个网关实例一个）。
+#[derive(Debug, Default)]
+pub struct RoundRobinState {
+    cursor: u64,
+}
+
+impl RoundRobinState {
+    /// 取当前值并自增（`wrapping_add`：u64 溢出现实中不可达，但行为要确定）。
+    ///
+    /// 名字按 spec 冻结为 `next`；它不是迭代器（不产出序列），只是「取号 + 前进」。
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> u64 {
+        let v = self.cursor;
+        self.cursor = self.cursor.wrapping_add(1);
+        v
+    }
+}
+
+/// 从前 `top_n` 个候选里按权重选一个。**纯函数**：给定同样的
+/// `(candidates, top_n, cursor)` 必得同样的结果（这是可测性的基础）。
+///
+/// 算法（完整版见 `docs/specs/M39-S3-负载均衡与上游保护.md` §4.1）：
+/// 有 `probe` 就直接返回它且**不读 cursor**（否则探针可能永远轮不到，冷却恢复不了）；
+/// 否则取前 `top_n` 个（`0` 视为 1）；只剩一个就直接返回且不读 cursor（单候选与今天逐字相同）；
+/// 其余按 `unit = 1/max(rate, 0.01)` 以组内最小 unit 归一（clamp 到 `[1, 100]`）建槽位表，
+/// 用 `cursor % slots.len()` 取一个。
+pub fn weighted_pick<'a>(
+    candidates: &[Candidate<'a>],
+    top_n: usize,
+    cursor: u64,
+) -> Option<&'a Upstream> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if let Some(probe) = candidates.iter().find(|c| c.probe) {
+        return Some(probe.upstream);
+    }
+    let n = top_n.max(1).min(candidates.len());
+    let head = &candidates[..n];
+    if head.len() == 1 {
+        return Some(head[0].upstream);
+    }
+    let units: Vec<f64> = head
+        .iter()
+        .map(|c| rotation_weight(c.upstream.rate))
+        .collect();
+    let base = units.iter().cloned().fold(f64::INFINITY, f64::min);
+    let weights: Vec<u64> = units
+        .iter()
+        .map(|u| ((u / base).round() as i64).clamp(1, 100) as u64)
+        .collect();
+    let mut slots: Vec<usize> = Vec::new();
+    for (i, w) in weights.iter().enumerate() {
+        for _ in 0..*w {
+            slots.push(i);
+        }
+    }
+    let idx = slots[(cursor % slots.len() as u64) as usize];
+    Some(head[idx].upstream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +675,7 @@ mod tests {
             rate,
             balance_usd: balance,
             latency_ms: latency,
+            key_id: None,
         }
     }
 
@@ -479,11 +708,11 @@ mod tests {
     fn record_failure_opens_after_threshold() {
         let mut b = Breaker::new(BreakerPolicy::default());
         let t0 = Instant::now();
-        assert_eq!(b.record_failure(1, t0), BreakerState::Closed);
-        assert_eq!(b.record_failure(1, t0), BreakerState::Closed);
+        assert_eq!(b.record_failure(&site_key(1), t0), BreakerState::Closed);
+        assert_eq!(b.record_failure(&site_key(1), t0), BreakerState::Closed);
         // 第三次达阈值 → Open，opened_at 设为 t0
-        assert_eq!(b.record_failure(1, t0), BreakerState::Open);
-        assert_eq!(b.state(1, t0), BreakerState::Open);
+        assert_eq!(b.record_failure(&site_key(1), t0), BreakerState::Open);
+        assert_eq!(b.state(&site_key(1), t0), BreakerState::Open);
     }
 
     #[test]
@@ -493,17 +722,17 @@ mod tests {
         let mut b = Breaker::new(BreakerPolicy::default());
         let t0 = Instant::now();
         for _ in 0..3 {
-            b.record_failure(1, t0);
+            b.record_failure(&site_key(1), t0);
         }
         // 冷却期内（t0+30s）再失败 —— opened_at 应保持 t0，不刷成 t0+30s
         let t1 = t0 + Duration::from_secs(30);
-        b.record_failure(1, t1);
-        assert_eq!(b.state(1, t1), BreakerState::Open);
+        b.record_failure(&site_key(1), t1);
+        assert_eq!(b.state(&site_key(1), t1), BreakerState::Open);
         // t0+61s 冷却应到期 → HalfOpen。
         // 若 opened_at 被续到 t1（旧 bug），则 t1+61s 才到期，t0+61s 仍 Open。
         let t2 = t0 + Duration::from_secs(61);
         assert_eq!(
-            b.state(1, t2),
+            b.state(&site_key(1), t2),
             BreakerState::HalfOpen,
             "冷却应从首次打开算起，不被冷却期内的失败续期"
         );
@@ -514,11 +743,11 @@ mod tests {
         let mut b = Breaker::new(BreakerPolicy::default());
         let t0 = Instant::now();
         for _ in 0..3 {
-            b.record_failure(1, t0);
+            b.record_failure(&site_key(1), t0);
         }
-        assert_eq!(b.state(1, t0), BreakerState::Open);
+        assert_eq!(b.state(&site_key(1), t0), BreakerState::Open);
         assert_eq!(
-            b.state(1, t0 + Duration::from_secs(61)),
+            b.state(&site_key(1), t0 + Duration::from_secs(61)),
             BreakerState::HalfOpen
         );
     }
@@ -529,16 +758,16 @@ mod tests {
         let mut b = Breaker::new(BreakerPolicy::default());
         let t0 = Instant::now();
         for _ in 0..3 {
-            b.record_failure(1, t0);
+            b.record_failure(&site_key(1), t0);
         }
         let t1 = t0 + Duration::from_secs(61);
-        assert_eq!(b.state(1, t1), BreakerState::HalfOpen);
+        assert_eq!(b.state(&site_key(1), t1), BreakerState::HalfOpen);
         // 探针失败 —— opened_at 应刷到 t1
-        b.record_failure(1, t1);
+        b.record_failure(&site_key(1), t1);
         let t2 = t1 + Duration::from_secs(30);
-        assert_eq!(b.state(1, t2), BreakerState::Open);
+        assert_eq!(b.state(&site_key(1), t2), BreakerState::Open);
         let t3 = t1 + Duration::from_secs(61);
-        assert_eq!(b.state(1, t3), BreakerState::HalfOpen);
+        assert_eq!(b.state(&site_key(1), t3), BreakerState::HalfOpen);
     }
 
     #[test]
@@ -546,11 +775,11 @@ mod tests {
         let mut b = Breaker::new(BreakerPolicy::default());
         let t0 = Instant::now();
         for _ in 0..3 {
-            b.record_failure(1, t0);
+            b.record_failure(&site_key(1), t0);
         }
-        assert_eq!(b.state(1, t0), BreakerState::Open);
-        b.record_success(1, t0);
-        assert_eq!(b.state(1, t0), BreakerState::Closed);
+        assert_eq!(b.state(&site_key(1), t0), BreakerState::Open);
+        b.record_success(&site_key(1), t0);
+        assert_eq!(b.state(&site_key(1), t0), BreakerState::Closed);
     }
 
     #[test]
@@ -561,26 +790,26 @@ mod tests {
         let mut b = Breaker::new(BreakerPolicy::default());
         let t0 = Instant::now();
         for _ in 0..3 {
-            b.record_failure(1, t0);
+            b.record_failure(&site_key(1), t0);
         }
         let t1 = t0 + Duration::from_secs(61);
-        assert_eq!(b.state(1, t1), BreakerState::HalfOpen);
+        assert_eq!(b.state(&site_key(1), t1), BreakerState::HalfOpen);
 
         assert!(
-            b.try_take_half_open_probe(1, t1),
+            b.try_take_half_open_probe(&site_key(1), t1),
             "第一个 HalfOpen 探针应被放行"
         );
         assert!(
-            !b.try_take_half_open_probe(1, t1),
+            !b.try_take_half_open_probe(&site_key(1), t1),
             "探针在飞时，第二个并发请求不得再放探针（P2-8）"
         );
 
         // 探针失败 ⇒ 清除标记 + 重新冷却；冷却过后可再放探针（标记已清）
-        b.record_failure(1, t1);
+        b.record_failure(&site_key(1), t1);
         let t2 = t1 + Duration::from_secs(61);
-        assert_eq!(b.state(1, t2), BreakerState::HalfOpen);
+        assert_eq!(b.state(&site_key(1), t2), BreakerState::HalfOpen);
         assert!(
-            b.try_take_half_open_probe(1, t2),
+            b.try_take_half_open_probe(&site_key(1), t2),
             "探针结果回来后标记清除，冷却过后可再放探针"
         );
     }
@@ -589,12 +818,15 @@ mod tests {
     fn try_take_half_open_probe_is_no_op_for_non_half_open() {
         let mut b = Breaker::new(BreakerPolicy::default());
         let t0 = Instant::now();
-        assert!(!b.try_take_half_open_probe(1, t0), "Closed 不放探针");
+        assert!(
+            !b.try_take_half_open_probe(&site_key(1), t0),
+            "Closed 不放探针"
+        );
         for _ in 0..3 {
-            b.record_failure(1, t0);
+            b.record_failure(&site_key(1), t0);
         }
         assert!(
-            !b.try_take_half_open_probe(1, t0),
+            !b.try_take_half_open_probe(&site_key(1), t0),
             "Open（冷却未过）不放探针"
         );
     }
@@ -610,6 +842,7 @@ mod tests {
             rate: None,
             balance_usd: None,
             latency_ms: None,
+            key_id: None,
         }
     }
 

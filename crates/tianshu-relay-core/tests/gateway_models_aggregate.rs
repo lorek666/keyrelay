@@ -146,6 +146,7 @@ async fn call(
 fn upstream(site_id: i64, base_url: &str, key_ref: &str, models: &[&str]) -> Upstream {
     Upstream {
         site_id,
+        key_id: None,
         base_url: base_url.to_string(),
         key_ref: key_ref.to_string(),
         models: models.iter().map(|m| (*m).to_string()).collect(),
@@ -183,6 +184,9 @@ fn base_config(
         on_usage: None,
         upstream_proxy: None,
         legacy_key_ref: None,
+        // M39-S3：单候选 + 默认 guard（聚合测试与负载均衡无关）
+        lb_top_n: 1,
+        guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
         runtime: None,
     }
 }
