@@ -809,6 +809,55 @@ impl GatewayConfig {
     }
 }
 
+/// 网关任务结束的原因（M41-S1 §4.1.1）。只做**分类**，不含 payload / 不含上游信息。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayExitReason {
+    /// 收到 `shutdown()` / `shutdown_and_wait()` 的停止信号，且任务正常结束。
+    Requested,
+    /// 服务任务 panic（`JoinError`）。
+    Panicked,
+    /// **没收到停止信号却正常结束**：任务自己返回了（最可疑的一类）。
+    Unexpected,
+}
+
+impl GatewayExitReason {
+    /// IPC DTO 用的稳定字符串：`requested` / `panicked` / `unexpected`。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GatewayExitReason::Requested => "requested",
+            GatewayExitReason::Panicked => "panicked",
+            GatewayExitReason::Unexpected => "unexpected",
+        }
+    }
+}
+
+/// 任务结束记录（`alive() == false` 之后才有值）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatewayExit {
+    /// 结束时刻（unix 秒，只用于展示）。
+    pub at: i64,
+    pub reason: GatewayExitReason,
+}
+
+/// 纯函数：`stop_requested` = 结束前是否收到过停止信号；`panicked` = 任务是否 panic。
+///
+/// 四格：`(true,false)=Requested`、`(true,true)=Panicked`、`(false,true)=Panicked`、
+/// `(false,false)=Unexpected`。
+pub fn classify_gateway_exit(stop_requested: bool, panicked: bool) -> GatewayExitReason {
+    match (stop_requested, panicked) {
+        (true, false) => GatewayExitReason::Requested,
+        (_, true) => GatewayExitReason::Panicked,
+        (false, false) => GatewayExitReason::Unexpected,
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 pub struct GatewayHandle {
     pub addr: SocketAddr,
     pub token: String,
@@ -819,6 +868,8 @@ pub struct GatewayHandle {
     finished: tokio::task::JoinHandle<()>,
     /// 与 `AppState` 共享的「正在停止」标志（M16-S4 / P3-3）。
     stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// 任务结束记录（M41-S1）：任务体结束时回写，`alive()` 为假之后才可能有值。
+    exit: Arc<std::sync::Mutex<Option<GatewayExit>>>,
 }
 
 impl std::fmt::Debug for GatewayHandle {
@@ -833,6 +884,26 @@ impl std::fmt::Debug for GatewayHandle {
 impl GatewayHandle {
     pub fn local_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.addr.port())
+    }
+
+    /// 服务任务是否还活着。**非阻塞**（`JoinHandle::is_finished`）。
+    ///
+    /// M41-S1：`gateway_status` 用这个而不是「`Option` 是不是 `Some`」——
+    /// 一个已经 panic 的句柄绝不能继续被报成「运行中」。
+    pub fn alive(&self) -> bool {
+        !self.finished.is_finished()
+    }
+
+    /// 任务结束记录（还活着 ⇒ `None`）。
+    pub fn last_exit(&self) -> Option<GatewayExit> {
+        self.exit.lock().ok().and_then(|slot| *slot)
+    }
+
+    /// 仅测试用：`shutdown_and_wait(self)` 会消费句柄，测试需要先克隆一份结束记录槽，
+    /// 才能在停止之后断言 `last_exit`。
+    #[cfg(test)]
+    pub(crate) fn exit_slot(&self) -> Arc<std::sync::Mutex<Option<GatewayExit>>> {
+        Arc::clone(&self.exit)
     }
 
     /// 停止网关并释放端口。幂等。
@@ -1031,12 +1102,30 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
     }
 
     let (tx, rx) = oneshot::channel::<()>();
+    // M41-S1：录一次「任务怎么结束的」。serve 再包一层 spawn——外层能拿到 `JoinError`
+    // （panic），`is_finished()` 只能回答「结束了吗」，回答不了「正常停止 / panic / 自己提前返回」。
+    let exit: Arc<std::sync::Mutex<Option<GatewayExit>>> = Arc::new(std::sync::Mutex::new(None));
+    let stopping_for_task = Arc::clone(&stopping);
+    let exit_for_task = Arc::clone(&exit);
     let finished = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = rx.await;
-            })
-            .await;
+        let served = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await;
+        })
+        .await;
+        let reason = classify_gateway_exit(
+            stopping_for_task.load(std::sync::atomic::Ordering::SeqCst),
+            served.is_err(),
+        );
+        if let Ok(mut slot) = exit_for_task.lock() {
+            *slot = Some(GatewayExit {
+                at: now_secs(),
+                reason,
+            });
+        }
     });
 
     Ok(GatewayHandle {
@@ -1046,6 +1135,7 @@ pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
         shutdown: tx,
         finished,
         stopping,
+        exit,
     })
 }
 
@@ -2556,6 +2646,51 @@ mod tests {
     /// 本测试里**没有任何 await**，所以服务任务只可能在 `shutdown_and_wait` 内部被推进。
     /// 若它只是「发个信号就返回」，服务任务在单线程运行时里根本没机会被调度、监听套接字
     /// 还开着，下面两条断言必红。
+    /// M41-S1：四格分类（每一格都要有）。
+    #[test]
+    fn classify_gateway_exit_covers_all_four_cells() {
+        assert_eq!(
+            classify_gateway_exit(true, false),
+            GatewayExitReason::Requested
+        );
+        assert_eq!(
+            classify_gateway_exit(true, true),
+            GatewayExitReason::Panicked,
+            "停止过程中崩了仍按崩了算"
+        );
+        assert_eq!(
+            classify_gateway_exit(false, true),
+            GatewayExitReason::Panicked
+        );
+        assert_eq!(
+            classify_gateway_exit(false, false),
+            GatewayExitReason::Unexpected,
+            "没让停却自己结束"
+        );
+        // DTO 字符串稳定
+        assert_eq!(GatewayExitReason::Requested.as_str(), "requested");
+        assert_eq!(GatewayExitReason::Panicked.as_str(), "panicked");
+        assert_eq!(GatewayExitReason::Unexpected.as_str(), "unexpected");
+    }
+
+    /// M41-S1：`alive()` / `last_exit()` 跟踪任务生命周期（五格矩阵的 ①②）。
+    #[tokio::test]
+    async fn alive_and_last_exit_track_the_task_lifecycle() {
+        let handle = start(test_config(0)).await.expect("网关应能启动");
+        assert!(handle.alive(), "刚启动必须 alive");
+        assert_eq!(handle.last_exit(), None, "活着时没有结束记录");
+        let slot = handle.exit_slot();
+
+        handle.shutdown_and_wait().await;
+
+        let exit = slot
+            .lock()
+            .expect("结束记录槽可锁")
+            .expect("停止后有结束记录");
+        assert_eq!(exit.reason, GatewayExitReason::Requested);
+        assert!(exit.at > 0, "结束时刻应为 unix 秒");
+    }
+
     #[tokio::test]
     async fn shutdown_and_wait_releases_the_port_before_returning() {
         let handle = start(test_config(0)).await.expect("网关应能启动");
@@ -2618,6 +2753,7 @@ mod tests {
             shutdown: tx,
             finished,
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            exit: Arc::new(std::sync::Mutex::new(None)),
         };
         handle.shutdown_and_wait().await;
     }

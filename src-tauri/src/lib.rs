@@ -640,6 +640,50 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
 /// 模型目录采集循环的醒来间隔（M39-S1）。真正的节流在每站的 `should_collect_models`。
 const MODEL_CATALOG_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// M41-S1：`gateway_auto_start` 的启动期尝试（只跑一次，失败**不阻断启动**）。
+///
+/// 选组规则见 [`crate::commands::auto_start_target`]：优先「上次成功运行」的 site/key
+/// （四项校验全过才用），否则回退「第一个 health=ok 站点 + 其第一把 enabled key」，
+/// 都没有就跳过并记一行日志——**不自动重试、不循环**。
+fn maybe_auto_start_gateway<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    use tauri::Manager as _;
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let Ok(settings) = state.service.settings() else {
+        return;
+    };
+    if !settings.gateway_auto_start || !settings.gateway_enabled {
+        return;
+    }
+    let Ok(sites) = state.service.sites() else {
+        return;
+    };
+    let Ok(keys) = state.service.stored_keys() else {
+        return;
+    };
+    let Some((site_id, key_id)) = commands::auto_start_target(
+        &sites,
+        &keys,
+        settings.gateway_last_site_id,
+        settings.gateway_last_key_id,
+    ) else {
+        eprintln!("[tianshu-relay] 自动启动网关：没有可用的健康站点 / 启用密钥，跳过（不重试）");
+        return;
+    };
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(state) = app_handle.try_state::<AppState>() else {
+            return;
+        };
+        // 与手动启动共用同一把串行锁；auto-start 只在这里 spawn 一次。
+        let _op = state.gateway_op.lock().await;
+        if let Err(err) = commands::start_gateway_locked(&state, site_id, key_id).await {
+            eprintln!("[tianshu-relay] 自动启动网关失败（不影响应用启动）: {err}");
+        }
+    });
+}
+
 pub fn spawn_maintenance_tasks<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     use tauri::Manager;
 
@@ -776,6 +820,8 @@ pub fn run() {
     let result = configure(tauri::Builder::default())
         .setup(|app| {
             spawn_maintenance_tasks(app.handle());
+            // M41-S1：应用启动时的 auto-start（默认关）。只尝试一次、不阻塞启动、失败只记日志。
+            maybe_auto_start_gateway(app.handle());
 
             // 托盘（M6-S5 / B-53）。**失败不阻断启动**：无 GUI 会话的环境
             // （CI、SSH、headless）建不出托盘图标，但那不该让整个应用起不来。

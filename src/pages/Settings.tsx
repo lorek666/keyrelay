@@ -504,7 +504,9 @@ export default function SettingsPage() {
 
   const save = useMutation({
     mutationFn: async (settings: Settings) => {
-      const saved = await updateSettings(settings);
+      const result = await updateSettings(settings);
+      // M41-S1：设置已保存 ≠ 网关已按新设置运行。gatewayError 有值时两件事都要说。
+      const saved = result.settings;
       // 自启不是「存一个布尔值」就完事的：它要在磁盘上真写 / 真删一个 LaunchAgent，
       // 或者在 Windows 上动注册表。所以保存设置之后立刻把它同步成实际状态，
       // 并把实际状态带回来——否则界面显示「已开启」而系统里什么都没有。
@@ -513,9 +515,21 @@ export default function SettingsPage() {
       // 把两件事的结果分别带回，界面分开说——否则用户以为设置没存，会重复保存。
       try {
         const autostart = await setAutostart(saved.autostartEnabled);
-        return { saved, autostart, autostartError: null as string | null };
+        return {
+          saved,
+          autostart,
+          autostartError: null as string | null,
+          gatewayError: result.gatewayError,
+          gateway: result.gateway,
+        };
       } catch (err) {
-        return { saved, autostart: null, autostartError: (err as Error).message };
+        return {
+          saved,
+          autostart: null,
+          autostartError: (err as Error).message,
+          gatewayError: result.gatewayError,
+          gateway: result.gateway,
+        };
       }
     },
     onSuccess: async ({ saved, autostart, autostartError }) => {
@@ -940,6 +954,20 @@ export default function SettingsPage() {
             {dirty ? <span className="muted">{t("settings.save.dirty")}</span> : null}
           </div>
 
+          <div className="card">
+            <h3>{t("settings.gatewayAutoStart.title")}</h3>
+            <label className="checkline">
+              <input
+                type="checkbox"
+                checked={draft.gatewayAutoStart}
+                onChange={(e) =>
+                  setDraft({ ...draft, gatewayAutoStart: e.target.checked })
+                }
+              />
+              <span>{t("settings.gatewayAutoStart.label")}</span>
+            </label>
+            <p className="muted">{t("settings.gatewayAutoStart.hint")}</p>
+          </div>
           <GatewayCard
             enabled={draft.gatewayEnabled}
             port={draft.gatewayPort}

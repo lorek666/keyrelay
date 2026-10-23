@@ -43,6 +43,10 @@ const KEY_GATEWAY_ENABLED: &str = "gateway_enabled";
 const KEY_GATEWAY_PORT: &str = "gateway_port";
 // M14-S1：多站路由 + 模型采集（B-99）
 const KEY_GATEWAY_MULTI_SITE: &str = "gateway_multi_site";
+// M41-S1：自动启动 + 「上次成功运行」的那组 site/key（0 = 无）
+const KEY_GATEWAY_AUTO_START: &str = "gateway_auto_start";
+const KEY_GATEWAY_LAST_SITE_ID: &str = "gateway_last_site_id";
+const KEY_GATEWAY_LAST_KEY_ID: &str = "gateway_last_key_id";
 const KEY_COLLECT_MODELS: &str = "collect_models";
 const KEY_MODELS_MIN_INTERVAL: &str = "models_min_interval_secs";
 // M39-S3：负载均衡与每站保护（三个新设置）
@@ -77,6 +81,14 @@ pub struct Settings {
     pub gateway_enabled: bool,
     /// 网关端口。只绑 `127.0.0.1`。
     pub gateway_port: u16,
+    /// 应用启动时是否自动启动网关（M41-S1）。**默认 false**：自动监听端口是显式选择。
+    /// 只有 `gateway_auto_start && gateway_enabled` 且能确定站点/密钥时才尝试；
+    /// 失败不阻断启动（只记日志）。
+    pub gateway_auto_start: bool,
+    /// 「上次成功运行」的站点行号（M41-S1）。`0` = 无。auto-start 的首选组。
+    pub gateway_last_site_id: i64,
+    /// 「上次成功运行」的密钥行号（M41-S1）。`0` = 无。
+    pub gateway_last_key_id: i64,
     /// 多站路由开关（M14-S1 / B-99）：关时 `gateway_config` 走 `single_upstream`
     ///（M8-S4 §6.5 换站语义）；开时走 `build_gateway_route`（多站聚合，按模型选路）。
     /// **默认 false**——PRD FR-6 多站聚合是 V1.1 可选，默认不破坏换站语义。
@@ -159,6 +171,10 @@ impl Default for Settings {
             // 网关会监听端口，默认关闭
             gateway_enabled: false,
             gateway_port: 8787,
+            // M41-S1：默认不自动启动；没有「上次成功运行」的组
+            gateway_auto_start: false,
+            gateway_last_site_id: 0,
+            gateway_last_key_id: 0,
             // M14-S1：多站路由默认关（保住 M8-S4 换站语义）；采集默认关（不替用户打带密钥请求）
             gateway_multi_site: false,
             collect_models: false,
@@ -249,6 +265,12 @@ impl Settings {
                 self.language,
                 LANGUAGES.join(" / ")
             )));
+        }
+        // M41-S1：last_* 是行号，负数没有意义（0 = 无）。
+        if self.gateway_last_site_id < 0 || self.gateway_last_key_id < 0 {
+            return Err(Error::Store(
+                "gateway_last_site_id / gateway_last_key_id 不能为负数（0 表示无）".into(),
+            ));
         }
         // M10-S2：proxy_mode 必须是合法值之一。from_pairs 已过滤，但保存路径要走 validate。
         if crate::proxy::ProxyMode::parse(&self.proxy_mode).is_none() {
@@ -415,6 +437,25 @@ impl Settings {
                         }
                     }
                 }
+                KEY_GATEWAY_AUTO_START => {
+                    if let Some(flag) = parse_bool(value) {
+                        settings.gateway_auto_start = flag;
+                    }
+                }
+                KEY_GATEWAY_LAST_SITE_ID => {
+                    if let Ok(id) = value.parse::<i64>() {
+                        if id >= 0 {
+                            settings.gateway_last_site_id = id;
+                        }
+                    }
+                }
+                KEY_GATEWAY_LAST_KEY_ID => {
+                    if let Ok(id) = value.parse::<i64>() {
+                        if id >= 0 {
+                            settings.gateway_last_key_id = id;
+                        }
+                    }
+                }
                 // M14-S1：多站路由 + 模型采集
                 KEY_GATEWAY_MULTI_SITE => {
                     if let Some(flag) = parse_bool(value) {
@@ -565,6 +606,15 @@ impl Settings {
             (KEY_DRIFT_ON_START, self.drift_check_on_start.to_string()),
             (KEY_GATEWAY_ENABLED, self.gateway_enabled.to_string()),
             (KEY_GATEWAY_PORT, self.gateway_port.to_string()),
+            (KEY_GATEWAY_AUTO_START, self.gateway_auto_start.to_string()),
+            (
+                KEY_GATEWAY_LAST_SITE_ID,
+                self.gateway_last_site_id.to_string(),
+            ),
+            (
+                KEY_GATEWAY_LAST_KEY_ID,
+                self.gateway_last_key_id.to_string(),
+            ),
             // M14-S1：多站路由 + 模型采集
             (KEY_GATEWAY_MULTI_SITE, self.gateway_multi_site.to_string()),
             (KEY_COLLECT_MODELS, self.collect_models.to_string()),
@@ -621,12 +671,16 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 26] = [
+    pub const KEYS: [&'static str; 29] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
         KEY_GATEWAY_ENABLED,
         KEY_GATEWAY_PORT,
+        // M41-S1
+        KEY_GATEWAY_AUTO_START,
+        KEY_GATEWAY_LAST_SITE_ID,
+        KEY_GATEWAY_LAST_KEY_ID,
         KEY_GATEWAY_MULTI_SITE,
         KEY_COLLECT_MODELS,
         KEY_MODELS_MIN_INTERVAL,
@@ -941,6 +995,9 @@ mod tests {
             notify_enabled: true,
             gateway_enabled: true,
             gateway_port: 9999,
+            gateway_auto_start: true,
+            gateway_last_site_id: 11,
+            gateway_last_key_id: 22,
             gateway_multi_site: false,
             collect_models: false,
             models_min_interval_secs: 1800,
