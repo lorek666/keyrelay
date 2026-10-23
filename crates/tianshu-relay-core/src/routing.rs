@@ -249,6 +249,18 @@ fn ordered<'a>(upstreams: impl Iterator<Item = &'a Upstream>) -> Vec<&'a Upstrea
 /// 余额健康度档位：0 = 有余额，1 = 未知（`None` 或 `NaN`），2 = 已耗尽。
 ///
 /// `NaN` 归入「未知」而不是「已耗尽」：`NaN` 表示**算不出来**，不是「没钱了」。
+/// M40-S2：健康档位的**字符串**视图（DTO 用）。
+///
+/// **唯一出处**：与 `health_rank` 同一个判据——三档 `healthy(0) / unknown(1) / exhausted(2)`。
+/// 禁止在 DTO 里复制判据（否则排序与展示会分叉）。
+pub(crate) fn health_label(balance: Option<f64>) -> &'static str {
+    match health_rank(balance) {
+        0 => "healthy",
+        1 => "unknown",
+        _ => "exhausted",
+    }
+}
+
 fn health_rank(balance: Option<f64>) -> u8 {
     match balance {
         Some(x) if x.is_nan() => 1,
@@ -405,6 +417,23 @@ impl Breaker {
     }
 
     /// 只读查询，**不**改状态。`Open` 且冷却已过 ⇒ `HalfOpen`（允许一个探活请求）。
+    /// M40-S2：该站点**任意模型**上最坏的那个熔断态（`Open > HalfOpen > Closed`）。
+    ///
+    /// 为什么需要聚合：熔断是 `(site, model)` 粒度，而状态面板的候选**没有**模型维度；
+    /// 用户看到「这个站点被跳过」时，关心的是「有没有模型在熔断」，不是某一个模型。
+    /// **只读**：不推进冷却、不放出探针（与 [`Self::state`] 同语义）。
+    pub(crate) fn worst_state_for_site(&self, site_id: i64, now: Instant) -> BreakerState {
+        let mut worst = BreakerState::Closed;
+        for key in self.entries.keys().filter(|k| k.0 == site_id) {
+            match self.state(key, now) {
+                BreakerState::Open => return BreakerState::Open,
+                BreakerState::HalfOpen => worst = BreakerState::HalfOpen,
+                BreakerState::Closed => {}
+            }
+        }
+        worst
+    }
+
     pub fn state(&self, key: &BreakerKey, now: Instant) -> BreakerState {
         let Some(entry) = self.entries.get(key) else {
             return BreakerState::Closed;

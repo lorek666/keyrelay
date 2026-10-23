@@ -943,6 +943,23 @@
     }
   },
   "gateway": {
+    "metrics": {
+      "title": "网关指标",
+      "notRunning": "网关未运行，暂无指标。",
+      "mode": "路由模式",
+      "modeValue": { "single": "单上游", "multi": "多站路由", "stopped": "未运行" },
+      "qps": "QPS（最近 60 秒）",
+      "requests": "总请求数",
+      "inflight": "在途请求",
+      "failovers": "失败切换",
+      "generation": "路由版本",
+      "lastError": "最近错误",
+      "none": "无",
+      "singleUpstream": "单上游模式：无候选列表。",
+      "candidate": { "site": "站点", "key": "密钥", "health": "健康", "breaker": "熔断" },
+      "health": { "healthy": "健康", "unknown": "未知", "exhausted": "额度耗尽" },
+      "breaker": { "closed": "正常", "open": "熔断中", "halfOpen": "探活中", "unknown": "未知" }
+    },
     "phase": {
       "running": "状态：运行中",
       "stopped": "状态：已停止",

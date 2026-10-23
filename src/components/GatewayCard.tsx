@@ -14,6 +14,7 @@ import {
   applyDelivery,
   type ChannelBinding,
   type DeliveryPlan,
+  type GatewayStatus,
 } from "../lib/api";
 import { maskRemovedValues } from "../lib/deliveryView";
 import { useTranslation } from "../i18n";
@@ -46,6 +47,93 @@ type Props = {
  * 并**持久化在系统钥匙串**里（M8-S4 §6.4）：不持久化的话每次重启都作废 agent 配置，
  * 「换站零改动」（FR-5:158）就不成立。站点密钥永远不会离开本机。
  */
+/**
+ * M40-S2：网关内存指标面板。
+ *
+ * **空态规则（spec §4.3，违反即 bug）**：
+ * - 未运行 ⇒ 只显示一行占位；**绝不**渲染 `0 req` / `0 QPS` / 空表格 / 灰色假候选。
+ * - `candidates` 为空但运行中 ⇒ 「单上游模式」，不渲染空表。
+ * - `requestsTotal < 3`（刚启动）⇒ QPS 显示 `—`（样本不足，不拿 0.3 秒的窗口吹稳定值）。
+ * - `lastError == null` ⇒ 显示「无」（不显示空白：读者分不清「没有」与「没加载」）。
+ */
+function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
+  const { t } = useTranslation();
+  if (!status || !status.running) {
+    return (
+      <div className="gateway-metrics">
+        <p className="muted">{t("gateway.metrics.notRunning")}</p>
+      </div>
+    );
+  }
+  const candidates = status.candidates ?? [];
+  const requestsTotal = status.requestsTotal ?? 0;
+  const qps = requestsTotal < 3 ? null : status.qps;
+  const badge = (kind: "ok" | "warn" | "danger") => `badge badge-${kind}`;
+  return (
+    <div className="gateway-metrics">
+      <h4>{t("gateway.metrics.title")}</h4>
+      <dl className="kv">
+        <dt>{t("gateway.metrics.mode")}</dt>
+        <dd>{t(`gateway.metrics.modeValue.${status.mode}`)}</dd>
+        <dt>{t("gateway.metrics.qps")}</dt>
+        <dd className="mono" data-gateway-qps>
+          {qps === null ? "—" : qps.toFixed(1)}
+        </dd>
+        <dt>{t("gateway.metrics.requests")}</dt>
+        <dd className="mono">{requestsTotal}</dd>
+        <dt>{t("gateway.metrics.inflight")}</dt>
+        <dd className="mono">{status.inflight}</dd>
+        <dt>{t("gateway.metrics.failovers")}</dt>
+        <dd className="mono">{status.failoversTotal}</dd>
+        <dt>{t("gateway.metrics.generation")}</dt>
+        <dd className="mono">{status.generation}</dd>
+        <dt>{t("gateway.metrics.lastError")}</dt>
+        <dd>{status.lastError ?? t("gateway.metrics.none")}</dd>
+      </dl>
+      {candidates.length === 0 ? (
+        <p className="muted">{t("gateway.metrics.singleUpstream")}</p>
+      ) : (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>{t("gateway.metrics.candidate.site")}</th>
+              <th>{t("gateway.metrics.candidate.key")}</th>
+              <th>{t("gateway.metrics.candidate.health")}</th>
+              <th>{t("gateway.metrics.candidate.breaker")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {candidates.map((c) => (
+              <tr key={`${c.siteId}-${c.keyId ?? "none"}-${c.displayName}`}>
+                <td>{c.displayName}</td>
+                <td className="mono">{c.keyId ?? "—"}</td>
+                <td>
+                  <span
+                    className={badge(
+                      c.health === "healthy" ? "ok" : c.health === "exhausted" ? "danger" : "warn",
+                    )}
+                  >
+                    {t(`gateway.metrics.health.${c.health}`)}
+                  </span>
+                </td>
+                <td>
+                  <span
+                    className={badge(
+                      c.breaker === "closed" ? "ok" : c.breaker === "open" ? "danger" : "warn",
+                    )}
+                  >
+                    {t(`gateway.metrics.breaker.${c.breaker}`)}
+                  </span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
 export default function GatewayCard({
   enabled,
   port,
@@ -413,6 +501,9 @@ export default function GatewayCard({
         />
       </label>
       <p className="muted">{t("gateway.maxRequestHint")}</p>
+
+      {/* M40-S2：指标面板（**所有相位都渲染**；未运行时由面板自己显示一行占位）。 */}
+      <GatewayMetricsPanel status={status.data} />
 
       {running ? (
         <>
