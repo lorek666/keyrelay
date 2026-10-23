@@ -1016,6 +1016,17 @@ button.ghost:disabled {
   overflow-wrap: anywhere;
 }
 
+/* M37-S1：模型清单失败态的「重试」按钮。
+   与输入框同宽（列向布局里 stretch），高度与行内其它按钮一致；
+   只做最小样式，视觉与 `.agent-row-model-fallback` 的输入/提示对齐。 */
+.agent-row-model-retry {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 2px 10px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
 /* ============================================================================
    M33-S1：全站界面排版与动效升级
 

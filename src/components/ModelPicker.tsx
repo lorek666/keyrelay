@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { listKeyModels } from "../lib/api";
 import { useTranslation } from "../i18n";
@@ -46,6 +47,19 @@ export default function ModelPicker({
     retry: false,
   });
 
+  // 失败态必须**粘住**到重试结束：`refetch()` 会把 status / error 一起清回 pending，
+  // 只看 `isError` 会让「重试中…」的按钮瞬间消失、变成加载态。用局部标记记住
+  // 「这次查询失败过」，直到它**成功**（data 出现）为止。
+  const [hadError, setHadError] = useState(false);
+  // 换 key ⇒ 新的查询，旧的失败标记必须清掉（否则新 key 会先闪一下失败态）
+  useEffect(() => {
+    setHadError(false);
+  }, [keyId]);
+  useEffect(() => {
+    if (models.isError) setHadError(true);
+    else if (models.data !== undefined) setHadError(false);
+  }, [models.isError, models.data]);
+
   // 未选密钥：没有查询可发，给一个禁用下拉，与既有「先选密钥」的引导一致
   if (keyId === null) {
     return (
@@ -55,7 +69,10 @@ export default function ModelPicker({
     );
   }
 
-  if (models.isLoading) {
+  const failed = models.isError || hadError;
+  const list = models.data ?? [];
+
+  if (!failed && models.isLoading) {
     return (
       <select className="input agent-row-model" aria-label={label} disabled>
         <option value="">{t("agents.select.modelLoading")}</option>
@@ -63,23 +80,49 @@ export default function ModelPicker({
     );
   }
 
-  const failed = models.isError;
-  const list = models.data ?? [];
+  // 回退输入：失败态与空清单态共用同一个输入框（只有提示与「重试」按钮不同）
+  const fallbackInput = (
+    <input
+      className="input agent-row-model"
+      aria-label={label}
+      value={value}
+      placeholder={t("agents.select.modelPlaceholder")}
+      spellCheck={false}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.value)}
+    />
+  );
 
-  if (failed || list.length === 0) {
+  // 失败态（M37-S1）：多一个「重试」按钮。站点会话刚恢复（例如刚登录）时，
+  // 用户不必重选 key——refetch 会重新走一次 list_key_models（核心层会顺手恢复明文）。
+  // 只在失败态出现：空清单态重试也没用（该分组确实没有模型），不给假希望。
+  if (failed) {
     return (
       <span className="agent-row-model-fallback">
-        <input
-          className="input agent-row-model"
-          aria-label={label}
-          value={value}
-          placeholder={t("agents.select.modelPlaceholder")}
-          spellCheck={false}
-          disabled={disabled}
-          onChange={(e) => onChange(e.target.value)}
-        />
+        {fallbackInput}
         <span className="muted agent-row-model-hint">
-          {failed ? t("agents.select.modelFetchFailed") : t("agents.select.modelEmpty")}
+          {t("agents.select.modelFetchFailed")}
+        </span>
+        <button
+          type="button"
+          className="btn agent-row-model-retry"
+          disabled={models.isFetching}
+          onClick={() => void models.refetch()}
+        >
+          {models.isFetching
+            ? t("agents.select.modelRetrying")
+            : t("agents.select.modelRetry")}
+        </button>
+      </span>
+    );
+  }
+
+  if (list.length === 0) {
+    return (
+      <span className="agent-row-model-fallback">
+        {fallbackInput}
+        <span className="muted agent-row-model-hint">
+          {t("agents.select.modelEmpty")}
         </span>
       </span>
     );

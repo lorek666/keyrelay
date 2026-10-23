@@ -3527,11 +3527,23 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 站点响应的解析口径沿用 [`crate::site::fetch_models`]（`data[].id`），非 2xx 走
     /// 既有的 `map_http_error`（含站点原文脱敏）。
     pub async fn models_for_key(&self, key_id: i64) -> Result<Vec<String>> {
-        let secret = self.key_secret(key_id)?;
         let row = self
             .store
             .get_key(key_id)?
             .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
+        // 已回收 / 不存在：任何网络请求之前就拒绝（M32-S1 既有语义，M37-S1 保持）。
+        ensure_not_revoked(&row)?;
+
+        // M37-S1（B-219 的即时修复）：本地保险库缺明文时自动回读。
+        //
+        // 只认 `Ok(None)`（条目不存在）。`Err`（读失败，例如钥匙串被锁）**原样返回**——
+        // 把「读失败」当成「没有」会在用户不知情时多发一次明文读取请求，且会把
+        // 「打不开保险库」误报成「站点上没有这把钥匙」。
+        let secret = match self.vault_secret(&row.secret_ref)? {
+            Some(secret) => secret,
+            None => self.restore_key_secret(&row).await?,
+        };
+
         let site = self
             .store
             .get_site(row.site_id)?
@@ -3541,6 +3553,83 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         models.sort_unstable();
         models.dedup();
         Ok(models)
+    }
+
+    /// 本地缺少明文时，用站点会话把该 key 的明文回读到原 `secret_ref`（M37-S1）。
+    ///
+    /// 只有 [`Self::models_for_key`] 在 `vault_secret` 返回 `Ok(None)` 时调用它：
+    /// 已回收的 key 在调用方就被拒绝，读失败（`Err`）不会走到这里。
+    ///
+    /// 明文只存在于核心内存（`Zeroizing`）与本地加密保险库；**不返回给前端、
+    /// 不写日志、不进事件 payload**。写回用**原 `secret_ref`**：复用原行，
+    /// 不新建 key 行，不动 `remote_id` / 分组 / 状态。
+    async fn restore_key_secret(
+        &self,
+        row: &crate::store::KeyRow,
+    ) -> Result<zeroize::Zeroizing<String>> {
+        // 没有站点主键就没法回读：说清原因，别让用户看到「钥匙串里没有」这种内部黑话。
+        let remote_id = row.remote_id.as_deref().map(str::trim).unwrap_or_default();
+        if remote_id.is_empty() {
+            return Err(Error::Vault(format!(
+                "密钥 #{} 的明文不在本地，且本地没有它的站点主键（remote_id），无法自动恢复；请在该站点重新取一次钥匙",
+                row.id
+            )));
+        }
+
+        let site = self
+            .store
+            .get_site(row.site_id)?
+            .ok_or_else(|| Error::NotFound(format!("站点 #{} 不存在", row.site_id)))?;
+        let kind = self.kind_of(&site)?;
+        // 能力门必须在 `session()` 之前：没有令牌管理端点的站点通常也没有会话，
+        // 先要会话会先报「未登录」，把用户引向一个不存在的登录流程（M7-S5 既定顺序）。
+        capability_gate(
+            kind,
+            crate::site::capability::capabilities(kind).reveal_key,
+            "读取密钥明文",
+        )?;
+
+        // 无会话 ⇒ 可执行错误：先说要登录，登录后点重试即可（前端有重试按钮）。
+        let session = self.session(row.site_id).map_err(|_| {
+            Error::AuthFailed(format!(
+                "密钥 #{} 的明文不在本地，自动恢复需要先登录站点「{}」；登录后点重试即可",
+                row.id, site.display_name
+            ))
+        })?;
+
+        let adapter = self.registry.adapter(kind);
+        let material = match adapter
+            .reveal_key(&site.base_url, &session, remote_id)
+            .await
+        {
+            Ok(material) => material,
+            Err(err) => return Err(self.on_auth_error(row.site_id, err)),
+        };
+
+        // 站点返回空 / 全空白 ⇒ 不写回：把空串塞进保险库会让后续查询更难诊断。
+        if material.secret.trim().is_empty() {
+            return Err(Error::Vault(format!(
+                "站点返回的密钥明文为空（密钥 #{}），无法自动恢复；请在该站点重新取一次钥匙",
+                row.id
+            )));
+        }
+
+        self.vault.put(&row.secret_ref, &material.secret)?;
+
+        // 只记标识与脱敏指纹：不写明文、不写 secret_ref（定位串没必要进事件）。
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "key",
+            "已从站点自动恢复本地缺失的密钥明文",
+            serde_json::json!({
+                "site_id": row.site_id,
+                "key_id": row.id,
+                "remote_id": remote_id,
+                "fingerprint": crate::redact::fingerprint(&material.secret),
+            }),
+        ));
+
+        Ok(zeroize::Zeroizing::new(material.secret))
     }
 
     /// 站点侧可用分组与倍率（FR-2）。
@@ -7703,7 +7792,7 @@ mod tests {
             .expect("vault.put");
         let key_id = service
             .store
-            .insert_key(site.id, "k", &reference, Some("remote-1"), None)
+            .insert_key(site.id, "k", &reference, Some("670"), None)
             .expect("insert_key");
         (service, key_id, mock)
     }
@@ -7738,9 +7827,160 @@ mod tests {
         );
     }
 
+    /// M37-S1 夹具：在 `models_fixture` 基础上**删掉** vault 条目（模拟 B-219 迁移放弃）。
+    async fn missing_secret_fixture(
+        tail: Vec<HttpResponse>,
+    ) -> (TianshuRelayService<MockTransport>, i64, MockTransport) {
+        let (service, key_id, mock) = models_fixture(tail).await;
+        let row = service
+            .store
+            .get_key(key_id)
+            .expect("读 key")
+            .expect("key 行存在");
+        service
+            .vault
+            .delete(&row.secret_ref)
+            .expect("删掉 vault 条目");
+        assert!(
+            !service
+                .vault_has_for_test(&row.secret_ref)
+                .expect("vault.has"),
+            "夹具前提：vault 里必须没有该条目"
+        );
+        (service, key_id, mock)
+    }
+
+    fn login_session() -> Session {
+        Session {
+            cookies: vec![("session".to_string(), "abc".to_string())],
+            access_token: Some("tok-m37".to_string()),
+            user_id: Some("7".to_string()),
+            user_agent: None,
+        }
+    }
+
+    /// 数 `/api/token/<id>/key` 请求（reveal 的唯一入口）。
+    fn reveal_requests(mock: &MockTransport) -> usize {
+        mock.requests()
+            .iter()
+            .filter(|req| req.url.contains("/api/token/") && req.url.ends_with("/key"))
+            .count()
+    }
+
+    fn reveal_response(secret: &str) -> HttpResponse {
+        HttpResponse::json(200, json!({"success": true, "data": {"key": secret}}))
+            .expect("构造响应")
+    }
+
+    /// M37-S1 §7：缺明文 + 会话有效 ⇒ 回读明文、写回原 ref、再查模型。
+    #[tokio::test]
+    async fn models_for_key_restores_missing_secret_then_lists_models() {
+        let restored = "sk-restored-m37-0123456789abcdef";
+        let (service, key_id, mock) = missing_secret_fixture(vec![
+            reveal_response(restored),
+            models_response(&["m2", "m1"]),
+        ])
+        .await;
+        let row = service
+            .store
+            .get_key(key_id)
+            .expect("读 key")
+            .expect("key 行存在");
+        service
+            .sessions
+            .put(row.site_id, login_session())
+            .expect("塞会话");
+
+        let models = service.models_for_key(key_id).await.expect("取模型");
+
+        assert_eq!(models, vec!["m1".to_string(), "m2".to_string()]);
+        // 写回的是**原 secret_ref**，且条目真的进了保险库
+        assert!(
+            service
+                .vault_has_for_test(&row.secret_ref)
+                .expect("vault.has"),
+            "恢复后 vault 里必须有原 secret_ref 的条目"
+        );
+        // reveal 恰好一次，且打的是该 key 的站点主键（670）；没有新建 key 行
+        assert_eq!(reveal_requests(&mock), 1, "reveal 只应发一次");
+        let reveal_req = mock
+            .requests()
+            .into_iter()
+            .find(|req| req.url.ends_with("/api/token/670/key"))
+            .expect("reveal 应打 /api/token/670/key");
+        assert_eq!(reveal_req.method.as_str(), "POST");
+        let after = service
+            .store
+            .get_key(key_id)
+            .expect("读 key")
+            .expect("key 行仍在");
+        assert_eq!(after.remote_id, row.remote_id);
+        assert_eq!(after.secret_ref, row.secret_ref);
+        assert_eq!(service.store.list_keys().expect("列 key").len(), 1);
+        // /v1/models 用的是**恢复后的** key
+        let models_req = mock
+            .requests()
+            .into_iter()
+            .find(|req| req.url.ends_with("/v1/models"))
+            .expect("有 /v1/models 请求");
+        assert!(
+            models_req
+                .headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v.as_str() == format!("Bearer {restored}")),
+            "{:?}",
+            models_req.headers
+        );
+    }
+
+    /// M37-S1 §7：缺明文 + 无会话 ⇒ 可执行错误（含「登录」），不发 reveal、不发 /v1/models。
+    #[tokio::test]
+    async fn models_for_key_missing_secret_without_session_is_actionable() {
+        let (service, key_id, mock) = missing_secret_fixture(vec![models_response(&["m1"])]).await;
+        let row = service
+            .store
+            .get_key(key_id)
+            .expect("读 key")
+            .expect("key 行存在");
+
+        let err = service
+            .models_for_key(key_id)
+            .await
+            .expect_err("无会话必须报错");
+        let text = err.to_string();
+        assert!(text.contains("登录"), "错误文案要说明先登录：{text}");
+        assert!(
+            !text.contains("sk-test-secret"),
+            "错误文案不得含明文：{text}"
+        );
+        assert_eq!(reveal_requests(&mock), 0, "无会话不得发 reveal");
+        assert_eq!(models_requests(&mock), 0, "无会话不得发 /v1/models");
+        assert!(
+            !service
+                .vault_has_for_test(&row.secret_ref)
+                .expect("vault.has"),
+            "失败后 vault 仍应没有条目"
+        );
+    }
+
     #[tokio::test]
     async fn models_for_key_rejects_revoked_key() {
-        let (service, key_id, mock) = models_fixture(vec![models_response(&["m1"])]).await;
+        // M37-S1：已回收 + **本地缺明文** 也必须拒绝——不能在「缺明文」分支里
+        // 顺手回读明文（那会给已回收的 key 重新拿到明文）。
+        let (service, key_id, mock) = missing_secret_fixture(vec![
+            reveal_response("sk-restored-should-never-happen"),
+            models_response(&["m1"]),
+        ])
+        .await;
+        let row = service
+            .store
+            .get_key(key_id)
+            .expect("读 key")
+            .expect("key 行存在");
+        service
+            .sessions
+            .put(row.site_id, login_session())
+            .expect("塞会话");
         service
             .store
             .set_key_status(key_id, crate::store::KEY_STATUS_REVOKED)
@@ -7751,6 +7991,13 @@ mod tests {
             .expect_err("已回收必须拒绝");
         assert!(!err.to_string().contains("sk-test-secret"), "{err}");
         assert_eq!(models_requests(&mock), 0, "已回收的 key 不得发请求");
+        assert_eq!(reveal_requests(&mock), 0, "已回收的 key 不得回读明文");
+        assert!(
+            !service
+                .vault_has_for_test(&row.secret_ref)
+                .expect("vault.has"),
+            "已回收的 key 不得被写回保险库"
+        );
     }
 
     #[tokio::test]
