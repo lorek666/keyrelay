@@ -4897,6 +4897,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hex",
+ "http-body-util",
  "keyring",
  "pbkdf2",
  "reqwest",

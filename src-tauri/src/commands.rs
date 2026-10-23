@@ -362,6 +362,8 @@ pub struct SettingsDto {
     drift_check_on_start: bool,
     gateway_enabled: bool,
     gateway_port: u16,
+    /// M42-S1：网关**请求体**上限（MiB，1..=64；默认 16）。camelCase `gatewayMaxRequestMib`。
+    gateway_max_request_mib: u16,
     // M41-S1：自动启动 + 上次成功运行的那组 site/key（0 = 无）
     gateway_auto_start: bool,
     gateway_last_site_id: i64,
@@ -464,6 +466,13 @@ pub struct GatewayStatusDto {
     token_persistent: bool,
     /// 最近一次任务结束（`crashed` 且有结束记录时才有值）。
     last_exit: Option<GatewayExitDto>,
+    /// M42-S1：**实际**监听的地址，例如 `["127.0.0.1:8787", "[::1]:8787"]`。
+    /// 网关没在跑时为空 vec（不是「以为在监听」）。
+    listen_addrs: Vec<String>,
+    /// M42-S1：IPv6 回环是否降级（`false` = 双栈都在听）。
+    ipv6_degraded: bool,
+    /// M42-S1：降级原因（未降级为 `None`）。
+    ipv6_note: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1333,6 +1342,7 @@ fn settings_from_dto(dto: &SettingsDto) -> tianshu_relay_core::settings::Setting
         drift_check_on_start: dto.drift_check_on_start,
         gateway_enabled: dto.gateway_enabled,
         gateway_port: dto.gateway_port,
+        gateway_max_request_mib: dto.gateway_max_request_mib,
         gateway_auto_start: dto.gateway_auto_start,
         gateway_last_site_id: dto.gateway_last_site_id,
         gateway_last_key_id: dto.gateway_last_key_id,
@@ -1367,6 +1377,7 @@ fn settings_to_dto(settings: &tianshu_relay_core::settings::Settings) -> Setting
         drift_check_on_start: settings.drift_check_on_start,
         gateway_enabled: settings.gateway_enabled,
         gateway_port: settings.gateway_port,
+        gateway_max_request_mib: settings.gateway_max_request_mib,
         gateway_auto_start: settings.gateway_auto_start,
         gateway_last_site_id: settings.gateway_last_site_id,
         gateway_last_key_id: settings.gateway_last_key_id,
@@ -1541,6 +1552,10 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
         site: None,
         token_persistent,
         last_exit: None,
+        // M42-S1：没在跑 ⇒ 没有监听地址（不要凭空写 127.0.0.1:port）。
+        listen_addrs: Vec::new(),
+        ipv6_degraded: false,
+        ipv6_note: None,
     };
     let Ok(guard) = state.gateway.lock() else {
         return stopped;
@@ -1552,6 +1567,17 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
         at: exit.at,
         reason: exit.reason.as_str().to_string(),
     });
+    // M42-S1 §4.5：监听地址与 IPv6 降级状态来自**运行中的句柄**（不是推断）。
+    let listen_addrs: Vec<String> = run
+        .handle
+        .addrs
+        .iter()
+        .map(|addr| addr.to_string())
+        .collect();
+    let (ipv6_degraded, ipv6_note) = match &run.handle.ipv6 {
+        tianshu_relay_core::gateway::Ipv6State::Listening => (false, None),
+        tianshu_relay_core::gateway::Ipv6State::Degraded { reason } => (true, Some(reason.clone())),
+    };
     if run.handle.alive() {
         GatewayStatusDto {
             running: true,
@@ -1561,6 +1587,9 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             site: Some(run.handle.site_display_name.clone()),
             token_persistent,
             last_exit,
+            listen_addrs,
+            ipv6_degraded,
+            ipv6_note,
         }
     } else {
         // M41-S1：已死的句柄**绝不**报 running（url/token/site 一并清空，避免 UI 展示假地址）。
@@ -1572,6 +1601,10 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             site: None,
             token_persistent,
             last_exit,
+            // 任务已死 ⇒ 端口已释放：不再报任何监听地址。
+            listen_addrs: Vec::new(),
+            ipv6_degraded: false,
+            ipv6_note: None,
         }
     }
 }
@@ -1774,6 +1807,24 @@ pub(crate) async fn start_gateway_locked(
     let handle = tianshu_relay_core::gateway::start(config)
         .await
         .map_err(|e| e.to_string())?;
+    // M42-S1 §4.5：IPv6 降级必须**可见**——状态字段（`listenAddrs` / `ipv6Degraded`）之外，
+    // 再记一条 `Warn` 事件。payload **只含** port 与 kind（不放 reason 原文：
+    // 它可能带 OS 错误串，事件表只留可判定的事实）。
+    if let tianshu_relay_core::gateway::Ipv6State::Degraded { reason } = &handle.ipv6 {
+        let kind = if reason.contains("占用") {
+            "addr_in_use"
+        } else {
+            "unavailable"
+        };
+        state
+            .service
+            .record_event(tianshu_relay_core::observability::event_with_payload(
+                tianshu_relay_core::observability::Level::Warn,
+                "gateway",
+                format!("网关 IPv6 回环未监听，仅监听 127.0.0.1：{reason}"),
+                serde_json::json!({ "port": handle.addr.port(), "kind": kind }),
+            ));
+    }
     if let Ok(mut guard) = state.gateway.lock() {
         *guard = Some(GatewayRunning {
             handle,

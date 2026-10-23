@@ -995,8 +995,12 @@
       "url": "URL",
       "upstream": "Upstream",
       "token": "Local token",
-      "tokenStorage": "Token storage"
+      "tokenStorage": "Token storage",
+      "listenAddrs": "Listening on"
     },
+    "maxRequestLabel": "Request body limit (MiB, 1–64)",
+    "maxRequestHint": "Limits the **request body** only (1–64 MiB). The response body cap is a fixed 64 MiB constant and is unrelated; changes apply the next time the gateway starts.",
+    "ipv6Degraded": "IPv6 loopback is not listening: {note} (only 127.0.0.1 is available; v4 is unaffected)",
     "batch": {
       "btn": "Re-point delivered channels at the gateway…",
       "notRunning": "Gateway isn't running: re-pointing needs the local token; start the gateway first.",

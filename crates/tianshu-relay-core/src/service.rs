@@ -4629,6 +4629,12 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             max_concurrency: settings.gateway_per_site_concurrency,
             rate_limit_per_sec: settings.gateway_per_site_rate_limit,
         };
+        // M42-S1 §4.4：请求体上限（MiB → 字节）。`1..=64` 已由 `Settings::validate` 保证；
+        // 这里再夹一次硬上限，防止旧库里的越界值把内存撑爆。
+        config.max_request_bytes = (settings.gateway_max_request_mib as usize) * 1024 * 1024;
+        config.max_request_bytes = config
+            .max_request_bytes
+            .clamp(1, crate::gateway::MAX_REQUEST_BYTES_LIMIT);
         if settings.gateway_multi_site {
             let (route, keys) = self.build_gateway_route()?;
             config.route = route;
@@ -5776,6 +5782,14 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             events,
             registered,
         })
+    }
+
+    /// 记录一条事件（M42-S1）：给**命令层**用的公开入口（网关降级这类「命令上下文」的
+    /// 运维事件由 `commands.rs` 产生，而内部 `log` 是私有的）。
+    ///
+    /// 与 [`Self::log`] 同义：写失败只打印，不向上传播。
+    pub fn record_event(&self, event: Event) {
+        self.log(event);
     }
 
     /// 写事件。**故意不向上传播失败**：可观测性坏掉不该让业务操作失败。

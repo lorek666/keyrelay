@@ -159,6 +159,8 @@ fn base_config(
         on_usage: None,
         upstream_proxy: None,
         legacy_key_ref: None,
+        // M42-S1：请求体上限（既有用例用默认 16 MiB）
+        max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
         // M39-S3：单候选 + 默认 guard（快照测试与负载均衡无关）
         lb_top_n: 1,
         guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),

@@ -35,7 +35,8 @@ fn v3_database_gets_alias_table_and_keeps_rows() {
     // open 触发 migrate：补建 model_aliases + 升版本到 4。
     let store = Store::open(&path).expect("open v3");
     // M39-S1：schema 6 → 7（新增 site_model_catalog / site_model_sync）。
-    assert_eq!(store.schema_version().unwrap(), 7, "迁移到 v7");
+    // M40-S1 把 SCHEMA_VERSION 升到 8（用量账本六字段）；本测试只关心「版本被升到当前值」。
+    assert_eq!(store.schema_version().unwrap(), 8, "迁移到 v8");
     // 老数据零丢失
     let sites = store.list_sites().expect("list_sites");
     assert_eq!(sites.len(), 1, "老数据零丢失");
@@ -49,7 +50,7 @@ fn v3_database_gets_alias_table_and_keeps_rows() {
     // 二次 open 幂等：不报 duplicate / 不丢数据
     drop(store);
     let again = Store::open(&path).expect("二次 open");
-    assert_eq!(again.schema_version().unwrap(), 7, "M39-S1：v7");
+    assert_eq!(again.schema_version().unwrap(), 8, "M40-S1：v8");
     assert_eq!(again.list_sites().unwrap().len(), 1);
 }
 
