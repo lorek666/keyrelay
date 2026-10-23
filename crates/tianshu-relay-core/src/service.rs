@@ -4624,6 +4624,39 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             .collect())
     }
 
+    /// M41-S2 复审 P1：读取当前网关令牌明文，**不**构造 `GatewayConfig`。
+    ///
+    /// 宽限轮换不需要重启网关，因此不能调用 `gateway_config`——后者会自增会话代号、
+    /// 替换运行时快照并把 `on_usage`/`on_failure` 绑到新会话，运行中的旧网关会因此
+    /// 静默丢掉之后的用量与失败事件。
+    pub fn gateway_token_plaintext(&self) -> Result<zeroize::Zeroizing<String>> {
+        let (token, persistent) = self.gateway_token();
+        self.gateway_token_persistent
+            .store(persistent, std::sync::atomic::Ordering::SeqCst);
+        Ok(token)
+    }
+
+    /// M41-S2 复审 P1：只校验「这个站/key 还能不能作为网关目标」，无副作用。
+    ///
+    /// 与 `gateway_config` 的前半段同判据，但不建 route、不碰 `gateway_runtime`、
+    /// 不自增 `gateway_session`；用于令牌轮换的前置校验。
+    pub fn validate_gateway_target(&self, site_id: i64, key_id: i64) -> Result<()> {
+        let _site = self.site(site_id)?;
+        let row = self
+            .store
+            .get_key(key_id)?
+            .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
+        if row.site_id != site_id {
+            return Err(Error::Store(format!(
+                "密钥 #{key_id} 不属于站点 #{site_id}"
+            )));
+        }
+        ensure_not_revoked(&row)?;
+        // 走咽喉点，顺带验证钥匙串里确实有可用明文；返回值立即丢弃。
+        let _ = self.key_secret(key_id)?;
+        Ok(())
+    }
+
     pub fn gateway_config(
         &self,
         site_id: i64,
