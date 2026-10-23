@@ -321,6 +321,8 @@ export type Settings = {
   gatewayEnabled: boolean;
   /** 网关端口（只绑 127.0.0.1） */
   gatewayPort: number;
+  /** M42-S1：网关**请求体**上限（MiB，1–64；默认 16）。 */
+  gatewayMaxRequestMib: number;
   /** M41-S1：应用启动时自动启动网关（默认 false）。 */
   gatewayAutoStart: boolean;
   /** M41-S1：「上次成功运行」的站点行号（0 = 无；auto-start 的首选组）。 */
@@ -437,6 +439,12 @@ export type GatewayStatus = {
    * 这是**降级**，必须显示出来——不说的话用户会以为「换站零改动」成立了，直到 agent 开始 401。
    */
   tokenPersistent: boolean;
+  /** M42-S1：实际监听的地址（如 `["127.0.0.1:8787", "[::1]:8787"]`）；没在跑时为空。 */
+  listenAddrs?: string[];
+  /** M42-S1：IPv6 回环是否降级（`true` = 只在 127.0.0.1 上听）。 */
+  ipv6Degraded?: boolean;
+  /** M42-S1：降级原因（未降级为 null）。 */
+  ipv6Note?: string | null;
 };
 
 /** 一次回收（站点侧删除）的回报（B-100）。 */
@@ -1564,6 +1572,7 @@ let mockSettings: Settings = {
   driftCheckOnStart: true,
   gatewayEnabled: false,
   gatewayPort: 8787,
+  gatewayMaxRequestMib: 16,
   gatewayAutoStart: false,
   gatewayLastSiteId: 0,
   gatewayLastKeyId: 0,

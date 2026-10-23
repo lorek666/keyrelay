@@ -10,6 +10,9 @@ rust-version.workspace = true
 aes-gcm = "0.11.1"
 async-trait = "0.1.92"
 axum = "0.8.9"
+# M42-S1：413 判定要 downcast `LengthLimitError`；它早就在 Cargo.lock 里（axum 的传递依赖），
+# 这里只是让它变成可直接引用的类型（不新增任何 crate 下载）。
+http-body-util = "0.1.5"
 base64 = "0.23.1"
 bytes = "1.12.1"
 futures-util = "0.3.34"

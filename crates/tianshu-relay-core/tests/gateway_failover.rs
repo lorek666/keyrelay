@@ -205,6 +205,8 @@ async fn start_routed_full(
         })),
         upstream_proxy: None,
         legacy_key_ref: None,
+        // M42-S1：请求体上限（既有用例用默认 16 MiB）
+        max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
         // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
         lb_top_n: 1,
         guard_policy: guard,
@@ -288,6 +290,8 @@ async fn route_and_keys_by_ref_must_agree() {
             on_usage: None,
             upstream_proxy: None,
             legacy_key_ref: None,
+            // M42-S1：请求体上限（既有用例用默认 16 MiB）
+            max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
             // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
             lb_top_n: 1,
             guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
@@ -792,6 +796,8 @@ async fn failure_event_scrubs_a_key_shaped_model() {
             on_usage: None,
             upstream_proxy: None,
             legacy_key_ref: None,
+            // M42-S1：请求体上限（既有用例用默认 16 MiB）
+            max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
             // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
             lb_top_n: 1,
             guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
@@ -1056,6 +1062,8 @@ async fn a_missing_plaintext_is_refused_at_startup() {
         on_usage: None,
         upstream_proxy: None,
         legacy_key_ref: None,
+        // M42-S1：请求体上限（既有用例用默认 16 MiB）
+        max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
         // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
         lb_top_n: 1,
         guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
