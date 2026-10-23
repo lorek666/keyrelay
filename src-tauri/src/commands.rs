@@ -485,6 +485,7 @@ pub struct GatewayStatusDto {
     failovers_total: u64,
     last_error: Option<String>,
     generation: u64,
+    tokens: Vec<GatewayTokenDto>,
 }
 
 #[derive(Serialize)]
@@ -1570,6 +1571,8 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
     // 被报成「临时令牌」——那才是真的在说假话。
     let token_persistent = state.service.gateway_token_persistent();
     // M40-S2：未运行 ⇒ `mode="stopped"`，其余字段是**结构性空值**（UI 不显示它们）
+
+    let tokens = gateway_token_dtos(state);
     let stopped = GatewayStatusDto {
         running: false,
         phase: "stopped".to_string(),
@@ -1591,6 +1594,8 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
         failovers_total: 0,
         last_error: None,
         generation: 0,
+
+        tokens: tokens.clone(),
     };
     let Ok(guard) = state.gateway.lock() else {
         return stopped;
@@ -1665,6 +1670,8 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             failovers_total: m.failovers_total,
             last_error,
             generation: run.handle.generation(),
+
+            tokens,
         }
     } else {
         // M41-S1：已死的句柄**绝不**报 running（url/token/site 一并清空，避免 UI 展示假地址）。
@@ -1690,6 +1697,8 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             failovers_total: 0,
             last_error: None,
             generation: 0,
+
+            tokens,
         }
     }
 }
@@ -1909,6 +1918,12 @@ pub(crate) async fn start_gateway_locked(
                 format!("网关 IPv6 回环未监听，仅监听 127.0.0.1：{reason}"),
                 serde_json::json!({ "port": handle.addr.port(), "kind": kind }),
             ));
+    }
+
+    // M43-S1：把库里的有效令牌播种进运行态集合（空 ⇒ legacy 回退）。
+    match state.service.gateway_tokens_for_registry() {
+        Ok(tokens) => handle.set_tokens(tokens),
+        Err(err) => eprintln!("[tianshu-relay] 读取网关令牌集合失败（回退 legacy 单令牌）: {err}"),
     }
     if let Ok(mut guard) = state.gateway.lock() {
         *guard = Some(GatewayRunning {
@@ -3286,6 +3301,174 @@ pub fn vault_migration_abandon(
     tianshu_relay_core::vault::abandon_migration(&vault).map_err(|e| e.to_string())?;
     let status = tianshu_relay_core::vault::status_for(&vault).map_err(|e| e.to_string())?;
     Ok(migration_status_dto(status))
+}
+
+// ============================================================== Agent 网关令牌（M43-S1）
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedGatewayTokenDto {
+    id: i64,
+    label: String,
+    /// 明文**只在这里出现一次**；库/日志/事件/导出都没有它。
+    token: String,
+    created_at: i64,
+}
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayTokenDto {
+    id: i64,
+    label: String,
+    created_at: i64,
+    revoked_at: Option<i64>,
+    last_used_at: Option<i64>,
+    active: bool,
+    is_default: bool,
+}
+
+fn gateway_token_dto(row: &tianshu_relay_core::store::GatewayTokenRow) -> GatewayTokenDto {
+    GatewayTokenDto {
+        id: row.id,
+        label: row.label.clone(),
+        created_at: row.created_at,
+        revoked_at: row.revoked_at,
+        last_used_at: row.last_used_at,
+        active: row.active(),
+        is_default: row.is_default,
+    }
+}
+
+fn gateway_token_dtos(state: &AppState) -> Vec<GatewayTokenDto> {
+    state
+        .service
+        .store()
+        .list_gateway_tokens()
+        .map(|rows| rows.iter().map(gateway_token_dto).collect())
+        .unwrap_or_default()
+}
+
+/// 标签校验（§6）：空 / 超长 / 重名（非吊销内） / 令牌形态，四条都要挡。
+fn validate_gateway_label(state: &AppState, label: &str) -> Result<String, String> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return Err("令牌标签不能为空：它决定用量归因到哪个 agent".to_string());
+    }
+    if trimmed.chars().count() > 64 {
+        return Err("令牌标签最多 64 个字符".to_string());
+    }
+    let lower = trimmed.to_lowercase();
+    let looks_like_token = lower.starts_with("kr-gw-")
+        || lower.starts_with("sk-")
+        || trimmed
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .any(|part| part.len() >= 32);
+    if looks_like_token {
+        return Err("标签不能包含令牌/密钥形态的字符串".to_string());
+    }
+    let existing = state
+        .service
+        .store()
+        .list_gateway_tokens()
+        .map_err(|e| e.to_string())?;
+    if existing
+        .iter()
+        .any(|row| row.active() && row.label == trimmed)
+    {
+        return Err(format!(
+            "已有同名令牌「{trimmed}」；请换一个名字（归因按标签聚合，重名会混账）"
+        ));
+    }
+    Ok(tianshu_relay_core::redact::scrub(trimmed))
+}
+
+/// 创建 Agent 令牌：明文**只返回一次**；库只存 hash。
+#[tauri::command]
+pub fn gateway_token_create(
+    state: State<'_, AppState>,
+    label: String,
+) -> Result<CreatedGatewayTokenDto, String> {
+    let label = validate_gateway_label(&state, &label)?;
+    let token = tianshu_relay_core::gateway::generate_token();
+    let hash = tianshu_relay_core::gateway::sha256_hex(&token);
+    let id = state
+        .service
+        .store()
+        .insert_gateway_token(&hash, &label, false)
+        .map_err(|e| e.to_string())?;
+    // 网关在跑 ⇒ 推进运行态集合（不重启网关、下一请求立即生效）。
+    if let Ok(guard) = state.gateway.lock() {
+        if let Some(run) = guard.as_ref() {
+            if let Ok(mut tokens) = run.handle.token_registry().write() {
+                tokens.push(tianshu_relay_core::gateway::GatewayTokenEntry {
+                    id,
+                    token_hash: hash,
+                    label: label.clone(),
+                    grace_until: None,
+                });
+            }
+        }
+    }
+    let row = state
+        .service
+        .store()
+        .gateway_token_by_id(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "令牌刚写入却读不到".to_string())?;
+    Ok(CreatedGatewayTokenDto {
+        id: row.id,
+        label: row.label,
+        token,
+        created_at: row.created_at,
+    })
+}
+
+/// 列表（**永不含明文**）。
+#[tauri::command]
+pub fn gateway_token_list(state: State<'_, AppState>) -> Result<Vec<GatewayTokenDto>, String> {
+    let rows = state
+        .service
+        .store()
+        .list_gateway_tokens()
+        .map_err(|e| e.to_string())?;
+    Ok(rows.iter().map(gateway_token_dto).collect())
+}
+
+/// 吊销（幂等）。**默认行不可吊销**（M43-S1 T4e）：要换它请用轮换。
+#[tauri::command]
+pub fn gateway_token_revoke(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<GatewayTokenDto, String> {
+    let row = state
+        .service
+        .store()
+        .gateway_token_by_id(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("找不到令牌 #{id}"))?;
+    if row.is_default {
+        return Err("默认令牌不能吊销；要换它请用令牌轮换（M41-S2）".to_string());
+    }
+    state
+        .service
+        .store()
+        .revoke_gateway_token(id)
+        .map_err(|e| e.to_string())?;
+    // 运行态集合移除 ⇒ 下一请求立即 401（不重启网关）。
+    if let Ok(guard) = state.gateway.lock() {
+        if let Some(run) = guard.as_ref() {
+            if let Ok(mut tokens) = run.handle.token_registry().write() {
+                tokens.retain(|entry| entry.id != id);
+            }
+        }
+    }
+    let row = state
+        .service
+        .store()
+        .gateway_token_by_id(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("找不到令牌 #{id}"))?;
+    Ok(gateway_token_dto(&row))
 }
 
 // ============================================================== 自动人机验证（M36-S1）

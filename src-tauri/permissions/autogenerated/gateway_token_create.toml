@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gateway-token-create"
+description = "Enables the gateway_token_create command without any pre-configured scope."
+commands.allow = ["gateway_token_create"]
+
+[[permission]]
+identifier = "deny-gateway-token-create"
+description = "Denies the gateway_token_create command without any pre-configured scope."
+commands.deny = ["gateway_token_create"]

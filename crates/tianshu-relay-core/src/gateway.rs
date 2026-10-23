@@ -241,6 +241,9 @@ pub(crate) struct UsageCapture {
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
     site_id: i64,
     key_id: Option<i64>,
+    /// M43-S1：认证身份（`None`/空 = legacy 单令牌，未归因）。
+    token_id: Option<i64>,
+    agent_label: String,
     model: String,
     status: u16,
     latency_ms: u64,
@@ -278,6 +281,8 @@ impl UsageCapture {
             now,
             site_id,
             key_id,
+            token_id: None,
+            agent_label: String::new(),
             model,
             status,
             latency_ms,
@@ -290,6 +295,13 @@ impl UsageCapture {
             body: Vec::new(),
             emitted: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// M43-S1：把认证身份挂到这次请求的用量上（`None` = legacy，未归因）。
+    pub(crate) fn with_identity(mut self, token_id: Option<i64>, agent_label: String) -> Self {
+        self.token_id = token_id;
+        self.agent_label = agent_label;
+        self
     }
 
     /// 每收到一个 chunk 调用一次：SSE 走行缓冲；非流式追加到 body。
@@ -365,6 +377,8 @@ impl UsageCapture {
                 latency_ms: self.latency_ms,
                 attempts: self.attempts,
                 stream: self.stream,
+                token_id: self.token_id,
+                agent_label: self.agent_label.clone(),
             });
         }
     }
@@ -458,6 +472,56 @@ where
             }
         },
     )
+}
+
+/// M43-S1：认证集合里的一条（**只有 id 与 hash，装不下明文**）。
+///
+/// `grace_until` 是 M41-S2 的宽限期（运行态，不落库）：`None` = 立即失效。
+/// `label` 是认证当时要带进用量归因的**快照**（每请求不再查库）。
+#[derive(Clone, PartialEq, Eq)]
+pub struct GatewayTokenEntry {
+    pub id: i64,
+    /// SHA-256(明文令牌) 的 64 位 hex（小写）。**明文永不入库**。
+    pub token_hash: String,
+    /// 归因标签快照（用户输入；展示前过 scrub）。
+    pub label: String,
+    /// M41-S2：宽限截止（运行态，不落库）。
+    pub grace_until: Option<std::time::Instant>,
+}
+
+impl std::fmt::Debug for GatewayTokenEntry {
+    /// 不打印 hash（它是凭据的等价物）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayTokenEntry")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("grace_until", &self.grace_until)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 认证结果：只有 id 与标签，**没有明文**。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthIdentity {
+    /// `None` = 走的是 legacy 单令牌（未迁移 / 迁移未完成）。
+    pub token_id: Option<i64>,
+    /// 运行时从库里取（认证成功那一刻的快照）。
+    pub label: Option<String>,
+}
+
+/// SHA-256(明文) 的 64 位小写 hex。令牌是**高熵随机串**，不需要慢哈希/加盐
+/// （M43-S1 §4.1 的显式裁决：抗离线爆破的代价不该落在每请求的热路径上）。
+pub fn sha256_hex(plaintext: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(plaintext.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -631,6 +695,10 @@ pub struct GatewayUsage {
     pub attempts: u32,
     /// 响应是否为 SSE。
     pub stream: bool,
+    /// M43-S1：命中的令牌行 id；`None` = 走 legacy 单令牌（未迁移 / 迁移未完成）。
+    pub token_id: Option<i64>,
+    /// M43-S1：认证当时的 label 快照（`''` = 未归因）。
+    pub agent_label: String,
 }
 
 /// 一次「因可切换状态而放弃当前上游」的元数据。
@@ -1117,6 +1185,9 @@ pub struct GatewayHandle {
     /// M40-S2：legacy 单上游的站点/密钥 id（`route` 为空时作为唯一候选）。
     legacy_site_id: i64,
     legacy_key_id: Option<i64>,
+
+    /// M43-S1：认证集合的运行态句柄（与网关内部 `AppState` 共用同一份）。
+    tokens: Arc<std::sync::RwLock<Vec<GatewayTokenEntry>>>,
 }
 
 impl std::fmt::Debug for GatewayHandle {
@@ -1205,7 +1276,19 @@ impl GatewayHandle {
         self.exit.lock().ok().and_then(|slot| *slot)
     }
 
-    /// 仅测试用：`shutdown_and_wait(self)` 会消费句柄，测试需要先克隆一份结束记录槽，
+    /// M43-S1：认证集合的运行态句柄——创建/吊销令牌**不重启网关**就生效。
+    pub fn token_registry(&self) -> Arc<std::sync::RwLock<Vec<GatewayTokenEntry>>> {
+        Arc::clone(&self.tokens)
+    }
+
+    /// M43-S1：把库里读出的集合播种进运行态（`start()` 之后由服务层调用）。
+    pub fn set_tokens(&self, entries: Vec<GatewayTokenEntry>) {
+        if let Ok(mut guard) = self.tokens.write() {
+            *guard = entries;
+        }
+    }
+
+    /// 仅测试用：`shutdown_and_wait(self)` 会消费 token_registry 的克隆用于断言，
     /// 才能在停止之后断言 `last_exit`。
     #[cfg(test)]
     pub(crate) fn exit_slot(&self) -> Arc<std::sync::Mutex<Option<GatewayExit>>> {
@@ -1413,6 +1496,10 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
     let runtime_for_handle = config.runtime.clone();
     let route_for_handle = config.route.clone();
     let initial_route_is_empty = config.route.is_empty();
+
+    // M43-S1：认证集合的共享句柄（handle 与 AppState 共用同一份）。
+    let tokens: Arc<std::sync::RwLock<Vec<GatewayTokenEntry>>> =
+        Arc::new(std::sync::RwLock::new(Vec::new()));
     let state = AppState {
         metrics: Arc::clone(&metrics),
         breaker: Arc::clone(&breaker),
@@ -1422,6 +1509,9 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
         config: config.clone(),
         upstream,
         stopping: Arc::clone(&stopping),
+        // M43-S1：认证集合的运行态副本（创建/吊销**立即生效**，不重启网关）。
+        // `start()` 从空集合起步（legacy 回退）；服务层随后用 `handle.set_tokens()` 播种。
+        tokens: Arc::clone(&tokens),
     };
     let app = Router::new()
         .route("/health", any(health))
@@ -1544,6 +1634,8 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
         route: route_for_handle,
         legacy_site_id: config.site_id,
         legacy_key_id: config.key_id,
+
+        tokens,
     })
 }
 
@@ -1552,6 +1644,9 @@ struct AppState {
     /// M40-S2：内存指标（与 `GatewayHandle` 共享同一个 Arc）。
     metrics: Arc<GatewayMetrics>,
     config: GatewayConfig,
+    /// M43-S1：运行态认证集合。`tokens` 非空 ⇒ 只认集合（hash + 常量时间 + grace）；
+    /// 空 ⇒ 回退 `config.token`（legacy 单令牌，行为与今天逐字相同）。
+    tokens: Arc<std::sync::RwLock<Vec<GatewayTokenEntry>>>,
     upstream: reqwest::Client,
     /// M39-S3 §4.1：加权轮转计数器（跨请求共享；单候选时不读）。
     round_robin: Arc<Mutex<RoundRobinState>>,
@@ -1707,13 +1802,57 @@ fn is_stopping(state: &AppState) -> bool {
     state.stopping.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// M43-S1：认证入口——`/health` 与 `/proxy` **共用**（T3b）。
+///
+/// 顺序（逐字，见 spec §4.3）：
+/// 1. 取 presented token（两种头 + 旧版头，trim + scheme 大小写不敏感）；取不到 ⇒ None；
+/// 2. 与**运行态集合**逐条 `constant_time_eq`（**不早退**——不泄露命中的是第几条）；
+///    `grace_until` 已过 ⇒ 该条不参与匹配；
+/// 3. 集合为空 ⇒ 与 `config.token` 常量时间比较（legacy 回退，行为与今天逐字相同）；
+/// 4. 其余 ⇒ None（401）。
+fn authenticate(headers: &HeaderMap, state: &AppState) -> Option<AuthIdentity> {
+    let presented = presented_token(headers)?;
+    let presented_hash = sha256_hex(&presented);
+    let entries = match state.tokens.read() {
+        Ok(guard) => guard.clone(),
+        Err(_) => {
+            // 读锁中毒 ⇒ fail-closed（不放行），不 panic。
+            return None;
+        }
+    };
+    if !entries.is_empty() {
+        let now = std::time::Instant::now();
+        let mut matched: Option<AuthIdentity> = None;
+        for entry in &entries {
+            if let Some(deadline) = entry.grace_until {
+                if now > deadline {
+                    continue; // 宽限到期：等价于已失效
+                }
+            }
+            if constant_time_eq(Some(presented_hash.as_str()), &entry.token_hash) {
+                matched = Some(AuthIdentity {
+                    token_id: Some(entry.id),
+                    label: Some(entry.label.clone()),
+                });
+            }
+            // **不早退**：走完整个集合（响应时间不泄露「命中的是第几条」）。
+        }
+        return matched;
+    }
+    // 集合为空 ⇒ legacy 单令牌回退。
+    if constant_time_eq(Some(presented.as_str()), state.config.token.as_str()) {
+        Some(AuthIdentity {
+            token_id: None,
+            label: None,
+        })
+    } else {
+        None
+    }
+}
+
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    // P3-6 / 复审 F1：与 `proxy` 同口径走 `constant_time_eq`——health 同样长期有效，
-    // 同样可被计时侧信道探测令牌前缀，不该用 `!=` 提前返回。
-    if !constant_time_eq(
-        presented_token(&headers).as_deref(),
-        state.config.token.as_str(),
-    ) {
+    // M43-S1：与 `proxy` 共用 `authenticate()`（同一口径，T3b 钉住）。
+    if authenticate(&headers, &state).is_none() {
         return unauthorized("缺少或错误的本地令牌");
     }
     axum::Json(serde_json::json!({
@@ -1757,13 +1896,10 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
 }
 
 async fn proxy_inner(State(state): State<AppState>, request: Request) -> Response {
-    // ① 令牌校验：不通过就**不转发**
-    if !constant_time_eq(
-        presented_token(request.headers()).as_deref(),
-        state.config.token.as_str(),
-    ) {
+    // ① 令牌校验：不通过就**不转发**。M43-S1：与 `/health` 共用 `authenticate()`。
+    let Some(identity) = authenticate(request.headers(), &state) else {
         return unauthorized("缺少或错误的本地令牌");
-    }
+    };
 
     let path = request.uri().path().to_string();
     let query = request
@@ -1887,7 +2023,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         }
         let url = format!("{}{}{}", state.config.base_url, path, query);
         let headers = upstream_headers(&state.config, &inbound, &state.config.api_key);
-        return forward_to(&state, method, &url, headers, body).await;
+        return forward_to(&state, method, &url, headers, body, &identity).await;
     }
 
     // ④ 路由非空：选候选（首位即首选，顺序由 `RouteTable` 保证确定）
@@ -2110,6 +2246,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                         latency_ms,
                         attempts: index as u32 + 1,
                     },
+                    &identity,
                 );
             }
             Err(failure) => {
@@ -2162,6 +2299,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
             &pending.model,
             pending.lease,
             pending.meta,
+            &identity,
         );
     }
 
@@ -2354,6 +2492,7 @@ async fn forward_to(
     url: &str,
     headers: HeaderMap,
     body: bytes::Bytes,
+    identity: &AuthIdentity,
 ) -> Response {
     let model = model_from_body(&body).unwrap_or_default();
     let started = Instant::now();
@@ -2377,6 +2516,7 @@ async fn forward_to(
                     latency_ms,
                     attempts: 1,
                 },
+                identity,
             )
         }
         Err(failure) => local_error(
@@ -2415,6 +2555,7 @@ fn into_upstream_response(
     model: &str,
     lease: Option<SiteLease>,
     meta: AttemptMeta,
+    identity: &AuthIdentity,
 ) -> Response {
     let status = upstream_response.status();
     let is_success = status.is_success();
@@ -2453,6 +2594,10 @@ fn into_upstream_response(
         meta.attempts,
         is_sse,
         Arc::new(unix_now_secs),
+    )
+    .with_identity(
+        identity.token_id,
+        identity.label.clone().unwrap_or_default(),
     );
     let capped = cap_stream_with_usage(
         upstream_response.bytes_stream(),
@@ -3341,6 +3486,8 @@ mod tests {
             route: RouteTable::default(),
             legacy_site_id: 0,
             legacy_key_id: None,
+
+            tokens: Arc::new(std::sync::RwLock::new(Vec::new())),
         };
         handle.shutdown_and_wait().await;
     }

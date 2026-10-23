@@ -56,6 +56,10 @@ pub const COMMANDS: &[&str] = &[
     "detect_unmanaged_targets",
     // M31-S1：Agent 安装/版本发现（只读）
     "detect_agents",
+    // M43-S1：Agent 网关令牌
+    "gateway_token_create",
+    "gateway_token_list",
+    "gateway_token_revoke",
     // M38-S2：钥匙串迁移（状态 / 显式重试 / 放弃）
     "vault_migration_status",
     "vault_migration_retry",
