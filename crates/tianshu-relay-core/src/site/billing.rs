@@ -519,6 +519,20 @@ mod tests {
         let body = format!(
             r#"{{"success":true,"data":[{{"created_at":1700000000,"quota":500000,"prompt":"{canary}","response":"{canary}","payload":{{"text":"{canary}"}}}}],"total":1}}"#
         );
+        // B-224 长尾 canary 先命中证明（与 M43-S1 T7 同标准）：先证明
+        // 「Debug 拼串 + contains」这套扫描器在行里真有 canary 时能命中，
+        // 否则下面的零命中可能是扫描器空转。RawBill 只有 day/amount/
+        // requests 三个字段——把 canary 放进 day 字段即可证明扫描路径。
+        let probe = vec![RawBill {
+            day: canary.to_string(),
+            amount: None,
+            requests: None,
+        }];
+        assert!(
+            format!("{probe:?}").contains(canary),
+            "扫描器必须能命中故意放进 sink 行的 canary，否则零命中是空转"
+        );
+
         let transport = MockTransport::new(vec![HttpResponse::new(200, body.as_str())]);
         let mut rows: Vec<RawBill> = Vec::new();
         let out = import_site_bills(&transport, &site(), &session(), None, None, &mut |b| {

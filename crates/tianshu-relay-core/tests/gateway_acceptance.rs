@@ -420,13 +420,16 @@ async fn m44_c5_breaker_opens_per_site_and_model() {
     h.shutdown_and_wait().await;
 }
 
-/// C6：每站并发上限（默认 8）——32 并发时每站上游实测峰值 ≤ 8。
+/// C6：每站并发上限（默认 8）——32 并发时每站上游实测峰值 == 8。
 ///
 /// B-224 P3 修复：此前本用例只断言 `ok > 0`，并发上限等于没被守住。
 /// 现在假上游本身按连接记并发峰值（每连接一线程 + 200ms 延迟，保证
 /// 32 个请求在同一窗口内重叠）：上限若被打破，峰值会冲到 16 左右；
-/// 若测试本身没压出并发（调度问题），`peak >= 4` 的下限会让它显形，
+/// 若测试本身没压出并发（调度问题），`peak == 8` 的精确断言会让它显形，
 /// 而不是在串行执行下悄悄变绿。
+/// B-224 长尾：补齐 spec §7 C6 的三条判据——峰值 == 8（不是 ≤ 8 且 ≥ 4）、
+/// 被拒请求是本地 429（body `error.code == "local_rate_limited"`，即代码
+/// 注释里说的 kind 口径）、A 满后切到 B（双站峰值都到 8 即证明）。
 struct ConcurrentFake {
     port: u16,
     current: Arc<AtomicUsize>,
@@ -498,20 +501,31 @@ async fn m44_c6_per_site_concurrency_cap() {
     };
     let h = gateway::start(cfg).await.unwrap();
     let p = port_of(&h);
-    let ok = Arc::new(AtomicUsize::new(0));
+    let results = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut joins = Vec::new();
     for _ in 0..32 {
-        let ok = Arc::clone(&ok);
+        let results = Arc::clone(&results);
         joins.push(std::thread::spawn(move || {
-            if request(p, "POST", "/v1/chat/completions", Some(BODY)).0 == 200 {
-                ok.fetch_add(1, Ordering::SeqCst);
-            }
+            let (status, text) = request(p, "POST", "/v1/chat/completions", Some(BODY));
+            results.lock().unwrap().push((status, text));
         }));
     }
     for j in joins {
         j.join().unwrap();
     }
-    assert!(ok.load(Ordering::SeqCst) > 0, "至少要有成功的");
+    let results = results.lock().unwrap();
+    let ok = results.iter().filter(|(s, _)| *s == 200).count();
+    assert!(ok > 0, "至少要有成功的");
+    // 被拒的必须是本地 429（不是上游 429）：body error.code 为 local_rate_limited。
+    let local_429 = results
+        .iter()
+        .filter(|(s, text)| *s == 429 && text.contains(r#""code":"local_rate_limited""#))
+        .count();
+    assert!(
+        local_429 > 0,
+        "32 并发、双站各 8 上限 ⇒ 必然有请求在双站都满时被本地拒掉（429 local_rate_limited），实测各状态：{:?}",
+        results.iter().map(|(s, _)| s).collect::<Vec<_>>()
+    );
     assert_eq!(
         a.current.load(Ordering::SeqCst),
         0,
@@ -524,11 +538,10 @@ async fn m44_c6_per_site_concurrency_cap() {
     );
     let peak_a = a.peak.load(Ordering::SeqCst);
     let peak_b = b.peak.load(Ordering::SeqCst);
-    assert!(peak_a <= 8, "A 站并发峰值不得超过上限 8，实测 {peak_a}");
-    assert!(peak_b <= 8, "B 站并发峰值不得超过上限 8，实测 {peak_b}");
-    assert!(
-        peak_a.max(peak_b) >= 4,
-        "峰值下限：测试必须真的压出并发（A {peak_a} / B {peak_b}），否则上限没被真正检验"
+    assert_eq!(peak_a, 8, "A 站并发峰值必须压满上限 8，实测 {peak_a}");
+    assert_eq!(
+        peak_b, 8,
+        "B 站并发峰值必须压满上限 8（A 满后切到 B 的证明），实测 {peak_b}"
     );
     h.shutdown_and_wait().await;
 }

@@ -80,8 +80,12 @@ fn gemini_stream_closes_without_done_marker() {
     let frames = t.on_event(&ev);
     assert_eq!(frames.len(), 1);
     assert!(frames[0].contains("\"text\":\"你\""));
-    // Gemini **没有 [DONE]**：收尾不额外发帧
-    assert!(t.finish().is_empty(), "Gemini 不该发 [DONE] 或额外结束帧");
+    // B-224 长尾：Gemini 仍没有 [DONE]，但收尾要补一帧显式 finishReason
+    // （此前无工具调用时 finish 零帧，客户端只能靠流关闭猜结束）。
+    let fin = t.finish();
+    assert_eq!(fin.len(), 1, "应补一帧结束帧: {fin:?}");
+    assert!(fin[0].contains("\"finishReason\":\"STOP\""), "{fin:?}");
+    assert!(t.finish().is_empty(), "收尾必须恰好一次");
 }
 
 // ---------------------------------------------------------------- T5 三协议增量
@@ -237,6 +241,136 @@ fn two_tool_calls_across_multiple_deltas_start_once_each() {
         "args 必须累积完整: {v}"
     );
     assert_eq!(parts[1]["functionCall"]["args"]["b"], 2, "{v}");
+}
+
+// ---------------------------------------------------------------- B-224 长尾：三协议收尾帧形状
+
+fn sse_event(data: &str) -> tianshu_relay_core::gateway::translate::stream::SseEvent {
+    tianshu_relay_core::gateway::translate::stream::SseEvent {
+        event: None,
+        data: data.to_string(),
+    }
+}
+
+/// Anthropic：message_start 带 id/model，收尾先 message_delta（stop_reason + usage）再 message_stop。
+#[test]
+fn anthropic_finish_emits_message_delta_with_stop_reason_and_usage() {
+    let mut t = StreamTranslator::new(Protocol::AnthropicMessages);
+    let first = t.on_event(&sse_event(
+        r#"{"id":"msg-1","model":"m1","choices":[{"delta":{"content":"好"}}]}"#,
+    ));
+    let start = first.iter().find(|f| f.contains("message_start")).unwrap();
+    assert!(start.contains("\"id\":\"msg-1\""), "{start}");
+    assert!(start.contains("\"model\":\"m1\""), "{start}");
+    let _ = t.on_event(&sse_event(
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#,
+    ));
+    let fin = t.finish();
+    let delta_pos = fin
+        .iter()
+        .position(|f| f.contains("message_delta"))
+        .unwrap();
+    let stop_pos = fin.iter().position(|f| f.contains("message_stop")).unwrap();
+    assert!(
+        delta_pos < stop_pos,
+        "message_delta 必须在 message_stop 之前: {fin:?}"
+    );
+    let delta = &fin[delta_pos];
+    assert!(delta.contains("\"stop_reason\":\"end_turn\""), "{delta}");
+    assert!(delta.contains("\"input_tokens\":5"), "{delta}");
+    assert!(delta.contains("\"output_tokens\":2"), "{delta}");
+}
+
+/// Anthropic：length ⇒ max_tokens；无 usage 时 message_delta 不带 usage（不编数字）。
+#[test]
+fn anthropic_length_maps_to_max_tokens_and_no_usage_when_unseen() {
+    let mut t = StreamTranslator::new(Protocol::AnthropicMessages);
+    let _ = t.on_event(&sse_event(
+        r#"{"choices":[{"delta":{"content":"x"},"finish_reason":"length"}]}"#,
+    ));
+    let fin = t.finish();
+    let delta = fin.iter().find(|f| f.contains("message_delta")).unwrap();
+    assert!(delta.contains("\"stop_reason\":\"max_tokens\""), "{delta}");
+    assert!(
+        !delta.contains("input_tokens"),
+        "没见过 usage 就不带 usage: {delta}"
+    );
+}
+
+/// Responses：created/completed 带 response 对象（含 id/model/status/usage），item 带 id。
+#[test]
+fn responses_frames_carry_response_object_and_item_id() {
+    let mut t = StreamTranslator::new(Protocol::OpenAiResponses);
+    let first = t.on_event(&sse_event(
+        r#"{"id":"resp-1","model":"m1","choices":[{"delta":{"content":"好"}}]}"#,
+    ));
+    let created = first
+        .iter()
+        .find(|f| f.contains("response.created"))
+        .unwrap();
+    assert!(created.contains("\"id\":\"resp-1\""), "{created}");
+    assert!(created.contains("\"status\":\"in_progress\""), "{created}");
+    let _ = t.on_event(&sse_event(
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"f1","arguments":"{}"}}]}}]}"#,
+    ));
+    let fin = t.finish();
+    let completed = fin
+        .iter()
+        .find(|f| f.contains("response.completed"))
+        .unwrap();
+    assert!(
+        completed.contains("\"status\":\"completed\""),
+        "{completed}"
+    );
+    // item 的 id 与 call_id 一致（SDK 的 function_call item 要求 id 字段）
+    let mut t2 = StreamTranslator::new(Protocol::OpenAiResponses);
+    let f2 = t2.on_event(&sse_event(
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c9","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+    ));
+    let added = f2
+        .iter()
+        .find(|f| f.contains("response.output_item.added"))
+        .unwrap();
+    assert!(added.contains("\"id\":\"c9\""), "{added}");
+    assert!(added.contains("\"call_id\":\"c9\""), "{added}");
+}
+
+/// Gemini：带 finish_reason 的增量帧带 finishReason；已发过则 finish 不再补帧。
+#[test]
+fn gemini_finish_reason_is_rendered_and_finish_stays_idempotent() {
+    let mut t = StreamTranslator::new(Protocol::GeminiGenerateContent);
+    let frames = t.on_event(&sse_event(
+        r#"{"choices":[{"delta":{"content":"好"},"finish_reason":"stop"}]}"#,
+    ));
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.contains("\"finishReason\":\"STOP\"")),
+        "{frames:?}"
+    );
+    assert!(
+        t.finish().is_empty(),
+        "finishReason 已发过，finish 不再补帧"
+    );
+    // 无 finish_reason 的流：finish 补 STOP 结束帧
+    let mut t2 = StreamTranslator::new(Protocol::GeminiGenerateContent);
+    let _ = t2.on_event(&sse_event(r#"{"choices":[{"delta":{"content":"好"}}]}"#));
+    let fin = t2.finish();
+    assert!(
+        fin.iter().any(|f| f.contains("\"finishReason\":\"STOP\"")),
+        "{fin:?}"
+    );
+    // length ⇒ MAX_TOKENS
+    let mut t3 = StreamTranslator::new(Protocol::GeminiGenerateContent);
+    let frames = t3.on_event(&sse_event(
+        r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+    ));
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.contains("\"finishReason\":\"MAX_TOKENS\"")),
+        "纯 finish_reason 帧也要发: {frames:?}"
+    );
 }
 
 // ---------------------------------------------------------------- B-224 P2：SSE 缓冲上限

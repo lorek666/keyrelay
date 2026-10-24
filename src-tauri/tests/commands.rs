@@ -2043,6 +2043,14 @@ fn update_settings_restart_failure_reports_error_and_keeps_settings() {
 ///    `last_exit.reason == Requested`）；
 /// ② `gateway_status_of` 的实现（`alive()` 为假 ⇒ 绝不报 running）。
 /// 这里钉住的是「正常停止之后**不会**报 running，也不会谎报 crashed」。
+///
+/// **同理没有「任务真 panic ⇒ `last_exit.reason == Panicked`」用例**（B-224 长尾核查结论）：
+/// panic 接线在 core 侧是唯一的调用点——v4 主任务 `served.is_err()`（JoinHandle 的
+/// panic/cancel 信号）→ `classify_gateway_exit` → 写 `exit` 槽；`classify` 本身的四格
+/// 已由 `classify_gateway_exit_covers_all_four_cells` 全覆盖。但 serve 任务本身无法从外部
+/// 弄 panic：handler panic 只杀当条连接任务，serve 任务继续；也没有注入自定义 app 的
+/// 公共路径。因此 panic 腿由「四格纯函数 + 唯一调用点 + ①② 的生命周期测试」共同保证，
+/// 不造一个测不到该路径的假用例。
 #[test]
 fn gateway_status_never_reports_a_stopped_gateway_as_running() {
     let _serial = gateway_test_guard();
@@ -2077,6 +2085,97 @@ fn gateway_status_never_reports_a_stopped_gateway_as_running() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(released, "停止后端口 {port} 必须最终不再监听");
+}
+
+/// M41-S1 §7.3：手动成功启动 ⇒ `settings.gateway_last_site_id/key_id` 被写成这一组。
+///
+/// auto 腿由同一函数保证：应用启动的 `maybe_auto_start_gateway`（`lib.rs`）同样调
+/// `start_gateway_locked`（唯一启动出口），写 last_* 的代码不在手动/auto 间分叉；
+/// auto-start 选组本身（`auto_start_target`）已有纯函数单测。
+#[test]
+fn gateway_start_writes_last_site_and_key_into_settings() {
+    let _serial = gateway_test_guard();
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let port = free_port();
+    enable_gateway(&webview, port);
+
+    let before = read_settings(&webview);
+    assert_eq!(
+        before["gatewayLastSiteId"],
+        json!(0),
+        "初始应为 0（无）: {before}"
+    );
+    assert_eq!(before["gatewayLastKeyId"], json!(0), "{before}");
+
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    assert_eq!(started["phase"], "running", "{started}");
+
+    let saved = read_settings(&webview);
+    assert_eq!(
+        saved["gatewayLastSiteId"],
+        json!(site),
+        "手动启动后应记下站点: {saved}"
+    );
+    assert_eq!(
+        saved["gatewayLastKeyId"],
+        json!(key_id),
+        "手动启动后应记下密钥: {saved}"
+    );
+}
+
+/// M41-S1 §7.2-4（验收 3）：改**非网关**设置 ⇒ 网关不中断（端口不变、仍在跑、
+/// `last_exit` 无新记录）。
+///
+/// `gateway_transition` 是白名单：只有端口 / 多站 / 代理模式 / 代理地址才重启；
+/// 这里改一个与网关无关的字段（`driftCheckOnStart` 不在白名单内），断言网关纹丝不动。
+#[test]
+fn update_settings_non_gateway_field_leaves_the_gateway_running() {
+    let _serial = gateway_test_guard();
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let port = free_port();
+    enable_gateway(&webview, port);
+
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    assert_eq!(started["phase"], "running", "{started}");
+    assert!(connect_ok(port), "启动后端口 {port} 应可连接");
+    let url_before = started["url"].as_str().unwrap_or("").to_string();
+
+    let mut payload = read_settings(&webview);
+    let drift_before = payload["driftCheckOnStart"].as_bool().unwrap_or(false);
+    payload["driftCheckOnStart"] = json!(!drift_before);
+    let result = invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": payload}}),
+    )
+    .expect("保存设置");
+    assert_eq!(
+        result["gateway"]["phase"], "running",
+        "改非网关字段不得停网关: {result}"
+    );
+    assert_eq!(result["gateway"]["url"], url_before, "端口不得变: {result}");
+    assert!(result["gatewayError"].is_null(), "不得报错: {result}");
+    assert!(connect_ok(port), "端口 {port} 必须仍可连接");
+
+    let status = invoke_on(&webview, "gateway_status", json!({})).expect("读状态");
+    assert_eq!(status["phase"], "running", "{status}");
+    assert!(status["lastExit"].is_null(), "不得有新的结束记录: {status}");
+
+    // 设置本身确实保存了（改动生效，但网关没动）。
+    let saved = read_settings(&webview);
+    assert_eq!(saved["driftCheckOnStart"], json!(!drift_before), "{saved}");
 }
 
 // ============================================ M42-S1：网关状态 DTO 的监听字段
@@ -2255,6 +2354,34 @@ fn m43_t7_token_plaintext_never_reaches_events() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(!haystack.contains(&plaintext), "事件里不得出现令牌明文");
+    // B-224 长尾 T7 扩展：诊断导出与备份导出也要扫同一明文（零命中）。
+    // 顺序注意：必须在下面塞 canary 之前导出——备份包/诊断包会把事件表
+    // 也打进去，塞完再导会把 canary 自身扫出来。两个产物按设计本就不含
+    // 令牌明文，所以 canary 证明仍用下面的事件表塞行法——扫描器有效性
+    // 已证明，这里只要求产物零命中。
+    let exports = state.data_dir.join("exports");
+    std::fs::create_dir_all(&exports).expect("建导出目录");
+    let diag_path = exports.join("tianshu-relay-diagnostics-t7.json");
+    invoke_on(
+        &webview,
+        "export_diagnostics",
+        json!({"args": {"path": diag_path.display().to_string()}}),
+    )
+    .expect("诊断导出");
+    let diag_text = std::fs::read_to_string(&diag_path).expect("读诊断包");
+    assert!(!diag_text.contains(&plaintext), "诊断包里不得出现令牌明文");
+    let bundle_path = exports.join("tianshu-relay-bundle-t7.json");
+    invoke_on(
+        &webview,
+        "export_bundle",
+        json!({"args": {"path": bundle_path.display().to_string()}}),
+    )
+    .expect("备份导出");
+    let bundle_text = std::fs::read_to_string(&bundle_path).expect("读备份包");
+    assert!(
+        !bundle_text.contains(&plaintext),
+        "备份包里不得出现令牌明文"
+    );
     // canary（B-224 P3 修复）：此前这里是恒真式
     // `events.iter().any(|_| true) || events.is_empty()`，且「自检」只扫一个
     // 现拼的字符串——扫描器根本没碰过事件表，零命中可能是空转。
@@ -2491,6 +2618,322 @@ fn m41s2_grace_positive_and_restart_kills_the_old_token() {
         "grace>0 进行中重启后旧令牌必须 401（宽限不跨重启）"
     );
     assert_eq!(health_status(port, &current), 200, "重启后当前令牌可用");
+}
+
+/// M41-S2 T-3：二次轮换 ⇒ 第一代旧令牌**立即** 401（宽限槽只留上一代）。
+#[test]
+fn m41s2_second_rotation_revokes_the_first_generation_immediately() {
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let port = free_port();
+    enable_gateway(&webview, port);
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    let gen1 = started["token"].as_str().expect("令牌").to_string();
+
+    set_grace(&webview, 60);
+    let rotated1 =
+        invoke_on(&webview, "gateway_rotate_token", json!({"args": null})).expect("第一次轮换");
+    let gen2 = rotated1["token"].as_str().expect("令牌").to_string();
+    assert_ne!(gen1, gen2);
+    assert_eq!(
+        health_status(port, &gen1),
+        200,
+        "第一次轮换后第一代仍在宽限内"
+    );
+    assert_eq!(health_status(port, &gen2), 200);
+
+    let rotated2 =
+        invoke_on(&webview, "gateway_rotate_token", json!({"args": null})).expect("第二次轮换");
+    let gen3 = rotated2["token"].as_str().expect("令牌").to_string();
+    assert_ne!(gen2, gen3);
+    assert_eq!(
+        health_status(port, &gen1),
+        401,
+        "第二次轮换后第一代必须立即 401（宽限槽只留上一代）"
+    );
+    assert_eq!(health_status(port, &gen2), 200, "第二代进入新宽限，仍可用");
+    assert_eq!(health_status(port, &gen3), 200, "第三代立即生效");
+}
+
+/// M41-S2 T-6：轮换后旧明文在令牌表 / 事件表 / 诊断导出 / 备份导出里零命中；
+/// 钥匙串里只剩新令牌（旧明文已被覆盖，不是「新旧并存」）。
+#[test]
+fn m41s2_rotated_old_plaintext_appears_nowhere() {
+    use tauri::Manager;
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let port = free_port();
+    enable_gateway(&webview, port);
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    let old_plaintext = started["token"].as_str().expect("令牌").to_string();
+
+    set_grace(&webview, 60);
+    let rotated = invoke_on(&webview, "gateway_rotate_token", json!({"args": null})).expect("轮换");
+    let new_plaintext = rotated["token"].as_str().expect("令牌").to_string();
+    assert_ne!(old_plaintext, new_plaintext);
+
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
+    // 令牌表：只有 hash，没有任何明文。
+    let rows = state
+        .service
+        .store()
+        .list_gateway_tokens()
+        .expect("读令牌表");
+    let rows_dump = format!("{rows:?}");
+    assert!(
+        !rows_dump.contains(&old_plaintext),
+        "令牌表里不得出现旧明文"
+    );
+    // 事件表。
+    let events = state.service.store().list_events(200).expect("读事件");
+    let events_dump = events
+        .iter()
+        .map(|e| format!("{e:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !events_dump.contains(&old_plaintext),
+        "事件表里不得出现旧明文"
+    );
+    // 钥匙串当前值必须是新令牌（旧值已被覆盖）。
+    let vault_current = state.service.gateway_token_plaintext().expect("读钥匙串");
+    assert_eq!(vault_current.as_str(), new_plaintext, "钥匙串应只剩新令牌");
+    assert_ne!(vault_current.as_str(), old_plaintext);
+
+    // 诊断导出 + 备份导出（同 app 内导出，不是新 app 的空库）。
+    let exports = state.data_dir.join("exports");
+    std::fs::create_dir_all(&exports).expect("建导出目录");
+    let diag_path = exports.join("tianshu-relay-diagnostics-t6.json");
+    invoke_on(
+        &webview,
+        "export_diagnostics",
+        json!({"args": {"path": diag_path.display().to_string()}}),
+    )
+    .expect("诊断导出");
+    let diag_text = std::fs::read_to_string(&diag_path).expect("读诊断包");
+    assert!(
+        !diag_text.contains(&old_plaintext),
+        "诊断包里不得出现旧明文"
+    );
+    let bundle_path = exports.join("tianshu-relay-bundle-t6.json");
+    invoke_on(
+        &webview,
+        "export_bundle",
+        json!({"args": {"path": bundle_path.display().to_string()}}),
+    )
+    .expect("备份导出");
+    let bundle_text = std::fs::read_to_string(&bundle_path).expect("读备份包");
+    assert!(
+        !bundle_text.contains(&old_plaintext),
+        "备份包里不得出现旧明文"
+    );
+}
+
+/// M41-S2 T-7：轮换后默认行恰好一条、且未被吊销（`is_default == 1` 唯一，`revoked_at` 为空）。
+#[test]
+fn m41s2_rotation_keeps_exactly_one_unrevoked_default_row() {
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let port = free_port();
+    enable_gateway(&webview, port);
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
+    let before = state
+        .service
+        .store()
+        .default_gateway_token()
+        .expect("读默认行")
+        .expect("默认行");
+    set_grace(&webview, 60);
+    invoke_on(&webview, "gateway_rotate_token", json!({"args": null})).expect("轮换");
+
+    let rows = state
+        .service
+        .store()
+        .list_gateway_tokens()
+        .expect("读令牌表");
+    let defaults: Vec<_> = rows.iter().filter(|r| r.is_default).collect();
+    assert_eq!(defaults.len(), 1, "默认行必须恰好一条: {rows:?}");
+    assert_eq!(defaults[0].id, before.id, "默认行 id 不得变");
+    assert!(
+        defaults[0].revoked_at.is_none(),
+        "默认行不得被吊销: {:?}",
+        defaults[0]
+    );
+}
+
+/// M41-S2 T-10：宽限轮换**不重启**——地址不变、仍在跑、`last_exit` 无新记录。
+///
+/// 与 legacy 路径的 `gateway_rotate_token_restarts_the_running_gateway_with_the_new_token`
+///（重启）并存不矛盾：那条是无默认行时的 legacy 回退；有默认行时走宽限路径，不重启。
+#[test]
+fn m41s2_grace_rotation_does_not_restart_the_gateway() {
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let port = free_port();
+    enable_gateway(&webview, port);
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    let url_before = started["url"].as_str().unwrap_or("").to_string();
+    assert_eq!(started["phase"], "running");
+
+    set_grace(&webview, 60);
+    invoke_on(&webview, "gateway_rotate_token", json!({"args": null})).expect("轮换");
+
+    let status = invoke_on(&webview, "gateway_status", json!({})).expect("读状态");
+    assert_eq!(status["phase"], "running", "宽限轮换不得停网关: {status}");
+    assert_eq!(
+        status["url"], url_before,
+        "宽限轮换不得换地址（不重启）: {status}"
+    );
+    assert!(
+        status["lastExit"].is_null(),
+        "宽限轮换不得产生结束记录: {status}"
+    );
+    assert!(connect_ok(port), "端口 {port} 必须仍可连接");
+}
+
+/// M41-S2 T-14：连轮 3 次 ⇒ 默认行永不吊销；且直接吊销默认行必须被拒。
+#[test]
+fn m41s2_three_rotations_never_revoke_the_default_row() {
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let port = free_port();
+    enable_gateway(&webview, port);
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
+    let default_before = state
+        .service
+        .store()
+        .default_gateway_token()
+        .expect("读默认行")
+        .expect("默认行");
+    set_grace(&webview, 60);
+    let mut current = started["token"].as_str().expect("令牌").to_string();
+    for _ in 0..3 {
+        let rotated =
+            invoke_on(&webview, "gateway_rotate_token", json!({"args": null})).expect("轮换");
+        current = rotated["token"].as_str().expect("令牌").to_string();
+        assert_eq!(health_status(port, &current), 200, "每次轮换后新令牌都可用");
+    }
+    let rows = state
+        .service
+        .store()
+        .list_gateway_tokens()
+        .expect("读令牌表");
+    let defaults: Vec<_> = rows.iter().filter(|r| r.is_default).collect();
+    assert_eq!(defaults.len(), 1, "连轮 3 次后默认行仍恰好一条: {rows:?}");
+    assert_eq!(defaults[0].id, default_before.id, "默认行 id 不得变");
+    assert!(
+        defaults[0].revoked_at.is_none(),
+        "默认行永不得被吊销: {:?}",
+        defaults[0]
+    );
+
+    let err = invoke_on(
+        &webview,
+        "gateway_token_revoke",
+        json!({"id": default_before.id}),
+    )
+    .expect_err("吊销默认行必须被拒");
+    assert!(err.to_string().contains("默认令牌不能吊销"), "{err}");
+}
+
+/// M41-S2 3601：宽限期上限 3600 秒，3601 必须被设置校验拒掉。
+#[test]
+fn m41s2_grace_secs_above_3600_is_rejected() {
+    let (_app, webview) = build_app();
+    let mut payload = read_settings(&webview);
+    payload["gatewayTokenGraceSecs"] = json!(3601);
+    let err = invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": payload}}),
+    )
+    .expect_err("3601 秒宽限必须被拒");
+    assert!(err.to_string().contains("3600"), "{err}");
+}
+
+/// M41-S2 F-2：DB 写入失败 ⇒ 轮换命令报错、旧令牌仍 200、`tokenGraceUntil` 为空。
+///
+/// 失败注入点：`Store::fail_next_gateway_token_hash_update_for_test`（一次性开关，
+/// 生产代码永不 arm）。写序硬约束——DB 失败时运行态绝不先换新令牌，否则重启后旧
+/// hash 复活——由本用例钉住：命令报错后注册表仍是旧 hash，网关仍认旧令牌。
+#[test]
+fn m41s2_db_failure_keeps_the_old_token_and_no_grace() {
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let port = free_port();
+    enable_gateway(&webview, port);
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    let old_token = started["token"].as_str().expect("令牌").to_string();
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
+    let hash_before = state
+        .service
+        .store()
+        .default_gateway_token()
+        .expect("读默认行")
+        .expect("默认行")
+        .token_hash;
+
+    set_grace(&webview, 60);
+    state
+        .service
+        .store()
+        .fail_next_gateway_token_hash_update_for_test();
+    let err = invoke_on(&webview, "gateway_rotate_token", json!({"args": null}))
+        .expect_err("DB 失败时轮换必须报错");
+    assert!(err.to_string().contains("入库失败"), "{err}");
+
+    // 运行态未动：旧令牌仍 200，DB hash 未变，无宽限。
+    assert_eq!(
+        health_status(port, &old_token),
+        200,
+        "DB 失败后旧令牌必须仍可用"
+    );
+    let hash_after = state
+        .service
+        .store()
+        .default_gateway_token()
+        .expect("重读默认行")
+        .expect("默认行")
+        .token_hash;
+    assert_eq!(hash_after, hash_before, "DB 失败时 hash 不得变");
+    let status = invoke_on(&webview, "gateway_status", json!({})).expect("读状态");
+    assert_eq!(
+        status["tokenGraceUntil"],
+        Value::Null,
+        "DB 失败时不得有宽限: {status}"
+    );
 }
 
 /// M43-S2：模型单价与站点账单命令在 IPC 层可用，DTO 键是 camelCase，
