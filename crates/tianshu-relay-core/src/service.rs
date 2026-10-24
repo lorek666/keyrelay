@@ -4586,13 +4586,16 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 内部版本：用**已经读到**的令牌做对账，避免 `gateway_config` 为同一份令牌读两次钥匙串
     /// （第二次读失败会把一次瞬时故障放大成「临时令牌」，M16-S4 的读失败语义被改变）。
     fn ensure_default_token_migrated_with(&self, current: &str) -> Result<bool> {
-        if self.store.default_gateway_token()?.is_some() {
+        // B-224 P3：直接复用第一次查询的结果——此前先判 `is_some()` 再二次
+        // 查询并 `.expect("上面刚判过")`，两次之间若默认行被并发删除/吊销，
+        // 就会在一条「已判过存在」的路径上 panic。复用后最坏情况是后续
+        // 更新/恢复返回 `Err`（调用方正常处理），而不是无条件 panic。
+        if let Some(row) = self.store.default_gateway_token()? {
             // M41-S2：对账——默认行 hash 与钥匙串不一致时**原地**更新（保留 id/label/created_at）。
             if current.trim().is_empty() {
                 return Ok(false);
             }
             let expected = crate::gateway::sha256_hex(current);
-            let row = self.store.default_gateway_token()?.expect("上面刚判过");
             let mut changed = false;
             // 手工吊销过的默认行：对账把它恢复（spec §4.6/T-13），否则钥匙串里的
             // 默认令牌永远 401，连轮换都救不回。

@@ -383,3 +383,41 @@ fn rollback_still_succeeds_when_the_status_cannot_be_recorded() {
         "状态确实没记上（这条断言防止触发器没生效、测试空转）"
     );
 }
+
+/// B-224 P3（变异存活 P4 的守护）：老库 / 手工行里 `bindings.journal_id`
+/// 可能为 NULL，而 Rust 侧 `DeliveryHistoryRow.journal_id` 是 `String`——
+/// 没有 `COALESCE(b.journal_id, '')` 时，一行 NULL 就会让 `row.get::<String>`
+/// 报「Invalid column type Null」，**整张历史表**读不出来。
+/// 本用例把一次真实投递的 journal_id 置 NULL，再读历史：必须成功，且
+/// 该行 journal_id 为空串、has_journal 为 false（与「空串匹配不到 journal
+/// 行」的语义一致），而不是整表报错。
+/// 注意：探针 P4 回退 `COALESCE` 时，本用例必须变红——探针脚本已把
+/// P4 的目标测试改成 `--test delivery_history`，不再只跑 rotation_run。
+#[test]
+fn null_journal_id_does_not_break_delivery_history() {
+    let f = setup();
+    let _outcome = deliver(&f, f.keys[0], DeliveryChannel::CodexAuthJson);
+    let rows_before = f.service.delivery_history(100).unwrap();
+    assert_eq!(rows_before.len(), 1, "先确认投递已有一行");
+    let binding_id = rows_before[0].binding_id;
+
+    let conn = rusqlite::Connection::open(&f.db_path).expect("直连库");
+    let changed = conn
+        .execute(
+            "UPDATE bindings SET journal_id = NULL WHERE id = ?1",
+            rusqlite::params![binding_id],
+        )
+        .expect("置 NULL");
+    assert_eq!(changed, 1, "必须确实改到那一行（否则测试空转）");
+
+    let rows = f
+        .service
+        .delivery_history(100)
+        .expect("NULL journal_id 不得让整表读失败");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].journal_id, "", "NULL ⇒ 空串");
+    assert!(
+        !rows[0].has_journal,
+        "NULL 匹配不到 journal 行 ⇒ has_journal 为 false"
+    );
+}

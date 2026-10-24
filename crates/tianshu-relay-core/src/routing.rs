@@ -622,9 +622,14 @@ pub struct Candidate<'a> {
 /// `rate` 是站点倍率；`None`（未知）按 1.0 处理。
 /// 权重 = `1/max(rate, 0.01)`：**倍率越低（越便宜）权重越高**。
 /// 这是「组内未归一」的原始 unit，归一在 [`weighted_pick`] 里做（需要组内最小值）。
+///
+/// 注意 `rate = Some(0.0)`（免费分组）**不是**未知：按公式应得 `1/0.01 = 100`
+/// （最高权重），而不是落到 1.0 被长期冷落（B-224 P2 修复；此前 `0.0`
+/// 走 `_ => 1.0` 分支，与 spec 公式不一致）。
 pub fn rotation_weight(rate: Option<f64>) -> f64 {
     let r = match rate {
         Some(x) if x.is_finite() && x > 0.0 => x,
+        Some(x) if x.is_finite() && x == 0.0 => 0.01,
         _ => 1.0,
     };
     1.0 / r.max(0.01)
@@ -706,6 +711,18 @@ mod tests {
             latency_ms: latency,
             key_id: None,
         }
+    }
+
+    #[test]
+    fn rotation_weight_gives_free_sites_the_spec_maximum() {
+        // B-224 P2：`rate = Some(0.0)`（免费分组）按公式 `1/max(rate, 0.01)`
+        // 应得 100，而不是此前落到 1.0 被长期冷落。
+        assert_eq!(rotation_weight(Some(0.0)), 100.0);
+        assert_eq!(rotation_weight(Some(0.01)), 100.0);
+        assert_eq!(rotation_weight(Some(1.0)), 1.0);
+        assert_eq!(rotation_weight(None), 1.0);
+        assert_eq!(rotation_weight(Some(f64::NAN)), 1.0);
+        assert_eq!(rotation_weight(Some(-1.0)), 1.0);
     }
 
     #[test]

@@ -560,12 +560,18 @@ async fn ipv6_addr_in_use_degrades_and_keeps_v4_serving() {
     let token = handle.token.clone();
     assert_eq!(handle.addrs.len(), 1, "只有 v4");
     match &handle.ipv6 {
-        Ipv6State::Degraded { reason } => {
+        Ipv6State::Degraded { reason, kind } => {
             assert!(
                 reason.contains("占用"),
                 "降级原因要说清是端口占用: {reason}"
             );
             assert!(reason.contains("127.0.0.1"), "要说明只剩 v4: {reason}");
+            // B-224 P2：kind 必须由核心层按 ErrorKind 定死，调用方不再解析文案。
+            assert_eq!(
+                *kind,
+                tianshu_relay_core::gateway::Ipv6DegradedKind::AddrInUse,
+                "端口占用 ⇒ kind 必须是 AddrInUse: {kind:?}"
+            );
         }
         other => panic!("应当是 Degraded，实际 {other:?}"),
     }
@@ -587,8 +593,13 @@ async fn ephemeral_port_binds_v4_only() {
         .expect("启动");
     assert_eq!(handle.addrs.len(), 1, "port 0 只绑 v4");
     assert!(matches!(handle.ipv6, Ipv6State::Degraded { .. }));
-    if let Ipv6State::Degraded { reason } = &handle.ipv6 {
+    if let Ipv6State::Degraded { reason, kind } = &handle.ipv6 {
         assert!(reason.contains("端口 0"), "原因要说明是 port 0: {reason}");
+        assert_eq!(
+            *kind,
+            tianshu_relay_core::gateway::Ipv6DegradedKind::Skipped,
+            "port 0 ⇒ kind 必须是 Skipped: {kind:?}"
+        );
     }
     shutdown(handle).await;
 }

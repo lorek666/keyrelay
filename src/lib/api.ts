@@ -458,6 +458,8 @@ export type GatewayStatus = {
   candidates: GatewayCandidate[];
   /** 最近 60s 滑动；启动不足 3s 时为 0（UI 显示 `—`）。 */
   qps: number;
+  /** B-224（M40-S2 P2-2）：网关运行秒数，与后端 QPS 守则同源；缺失时回退到 requestsTotal < 3。 */
+  uptimeSecs?: number;
   requestsTotal: number;
   inflight: number;
   failoversTotal: number;

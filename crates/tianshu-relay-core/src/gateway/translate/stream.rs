@@ -14,6 +14,14 @@ pub struct SseEvent {
     pub data: String,
 }
 
+/// 单个 SSE 事件的缓冲上限（B-224 P2 修复）。
+///
+/// 上游永不发空行时，无上限的缓冲会随字节无界增长；1 MiB 远大于任何
+/// 正常增量事件（通常 < 64 KiB），超限即判定为畸形流、由调用方发 error
+/// 关闭（与非流式 64 MiB 上限、usage carry 64 KiB 上限同口径：有上限，
+/// 而不是先把内存撑爆再处理）。
+pub const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+
 /// 增量 SSE 拆包器：喂字节、吐事件。
 ///
 /// **必须能处理事件跨 TCP 包**——这是流式翻译最容易写错的地方（假设"一次 read 一个事件"，
@@ -21,6 +29,7 @@ pub struct SseEvent {
 #[derive(Debug, Default)]
 pub struct SseDecoder {
     buf: Vec<u8>,
+    overflowed: bool,
 }
 
 impl SseDecoder {
@@ -28,9 +37,17 @@ impl SseDecoder {
         Self::default()
     }
 
+    /// 是否已因单个事件超限而溢出。溢出后缓冲已清空，调用方应把流
+    /// 当作错误关闭，而不是继续喂字节（否则超限流可以无限续喂）。
+    pub fn is_overflowed(&self) -> bool {
+        self.overflowed
+    }
+
     /// 喂一块字节，返回**本次能完整解出**的事件。
     ///
     /// 切事件的依据是空行（`\n\n`，兼容 `\r\n\r\n`）——不是单行、不是字节数。
+    /// 本次解完后仍残留超过 [`MAX_SSE_EVENT_BYTES`] 的未成事件 ⇒ 记溢出
+    /// 并清空缓冲，本次返回已解出的事件（调用方须先查 [`Self::is_overflowed`]）。
     pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
@@ -40,6 +57,10 @@ impl SseDecoder {
             if let Some(ev) = parse_event(&raw) {
                 out.push(ev);
             }
+        }
+        if self.buf.len() > MAX_SSE_EVENT_BYTES {
+            self.overflowed = true;
+            self.buf.clear();
         }
         out
     }

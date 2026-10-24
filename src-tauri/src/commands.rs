@@ -483,6 +483,11 @@ pub struct GatewayStatusDto {
     candidates: Vec<GatewayCandidateDto>,
     /// 最近 60s 滑动；启动不足 3s 时为 0（UI 显示 `—`）。
     qps: f64,
+    /// B-224（M40-S2 P2-2 修复）：核心快照本就有的 `uptime_secs`，此前
+    /// IPC 层没透出，前端只能用 `requestsTotal < 3` 另 invent 一套
+    /// 「样本不足」判据，与后端的「uptime < 3s」判据不一致。透出后
+    /// 前端以它为准（缺失时回退到 requestsTotal < 3）。
+    uptime_secs: u64,
     requests_total: u64,
     inflight: u64,
     failovers_total: u64,
@@ -1857,6 +1862,7 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
         mode: "stopped".to_string(),
         candidates: Vec::new(),
         qps: 0.0,
+        uptime_secs: 0,
         requests_total: 0,
         inflight: 0,
         failovers_total: 0,
@@ -1884,7 +1890,9 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
         .collect();
     let (ipv6_degraded, ipv6_note) = match &run.handle.ipv6 {
         tianshu_relay_core::gateway::Ipv6State::Listening => (false, None),
-        tianshu_relay_core::gateway::Ipv6State::Degraded { reason } => (true, Some(reason.clone())),
+        tianshu_relay_core::gateway::Ipv6State::Degraded { reason, .. } => {
+            (true, Some(reason.clone()))
+        }
     };
     if run.handle.alive() {
         let m = run.handle.metrics();
@@ -1934,6 +1942,7 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             mode: if route_is_empty { "single" } else { "multi" }.to_string(),
             candidates,
             qps: m.qps,
+            uptime_secs: m.uptime_secs,
             requests_total: m.requests_total,
             inflight: m.inflight,
             failovers_total: m.failovers_total,
@@ -1962,6 +1971,7 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             mode: "stopped".to_string(),
             candidates: Vec::new(),
             qps: 0.0,
+            uptime_secs: 0,
             requests_total: 0,
             inflight: 0,
             failovers_total: 0,
@@ -2006,6 +2016,41 @@ pub(crate) fn auto_start_target(
         .filter(|key| key.site_id == site.id && key.status == "enabled")
         .min_by_key(|key| key.id)?;
     Some((site.id, key.id))
+}
+
+/// auto-start 的**有序候选清单**（B-224 P2 修复）：首选是 [`auto_start_target`]，
+/// 其后是其余健康站点 / 启用密钥的组合（按站点 id、密钥 id 升序，去重）。
+///
+/// 此前选组本身有回退（上次组失效 ⇒ 第一个健康组），但**首选组启动失败**
+/// 后没有任何回退——只 eprintln 一句就结束，网关停在「未运行」。现在调用方
+/// 按此清单依次试启动，首个成功即停；全部失败才放弃（仍只试一轮，不循环）。
+pub(crate) fn auto_start_targets(
+    sites: &[tianshu_relay_core::service::SiteSummary],
+    keys: &[tianshu_relay_core::store::KeyRow],
+    last_site_id: i64,
+    last_key_id: i64,
+) -> Vec<(i64, i64)> {
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    if let Some(first) = auto_start_target(sites, keys, last_site_id, last_key_id) {
+        out.push(first);
+    }
+    let mut sites_sorted: Vec<&tianshu_relay_core::service::SiteSummary> =
+        sites.iter().filter(|site| site.health == "ok").collect();
+    sites_sorted.sort_by_key(|site| site.id);
+    for site in sites_sorted {
+        let mut site_keys: Vec<&tianshu_relay_core::store::KeyRow> = keys
+            .iter()
+            .filter(|key| key.site_id == site.id && key.status == "enabled")
+            .collect();
+        site_keys.sort_by_key(|key| key.id);
+        for key in site_keys {
+            let pair = (site.id, key.id);
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+    }
+    out
 }
 
 /// 设置变更需要网关做什么（M41-S1 §4.3 的纯函数，单测钉住矩阵）。
@@ -2181,21 +2226,18 @@ pub(crate) async fn start_gateway_locked(
         .await
         .map_err(|e| e.to_string())?;
     // M42-S1 §4.5：IPv6 降级必须**可见**——状态字段（`listenAddrs` / `ipv6Degraded`）之外，
-    // 再记一条 `Warn` 事件。payload **只含** port 与 kind（不放 reason 原文：
-    // 它可能带 OS 错误串，事件表只留可判定的事实）。
-    if let tianshu_relay_core::gateway::Ipv6State::Degraded { reason } = &handle.ipv6 {
-        let kind = if reason.contains("占用") {
-            "addr_in_use"
-        } else {
-            "unavailable"
-        };
+    // 再记一条 `Warn` 事件。payload **只含** port 与 kind，message 用固定文案：
+    // kind 直接取核心层在绑定失败时按 `ErrorKind` 定好的结构化分类
+    // （B-224 P2 修复；此前这里靠 `reason.contains("占用")` 反推 kind，且
+    // message 里还带了 reason 原文，与「事件表只留可判定事实」自述矛盾）。
+    if let tianshu_relay_core::gateway::Ipv6State::Degraded { kind, .. } = &handle.ipv6 {
         state
             .service
             .record_event(tianshu_relay_core::observability::event_with_payload(
                 tianshu_relay_core::observability::Level::Warn,
                 "gateway",
-                format!("网关 IPv6 回环未监听，仅监听 127.0.0.1：{reason}"),
-                serde_json::json!({ "port": handle.addr.port(), "kind": kind }),
+                "网关 IPv6 回环未监听，仅监听 127.0.0.1",
+                serde_json::json!({ "port": handle.addr.port(), "kind": kind.as_str() }),
             ));
     }
 
@@ -5661,6 +5703,28 @@ mod m41s1_tests {
         assert_eq!(auto_start_target(&sick, &keys, 2, 20), Some((1, 10)));
         // 0 = 无 ⇒ 直接兜底
         assert_eq!(auto_start_target(&sites, &keys, 0, 0), Some((1, 10)));
+    }
+
+    #[test]
+    fn auto_start_targets_lists_preferred_first_then_the_rest_in_order() {
+        let sites = vec![site(1, "ok"), site(2, "ok"), site(3, "error")];
+        let keys = vec![
+            key(10, 1, "enabled"),
+            key(11, 1, "enabled"),
+            key(20, 2, "enabled"),
+            key(30, 3, "enabled"),
+        ];
+        // 首选是上次组，其后按站点/密钥 id 升序，不含不健康站点。
+        assert_eq!(
+            auto_start_targets(&sites, &keys, 2, 20),
+            vec![(2, 20), (1, 10), (1, 11)]
+        );
+        // 无上次组时首选即第一个健康组，清单仍完整。
+        assert_eq!(
+            auto_start_targets(&sites, &keys, 0, 0),
+            vec![(1, 10), (1, 11), (2, 20)]
+        );
+        assert!(auto_start_targets(&[], &[], 0, 0).is_empty());
     }
 
     #[test]

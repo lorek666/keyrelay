@@ -227,6 +227,38 @@ describe("M40-S2 网关指标面板", () => {
     expect(document.querySelector("[data-gateway-qps]")?.textContent).toBe("—");
   });
 
+  it("U3b 样本不足以后端 uptimeSecs 为准（请求数多也不显示 QPS）", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(
+      status({
+        running: true,
+        phase: "running",
+        requestsTotal: 10,
+        qps: 2.5,
+        uptimeSecs: 1,
+        mode: "single",
+      }),
+    );
+    renderCard();
+    expect(await screen.findByText("QPS（最近 60 秒）")).toBeInTheDocument();
+    expect(document.querySelector("[data-gateway-qps]")?.textContent).toBe("—");
+  });
+
+  it("U3c uptimeSecs 已够时即使请求数 < 3 也显示 QPS", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(
+      status({
+        running: true,
+        phase: "running",
+        requestsTotal: 1,
+        qps: 2.5,
+        uptimeSecs: 10,
+        mode: "single",
+      }),
+    );
+    renderCard();
+    expect(await screen.findByText("QPS（最近 60 秒）")).toBeInTheDocument();
+    expect(document.querySelector("[data-gateway-qps]")?.textContent).toBe("2.5");
+  });
+
   it("U5 运行中但无候选 ⇒ 显示「单上游模式」，不渲染空表", async () => {
     vi.mocked(gatewayStatus).mockResolvedValue(
       status({ running: true, phase: "running", mode: "single", requestsTotal: 10, qps: 2.5 }),

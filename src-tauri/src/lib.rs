@@ -654,6 +654,10 @@ const MODEL_CATALOG_TICK: std::time::Duration = std::time::Duration::from_secs(6
 /// 选组规则见 [`crate::commands::auto_start_target`]：优先「上次成功运行」的 site/key
 /// （四项校验全过才用），否则回退「第一个 health=ok 站点 + 其第一把 enabled key」，
 /// 都没有就跳过并记一行日志——**不自动重试、不循环**。
+///
+/// B-224 P2 补充：首选组**启动失败**时，按 [`crate::commands::auto_start_targets`]
+/// 的有序清单依次试其余健康组（首个成功即停）；此前首选失败只记一行日志就
+/// 结束，网关停在「未运行」。清单内每个组仍只试一次，全部失败才放弃。
 fn maybe_auto_start_gateway<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     use tauri::Manager as _;
     let Some(state) = app.try_state::<AppState>() else {
@@ -671,15 +675,16 @@ fn maybe_auto_start_gateway<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let Ok(keys) = state.service.stored_keys() else {
         return;
     };
-    let Some((site_id, key_id)) = commands::auto_start_target(
+    let targets = commands::auto_start_targets(
         &sites,
         &keys,
         settings.gateway_last_site_id,
         settings.gateway_last_key_id,
-    ) else {
+    );
+    if targets.is_empty() {
         eprintln!("[tianshu-relay] 自动启动网关：没有可用的健康站点 / 启用密钥，跳过（不重试）");
         return;
-    };
+    }
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let Some(state) = app_handle.try_state::<AppState>() else {
@@ -687,9 +692,17 @@ fn maybe_auto_start_gateway<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         };
         // 与手动启动共用同一把串行锁；auto-start 只在这里 spawn 一次。
         let _op = state.gateway_op.lock().await;
-        if let Err(err) = commands::start_gateway_locked(&state, site_id, key_id).await {
-            eprintln!("[tianshu-relay] 自动启动网关失败（不影响应用启动）: {err}");
+        for (site_id, key_id) in targets {
+            match commands::start_gateway_locked(&state, site_id, key_id).await {
+                Ok(()) => return,
+                Err(err) => {
+                    eprintln!(
+                        "[tianshu-relay] 自动启动网关：站点 {site_id} / 密钥 {key_id} 启动失败，尝试下一组（不影响应用启动）: {err}"
+                    );
+                }
+            }
         }
+        eprintln!("[tianshu-relay] 自动启动网关：全部候选组均启动失败，网关未运行");
     });
 }
 

@@ -508,3 +508,111 @@ async fn gemini_tool_result_reaches_the_upstream_as_a_tool_message() {
 // ---------------------------------------------------------------- 复审 P2-4：Gemini 流式 ⇒ 400（不是 404）
 
 // （`?alt=sse` 的 400 断言已由 M42-S2b 取代：现在真的走流式，见 gateway_translate_stream_e2e.rs）
+
+// ---------------------------------------------------------------- B-224 P3：翻译 usage 与 UsageCapture 逐字段等价
+
+/// M42-S2a P2：同一上游响应、同一模型名，走 Chat 直通（`UsageCapture`）
+/// 与走 Responses 翻译（手工组 `GatewayUsage`）时，记下的用量行除
+/// `at`（完成时刻）与 `latency_ms`（真实耗时）外必须逐字段相同。
+/// 此前翻译路径只断言了自身字段（token_id / agent_label 不丢），两条
+/// 路径漂移时没有任何用例会红。
+#[tokio::test]
+async fn translated_usage_matches_passthrough_usage_field_by_field() {
+    use std::sync::Mutex as StdMutex;
+    use tianshu_relay_core::gateway::{sha256_hex, GatewayTokenEntry, GatewayUsage};
+
+    let up = spawn_upstream("200 OK", &chat_response_text("好"));
+    let captured: Arc<StdMutex<Vec<GatewayUsage>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&captured);
+    let mut config = GatewayConfig::single_upstream(
+        0,
+        "local-token-e2e".to_string(),
+        up.base_url.clone(),
+        Zeroizing::new(KEY_A.to_string()),
+        "e2e".to_string(),
+    );
+    config.on_usage = Some(Arc::new(move |u| sink.lock().unwrap().push(u)));
+    let h = start(config).await.expect("启动");
+    h.set_tokens(vec![GatewayTokenEntry {
+        id: 42,
+        token_hash: sha256_hex("local-token-e2e"),
+        label: "e2e-agent".to_string(),
+        grace_until: None,
+    }]);
+
+    let url = format!("http://{}", h.addr);
+    // 直通：Chat 请求，模型名与翻译请求相同，消除模型名差异。
+    let chat_body = json!({
+        "model": "m",
+        "messages": [{ "role": "user", "content": "问" }]
+    })
+    .to_string();
+    let (status, _) = tokio::task::spawn_blocking({
+        let url = url.clone();
+        move || http_post(&url, "local-token-e2e", "/v1/chat/completions", &chat_body)
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, 200);
+    // 翻译：Responses 请求，同一模型名、同一上游响应。
+    let resp_body = json!({
+        "model": "m",
+        "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "问" }] }]
+    })
+    .to_string();
+    let (status, _) = tokio::task::spawn_blocking({
+        let url = url.clone();
+        move || http_post(&url, "local-token-e2e", "/v1/responses", &resp_body)
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, 200);
+
+    // 先 clone 出来再断言：直接抱着 MutexGuard 跨 shutdown await 会
+    // 触发 clippy::await_holding_lock（且关停本身可能再回调 on_usage）。
+    let rows = captured.lock().unwrap().clone();
+    assert_eq!(rows.len(), 2, "两条路径各记一次，合计恰好两行: {rows:?}");
+    let (a, b) = (&rows[0], &rows[1]);
+    for (name, va, vb) in [
+        ("site_id", a.site_id.to_string(), b.site_id.to_string()),
+        (
+            "key_id",
+            format!("{:?}", a.key_id),
+            format!("{:?}", b.key_id),
+        ),
+        ("model", a.model.clone(), b.model.clone()),
+        (
+            "prompt_tokens",
+            a.prompt_tokens.to_string(),
+            b.prompt_tokens.to_string(),
+        ),
+        (
+            "completion_tokens",
+            a.completion_tokens.to_string(),
+            b.completion_tokens.to_string(),
+        ),
+        (
+            "total_tokens",
+            a.total_tokens.to_string(),
+            b.total_tokens.to_string(),
+        ),
+        ("status", a.status.to_string(), b.status.to_string()),
+        ("attempts", a.attempts.to_string(), b.attempts.to_string()),
+        ("stream", a.stream.to_string(), b.stream.to_string()),
+        (
+            "token_id",
+            format!("{:?}", a.token_id),
+            format!("{:?}", b.token_id),
+        ),
+        ("agent_label", a.agent_label.clone(), b.agent_label.clone()),
+    ] {
+        assert_eq!(
+            va, vb,
+            "翻译与直通的用量字段 {name} 必须一致: {a:?} vs {b:?}"
+        );
+    }
+    assert_eq!(a.prompt_tokens, 7);
+    assert_eq!(a.completion_tokens, 3);
+    assert_eq!(a.total_tokens, 10);
+    h.shutdown_and_wait().await;
+}

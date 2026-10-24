@@ -59,7 +59,7 @@ type Props = {
  * **空态规则（spec §4.3，违反即 bug）**：
  * - 未运行 ⇒ 只显示一行占位；**绝不**渲染 `0 req` / `0 QPS` / 空表格 / 灰色假候选。
  * - `candidates` 为空但运行中 ⇒ 「单上游模式」，不渲染空表。
- * - `requestsTotal < 3`（刚启动）⇒ QPS 显示 `—`（样本不足，不拿 0.3 秒的窗口吹稳定值）。
+ * - 刚启动（`uptimeSecs < 3`，缺失时回退 `requestsTotal < 3`）⇒ QPS 显示 `—`（样本不足，不拿 0.3 秒的窗口吹稳定值）。
  * - `lastError == null` ⇒ 显示「无」（不显示空白：读者分不清「没有」与「没加载」）。
  */
 function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
@@ -73,7 +73,11 @@ function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
   }
   const candidates = status.candidates ?? [];
   const requestsTotal = status.requestsTotal ?? 0;
-  const qps = requestsTotal < 3 ? null : status.qps;
+  // B-224（M40-S2 P2-2）：样本不足判据以后端为准（uptime < 3s）；旧
+  // 客户端没给 uptimeSecs 时回退到 requestsTotal < 3，保持兼容。
+  const sampleTooSmall =
+    status.uptimeSecs !== undefined ? status.uptimeSecs < 3 : requestsTotal < 3;
+  const qps = sampleTooSmall ? null : status.qps;
   const badge = (kind: "ok" | "warn" | "danger") => `badge badge-${kind}`;
   return (
     <div className="gateway-metrics">

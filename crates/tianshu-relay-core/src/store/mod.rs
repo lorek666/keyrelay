@@ -4650,7 +4650,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_v8_fresh_db_has_all_six_columns() {
+    // B-224 P3（M43-S1 T4b 名实不符）：旧名写 v8、实际断言的是当前
+    // schema v10 的 15 列（其中 6 列是 M40 新增的），改名以免后人按
+    // 名去找一个不存在的 v8 夹具。
+    fn schema_v10_fresh_db_has_all_fifteen_columns() {
         let store = Store::open_in_memory().expect("内存库");
         assert_eq!(store.schema_version().unwrap(), 10);
         let columns = usage_columns(&store);
