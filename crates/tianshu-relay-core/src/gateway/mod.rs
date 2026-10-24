@@ -2661,6 +2661,28 @@ async fn forward_to(
     translate_stream: bool,
 ) -> Response {
     let model = model_from_body(&body).unwrap_or_default();
+    // B-224 长尾（M42-S2b §4.4）：legacy 单上游此前传 `lease: None`，流式翻译
+    // 全程不受每站并发约束——与「流式请求同样受每站并发/令牌桶约束」矛盾。
+    // 现与多上游路径同口径：发请求前 `try_admit`，拿不到即 429（不发上游、
+    // 不喂熔断）；拿到的 lease 随响应 body 生命周期归还（流式泵内 `_lease`）。
+    // 默认策略（8 并发、不限速）下对既有单上游部署的影响仅是 8 并发上限。
+    let lease: Option<SiteLease> = match site_guard(state, state.config.site_id)
+        .map(|guard| guard.try_admit(Instant::now()))
+    {
+        None => None,
+        Some(GuardOutcome::Admitted(lease)) => Some(lease),
+        Some(GuardOutcome::ConcurrencyLimited) | Some(GuardOutcome::RateLimited) => {
+            state
+                .local_rejects
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return local_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                GatewayErrorKind::RateLimit,
+                "local_rate_limited",
+                "本地保护：站点并发/限流拒绝",
+            );
+        }
+    };
     let started = Instant::now();
     match send_once(state, method, url, headers, body).await {
         Ok(response) => {
@@ -2678,7 +2700,7 @@ async fn forward_to(
                 response,
                 state.config.site_id,
                 &model,
-                None,
+                lease,
                 AttemptMeta {
                     key_id: state.config.key_id,
                     latency_ms,
@@ -2868,6 +2890,45 @@ async fn maybe_translate_response(
 /// - **客户端断开** ⇒ `tx.send` 失败 ⇒ 任务退出（不泄漏、不继续跑）；
 /// - **usage 只记一次**（`include_usage` 的末帧）。
 #[allow(clippy::too_many_arguments)]
+/// 流式 usage 末帧口径（B-224 长尾）：与 [`UsageCapture`] 的 last-wins 一致——
+/// 泵在整个流里只记**最后一次**见到的 usage，任务结束时（正常、错误、客户端断开）
+/// 恰好发一行；无 usage 则不发。`Drop` 保证各返回点都不漏发、不多发；
+/// `at` 取任务结束时刻（与 `GatewayUsage.at`「流结束或被客户端断开的那一刻」一致）。
+struct StreamUsageFlush {
+    sink: Option<std::sync::Arc<dyn Fn(GatewayUsage) + Send + Sync>>,
+    site_id: i64,
+    key_id: Option<i64>,
+    model: String,
+    status: u16,
+    latency_ms: u64,
+    attempts: u32,
+    token_id: Option<i64>,
+    label: String,
+    pending: Option<(i64, i64, i64)>,
+}
+
+impl Drop for StreamUsageFlush {
+    fn drop(&mut self) {
+        if let (Some(sink), Some((p, c, t))) = (&self.sink, self.pending) {
+            sink(GatewayUsage {
+                at: unix_now_secs(),
+                site_id: self.site_id,
+                key_id: self.key_id,
+                model: self.model.clone(),
+                prompt_tokens: p,
+                completion_tokens: c,
+                total_tokens: t,
+                status: self.status,
+                latency_ms: self.latency_ms,
+                attempts: self.attempts,
+                stream: true,
+                token_id: self.token_id,
+                agent_label: self.label.clone(),
+            });
+        }
+    }
+}
+
 fn streaming_translate_response(
     state: &AppState,
     proto: translate::Protocol,
@@ -2893,7 +2954,20 @@ fn streaming_translate_response(
         let _lease = lease;
         let mut dec = SseDecoder::new();
         let mut tr = StreamTranslator::new(proto);
-        let mut usage_sent = false;
+        // B-224 长尾：usage 取末帧（与 UsageCapture last-wins 同口径），
+        // 任务结束时由 Drop 恰好发一行；首帧即发会在上游发多次 usage 时记少。
+        let mut usage_flush = StreamUsageFlush {
+            sink: on_usage.clone(),
+            site_id,
+            key_id: meta.key_id,
+            model: model.clone(),
+            status: status_code,
+            latency_ms: meta.latency_ms,
+            attempts: meta.attempts,
+            token_id,
+            label: label.clone(),
+            pending: None,
+        };
         let mut saw_done = false;
 
         loop {
@@ -2939,28 +3013,10 @@ fn streaming_translate_response(
                             let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
                             return;
                         }
-                        if !usage_sent {
-                            if let (Some(d), Some(sink)) =
-                                (ChatDelta::from_json(&e.data), on_usage.as_ref())
-                            {
-                                if let Some((p, c, t)) = d.usage {
-                                    usage_sent = true;
-                                    sink(GatewayUsage {
-                                        at: unix_now_secs(),
-                                        site_id,
-                                        key_id: meta.key_id,
-                                        model: model.clone(),
-                                        prompt_tokens: p,
-                                        completion_tokens: c,
-                                        total_tokens: t,
-                                        status: status_code,
-                                        latency_ms: meta.latency_ms,
-                                        attempts: meta.attempts,
-                                        stream: true,
-                                        token_id,
-                                        agent_label: label.clone(),
-                                    });
-                                }
+                        // 末帧口径：每次见到的 usage 都覆盖 pending，结束时只发最后一次。
+                        if let Some(d) = ChatDelta::from_json(&e.data) {
+                            if d.usage.is_some() {
+                                usage_flush.pending = d.usage;
                             }
                         }
                         let frames = tr.on_event(e);

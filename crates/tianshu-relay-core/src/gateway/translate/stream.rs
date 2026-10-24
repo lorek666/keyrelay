@@ -129,6 +129,9 @@ pub struct ChatDelta {
     pub tool_calls: Vec<(u32, String, String, String)>,
     pub finish_reason: Option<String>,
     pub usage: Option<(i64, i64, i64)>,
+    /// 顶层 `id`/`model`（Chat chunk 自带；渲染侧用它补起始帧的身份字段）。
+    pub id: Option<String>,
+    pub model: Option<String>,
 }
 
 impl ChatDelta {
@@ -136,6 +139,8 @@ impl ChatDelta {
     pub fn from_json(data: &str) -> Option<Self> {
         let v: Value = serde_json::from_str(data).ok()?;
         let mut d = ChatDelta::default();
+        d.id = v.get("id").and_then(|x| x.as_str()).map(str::to_string);
+        d.model = v.get("model").and_then(|x| x.as_str()).map(str::to_string);
         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
             d.usage = Some((
                 u.get("prompt_tokens").and_then(|x| x.as_i64()).unwrap_or(0),
@@ -202,6 +207,15 @@ pub struct StreamTranslator {
     /// 已开过的 tool 块：`index → 累积的 arguments 字符串`（P1-2 状态机）。
     /// start 只发一次；后续只发增量；Gemini 在 finish 时一次性发完整 functionCall。
     tool_blocks: std::collections::BTreeMap<u32, String>,
+    /// 首个 chunk 的身份字段（B-224 长尾：起始帧补 id/model 用）。
+    msg_id: Option<String>,
+    msg_model: Option<String>,
+    /// 最近一次见到的 usage（收尾帧用；流式 usage 只在末帧出现时与直通一致）。
+    last_usage: Option<(i64, i64, i64)>,
+    /// 最近一次见到的 finish_reason（收尾帧的 stop_reason/finishReason 用）。
+    last_finish_reason: Option<String>,
+    /// Gemini 是否已在增量帧里发过 finishReason（发过则 finish 不再补结束帧）。
+    gemini_finish_emitted: bool,
 }
 
 impl StreamTranslator {
@@ -213,6 +227,11 @@ impl StreamTranslator {
             block_index: 0,
             text_block_open: false,
             tool_blocks: std::collections::BTreeMap::new(),
+            msg_id: None,
+            msg_model: None,
+            last_usage: None,
+            last_finish_reason: None,
+            gemini_finish_emitted: false,
         }
     }
 
@@ -227,6 +246,19 @@ impl StreamTranslator {
         let Some(d) = ChatDelta::from_json(&ev.data) else {
             return Vec::new();
         };
+        // 先记身份/用量/结束原因，再开起始帧（起始帧的 id/model 来自首个 chunk）。
+        if self.msg_id.is_none() {
+            self.msg_id = d.id.clone();
+        }
+        if self.msg_model.is_none() {
+            self.msg_model = d.model.clone();
+        }
+        if d.usage.is_some() {
+            self.last_usage = d.usage;
+        }
+        if d.finish_reason.is_some() {
+            self.last_finish_reason = d.finish_reason.clone();
+        }
         let mut frames = Vec::new();
         self.ensure_started(&mut frames);
         match self.proto {
@@ -244,7 +276,7 @@ impl StreamTranslator {
                         frames.push(sse_data(&json!({
                             "type": "response.output_item.added",
                             "output_index": idx,
-                            "item": { "type": "function_call", "call_id": id, "name": name },
+                            "item": { "type": "function_call", "id": id, "call_id": id, "name": name },
                         })));
                     }
                     if !args.is_empty() {
@@ -297,10 +329,17 @@ impl StreamTranslator {
                 for (idx, _, _, args) in &d.tool_calls {
                     self.tool_blocks.entry(*idx).or_default().push_str(args);
                 }
-                if !parts.is_empty() {
-                    frames.push(sse_data(&json!({
-                        "candidates": [{ "content": { "role": "model", "parts": parts }, "index": 0 }]
-                    })));
+                // B-224 长尾：带 finish_reason 的增量帧必须带 finishReason（否则客户端
+                // 只看到内容帧、不知道流为什么结束）；纯 finish_reason 帧（无正文）也要发。
+                let finish_reason = d.finish_reason.as_deref().map(gemini_finish_reason);
+                if !parts.is_empty() || finish_reason.is_some() {
+                    let mut candidate =
+                        json!({ "content": { "role": "model", "parts": parts }, "index": 0 });
+                    if let Some(fr) = finish_reason {
+                        candidate["finishReason"] = json!(fr);
+                        self.gemini_finish_emitted = true;
+                    }
+                    frames.push(sse_data(&json!({ "candidates": [candidate] })));
                 }
             }
             super::Protocol::OpenAiChat => {}
@@ -318,7 +357,10 @@ impl StreamTranslator {
         self.ensure_started(&mut frames);
         match self.proto {
             super::Protocol::OpenAiResponses => {
-                frames.push(sse_data(&json!({ "type": "response.completed" })));
+                frames.push(sse_data(&json!({
+                    "type": "response.completed",
+                    "response": self.response_object("completed"),
+                })));
             }
             super::Protocol::AnthropicMessages => {
                 if self.text_block_open {
@@ -332,6 +374,16 @@ impl StreamTranslator {
                         "type": "content_block_stop", "index": idx + 1
                     })));
                 }
+                // B-224 长尾：SDK 要求 message_delta（stop_reason + usage）先于 message_stop；
+                // usage 只有上游发过才带，不编造数字。
+                let mut delta = json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": anthropic_stop_reason(self.last_finish_reason.as_deref()) },
+                });
+                if let Some((p, c)) = self.last_usage.map(|(p, c, _)| (p, c)) {
+                    delta["usage"] = json!({ "input_tokens": p, "output_tokens": c });
+                }
+                frames.push(sse_data(&delta));
                 frames.push(sse_data(&json!({ "type": "message_stop" })));
             }
             super::Protocol::GeminiGenerateContent => {
@@ -349,11 +401,42 @@ impl StreamTranslator {
                         "candidates": [{ "content": { "role": "model", "parts": parts }, "index": 0 }]
                     })));
                 }
-                // Gemini **没有 [DONE]**：靠流关闭本身表示结束，不额外发结束帧
+                // B-224 长尾：增量帧里没发过 finishReason 时，收尾补一帧显式结束
+                // （此前无工具调用时 finish 零帧，客户端只能靠流关闭猜结束）。
+                if !self.gemini_finish_emitted {
+                    let fr = self
+                        .last_finish_reason
+                        .as_deref()
+                        .map(gemini_finish_reason)
+                        .unwrap_or("STOP");
+                    frames.push(sse_data(&json!({
+                        "candidates": [{ "content": { "role": "model", "parts": [] }, "index": 0, "finishReason": fr }]
+                    })));
+                }
             }
             super::Protocol::OpenAiChat => frames.push(sse_data_raw("[DONE]")),
         }
         frames
+    }
+
+    /// Responses 的 response 对象：id/model 只有上游给过才带，usage 同理。
+    fn response_object(&self, status: &str) -> Value {
+        let mut obj = serde_json::Map::new();
+        if let Some(id) = &self.msg_id {
+            obj.insert("id".to_string(), json!(id));
+        }
+        obj.insert("object".to_string(), json!("response"));
+        obj.insert("status".to_string(), json!(status));
+        if let Some(m) = &self.msg_model {
+            obj.insert("model".to_string(), json!(m));
+        }
+        if let Some((p, c, t)) = self.last_usage {
+            obj.insert(
+                "usage".to_string(),
+                json!({ "input_tokens": p, "output_tokens": c, "total_tokens": t }),
+            );
+        }
+        Value::Object(obj)
     }
 
     fn ensure_started(&mut self, frames: &mut Vec<String>) {
@@ -363,19 +446,58 @@ impl StreamTranslator {
         self.started = true;
         match self.proto {
             super::Protocol::AnthropicMessages => {
+                let mut message = serde_json::Map::new();
+                if let Some(id) = &self.msg_id {
+                    message.insert("id".to_string(), json!(id));
+                }
+                message.insert("type".to_string(), json!("message"));
+                message.insert("role".to_string(), json!("assistant"));
+                message.insert("content".to_string(), json!([]));
+                if let Some(m) = &self.msg_model {
+                    message.insert("model".to_string(), json!(m));
+                }
+                message.insert("stop_reason".to_string(), Value::Null);
+                message.insert("stop_sequence".to_string(), Value::Null);
+                message.insert(
+                    "usage".to_string(),
+                    json!({ "input_tokens": 0, "output_tokens": 0 }),
+                );
                 frames.push(sse_event(
                     "message_start",
-                    &json!({ "type": "message_start", "message": { "role": "assistant", "content": [] } }),
+                    &json!({ "type": "message_start", "message": message }),
                 ));
             }
             super::Protocol::OpenAiResponses => {
                 frames.push(sse_event(
                     "response.created",
-                    &json!({ "type": "response.created" }),
+                    &json!({
+                        "type": "response.created",
+                        "response": self.response_object("in_progress"),
+                    }),
                 ));
             }
             _ => {}
         }
+    }
+}
+
+/// Chat 的 finish_reason → Anthropic stop_reason（无对应项时落 end_turn，不编新语义）。
+fn anthropic_stop_reason(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("length") => "max_tokens",
+        Some("tool_calls") => "tool_use",
+        _ => "end_turn",
+    }
+}
+
+/// Chat 的 finish_reason → Gemini finishReason（无对应项时落 OTHER）。
+fn gemini_finish_reason(reason: &str) -> &'static str {
+    match reason {
+        "stop" => "STOP",
+        "length" => "MAX_TOKENS",
+        "content_filter" => "SAFETY",
+        "tool_calls" => "STOP",
+        _ => "OTHER",
     }
 }
 

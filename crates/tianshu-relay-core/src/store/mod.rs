@@ -733,6 +733,9 @@ pub struct Store {
     conn: Mutex<Connection>,
     /// 文件库的路径；内存库为 `None`。审计要用它定位 `*.db` / `-wal` / `-shm`。
     path: Option<std::path::PathBuf>,
+    /// 仅测试用：下一次 `update_gateway_token_hash` 强制失败（M41-S2 F-2 失败路径用例）。
+    /// 生产代码永不 arm；一次性，用后自动清零。
+    fail_next_token_hash_update: std::sync::atomic::AtomicBool,
 }
 
 /// `scheme://user:pass@host/...` 里的 `user:pass@host` 部分（**不含**路径 / query / fragment）。
@@ -948,6 +951,7 @@ impl Store {
         Ok(Self {
             conn: store.conn,
             path: Some(path.to_path_buf()),
+            fail_next_token_hash_update: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -963,6 +967,7 @@ impl Store {
         let store = Self {
             conn: Mutex::new(conn),
             path: None,
+            fail_next_token_hash_update: std::sync::atomic::AtomicBool::new(false),
         };
         store.migrate()?;
         // P2-1：接线显示名 userinfo 剥离迁移（DEBUG-REPORT-v3 P2 #1）。
@@ -2258,7 +2263,20 @@ impl Store {
     }
 
     /// M41-S2 的轮换接口：**原地**改默认行的 hash（保留 id/label/created_at/is_default）。
+    /// 仅测试用：让下一次 `update_gateway_token_hash` 强制失败（M41-S2 F-2）。
+    /// 生产代码永不调用；一次性，用后自动清零。
+    pub fn fail_next_gateway_token_hash_update_for_test(&self) {
+        self.fail_next_token_hash_update
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn update_gateway_token_hash(&self, id: i64, token_hash: &str) -> Result<()> {
+        if self
+            .fail_next_token_hash_update
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Store("测试注入：令牌 hash 更新失败".to_string()));
+        }
         let conn = self.lock()?;
         conn.execute(
             "UPDATE gateway_tokens SET token_hash = ?2 WHERE id = ?1",
@@ -4647,6 +4665,78 @@ mod tests {
         let store = Store::open(&path).expect("再次打开");
         assert_eq!(store.schema_version().unwrap(), 10);
         assert_eq!(usage_columns(&store).len(), 15);
+    }
+
+    #[test]
+    // M43-S1 T4b（B-224 长尾）：**真 v8 夹具**——含 M40 六列、无令牌表、
+    // 无归因列、无 cost 标记，user_version = 8 ⇒ 打开后走 8→9→10。
+    // 区别于上面的 v7 夹具（v7 连 M40 六列都没有）和下面的 v10 新库用例。
+    fn schema_v9_migrates_v8_db_and_adds_token_tables() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("tianshu-relay.db");
+        let store = Store::open(&path).expect("建库");
+        let site_id = store
+            .upsert_site("newapi", "https://m40.example.com", "测试")
+            .expect("upsert_site");
+        {
+            let conn = store.lock().unwrap();
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_gateway_usage_token;
+                 ALTER TABLE gateway_usage_log DROP COLUMN token_id;
+                 ALTER TABLE gateway_usage_log DROP COLUMN agent_label;
+                 DROP TABLE IF EXISTS gateway_tokens;
+                 ALTER TABLE usage_samples DROP COLUMN cost_reported;
+                 PRAGMA user_version = 8;",
+            )
+            .expect("模拟 v8 老库");
+            conn.execute(
+                "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens, at, key_id, status, latency_ms, attempts, stream) \
+                 VALUES (1700000000, ?1, 'legacy-v8', 3, 4, 7, 1700000000, NULL, 200, 33, 1, 0)",
+                params![site_id],
+            )
+            .expect("写一行 v8 旧数据");
+        }
+        drop(store);
+
+        let store = Store::open(&path).expect("重新打开 v8 旧库");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 10, "当前 schema 应为 v10");
+        // v9 产物：令牌表 + 归因两列。
+        let columns = usage_columns(&store);
+        for expected in ["token_id", "agent_label"] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "老库必须补出 {expected} 列"
+            );
+        }
+        {
+            let conn = store.lock().unwrap();
+            let table: String = conn
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='gateway_tokens'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("令牌表必须存在");
+            assert_eq!(table, "gateway_tokens");
+            let cost_col: String = conn
+                .query_row(
+                    "SELECT name FROM pragma_table_info('usage_samples') WHERE name='cost_reported'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("v10 的 cost_reported 列必须存在");
+            assert_eq!(cost_col, "cost_reported");
+            // 旧行保留：归因列取默认值（token_id NULL、agent_label ''），不丢账。
+            let row: (String, Option<i64>, String) = conn
+                .query_row(
+                    "SELECT model, token_id, agent_label FROM gateway_usage_log",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .expect("读旧行");
+            assert_eq!(row, ("legacy-v8".to_string(), None, String::new()));
+        }
     }
 
     #[test]
