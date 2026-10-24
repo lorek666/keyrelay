@@ -4,7 +4,6 @@ import { AlertTriangle, RefreshCw, Undo2 } from "lucide-react";
 import {
   listDeliveries,
   listStoredKeys,
-  recentEvents,
   rollbackDelivery,
   type DeliveryRecord,
 } from "../lib/api";
@@ -13,13 +12,6 @@ import CapButton from "../components/CapButton";
 import ConfirmDialog from "../components/ConfirmDialog";
 import Skeleton from "../components/Skeleton";
 import { useTranslation, translate, getCurrentDict } from "../i18n";
-
-const LEVEL_TONE: Record<string, string> = {
-  debug: "muted",
-  info: "ok",
-  warn: "warn",
-  error: "danger",
-};
 
 /**
  * 一次投递能不能回滚（M9-S4 / A）。判据来自后端的三个标志位；灰显必须说明原因——
@@ -68,10 +60,6 @@ function rollbackGate(row: DeliveryRecord): {
 export default function History() {
   const { t } = useTranslation();
   const qc = useQueryClient();
-  const events = useQuery({
-    queryKey: ["events"],
-    queryFn: () => recentEvents(200),
-  });
   const deliveries = useQuery({ queryKey: ["deliveries"], queryFn: () => listDeliveries(100) });
   const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
   const [target, setTarget] = useState<DeliveryRecord | null>(null);
@@ -224,63 +212,6 @@ export default function History() {
           </div>
         ) : null}
         <p className="muted">{t("history.deliveries.hint")}</p>
-      </div>
-
-      <div className="card">
-        <div className="row row-between">
-          <h3>{t("history.events.title", { count: events.data?.length ?? 0 })}</h3>
-          <button
-            type="button"
-            className="btn btn-ghost"
-            onClick={() => events.refetch()}
-            disabled={events.isFetching}
-          >
-            <RefreshCw size={14} aria-hidden /> {t("common.refresh")}
-          </button>
-        </div>
-
-        {events.isLoading ? <p className="muted">{t("common.loading")}</p> : null}
-        {events.isError ? (
-          <p className="error" role="alert">
-            {t("history.events.error", { error: (events.error as Error).message })}
-          </p>
-        ) : null}
-        {events.data?.length === 0 ? (
-          <p className="muted empty">{t("history.events.empty")}</p>
-        ) : null}
-
-        {events.data?.length ? (
-          <div className="table-wrap">
-          <table className="table">
-            <thead>
-              <tr>
-                <th>{t("history.events.table.time")}</th>
-                <th>{t("history.events.table.level")}</th>
-                <th>{t("history.events.table.source")}</th>
-                <th>{t("history.events.table.message")}</th>
-                <th>{t("history.events.table.payload")}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {events.data.map((row) => (
-                <tr key={row.id}>
-                  <td className="mono">{formatTs(row.ts)}</td>
-                  <td>
-                    <span className={`badge badge-${LEVEL_TONE[row.level] ?? "muted"}`}>
-                      {row.level}
-                    </span>
-                  </td>
-                  <td className="mono">{row.source}</td>
-                  <td>{row.message}</td>
-                  <td className="mono ellipsis" title={row.payload ?? ""}>
-                    {row.payload ?? "—"}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          </div>
-        ) : null}
       </div>
 
       <ConfirmDialog

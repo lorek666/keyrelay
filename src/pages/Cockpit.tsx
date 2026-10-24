@@ -1,6 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle, KeyRound, Server, ShieldCheck } from "lucide-react";
-import { useMutation } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { AlertTriangle } from "lucide-react";
 import {
   appInfo,
   driftReport,
@@ -16,8 +16,19 @@ import {
 import { useTranslation } from "../i18n";
 import RebrandNotice from "../components/RebrandNotice";
 
-export default function Overview() {
+/**
+ * 指挥舱（M45-S1）：总览页的数据逻辑，只换 Harmony 呈现。
+ * 口径与 Overview.tsx 逐项一致：5 指标定义、漂移三态过滤、告警 top5 截断、
+ * 用量 24h 分站点汇总与 7d 余额快照 delta——改任一口径都必须同步改单测。
+ */
+export default function Cockpit() {
   const { t } = useTranslation();
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
   const info = useQuery({ queryKey: ["app-info"], queryFn: appInfo });
   const sites = useQuery({ queryKey: ["sites"], queryFn: listSites });
   const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
@@ -37,55 +48,76 @@ export default function Overview() {
   });
 
   const drifted = (drift.data ?? []).filter(
-    (r) =>
-      r.state === "modified" ||
-      r.state === "missing" ||
-      // 文件存在但读不到：不是「被删了」，但同样要用户处理（复审 P2-4）
-      r.state === "unreadable",
+    (r) => r.state === "modified" || r.state === "missing" || r.state === "unreadable",
   );
   const hasUnreadable = drifted.some((r) => r.state === "unreadable");
-
-  // 会话已失效、需要重新登录的站点（B-61）。从站点表读，而不是只看上一轮刷新结果：
-  // 一轮刷新只反映那一刻，而这个状态是**持久**的——用户不重新登录就一直存在。
   const needsLogin = (sites.data ?? []).filter((s) => s.health === "needs_login");
-
-  const warnings = (events.data ?? []).filter(
-    (e) => e.level === "warn" || e.level === "error",
-  );
+  const warnings = (events.data ?? []).filter((e) => e.level === "warn" || e.level === "error");
 
   return (
     <section className="page">
-      <div className="cards">
-        <Stat
-          icon={<Server size={16} aria-hidden />}
-          label={t("overview.stat.sites")}
-          value={sites.data?.length ?? "—"}
-        />
-        <Stat
-          icon={<KeyRound size={16} aria-hidden />}
-          label={t("overview.stat.keys")}
-          value={keys.data?.length ?? "—"}
-        />
-        <Stat
-          icon={<ShieldCheck size={16} aria-hidden />}
-          label={t("overview.stat.consents")}
-          value={consents.data?.filter((c) => !c.revokedAt).length ?? "—"}
-        />
-        <Stat
-          icon={<AlertTriangle size={16} aria-hidden />}
-          label={t("overview.stat.alerts")}
-          value={warnings.length}
-          tone={warnings.length > 0 ? "warn" : undefined}
-        />
-        <Stat
-          icon={<ShieldCheck size={16} aria-hidden />}
-          label={t("overview.stat.drift")}
-          value={drifted.length}
-          tone={drifted.length > 0 ? "warn" : undefined}
-        />
+      <div className="hm-hero">
+        <div>
+          <h1>
+            {t("nav.brand")} <span>Relay</span>
+          </h1>
+          <p>
+            {info.data ? `${t("nav.brand")} ${info.data.version}` : "…"} · {t("overview.runState.mode")}
+            :{" "}
+            {runtimeMode === "tauri"
+              ? t("overview.runState.modeTauri")
+              : t("overview.runState.modeBrowser")}
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <span className="hm-pill">
+            {t("cockpit.live")} {now.toTimeString().slice(0, 8)}
+          </span>
+        </div>
       </div>
 
-      <div className="card run-state">
+      <div className="hm-grid8">
+        <div className="hm-card hm-metric" style={{ margin: 0 }}>
+          <div className="hm-label">{t("overview.stat.sites")}</div>
+          <div className="hm-num">{sites.data?.length ?? "—"}</div>
+        </div>
+        <div className="hm-card hm-metric" style={{ margin: 0 }}>
+          <div className="hm-label">{t("overview.stat.keys")}</div>
+          <div className="hm-num">{keys.data?.length ?? "—"}</div>
+        </div>
+        <div className="hm-card hm-metric" style={{ margin: 0 }}>
+          <div className="hm-label">{t("overview.stat.consents")}</div>
+          <div className="hm-num">
+            {consents.data ? consents.data.filter((c) => !c.revokedAt).length : "—"}
+          </div>
+        </div>
+        <div className="hm-card hm-metric" style={{ margin: 0 }}>
+          <div className="hm-label">{t("overview.stat.alerts")}</div>
+          <div className="hm-num">{events.isLoading ? "—" : warnings.length}</div>
+        </div>
+        <div className="hm-card hm-metric" style={{ margin: 0 }}>
+          <div className="hm-label">{t("overview.stat.drift")}</div>
+          <div className="hm-num">{drift.isLoading ? "—" : drifted.length}</div>
+        </div>
+        <div className="hm-card hm-metric" style={{ margin: 0 }}>
+          <div className="hm-label">{t("overview.runState.dataDir")}</div>
+          <div className="hm-num-sm mono ellipsis" title={info.data?.dataDir}>
+            {info.data?.dataDir ?? "…"}
+          </div>
+        </div>
+        <div className="hm-card hm-metric" style={{ margin: 0 }}>
+          <div className="hm-label">{t("overview.runState.db")}</div>
+          <div className="hm-num-sm mono ellipsis" title={info.data?.dbPath}>
+            {info.data?.dbPath ?? "…"}
+          </div>
+        </div>
+        <div className="hm-card hm-metric" style={{ margin: 0 }}>
+          <div className="hm-label">{t("overview.runState.vault")}</div>
+          <div className="hm-num-sm mono">{info.data?.vaultBackend ?? "…"}</div>
+        </div>
+      </div>
+
+      <div className="hm-card">
         <h3>{t("overview.runState.title")}</h3>
         <dl className="kv">
           <dt>{t("overview.runState.mode")}</dt>
@@ -94,22 +126,9 @@ export default function Overview() {
               ? t("overview.runState.modeTauri")
               : t("overview.runState.modeBrowser")}
           </dd>
-          <dt>{t("overview.runState.dataDir")}</dt>
-          <dd className="mono ellipsis" title={info.data?.dataDir}>
-            {info.data?.dataDir ?? "…"}
-          </dd>
-          <dt>{t("overview.runState.db")}</dt>
-          <dd className="mono ellipsis" title={info.data?.dbPath}>
-            {info.data?.dbPath ?? "…"}
-          </dd>
           <dt>{t("overview.runState.version")}</dt>
-          <dd className="mono">
-            {info.data ? `${t("nav.brand")} ${info.data.version}` : "…"}
-          </dd>
-          <dt>{t("overview.runState.vault")}</dt>
-          <dd className="mono">{info.data?.vaultBackend ?? "…"}</dd>
+          <dd className="mono">{info.data ? `${t("nav.brand")} ${info.data.version}` : "…"}</dd>
         </dl>
-
         <button
           type="button"
           className="btn"
@@ -133,22 +152,18 @@ export default function Overview() {
               : ""}
           </p>
         ) : null}
-        {/* 刷新失败必须说出来（M8-S5B §6.8）：`refresh_all` 出错时整个 mutation 走
-            onError，而这里原本只渲染 `refresh.data`（成功分支）⇒ 界面上「成功」与
-            「失败」看不出差别，用户会以为刷新成功了。 */}
         {refresh.isError ? (
           <p className="error" role="alert">
-            <AlertTriangle size={14} aria-hidden /> {t("overview.error.refreshFailed", { error: refresh.error.message })}
+            <AlertTriangle size={14} aria-hidden />{" "}
+            {t("overview.error.refreshFailed", { error: refresh.error.message })}
           </p>
         ) : null}
-
         {info.data?.vaultBackend === "memory" ? (
           <p className="error" role="alert">
             <AlertTriangle size={14} aria-hidden /> {t("overview.error.memoryVaultPre")}
             {t("overview.error.memoryVaultPost")}
           </p>
         ) : null}
-
         {runtimeMode === "browser" ? (
           <p className="warn" role="status">
             {t("overview.warn.browserPreviewPre")}
@@ -161,9 +176,10 @@ export default function Overview() {
       <RebrandNotice rebrand={info.data?.rebrand} dataDir={info.data?.dataDir} />
 
       {needsLogin.length ? (
-        <div className="card">
+        <div className="hm-card">
           <h3>
-            <AlertTriangle size={15} aria-hidden /> {t("overview.needsLogin.title", { count: needsLogin.length })}
+            <AlertTriangle size={15} aria-hidden />{" "}
+            {t("overview.needsLogin.title", { count: needsLogin.length })}
           </h3>
           <ul className="list">
             {needsLogin.map((s) => (
@@ -180,9 +196,10 @@ export default function Overview() {
       ) : null}
 
       {drifted.length ? (
-        <div className="card">
+        <div className="hm-card">
           <h3>
-            <AlertTriangle size={15} aria-hidden /> {t("overview.drift.title", { count: drifted.length })}
+            <AlertTriangle size={15} aria-hidden />{" "}
+            {t("overview.drift.title", { count: drifted.length })}
           </h3>
           <ul className="list">
             {drifted.map((r) => (
@@ -202,8 +219,6 @@ export default function Overview() {
             <span className="mono">modified</span>
             {t("overview.drift.hint1Post")}
           </p>
-          {/* 回滚只还原文件、不动绑定 ⇒ 用户自己回滚过的目标也会被报在这里（M3-S1 既定语义，B-126）。
-              不说这一句，上面「重新投递」那条会把用户引去撤销他刚做的回滚（复审 P2-1）。 */}
           <p className="muted">
             <strong>{t("overview.drift.hint2Pre")}</strong>
             {t("overview.drift.hint2Post")}
@@ -221,7 +236,7 @@ export default function Overview() {
       ) : null}
 
       {warnings.length ? (
-        <div className="card">
+        <div className="hm-card">
           <h3>{t("overview.alerts.title")}</h3>
           <ul className="list">
             {warnings.slice(0, 5).map((row) => (
@@ -235,8 +250,9 @@ export default function Overview() {
           </ul>
         </div>
       ) : null}
+
       {gatewayUsage.data?.length || usageSnapshots.data?.length ? (
-        <div className="card">
+        <div className="hm-card">
           <h3>{t("overview.usage.title")}</h3>
           {(() => {
             const siteName = (id: number) =>
@@ -312,28 +328,5 @@ export default function Overview() {
         </div>
       ) : null}
     </section>
-  );
-}
-
-function Stat({
-  icon,
-  label,
-  value,
-  tone,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: number | string;
-  /** M33-S1：>0 的告警类指标给告警色调（中性时不传，样式与文案都不变）。 */
-  tone?: "warn" | "danger";
-}) {
-  return (
-    <div className={tone ? `stat stat-${tone}` : "stat"}>
-      <span className="stat-icon">{icon}</span>
-      <div className="stat-label">
-        <span>{label}</span>
-      </div>
-      <div className="stat-value">{value}</div>
-    </div>
   );
 }

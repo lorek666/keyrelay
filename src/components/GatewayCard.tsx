@@ -62,7 +62,7 @@ type Props = {
  * - 刚启动（`uptimeSecs < 3`，缺失时回退 `requestsTotal < 3`）⇒ QPS 显示 `—`（样本不足，不拿 0.3 秒的窗口吹稳定值）。
  * - `lastError == null` ⇒ 显示「无」（不显示空白：读者分不清「没有」与「没加载」）。
  */
-function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
+export function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
   const { t } = useTranslation();
   if (!status || !status.running) {
     return (
