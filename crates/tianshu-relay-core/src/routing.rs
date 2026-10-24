@@ -246,6 +246,46 @@ fn ordered<'a>(upstreams: impl Iterator<Item = &'a Upstream>) -> Vec<&'a Upstrea
     keyed.into_iter().map(|(_, u)| u).collect()
 }
 
+/// M46-S2：EWMA 平滑系数（固定值，不可配——可配会让两台网关的选路行为不可复现）。
+pub const EWMA_ALPHA: f64 = 0.2;
+
+/// M46-S2：一次成功样本后的 EWMA。首次样本直接作为初值（不是 `alpha × 样本`）：
+/// `None ⇒ 样本`；`Some(prev) ⇒ alpha × 样本 + (1 − alpha) × prev`。
+/// 纯函数：只算数，不判定「成功」——调用方（网关成功分支）负责只喂成功样本。
+pub fn ewma_update(previous: Option<f64>, sample_ms: u64) -> f64 {
+    match previous {
+        None => sample_ms as f64,
+        Some(prev) => EWMA_ALPHA * sample_ms as f64 + (1.0 - EWMA_ALPHA) * prev,
+    }
+}
+
+/// M46-S2：按有效延迟重排候选（网关 handler 在 `weighted_pick` 前调用）。
+///
+/// 排序键与 [`SortKey`] 逐字同一套（余额档位 → 倍率 → 延迟 → `site_id`），
+/// 只把延迟一项换成有效延迟：`ewma_ms(site)` 有值（且有限）⇒ `round()` 到毫秒
+/// （静态延迟本就是 `u64` 毫秒，排序粒度即毫秒）；否则回退 `Upstream.latency_ms`。
+/// 输入输出都是 `Vec<Candidate>`：`probe` 旗标跟着候选走，不增不减；
+/// 权重公式不在这里（`weighted_pick` 的槽位份额只由 `rate` 定），
+/// 本函数只改变组首次出现顺序与失败切换顺序。
+/// 全序（末位 `site_id` 兜底），输出与输入顺序无关。
+pub fn reorder_by_effective_latency<'a>(
+    candidates: Vec<Candidate<'a>>,
+    ewma_ms: &dyn Fn(i64) -> Option<f64>,
+) -> Vec<Candidate<'a>> {
+    let mut keyed: Vec<(SortKey, Candidate<'a>)> = candidates
+        .into_iter()
+        .map(|c| {
+            let effective = ewma_ms(c.upstream.site_id)
+                .filter(|v| v.is_finite())
+                .map(|v| v.round().max(0.0) as u64)
+                .or(c.upstream.latency_ms);
+            (SortKey::of_with_latency(c.upstream, effective), c)
+        })
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.into_iter().map(|(_, c)| c).collect()
+}
+
 /// 余额健康度档位：0 = 有余额，1 = 未知（`None` 或 `NaN`），2 = 已耗尽。
 ///
 /// `NaN` 归入「未知」而不是「已耗尽」：`NaN` 表示**算不出来**，不是「没钱了」。
@@ -286,11 +326,18 @@ struct SortKey {
 
 impl SortKey {
     fn of(u: &Upstream) -> Self {
+        Self::of_with_latency(u, u.latency_ms)
+    }
+
+    /// M46-S2：与 `of` 同一套键，只把延迟一项换成调用方给的有效延迟
+    /// （实测 EWMA 或回退后的静态值）。`None` = 延迟缺失（排最后），
+    /// 与 `of` 的 `latency_missing` 语义逐字一致。
+    fn of_with_latency(u: &Upstream, latency_ms: Option<u64>) -> Self {
         let (rate_missing, rate) = match u.rate {
             Some(x) if !x.is_nan() => (false, x),
             _ => (true, 0.0),
         };
-        let (latency_missing, latency) = match u.latency_ms {
+        let (latency_missing, latency) = match latency_ms {
             Some(x) => (false, x),
             None => (true, 0),
         };
@@ -832,6 +879,155 @@ mod tests {
         assert_eq!(b.state(&site_key(1), t2), BreakerState::Open);
         let t3 = t1 + Duration::from_secs(61);
         assert_eq!(b.state(&site_key(1), t3), BreakerState::HalfOpen);
+    }
+
+    // ============================================================ M46-S2：EWMA
+
+    #[test]
+    fn ewma_update_first_sample_is_the_sample() {
+        // 首次样本直接作为初值，不是 alpha × 样本（0.2 × 200 = 40 是错的）。
+        assert_eq!(ewma_update(None, 200), 200.0);
+        assert_eq!(ewma_update(None, 0), 0.0);
+    }
+
+    #[test]
+    fn ewma_update_applies_alpha_0_2() {
+        assert_eq!(EWMA_ALPHA, 0.2);
+        assert!((ewma_update(Some(100.0), 200) - 120.0).abs() < 1e-9);
+        assert!((ewma_update(Some(120.0), 200) - 136.0).abs() < 1e-9);
+        assert!((ewma_update(Some(136.0), 0) - 108.8).abs() < 1e-9);
+    }
+
+    fn reorder_sites(
+        ups: &[Upstream],
+        probes: &[bool],
+        ewma: &dyn Fn(i64) -> Option<f64>,
+    ) -> Vec<i64> {
+        let candidates: Vec<Candidate<'_>> = ups
+            .iter()
+            .zip(probes.iter())
+            .map(|(u, p)| Candidate {
+                upstream: u,
+                probe: *p,
+            })
+            .collect();
+        reorder_by_effective_latency(candidates, ewma)
+            .iter()
+            .map(|c| c.upstream.site_id)
+            .collect()
+    }
+
+    #[test]
+    fn reorder_by_effective_latency_matches_static_order_without_ewma() {
+        // 回退用例：无 EWMA 时重排输出必须与 RouteTable::candidates 逐字相等。
+        let a = up(1, Some(1.0), Some(10.0), Some(200));
+        let b = up(2, Some(0.5), Some(10.0), Some(10));
+        let c = up(3, Some(1.0), None, Some(5));
+        let d = up(4, Some(1.0), Some(0.0), Some(1));
+        let ups = vec![a, b, c, d];
+        let route = RouteTable::new(ups.clone());
+        let expected: Vec<i64> = route
+            .candidates("gpt-5.6")
+            .iter()
+            .map(|u| u.site_id)
+            .collect();
+        let got = reorder_sites(&ups, &[false, false, false, false], &|_| None);
+        assert_eq!(got, expected, "无 EWMA 时重排不得改变静态顺序");
+    }
+
+    #[test]
+    fn reorder_by_effective_latency_substitutes_ewma_for_static() {
+        let a = up(1, Some(1.0), Some(10.0), Some(10));
+        let b = up(2, Some(1.0), Some(10.0), Some(200));
+        let ups = vec![a, b];
+        let got = reorder_sites(&ups, &[false, false], &|site| match site {
+            1 => Some(300.0),
+            2 => Some(50.0),
+            _ => None,
+        });
+        assert_eq!(got, vec![2, 1], "EWMA 必须替换静态延迟参与排序");
+    }
+
+    #[test]
+    fn reorder_by_effective_latency_falls_back_to_static_when_missing() {
+        let a = up(1, Some(1.0), Some(10.0), Some(10));
+        let b = up(2, Some(1.0), Some(10.0), Some(10));
+        let ups = vec![a, b];
+        // A 有 EWMA 300，B 无 EWMA、静态 10 ⇒ B 在前（回退，不是按缺失排最后）。
+        let got = reorder_sites(&ups, &[false, false], &|site| match site {
+            1 => Some(300.0),
+            _ => None,
+        });
+        assert_eq!(got, vec![2, 1]);
+        // 两边都缺失 ⇒ 静态平局 ⇒ site_id 兜底。
+        let got = reorder_sites(&ups, &[false, false], &|_| None);
+        assert_eq!(got, vec![1, 2]);
+    }
+
+    #[test]
+    fn reorder_by_effective_latency_keeps_rate_and_health_precedence() {
+        // 便宜慢站仍排在贵快站前面（倍率档位在延迟之前）。
+        let cheap_slow = up(1, Some(0.5), Some(10.0), Some(10));
+        let pricey_fast = up(2, Some(2.0), Some(10.0), Some(10));
+        let ups = vec![cheap_slow, pricey_fast];
+        let got = reorder_sites(&ups, &[false, false], &|site| match site {
+            1 => Some(500.0),
+            2 => Some(5.0),
+            _ => None,
+        });
+        assert_eq!(got, vec![1, 2], "EWMA 不得推翻倍率档位");
+        // 余额耗尽快站仍排在健康慢站后面（健康档位在延迟之前）。
+        let exhausted_fast = up(1, Some(1.0), Some(0.0), Some(10));
+        let healthy_slow = up(2, Some(1.0), Some(10.0), Some(10));
+        let ups = vec![exhausted_fast, healthy_slow];
+        let got = reorder_sites(&ups, &[false, false], &|site| match site {
+            1 => Some(5.0),
+            2 => Some(500.0),
+            _ => None,
+        });
+        assert_eq!(got, vec![2, 1], "EWMA 不得推翻健康档位");
+    }
+
+    #[test]
+    fn reorder_by_effective_latency_preserves_probe_flags() {
+        let slow_probe = up(1, Some(1.0), Some(10.0), Some(10));
+        let fast_plain = up(2, Some(1.0), Some(10.0), Some(200));
+        let ups = [slow_probe, fast_plain];
+        let candidates: Vec<Candidate<'_>> = vec![
+            Candidate {
+                upstream: &ups[0],
+                probe: true,
+            },
+            Candidate {
+                upstream: &ups[1],
+                probe: false,
+            },
+        ];
+        let reordered = reorder_by_effective_latency(candidates, &|site| match site {
+            1 => Some(300.0),
+            2 => Some(50.0),
+            _ => None,
+        });
+        assert_eq!(reordered.len(), 2);
+        // 快站排前，但探针旗标仍绑在慢站身上（不剥离、不重建）。
+        assert_eq!(reordered[0].upstream.site_id, 2);
+        assert!(!reordered[0].probe);
+        assert_eq!(reordered[1].upstream.site_id, 1);
+        assert!(reordered[1].probe);
+    }
+
+    #[test]
+    fn reorder_by_effective_latency_rounds_ewma_to_milliseconds() {
+        // 10.4 与 10.49 都舍入到 10ms ⇒ 平局 ⇒ site_id 兜底（毫秒粒度是设计）。
+        let a = up(2, Some(1.0), Some(10.0), Some(10));
+        let b = up(1, Some(1.0), Some(10.0), Some(10));
+        let ups = vec![a, b];
+        let got = reorder_sites(&ups, &[false, false], &|site| match site {
+            2 => Some(10.4),
+            1 => Some(10.49),
+            _ => None,
+        });
+        assert_eq!(got, vec![1, 2]);
     }
 
     #[test]

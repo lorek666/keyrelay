@@ -36,9 +36,9 @@ use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::routing::{
-    model_key, should_failover, site_key, weighted_pick, Breaker, BreakerKey, BreakerPolicy,
-    BreakerState, Candidate, GuardOutcome, RoundRobinState, RouteTable, SiteGuard, SiteGuardPolicy,
-    SiteLease, Upstream,
+    ewma_update, model_key, reorder_by_effective_latency, should_failover, site_key, weighted_pick,
+    Breaker, BreakerKey, BreakerPolicy, BreakerState, Candidate, GuardOutcome, RoundRobinState,
+    RouteTable, SiteGuard, SiteGuardPolicy, SiteLease, Upstream,
 };
 
 /// 回传上游响应体的大小上限。
@@ -1024,6 +1024,9 @@ pub struct SiteMetrics {
     pub failovers: u64,
     /// 最近一次尝试的 TTFB（毫秒）。
     pub last_latency_ms: Option<u64>,
+    /// M46-S2：成功请求的 TTFB 的 EWMA（毫秒，alpha 0.2）。
+    /// `None` = 尚无成功样本（选路回退静态延迟；不是「实测 0ms」）。
+    pub ewma_latency_ms: Option<f64>,
     pub last_status: Option<u16>,
     /// 已 `scrub` 且截断到 200 字符。
     pub last_error: Option<String>,
@@ -1165,6 +1168,29 @@ impl GatewayMetrics {
             e.last_latency_ms = Some(latency_ms);
             e.last_status = Some(status);
         }
+    }
+
+    /// M46-S2：记一次成功请求的 TTFB 进 EWMA。**只由成功分支调用**——
+    /// 失败路径（429 / 5xx / 传输失败）不调，失败不污染 EWMA。
+    /// 锁中毒 ⇒ 跳过（可用性优先，与 `record_attempt` 同口径）。
+    fn record_measured_latency(&self, site_id: i64, latency_ms: u64) {
+        if let Ok(mut map) = self.per_site.lock() {
+            let e = map.entry(site_id).or_default();
+            e.ewma_latency_ms = Some(ewma_update(e.ewma_latency_ms, latency_ms));
+        }
+    }
+
+    /// M46-S2：选路用的每站 EWMA 快照（只有 `Some` 的站进 map）。
+    /// 锁中毒 ⇒ 空 map（选路退化为静态顺序）。
+    fn ewma_latency_map(&self) -> std::collections::BTreeMap<i64, f64> {
+        self.per_site
+            .lock()
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(site_id, metrics)| metrics.ewma_latency_ms.map(|v| (*site_id, v)))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// 一次失败（原因先剥 URL，再 scrub + 截断；M40-S2 复审 P1）。
@@ -2278,6 +2304,12 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         .filter(|c| is_sendable(&state, view.keys(), c.upstream))
         .collect();
 
+    // M46-S2：按实测 EWMA 重排（在 weighted_pick 之前；本行不读 round_robin，
+    // 所以 cursor 消耗规则逐字不变；权重公式在 weighted_pick 内只由 rate 定，
+    // 重排只改变组首次出现顺序与失败切换顺序）。
+    let ewma = state.metrics.ewma_latency_map();
+    let sendable = reorder_by_effective_latency(sendable, &|site_id| ewma.get(&site_id).copied());
+
     // M39-S3 §4.1：加权轮转只决定**第一个**尝试谁；失败切换仍按确定性顺序走其余候选。
     // 单候选 / 有探针时不读计数器（`weighted_pick` 内部保证）。
     let top_n = state.config.lb_top_n;
@@ -2393,6 +2425,11 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                     );
                 } else {
                     record_success(&state, &breaker_key, Instant::now());
+                    // M46-S2：唯一 EWMA 更新点，与 record_success 同分支
+                    // （成功定义同源；429 / 5xx / 传输失败不走到这里）。
+                    state
+                        .metrics
+                        .record_measured_latency(upstream.site_id, latency_ms);
                 }
                 // M16-S4 / P2-13：**只有 429 才重放**（上游明确没处理这个请求）。
                 // 其余状态码——含 5xx / 524 / 504 这类可能已经计费的——一律**原样返回**：
@@ -3463,6 +3500,31 @@ pub fn generate_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M46-S2：成功样本喂 EWMA，且快照携带同一值；失败尝试不写 EWMA。
+    #[test]
+    fn measured_latency_feeds_ewma_and_snapshot() {
+        let metrics = GatewayMetrics::new();
+        assert!(metrics.ewma_latency_map().is_empty());
+        metrics.record_measured_latency(7, 200);
+        metrics.record_measured_latency(7, 200);
+        metrics.record_measured_latency(7, 0);
+        // 200 → 200 → 0.2×0 + 0.8×200 = 160。
+        let map = metrics.ewma_latency_map();
+        assert_eq!(map.len(), 1);
+        assert!(
+            (map[&7] - 160.0).abs() < 1e-9,
+            "EWMA 应为 160，实测 {:?}",
+            map.get(&7)
+        );
+        let snap = metrics.snapshot();
+        assert_eq!(snap.per_site[&7].ewma_latency_ms, Some(160.0));
+        // record_attempt 不写 EWMA：只被尝试过（失败）的站 EWMA 仍为 None。
+        metrics.record_attempt(9, 200, 33);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.per_site[&9].ewma_latency_ms, None);
+        assert_eq!(snap.per_site[&9].last_latency_ms, Some(33));
+    }
 
     /// M40-S2 复审 P1：`lastError` 不得带 URL/域名，且仍保留分类与状态码。
     #[test]

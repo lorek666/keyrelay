@@ -495,6 +495,8 @@ pub struct GatewayStatusDto {
     failovers_total: u64,
     last_error: Option<String>,
     generation: u64,
+    /// M46-S2：每站 EWMA（毫秒）；未运行 / 无样本 ⇒ 空 map（字段恒在，IPC 形状稳定）。
+    ewma_latency_ms: std::collections::BTreeMap<i64, f64>,
     tokens: Vec<GatewayTokenDto>,
 }
 
@@ -1872,6 +1874,7 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
         failovers_total: 0,
         last_error: None,
         generation: 0,
+        ewma_latency_ms: std::collections::BTreeMap::new(),
 
         tokens: tokens.clone(),
     };
@@ -1930,6 +1933,12 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             .filter(|v| v.last_error.is_some())
             .max_by_key(|v| v.last_error_at.unwrap_or(0))
             .and_then(|v| v.last_error.clone());
+        // M46-S2：每站 EWMA（只有 Some 的站进 map；无样本的站不在 map 里）。
+        let ewma_latency_ms = m
+            .per_site
+            .iter()
+            .filter_map(|(site_id, v)| v.ewma_latency_ms.map(|ewma| (*site_id, ewma)))
+            .collect();
         GatewayStatusDto {
             running: true,
             phase: "running".to_string(),
@@ -1952,6 +1961,7 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             failovers_total: m.failovers_total,
             last_error,
             generation: run.handle.generation(),
+            ewma_latency_ms,
 
             tokens,
         }
@@ -1981,6 +1991,7 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             failovers_total: 0,
             last_error: None,
             generation: 0,
+            ewma_latency_ms: std::collections::BTreeMap::new(),
 
             tokens,
         }

@@ -466,6 +466,11 @@ export type GatewayStatus = {
   /** 已脱敏的最近错误；没有则为 null（UI 显示「无」）。 */
   lastError: string | null;
   generation: number;
+  /**
+   * M46-S2：每站 EWMA（毫秒，键为站点 id）。旧后端无此字段时为 undefined，
+   * 调用方回退为空 map；未运行 / 无样本时后端给空 map（UI 暂不渲染）。
+   */
+  ewmaLatencyMs?: Record<number, number>;
 };
 
 export type GatewayCandidate = {
