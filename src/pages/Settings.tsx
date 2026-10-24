@@ -1001,6 +1001,8 @@ export default function SettingsPage() {
             modelsMinIntervalSecs={draft.modelsMinIntervalSecs}
             maxRequestMib={draft.gatewayMaxRequestMib}
             perSiteBurst={draft.gatewayPerSiteBurst}
+            perSiteConcurrency={draft.gatewayPerSiteConcurrency}
+            perSiteRateLimit={draft.gatewayPerSiteRateLimit}
             maxAttempts={draft.gatewayMaxAttempts}
             keyHealthIntervalSecs={draft.gatewayKeyHealthIntervalSecs}
             routingRules={draft.routingRules}
@@ -1020,6 +1022,12 @@ export default function SettingsPage() {
             }
             onPerSiteBurstChange={(gatewayPerSiteBurst) =>
               setDraft({ ...draft, gatewayPerSiteBurst })
+            }
+            onPerSiteConcurrencyChange={(gatewayPerSiteConcurrency) =>
+              setDraft({ ...draft, gatewayPerSiteConcurrency })
+            }
+            onPerSiteRateLimitChange={(gatewayPerSiteRateLimit) =>
+              setDraft({ ...draft, gatewayPerSiteRateLimit })
             }
             onMaxAttemptsChange={(gatewayMaxAttempts) =>
               setDraft({ ...draft, gatewayMaxAttempts })

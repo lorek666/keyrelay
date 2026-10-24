@@ -38,6 +38,10 @@ type Props = {
   maxRequestMib: number;
   /** 每站限流 burst（M46-S3）：令牌桶额外容量，0 = 关，0..=10000。 */
   perSiteBurst: number;
+  /** 每站并发上限（M46-UI B-241）：1..=128，默认 8。 */
+  perSiteConcurrency: number;
+  /** 每站每秒上限（M46-UI B-241）：0 = 不限速，0..=10000。 */
+  perSiteRateLimit: number;
   /** 每请求最多尝试候选数（M46-S4）：0 = 走全部候选，0..=64。 */
   maxAttempts: number;
   /** 密钥健康巡检间隔（秒，M46-UI B-237）：0 = 关，非 0 时 60..=86400。 */
@@ -51,6 +55,8 @@ type Props = {
   onModelsIntervalChange: (secs: number) => void;
   onMaxRequestMibChange: (mib: number) => void;
   onPerSiteBurstChange: (burst: number) => void;
+  onPerSiteConcurrencyChange: (n: number) => void;
+  onPerSiteRateLimitChange: (n: number) => void;
   onMaxAttemptsChange: (n: number) => void;
   onKeyHealthIntervalChange: (secs: number) => void;
   /** M46-S7：路由规则 JSON 文本变更（直传，不在前端解析）。 */
@@ -165,6 +171,8 @@ export default function GatewayCard({
   modelsMinIntervalSecs,
   maxRequestMib,
   perSiteBurst,
+  perSiteConcurrency,
+  perSiteRateLimit,
   maxAttempts,
   keyHealthIntervalSecs,
   routingRules,
@@ -175,6 +183,8 @@ export default function GatewayCard({
   onModelsIntervalChange,
   onMaxRequestMibChange,
   onPerSiteBurstChange,
+  onPerSiteConcurrencyChange,
+  onPerSiteRateLimitChange,
   onMaxAttemptsChange,
   onKeyHealthIntervalChange,
   onRoutingRulesChange,
@@ -602,6 +612,50 @@ export default function GatewayCard({
         />
       </label>
       <p className="muted">{t("gateway.perSiteBurstHint")}</p>
+
+      {/*
+        M46-UI B-241：每站并发上限与每秒上限。口径与 burst 输入框相同（受控
+        number，越界/非整数不调 onChange，后端 validate 是第二道）；保存后
+        下次启动网关生效。两个字段都是 burst 的生效前提字段：burst 只抬高
+        令牌桶容量，不提高补充速率，且 rate = 0 时桶分支整体跳过、burst 无效。
+      */}
+      <label className="field">
+        <span>{t("gateway.perSiteConcurrencyLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={1}
+          max={128}
+          step={1}
+          value={perSiteConcurrency}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isInteger(n) && n >= 1 && n <= 128) {
+              onPerSiteConcurrencyChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.perSiteConcurrencyHint")}</p>
+
+      <label className="field">
+        <span>{t("gateway.perSiteRateLimitLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={0}
+          max={10000}
+          step={1}
+          value={perSiteRateLimit}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isInteger(n) && n >= 0 && n <= 10000) {
+              onPerSiteRateLimitChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.perSiteRateLimitHint")}</p>
 
       {/*
         M46-S4：每请求最多尝试候选数。口径与 burst 输入框相同（受控 number，
