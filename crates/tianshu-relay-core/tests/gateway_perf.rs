@@ -70,10 +70,14 @@ fn cfg(port: u16) -> GatewayConfig {
         upstream_proxy: None,
         legacy_key_ref: None,
         lb_top_n: 1,
+        max_attempts: 0,
         guard_policy: SiteGuardPolicy::default(),
         runtime: None,
         on_failure: None,
         on_usage: None,
+        budget_check: None,
+        on_budget_breach: None,
+        routing_rules: Vec::new(),
         max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
     }
 }

@@ -26,14 +26,13 @@
       "delivery": "投递",
       "system": "系统"
     },
-    "overview": "总览",
-    "sites": "站点",
-    "keys": "密钥",
-    "agents": "Agent 投递",
-    "history": "变更历史",
-    "settings": "设置",
-    "probe": "模型检测",
-    "usage": "用量"
+    "cockpit": "指挥舱",
+    "traffic": "流量",
+    "cost": "成本",
+    "health": "健康",
+    "assets": "资产",
+    "delivery": "投递",
+    "settings": "设置"
   },
   "usage": {
     "cost": {
@@ -45,6 +44,47 @@
       "unpriced": "未知（未定价）",
       "partial": "另有 {count} 条未定价",
       "allUnpriced": "{count} 条全部未定价"
+    },
+    "budgets": {
+      "title": "硬预算（超了即停）",
+      "body": "当期已花达到上限时，网关会拦下该站点 / 密钥的候选（429 本地拒绝），新周期自动恢复。只计 USD 定价的用量；未定价与 CNY 定价的用量不计入。",
+      "site": "站点",
+      "sitePlaceholder": "选择站点",
+      "key": "密钥",
+      "keyAll": "全部密钥（全站合计）",
+      "period": "周期",
+      "periodDay": "按日",
+      "periodMonth": "按月",
+      "limit": "上限（USD）",
+      "spent": "当期已花",
+      "save": "保存",
+      "delete": "删除",
+      "empty": "还没有预算。",
+      "note": "超标即拦，没有预警分档；新建与删除立即生效，无需重启网关。"
+    },
+    "reconciliation": {
+      "title": "账单对账（网关成本 vs 站点账单）",
+      "body": "按站点、按天对比网关侧成本与已导入的站点账单。注意覆盖度：目前账单来源基本只有 NewAPI 系导入，其它来源的账单只有被导入后才会出现；数据随导入节拍更新，有滞后，不是实时全来源对账。差异超过 max（5%，$1）标为超阈值。",
+      "daysLabel": "窗口（天）",
+      "daysOption": "{days} 天",
+      "flaggedOnly": "仅看超阈值",
+      "day": "日期",
+      "site": "站点",
+      "gateway": "网关成本",
+      "bill": "站点账单",
+      "diff": "差异",
+      "kind": "存在分区",
+      "flagged": "标记",
+      "kindValues": {
+        "matched": "双方都有",
+        "gateway_only": "仅网关",
+        "bill_only": "仅账单"
+      },
+      "flaggedYes": "超阈值",
+      "incomparableTitle": "不可比行",
+      "incomparableNote": "以下行的账单币种非 USD、为空，或账单金额为空，无法与网关侧 USD 成本比较，故不参与超阈值筛选；它们在 IPC 里同样 flagged=true，但这里单独立组，不与超阈值行混在一起。",
+      "empty": "该窗口内没有对账行。",
+      "flaggedEmpty": "该窗口内没有超阈值行。"
     },
     "agents": {
       "title": "按 Agent 成本",
@@ -278,6 +318,9 @@
       "balance": "{site}: 已用 {used} {currency} / 剩余 {remaining}{delta}",
       "delta": "（{delta}）"
     }
+  },
+  "cockpit": {
+    "live": "实时"
   },
   "sites": {
     "title": "接入新站点",
@@ -1055,7 +1098,8 @@
         "site": "站点",
         "key": "密钥",
         "health": "健康",
-        "breaker": "熔断"
+        "breaker": "熔断",
+        "ewmaLatency": "EWMA 延迟"
       },
       "health": {
         "healthy": "健康",
@@ -1126,6 +1170,27 @@
     },
     "maxRequestLabel": "请求体上限（MiB，1–64）",
     "maxRequestHint": "只限制**请求体**大小（1–64 MiB）。响应体上限固定为 64 MiB，与这里无关；保存后下次启动网关生效。",
+    "perSiteBurstLabel": "每站限流 burst（0–10000，0=关）",
+    "perSiteBurstHint": "仅在每站每秒上限大于 0 时生效：令牌桶容量变为「每秒上限 + burst」，突发的第一批请求不再被误杀；每秒补充仍是每秒上限，长期速率不变。保存后下次启动网关生效。",
+    "perSiteConcurrencyLabel": "每站并发上限（1–128）",
+    "perSiteConcurrencyHint": "每站同时在飞的上游请求上限；超了的请求本地拒绝（429 local_rate_limited），不喂熔断。保存后下次启动网关生效。",
+    "perSiteRateLimitLabel": "每站每秒上限（0–10000，0=不限速）",
+    "perSiteRateLimitHint": "每站每秒允许的新请求数；0 = 不限速，此时 burst 也不生效（burst 只有在每秒上限大于 0 时才抬高令牌桶容量）。保存后下次启动网关生效。",
+    "maxAttemptsLabel": "每请求最多尝试候选数（0–64，0=走全部）",
+    "maxAttemptsHint": "0 = 走全部候选（今天行为）；大于 0 时每请求最多尝试这么多个候选，超了就返回最后一条真实错误，不编新错误。只计实际发出去的上游尝试，本地保护拒绝的候选不计。保存后下次启动网关生效。",
+    "keyHealthIntervalLabel": "密钥健康巡检间隔（秒，0=关）",
+    "keyHealthIntervalHint": "0 = 关闭巡检；非 0 时每隔这么多秒用 GET /v1/models 探活一次，死 key 提前标红摘除。合法范围 60–86400 秒，超出会在失焦时钳制。巡检花上游配额，默认关闭。保存后下次启动网关生效。",
+    "keyHealthIntervalClamped": "已钳制到合法范围（0=关，或 60–86400 秒）。",
+    "routingRulesLabel": "按 agent 路由规则（JSON，空 = 无规则）",
+    "routingRulesHint": "示例：[{\"agentLabel\": \"codex\", \"siteIds\": [1, 2]}]。agentLabel 与令牌 label 精确匹配（大小写敏感）；命中规则的 agent 只走规则列出的站点，未命中走全局加权；空 = 无规则。非法 JSON 保存时会被拒绝。保存后下次启动网关生效。",
+    "routingRulesAgent": "Agent",
+    "routingRulesAgentPlaceholder": "选择 Agent",
+    "routingRulesSites": "站点",
+    "routingRulesAddRow": "添加规则",
+    "routingRulesDeleteRow": "删除",
+    "routingRulesRowIncomplete": "该行未填完整：agent 与站点都要选，否则保存时后端会拒绝整单。",
+    "routingRulesFallbackNote": "当前规则文本不是结构化形状（解析失败），显示原文编辑；改成合法 JSON 数组后即回到结构化编辑。",
+    "routingRulesNoTokens": "暂无可用令牌 label：先在下方令牌区创建一个令牌，再回来选 agent。",
     "ipv6Degraded": "IPv6 回环未监听：{note}（仅 127.0.0.1 可用，v4 不受影响）",
     "batch": {
       "btn": "把已投递的通道批量改指网关…",
@@ -1178,6 +1243,16 @@
       "drift": "「总览」会一直把这个目标列为「需要处理」，每打开一次总览还会记一条「外部改动」告警——文件已经不是 天枢 Relay 最后一次投递写入的内容，这是预期的，不要据此重新投递（那等于撤销这次回滚）。",
       "rotation": "轮换这把密钥时这个文件会被重新写入；批量改指网关时它也仍在候选里。如果这次回滚把文件还原成了更早一次投递写下的**另一把**密钥：之后轮换或回收那把密钥时，天枢 Relay 不会重写这个文件，做完要回来给它投递一把仍然有效的密钥，否则 agent 会留在一把已被回收的密钥上。",
       "unbind": "不想再让 天枢 Relay 管它，到「Agent 投递」页解绑 {agent}。"
+    }
+  },
+  "health": {
+    "balance": {
+      "title": "余额",
+      "note": "各站点的余额总览；未知绝不当成 0。",
+      "error": "加载站点失败：{error}",
+      "empty": "还没有站点。",
+      "site": "站点",
+      "balance": "余额"
     }
   }
 }

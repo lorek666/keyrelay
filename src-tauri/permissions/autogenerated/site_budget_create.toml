@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-site-budget-create"
+description = "Enables the site_budget_create command without any pre-configured scope."
+commands.allow = ["site_budget_create"]
+
+[[permission]]
+identifier = "deny-site-budget-create"
+description = "Denies the site_budget_create command without any pre-configured scope."
+commands.deny = ["site_budget_create"]

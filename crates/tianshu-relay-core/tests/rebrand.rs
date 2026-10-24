@@ -4,7 +4,11 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// B-224 P3 / Linux 门禁：`PathBuf` 只在 macOS 专属用例里用，Linux 上成
+// 未用导入（`-D warnings` 下报错），故按平台引入。
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 
 use tianshu_relay_core::rebrand::{
     resolve_app_home, RebrandStatus, APP_DIR_NAME, DB_FILE_NAME, LEGACY_APP_DIR_NAME,

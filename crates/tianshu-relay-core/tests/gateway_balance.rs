@@ -16,7 +16,8 @@ use std::thread;
 use std::time::Duration;
 
 use tianshu_relay_core::gateway::{
-    start, GatewayConfig, GatewayFailure, GatewayHandle, UpstreamTimeout,
+    start, BudgetBreach, BudgetCheck, BudgetPeriod, GatewayConfig, GatewayFailure, GatewayHandle,
+    UpstreamTimeout,
 };
 use tianshu_relay_core::routing::{
     model_key, site_key, weighted_pick, Breaker, BreakerPolicy, BreakerState, Candidate,
@@ -188,6 +189,17 @@ async fn post(handle: &GatewayHandle, token: &str) -> (u16, String) {
         .expect("阻塞任务")
 }
 
+/// 与 [`post`] 相同，但指定请求模型（T3 单候选 cursor 用例：靠模型过滤
+/// 让候选集从单站扩到双站，验证单候选阶段没有消耗 cursor）。
+async fn post_model(handle: &GatewayHandle, token: &str, model: &str) -> (u16, String) {
+    let url = handle.local_url();
+    let token = token.to_string();
+    let body = format!(r#"{{"model":"{model}","messages":[]}}"#);
+    tokio::task::spawn_blocking(move || http_post(&url, &token, "/v1/chat/completions", &body))
+        .await
+        .expect("阻塞任务")
+}
+
 // ============================================================ 配置构造
 
 type Failures = Arc<Mutex<Vec<GatewayFailure>>>;
@@ -202,6 +214,28 @@ fn upstream(site_id: i64, base_url: &str, key_ref: &str, rate: f64) -> Upstream 
         rate: Some(rate),
         balance_usd: Some(10.0),
         latency_ms: Some(10),
+        timeout_ms: None,
+    }
+}
+
+/// 与 [`upstream`] 相同，但指定模型集合（T3 单候选 cursor 用例）。
+fn upstream_with_models(
+    site_id: i64,
+    base_url: &str,
+    key_ref: &str,
+    rate: f64,
+    models: &[&str],
+) -> Upstream {
+    Upstream {
+        site_id,
+        key_id: None,
+        base_url: base_url.to_string(),
+        key_ref: key_ref.to_string(),
+        models: models.iter().map(|m| m.to_string()).collect(),
+        rate: Some(rate),
+        balance_usd: Some(10.0),
+        latency_ms: Some(10),
+        timeout_ms: None,
     }
 }
 
@@ -233,6 +267,7 @@ fn config(
         route: RouteTable::new(route),
         breaker,
         lb_top_n: top_n,
+        max_attempts: 0,
         guard_policy: guard,
         keys_by_ref,
         upstream_timeout: UpstreamTimeout::default(),
@@ -244,6 +279,10 @@ fn config(
         })),
         on_observation: None,
         on_usage: None,
+        // M46-S5：既有用例默认不拦、不回调（行为与改动前逐字相同）。
+        budget_check: None,
+        on_budget_breach: None,
+        routing_rules: Vec::new(),
         upstream_proxy: None,
         legacy_key_ref: None,
         // M42-S1：请求体上限（既有用例用默认 16 MiB）
@@ -264,6 +303,7 @@ fn no_guard() -> SiteGuardPolicy {
     SiteGuardPolicy {
         max_concurrency: 0, // 0 = 不限
         rate_limit_per_sec: 0,
+        rate_burst: 0, // M46-S3：机械补字段，行为不变
     }
 }
 
@@ -341,6 +381,71 @@ fn single_candidate_does_not_touch_the_cursor() {
     let mut state = RoundRobinState::default();
     assert_eq!(state.next(), 0);
     assert_eq!(state.next(), 1);
+}
+
+/// B-224 P2-5（2026-10-24，按站点归一）：站点份额只由站点倍率决定，不被 key 数放大；
+/// 且站内 key 都轮得到（不是只有首 key 被选中）。
+/// 关键判别点是 key 数不等的情形：等倍率下 A 站 2 key、B 站 1 key 时，
+/// 按 key 计权重会得到 2:1（A 占 2 组槽位），按站点归一得到 1:1——本测试锁定后者。
+/// 2v2 一档锁定倍率比与站内 key 全覆盖（10:1 倍率 ⇒ 站点 100:10，两站的 key 都用到）。
+#[test]
+fn multi_key_sites_share_by_site_not_by_key_count() {
+    use std::collections::BTreeSet;
+    // 判别档：等倍率，A 2 key、B 1 key ⇒ 站点 50/50（旧按 key 计会是 2:1），A 两把 key 都用到。
+    let a1 = upstream(1, "http://127.0.0.1:1", REF_A, 1.0);
+    let a2 = upstream(1, "http://127.0.0.1:1", "kr/key/a2/secret", 1.0);
+    let b1 = upstream(2, "http://127.0.0.1:2", REF_B, 1.0);
+    let candidates = vec![cand(&a1, false), cand(&a2, false), cand(&b1, false)];
+    let mut counts = [0usize; 2];
+    let mut keys_a: BTreeSet<&str> = BTreeSet::new();
+    for cursor in 0..100u64 {
+        let picked = weighted_pick(&candidates, 10, cursor).unwrap();
+        match picked.site_id {
+            1 => {
+                counts[0] += 1;
+                keys_a.insert(picked.key_ref.as_str());
+            }
+            2 => counts[1] += 1,
+            other => panic!("意外站点 {other}"),
+        }
+    }
+    assert_eq!(
+        counts,
+        [50, 50],
+        "等倍率 2 key v 1 key 时站点应当 50/50，而不是 2:1"
+    );
+    assert_eq!(keys_a.len(), 2, "A 站两把 key 都应当轮到");
+    // 倍率档：10:1 倍率 2v2 ⇒ 站点 100:10，两站的 key 都用到。
+    let a1 = upstream(1, "http://127.0.0.1:1", REF_A, 0.1);
+    let a2 = upstream(1, "http://127.0.0.1:1", "kr/key/a2/secret", 0.1);
+    let b1 = upstream(2, "http://127.0.0.1:2", REF_B, 1.0);
+    let b2 = upstream(2, "http://127.0.0.1:2", "kr/key/b2/secret", 1.0);
+    let candidates = vec![
+        cand(&a1, false),
+        cand(&a2, false),
+        cand(&b1, false),
+        cand(&b2, false),
+    ];
+    let mut counts = [0usize; 2];
+    let mut keys_a: BTreeSet<&str> = BTreeSet::new();
+    let mut keys_b: BTreeSet<&str> = BTreeSet::new();
+    for cursor in 0..110u64 {
+        let picked = weighted_pick(&candidates, 10, cursor).unwrap();
+        match picked.site_id {
+            1 => {
+                counts[0] += 1;
+                keys_a.insert(picked.key_ref.as_str());
+            }
+            2 => {
+                counts[1] += 1;
+                keys_b.insert(picked.key_ref.as_str());
+            }
+            other => panic!("意外站点 {other}"),
+        }
+    }
+    assert_eq!(counts, [100, 10], "10:1 倍率 2v2 时站点应当 100:10");
+    assert_eq!(keys_a.len(), 2, "A 站两把 key 都应当轮到");
+    assert_eq!(keys_b.len(), 2, "B 站两把 key 都应当轮到");
 }
 
 /// T4：统计补充——1000 次里便宜站点至少是贵站点的 50 倍（不替代 T1 的精确序列）。
@@ -427,6 +532,7 @@ async fn per_site_concurrency_caps_in_flight_requests() {
         SiteGuardPolicy {
             max_concurrency: 2,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         open_breaker(),
     );
@@ -473,6 +579,7 @@ async fn token_bucket_boundary_is_per_second() {
         SiteGuardPolicy {
             max_concurrency: 0,
             rate_limit_per_sec: 2,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         open_breaker(),
     );
@@ -492,6 +599,103 @@ async fn token_bucket_boundary_is_per_second() {
     handle.shutdown_and_wait().await;
 }
 
+/// M46-S3：burst 只抬容量上限，不提高补充速率。
+/// rate=2 + burst=3 ⇒ 同秒 5 放行第 6 拒绝；1.1 秒后**只**恢复 2 个
+/// （若补充速率被误写成 cap=5，这里第 3 个也会放行，测试变红）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn token_bucket_burst_allows_initial_burst_then_refills_at_rate() {
+    let fast = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let (config, failures) = config(
+        vec![upstream(1, &fast.base_url, REF_A, 0.1)],
+        keys(&[(REF_A, KEY_A)]),
+        3,
+        SiteGuardPolicy {
+            max_concurrency: 0,
+            rate_limit_per_sec: 2,
+            rate_burst: 3,
+        },
+        open_breaker(),
+    );
+    let handle = start(config).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    for i in 1..=5 {
+        assert_eq!(post(&handle, &token).await.0, 200, "同秒第 {i} 个应放行");
+    }
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 429, "同秒第 6 个必须被令牌桶拒绝: {body}");
+    assert!(body.contains("local_rate_limited"), "{body}");
+    assert!(failures.lock().expect("锁").is_empty(), "限流不是上游故障");
+
+    // 1.1 秒后只恢复 rate = 2 个令牌，不是 cap = 5 个。
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(post(&handle, &token).await.0, 200, "恢复后第 1 个应放行");
+    assert_eq!(post(&handle, &token).await.0, 200, "恢复后第 2 个应放行");
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(
+        status, 429,
+        "恢复后第 3 个必须再被拒绝（补充速率未变）: {body}"
+    );
+    assert!(body.contains("local_rate_limited"), "{body}");
+    handle.shutdown_and_wait().await;
+}
+
+/// M46-S3：burst=0 与旧语义等价——与 T6 同一脚本，只把 burst 置 0，
+/// 放行/拒绝序列必须与旧实现逐字相同。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn token_bucket_burst_zero_matches_legacy_semantics() {
+    let fast = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let (config, failures) = config(
+        vec![upstream(1, &fast.base_url, REF_A, 0.1)],
+        keys(&[(REF_A, KEY_A)]),
+        3,
+        SiteGuardPolicy {
+            max_concurrency: 0,
+            rate_limit_per_sec: 2,
+            rate_burst: 0,
+        },
+        open_breaker(),
+    );
+    let handle = start(config).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    assert_eq!(post(&handle, &token).await.0, 200);
+    assert_eq!(post(&handle, &token).await.0, 200);
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 429, "burst=0 时同一秒第 3 个必须被拒绝: {body}");
+    assert!(body.contains("local_rate_limited"), "{body}");
+    assert!(failures.lock().expect("锁").is_empty(), "限流不是上游故障");
+    handle.shutdown_and_wait().await;
+}
+
+/// M46-S3：rate=0（不限速）时 burst 被忽略——桶分支根本不执行。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn token_bucket_burst_ignored_when_rate_is_zero() {
+    let fast = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let (config, _) = config(
+        vec![upstream(1, &fast.base_url, REF_A, 0.1)],
+        keys(&[(REF_A, KEY_A)]),
+        3,
+        SiteGuardPolicy {
+            max_concurrency: 0,
+            rate_limit_per_sec: 0,
+            rate_burst: 5,
+        },
+        open_breaker(),
+    );
+    let handle = start(config).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    for i in 1..=10 {
+        assert_eq!(
+            post(&handle, &token).await.0,
+            200,
+            "rate=0 时第 {i} 个也应放行（burst 被忽略）"
+        );
+    }
+    handle.shutdown_and_wait().await;
+}
+
 /// T7：连续本地拒绝**不喂熔断**——之后正常请求仍然是 200（熔断仍 Closed）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_rejects_never_trip_the_breaker() {
@@ -503,6 +707,7 @@ async fn local_rejects_never_trip_the_breaker() {
         SiteGuardPolicy {
             max_concurrency: 1,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         // 阈值 1：只要本地拒绝被误算成一次失败，熔断立刻打开，下一条就会 503
         BreakerPolicy {
@@ -548,6 +753,7 @@ async fn all_candidates_locally_rejected_returns_429() {
         SiteGuardPolicy {
             max_concurrency: 1,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         open_breaker(),
     );
@@ -593,6 +799,7 @@ async fn same_site_keys_share_one_guard() {
         SiteGuardPolicy {
             max_concurrency: 1,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         open_breaker(),
     );
@@ -674,6 +881,52 @@ async fn half_open_probe_is_tried_before_the_rotated_candidates() {
     handle.shutdown_and_wait().await;
 }
 
+/// M39-S3 P2-1（探针半边，B-224 长尾）：探针请求不得消耗 cursor。
+///
+/// 与 T15 同一套脚手架，但断言更精确：T16 的「6 条里两站都 ≥2」在两种
+/// cursor 假设下都会过（奇偶平移后分布相同），判别不了。本用例只看探针
+/// 后的**第一条**轮转请求：探针不消耗 cursor ⇒ 下一条从 cursor 1 继续 ⇒
+/// 槽位 [A, B] 的第 1 位是 B；若探针消耗了 cursor，下条是 cursor 2 ⇒ A。
+/// 因此第三条必须打 B（b.count 0→1、a.count 停在 2），打 A 即红。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_request_does_not_advance_the_cursor() {
+    let a = spawn_upstream(1, &["503 Service Unavailable", "200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let (config, _failures) = config(
+        vec![
+            upstream(1, &a.base_url, REF_A, 1.0),
+            upstream(2, &b.base_url, REF_B, 1.0),
+        ],
+        keys(&[(REF_A, KEY_A), (REF_B, KEY_B)]),
+        3,
+        no_guard(),
+        BreakerPolicy {
+            threshold: 1,
+            cooldown: Duration::from_millis(50),
+        },
+    );
+    let handle = start(config).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    // 第 1 条：cursor 0 ⇒ A，503 熔断。
+    assert_eq!(post(&handle, &token).await.0, 503, "第一条打 A 且失败");
+    assert_eq!(a.count(), 1);
+    // 第 2 条：冷却后 A 是 HalfOpen 探针，优先且不消耗 cursor。
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(post(&handle, &token).await.0, 200, "第二条是成功的探针");
+    assert_eq!(a.count(), 2, "探针先打 A");
+    assert_eq!(b.count(), 0, "探针阶段 B 不该被请求");
+    // 第 3 条：A 已 Closed、无探针 ⇒ 从 cursor 1 继续 ⇒ 打 B。
+    assert_eq!(post(&handle, &token).await.0, 200, "第三条应成功");
+    assert_eq!(
+        b.count(),
+        1,
+        "探针不消耗 cursor：第三条必须打 B（cursor 1）；若打 A，说明探针偷消耗了 cursor"
+    );
+    assert_eq!(a.count(), 2, "第三条不该再打 A");
+    handle.shutdown_and_wait().await;
+}
+
 /// T16：探针成功后 A 回到 Closed ⇒ 轮转恢复（B 占绝对多数）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn after_a_successful_probe_rotation_resumes() {
@@ -717,6 +970,57 @@ async fn after_a_successful_probe_rotation_resumes() {
     handle.shutdown_and_wait().await;
 }
 
+/// M39-S3 P2-1（单候选半边，B-224 长尾）：单候选请求不得消耗 cursor。
+///
+/// 纯函数侧的 T3 只证明了 `weighted_pick` 单候选时与 cursor 无关，没证明
+/// 网关侧「单候选时不调 `round_robin.next()`」。本用例用模型过滤让候选集
+/// 在运行时从单站扩到双站，以此观测 cursor：A 服 [m-single, m-both]，
+/// B 只服 [m-both]；先发 3 条 m-single（每条都只有 A 一个候选），再发
+/// 1 条 m-both（候选 [A, B]）。单候选不消耗 cursor ⇒ 这条从 cursor 0
+/// 继续 ⇒ 槽位 [A, B] 的第 0 位是 A；若单候选偷消耗了 cursor，这条会是
+/// cursor 3 ⇒ 槽位第 1 位 B。3 取奇数正是为了让两种假设落在不同槽位。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_candidate_requests_do_not_advance_the_cursor() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let (config, _failures) = config(
+        vec![
+            upstream_with_models(1, &a.base_url, REF_A, 1.0, &["m-single", "m-both"]),
+            upstream_with_models(2, &b.base_url, REF_B, 1.0, &["m-both"]),
+        ],
+        keys(&[(REF_A, KEY_A), (REF_B, KEY_B)]),
+        3,
+        no_guard(),
+        open_breaker(),
+    );
+    let handle = start(config).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    // 单候选阶段：3 条 m-single 都只打 A，B 一次不该被请求。
+    for _ in 0..3 {
+        assert_eq!(
+            post_model(&handle, &token, "m-single").await.0,
+            200,
+            "m-single 应由 A 成功服务"
+        );
+    }
+    assert_eq!(a.count(), 3, "单候选阶段 3 条都打 A");
+    assert_eq!(b.count(), 0, "单候选阶段 B 不该被请求");
+    // 扩候选：m-both 的候选是 [A, B]，cursor 若未被消耗应为 0 ⇒ 打 A。
+    assert_eq!(
+        post_model(&handle, &token, "m-both").await.0,
+        200,
+        "m-both 应成功"
+    );
+    assert_eq!(
+        a.count(),
+        4,
+        "单候选不消耗 cursor：扩候选后的第一条必须打 A（cursor 0）；若打 B，说明单候选偷消耗了 cursor"
+    );
+    assert_eq!(b.count(), 0, "扩候选后的第一条不该打 B");
+    handle.shutdown_and_wait().await;
+}
+
 // ============================================================ T13：设置校验
 
 #[test]
@@ -751,12 +1055,28 @@ fn gateway_guard_settings_are_validated() {
     s.gateway_per_site_rate_limit = 10_000;
     assert!(s.validate().is_ok());
 
-    // KV 往返：三个字段都要出现且能被读回
+    // M46-S3：burst 默认 0；10001 被拒、10000 通过（与 rate 上限同口径）。
+    assert_eq!(s.gateway_per_site_burst, 0, "默认 0 = 关");
+    s.gateway_per_site_burst = 10_001;
+    assert!(s.validate().is_err(), "burst 超过 10000 必须被拒");
+    s.gateway_per_site_burst = 10_000;
+    assert!(s.validate().is_ok(), "10000 是合法上界");
+
+    // M46-S4：max_attempts 默认 0（走全部）；65 被拒、64 通过。
+    assert_eq!(s.gateway_max_attempts, 0, "默认 0 = 走全部候选");
+    s.gateway_max_attempts = 65;
+    assert!(s.validate().is_err(), "max_attempts 超过 64 必须被拒");
+    s.gateway_max_attempts = 64;
+    assert!(s.validate().is_ok(), "64 是合法上界");
+
+    // KV 往返：五个字段都要出现且能被读回
     let pairs = s.to_pairs();
     for key in [
         "gateway_lb_top_n",
         "gateway_per_site_concurrency",
         "gateway_per_site_rate_limit",
+        "gateway_per_site_burst",
+        "gateway_max_attempts",
     ] {
         assert!(
             pairs.iter().any(|(k, _)| *k == key),
@@ -773,6 +1093,8 @@ fn gateway_guard_settings_are_validated() {
         back.gateway_per_site_rate_limit,
         s.gateway_per_site_rate_limit
     );
+    assert_eq!(back.gateway_per_site_burst, s.gateway_per_site_burst);
+    assert_eq!(back.gateway_max_attempts, s.gateway_max_attempts);
 }
 
 // ============================================================ T9：多 key（服务层）
@@ -851,6 +1173,7 @@ fn site_guard_is_non_blocking_and_returns_the_lease() {
         SiteGuardPolicy {
             max_concurrency: 1,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         std::time::Instant::now(),
     );
@@ -885,6 +1208,7 @@ async fn the_concurrency_lease_is_held_for_the_whole_body_stream() {
         SiteGuardPolicy {
             max_concurrency: 1,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         open_breaker(),
     );
@@ -942,6 +1266,7 @@ async fn a_replayable_429_survives_a_locally_rejected_candidate() {
         SiteGuardPolicy {
             max_concurrency: 1,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         open_breaker(),
     );
@@ -976,4 +1301,507 @@ async fn post_model_owned(url: String, token: String, model: &str) -> (u16, Stri
     tokio::task::spawn_blocking(move || http_post(&url, &token, "/v1/chat/completions", &body))
         .await
         .expect("阻塞任务")
+}
+
+// ============================================================ M46-S4：重试预算与分站超时
+
+/// 与 [`upstream`] 相同，但带分站超时（`None` = 回退全局）。
+fn upstream_with_timeout(
+    site_id: i64,
+    base_url: &str,
+    key_ref: &str,
+    rate: f64,
+    timeout_ms: Option<u64>,
+) -> Upstream {
+    Upstream {
+        site_id,
+        key_id: None,
+        base_url: base_url.to_string(),
+        key_ref: key_ref.to_string(),
+        models: vec![MODEL.to_string()],
+        rate: Some(rate),
+        balance_usd: Some(10.0),
+        latency_ms: Some(10),
+        timeout_ms,
+    }
+}
+
+/// M46-S4：三候选网关。费率 0.01 / 1.0 / 2.0 ⇒ 排序与槽位首选恒为 1 号站
+///（首请求 cursor=0 落在 1 号站的 100 个槽位内）；`cap` 由调用方在返回的
+/// `GatewayConfig` 上改写（`config()` 构造后 `max_attempts` 字段可直接赋值）。
+fn three_site_config(
+    a: &FakeUpstream,
+    b: &FakeUpstream,
+    c: &FakeUpstream,
+    guard: SiteGuardPolicy,
+    breaker: BreakerPolicy,
+) -> (GatewayConfig, Failures) {
+    config(
+        vec![
+            upstream(1, &a.base_url, REF_A, 0.01),
+            upstream(2, &b.base_url, REF_B, 1.0),
+            upstream(3, &c.base_url, "kr/key/3/secret", 2.0),
+        ],
+        keys(&[
+            (REF_A, KEY_A),
+            (REF_B, KEY_B),
+            ("kr/key/3/secret", "sk-c-0123456789abcdef"),
+        ]),
+        3,
+        guard,
+        breaker,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_attempts_one_returns_first_candidates_real_429() {
+    let a = spawn_upstream(1, &["429 Too Many Requests"], Duration::ZERO);
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let c = spawn_upstream(3, &["200 OK"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    cfg.max_attempts = 1;
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 429, "cap=1 时应直接返回首候选的真实 429: {body}");
+    assert!(body.contains("site1"), "响应体应当来自 1 号站: {body}");
+    assert_eq!(b.count(), 0, "cap=1 时 2 号站必须没被打到");
+    assert_eq!(c.count(), 0, "cap=1 时 3 号站必须没被打到");
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_attempts_two_stops_after_two_attempts() {
+    let a = spawn_upstream(1, &["429 Too Many Requests"], Duration::ZERO);
+    let b = spawn_upstream(2, &["429 Too Many Requests"], Duration::ZERO);
+    let c = spawn_upstream(3, &["200 OK"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    cfg.max_attempts = 2;
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 429, "cap=2 时应返回第 2 个候选的 429: {body}");
+    assert!(body.contains("site2"), "响应体应当来自 2 号站: {body}");
+    assert_eq!(a.count(), 1, "1 号站应恰好被打 1 次");
+    assert_eq!(b.count(), 1, "2 号站应恰好被打 1 次");
+    assert_eq!(c.count(), 0, "cap=2 时 3 号站必须没被打到");
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_attempts_zero_walks_all_candidates() {
+    let a = spawn_upstream(1, &["429 Too Many Requests"], Duration::ZERO);
+    let b = spawn_upstream(2, &["429 Too Many Requests"], Duration::ZERO);
+    let c = spawn_upstream(3, &["200 OK"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    cfg.max_attempts = 0;
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 200, "cap=0（走全部）时应切到 3 号站成功: {body}");
+    assert!(body.contains("site3"), "响应体应当来自 3 号站: {body}");
+    assert_eq!(a.count(), 1);
+    assert_eq!(b.count(), 1);
+    assert_eq!(c.count(), 1);
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_attempts_above_candidate_count_matches_walking_all() {
+    let a = spawn_upstream(1, &["429 Too Many Requests"], Duration::ZERO);
+    let b = spawn_upstream(2, &["429 Too Many Requests"], Duration::ZERO);
+    let c = spawn_upstream(3, &["200 OK"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    cfg.max_attempts = 5;
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 200, "cap 大于候选数时应等价于走全部: {body}");
+    assert!(body.contains("site3"), "响应体应当来自 3 号站: {body}");
+    assert_eq!(c.count(), 1, "3 号站必须被打到（cap 没提前截断）");
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_attempts_ignores_locally_rejected_candidates() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let c = spawn_upstream(3, &["200 OK"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(
+        &a,
+        &b,
+        &c,
+        SiteGuardPolicy {
+            max_concurrency: 8,
+            rate_limit_per_sec: 1,
+            rate_burst: 0,
+        },
+        open_breaker(),
+    );
+    cfg.max_attempts = 1;
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    // 请求 1 耗尽 1 号站的令牌（rate=1、burst=0，桶初始恰好 1 个）。
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 200, "请求 1 应由 1 号站成功: {body}");
+    assert!(
+        body.contains("site1"),
+        "请求 1 的响应体应当来自 1 号站: {body}"
+    );
+
+    // 请求 2（紧接着发，桶来不及补充）：1 号站被本地限流拒绝——这次拒绝
+    // 不计预算，cap=1 的额度应留给 2 号站的真实发送。
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(
+        status, 200,
+        "本地拒绝不计预算时请求 2 应由 2 号站成功: {body}"
+    );
+    assert!(
+        body.contains("site2"),
+        "请求 2 的响应体应当来自 2 号站: {body}"
+    );
+    assert!(
+        !body.contains("local_rate_limited"),
+        "若本地拒绝被误计预算，请求 2 会是本地 429: {body}"
+    );
+    assert_eq!(a.count(), 1, "1 号站只在请求 1 里被打过");
+    assert_eq!(b.count(), 1, "2 号站应在请求 2 里被打 1 次");
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_attempts_counts_half_open_probe() {
+    let a = spawn_upstream(
+        1,
+        &["503 Service Unavailable", "429 Too Many Requests"],
+        Duration::ZERO,
+    );
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let c = spawn_upstream(3, &["200 OK"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(
+        &a,
+        &b,
+        &c,
+        no_guard(),
+        BreakerPolicy {
+            threshold: 1,
+            cooldown: Duration::from_millis(300),
+        },
+    );
+    cfg.max_attempts = 1;
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    // 请求 1：1 号站 503（不可重放，直接返回）⇒ 熔断 Open（threshold=1）。
+    let (status, _) = post(&handle, &token).await;
+    assert_eq!(status, 503, "请求 1 应拿到 1 号站的 503");
+    // 冷却 300ms 过后，请求 2 里 1 号站是 HalfOpen 探针（order 首位）。
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(
+        status, 429,
+        "探针回 429 且 cap=1 时应直接返回该 429: {body}"
+    );
+    assert!(
+        body.contains("site1"),
+        "响应体应当来自探针站（1 号站）: {body}"
+    );
+    assert_eq!(a.count(), 2, "1 号站应被打 2 次（请求 1 + 探针）");
+    assert_eq!(b.count(), 0, "探针占了唯一的预算，2 号站必须没被打到");
+    assert_eq!(c.count(), 0, "探针占了唯一的预算，3 号站必须没被打到");
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_site_timeout_short_fails_fast_with_real_timeout_error() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::from_millis(600));
+    let (config, _) = config(
+        vec![upstream_with_timeout(1, &a.base_url, REF_A, 0.01, Some(50))],
+        keys(&[(REF_A, KEY_A)]),
+        3,
+        no_guard(),
+        open_breaker(),
+    );
+    let handle = start(config).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let started = std::time::Instant::now();
+    let (status, body) = post(&handle, &token).await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        status, 502,
+        "分站 50ms 超时应让 600ms 延迟的上游快速失败: {body}"
+    );
+    assert!(
+        body.contains("all_upstreams_failed"),
+        "应返回既有的全失败错误体（不编新错误）: {body}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "失败必须远快于 600ms 延迟（实测 {elapsed:?}），否则分站值没生效"
+    );
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_site_timeout_larger_than_global_is_not_cut_early() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::from_millis(300));
+    let (mut config, _) = config(
+        vec![upstream_with_timeout(
+            1,
+            &a.base_url,
+            REF_A,
+            0.01,
+            Some(5000),
+        )],
+        keys(&[(REF_A, KEY_A)]),
+        3,
+        no_guard(),
+        open_breaker(),
+    );
+    // 全局 read 只有 100ms：若分站客户端没被用上（共享客户端），请求会在 100ms 处被掐断。
+    config.upstream_timeout = UpstreamTimeout {
+        connect: Duration::from_secs(5),
+        read: Duration::from_millis(100),
+    };
+    let handle = start(config).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(
+        status, 200,
+        "分站 5000ms > 全局 100ms 时全局不得提前掐断: {body}"
+    );
+    assert!(body.contains("site1"), "响应体应当来自 1 号站: {body}");
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_site_timeout_absent_falls_back_to_global() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::from_millis(300));
+    let (mut config, _) = config(
+        vec![upstream(1, &a.base_url, REF_A, 0.01)],
+        keys(&[(REF_A, KEY_A)]),
+        3,
+        no_guard(),
+        open_breaker(),
+    );
+    config.upstream_timeout = UpstreamTimeout {
+        connect: Duration::from_secs(5),
+        read: Duration::from_millis(100),
+    };
+    let handle = start(config).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(
+        status, 502,
+        "未填分站值时应回退全局 100ms 读超时、快速 502: {body}"
+    );
+    assert!(body.contains("all_upstreams_failed"), "{body}");
+    handle.shutdown_and_wait().await;
+}
+
+// ============================================================ M46-S5：按站 / 按 key 硬预算
+//
+// 预算判定用固定桩（不连真实 store）：桩按站点号决定拦不拦；store 侧的真实判定
+// （读表 + 算已花）由 service 层单测覆盖。桩的 breach 一律为 day 周期、已花 10、上限 5。
+
+type Breaches = Arc<Mutex<Vec<BudgetBreach>>>;
+
+/// 拦指定站点的预算桩 + 回调收集器。未列出的站点一律放行。
+fn budget_blocking(blocked: &[i64]) -> (BudgetCheck, Breaches) {
+    let blocked: Vec<i64> = blocked.to_vec();
+    let sink: Breaches = Arc::new(Mutex::new(Vec::new()));
+    let check: BudgetCheck = Arc::new(move |site_id: i64, _key_id: Option<i64>| {
+        if blocked.contains(&site_id) {
+            Some(BudgetBreach {
+                site_id,
+                key_id: None,
+                period: BudgetPeriod::Day,
+                spent_usd: 10.0,
+                limit_usd: 5.0,
+            })
+        } else {
+            None
+        }
+    });
+    (check, sink)
+}
+
+fn install_budget(cfg: &mut GatewayConfig, blocked: &[i64]) -> Breaches {
+    let (check, sink) = budget_blocking(blocked);
+    let sink_clone = Arc::clone(&sink);
+    cfg.budget_check = Some(check);
+    cfg.on_budget_breach = Some(Arc::new(move |breach| {
+        if let Ok(mut log) = sink_clone.lock() {
+            log.push(breach);
+        }
+    }));
+    sink
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_blocks_all_candidates_with_local_rate_limited() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let c = spawn_upstream(3, &["200 OK"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    let breaches = install_budget(&mut cfg, &[1, 2, 3]);
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 429, "全部候选被预算拦时应为 429: {body}");
+    assert!(
+        body.contains("local_rate_limited"),
+        "kind 必须是 local_rate_limited: {body}"
+    );
+    assert!(body.contains("预算"), "全是预算拦时文案应点名预算: {body}");
+    assert_eq!(a.count(), 0, "1 号站必须没被打到");
+    assert_eq!(b.count(), 0, "2 号站必须没被打到");
+    assert_eq!(c.count(), 0, "3 号站必须没被打到");
+    assert_eq!(
+        breaches.lock().unwrap().len(),
+        3,
+        "三站各触发一次 breach 回调（同一请求内同一 breach 去重后仍是 3 条不同 breach）"
+    );
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_blocks_only_the_over_budget_candidate() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let c = spawn_upstream(3, &["200 OK"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    let breaches = install_budget(&mut cfg, &[1]);
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 200, "只拦 1 号站时应由其它站成功: {body}");
+    assert!(
+        !body.contains("site1"),
+        "响应体不应来自被拦的 1 号站: {body}"
+    );
+    assert_eq!(a.count(), 0, "被拦的 1 号站必须没被打到");
+    assert_eq!(breaches.lock().unwrap().len(), 1, "只应回调一次 breach");
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_block_does_not_consume_retry_attempts() {
+    // cap=2 + 首候选被预算拦 + 第 2 候选回 429 + 第 3 候选成功：
+    // 被拦不计 attempts_made 时，第 2 候选的 429 不是最后一个（attempts=1 < 2），
+    // 应进 pending 后继续切到第 3 站成功；若被拦误计预算，第 2 候选的 429 会
+    // 被当成最后一个而直接返回，3 号站见 0 次——用例以此区分。
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["429 Too Many Requests"], Duration::ZERO);
+    let c = spawn_upstream(3, &["200 OK"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    cfg.max_attempts = 2;
+    install_budget(&mut cfg, &[1]);
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 200, "被拦不计预算时应切到 3 号站成功: {body}");
+    assert!(body.contains("site3"), "响应体应当来自 3 号站: {body}");
+    assert_eq!(a.count(), 0, "被拦的 1 号站必须没被打到");
+    assert_eq!(c.count(), 1, "3 号站应被打到 1 次");
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_block_does_not_pollute_last_real_error() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["429 Too Many Requests"], Duration::ZERO);
+    let c = spawn_upstream(3, &["502 Bad Gateway"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    install_budget(&mut cfg, &[1]);
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(
+        status, 502,
+        "被拦候选不应产生错误体，应返回最后一条真实错误: {body}"
+    );
+    assert!(
+        body.contains("site3"),
+        "响应体应当来自 3 号站的真实 502: {body}"
+    );
+    assert!(!body.contains("预算"), "真实错误里不应混入预算文案: {body}");
+    assert_eq!(a.count(), 0, "被拦的 1 号站必须没被打到");
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_mixed_rejects_keep_generic_message() {
+    // 混拦（1 预算 + 2 guard）全拒时文案为既有通用文案、kind 仍是 local_rate_limited。
+    // 请求 1：1 号站预算拦、2/3 号站各回 429（各耗 1 个令牌）；请求 2（紧接着发）：
+    // 1 号站预算拦、2/3 号站 guard 拒绝（桶来不及补充）。
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["429 Too Many Requests"], Duration::ZERO);
+    let c = spawn_upstream(3, &["429 Too Many Requests"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(
+        &a,
+        &b,
+        &c,
+        SiteGuardPolicy {
+            max_concurrency: 8,
+            rate_limit_per_sec: 1,
+            rate_burst: 0,
+        },
+        open_breaker(),
+    );
+    install_budget(&mut cfg, &[1]);
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, _) = post(&handle, &token).await;
+    assert_eq!(status, 429, "请求 1 应由 3 号站的真实 429 收尾");
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 429, "请求 2 全部候选被拦时应为 429: {body}");
+    assert!(
+        body.contains("local_rate_limited"),
+        "kind 必须是 local_rate_limited: {body}"
+    );
+    assert!(
+        !body.contains("预算"),
+        "混拦时文案应为通用文案、不得点名预算: {body}"
+    );
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_legacy_single_upstream_blocked() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let mut cfg = GatewayConfig::single_upstream(
+        0,
+        "legacy-budget-token".to_string(),
+        a.base_url.clone(),
+        Zeroizing::new("k-test".to_string()),
+        "单站".to_string(),
+    );
+    // legacy 的 site_id / key_id 取 config 字段：single_upstream 默认 (0, None)。
+    let breaches = install_budget(&mut cfg, &[0]);
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 429, "legacy 单上游超预算时应为 429: {body}");
+    assert!(
+        body.contains("local_rate_limited"),
+        "kind 必须是 local_rate_limited: {body}"
+    );
+    assert_eq!(a.count(), 0, "被拦时上游必须没被打到");
+    assert_eq!(breaches.lock().unwrap().len(), 1, "应回调一次 breach");
+    handle.shutdown_and_wait().await;
 }

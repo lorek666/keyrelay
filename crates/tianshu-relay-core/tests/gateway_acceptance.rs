@@ -82,6 +82,7 @@ fn upstream(site_id: i64, port: u16, key_ref: &str, models: Vec<&str>, rate: f64
         rate: Some(rate),
         balance_usd: Some(100.0),
         latency_ms: None,
+        timeout_ms: None,
     }
 }
 
@@ -113,10 +114,14 @@ fn config(route: Vec<Upstream>, keys: Vec<(&str, &str)>) -> GatewayConfig {
         upstream_proxy: None,
         legacy_key_ref: None,
         lb_top_n: 3,
+        max_attempts: 0,
         guard_policy: SiteGuardPolicy::default(),
         runtime: None,
         on_failure: None,
         on_usage: None,
+        budget_check: None,
+        on_budget_breach: None,
+        routing_rules: Vec::new(),
         max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
     }
 }
@@ -420,11 +425,74 @@ async fn m44_c5_breaker_opens_per_site_and_model() {
     h.shutdown_and_wait().await;
 }
 
-/// C6：每站并发上限（默认 8）——32 并发时 A 的 in_flight 峰值 == 8。
+/// C6：每站并发上限（默认 8）——32 并发时每站上游实测峰值 == 8。
+///
+/// B-224 P3 修复：此前本用例只断言 `ok > 0`，并发上限等于没被守住。
+/// 现在假上游本身按连接记并发峰值（每连接一线程 + 200ms 延迟，保证
+/// 32 个请求在同一窗口内重叠）：上限若被打破，峰值会冲到 16 左右；
+/// 若测试本身没压出并发（调度问题），`peak == 8` 的精确断言会让它显形，
+/// 而不是在串行执行下悄悄变绿。
+/// B-224 长尾：补齐 spec §7 C6 的三条判据——峰值 == 8（不是 ≤ 8 且 ≥ 4）、
+/// 被拒请求是本地 429（body `error.code == "local_rate_limited"`，即代码
+/// 注释里说的 kind 口径）、A 满后切到 B（双站峰值都到 8 即证明）。
+struct ConcurrentFake {
+    port: u16,
+    current: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+}
+
+fn concurrent_fake(delay_ms: u64) -> ConcurrentFake {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let current = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let cur = Arc::clone(&current);
+    let pk = Arc::clone(&peak);
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { continue };
+            let cur = Arc::clone(&cur);
+            let pk = Arc::clone(&pk);
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 8192];
+                let Ok(n) = stream.read(&mut buf) else { return };
+                if n == 0 {
+                    return;
+                }
+                let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
+                // 峰值 = 见过的最大 current（CAS 循环，避免 fetch_max 的旧版本问题）
+                loop {
+                    let old = pk.load(Ordering::SeqCst);
+                    if now <= old
+                        || pk
+                            .compare_exchange(old, now, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                let body = r#"{"ok":true}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                cur.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    ConcurrentFake {
+        port,
+        current,
+        peak,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn m44_c6_per_site_concurrency_cap() {
-    let a = fake(vec!["200 OK"], 60);
-    let b = fake(vec!["200 OK"], 60);
+    let a = concurrent_fake(200);
+    let b = concurrent_fake(200);
     let mut cfg = config(
         vec![
             upstream(1, a.port, "r1", vec!["gpt-4o"], 1.0),
@@ -435,24 +503,65 @@ async fn m44_c6_per_site_concurrency_cap() {
     cfg.guard_policy = SiteGuardPolicy {
         max_concurrency: 8,
         rate_limit_per_sec: 0,
+        rate_burst: 0, // M46-S3：机械补字段，行为不变
     };
     let h = gateway::start(cfg).await.unwrap();
     let p = port_of(&h);
-    let ok = Arc::new(AtomicUsize::new(0));
+    let results = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut joins = Vec::new();
     for _ in 0..32 {
-        let ok = Arc::clone(&ok);
+        let results = Arc::clone(&results);
         joins.push(std::thread::spawn(move || {
-            if request(p, "POST", "/v1/chat/completions", Some(BODY)).0 == 200 {
-                ok.fetch_add(1, Ordering::SeqCst);
-            }
+            // B-224 长尾（C6「无请求 > 5s」）：逐请求计时——本地保护不排队，
+            // 200 靠 200ms 上游延迟、429 靠立即拒绝，两者都应远小于 5s。
+            let started = Instant::now();
+            let (status, text) = request(p, "POST", "/v1/chat/completions", Some(BODY));
+            let elapsed = started.elapsed();
+            results.lock().unwrap().push((status, text, elapsed));
         }));
     }
     for j in joins {
         j.join().unwrap();
     }
-    // 全部应被两个站点消化（本地 429 会被切成另一站；两站各 8 ⇒ 16 并发额度）
-    assert!(ok.load(Ordering::SeqCst) > 0, "至少要有成功的");
+    let results = results.lock().unwrap();
+    let ok = results.iter().filter(|(s, _, _)| *s == 200).count();
+    assert!(ok > 0, "至少要有成功的");
+    // 被拒的必须是本地 429（不是上游 429）：body error.code 为 local_rate_limited。
+    let local_429 = results
+        .iter()
+        .filter(|(s, text, _)| *s == 429 && text.contains(r#""code":"local_rate_limited""#))
+        .count();
+    assert!(
+        local_429 > 0,
+        "32 并发、双站各 8 上限 ⇒ 必然有请求在双站都满时被本地拒掉（429 local_rate_limited），实测各状态：{:?}",
+        results.iter().map(|(s, _, _)| s).collect::<Vec<_>>()
+    );
+    let max_latency = results
+        .iter()
+        .map(|(_, _, elapsed)| *elapsed)
+        .max()
+        .expect("至少一条请求");
+    assert!(
+        max_latency < Duration::from_secs(5),
+        "无请求耗时可超过 5s，实测最慢 {max_latency:?}"
+    );
+    assert_eq!(
+        a.current.load(Ordering::SeqCst),
+        0,
+        "A 站在途必须归零（无泄漏）"
+    );
+    assert_eq!(
+        b.current.load(Ordering::SeqCst),
+        0,
+        "B 站在途必须归零（无泄漏）"
+    );
+    let peak_a = a.peak.load(Ordering::SeqCst);
+    let peak_b = b.peak.load(Ordering::SeqCst);
+    assert_eq!(peak_a, 8, "A 站并发峰值必须压满上限 8，实测 {peak_a}");
+    assert_eq!(
+        peak_b, 8,
+        "B 站并发峰值必须压满上限 8（A 满后切到 B 的证明），实测 {peak_b}"
+    );
     h.shutdown_and_wait().await;
 }
 
@@ -622,3 +731,65 @@ async fn m44_d2_d3_sse_rows_are_not_covered_here() {}
 #[tokio::test]
 #[ignore = "未覆盖：E1/E2 在 src-tauri 壳层（M41-S1 supervisor）"]
 async fn m44_e1_e2_lifecycle_rows_are_not_covered_here() {}
+
+/// B-224 P2：不可发送候选（已回收）不得喂熔断。
+/// 阈值 3 的熔断下连发 5 次「已回收」请求：若喂熔断，第 4 次起会
+/// 变成熔断中 503 且候选 breaker 显示 open；正确行为是每次都 502
+///（all_upstreams_failed），且 breaker 始终 closed。
+/// 注：启动期会校验「密钥映射缺失 ⇒ 拒绝启动」，所以不可发送的
+/// 真实形态是「映射在、运行中被回收」——用 `revoked_refs` 构造它，
+/// 而不是留空 keys（那条是启动校验的职责，与本用例无关）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsendable_candidates_do_not_feed_the_breaker() {
+    let a = fake(vec!["200 OK"], 0);
+    let mut cfg = config(
+        vec![upstream(1, a.port, "r1", vec!["gpt-4o"], 1.0)],
+        vec![("r1", "sk-test-1")],
+    );
+    cfg.revoked_refs = Some(Arc::new(Mutex::new(
+        ["r1".to_string()].into_iter().collect(),
+    )));
+    let h = gateway::start(cfg).await.unwrap();
+    let p = port_of(&h);
+    for i in 0..5 {
+        let (status, _) = request(p, "POST", "/v1/chat/completions", Some(BODY));
+        assert_eq!(
+            status, 502,
+            "第 {i} 次不可发送请求应为 502（熔断中会变成 503）"
+        );
+    }
+    assert_eq!(a.hits.load(Ordering::SeqCst), 0, "不可发送不得打到上游");
+    let cand = h
+        .candidates()
+        .into_iter()
+        .find(|c| c.site_id == 1)
+        .expect("site1 候选");
+    assert_eq!(cand.breaker, "closed", "不可发送失败不得打开熔断: {cand:?}");
+    h.shutdown_and_wait().await;
+}
+
+/// B-224 P2：per_site.requests 口径——一次失败尝试只计一次。
+/// 上游恒 503（可切换状态但只有一个候选 ⇒ 原样返回）：record_attempt
+/// 记 1 次后，record_failure 不得再 +1，否则 requests 会是 attempts 的两倍。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_attempt_counts_requests_exactly_once() {
+    let a = fake(vec!["503 Service Unavailable"], 0);
+    let cfg = config(
+        vec![upstream(1, a.port, "r1", vec!["gpt-4o"], 1.0)],
+        vec![("r1", "sk-test-1")],
+    );
+    let h = gateway::start(cfg).await.unwrap();
+    let p = port_of(&h);
+    for _ in 0..3 {
+        let (status, _) = request(p, "POST", "/v1/chat/completions", Some(BODY));
+        assert_eq!(status, 503);
+    }
+    let m = h.metrics();
+    let per_site = m.per_site.get(&1).expect("site1 指标");
+    assert_eq!(
+        per_site.requests, 3,
+        "3 次失败尝试 ⇒ requests 必须为 3（此前为 6）: {per_site:?}"
+    );
+    assert!(per_site.last_error.is_some(), "失败原因仍要记");
+    h.shutdown_and_wait().await;
+}

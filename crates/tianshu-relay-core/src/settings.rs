@@ -38,6 +38,12 @@ pub const GATEWAY_LB_TOP_N_MAX: usize = 20;
 pub const GATEWAY_PER_SITE_CONCURRENCY_MIN: usize = 1;
 pub const GATEWAY_PER_SITE_CONCURRENCY_MAX: usize = 128;
 pub const GATEWAY_PER_SITE_RATE_LIMIT_MAX: u32 = 10_000;
+/// 每站限流 burst 上限（M46-S3）。数值与 rate 上限同口径但另立常量：
+/// 两者将来调价互不牵连。
+pub const GATEWAY_PER_SITE_BURST_MAX: u32 = 10_000;
+/// 每请求最多尝试候选数上限（M46-S4）。候选数受路由规模约束（站点数 × 每站 key 数，
+/// 真实部署是个位数到两位数）；64 已是三倍于合理规模的上限，超大规模的值无害但无意义。
+pub const GATEWAY_MAX_ATTEMPTS_MAX: usize = 64;
 
 /// 网关请求体上限的默认值 / 硬上限（MiB，M42-S1 §4.4）。
 pub const DEFAULT_GATEWAY_MAX_REQUEST_MIB: u16 = 16;
@@ -59,10 +65,24 @@ const KEY_GATEWAY_LAST_KEY_ID: &str = "gateway_last_key_id";
 const KEY_GATEWAY_TOKEN_GRACE_SECS: &str = "gateway_token_grace_secs";
 const KEY_COLLECT_MODELS: &str = "collect_models";
 const KEY_MODELS_MIN_INTERVAL: &str = "models_min_interval_secs";
+// M46-S1：密钥健康巡检间隔（秒，0 = 关闭）
+const KEY_GATEWAY_KEY_HEALTH_INTERVAL: &str = "gateway_key_health_interval_secs";
+/// 巡检间隔非 0 时的下限（秒）。60 秒是「死 key 最多晚 60 秒被摘除」与
+/// 「不把上游打爆」之间的保守折中；巡检结论直接改变选路，比只读目录后果更强，
+/// 故下限高于模型采集间隔的 30 秒。
+const KEY_HEALTH_MIN_INTERVAL_SECS: u64 = 60;
+/// 巡检间隔的上限（秒），与 `MAX_REFRESH_INTERVAL_SECS` 同口径（24 小时）。
+const KEY_HEALTH_MAX_INTERVAL_SECS: u64 = 86_400;
 // M39-S3：负载均衡与每站保护（三个新设置）
 const KEY_GATEWAY_LB_TOP_N: &str = "gateway_lb_top_n";
 const KEY_GATEWAY_PER_SITE_CONCURRENCY: &str = "gateway_per_site_concurrency";
 const KEY_GATEWAY_PER_SITE_RATE_LIMIT: &str = "gateway_per_site_rate_limit";
+// M46-S3：每站限流 burst（额外桶容量，0 = 关）
+const KEY_GATEWAY_PER_SITE_BURST: &str = "gateway_per_site_burst";
+// M46-S4：每请求最多尝试候选数（0 = 走全部候选，即今天行为）
+const KEY_GATEWAY_MAX_ATTEMPTS: &str = "gateway_max_attempts";
+// M46-S7：按 agent 路由规则 JSON（空 = 无规则；schema 见 routing.rs）。
+const KEY_ROUTING_RULES: &str = "routing_rules";
 const KEY_THEME: &str = "theme";
 const KEY_LANGUAGE: &str = "language";
 const KEY_PROXY_URL: &str = "proxy_url";
@@ -114,6 +134,10 @@ pub struct Settings {
     pub collect_models: bool,
     /// 模型采集最小间隔秒（M14-S1）：**默认 1800（30min）**。`0` = 不节流（仅测试用）。
     pub models_min_interval_secs: u64,
+    /// 密钥健康巡检间隔秒（M46-S1）：**默认 0（关闭）**。非 0 时范围 `60..=86_400`。
+    /// 默认关的理由与 `collect_models` 相同：巡检是替用户花上游配额的行为，
+    /// 用户显式 opt-in 才生效；`0` 以外的下限见 `KEY_HEALTH_MIN_INTERVAL_SECS`。
+    pub gateway_key_health_interval_secs: u64,
     /// 参与加权轮转的健康候选数（M39-S3 §4.6）：**默认 3**，范围 `1..=20`。
     /// `1` = 关掉负载均衡（永远首选，与 M39-S3 之前逐字相同）。
     pub gateway_lb_top_n: usize,
@@ -122,6 +146,17 @@ pub struct Settings {
     /// 每站**每秒**请求上限（M39-S3 §4.6）：**默认 0（不限速）**，范围 `0..=10000`。
     /// 单位是**每秒**——不是每分钟（Lead 裁决，界面文案必须写清）。
     pub gateway_per_site_rate_limit: u32,
+    /// 每站限流的额外桶容量（M46-S3）：**默认 0（关）**，范围 `0..=10000`。
+    /// 桶容量 = `gateway_per_site_rate_limit + gateway_per_site_burst`，
+    /// 每秒补充仍是 `gateway_per_site_rate_limit`；rate = 0（不限速）时无意义。
+    pub gateway_per_site_burst: u32,
+    /// 每请求最多尝试的候选数（M46-S4）：**默认 0（走全部候选，即今天行为）**，
+    /// 范围 `0..=64`。只计实际发出去的上游尝试，本地保护拒绝的候选不计。
+    pub gateway_max_attempts: usize,
+    /// 按 agent 路由规则 JSON（M46-S7）：**默认空（无规则，走全局加权）**。
+    /// Schema 见 `crate::routing::parse_routing_rules`；非法值由 `validate` 拒绝，
+    /// 不落库。保存后下次启动网关生效。
+    pub routing_rules: String,
 
     // ---- M6-S5：FR-9 界面与隐私 ----
     /// 主题：`system` / `light` / `dark`。
@@ -197,10 +232,18 @@ impl Default for Settings {
             gateway_multi_site: false,
             collect_models: false,
             models_min_interval_secs: 1800,
+            // M46-S1：巡检默认关（不替用户花上游配额）。
+            gateway_key_health_interval_secs: 0,
             // M39-S3：默认「前 3 个候选轮转 + 每站 8 并发 + 不限速」
             gateway_lb_top_n: 3,
             gateway_per_site_concurrency: 8,
             gateway_per_site_rate_limit: 0,
+            // M46-S3：burst 默认关（默认行为与今天逐字相同）。
+            gateway_per_site_burst: 0,
+            // M46-S4：0 = 走全部候选（默认行为与今天逐字相同）。
+            gateway_max_attempts: 0,
+            // M46-S7：空 = 无规则（默认行为与今天逐字相同）。
+            routing_rules: String::new(),
 
             theme: "system".to_string(),
             language: "zh-CN".to_string(),
@@ -260,6 +303,15 @@ impl Settings {
                 "模型采集间隔必须在 {MODELS_MIN_INTERVAL_SECS}..={MODELS_MAX_INTERVAL_SECS} 秒之间"
             )));
         }
+        // M46-S1：巡检间隔 0 = 关闭；非 0 必须在 60..=86_400 之间。
+        if self.gateway_key_health_interval_secs != 0
+            && (self.gateway_key_health_interval_secs < KEY_HEALTH_MIN_INTERVAL_SECS
+                || self.gateway_key_health_interval_secs > KEY_HEALTH_MAX_INTERVAL_SECS)
+        {
+            return Err(Error::Store(format!(
+                "密钥健康巡检间隔必须为 0（关闭）或在 {KEY_HEALTH_MIN_INTERVAL_SECS}..={KEY_HEALTH_MAX_INTERVAL_SECS} 秒之间"
+            )));
+        }
         // M39-S3：三个新设置的取值范围（越界 ⇒ Err 且不落库，与既有设置同口径）
         if !(GATEWAY_LB_TOP_N_MIN..=GATEWAY_LB_TOP_N_MAX).contains(&self.gateway_lb_top_n) {
             return Err(Error::Store(format!(
@@ -277,6 +329,25 @@ impl Settings {
             return Err(Error::Store(format!(
                 "每站每秒请求上限必须在 0..={GATEWAY_PER_SITE_RATE_LIMIT_MAX} 之间（0 = 不限速；单位是每秒）"
             )));
+        }
+        // M46-S3：burst 越界 ⇒ Err 且不落库（与既有设置同口径）。
+        if self.gateway_per_site_burst > GATEWAY_PER_SITE_BURST_MAX {
+            return Err(Error::Store(format!(
+                "每站限流 burst 必须在 0..={GATEWAY_PER_SITE_BURST_MAX} 之间（0 = 关）"
+            )));
+        }
+        // M46-S4：重试预算越界 ⇒ Err 且不落库（与既有设置同口径）。
+        if self.gateway_max_attempts > GATEWAY_MAX_ATTEMPTS_MAX {
+            return Err(Error::Store(format!(
+                "每请求最多尝试候选数必须在 0..={GATEWAY_MAX_ATTEMPTS_MAX} 之间（0 = 走全部候选）"
+            )));
+        }
+        // M46-S7：路由规则写路径校验（非法 ⇒ Err 且不落库；空 = 无规则，直接放行）。
+        // 解析权威在 routing.rs；这里只转译错误，不复写 schema。
+        if !self.routing_rules.trim().is_empty() {
+            if let Err(reason) = crate::routing::parse_routing_rules(&self.routing_rules) {
+                return Err(Error::Store(format!("路由规则无效：{reason}")));
+            }
         }
         if !THEMES.contains(&self.theme.as_str()) {
             return Err(Error::Store(format!(
@@ -383,6 +454,10 @@ impl Settings {
             "gateway_lb_top_n": self.gateway_lb_top_n,
             "gateway_per_site_concurrency": self.gateway_per_site_concurrency,
             "gateway_per_site_rate_limit": self.gateway_per_site_rate_limit,
+            "gateway_per_site_burst": self.gateway_per_site_burst,
+            "gateway_max_attempts": self.gateway_max_attempts,
+            // M46-S7：只报配没配，不报全文（与 proxy_url 全文不进快照同理）。
+            "routing_rules_configured": !self.routing_rules.trim().is_empty(),
             "theme": self.theme,
             "language": self.language,
             "telemetry_enabled": self.telemetry_enabled,
@@ -518,6 +593,13 @@ impl Settings {
                         settings.models_min_interval_secs = secs;
                     }
                 }
+                // M46-S1：只做类型转换，范围由 `validate()` 在写路径统一拒绝
+                //（与模型采集间隔同口径）。
+                KEY_GATEWAY_KEY_HEALTH_INTERVAL => {
+                    if let Ok(secs) = value.parse::<u64>() {
+                        settings.gateway_key_health_interval_secs = secs;
+                    }
+                }
                 // M39-S3：三个字段各自按范围过滤（读路径的纵深防御；写路径由 `validate` 拒）
                 KEY_GATEWAY_LB_TOP_N => {
                     if let Ok(n) = value.parse::<usize>() {
@@ -541,6 +623,30 @@ impl Settings {
                             settings.gateway_per_site_rate_limit = n;
                         }
                     }
+                }
+                // M46-S3：与 rate_limit 同口径（只做类型转换 + 上限过滤，
+                // 范围由写路径 validate 统一拒绝）。
+                KEY_GATEWAY_PER_SITE_BURST => {
+                    if let Ok(n) = value.parse::<u32>() {
+                        if n <= GATEWAY_PER_SITE_BURST_MAX {
+                            settings.gateway_per_site_burst = n;
+                        }
+                    }
+                }
+                // M46-S4：与 burst 同口径（只做类型转换 + 上限过滤，
+                // 范围由写路径 validate 统一拒绝）。
+                KEY_GATEWAY_MAX_ATTEMPTS => {
+                    if let Ok(n) = value.parse::<usize>() {
+                        if n <= GATEWAY_MAX_ATTEMPTS_MAX {
+                            settings.gateway_max_attempts = n;
+                        }
+                    }
+                }
+                // M46-S7：规则 JSON 原样收下（解析只在 validate 与 gateway_config 做；
+                // from_pairs 的「非法项退回默认」口径不适用于整串 JSON——非法串的
+                // 唯一 gate 是 validate）。
+                KEY_ROUTING_RULES => {
+                    settings.routing_rules = value.to_string();
                 }
                 KEY_THEME => {
                     if THEMES.contains(&value) {
@@ -676,6 +782,10 @@ impl Settings {
                 KEY_MODELS_MIN_INTERVAL,
                 self.models_min_interval_secs.to_string(),
             ),
+            (
+                KEY_GATEWAY_KEY_HEALTH_INTERVAL,
+                self.gateway_key_health_interval_secs.to_string(),
+            ),
             // M39-S3：负载均衡与每站保护
             (KEY_GATEWAY_LB_TOP_N, self.gateway_lb_top_n.to_string()),
             (
@@ -686,6 +796,15 @@ impl Settings {
                 KEY_GATEWAY_PER_SITE_RATE_LIMIT,
                 self.gateway_per_site_rate_limit.to_string(),
             ),
+            (
+                KEY_GATEWAY_PER_SITE_BURST,
+                self.gateway_per_site_burst.to_string(),
+            ),
+            (
+                KEY_GATEWAY_MAX_ATTEMPTS,
+                self.gateway_max_attempts.to_string(),
+            ),
+            (KEY_ROUTING_RULES, self.routing_rules.clone()),
             (KEY_THEME, self.theme.clone()),
             (KEY_LANGUAGE, self.language.clone()),
             (KEY_PROXY_URL, self.proxy_url.clone()),
@@ -725,7 +844,7 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 31] = [
+    pub const KEYS: [&'static str; 35] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
@@ -740,9 +859,13 @@ impl Settings {
         KEY_GATEWAY_MULTI_SITE,
         KEY_COLLECT_MODELS,
         KEY_MODELS_MIN_INTERVAL,
+        KEY_GATEWAY_KEY_HEALTH_INTERVAL,
         KEY_GATEWAY_LB_TOP_N,
         KEY_GATEWAY_PER_SITE_CONCURRENCY,
         KEY_GATEWAY_PER_SITE_RATE_LIMIT,
+        KEY_GATEWAY_PER_SITE_BURST,
+        KEY_GATEWAY_MAX_ATTEMPTS,
+        KEY_ROUTING_RULES,
         KEY_THEME,
         KEY_LANGUAGE,
         KEY_PROXY_URL,
@@ -1083,9 +1206,13 @@ mod tests {
             gateway_multi_site: false,
             collect_models: false,
             models_min_interval_secs: 1800,
+            gateway_key_health_interval_secs: 300,
             gateway_lb_top_n: 3,
             gateway_per_site_concurrency: 8,
             gateway_per_site_rate_limit: 0,
+            gateway_per_site_burst: 0,
+            gateway_max_attempts: 0,
+            routing_rules: String::new(),
             theme: "dark".to_string(),
             language: "en-US".to_string(),
             proxy_url: "socks5://127.0.0.1:1080".to_string(),
@@ -1106,6 +1233,23 @@ mod tests {
         assert_eq!(Settings::from_pairs(borrowed), s);
         // 每一个字段都要有对应的键，漏一个就会在往返里静默丢失
         assert_eq!(pairs.len(), Settings::KEYS.len());
+    }
+
+    #[test]
+    fn key_health_interval_defaults_to_disabled_and_validates_range() {
+        // 默认关：不替用户花上游配额。
+        assert_eq!(Settings::default().gateway_key_health_interval_secs, 0);
+        let mut s = Settings::default();
+        // 0（关）/ 60 / 86_400 通过。
+        for ok in [0u64, 60, 86_400] {
+            s.gateway_key_health_interval_secs = ok;
+            assert!(s.validate().is_ok(), "{ok} 应通过");
+        }
+        // 1..=59 与超上限被拒（且不落库：写路径先 validate）。
+        for bad in [1u64, 59, 86_401] {
+            s.gateway_key_health_interval_secs = bad;
+            assert!(s.validate().is_err(), "{bad} 必须被拒");
+        }
     }
 
     #[test]
@@ -1274,5 +1418,37 @@ mod tests {
         let pairs = wanted.to_pairs();
         let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
         assert_eq!(Settings::from_pairs(borrowed), wanted);
+    }
+
+    #[test]
+    fn routing_rules_validate_and_round_trip_through_pairs() {
+        let good = Settings {
+            routing_rules: r#"[{"agentLabel": "codex", "siteIds": [1, 2]}]"#.to_string(),
+            ..Settings::default()
+        };
+        assert!(good.validate().is_ok(), "合法规则应当通过 validate");
+        let pairs = good.to_pairs();
+        let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(
+            Settings::from_pairs(borrowed),
+            good,
+            "规则 JSON 经 pairs 往返不变"
+        );
+        let missing = Settings::from_pairs(Vec::<(&str, &str)>::new());
+        assert_eq!(missing.routing_rules, "", "缺失键 ⇒ 默认空（无规则）");
+        for bad in [
+            "{not json",
+            r#"[{"agentLabel": "a", "siteIds": []}]"#,
+            r#"[{"agentLabel": "a", "siteIds": [1]}, {"agentLabel": "a", "siteIds": [2]}]"#,
+        ] {
+            let settings = Settings {
+                routing_rules: bad.to_string(),
+                ..Settings::default()
+            };
+            assert!(
+                matches!(settings.validate(), Err(Error::Store(_))),
+                "非法规则必须被 validate 拒绝：{bad}"
+            );
+        }
     }
 }

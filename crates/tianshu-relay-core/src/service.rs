@@ -364,6 +364,40 @@ pub struct RefreshSummary {
     pub needs_login: Vec<i64>,
 }
 
+/// 一站的巡检结论（M46-S1）。**可安全打印**：只有 id 与结论，不含密钥、不含响应正文。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyHealthOutcome {
+    pub site_id: i64,
+    pub key_id: i64,
+    pub verdict: crate::notify::KeyHealthVerdict,
+    /// 该站已知的模型名（库里目录 ∪ 本轮探活返回），供壳层喂模型熔断键。
+    pub models: Vec<String>,
+}
+
+/// 一趟密钥健康巡检的摘要（M46-S1）。**可安全打印**：不含密钥、不含响应正文。
+#[derive(Clone, Debug, Default)]
+pub struct KeyHealthSummary {
+    /// 真的发出探活请求的站点数（受间隔开关 / 有可用 key 两重过滤之后）。
+    pub attempted: usize,
+    pub healthy: usize,
+    pub dead: usize,
+    pub quota: usize,
+    pub fault: usize,
+    pub unknown: usize,
+    pub outcomes: Vec<KeyHealthOutcome>,
+}
+
+/// 一趟巡检里**同时在途**的站点数上限（M46-S1）。
+///
+/// 与 `MODEL_CATALOG_CONCURRENCY` 同值（2）但独立常量：巡检与目录采集是两条
+/// 任务，任一方的并发上限调整都不应静默改变另一方。
+pub const KEY_HEALTH_CONCURRENCY: usize = 2;
+
+/// 单站探活 deadline（M46-S1）：10 秒，远短于网关上游读超时 240 秒。
+/// `/v1/models` 是小 JSON、无流式长尾，10 秒足够区分「活」与「挂」；
+/// 超时按 `UpstreamFault` 计（站点侧无响应，不是 key 之死）。
+const KEY_HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 一趟模型目录采集的摘要（M39-S1）。**可安全打印**：不含密钥、不含响应正文。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelCatalogSummary {
@@ -751,7 +785,10 @@ pub struct TianshuRelayService<T: HttpTransport + Clone + 'static> {
     /// 投递路径是同步的（不能 `.await`），所以「异步预热 → 同步读快照」两步走：
     /// `warm_model_meta` 填这份缓存，`meta_for` 在 `prepare_delivery` 里读。
     meta_cache: crate::model_meta::OnlineMetaCache,
-    store: Store,
+    /// M46-S5：`Arc` 包裹是预算接线的最小改动——`gateway_config` 要给网关一个
+    /// `'static` 的 `budget_check` 闭包，闭包必须自持 store；按值持有派生不出
+    /// `'static` 引用。调用点零改动（`Arc` 的 Deref 让 `self.store.foo()` 照常编译）。
+    store: std::sync::Arc<Store>,
     sessions: SessionCache,
     vault: Arc<dyn Vault>,
     home: PathBuf,
@@ -782,6 +819,17 @@ pub struct TianshuRelayService<T: HttpTransport + Clone + 'static> {
     /// M13-S1：网关 token 用量的内存缓冲（与  同形）。
     /// 回调里只 push，在  时落库——网关回调不该做 IO。
     gateway_usage_buffer: Arc<std::sync::Mutex<Vec<crate::gateway::GatewayUsage>>>,
+    /// M46-S5：网关预算超标的内存缓冲（与 gateway_failures 同形）。
+    /// 回调里只 push，在 refresh_all 的 drain_budget_breaches 里写事件 + 通知
+    /// ——网关回调不该做 IO、不该发网络请求（通知配置活在 service 侧）。
+    budget_breaches: BudgetBreachQueue,
+    /// M46-S5：预算缓冲满丢弃计数（与 gateway_failures_dropped 同口径）。
+    budget_breaches_dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// M46-S5：已通知过的预算键集合（节流：每周期只通知一次）。
+    /// 键 = (site_id, 预算行 key_id, period, 周期起点 epoch)；drain 时清扫 32 天前的旧键。
+    /// 只活在内存：服务重启后首 breach 会再通知一次（与既有通知重启行为同口径）。
+    budget_notified: BudgetNotifiedKeys,
+
     /// M13-S1：网关用量缓冲满时丢弃的计数（与 `gateway_failures_dropped` 同口径）。
     gateway_usage_dropped: Arc<std::sync::atomic::AtomicU64>,
     /// 网关**会话**代号（M8-S1 §11.1）。每次 `gateway_config` 递增一次，
@@ -863,6 +911,14 @@ struct SiteObservations {
 /// 网关失败的内存缓冲上限。见 [`TianshuRelayService::gateway_failures`] 的说明。
 pub const MAX_BUFFERED_GATEWAY_FAILURES: usize = 256;
 
+/// M46-S5：预算超标缓冲的类型（字段类型过长会触发 clippy type_complexity，故抽别名）。
+type BudgetBreachQueue =
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<crate::gateway::BudgetBreach>>>;
+
+/// M46-S5：已通知预算键集合的类型（同上，抽别名）。
+type BudgetNotifiedKeys =
+    std::sync::Mutex<std::collections::HashSet<(i64, Option<i64>, String, i64)>>;
+
 /// 一轮刷新里**同时在途**的站点数上限（M8-S3 §3.4 异议 O-1 的裁决 ①）。
 ///
 /// 取 4 的理由：
@@ -923,6 +979,211 @@ struct NotifyState {
     last: std::sync::Mutex<Option<crate::notify::Snapshot>>,
 }
 
+/// M46-S5：查 (site_id, key_id) 是否命中超标预算。
+///
+/// 闭包与测试共用同一条判定（判定逻辑不在闭包里展开）：适用行是该站的站级行
+/// 以及该 key 的 key 级行；每行 spent 是当期已花；`spent >= limit` 即 breach；
+/// key 级行优先返回（事件归因更具体），否则站级行；均未超则返回 None。
+/// store 查询出错则返回 Err（调用方闭包据此 fail-open，见 spec §4.2）。
+pub fn budget_breach_for(
+    store: &Store,
+    site_id: i64,
+    key_id: Option<i64>,
+) -> Result<Option<crate::gateway::BudgetBreach>> {
+    let mut site_breach: Option<crate::gateway::BudgetBreach> = None;
+    for row in store.budget_list()? {
+        if row.site_id != site_id {
+            continue;
+        }
+        // 适用性：站级行恒适用；key 级行只对该 key 的请求适用。
+        // M46-S5 复审 P0-1：他 key 的 key 级行必须 continue——此前 (Some, Some-不同)
+        // 只把 is_key_row 置 false 就继续往下算，超标后落入站级回落，误拦无关 key。
+        let is_key_row = match (row.key_id, key_id) {
+            (None, _) => false,
+            (Some(budget_key), Some(request_key)) if budget_key == request_key => true,
+            (Some(_), _) => continue,
+        };
+        let Some(period) = crate::gateway::BudgetPeriod::parse(&row.period) else {
+            continue; // 建行时已校验，库里非法 period 只可能是外部改库：跳过该行不拦
+        };
+        let spent = store.budget_spent_usd(row.site_id, row.key_id, &row.period)?;
+        if spent < row.limit_usd {
+            continue;
+        }
+        let breach = crate::gateway::BudgetBreach {
+            site_id: row.site_id,
+            key_id: row.key_id,
+            period,
+            spent_usd: spent,
+            limit_usd: row.limit_usd,
+        };
+        if is_key_row {
+            return Ok(Some(breach));
+        }
+        if site_breach.is_none() {
+            site_breach = Some(breach);
+        }
+    }
+    Ok(site_breach)
+}
+
+/// M46-S6：对账行种类——**存在分区**，不是金额结论（见 spec §4.2）：
+/// `matched` = 账单行存在且网关成本 > 0；`gateway_only` = 网关成本 > 0 且
+/// 该 (site, day) 无任何账单行；`bill_only` = 账单行存在且网关成本为 0 或无行；
+/// 两边都空 ⇒ 不出任何行。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BillReconciliationKind {
+    Matched,
+    GatewayOnly,
+    BillOnly,
+}
+
+impl BillReconciliationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BillReconciliationKind::Matched => "matched",
+            BillReconciliationKind::GatewayOnly => "gateway_only",
+            BillReconciliationKind::BillOnly => "bill_only",
+        }
+    }
+}
+
+/// M46-S6：一行对账结果。`bill_usd / diff_usd` 为空**只**表示不可比
+/// （currency 非 USD、或为空、或 amount 为空），不表示「无账单」：
+/// 缺失侧在算术上按 0 计（gateway-only 行 `bill_usd = 0.0`、
+/// bill-only 行 `gateway_usd = 0.0`）。`flagged` 可比时 = 超阈值，
+/// 不可比时恒为 true（需人工看）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct BillReconciliationRow {
+    pub site_id: i64,
+    pub day: String,
+    pub gateway_usd: f64,
+    pub bill_usd: Option<f64>,
+    pub diff_usd: Option<f64>,
+    pub flagged: bool,
+    pub kind: BillReconciliationKind,
+    pub source: Option<String>,
+}
+
+/// 6 位舍入（与成本口径同位数；与 SQLite `ROUND` 同为半值远离零），
+/// `-0.0` 归一化为 `0.0`，避免 DTO 里出现 `-0.0`。
+fn round6_usd(value: f64) -> f64 {
+    let rounded = (value * 1_000_000.0).round() / 1_000_000.0;
+    if rounded == 0.0 {
+        0.0
+    } else {
+        rounded
+    }
+}
+
+/// M46-S6：按 (site, day) 对账。只读：只调 `site_bills` / `gateway_usage_days` /
+/// `local_day_bounds` / `gateway_cost_usd_in_window`，不写任何表、不发通知、
+/// 不感知导入来源（`source` 只是把 `site_bills.source` 原样透传）。
+/// `site_id` 为空 = 全部站点；不存在的站 ⇒ 空数组（读侧不做存在性校验）。
+/// `days` 夹到 1..=90（含今天）。任一查询失败 ⇒ Err（不返回半份数据）。
+/// 阈值：`threshold = max(5% × max(gateway, bill), $1)`，`flagged = |diff| > threshold`
+/// （严格大于；等于不标——与 S5 的 `>=` 拦停语义不同，各从其字面语义）。
+fn reconciliation_gateway_cost(
+    store: &Store,
+    cache: &mut std::collections::HashMap<(i64, String), f64>,
+    site_id: i64,
+    day: &str,
+) -> Result<f64> {
+    let key = (site_id, day.to_string());
+    if let Some(cost) = cache.get(&key) {
+        return Ok(*cost);
+    }
+    // 顺带校验账单 day 格式：非法 ⇒ Err（fail loud，不静默跳行）。
+    let (start, end) = store.local_day_bounds(day)?;
+    let cost = store.gateway_cost_usd_in_window(site_id, None, start, end)?;
+    cache.insert(key, cost);
+    Ok(cost)
+}
+
+pub fn reconcile_bills(
+    store: &Store,
+    site_id: Option<i64>,
+    days: i64,
+) -> Result<Vec<BillReconciliationRow>> {
+    let days = crate::store::clamp_usage_days(days);
+    let bills = store.site_bills(days)?;
+    let usage_days = store.gateway_usage_days(site_id, days)?;
+    let billed_days: std::collections::HashSet<(i64, String)> = bills
+        .iter()
+        .filter(|b| site_id.is_none_or(|s| s == b.site_id))
+        .map(|b| (b.site_id, b.day.clone()))
+        .collect();
+    let mut cost_cache: std::collections::HashMap<(i64, String), f64> =
+        std::collections::HashMap::new();
+    let mut rows: Vec<BillReconciliationRow> = Vec::new();
+    for bill in bills
+        .iter()
+        .filter(|b| site_id.is_none_or(|s| s == b.site_id))
+    {
+        let gateway_usd =
+            reconciliation_gateway_cost(store, &mut cost_cache, bill.site_id, &bill.day)?;
+        // 可比当且仅当 currency 大小写不敏感等于 USD 且 amount 非空；
+        // currency 为空（站点未报）是「未知」，不能默认 USD。
+        let comparable = bill.amount.is_some()
+            && bill
+                .currency
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case("USD"));
+        let kind = if gateway_usd > 0.0 {
+            BillReconciliationKind::Matched
+        } else {
+            BillReconciliationKind::BillOnly
+        };
+        let (bill_usd, diff_usd, flagged) = if comparable {
+            let amount = bill.amount.expect("可比行 amount 非空");
+            let diff = round6_usd(gateway_usd - amount);
+            let threshold = (0.05 * gateway_usd.max(amount)).max(1.0);
+            (Some(amount), Some(diff), diff.abs() > threshold)
+        } else {
+            (None, None, true)
+        };
+        rows.push(BillReconciliationRow {
+            site_id: bill.site_id,
+            day: bill.day.clone(),
+            gateway_usd,
+            bill_usd,
+            diff_usd,
+            flagged,
+            kind,
+            source: Some(bill.source.clone()),
+        });
+    }
+    for (site, day) in &usage_days {
+        if billed_days.contains(&(*site, day.clone())) {
+            continue; // 该天已有账单方，差异体现在各来源行里，不出 gateway-only 行。
+        }
+        let gateway_usd = reconciliation_gateway_cost(store, &mut cost_cache, *site, day)?;
+        if gateway_usd <= 0.0 {
+            continue; // 网关成本 0 且无账单 ⇒ 两边都空，无可对项。
+        }
+        let diff = round6_usd(gateway_usd);
+        let threshold = (0.05 * gateway_usd).max(1.0);
+        rows.push(BillReconciliationRow {
+            site_id: *site,
+            day: day.clone(),
+            gateway_usd,
+            bill_usd: Some(0.0),
+            diff_usd: Some(diff),
+            flagged: diff.abs() > threshold,
+            kind: BillReconciliationKind::GatewayOnly,
+            source: None,
+        });
+    }
+    // 输出顺序是契约：day 倒序、site_id 升序、source 升序。
+    rows.sort_by(|a, b| {
+        b.day
+            .cmp(&a.day)
+            .then(a.site_id.cmp(&b.site_id))
+            .then(a.source.cmp(&b.source))
+    });
+    Ok(rows)
+}
+
 impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     pub fn new(store: Store, transport: T, config: ServiceConfig) -> Self {
         let svc = Self {
@@ -939,7 +1200,8 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             meta_transport: None,
             // 默认空缓存：冷缓存 ⇒ 同步读拿不到在线参数（不联网），语义与「没查到」一致。
             meta_cache: crate::model_meta::OnlineMetaCache::new(),
-            store,
+            // M46-S5：包一层 Arc（见 store 字段注释）；调用点靠 Deref 不动。
+            store: std::sync::Arc::new(store),
             sessions: SessionCache::new(),
             vault: config.vault,
             home: config.home,
@@ -948,6 +1210,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             notify: None,
             gateway_failures: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             gateway_failures_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            budget_breaches: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            budget_breaches_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            budget_notified: std::sync::Mutex::new(std::collections::HashSet::new()),
             gateway_usage_buffer: Arc::new(std::sync::Mutex::new(Vec::new())),
             gateway_usage_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gateway_session: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2494,6 +2759,8 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         // 早于本轮的余额/漂移事件出现，读起来是因果顺序。
         self.drain_gateway_failures();
         self.drain_gateway_usage();
+        // M46-S5：预算超标 drain（用量落库之后：事件里的已花口径与库内账一致）。
+        self.drain_budget_breaches();
         // M13-S1：裁剪用量日志，保留最近 90 天（P2-2）。
         let _ = self.store.prune_gateway_usage_log(90);
         let _ = self.store.prune_usage_snapshots(90);
@@ -2761,69 +3028,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let items = crate::notify::evaluate(Some(&baseline), &snapshot, &state.config, now);
 
         for item in &items {
-            self.log(observability::event_with_payload(
-                Level::Info,
-                "app",
-                format!("通知: {}", item.title),
-                serde_json::json!({
-                    "kind": format!("{:?}", item.kind),
-                    "site_id": item.site_id,
-                }),
-            ));
-
-            let mut failures: Vec<String> = Vec::new();
-            // `send` 是 `Notifier` trait 上的方法，必须把 trait 带进作用域才能调用。
-            use crate::notify::Notifier as _;
-            if state.config.system_enabled {
-                let notifier =
-                    crate::notify::SystemNotifier::new(Box::new(crate::notify::StdCommandRunner));
-                if let Err(err) = notifier.send(item) {
-                    failures.push(format!("系统通知: {err}"));
-                }
-            }
-            let has_webhook = state
-                .config
-                .webhook_url
-                .as_deref()
-                .is_some_and(|url| !url.trim().is_empty());
-            if has_webhook {
-                let notifier = crate::notify::WebhookNotifier::new(
-                    state.config.clone(),
-                    self.resolved_upstream_proxy(),
-                );
-                if let Err(err) = notifier.send(item) {
-                    // B-179：按 err 变体分流前缀。`Error::Store` 是配置非法（如零超时守卫），
-                    // 不是发送失败——读事件表的人据此不会去查网络。其他变体（IO / 超时 / 认证）
-                    // 仍是「webhook」前缀。
-                    let label = match &err {
-                        crate::error::Error::Store(_) => "webhook 配置非法",
-                        _ => "webhook",
-                    };
-                    failures.push(format!("{label}: {err}"));
-                }
-            }
-            if !failures.is_empty() {
-                // B-179：标题按 failures 内容分流。有「配置非法」前缀 ⇒ 标题也用「通知配置非法」，
-                // 否则「通知发送失败」。子串匹配够用：当前只有 webhook 零超时守卫用这个词；
-                // 复审要点是「将来新增含『配置非法』的 failure 文案时这条匹配是否仍准」。
-                let has_config_err = failures.iter().any(|f| f.contains("配置非法"));
-                let title = if has_config_err {
-                    "通知配置非法"
-                } else {
-                    "通知发送失败"
-                };
-                self.log(observability::event_with_payload(
-                    Level::Warn,
-                    "app",
-                    format!("{title}: {}", failures.join(" | ")),
-                    serde_json::json!({
-                        "kind": format!("{:?}", item.kind),
-                        "webhook": crate::redact::mask_webhook_url(
-                            state.config.webhook_url.as_deref().unwrap_or("")
-                        ),
-                    }),
-                ));
-            }
+            self.send_notification(item);
         }
 
         if let Ok(mut guard) = state.last.lock() {
@@ -2831,6 +3036,80 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         }
         // B-81：把本轮快照落库当下一轮的基线（进程重启后仍可用）。
         self.persist_notify_baseline(&snapshot, now);
+    }
+
+    /// M46-S5：发送一条通知（系统通知 + webhook + 失败事件）。
+    ///
+    /// 从 dispatch_notifications 循环里原样抽出，与预算 drain 共用——抽 helper 是
+    /// 复用，不是重做规则引擎：规则评估（evaluate）仍只在 dispatch 里跑，预算
+    /// breach 不经过 evaluate（见 spec §4.3）。notify 未接时直接返回（drain 路径用）。
+    fn send_notification(&self, item: &crate::notify::Notification) {
+        let Some(state) = &self.notify else {
+            return;
+        };
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "app",
+            format!("通知: {}", item.title),
+            serde_json::json!({
+                "kind": format!("{:?}", item.kind),
+                "site_id": item.site_id,
+            }),
+        ));
+
+        let mut failures: Vec<String> = Vec::new();
+        // `send` 是 `Notifier` trait 上的方法，必须把 trait 带进作用域才能调用。
+        use crate::notify::Notifier as _;
+        if state.config.system_enabled {
+            let notifier =
+                crate::notify::SystemNotifier::new(Box::new(crate::notify::StdCommandRunner));
+            if let Err(err) = notifier.send(item) {
+                failures.push(format!("系统通知: {err}"));
+            }
+        }
+        let has_webhook = state
+            .config
+            .webhook_url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty());
+        if has_webhook {
+            let notifier = crate::notify::WebhookNotifier::new(
+                state.config.clone(),
+                self.resolved_upstream_proxy(),
+            );
+            if let Err(err) = notifier.send(item) {
+                // B-179：按 err 变体分流前缀。`Error::Store` 是配置非法（如零超时守卫），
+                // 不是发送失败——读事件表的人据此不会去查网络。其他变体（IO / 超时 / 认证）
+                // 仍是「webhook」前缀。
+                let label = match &err {
+                    crate::error::Error::Store(_) => "webhook 配置非法",
+                    _ => "webhook",
+                };
+                failures.push(format!("{label}: {err}"));
+            }
+        }
+        if !failures.is_empty() {
+            // B-179：标题按 failures 内容分流。有「配置非法」前缀 ⇒ 标题也用「通知配置非法」，
+            // 否则「通知发送失败」。子串匹配够用：当前只有 webhook 零超时守卫用这个词；
+            // 复审要点是「将来新增含『配置非法』的 failure 文案时这条匹配是否仍准」。
+            let has_config_err = failures.iter().any(|f| f.contains("配置非法"));
+            let title = if has_config_err {
+                "通知配置非法"
+            } else {
+                "通知发送失败"
+            };
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "app",
+                format!("{title}: {}", failures.join(" | ")),
+                serde_json::json!({
+                    "kind": format!("{:?}", item.kind),
+                    "webhook": crate::redact::mask_webhook_url(
+                        state.config.webhook_url.as_deref().unwrap_or("")
+                    ),
+                }),
+            ));
+        }
     }
 
     /// 读**落库的**通知基线（B-81）。
@@ -4586,13 +4865,16 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 内部版本：用**已经读到**的令牌做对账，避免 `gateway_config` 为同一份令牌读两次钥匙串
     /// （第二次读失败会把一次瞬时故障放大成「临时令牌」，M16-S4 的读失败语义被改变）。
     fn ensure_default_token_migrated_with(&self, current: &str) -> Result<bool> {
-        if self.store.default_gateway_token()?.is_some() {
+        // B-224 P3：直接复用第一次查询的结果——此前先判 `is_some()` 再二次
+        // 查询并 `.expect("上面刚判过")`，两次之间若默认行被并发删除/吊销，
+        // 就会在一条「已判过存在」的路径上 panic。复用后最坏情况是后续
+        // 更新/恢复返回 `Err`（调用方正常处理），而不是无条件 panic。
+        if let Some(row) = self.store.default_gateway_token()? {
             // M41-S2：对账——默认行 hash 与钥匙串不一致时**原地**更新（保留 id/label/created_at）。
             if current.trim().is_empty() {
                 return Ok(false);
             }
             let expected = crate::gateway::sha256_hex(current);
-            let row = self.store.default_gateway_token()?.expect("上面刚判过");
             let mut changed = false;
             // 手工吊销过的默认行：对账把它恢复（spec §4.6/T-13），否则钥匙串里的
             // 默认令牌永远 401，连轮换都救不回。
@@ -4728,9 +5010,13 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let settings = self.settings()?;
         // M39-S3 §4.6：负载均衡与每站保护策略（**下次启动网关生效**；不在请求路径热切换）。
         config.lb_top_n = settings.gateway_lb_top_n;
+        // M46-S4：重试预算（同口径：下次启动网关生效；0 = 走全部候选）。
+        config.max_attempts = settings.gateway_max_attempts;
         config.guard_policy = crate::routing::SiteGuardPolicy {
             max_concurrency: settings.gateway_per_site_concurrency,
             rate_limit_per_sec: settings.gateway_per_site_rate_limit,
+            // M46-S3：burst 直传（唯一组装点；legacy 与多站路由共用同一份 policy）。
+            rate_burst: settings.gateway_per_site_burst,
         };
         // M42-S1 §4.4：请求体上限（MiB → 字节）。`1..=64` 已由 `Settings::validate` 保证；
         // 这里再夹一次硬上限，防止旧库里的越界值把内存撑爆。
@@ -4821,6 +5107,85 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 buffer.push(usage);
             }
         }));
+
+        // M46-S5：预算判定注入出口。闭包只包一层 Arc<Store>，判定走
+        // budget_breach_for（闭包与测试共用）；store 查询出错 ⇒ None（fail-open，
+        // 见 spec §4.2）。网关本身仍不依赖 store 类型（闭包签名只有 id）。
+        let budget_store = std::sync::Arc::clone(&self.store);
+        config.budget_check = Some(Arc::new(move |site_id, key_id| {
+            budget_breach_for(&budget_store, site_id, key_id)
+                .ok()
+                .flatten()
+        }));
+
+        // M46-S5：超标回调注入出口。只做有界 push（与 on_failure 闭包同口径：
+        // 会话比对 + 上限丢最旧 + 丢弃计数），事件与通知由 refresh_all 的 drain 做。
+        let breach_sink = Arc::clone(&self.budget_breaches);
+        let breach_dropped = Arc::clone(&self.budget_breaches_dropped);
+        let breach_session_current = Arc::clone(&self.gateway_session);
+        config.on_budget_breach = Some(Arc::new(move |breach: crate::gateway::BudgetBreach| {
+            if breach_session_current.load(std::sync::atomic::Ordering::SeqCst) != session {
+                return;
+            }
+            if let Ok(mut buffer) = breach_sink.lock() {
+                if buffer.len() >= MAX_BUFFERED_GATEWAY_FAILURES {
+                    buffer.pop_front();
+                    breach_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                buffer.push_back(breach);
+            }
+        }));
+
+        // M46-S7：按 agent 路由规则（启动时快照；解析与剥离都在这里做完，
+        // 网关请求路径只按 label 查表，不读 store、不解析 JSON）。
+        // 三条路径（见 spec §4.5 的区分表，绝不互换）：
+        // ① 解析成功 + 站表可读 ⇒ 剥离不存在站点（逐条 Warn 事件），有效规则进 config；
+        // ② 站表读失败 ⇒ 规则原样进 config（未知 id 在请求层自然匹配不到候选，无害），
+        //    只写一条 Warn；绝不因此让网关起不来；
+        // ③ 解析失败（仅手改库等旁路可达，正常写路径已被 validate 拦）⇒ fail-open：
+        //    规则置空 + 一条 Warn 事件（payload 只写原因摘要，不回显规则全文），
+        //    网关照常启动、全局加权。
+        config.routing_rules = match crate::routing::parse_routing_rules(&settings.routing_rules) {
+            Ok(rules) => match self.store.list_sites() {
+                Ok(rows) => {
+                    let known: std::collections::HashSet<i64> =
+                        rows.iter().map(|row| row.id).collect();
+                    let (effective, unknown) = crate::routing::resolve_routing_rules(rules, &known);
+                    for (label, site_id) in unknown {
+                        self.log(observability::event_with_payload(
+                            Level::Warn,
+                            "gateway",
+                            format!(
+                                "路由规则引用了不存在的站点 {site_id}（agent {label}），该条已忽略"
+                            ),
+                            serde_json::json!({
+                                "agent_label": label,
+                                "site_id": site_id,
+                            }),
+                        ));
+                    }
+                    effective
+                }
+                Err(_) => {
+                    self.log(observability::event_with_payload(
+                        Level::Warn,
+                        "gateway",
+                        "路由规则启动解析：站表读失败，未知站点不剥离、规则原样生效",
+                        serde_json::json!({}),
+                    ));
+                    rules
+                }
+            },
+            Err(reason) => {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "gateway",
+                    "路由规则解析失败，已按全局加权放行（请在设置页修正规则后重启网关）",
+                    serde_json::json!({ "reason": reason }),
+                ));
+                Vec::new()
+            }
+        };
         Ok(config)
     }
 
@@ -4866,6 +5231,84 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 ),
                 serde_json::json!({ "dropped": dropped_this_round }),
             ));
+        }
+    }
+
+    /// M46-S5：把网关攒下的预算超标写成事件 + 通知（refresh_all 在 drain 用量之后调）。
+    ///
+    /// 节流：按 (site_id, 预算行 key_id, period, 周期起点) 去重，每周期只发一次事件 +
+    /// 通知；同周期后续 breach 在 drain 时丢弃（已花只增不减，超标是持续状态）。
+    /// 通知不走 `rules::evaluate`：breach 是请求路径的事实，不是快照比较的产物；
+    /// 直接构造 `BudgetExceeded` 通知走 `send_notification`（与 dispatch 共用的发送块）。
+    pub fn drain_budget_breaches(&self) {
+        let drained: Vec<crate::gateway::BudgetBreach> = match self.budget_breaches.lock() {
+            Ok(mut buffer) => buffer.drain(..).collect(),
+            Err(_) => return,
+        };
+        let dropped = self
+            .budget_breaches_dropped
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if dropped > 0 {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "gateway",
+                format!("本轮因缓冲满丢弃 {dropped} 条预算超标记录（仅记计数，不逐条记）"),
+                serde_json::json!({ "dropped": dropped }),
+            ));
+        }
+        if drained.is_empty() {
+            return;
+        }
+        // 旧节流键清扫（32 天前）：集合只增不减会随周期滚动膨胀，drain 时顺手清。
+        let now = unix_now_secs();
+        let mut notified = self.budget_notified.lock().ok();
+        if let Some(set) = notified.as_mut() {
+            set.retain(|entry| entry.3 >= now - 32 * 86400);
+        }
+        for breach in &drained {
+            let period_start = self
+                .store
+                .budget_period_bounds(breach.period.as_str())
+                .map(|(start, _)| start)
+                .unwrap_or(0);
+            let key = (
+                breach.site_id,
+                breach.key_id,
+                breach.period.as_str().to_string(),
+                period_start,
+            );
+            let is_first = notified.as_mut().is_none_or(|set| set.insert(key));
+            if !is_first {
+                continue;
+            }
+            let period_label = match breach.period {
+                crate::gateway::BudgetPeriod::Day => "本日",
+                crate::gateway::BudgetPeriod::Month => "本月",
+            };
+            let detail = format!(
+                "预算超支：站点 {} {period_label}已花 ${}，上限 ${}",
+                breach.site_id, breach.spent_usd, breach.limit_usd,
+            );
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "gateway",
+                detail.clone(),
+                serde_json::json!({
+                    "site_id": breach.site_id,
+                    "key_id": breach.key_id,
+                    "period": breach.period.as_str(),
+                    "spent_usd": breach.spent_usd,
+                    "limit_usd": breach.limit_usd,
+                }),
+            ));
+            let notification = crate::notify::Notification::new(
+                crate::notify::NotifyKind::BudgetExceeded,
+                Some(breach.site_id),
+                "预算超支",
+                detail,
+                now,
+            );
+            self.send_notification(&notification);
         }
     }
 
@@ -5037,6 +5480,10 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     latency_ms: obs.latency_ms,
                     key_ref: row.secret_ref.clone(),
                     key_id: Some(row.id),
+                    // M46-S4：分站超时的数据源缺口（见 spec §4.4）：`sites` 表没有超时列，
+                    // 本步恒填 None ⇒ 生产路由回退全局超时，行为不变；列 + 迁移 +
+                    // 站点编辑 IPC/DTO + UI 落地后，这里改成从站点行取值。
+                    timeout_ms: None,
                 });
                 if !revoked.contains(&row.secret_ref) {
                     keys.insert(row.secret_ref.clone(), secret);
@@ -5286,6 +5733,124 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             summary.published = self.publish_gateway_snapshot()? > 0;
         }
         summary.generation = self.gateway_snapshot_generation();
+        Ok(summary)
+    }
+
+    /// **一趟**密钥健康巡检（M46-S1）。
+    ///
+    /// 与 `refresh_model_catalog_once` **同构但解耦**：取 key 口径相同
+    /// （`pick_gateway_key` + 已回收跳过 + `secret_for_row` 内存明文），
+    /// 探活调用相同（`site::fetch_models`），但结论与副作用完全不同——
+    /// 巡检**不写库**（目录、健康列一律不动）、**不发布快照**，只记可观测事件
+    /// 并返回摘要；把结论喂给运行中网关的 `Breaker` 是壳层循环的事
+    /// （服务层没有熔断句柄，见 spec §4.2）。
+    ///
+    /// 间隔为 0 ⇒ 立刻返回空摘要，**一个请求都不发、一条事件都不记**。
+    /// 明文只活在 job 里（`Zeroizing`），调完即 drop；事件 payload 只有
+    /// `site_id` / `key_id` / `verdict`，不含密钥、不含 base_url。
+    pub async fn check_key_health_once(&self) -> Result<KeyHealthSummary> {
+        let mut summary = KeyHealthSummary::default();
+        let settings = self.settings()?;
+        // 巡检的**唯一**门槛是间隔非 0（默认关；壳层循环里还会再判一次，纵深防御）。
+        if settings.gateway_key_health_interval_secs == 0 {
+            return Ok(summary);
+        }
+
+        // ① 选出「有可用 key」的站点。**同步段，不 await**（拿明文与判据都在这里）。
+        struct HealthJob {
+            site_id: i64,
+            key_id: i64,
+            base_url: String,
+            secret: zeroize::Zeroizing<String>,
+        }
+        let revoked = self
+            .revoked_refs
+            .lock()
+            .map(|set| set.clone())
+            .unwrap_or_default();
+        let mut jobs: Vec<HealthJob> = Vec::new();
+        for site in self.store.list_sites()? {
+            let Some(row) = self.pick_gateway_key(site.id)? else {
+                continue;
+            };
+            if revoked.contains(&row.secret_ref) {
+                continue;
+            }
+            // 钥匙串里没有明文是本地配置问题，不是探活结论：跳过，不记失败、不喂熔断。
+            let Ok(secret) = self.secret_for_row(&row) else {
+                continue;
+            };
+            jobs.push(HealthJob {
+                site_id: site.id,
+                key_id: row.id,
+                base_url: site.base_url.clone(),
+                secret,
+            });
+        }
+        if jobs.is_empty() {
+            return Ok(summary);
+        }
+
+        // ② 有界并发 + 单站 deadline：探活本身不重试，失败只等下一间隔轮次。
+        let transport = &self.transport;
+        let results = futures_util::stream::iter(jobs.into_iter().map(|job| async move {
+            let timed = tokio::time::timeout(
+                KEY_HEALTH_PROBE_TIMEOUT,
+                crate::site::fetch_models(transport, &job.base_url, &job.secret),
+            )
+            .await;
+            // 超时不是 `fetch_models` 的结果：单独标成 UpstreamFault（站点无响应）。
+            let (verdict, fetched) = match timed {
+                Err(_) => (crate::notify::KeyHealthVerdict::UpstreamFault, None),
+                Ok(result) => (crate::notify::classify_probe_result(&result), result.ok()),
+            };
+            (job, verdict, fetched)
+        }))
+        .buffer_unordered(KEY_HEALTH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        // ③ 记事件 + 写摘要（串行；不写库）。
+        for (job, verdict, fetched) in results {
+            summary.attempted += 1;
+            match verdict {
+                crate::notify::KeyHealthVerdict::Healthy => summary.healthy += 1,
+                crate::notify::KeyHealthVerdict::DeadKey => summary.dead += 1,
+                crate::notify::KeyHealthVerdict::QuotaExhausted => summary.quota += 1,
+                crate::notify::KeyHealthVerdict::UpstreamFault => summary.fault += 1,
+                crate::notify::KeyHealthVerdict::Unknown => summary.unknown += 1,
+            }
+            let level = match verdict {
+                crate::notify::KeyHealthVerdict::DeadKey
+                | crate::notify::KeyHealthVerdict::QuotaExhausted => Level::Warn,
+                _ => Level::Debug,
+            };
+            self.log(observability::event_with_payload(
+                level,
+                "gateway",
+                format!("密钥健康巡检：{}", verdict.as_str()),
+                serde_json::json!({
+                    "site_id": job.site_id,
+                    "key_id": job.key_id,
+                    "verdict": verdict.as_str(),
+                }),
+            ));
+            // 模型键集合 = 库里目录 ∪ 本轮返回（去重保序）；本轮清单**不落库**。
+            let mut models = self.store.site_models(job.site_id).unwrap_or_default();
+            if let Some(fetched) = fetched {
+                for name in fetched {
+                    if !models.iter().any(|kept| kept == &name) {
+                        models.push(name);
+                    }
+                }
+            }
+            summary.outcomes.push(KeyHealthOutcome {
+                site_id: job.site_id,
+                key_id: job.key_id,
+                verdict,
+                models,
+            });
+        }
         Ok(summary)
     }
 
@@ -7015,6 +7580,132 @@ mod tests {
         (service, key_id, mock, sleeper)
     }
 
+    /// M46-S1 巡检测试装配：1 站 + 1 把假密钥（内存 vault），巡检间隔已开（300 秒）。
+    /// 调用方在 `responses` 里先放 `status_response()`（供 `add_site` 消耗），再放探活响应。
+    async fn health_service(
+        responses: Vec<HttpResponse>,
+    ) -> (TianshuRelayService<MockTransport>, MockTransport) {
+        let store = Store::open_in_memory().expect("内存库");
+        let mock = MockTransport::new(responses);
+        let service = TianshuRelayService::new(store, mock.clone(), test_config());
+        let site = service
+            .add_site("https://relay.example.com")
+            .await
+            .expect("add_site");
+        let reference = crate::vault::secret_ref("key", 1, "secret");
+        service
+            .vault
+            .put(&reference, "sk-test-health-fake")
+            .expect("vault.put");
+        service
+            .store
+            .insert_key(site.id, "health-key", &reference, Some("remote-1"), None)
+            .expect("insert_key");
+        let mut settings = service.settings().expect("settings");
+        settings.gateway_key_health_interval_secs = 300;
+        service.update_settings(&settings).expect("update_settings");
+        (service, mock)
+    }
+
+    fn health_models_response() -> HttpResponse {
+        HttpResponse::json(200, json!({"data": [{"id": "gpt-4o"}, {"id": "claude-x"}]}))
+            .expect("构造响应")
+    }
+
+    fn health_unauthorized_response() -> HttpResponse {
+        HttpResponse::json(
+            401,
+            json!({"error": {"code": "invalid_api_key", "message": "bad key"}}),
+        )
+        .expect("构造响应")
+    }
+
+    #[tokio::test]
+    async fn key_health_disabled_sends_no_requests() {
+        // 默认间隔 0：巡检不开，零请求（Mock 计数以 add_site 的 1 次为准，不再增加）。
+        let (service, mock) = health_service(vec![status_response()]).await;
+        let mut settings = service.settings().expect("settings");
+        settings.gateway_key_health_interval_secs = 0;
+        service.update_settings(&settings).expect("update_settings");
+        let before = mock.request_count();
+        let summary = service.check_key_health_once().await.expect("巡检");
+        assert_eq!(summary.attempted, 0, "间隔为 0 时不得探活");
+        assert_eq!(mock.request_count(), before, "间隔为 0 时不得发出任何请求");
+    }
+
+    #[tokio::test]
+    async fn key_health_healthy_and_dead_key_roundtrip() {
+        let (service, mock) = health_service(vec![
+            status_response(),
+            health_models_response(),
+            health_unauthorized_response(),
+        ])
+        .await;
+        // 第一轮：200 模型清单 ⇒ Healthy，模型键集合 = 本轮返回。
+        let first = service.check_key_health_once().await.expect("巡检");
+        assert_eq!(first.attempted, 1);
+        assert_eq!(first.healthy, 1);
+        assert_eq!(first.outcomes.len(), 1);
+        assert_eq!(
+            first.outcomes[0].verdict,
+            crate::notify::KeyHealthVerdict::Healthy
+        );
+        assert_eq!(
+            first.outcomes[0].models,
+            vec!["gpt-4o".to_string(), "claude-x".to_string()]
+        );
+        // 第二轮：401 ⇒ DeadKey；目录不被巡检改写（巡检不落库）。
+        let second = service.check_key_health_once().await.expect("巡检");
+        assert_eq!(second.dead, 1);
+        assert_eq!(
+            second.outcomes[0].verdict,
+            crate::notify::KeyHealthVerdict::DeadKey
+        );
+        assert!(
+            service
+                .store
+                .site_models(second.outcomes[0].site_id)
+                .expect("读目录")
+                .is_empty(),
+            "巡检不得写目录"
+        );
+        // 事件表里有巡检事件，且不含假密钥原文。
+        let dump = service
+            .store
+            .list_events(200)
+            .expect("读事件")
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(dump.contains("dead_key"), "事件里应有死 key 结论: {dump}");
+        assert!(
+            !dump.contains("sk-test-health-fake"),
+            "事件不得含密钥原文: {dump}"
+        );
+        assert_eq!(mock.request_count(), 3, "add_site 1 次 + 巡检 2 次");
+    }
+
+    #[tokio::test]
+    async fn key_health_skips_site_without_usable_key() {
+        // 只有站点、没有 key：巡检不产生请求、不进摘要。
+        let store = Store::open_in_memory().expect("内存库");
+        let mock = MockTransport::new(vec![status_response()]);
+        let service = TianshuRelayService::new(store, mock.clone(), test_config());
+        service
+            .add_site("https://relay.example.com")
+            .await
+            .expect("add_site");
+        let mut settings = service.settings().expect("settings");
+        settings.gateway_key_health_interval_secs = 300;
+        service.update_settings(&settings).expect("update_settings");
+        let before = mock.request_count();
+        let summary = service.check_key_health_once().await.expect("巡检");
+        assert_eq!(summary.attempted, 0);
+        assert!(summary.outcomes.is_empty());
+        assert_eq!(mock.request_count(), before, "无可用 key 时不得发请求");
+    }
+
     #[tokio::test]
     async fn probe_model_confirm_false_returns_invalid_input_without_request() {
         // confirm=false → InvalidInput（请求未发出）；mock 队列只剩指纹，不该被 probe 消费。
@@ -8054,6 +8745,153 @@ mod tests {
             .await
             .expect_err("非人工态必须拒绝");
         assert!(matches!(err, Error::AuthFailed(_)), "{err:?}");
+    }
+
+    /// M43-S2 T13 外延（B-224 长尾）：原始条目正文不得出现在落库行 /
+    /// 事件表 / 诊断导出 / 备份导出里。T13 本体只扫了 core 的 sink 行
+    /// （`RawBill` 的 Debug 文本）；本用例走真实生产链
+    /// （`import_site_billing` → `site_bill_upsert` + 一条计数事件），
+    /// 证明原文在下游四个表面都到不了。
+    /// 结构注记：`site_bills` 表本身就没有存原文的列（只有
+    /// site_id/day/amount/currency/requests/source/fetched_at），导入事件
+    /// 的 payload 也只有计数；本用例的价值是回归防护——将来若有人给落库
+    /// 或事件加字段、或把原始 JSON 塞进导出物，这里会红。
+    /// 顺序约束（与 M43-S1 T7 扩展同理）：导出扫描必须在塞 canary 之前
+    /// ——导出物会把事件表打进去，塞完再导会把 canary 自身扫出来。
+    #[tokio::test]
+    async fn billing_import_raw_entry_text_never_reaches_store_events_or_exports() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        const CANARY: &str = "CANARY-BILL-9d2f4a";
+        // canary 先命中证明（与 T13 同标准）：把 canary 放进 SiteBillRow 的
+        // day 字段，证明「Debug 拼串 + contains」扫描器在行里真有 canary
+        // 时能命中，否则下面的零命中可能是扫描器空转。
+        let probe = vec![crate::store::SiteBillRow {
+            id: 0,
+            site_id: 0,
+            day: CANARY.to_string(),
+            amount: None,
+            currency: None,
+            requests: None,
+            source: "probe".to_string(),
+            fetched_at: 0,
+        }];
+        assert!(
+            format!("{probe:?}").contains(CANARY),
+            "扫描器必须能命中故意放进落库行的 canary，否则零命中是空转"
+        );
+
+        let dir = tempfile::tempdir().expect("临时目录");
+        let home = dir.keep();
+        let vault = Arc::new(crate::vault::MemoryVault::new());
+        let service = TianshuRelayService::new(
+            Store::open_in_memory().expect("内存库"),
+            MockTransport::new(vec![]),
+            ServiceConfig {
+                vault: Arc::clone(&vault) as Arc<dyn crate::vault::Vault>,
+                home: home.clone(),
+                backup_dir: home.join("backups"),
+            },
+        );
+        service.transport_push(json_ok_with(
+            json!({"success": true, "data": {"system_name": "示例 NewAPI", "version": "1.0.0-rc.45"}}),
+        ));
+        let site = service
+            .add_site("https://newapi.example.com")
+            .await
+            .expect("建站");
+        assert_eq!(site.kind, "newapi");
+        seed_session(
+            &service,
+            &vault,
+            site.id,
+            crate::site::Session {
+                cookies: vec![],
+                access_token: Some(newapi_jwt(9_999_999_999)),
+                user_id: Some("42".to_string()),
+                user_agent: None,
+            },
+        );
+
+        // 账单页：prompt/response/payload 里塞 canary；created_at 取今天，
+        // 让落库行落在 site_bills(30) 的窗口内（窗口上限 90 天）。
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("时钟")
+            .as_secs();
+        let body = format!(
+            r#"{{"success":true,"data":[{{"created_at":{now},"quota":500000,"prompt":"{CANARY}","response":"{CANARY}","payload":{{"text":"{CANARY}"}}}}],"total":1}}"#
+        );
+        service.transport_push(HttpResponse::new(200, body.as_str()));
+        let (outcome, rows) = service
+            .import_site_billing(site.id, None, None)
+            .await
+            .expect("导入");
+        assert_eq!(outcome.imported, 1);
+        assert_eq!(rows.len(), 1);
+
+        // ① 落库行（UI 读的公开路径）。
+        let bills = service.store.site_bills(30).expect("读账单");
+        assert_eq!(bills.len(), 1, "导入的一天必须落库: {bills:?}");
+        assert!(
+            !format!("{bills:?}").contains(CANARY),
+            "落库行不得含原始条目正文: {bills:?}"
+        );
+        // ② 事件表。
+        let events = service.store.list_events(200).expect("读事件");
+        let events_dump = events
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !events_dump.contains(CANARY),
+            "事件表不得含原始条目正文: {events_dump}"
+        );
+        // ③ 诊断导出（事件面重打包）。
+        let diag = service.export_diagnostics(200).expect("诊断导出");
+        assert!(!diag.contains(CANARY), "诊断包不得含原始条目正文");
+        // ④ 备份导出（与落盘同款脱敏序列化；bundle 本身不含 site_bills，
+        // 扫它等于扫事件面 + 站点/密钥/设置面）。
+        let bundle = service.export_bundle().expect("备份");
+        let bundle_text = crate::export::to_json(&bundle).expect("序列化");
+        assert!(!bundle_text.contains(CANARY), "备份包不得含原始条目正文");
+
+        // canary 证明：往事件表塞一条带 canary 的行，同一扫描必须命中。
+        service
+            .store
+            .insert_event(&crate::observability::Event {
+                ts: 1_700_000_000,
+                level: crate::observability::Level::Warn,
+                source: "site".to_string(),
+                message: format!("canary 泄漏行 {CANARY}"),
+                payload: None,
+            })
+            .expect("写 canary 事件");
+        let events_after = service.store.list_events(200).expect("重读事件");
+        let dump_after = events_after
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            dump_after.contains(CANARY),
+            "同一扫描必须能命中事件表里故意塞的 canary，否则零命中是空转"
+        );
+        // B224-TAIL-3 复审 P2-1：导出面扫描器也补正向对照——塞 canary 行后
+        // 重导诊断与备份，两处都必须命中。canary 文本非密钥形态（无前缀、
+        // 无 `=`、无 URL、无 JWT 结构、最长 hex 连续段仅 6 位），scrub
+        // 系对其为恒等变换，故该对照应为绿，不改生产代码。
+        let diag_after = service.export_diagnostics(200).expect("重导诊断");
+        assert!(
+            diag_after.contains(CANARY),
+            "塞 canary 行后重导诊断必须命中，否则导出扫描是空转"
+        );
+        let bundle_after = service.export_bundle().expect("重导备份");
+        let bundle_after_text = crate::export::to_json(&bundle_after).expect("序列化");
+        assert!(
+            bundle_after_text.contains(CANARY),
+            "塞 canary 行后重导备份必须命中，否则导出扫描是空转"
+        );
     }
 
     #[tokio::test]

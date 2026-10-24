@@ -24,12 +24,14 @@
 //! `service` / `settings`：通知渠道不该有落库能力，也不该被设置模型绑住（章程 §5.2 的中间态）。
 
 pub mod baseline;
+pub mod health;
 pub mod models;
 pub mod rules;
 pub mod system;
 pub mod webhook;
 
 pub use baseline::{decode_snapshot, encode_snapshot, BASELINE_MAX_AGE_SECS, BASELINE_SETTING_KEY};
+pub use health::{apply_probe_outcome, classify_probe_result, KeyHealthVerdict};
 pub use models::{merge_models, should_collect_models, ModelsPolicy};
 pub use rules::{
     evaluate, BalanceSnapshot, DriftFact, RotationDueFact, SiteSnapshot, Snapshot,
@@ -53,12 +55,17 @@ pub enum NotifyKind {
     QuotaExceeded,
     Drift,
     RotationDue,
+    /// M46-S5：本地硬预算超标（网关拦停候选）。与 `QuotaExceeded`（站点侧额度）
+    /// 不同：这是本地预算，不是上游报的额度；与 `BalanceLow`（余额阈值告警）
+    /// 不同：这是「已超且已拦停」的事实，不是阈值提醒。
+    /// 只由 service 的预算 drain 路径直接构造，不走 `rules::evaluate`（见 spec §4.3）。
+    BudgetExceeded,
 }
 
 impl NotifyKind {
-    /// 全部变体。存在的理由：测试要对「7 类都有覆盖」做穷举断言，
+    /// 全部变体。存在的理由：测试要对「8 类都有覆盖」做穷举断言，
     /// 而 `ALL` 与 `as_str` 一旦不同步，穷举就会静默漏掉新变体。
-    pub const ALL: [NotifyKind; 7] = [
+    pub const ALL: [NotifyKind; 8] = [
         NotifyKind::BalanceLow,
         NotifyKind::UsageSpike,
         NotifyKind::NeedsLogin,
@@ -66,6 +73,7 @@ impl NotifyKind {
         NotifyKind::QuotaExceeded,
         NotifyKind::Drift,
         NotifyKind::RotationDue,
+        NotifyKind::BudgetExceeded,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -77,6 +85,7 @@ impl NotifyKind {
             NotifyKind::QuotaExceeded => "quota_exceeded",
             NotifyKind::Drift => "drift",
             NotifyKind::RotationDue => "rotation_due",
+            NotifyKind::BudgetExceeded => "budget_exceeded",
         }
     }
 }
@@ -170,11 +179,11 @@ mod tests {
 
     #[test]
     fn kind_all_covers_every_variant_with_distinct_names() {
-        assert_eq!(NotifyKind::ALL.len(), 7);
+        assert_eq!(NotifyKind::ALL.len(), 8);
         let mut names: Vec<&str> = NotifyKind::ALL.iter().map(|k| k.as_str()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 7, "as_str 有重名: {names:?}");
+        assert_eq!(names.len(), 8, "as_str 有重名: {names:?}");
 
         // 逐个钉住字面量：`kind` 是 Webhook 报文的一部分，改名等于改线上契约
         assert_eq!(NotifyKind::BalanceLow.as_str(), "balance_low");
@@ -184,6 +193,7 @@ mod tests {
         assert_eq!(NotifyKind::QuotaExceeded.as_str(), "quota_exceeded");
         assert_eq!(NotifyKind::Drift.as_str(), "drift");
         assert_eq!(NotifyKind::RotationDue.as_str(), "rotation_due");
+        assert_eq!(NotifyKind::BudgetExceeded.as_str(), "budget_exceeded");
     }
 
     #[test]

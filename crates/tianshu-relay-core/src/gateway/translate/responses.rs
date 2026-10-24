@@ -4,6 +4,7 @@ use super::ir::*;
 use super::{reject_unknown, TranslateError};
 use serde_json::{json, Value};
 
+/// 入站白名单（与 M42-S2a spec §4.2 白名单表同源；改表必须同步改 spec；`store` 有意不在内）。
 const ALLOWED: &[&str] = &[
     "model",
     "instructions",

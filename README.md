@@ -9,17 +9,20 @@
 
 ```
 crates/tianshu-relay-core/     # 纯逻辑库：站点适配器 / 注入器 / 加密保险库 / 存储（不依赖 Tauri）
+crates/tianshu-relay-cli/      # 命令行（冒烟 / 迁移等运维入口）
 src-tauri/                # Tauri 2 桌面壳：命令与平台胶水
 src/                      # React 18 + Vite 前端
+scripts/                  # 门禁与守护脚本（gate / check-*）
 docs/specs/               # 每步 spec（先写）
 docs/reviews/             # 每步复审记录（后写）
+docs/evidence/            # 每步门禁与验证证据
 docs/ADR/                 # 架构决策
 docs/BACKLOG.md           # 范围外问题登记
 ```
 
 ## 环境要求
 
-- Rust 1.77+（本机 1.99）、Node 20+（本机 24）、pnpm 10+
+- Rust 1.89+（`Cargo.toml` 的 `rust-version`，见 ADR-0002；本机 1.99）、Node 20+（本机 24）、pnpm 10+
 - macOS 12+ 或 Windows 10+（Tauri 依赖系统 WebView）
 
 ## 常用命令
@@ -37,11 +40,13 @@ cargo check -p tianshu-relay        # 桌面壳类型检查（需先 pnpm build 
 
 ## 当前进度
 
-| Step | 内容 | 状态 |
-|------|------|------|
-| M0-S1 | 工程基线与核心骨架（适配器/注入器/钥匙串/存储契约 + NewAPI 契约测试） | 实现完成，复审中 |
+已实现至 **M44**（网关验收矩阵与打包），含 NewAPI / Sub2API 适配器、真实 HTTP 传输、
+系统钥匙串与本地加密保险库、本地网关（路由 / 熔断 / 负载均衡）、协议翻译（非流式与流式）、
+用量账本与成本估算、Agent 级令牌与归因。各步的 spec、复审与门禁证据见 `docs/specs/`、
+`docs/reviews/`、`docs/evidence/`；未完成项与遗留问题见 `docs/BACKLOG.md`。
 
-尚未实现（见 `docs/BACKLOG.md`）：Sub2API 适配器、Claude Code 注入器、真实 HTTP 传输、系统钥匙串、打包。
+> 2026-10-24 修复波次（分支 `fix-b224-20261024`，未提交）：B-224 清单中的 7 条 P2、
+> P3 组与测试有效性缺口已修，详见 `docs/BACKLOG.md` 的 B-224 状态更新行。
 
 ## 安全红线（不可违反）
 

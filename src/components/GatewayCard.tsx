@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Copy, Play, RefreshCw, Square } from "lucide-react";
 import {
@@ -36,12 +36,31 @@ type Props = {
   modelsMinIntervalSecs: number;
   /** 网关**请求体**上限（MiB，M42-S1）：1..=64。 */
   maxRequestMib: number;
+  /** 每站限流 burst（M46-S3）：令牌桶额外容量，0 = 关，0..=10000。 */
+  perSiteBurst: number;
+  /** 每站并发上限（M46-UI B-241）：1..=128，默认 8。 */
+  perSiteConcurrency: number;
+  /** 每站每秒上限（M46-UI B-241）：0 = 不限速，0..=10000。 */
+  perSiteRateLimit: number;
+  /** 每请求最多尝试候选数（M46-S4）：0 = 走全部候选，0..=64。 */
+  maxAttempts: number;
+  /** 密钥健康巡检间隔（秒，M46-UI B-237）：0 = 关，非 0 时 60..=86400。 */
+  keyHealthIntervalSecs: number;
+  /** 按 agent 路由规则 JSON（M46-S7）：空 = 无规则，走全局加权。 */
+  routingRules: string;
   onToggle: (enabled: boolean) => void;
   onPortChange: (port: number) => void;
   onMultiSiteChange: (enabled: boolean) => void;
   onCollectModelsChange: (enabled: boolean) => void;
   onModelsIntervalChange: (secs: number) => void;
   onMaxRequestMibChange: (mib: number) => void;
+  onPerSiteBurstChange: (burst: number) => void;
+  onPerSiteConcurrencyChange: (n: number) => void;
+  onPerSiteRateLimitChange: (n: number) => void;
+  onMaxAttemptsChange: (n: number) => void;
+  onKeyHealthIntervalChange: (secs: number) => void;
+  /** M46-S7：路由规则 JSON 文本变更（直传，不在前端解析）。 */
+  onRoutingRulesChange: (text: string) => void;
   /** 设置还没保存时提示用户先保存（端口要保存后才生效） */
   settingsDirty: boolean;
 };
@@ -59,10 +78,10 @@ type Props = {
  * **空态规则（spec §4.3，违反即 bug）**：
  * - 未运行 ⇒ 只显示一行占位；**绝不**渲染 `0 req` / `0 QPS` / 空表格 / 灰色假候选。
  * - `candidates` 为空但运行中 ⇒ 「单上游模式」，不渲染空表。
- * - `requestsTotal < 3`（刚启动）⇒ QPS 显示 `—`（样本不足，不拿 0.3 秒的窗口吹稳定值）。
+ * - 刚启动（`uptimeSecs < 3`，缺失时回退 `requestsTotal < 3`）⇒ QPS 显示 `—`（样本不足，不拿 0.3 秒的窗口吹稳定值）。
  * - `lastError == null` ⇒ 显示「无」（不显示空白：读者分不清「没有」与「没加载」）。
  */
-function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
+export function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
   const { t } = useTranslation();
   if (!status || !status.running) {
     return (
@@ -73,7 +92,11 @@ function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
   }
   const candidates = status.candidates ?? [];
   const requestsTotal = status.requestsTotal ?? 0;
-  const qps = requestsTotal < 3 ? null : status.qps;
+  // B-224（M40-S2 P2-2）：样本不足判据以后端为准（uptime < 3s）；旧
+  // 客户端没给 uptimeSecs 时回退到 requestsTotal < 3，保持兼容。
+  const sampleTooSmall =
+    status.uptimeSecs !== undefined ? status.uptimeSecs < 3 : requestsTotal < 3;
+  const qps = sampleTooSmall ? null : status.qps;
   const badge = (kind: "ok" | "warn" | "danger") => `badge badge-${kind}`;
   return (
     <div className="gateway-metrics">
@@ -106,6 +129,7 @@ function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
               <th>{t("gateway.metrics.candidate.key")}</th>
               <th>{t("gateway.metrics.candidate.health")}</th>
               <th>{t("gateway.metrics.candidate.breaker")}</th>
+              <th>{t("gateway.metrics.candidate.ewmaLatency")}</th>
             </tr>
           </thead>
           <tbody>
@@ -131,11 +155,216 @@ function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
                     {t(`gateway.metrics.breaker.${c.breaker}`)}
                   </span>
                 </td>
+                {/*
+                  M46-UI B-240：每站 EWMA 延迟（毫秒，键为站点 id，见 M46-S2）。
+                  红线：无样本必须显示 `—`，绝不得画成 0——所以这里用 `== null`
+                  判空，不用 `||` / 三元真值判断（EWMA 真为 0ms 时必须显示 `0 ms`，
+                  不能被真值判断吞成 `—`）。旧后端无此字段时 map 为 undefined，
+                  同样回退到 `—`。
+                */}
+                <td className="mono">
+                  {(status.ewmaLatencyMs ?? {})[c.siteId] == null
+                    ? "—"
+                    : `${(status.ewmaLatencyMs ?? {})[c.siteId]} ms`}
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
       )}
+    </div>
+  );
+}
+
+type RoutingRuleRow = {
+  agentLabel: string;
+  siteIds: number[];
+};
+
+/**
+ * 解析路由规则 JSON 文本为结构化行（M46-UI B-255）。
+ * - "" / "[]" ⇒ 空行表（结构化视图）。
+ * - 非数组、行不是对象、agentLabel 不是字符串、siteIds 不是数组、站 id 不是
+ *   正整数 ⇒ 不可解析（回退原文编辑，不丢用户文本）。
+ * - 行内 siteIds 按序去重（与后端 validate 的归一方向一致，但这里只是展示
+ *   归一，不拒传：解析权威仍在后端）。
+ * - agent 为空或站点为空的行仍可解析（渲染时挂未填完整提示，保存时由后端
+ *   拒绝整单并回显后端文案）。
+ */
+function parseRoutingRules(
+  text: string,
+): { ok: true; rows: RoutingRuleRow[] } | { ok: false } {
+  const trimmed = text.trim();
+  if (trimmed === "") return { ok: true, rows: [] };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { ok: false };
+  }
+  if (!Array.isArray(parsed)) return { ok: false };
+  const rows: RoutingRuleRow[] = [];
+  for (const entry of parsed) {
+    if (typeof entry !== "object" || entry === null) return { ok: false };
+    const { agentLabel, siteIds } = entry as {
+      agentLabel?: unknown;
+      siteIds?: unknown;
+    };
+    if (typeof agentLabel !== "string" || !Array.isArray(siteIds)) {
+      return { ok: false };
+    }
+    const ids: number[] = [];
+    for (const id of siteIds) {
+      if (typeof id !== "number" || !Number.isInteger(id) || id <= 0) {
+        return { ok: false };
+      }
+      if (!ids.includes(id)) ids.push(id);
+    }
+    rows.push({ agentLabel, siteIds: ids });
+  }
+  return { ok: true, rows };
+}
+
+/**
+ * M46-UI B-255：按 agent 路由规则的结构化编辑器。
+ *
+ * 同步策略（关键，别改错）：行状态是本地 state，prop 变化时只有「外部变化」
+ * 才重解析——结构化编辑器自己发出的文本经草稿回流到 prop 时（`=== lastEmitted`）
+ * 必须跳过，否则每改一次都会把编辑中的行重置。保存重载、切页回来等外部
+ * 变化会走到重解析分支。回退 textarea 是例外：它的值直接就是 prop，没有
+ * 编辑中状态可言，故 onChange 故意不写 lastEmitted，每次回流都重解析——
+ * 非法→仍回落（不丢文本），合法→立即翻回结构化视图。不可解析的文本不丢：
+ * 回退到原文 textarea（即今天的行为）+ 一行提示。
+ *
+ * 校验分工：前端只做「未填完整」的行级提示（agent 为空或站点为空），不拦
+ * 截、不拒传；解析权威与报错文案都在后端 validate——前端复写一套校验必然
+ * 与后端分叉，还可能拒传合法规则。
+ */
+function RoutingRulesEditor({
+  routingRules,
+  onRoutingRulesChange,
+  sites,
+  tokenLabels,
+}: {
+  routingRules: string;
+  onRoutingRulesChange: (text: string) => void;
+  sites: { id: number; displayName: string }[];
+  tokenLabels: string[];
+}) {
+  const { t } = useTranslation();
+  const initial = parseRoutingRules(routingRules);
+  const [rows, setRows] = useState<RoutingRuleRow[]>(initial.ok ? initial.rows : []);
+  const [fallback, setFallback] = useState(!initial.ok);
+  const lastEmitted = useRef(routingRules);
+  useEffect(() => {
+    if (routingRules !== lastEmitted.current) {
+      lastEmitted.current = routingRules;
+      const parsed = parseRoutingRules(routingRules);
+      setFallback(!parsed.ok);
+      setRows(parsed.ok ? parsed.rows : []);
+    }
+  }, [routingRules]);
+
+  const emit = (next: RoutingRuleRow[]) => {
+    const text = JSON.stringify(next);
+    lastEmitted.current = text;
+    onRoutingRulesChange(text);
+  };
+  const updateRow = (index: number, patch: Partial<RoutingRuleRow>) => {
+    const next = rows.map((r, i) => (i === index ? { ...r, ...patch } : r));
+    setRows(next);
+    emit(next);
+  };
+  const addRow = () => {
+    const next = [...rows, { agentLabel: "", siteIds: [] }];
+    setRows(next);
+    emit(next);
+  };
+  const deleteRow = (index: number) => {
+    const next = rows.filter((_, i) => i !== index);
+    setRows(next);
+    emit(next);
+  };
+
+  if (fallback) {
+    return (
+      <div>
+        <p className="muted">{t("gateway.routingRulesFallbackNote")}</p>
+        <textarea
+          className="input"
+          rows={4}
+          aria-label={t("gateway.routingRulesLabel")}
+          value={routingRules}
+          onChange={(e) => {
+            // M46-UI-5 复审 P1-1：回退 textarea 故意不写 lastEmitted。它的值
+            // 直接就是 prop，没有“编辑中状态会被重解析冲掉”的风险；若也写
+            // lastEmitted，保存重载回来的字符串与它相等，useEffect 永远
+            // 跳过，fallback 会粘住、合法文本也回不到结构化视图。不写它，
+            // 每次回流都会重解析：非法→仍回落（不丢文本），合法→立即翻回
+            // 结构化视图（比文案承诺的“保存重载”更早，但不矛盾）。
+            onRoutingRulesChange(e.target.value);
+          }}
+        />
+      </div>
+    );
+  }
+
+  // 下拉选项 = 可用令牌 label + 各行已有的 label（后者兜底：某行引用的令牌
+  // 若已被吊销，选项里仍保留它，否则该行 agent 会显示空白、值还会被改写掉）。
+  const options = [...new Set([...tokenLabels, ...rows.map((r) => r.agentLabel)])].filter(
+    (l) => l !== "",
+  );
+  return (
+    <div>
+      {tokenLabels.length === 0 ? (
+        <p className="muted">{t("gateway.routingRulesNoTokens")}</p>
+      ) : null}
+      {rows.map((row, i) => {
+        const incomplete =
+          row.agentLabel.trim() === "" || row.siteIds.length === 0;
+        return (
+          <div key={i} data-routing-row={i} className="row">
+            <select
+              className="input"
+              aria-label={t("gateway.routingRulesAgent")}
+              value={row.agentLabel}
+              onChange={(e) => updateRow(i, { agentLabel: e.target.value })}
+            >
+              <option value="">{t("gateway.routingRulesAgentPlaceholder")}</option>
+              {options.map((label) => (
+                <option key={label} value={label}>
+                  {label}
+                </option>
+              ))}
+            </select>
+            <span>{t("gateway.routingRulesSites")}</span>
+            {sites.map((s) => (
+              <label key={s.id} className="checkline">
+                <input
+                  type="checkbox"
+                  checked={row.siteIds.includes(s.id)}
+                  onChange={(e) => {
+                    const next = e.target.checked
+                      ? [...row.siteIds, s.id]
+                      : row.siteIds.filter((id) => id !== s.id);
+                    updateRow(i, { siteIds: next });
+                  }}
+                />
+                <span>{s.displayName}</span>
+              </label>
+            ))}
+            <button type="button" className="btn btn-ghost" onClick={() => deleteRow(i)}>
+              {t("gateway.routingRulesDeleteRow")}
+            </button>
+            {incomplete ? (
+              <p className="muted">{t("gateway.routingRulesRowIncomplete")}</p>
+            ) : null}
+          </div>
+        );
+      })}
+      <button type="button" className="btn" onClick={addRow}>
+        {t("gateway.routingRulesAddRow")}
+      </button>
     </div>
   );
 }
@@ -147,12 +376,24 @@ export default function GatewayCard({
   collectModels,
   modelsMinIntervalSecs,
   maxRequestMib,
+  perSiteBurst,
+  perSiteConcurrency,
+  perSiteRateLimit,
+  maxAttempts,
+  keyHealthIntervalSecs,
+  routingRules,
   onToggle,
   onPortChange,
   onMultiSiteChange,
   onCollectModelsChange,
   onModelsIntervalChange,
   onMaxRequestMibChange,
+  onPerSiteBurstChange,
+  onPerSiteConcurrencyChange,
+  onPerSiteRateLimitChange,
+  onMaxAttemptsChange,
+  onKeyHealthIntervalChange,
+  onRoutingRulesChange,
   settingsDirty,
 }: Props) {
   const { t } = useTranslation();
@@ -175,6 +416,18 @@ export default function GatewayCard({
     setIntervalText(String(modelsMinIntervalSecs));
     setClamped(false);
   }, [modelsMinIntervalSecs]);
+
+  // M46-UI B-237：巡检间隔输入框草稿，口径与采集间隔输入框相同（先输草稿，
+  // 失焦时才钳制）。合法值是 0（关）或 60..=86400：直接拒传会让用户输不出
+  // 60（先输 `6` 即被拒），所以必须走草稿 + 失焦钳制。
+  const [healthIntervalText, setHealthIntervalText] = useState(
+    String(keyHealthIntervalSecs),
+  );
+  const [healthClamped, setHealthClamped] = useState(false);
+  useEffect(() => {
+    setHealthIntervalText(String(keyHealthIntervalSecs));
+    setHealthClamped(false);
+  }, [keyHealthIntervalSecs]);
 
   const token = status.data?.token ?? "";
 
@@ -540,6 +793,156 @@ export default function GatewayCard({
         />
       </label>
       <p className="muted">{t("gateway.maxRequestHint")}</p>
+
+      {/*
+        M46-S3：每站限流 burst。口径与请求体上限输入框相同（受控 number，
+        越界/非整数不调 onChange，后端 validate 是第二道）；保存后下次启动网关生效。
+        注意：设置页此前没有任何 per-site 字段的渲染位置（见 spec §4.6），本字段是
+        第一个落进网关卡的 per-site 字段；并发上限与每秒上限的控件仍缺，见 BACKLOG。
+      */}
+      <label className="field">
+        <span>{t("gateway.perSiteBurstLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={0}
+          max={10000}
+          step={1}
+          value={perSiteBurst}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isInteger(n) && n >= 0 && n <= 10000) {
+              onPerSiteBurstChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.perSiteBurstHint")}</p>
+
+      {/*
+        M46-UI B-241：每站并发上限与每秒上限。口径与 burst 输入框相同（受控
+        number，越界/非整数不调 onChange，后端 validate 是第二道）；保存后
+        下次启动网关生效。两个字段都是 burst 的生效前提字段：burst 只抬高
+        令牌桶容量，不提高补充速率，且 rate = 0 时桶分支整体跳过、burst 无效。
+      */}
+      <label className="field">
+        <span>{t("gateway.perSiteConcurrencyLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={1}
+          max={128}
+          step={1}
+          value={perSiteConcurrency}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isInteger(n) && n >= 1 && n <= 128) {
+              onPerSiteConcurrencyChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.perSiteConcurrencyHint")}</p>
+
+      <label className="field">
+        <span>{t("gateway.perSiteRateLimitLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={0}
+          max={10000}
+          step={1}
+          value={perSiteRateLimit}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isInteger(n) && n >= 0 && n <= 10000) {
+              onPerSiteRateLimitChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.perSiteRateLimitHint")}</p>
+
+      {/*
+        M46-S4：每请求最多尝试候选数。口径与 burst 输入框相同（受控 number，
+        越界/非整数不调 onChange，后端 validate 是第二道）；保存后下次启动网关生效。
+      */}
+      <label className="field">
+        <span>{t("gateway.maxAttemptsLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={0}
+          max={64}
+          step={1}
+          value={maxAttempts}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isInteger(n) && n >= 0 && n <= 64) {
+              onMaxAttemptsChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.maxAttemptsHint")}</p>
+
+      {/*
+        M46-UI B-237：密钥健康巡检间隔。语义与 M46-S1 一致：0 = 关，非 0 时
+        60..=86400 秒；失焦时钳制（1..59 钳到 60、>86400 钳到 86400、非数字/
+        清空钳到 0 = 关），钳制后提示；与采集间隔输入框同口径，保存后下次
+        启动网关生效，后端 validate 是第二道。
+      */}
+      <label className="field">
+        <span>{t("gateway.keyHealthIntervalLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={0}
+          max={86400}
+          step={1}
+          value={healthIntervalText}
+          onChange={(e) => setHealthIntervalText(e.target.value)}
+          onBlur={() => {
+            const parsed = Number(healthIntervalText);
+            const clamped = !Number.isFinite(parsed)
+              ? 0
+              : Math.trunc(parsed) <= 0
+                ? 0
+                : Math.min(86400, Math.max(60, Math.trunc(parsed)));
+            setHealthIntervalText(String(clamped));
+            setHealthClamped(
+              clamped !== parsed || String(clamped) !== healthIntervalText,
+            );
+            if (clamped !== keyHealthIntervalSecs) {
+              onKeyHealthIntervalChange(clamped);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.keyHealthIntervalHint")}</p>
+      {healthClamped ? (
+        <p className="muted">{t("gateway.keyHealthIntervalClamped")}</p>
+      ) : null}
+
+      {/*
+        M46-UI B-255：按 agent 路由规则改为结构化编辑器（agent 下拉取令牌
+        label、站点多选、增删行、逐条未填完整提示）。解析权威仍在后端
+        validate：前端不复写解析、不拦截保存，非法时保存失败并由既有设置
+        保存错误路径回显后端文案。不可解析的文本回退到原文 textarea（见
+        RoutingRulesEditor）。保存后下次启动网关生效。
+      */}
+      <div className="field">
+        <span>{t("gateway.routingRulesLabel")}</span>
+        <RoutingRulesEditor
+          routingRules={routingRules}
+          onRoutingRulesChange={onRoutingRulesChange}
+          sites={sites.data ?? []}
+          tokenLabels={(tokenList.data ?? [])
+            .filter((tok) => tok.active)
+            .map((tok) => tok.label)}
+        />
+      </div>
+      <p className="muted">{t("gateway.routingRulesHint")}</p>
 
       {/* M40-S2：指标面板（**所有相位都渲染**；未运行时由面板自己显示一行占位）。 */}
       <GatewayMetricsPanel status={status.data} />

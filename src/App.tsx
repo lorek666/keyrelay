@@ -1,24 +1,23 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
+  Activity,
   AlertTriangle,
-  BarChart3,
-  FlaskConical,
-  History as HistoryIcon,
+  Wallet,
+  HeartPulse,
   KeyRound,
   LayoutDashboard,
+  Layers,
   Plug,
-  Server,
   Settings as SettingsIcon,
 } from "lucide-react";
-import Overview from "./pages/Overview";
-import Usage from "./pages/Usage";
-import Sites from "./pages/Sites";
-import Keys from "./pages/Keys";
-import Agents from "./pages/Agents";
-import History from "./pages/History";
+import Cockpit from "./pages/Cockpit";
+import Traffic from "./pages/Traffic";
+import Cost from "./pages/Cost";
+import Health from "./pages/Health";
+import Assets from "./pages/Assets";
+import Delivery from "./pages/Delivery";
 import SettingsPage from "./pages/Settings";
-import Probe from "./pages/Probe";
 import { appInfo, getSettings, reportUiReady, runtimeMode } from "./lib/api";
 import { useApplyTheme } from "./lib/theme";
 import { I18nProvider, normalizeLang, useTranslation, type Lang } from "./i18n";
@@ -34,13 +33,12 @@ const NAV_GROUPS = [
 ] as const;
 
 const PAGES = [
-  { id: "overview", labelKey: "nav.overview", icon: LayoutDashboard, group: "nav.group.daily", render: () => <Overview /> },
-  { id: "usage", labelKey: "nav.usage", icon: BarChart3, group: "nav.group.daily", render: () => <Usage /> },
-  { id: "sites", labelKey: "nav.sites", icon: Server, group: "nav.group.asset", render: () => <Sites /> },
-  { id: "keys", labelKey: "nav.keys", icon: KeyRound, group: "nav.group.asset", render: () => <Keys /> },
-  { id: "probe", labelKey: "nav.probe", icon: FlaskConical, group: "nav.group.asset", render: () => <Probe /> },
-  { id: "agents", labelKey: "nav.agents", icon: Plug, group: "nav.group.delivery", render: () => <Agents /> },
-  { id: "history", labelKey: "nav.history", icon: HistoryIcon, group: "nav.group.daily", render: () => <History /> },
+  { id: "cockpit", labelKey: "nav.cockpit", icon: LayoutDashboard, group: "nav.group.daily", render: () => <Cockpit /> },
+  { id: "traffic", labelKey: "nav.traffic", icon: Activity, group: "nav.group.daily", render: () => <Traffic /> },
+  { id: "cost", labelKey: "nav.cost", icon: Wallet, group: "nav.group.daily", render: () => <Cost /> },
+  { id: "health", labelKey: "nav.health", icon: HeartPulse, group: "nav.group.daily", render: () => <Health /> },
+  { id: "assets", labelKey: "nav.assets", icon: Layers, group: "nav.group.asset", render: () => <Assets /> },
+  { id: "delivery", labelKey: "nav.delivery", icon: Plug, group: "nav.group.delivery", render: () => <Delivery /> },
   { id: "settings", labelKey: "nav.settings", icon: SettingsIcon, group: "nav.group.system", render: () => <SettingsPage /> },
 ] as const;
 
@@ -67,7 +65,7 @@ export default function App({ initialDict }: { initialDict?: Record<string, unkn
 
 function AppInner() {
   const { t } = useTranslation();
-  const [page, setPage] = useState<PageId>("overview");
+  const [page, setPage] = useState<PageId>("cockpit");
   const { data: info } = useQuery({ queryKey: ["app-info"], queryFn: appInfo });
   const current = PAGES.find((p) => p.id === page) ?? PAGES[0];
 
@@ -80,7 +78,7 @@ function AppInner() {
   }, []);
 
   return (
-    <div className="app">
+    <div className="app harmony">
       <aside className="sidebar">
         <div className="brand">
           <KeyRound size={18} aria-hidden />

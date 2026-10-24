@@ -36,9 +36,9 @@ use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::routing::{
-    model_key, should_failover, site_key, weighted_pick, Breaker, BreakerKey, BreakerPolicy,
-    BreakerState, Candidate, GuardOutcome, RoundRobinState, RouteTable, SiteGuard, SiteGuardPolicy,
-    SiteLease, Upstream,
+    ewma_update, model_key, reorder_by_effective_latency, should_failover, site_key, weighted_pick,
+    Breaker, BreakerKey, BreakerPolicy, BreakerState, Candidate, GuardOutcome, RoundRobinState,
+    RouteTable, SiteGuard, SiteGuardPolicy, SiteLease, Upstream,
 };
 
 /// 回传上游响应体的大小上限。
@@ -556,6 +556,10 @@ pub struct GatewayConfig {
     pub breaker: BreakerPolicy,
     /// M39-S3 §4.1：参与加权轮转的候选数（`1` = 关掉负载均衡，回到确定性首选）。
     pub lb_top_n: usize,
+    /// M46-S4：每请求最多尝试的候选数。`0` = 走全部候选（今天行为）；`>0` 则截断
+    /// （只计实际发出去的上游尝试，本地保护拒绝的候选不计；见代理循环）。
+    /// 下次启动网关生效（与 `lb_top_n` / `guard_policy` 同口径）。
+    pub max_attempts: usize,
     /// M39-S3 §4.2：每站并发/限速策略。
     pub guard_policy: SiteGuardPolicy,
     /// `key_ref` → 明文。**仅进程内**；`Debug` 不打印（见下方手写 `Debug`）。
@@ -582,6 +586,21 @@ pub struct GatewayConfig {
     ///
     /// 与 `on_failure` 同形（注入出口），理由相同：网关不碰存储层。
     pub on_observation: Option<Arc<dyn Fn(UpstreamObservation) + Send + Sync>>,
+    /// M46-S5：预算判定注入出口。`None` = 不拦（`single_upstream` 默认 ⇒ 既有行为不变）。
+    ///
+    /// 签名刻意只有 `(site_id, key_id)`：网关不把 store 类型推进请求路径，判定逻辑
+    /// 活在 service 侧闭包里（读 `site_budgets` + 算已花）；网关只认返回的 breach。
+    /// 闭包返回 `None` = 未超标（含「查询出错时 fail-open」，见 spec §4.2）。
+    pub budget_check: Option<BudgetCheck>,
+    /// M46-S5：超预算回调注入出口。网关只在循环里首次遇到某 breach 时调一次
+    /// （同一请求内同一 breach 去重，见代理循环）；`None` = 不回调。
+    pub on_budget_breach: Option<BudgetBreachSink>,
+    /// M46-S7：按 agent 路由规则（启动时快照，见 `service::gateway_config`）。
+    ///
+    /// 空 = 无规则（全局加权）。网关只按 `identity.label` 精确匹配查表，
+    /// 不读 store、不解析 JSON——解析与不存在站点剥离都在 service 侧启动时做完。
+    /// legacy 单上游路径不读本字段（见 spec §4.6 的边界说明）。
+    pub routing_rules: Vec<crate::routing::RoutingRule>,
     /// 上游客户端走的代理（M10-S2）。`None` = 直连。
     ///
     /// 由 `service::gateway_config` 从 settings 解析后填入（与站点适配器 transport 同一份
@@ -619,7 +638,7 @@ pub struct GatewayConfig {
 ///
 /// 用的是 `connect_timeout` + `read_timeout`：后者计的是「多久没有新字节」，成功读到就重置，
 /// 它抓的是「接了连接却永远不回应」那种病态上游，不是「慢」。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct UpstreamTimeout {
     /// 连接阶段（TCP + TLS）。
     pub connect: Duration,
@@ -659,6 +678,28 @@ impl Default for UpstreamTimeout {
             connect: Duration::from_secs(5),
             read: Duration::from_secs(240),
         }
+    }
+}
+
+/// M46-S4：分站超时解析（纯函数，与发送解耦）。
+///
+/// **替代，不是取 min**：分站值比全局大时全局不得提前掐断；分站值比全局小时
+/// 分站值说了算。分站值同时作用于 connect 与 read 两维（见 `UpstreamTimeout` 的
+/// 注释：没有 total 维，`RequestBuilder::timeout` 的总 deadline 语义会砍合法长流，
+/// 故分站值绝不用它实现）。
+///
+/// `Some(0)` ≡ 未填：0 毫秒的超时永远不可能成功，把它当成配置值会直接 brick 掉
+/// 该站点；且与本仓库「0 = 关/不限」的惯例一致。
+pub fn effective_upstream_timeout(
+    global: UpstreamTimeout,
+    per_site_ms: Option<u64>,
+) -> UpstreamTimeout {
+    match per_site_ms {
+        Some(ms) if ms > 0 => UpstreamTimeout {
+            connect: Duration::from_millis(ms),
+            read: Duration::from_millis(ms),
+        },
+        _ => global,
     }
 }
 
@@ -715,6 +756,49 @@ pub struct GatewayUsage {
 /// （`store/mod.rs:706-721` 直接 `params![event.payload]`，不做任何脱敏）。
 /// 「由出口负责」这个假设会让密钥形状的自由文本进事件表、再随导出与审计外流——
 /// 与 B-75 是同一类咽喉。
+/// M46-S5：预算周期（网关侧词汇；store 层只认同名字符串，见 store::budget_create）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum BudgetPeriod {
+    Day,
+    Month,
+}
+
+impl BudgetPeriod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetPeriod::Day => "day",
+            BudgetPeriod::Month => "month",
+        }
+    }
+
+    /// 解析周期名（`from_str` 之名会撞标准 trait 方法，clippy 会告警，故用 `parse`）。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "day" => Some(BudgetPeriod::Day),
+            "month" => Some(BudgetPeriod::Month),
+            _ => None,
+        }
+    }
+}
+
+/// M46-S5：预算判定注入出口的类型（字段类型过长会触发 clippy type_complexity，
+/// 故抽别名；`on_failure` 等回调同理只是本身较短）。
+pub type BudgetCheck = Arc<dyn Fn(i64, Option<i64>) -> Option<BudgetBreach> + Send + Sync>;
+/// M46-S5：超标回调注入出口的类型（同上，抽别名）。
+pub type BudgetBreachSink = Arc<dyn Fn(BudgetBreach) + Send + Sync>;
+
+/// M46-S5：一次预算超标事实（service 侧 `budget_check` 闭包构造，网关只认它）。
+/// 不含任何密钥 / base_url / webhook 地址，可直接进事件与通知 payload。
+#[derive(Clone, Debug, PartialEq)]
+pub struct BudgetBreach {
+    pub site_id: i64,
+    /// 预算行的 key：`None` = 站级预算行超标；`Some(id)` = 该 key 的预算行超标。
+    pub key_id: Option<i64>,
+    pub period: BudgetPeriod,
+    pub spent_usd: f64,
+    pub limit_usd: f64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewayFailure {
     pub site_id: i64,
@@ -770,6 +854,8 @@ impl GatewayConfig {
             // M39-S3：单上游（legacy）路径保持 `top_n=1` 与默认 guard，
             // 行为与今天逐字相同（单候选不读轮转计数器）。
             lb_top_n: 1,
+            // M46-S4：0 = 走全部候选；legacy 只有一个候选，预算恒不截断。
+            max_attempts: 0,
             guard_policy: SiteGuardPolicy::default(),
             keys_by_ref: HashMap::new(),
             on_failure: None,
@@ -777,6 +863,13 @@ impl GatewayConfig {
             revoked_refs: None,
             on_observation: None,
             on_usage: None,
+            // M46-S5：默认不拦、不回调（single_upstream 的调用方行为逐字不变；
+            // 服务层的 gateway_config 在构造完再赋值）。
+            budget_check: None,
+            on_budget_breach: None,
+            // M46-S7：默认无规则（single_upstream 的调用方行为逐字不变；
+            // 服务层的 gateway_config 在构造完再赋值）。
+            routing_rules: Vec::new(),
             upstream_proxy: None,
             // P3-4：构造器不知道引用（签名逐字不变，M7-S0 §3.1 冻结）。
             // `None` ⇒ legacy 路径的已回收守卫不生效，行为与改动前逐字相同；
@@ -965,13 +1058,43 @@ fn sanitize_metric_error(reason: &str) -> String {
     crate::redact::scrub(&out).chars().take(200).collect()
 }
 
+/// IPv6 降级原因的**结构化分类**（B-224 P2 修复）。
+///
+/// 分类必须在 v6 绑定失败的那一刻、按 `std::io::ErrorKind` 定下来，
+/// 绝不能事后靠「原因文案里含不含『占用』」反推——OS 文案会随平台 /
+/// 语言环境变化，反推一变就误分类。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ipv6DegradedKind {
+    /// v6 端口被占用。
+    AddrInUse,
+    /// v6 不可用（不支持 / 地址不可用等其他绑定失败）。
+    Unavailable,
+    /// port 0 测试路径：内核分配端口，主动跳过 v6。
+    Skipped,
+}
+
+impl Ipv6DegradedKind {
+    /// 事件 payload / 指标里用的稳定字符串（与任何 OS 文案无关）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Ipv6DegradedKind::AddrInUse => "addr_in_use",
+            Ipv6DegradedKind::Unavailable => "unavailable",
+            Ipv6DegradedKind::Skipped => "skipped",
+        }
+    }
+}
+
 /// IPv6 回环监听状态（M42-S1 §4.5）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ipv6State {
     /// `[::1]:port` 已监听。
     Listening,
-    /// 未监听，附原因（OS 不支持 / 端口被占用 / port 0 测试路径）。
-    Degraded { reason: String },
+    /// 未监听：`kind` 是结构化分类（调用方按它判，不解析文案）；
+    /// `reason` 是**固定文案**，不含任何 OS 错误原文（事件表只留可判定事实）。
+    Degraded {
+        reason: String,
+        kind: Ipv6DegradedKind,
+    },
 }
 
 /// v6 绑定的测试注入模式（`#[doc(hidden)]`，只给集成测试用）。
@@ -994,6 +1117,9 @@ pub struct SiteMetrics {
     pub failovers: u64,
     /// 最近一次尝试的 TTFB（毫秒）。
     pub last_latency_ms: Option<u64>,
+    /// M46-S2：成功请求的 TTFB 的 EWMA（毫秒，alpha 0.2）。
+    /// `None` = 尚无成功样本（选路回退静态延迟；不是「实测 0ms」）。
+    pub ewma_latency_ms: Option<f64>,
     pub last_status: Option<u16>,
     /// 已 `scrub` 且截断到 200 字符。
     pub last_error: Option<String>,
@@ -1013,11 +1139,14 @@ pub struct GatewayMetricsSnapshot {
     pub per_site: std::collections::BTreeMap<i64, SiteMetrics>,
 }
 
-/// 60 个 1 秒槽的 QPS 环。
+/// 60 个 1 秒槽的 QPS 环（真正的滑动窗口，M40-S2 P2-3 修复）。
 #[derive(Debug)]
 struct QpsRing {
     slots: [u64; 60],
-    epoch: Option<Instant>,
+    /// 样本窗口的起点：连续流量下**不重置**（只在空闲 ≥60s 后重置，见下）。
+    started: Option<Instant>,
+    /// 上次推进的时刻：槽位老化按「距上次推进」算，而不是「距起点」。
+    last: Option<Instant>,
     current: usize,
 }
 
@@ -1025,7 +1154,8 @@ impl Default for QpsRing {
     fn default() -> Self {
         Self {
             slots: [0; 60],
-            epoch: None,
+            started: None,
+            last: None,
             current: 0,
         }
     }
@@ -1033,18 +1163,23 @@ impl Default for QpsRing {
 
 impl QpsRing {
     /// 推进到 `now` 对应的槽（按 `Instant`，系统改墙钟不影响）。
+    ///
+    /// 此前实现按「距起点 elapsed」算目标槽，连续流量下每过 60s 就
+    /// `elapsed / 60 > 0` ⇒ **整环清零**：QPS 在每分钟边界掉到 0，
+    /// 所谓「滑动窗口」实际是翻滚窗口（M40-S2 复审 P2-3 属实）。
+    /// 现在老化只清「上次推进以来经过的槽」：连续流量下每次推进
+    /// 最多清 59 个槽，60s 前的旧槽逐个过期、新槽正常计入；
+    /// 只有空闲 ≥60s（全部槽都已过期）时才整环清零并重置起点。
     fn advance(&mut self, now: Instant) {
-        let epoch = *self.epoch.get_or_insert(now);
-        let elapsed = now.saturating_duration_since(epoch).as_secs() as usize;
-        let target = elapsed % 60;
-        if elapsed / 60 > 0 {
-            // 跨过整圈：全部清零（保守：宁可少算，也不把一圈前的数当现在）
+        self.started.get_or_insert(now);
+        let last = self.last.replace(now).unwrap_or(now);
+        let elapsed = now.saturating_duration_since(last).as_secs() as usize;
+        if elapsed >= 60 {
             self.slots = [0; 60];
-            self.current = target;
-            self.epoch = Some(now - std::time::Duration::from_secs((elapsed % 60) as u64));
+            self.started = Some(now);
             return;
         }
-        while self.current != target {
+        for _ in 0..elapsed {
             self.current = (self.current + 1) % 60;
             self.slots[self.current] = 0;
         }
@@ -1054,12 +1189,16 @@ impl QpsRing {
         self.slots[self.current] += 1;
     }
     fn qps(&self) -> f64 {
+        self.qps_at(Instant::now())
+    }
+    /// 可注入时刻的版本（单测用真实 `Instant` 无法等 60s，故拆出来）。
+    fn qps_at(&self, now: Instant) -> f64 {
         let sum: u64 = self.slots.iter().sum();
-        let epoch = match self.epoch {
-            Some(e) => e,
+        let started = match self.started {
+            Some(s) => s,
             None => return 0.0,
         };
-        let uptime = epoch.elapsed().as_secs();
+        let uptime = now.saturating_duration_since(started).as_secs();
         if uptime < 3 {
             return 0.0;
         }
@@ -1124,12 +1263,39 @@ impl GatewayMetrics {
         }
     }
 
+    /// M46-S2：记一次成功请求的 TTFB 进 EWMA。**只由成功分支调用**——
+    /// 失败路径（429 / 5xx / 传输失败）不调，失败不污染 EWMA。
+    /// 锁中毒 ⇒ 跳过（可用性优先，与 `record_attempt` 同口径）。
+    fn record_measured_latency(&self, site_id: i64, latency_ms: u64) {
+        if let Ok(mut map) = self.per_site.lock() {
+            let e = map.entry(site_id).or_default();
+            e.ewma_latency_ms = Some(ewma_update(e.ewma_latency_ms, latency_ms));
+        }
+    }
+
+    /// M46-S2：选路用的每站 EWMA 快照（只有 `Some` 的站进 map）。
+    /// 锁中毒 ⇒ 空 map（选路退化为静态顺序）。
+    fn ewma_latency_map(&self) -> std::collections::BTreeMap<i64, f64> {
+        self.per_site
+            .lock()
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(site_id, metrics)| metrics.ewma_latency_ms.map(|v| (*site_id, v)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// 一次失败（原因先剥 URL，再 scrub + 截断；M40-S2 复审 P1）。
+    ///
+    /// **不加 `requests`**（B-224 P2 修复）：`requests` 的口径是「一次上游尝试」，
+    /// 由 `record_attempt` 在尝试发生时记一次；失败路径若再 +1，一次失败尝试
+    /// 会被计两遍。`record_failure` 只记失败元数据（状态 / 原因 / 时间），
+    /// 未实际尝试的失败（熔断中、不可发送候选）因此也不虚增尝试数。
     fn record_failure(&self, site_id: i64, status: u16, reason: &str) {
         let cleaned = sanitize_metric_error(reason);
         if let Ok(mut map) = self.per_site.lock() {
             let e = map.entry(site_id).or_default();
-            e.requests += 1;
             e.last_status = Some(status);
             e.last_error = Some(cleaned);
             e.last_error_at = Some(now_unix_secs());
@@ -1315,10 +1481,32 @@ impl GatewayHandle {
         Arc::clone(&self.tokens)
     }
 
+    /// M46-S1：把一站的巡检结论喂给运行中网关的 `Breaker`（与 `AppState`
+    /// 共享的同一份，`eligible_candidates` 下一次选路即见效）。
+    ///
+    /// 锁中毒 ⇒ 静默丢弃：巡检结论丢了，下一轮还会再探；可用性优先，
+    /// 不因此让巡检循环或网关请求失败。
+    pub fn record_probe_outcome(
+        &self,
+        site_id: i64,
+        models: &[String],
+        verdict: crate::notify::KeyHealthVerdict,
+        now: Instant,
+    ) {
+        if let Ok(mut guard) = self.breaker.lock() {
+            crate::notify::apply_probe_outcome(&mut guard, site_id, models, verdict, now);
+        }
+    }
+
     /// M43-S1：把库里读出的集合播种进运行态（`start()` 之后由服务层调用）。
     pub fn set_tokens(&self, entries: Vec<GatewayTokenEntry>) {
         if let Ok(mut guard) = self.tokens.write() {
             *guard = entries;
+        } else {
+            // B-224 P3：此前锁中毒时静默保留旧集合、无任何日志——网关跑着
+            // 旧令牌集，排障时没有任何线索。可用性仍优先（不因此停网关），
+            // 但必须留下一行可查的记录。
+            eprintln!("[tianshu-relay] 播种网关令牌集合失败：令牌锁已中毒，保留旧集合");
         }
     }
 
@@ -1408,14 +1596,21 @@ async fn bind_ipv6(port: u16) -> std::io::Result<tokio::net::TcpListener> {
 }
 
 /// v6 失败一律降级（M42-S1 §4.5 / Lead 裁决 2）：**IPv6 永远不阻断 v4**。
+///
+/// 分类与文案都在此处一次定死：`kind` 按 `ErrorKind` 分，`reason` 用固定
+/// 文案——**不把 `{error}` 的 OS 原文塞进 reason**（B-224 P2 修复；此前
+/// 非占用分支的 reason 带 OS 原文，事件 message 因此与「不放原文」的
+/// 注释自述矛盾，且调用方只能靠中文子串反推 kind）。
 fn classify_ipv6_error(error: &std::io::Error) -> Ipv6State {
     if error.kind() == std::io::ErrorKind::AddrInUse {
         Ipv6State::Degraded {
             reason: "IPv6 回环端口被占用，仅监听 127.0.0.1".to_string(),
+            kind: Ipv6DegradedKind::AddrInUse,
         }
     } else {
         Ipv6State::Degraded {
-            reason: format!("IPv6 回环不可用，仅监听 127.0.0.1：{error}"),
+            reason: "IPv6 回环不可用，仅监听 127.0.0.1".to_string(),
+            kind: Ipv6DegradedKind::Unavailable,
         }
     }
 }
@@ -1435,6 +1630,53 @@ fn bind_error_message(port: u16, e: &std::io::Error) -> String {
     } else {
         format!("无法在 127.0.0.1:{port} 上启动网关: {e}")
     }
+}
+
+/// M46-S4：建一个上游客户端（全局主客户端与分站懒建客户端共用）。
+///
+/// 超时写在 `build()` 时：connect + read 两维，不用 `ClientBuilder::timeout`
+///（总 deadline 会砍合法长流，见 `UpstreamTimeout` 的注释）。
+/// 代理校验复用 `proxy::validate_proxy_url`——非法代理在这里就 Err，不静默直连（M10-S2）。
+fn build_upstream_client(
+    timeout: UpstreamTimeout,
+    proxy_url: Option<&str>,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(timeout.connect)
+        .read_timeout(timeout.read);
+    if let Some(proxy_url) = proxy_url {
+        crate::proxy::validate_proxy_url(proxy_url)?;
+        let proxy = reqwest::Proxy::all(proxy_url.to_string()).map_err(|e| {
+            Error::Transport(format!(
+                "网关上游代理配置无效（{}），拒绝静默直连: {e}",
+                crate::proxy::mask_proxy(proxy_url)
+            ))
+        })?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|e| Error::Transport(format!("构造网关的上游客户端失败: {e}")))
+}
+
+/// M46-S4：按生效超时取客户端。生效超时 == 全局超时 ⇒ 共享主客户端（今天路径）；
+/// 否则按超时值缓存一个分站客户端（同值复用，不随请求膨胀）。
+/// 懒建失败 ⇒ 回退共享客户端（只可能因非法代理失败，而代理在 `start()` 时已校验；
+/// 回退时生效的是全局超时，与「没配分站值」一致，不产生新语义）。
+fn client_for_timeout(state: &AppState, timeout: UpstreamTimeout) -> reqwest::Client {
+    if timeout == state.config.upstream_timeout {
+        return state.upstream.clone();
+    }
+    if let Ok(mut cache) = state.upstream_by_timeout.lock() {
+        if let Some(client) = cache.get(&timeout) {
+            return client.clone();
+        }
+        if let Ok(client) = build_upstream_client(timeout, state.config.upstream_proxy.as_deref()) {
+            cache.insert(timeout, client.clone());
+            return client;
+        }
+    }
+    state.upstream.clone()
 }
 
 /// 启动网关（M42-S1：v4 必绑；v6 `[::1]` 同端口，失败降级）。
@@ -1499,28 +1741,12 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
         }
     }
 
-    let mut builder = reqwest::Client::builder()
-        // §3.5-2：上游**必须**有超时。没有它，一个接了连接却不回应的上游会让请求永远挂着，
-        // 既不切下一个候选，也不喂熔断（实测：卡 8.5s、下一个上游收到 0 次、失败事件 0 条）。
-        .connect_timeout(config.upstream_timeout.connect)
-        .read_timeout(config.upstream_timeout.read);
-
-    // M10-S2：上游客户端走解析后的代理（与站点适配器 transport 同一份 resolve_proxy）。
-    // 校验复用 `proxy::validate_proxy_url`——非法代理在这里就 Err，不静默直连。
-    if let Some(proxy_url) = config.upstream_proxy.as_deref() {
-        crate::proxy::validate_proxy_url(proxy_url)?;
-        let proxy = reqwest::Proxy::all(proxy_url.to_string()).map_err(|e| {
-            Error::Transport(format!(
-                "网关上游代理配置无效（{}），拒绝静默直连: {e}",
-                crate::proxy::mask_proxy(proxy_url)
-            ))
-        })?;
-        builder = builder.proxy(proxy);
-    }
-
-    let upstream = builder
-        .build()
-        .map_err(|e| Error::Transport(format!("构造网关的上游客户端失败: {e}")))?;
+    // §3.5-2：上游**必须**有超时。没有它，一个接了连接却不回应的上游会让请求永远挂着，
+    // 既不切下一个候选，也不喂熔断（实测：卡 8.5s、下一个上游收到 0 次、失败事件 0 条）。
+    // M46-S4：主客户端仍用全局超时建；分站客户端由 `client_for_timeout` 懒建，
+    // 与这里共用同一个构造器（两处各写一份 builder 正是分叉的来源）。
+    let upstream =
+        build_upstream_client(config.upstream_timeout, config.upstream_proxy.as_deref())?;
 
     // P3-3：停止闸门。`AppState` 与 `GatewayHandle` 共享同一个标志——
     // 句柄置位（停止信号发出之前），请求路径读取。
@@ -1542,6 +1768,8 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
         local_rejects: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         config: config.clone(),
         upstream,
+        // M46-S4：分站客户端缓存（空起步；生效超时 ≠ 全局时才懒建）。
+        upstream_by_timeout: Arc::new(Mutex::new(HashMap::new())),
         stopping: Arc::clone(&stopping),
         // M43-S1：认证集合的运行态副本（创建/吊销**立即生效**，不重启网关）。
         // `start()` 从空集合起步（legacy 回退）；服务层随后用 `handle.set_tokens()` 播种。
@@ -1577,6 +1805,7 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
             None,
             Ipv6State::Degraded {
                 reason: "端口 0 由内核分配，跳过 IPv6 监听（仅测试路径）".to_string(),
+                kind: Ipv6DegradedKind::Skipped,
             },
         )
     } else {
@@ -1682,6 +1911,9 @@ struct AppState {
     /// 空 ⇒ 回退 `config.token`（legacy 单令牌，行为与今天逐字相同）。
     tokens: Arc<std::sync::RwLock<Vec<GatewayTokenEntry>>>,
     upstream: reqwest::Client,
+    /// M46-S4：按生效超时缓存的分站客户端（键 = 生效超时值本身，同值复用）。
+    /// 共享主客户端（`upstream`）不在这里——生效超时 == 全局时直接用它。
+    upstream_by_timeout: Arc<Mutex<HashMap<UpstreamTimeout, reqwest::Client>>>,
     /// M39-S3 §4.1：加权轮转计数器（跨请求共享；单候选时不读）。
     round_robin: Arc<Mutex<RoundRobinState>>,
     /// M39-S3 §4.2：每站 guard（信号量 + 令牌桶），按 `site_id` 索引。
@@ -2152,6 +2384,32 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         );
     }
 
+    // M46-S7：按 agent 路由规则过滤（在 eligible 之前，见 spec §4.3）。
+    // identity.label 是认证当时的 label 快照（M43-S1）；legacy 令牌 label 为空，
+    // 恒不命中（routing_allowed_sites 的空 label 分支），走全局加权。
+    // 过滤只缩小候选集：后续的熔断 / sendable / EWMA / 预算 / 权重 / 限流 /
+    // 重试环节公式逐字不动，输入是规则子集。被规则排除的候选不进 order，
+    // 故不占 attempts、不进 local_rejects、不产生 breach 回调。
+    let allowed = crate::routing::routing_allowed_sites(
+        &state.config.routing_rules,
+        &identity.label.clone().unwrap_or_default(),
+    );
+    let candidates = crate::routing::filter_upstreams_by_sites(candidates, allowed);
+    if candidates.is_empty() {
+        // 命中规则但规则内无此模型候选（规则站点不在路由内，或不服务该模型）：
+        // kind 与既有 404 分支相同，不新造错误码；文案点名路由规则，
+        // 让客户端能把它与全局 404 区分开。
+        return local_error(
+            StatusCode::NOT_FOUND,
+            GatewayErrorKind::InvalidRequest,
+            "model_not_found",
+            format!(
+                "没有可服务模型 {} 的上游（该 agent 的路由规则限定站点内无此模型）",
+                model.as_deref().unwrap_or("(请求里未指定)")
+            ),
+        );
+    }
+
     let now = Instant::now();
     let eligible = eligible_candidates(&state.breaker, &candidates, model.as_deref(), now);
     if eligible.is_empty() {
@@ -2201,6 +2459,31 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         .filter(|c| is_sendable(&state, view.keys(), c.upstream))
         .collect();
 
+    // M46-S2：按实测 EWMA 重排（在 weighted_pick 之前；本行不读 round_robin，
+    // 所以 cursor 消耗规则逐字不变；权重公式在 weighted_pick 内只由 rate 定，
+    // 重排只改变组首次出现顺序与失败切换顺序）。
+    let ewma = state.metrics.ewma_latency_map();
+    let sendable = reorder_by_effective_latency(sendable, &|site_id| ewma.get(&site_id).copied());
+
+    // M46-S5：请求级预算拦截表。sendable 里去重后的 (site_id, key_id) 对各查一次
+    // budget_check，命中即记入映射（循环内按它跳过候选）。
+    // 不在 eligible 阶段过滤：eligible 为空走的是熔断 503 尾巴，预算拦光不得报成熔断。
+    let mut budget_blocked: std::collections::HashMap<(i64, Option<i64>), BudgetBreach> =
+        std::collections::HashMap::new();
+    if let Some(check) = &state.config.budget_check {
+        for c in &sendable {
+            let pair = (c.upstream.site_id, c.upstream.key_id);
+            if let std::collections::hash_map::Entry::Vacant(entry) = budget_blocked.entry(pair) {
+                if let Some(breach) = check(pair.0, pair.1) {
+                    entry.insert(breach);
+                }
+            }
+        }
+    }
+    // 同一请求内同一 breach 的回调去重集合（循环内首次遇到时才回调）。
+    let mut budget_breach_fired: std::collections::HashSet<(i64, Option<i64>, BudgetPeriod)> =
+        std::collections::HashSet::new();
+
     // M39-S3 §4.1：加权轮转只决定**第一个**尝试谁；失败切换仍按确定性顺序走其余候选。
     // 单候选 / 有探针时不读计数器（`weighted_pick` 内部保证）。
     let top_n = state.config.lb_top_n;
@@ -2221,8 +2504,16 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     }
 
     let mut last_error: Option<String> = None;
+    // M46-S4：重试预算。cap = 0 ⇒ 走全部候选（今天行为）；>0 则每请求最多
+    // 尝试 cap 个候选。attempts_made 只计实际发出去的上游尝试（见循环内递增点）：
+    // 本地保护拒绝的候选不计（它没产生可返回的真实错误），探针被实际发出去时
+    // 与普通候选一样占 1 个预算（计数代码里没有任何按 probe 旗标的分支）。
+    let cap = state.config.max_attempts;
+    let mut attempts_made = 0usize;
     // M39-S3 §4.5：本次请求里「被本地保护跳过」的候选数（与上游故障分开计）。
     let mut local_rejected = 0usize;
+    // M46-S5：其中「因预算被拦」的候选数（全拦时文案区分用；kind 始终不变）。
+    let mut budget_rejected = 0usize;
     // M39-S3（Lead P2）：先记下「可重放的真实响应」（目前只有 429）。若它之后的候选
     // 全被本地保护跳过，也要把它原样返回——不能把上游真的回过的 429 变成 502。
     // 元组里带着 lease：body 还没被读，站点并发要等这条响应真正结束才归还。
@@ -2236,7 +2527,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         meta: AttemptMeta,
     }
     let mut pending_replay: Option<PendingReplay> = None;
-    let attempts = order.len();
+    let order_len = order.len();
     for (index, upstream) in order.iter().enumerate() {
         // P3-3：**每一次上游尝试之前**都查停止闸门——信号可能在上一次尝试期间发出。
         // 在途请求允许跑完**当前**这一次（无法安全中断一个已发出的请求），
@@ -2245,7 +2536,9 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         if is_stopping(&state) {
             return stopping_response();
         }
-        let is_last = index + 1 == attempts;
+        // M46-S4：is_last 的判定移到实际发送处（见 `attempts_made` 递增点之后）：
+        // 预算是否耗尽只能在「本次发送计入之后」才知道，循环顶算不出来
+        // （本地拒绝的候选不计，本次迭代可能根本不发送）。
         // M39-S3 §4.4：有 model 用 `(site, Some(model))`，无 model 用 `(site, None)`。
         let breaker_key = if event_model.is_empty() {
             site_key(upstream.site_id)
@@ -2258,6 +2551,23 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         let Some(key) = view.keys().get(&upstream.key_ref) else {
             continue;
         };
+        // M46-S5：预算拦截——本地拒绝的一种，但刻意与 guard 拒绝不同：
+        // 不 record_failover（预算是策略拦停，不是失败切换）、不喂熔断、不写
+        // GatewayFailure；continue 发生在 attempts_made 递增之前，故不占 M46-S4
+        // 重试预算。回调只在同一请求内首次遇到该 breach 时发一次。
+        if let Some(breach) = budget_blocked.get(&(upstream.site_id, upstream.key_id)) {
+            state
+                .local_rejects
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            local_rejected += 1;
+            budget_rejected += 1;
+            if budget_breach_fired.insert((breach.site_id, breach.key_id, breach.period)) {
+                if let Some(sink) = &state.config.on_budget_breach {
+                    sink(breach.clone());
+                }
+            }
+            continue;
+        }
         // M39-S3 §4.2 / §4.5：**本地保护在发请求之前**——`try_admit` 绝不等待，
         // 拿不到就切下一个候选。**本地拒绝不是上游故障**：不调 `report_failure`、
         // 不喂熔断、不写 `GatewayFailure`（否则一个本机限流就能把好站点熔断）。
@@ -2280,8 +2590,29 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         let url = format!("{}{}{}", upstream.base_url, path, query);
         let headers = upstream_headers(&state.config, &inbound, key);
 
+        // M46-S4：预算计数点——本地保护已放行，本次 `send_once` 就是一次真实
+        // 上游尝试。本地拒绝的分支在上面 `continue` 了，根本到不了这里。
+        attempts_made += 1;
+        // 最后一个候选 = order 末位，或预算在本次发送后耗尽（cap > 0 时）。
+        // 其余分支条件（`replayable && !is_last` / `!replayable || is_last`）逐字不动：
+        // 预算截断复用既有的「最后一个候选」语义，不新写一套终止逻辑。
+        // cap = 0 时右半恒假，退化为今天的 `index + 1 == order_len`。
+        let is_last = index + 1 == order_len || (cap > 0 && attempts_made >= cap);
         let started = Instant::now();
-        match send_once(&state, method.clone(), &url, headers, outbound.clone()).await {
+        // M46-S4：本次发送的生效超时 = 全局超时被该候选的分站值替代
+        // （替代不是取 min；未填 ⇒ 全局本身 ⇒ 共享主客户端）。
+        let effective_timeout =
+            effective_upstream_timeout(state.config.upstream_timeout, upstream.timeout_ms);
+        match send_once(
+            &state,
+            method.clone(),
+            &url,
+            headers,
+            outbound.clone(),
+            effective_timeout,
+        )
+        .await
+        {
             Ok(response) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let status = response.status().as_u16();
@@ -2316,6 +2647,11 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                     );
                 } else {
                     record_success(&state, &breaker_key, Instant::now());
+                    // M46-S2：唯一 EWMA 更新点，与 record_success 同分支
+                    // （成功定义同源；429 / 5xx / 传输失败不走到这里）。
+                    state
+                        .metrics
+                        .record_measured_latency(upstream.site_id, latency_ms);
                 }
                 // M16-S4 / P2-13：**只有 429 才重放**（上游明确没处理这个请求）。
                 // 其余状态码——含 5xx / 524 / 504 这类可能已经计费的——一律**原样返回**：
@@ -2417,12 +2753,19 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     // M39-S3 §4.5：**全部候选都被本地保护跳过** ⇒ 429（不是 502）。
     // 这里没有任何上游出过错：本地并发/限流拒绝不写事件、不喂熔断，
     // 客户端据 `kind == "local_rate_limited"` 就能把「本机限流」与「上游 429」分开。
-    if local_rejected > 0 && local_rejected == attempts {
+    if local_rejected > 0 && local_rejected == order_len {
+        // M46-S5：全是预算拦时文案点名预算（kind 始终是 local_rate_limited，
+        // 客户端据 kind 分流，不据文案）；混拦时保持既有通用文案。
+        let message = if budget_rejected == order_len {
+            "本地保护：预算已超支"
+        } else {
+            "本地保护：所有候选均被限流"
+        };
         return local_error(
             StatusCode::TOO_MANY_REQUESTS,
             GatewayErrorKind::RateLimit,
             "local_rate_limited",
-            "本地保护：所有候选均被限流",
+            message,
         );
     }
 
@@ -2433,8 +2776,9 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     // 根因却是密钥映射空着——**没有任何线索**。
     //
     // **只在失败路径上报**（即上面那个 `for` 没有 `return`）。理由不是省事：
-    // `report_failure` 同时**喂熔断**，而「某个候选被跳过」在请求**成功**时不是故障——
-    // 若那时也上报，一个长期缺明文的候选会把熔断喂开，进而影响别的判断。
+    // 「某个候选被跳过」在请求**成功**时不是故障——若那时也上报，一个长期
+    // 缺明文的候选会污染失败信号。且本循环走**不喂熔断**的版本（B-224 P2）：
+    // 不可发送是配置问题，不是上游故障，绝不能因此把站点熔断。
     // 契约的原话是「不得静默 **502**」，指的正是这条路径。
     //
     // 文案区分两种原因（缺明文 / 已回收），但**都不写 `key_ref` 原文**：
@@ -2444,11 +2788,6 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         .filter(|c| !is_sendable(&state, view.keys(), c.upstream))
     {
         let upstream = cand.upstream;
-        let key = if event_model.is_empty() {
-            site_key(upstream.site_id)
-        } else {
-            model_key(upstream.site_id, &event_model)
-        };
         let (status, reason) = if is_revoked(&state, upstream) {
             (0u16, "该密钥已被回收，不再使用")
         } else {
@@ -2460,15 +2799,11 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         if last_error.is_none() {
             last_error = Some(format!("上游站点 {}: {reason}", upstream.site_id));
         }
-        report_failure(
-            &state,
-            &key,
-            upstream.site_id,
-            status,
-            &event_model,
-            reason,
-            Instant::now(),
-        );
+        // B-224 P2：不可发送是**配置问题**（缺明文 / 已回收），不是上游故障，
+        // 走不喂熔断的版本——否则一个长期缺明文的候选会把整个站点熔断。
+        // （注意：这里不用 `report_event_only` 而是用带指标的版本，否则这类
+        // 失败在 per_site 指标里连最后错误都看不到。）
+        report_failure_without_breaker(&state, upstream.site_id, status, &event_model, reason);
     }
 
     local_error(
@@ -2581,9 +2916,12 @@ async fn send_once(
     url: &str,
     headers: HeaderMap,
     body: bytes::Bytes,
+    // M46-S4：本次发送的生效超时。== 全局 ⇒ 共享主客户端；否则分站客户端
+    // （见 `client_for_timeout`）。绝不用 `RequestBuilder::timeout`（总 deadline
+    // 会砍合法长流，与全局两维语义不是同一维度）。
+    timeout: UpstreamTimeout,
 ) -> std::result::Result<reqwest::Response, AttemptFailure> {
-    state
-        .upstream
+    client_for_timeout(state, timeout)
         .request(method, url)
         .headers(headers)
         .body(body)
@@ -2609,8 +2947,55 @@ async fn forward_to(
     translate_stream: bool,
 ) -> Response {
     let model = model_from_body(&body).unwrap_or_default();
+    // B-224 长尾（M42-S2b §4.4）：legacy 单上游此前传 `lease: None`，流式翻译
+    // 全程不受每站并发约束——与「流式请求同样受每站并发/令牌桶约束」矛盾。
+    // 现与多上游路径同口径：发请求前 `try_admit`，拿不到即 429（不发上游、
+    // 不喂熔断）；拿到的 lease 随响应 body 生命周期归还（流式泵内 `_lease`）。
+    // 默认策略（8 并发、不限速）下对既有单上游部署的影响仅是 8 并发上限。
+    // M46-S5：legacy 单上游预算拦截（无循环、无尾巴可复用，直接 429；
+    // 不发上游、不喂熔断；回调语义与多上游路径相同）。
+    if let Some(check) = &state.config.budget_check {
+        if let Some(breach) = check(state.config.site_id, state.config.key_id) {
+            if let Some(sink) = &state.config.on_budget_breach {
+                sink(breach);
+            }
+            return local_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                GatewayErrorKind::RateLimit,
+                "local_rate_limited",
+                "本地保护：预算已超支",
+            );
+        }
+    }
+    let lease: Option<SiteLease> = match site_guard(state, state.config.site_id)
+        .map(|guard| guard.try_admit(Instant::now()))
+    {
+        None => None,
+        Some(GuardOutcome::Admitted(lease)) => Some(lease),
+        Some(GuardOutcome::ConcurrencyLimited) | Some(GuardOutcome::RateLimited) => {
+            state
+                .local_rejects
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return local_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                GatewayErrorKind::RateLimit,
+                "local_rate_limited",
+                "本地保护：站点并发/限流拒绝",
+            );
+        }
+    };
     let started = Instant::now();
-    match send_once(state, method, url, headers, body).await {
+    // M46-S4：legacy 单上游恒走全局超时 ⇒ 共享主客户端，今天路径逐字相同。
+    match send_once(
+        state,
+        method,
+        url,
+        headers,
+        body,
+        state.config.upstream_timeout,
+    )
+    .await
+    {
         Ok(response) => {
             let latency_ms = started.elapsed().as_millis() as u64;
             state.metrics.record_attempt(
@@ -2626,7 +3011,7 @@ async fn forward_to(
                 response,
                 state.config.site_id,
                 &model,
-                None,
+                lease,
                 AttemptMeta {
                     key_id: state.config.key_id,
                     latency_ms,
@@ -2816,6 +3201,45 @@ async fn maybe_translate_response(
 /// - **客户端断开** ⇒ `tx.send` 失败 ⇒ 任务退出（不泄漏、不继续跑）；
 /// - **usage 只记一次**（`include_usage` 的末帧）。
 #[allow(clippy::too_many_arguments)]
+/// 流式 usage 末帧口径（B-224 长尾）：与 [`UsageCapture`] 的 last-wins 一致——
+/// 泵在整个流里只记**最后一次**见到的 usage，任务结束时（正常、错误、客户端断开）
+/// 恰好发一行；无 usage 则不发。`Drop` 保证各返回点都不漏发、不多发；
+/// `at` 取任务结束时刻（与 `GatewayUsage.at`「流结束或被客户端断开的那一刻」一致）。
+struct StreamUsageFlush {
+    sink: Option<std::sync::Arc<dyn Fn(GatewayUsage) + Send + Sync>>,
+    site_id: i64,
+    key_id: Option<i64>,
+    model: String,
+    status: u16,
+    latency_ms: u64,
+    attempts: u32,
+    token_id: Option<i64>,
+    label: String,
+    pending: Option<(i64, i64, i64)>,
+}
+
+impl Drop for StreamUsageFlush {
+    fn drop(&mut self) {
+        if let (Some(sink), Some((p, c, t))) = (&self.sink, self.pending) {
+            sink(GatewayUsage {
+                at: unix_now_secs(),
+                site_id: self.site_id,
+                key_id: self.key_id,
+                model: self.model.clone(),
+                prompt_tokens: p,
+                completion_tokens: c,
+                total_tokens: t,
+                status: self.status,
+                latency_ms: self.latency_ms,
+                attempts: self.attempts,
+                stream: true,
+                token_id: self.token_id,
+                agent_label: self.label.clone(),
+            });
+        }
+    }
+}
+
 fn streaming_translate_response(
     state: &AppState,
     proto: translate::Protocol,
@@ -2841,13 +3265,48 @@ fn streaming_translate_response(
         let _lease = lease;
         let mut dec = SseDecoder::new();
         let mut tr = StreamTranslator::new(proto);
-        let mut usage_sent = false;
+        // B-224 长尾：usage 取末帧（与 UsageCapture last-wins 同口径），
+        // 任务结束时由 Drop 恰好发一行；首帧即发会在上游发多次 usage 时记少。
+        let mut usage_flush = StreamUsageFlush {
+            sink: on_usage.clone(),
+            site_id,
+            key_id: meta.key_id,
+            model: model.clone(),
+            status: status_code,
+            latency_ms: meta.latency_ms,
+            attempts: meta.attempts,
+            token_id,
+            label: label.clone(),
+            pending: None,
+        };
         let mut saw_done = false;
 
         loop {
-            match upstream.chunk().await {
+            // B-224 P2：同时等客户端断开——上游停顿时不等 read_timeout，
+            // 断开即退出、lease 随 `_lease` drop 归还。`tx.closed()` 在接收端
+            // 全部 drop 时完成；下面各分支里 `tx.send` 失败才发现断开的
+            // 旧路径仍保留（双重保障）。
+            tokio::select! {
+                _ = tx.closed() => {
+                    return;
+                }
+                result = upstream.chunk() => {
+                    match result {
                 Ok(Some(chunk)) => {
                     let events = dec.push(&chunk);
+                    // B-224 P2：单个 SSE 事件超 1 MiB ⇒ 畸形流，发 error 关闭，
+                    // 不继续缓冲（否则上游永不发空行即可无界涨内存）。
+                    if dec.is_overflowed() {
+                        let frame = format!(
+                            "event: error\ndata: {}\n\n",
+                            serde_json::json!({
+                                "type": "error",
+                                "error": { "type": "upstream_error", "message": "上游 SSE 事件超过上限" }
+                            })
+                        );
+                        let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
+                        return;
+                    }
                     for e in &events {
                         // P2（复审）：`[DONE]` 之外、解析不出增量的事件 ⇒ 明确报错并关闭，
                         // 不静默跳过（静默跳过 = 客户端拿到残缺回答却以为完整）。
@@ -2865,28 +3324,10 @@ fn streaming_translate_response(
                             let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
                             return;
                         }
-                        if !usage_sent {
-                            if let (Some(d), Some(sink)) =
-                                (ChatDelta::from_json(&e.data), on_usage.as_ref())
-                            {
-                                if let Some((p, c, t)) = d.usage {
-                                    usage_sent = true;
-                                    sink(GatewayUsage {
-                                        at: unix_now_secs(),
-                                        site_id,
-                                        key_id: meta.key_id,
-                                        model: model.clone(),
-                                        prompt_tokens: p,
-                                        completion_tokens: c,
-                                        total_tokens: t,
-                                        status: status_code,
-                                        latency_ms: meta.latency_ms,
-                                        attempts: meta.attempts,
-                                        stream: true,
-                                        token_id,
-                                        agent_label: label.clone(),
-                                    });
-                                }
+                        // 末帧口径：每次见到的 usage 都覆盖 pending，结束时只发最后一次。
+                        if let Some(d) = ChatDelta::from_json(&e.data) {
+                            if d.usage.is_some() {
+                                usage_flush.pending = d.usage;
                             }
                         }
                         let frames = tr.on_event(e);
@@ -2937,6 +3378,8 @@ fn streaming_translate_response(
                     );
                     let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
                     return;
+                }
+                    }
                 }
             }
         }
@@ -3106,6 +3549,24 @@ fn report_failure(
     if let Ok(mut guard) = state.breaker.lock() {
         guard.record_failure(key, now);
     }
+    report_event_only(state, site_id, status, model, reason);
+}
+
+/// 记一次**配置类**失败：记指标 + 上报事件，**不喂熔断**（B-224 P2 修复）。
+///
+/// 与 [`report_failure`] 的唯一区别就是不碰熔断：缺明文 / 已回收这类本地
+/// 配置问题不是上游故障，喂熔断会把站点熔断、进而影响后续正常请求。
+/// 指标仍要记（`record_failure` 现在只记失败元数据、不加尝试数），
+/// 否则这类失败在指标里完全不可见。
+#[allow(clippy::too_many_arguments)]
+fn report_failure_without_breaker(
+    state: &AppState,
+    site_id: i64,
+    status: u16,
+    model: &str,
+    reason: &str,
+) {
+    state.metrics.record_failure(site_id, status, reason);
     report_event_only(state, site_id, status, model, reason);
 }
 
@@ -3297,6 +3758,31 @@ pub fn generate_token() -> String {
 mod tests {
     use super::*;
 
+    /// M46-S2：成功样本喂 EWMA，且快照携带同一值；失败尝试不写 EWMA。
+    #[test]
+    fn measured_latency_feeds_ewma_and_snapshot() {
+        let metrics = GatewayMetrics::new();
+        assert!(metrics.ewma_latency_map().is_empty());
+        metrics.record_measured_latency(7, 200);
+        metrics.record_measured_latency(7, 200);
+        metrics.record_measured_latency(7, 0);
+        // 200 → 200 → 0.2×0 + 0.8×200 = 160。
+        let map = metrics.ewma_latency_map();
+        assert_eq!(map.len(), 1);
+        assert!(
+            (map[&7] - 160.0).abs() < 1e-9,
+            "EWMA 应为 160，实测 {:?}",
+            map.get(&7)
+        );
+        let snap = metrics.snapshot();
+        assert_eq!(snap.per_site[&7].ewma_latency_ms, Some(160.0));
+        // record_attempt 不写 EWMA：只被尝试过（失败）的站 EWMA 仍为 None。
+        metrics.record_attempt(9, 200, 33);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.per_site[&9].ewma_latency_ms, None);
+        assert_eq!(snap.per_site[&9].last_latency_ms, Some(33));
+    }
+
     /// M40-S2 复审 P1：`lastError` 不得带 URL/域名，且仍保留分类与状态码。
     #[test]
     fn metric_error_strips_urls_and_secrets() {
@@ -3307,6 +3793,49 @@ mod tests {
         assert!(cleaned.contains("<url>"), "{cleaned}");
         assert!(cleaned.contains("传输层失败"), "{cleaned}");
         assert!(!cleaned.contains("sk-secret"), "{cleaned}");
+    }
+
+    /// M40-S2 P2-3（B-224 待验证项，实测属实后修复）：QPS 环必须是
+    /// 滑动窗口——连续流量跨过 60s 边界时，60s 内的样本不得被整环清零。
+    #[test]
+    fn qps_ring_is_sliding_not_tumbling_across_the_60s_boundary() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut ring = QpsRing::default();
+        for _ in 0..10 {
+            ring.bump(t0);
+        }
+        for _ in 0..10 {
+            ring.bump(t0 + Duration::from_secs(30));
+        }
+        // 连续流量：t0 的 10 次在 t0+61 时已过期（>60s），但 t0+30 的
+        // 10 次仍在窗口内 ⇒ 和为 10，分母 clamp 到 60。
+        for _ in 0..10 {
+            ring.bump(t0 + Duration::from_secs(61));
+        }
+        let qps = ring.qps_at(t0 + Duration::from_secs(61));
+        assert!(
+            (qps - 20.0 / 60.0).abs() < 1e-9,
+            "滑动窗口下 t0+61 的 QPS 应为 20/60，实测 {qps}（翻滚实现会清零到 10/60 以下）"
+        );
+    }
+
+    #[test]
+    fn qps_ring_resets_after_a_full_idle_window() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut ring = QpsRing::default();
+        ring.bump(t0);
+        // 空闲 ≥60s 后再来：旧样本全部过期，起点重置，<3s 内仍按
+        // 样本不足判 0（与 M40-S2 §6.3 的守则一致）。
+        ring.bump(t0 + Duration::from_secs(120));
+        assert_eq!(ring.qps_at(t0 + Duration::from_secs(120)), 0.0);
+        ring.bump(t0 + Duration::from_secs(121));
+        let qps = ring.qps_at(t0 + Duration::from_secs(124));
+        assert!(
+            (qps - 2.0 / 4.0).abs() < 1e-9,
+            "空闲重置后窗口应只含新样本：2/4，实测 {qps}"
+        );
     }
 
     /// 无 URL 的原因原样保留（除了 scrub 既有规则）。
@@ -3372,6 +3901,33 @@ mod tests {
         assert!(
             accepted(Duration::from_secs(5)) && accepted(t.connect),
             "标定值 5s 必须落在可接受区间内"
+        );
+    }
+
+    /// M46-S4：分站超时解析——替代不是取 min；Some(0) ≡ 未填；两维同值。
+    #[test]
+    fn effective_upstream_timeout_replaces_both_dimensions_not_min() {
+        let global = UpstreamTimeout {
+            connect: Duration::from_secs(5),
+            read: Duration::from_secs(240),
+        };
+        // 未填 ⇒ 全局本身（不是 0、不是默认值）。
+        assert_eq!(effective_upstream_timeout(global, None), global);
+        // Some(0) ≡ 未填（0 毫秒的超时永远不可能成功，见函数注释）。
+        assert_eq!(effective_upstream_timeout(global, Some(0)), global);
+        // 分站值同时作用于 connect 与 read 两维。
+        let small = effective_upstream_timeout(global, Some(50));
+        assert_eq!(small.connect, Duration::from_millis(50));
+        assert_eq!(small.read, Duration::from_millis(50));
+        // 分站值大于全局 ⇒ 全局不得提前掐断：两维均为分站值，不是 min(全局, 分站)。
+        let big = effective_upstream_timeout(global, Some(30_000));
+        assert_eq!(big.connect, Duration::from_secs(30));
+        assert_eq!(big.read, Duration::from_secs(30));
+        // 区分「替代」与「逐维取 min」的关键在 connect：取 min 会给出 5s
+        // （全局 connect），替代给出 30s（分站值）。上面两条 assert_eq 已钉住 30s。
+        assert_ne!(
+            big.connect, global.connect,
+            "分站值 30s > 全局 connect 5s 时，生效 connect 必须是 30s 而非全局的 5s"
         );
     }
 
@@ -3896,6 +4452,7 @@ mod tests {
             addrs: vec![addr],
             ipv6: Ipv6State::Degraded {
                 reason: "单测：未监听 v6".to_string(),
+                kind: Ipv6DegradedKind::Unavailable,
             },
             token: "t".into(),
             site_display_name: "已停的站点".into(),

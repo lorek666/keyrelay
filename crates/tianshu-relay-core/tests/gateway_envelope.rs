@@ -207,6 +207,7 @@ fn routed_config(upstreams: Vec<Upstream>, keys: &[(&str, &str)], port: u16) -> 
         route: RouteTable::new(upstreams),
         breaker: tianshu_relay_core::routing::BreakerPolicy::default(),
         lb_top_n: 1,
+        max_attempts: 0,
         guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
         keys_by_ref: map,
         upstream_timeout: UpstreamTimeout::default(),
@@ -214,6 +215,9 @@ fn routed_config(upstreams: Vec<Upstream>, keys: &[(&str, &str)], port: u16) -> 
         on_failure: None,
         on_observation: None,
         on_usage: None,
+        budget_check: None,
+        on_budget_breach: None,
+        routing_rules: Vec::new(),
         upstream_proxy: None,
         legacy_key_ref: None,
         max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
@@ -231,6 +235,7 @@ fn upstream_of(site_id: i64, base_url: &str, key_ref: &str, models: &[&str]) -> 
         rate: None,
         balance_usd: None,
         latency_ms: None,
+        timeout_ms: None,
     }
 }
 
@@ -560,12 +565,18 @@ async fn ipv6_addr_in_use_degrades_and_keeps_v4_serving() {
     let token = handle.token.clone();
     assert_eq!(handle.addrs.len(), 1, "只有 v4");
     match &handle.ipv6 {
-        Ipv6State::Degraded { reason } => {
+        Ipv6State::Degraded { reason, kind } => {
             assert!(
                 reason.contains("占用"),
                 "降级原因要说清是端口占用: {reason}"
             );
             assert!(reason.contains("127.0.0.1"), "要说明只剩 v4: {reason}");
+            // B-224 P2：kind 必须由核心层按 ErrorKind 定死，调用方不再解析文案。
+            assert_eq!(
+                *kind,
+                tianshu_relay_core::gateway::Ipv6DegradedKind::AddrInUse,
+                "端口占用 ⇒ kind 必须是 AddrInUse: {kind:?}"
+            );
         }
         other => panic!("应当是 Degraded，实际 {other:?}"),
     }
@@ -587,8 +598,13 @@ async fn ephemeral_port_binds_v4_only() {
         .expect("启动");
     assert_eq!(handle.addrs.len(), 1, "port 0 只绑 v4");
     assert!(matches!(handle.ipv6, Ipv6State::Degraded { .. }));
-    if let Ipv6State::Degraded { reason } = &handle.ipv6 {
+    if let Ipv6State::Degraded { reason, kind } = &handle.ipv6 {
         assert!(reason.contains("端口 0"), "原因要说明是 port 0: {reason}");
+        assert_eq!(
+            *kind,
+            tianshu_relay_core::gateway::Ipv6DegradedKind::Skipped,
+            "port 0 ⇒ kind 必须是 Skipped: {kind:?}"
+        );
     }
     shutdown(handle).await;
 }

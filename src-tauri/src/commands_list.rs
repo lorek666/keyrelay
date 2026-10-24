@@ -86,9 +86,15 @@ pub const COMMANDS: &[&str] = &[
     "model_price_list",
     "model_price_upsert",
     "model_price_delete",
+    // M46-S5：站点 / key 硬预算
+    "site_budget_list",
+    "site_budget_create",
+    "site_budget_delete",
     "site_bill_probe",
     "site_bill_import",
     "site_bills",
+    // M46-S6：多源账单对账（只读）
+    "bill_reconciliation",
     // M14-S1：模型别名映射（B-110）
     "list_alias_map",
     "upsert_alias",
