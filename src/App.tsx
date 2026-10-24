@@ -5,7 +5,6 @@ import {
   AlertTriangle,
   Wallet,
   HeartPulse,
-  History as HistoryIcon,
   KeyRound,
   LayoutDashboard,
   Layers,
@@ -17,8 +16,7 @@ import Traffic from "./pages/Traffic";
 import Cost from "./pages/Cost";
 import Health from "./pages/Health";
 import Assets from "./pages/Assets";
-import Agents from "./pages/Agents";
-import History from "./pages/History";
+import Delivery from "./pages/Delivery";
 import SettingsPage from "./pages/Settings";
 import { appInfo, getSettings, reportUiReady, runtimeMode } from "./lib/api";
 import { useApplyTheme } from "./lib/theme";
@@ -40,8 +38,7 @@ const PAGES = [
   { id: "cost", labelKey: "nav.cost", icon: Wallet, group: "nav.group.daily", render: () => <Cost /> },
   { id: "health", labelKey: "nav.health", icon: HeartPulse, group: "nav.group.daily", render: () => <Health /> },
   { id: "assets", labelKey: "nav.assets", icon: Layers, group: "nav.group.asset", render: () => <Assets /> },
-  { id: "agents", labelKey: "nav.agents", icon: Plug, group: "nav.group.delivery", render: () => <Agents /> },
-  { id: "history", labelKey: "nav.history", icon: HistoryIcon, group: "nav.group.daily", render: () => <History /> },
+  { id: "delivery", labelKey: "nav.delivery", icon: Plug, group: "nav.group.delivery", render: () => <Delivery /> },
   { id: "settings", labelKey: "nav.settings", icon: SettingsIcon, group: "nav.group.system", render: () => <SettingsPage /> },
 ] as const;
 

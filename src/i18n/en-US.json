@@ -32,8 +32,7 @@
     "cost": "Cost",
     "health": "Health",
     "assets": "Assets",
-    "agents": "Agent Delivery",
-    "history": "Change History",
+    "delivery": "Delivery",
     "settings": "Settings"
   },
   "usage": {
