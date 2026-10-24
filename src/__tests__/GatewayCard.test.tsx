@@ -413,3 +413,61 @@ describe("M40-S2 网关指标面板", () => {
     expect(screen.queryByRole("table")).toBeNull();
   });
 });
+
+describe("M46-UI B-240 EWMA 列", () => {
+  const runningWithCandidate = (over: Record<string, unknown> = {}) =>
+    status({
+      running: true,
+      phase: "running",
+      mode: "multi",
+      requestsTotal: 10,
+      qps: 2.5,
+      candidates: [
+        {
+          siteId: 7,
+          displayName: "站A",
+          keyId: 1,
+          health: "healthy",
+          breaker: "closed",
+        },
+      ],
+      ...over,
+    });
+
+  it("有样本显示毫秒数", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(
+      runningWithCandidate({ ewmaLatencyMs: { 7: 42 } }),
+    );
+    renderCard();
+    expect(await screen.findByText("EWMA 延迟")).toBeInTheDocument();
+    expect(screen.getByText("42 ms")).toBeInTheDocument();
+  });
+
+  it("无样本显示 —，不画成 0（空 map 与旧后端缺字段两种情形）", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(
+      runningWithCandidate({ ewmaLatencyMs: {} }),
+    );
+    const { unmount } = renderCard();
+    await screen.findByText("EWMA 延迟");
+    const table = document.querySelector("table");
+    expect(table?.textContent).toContain("—");
+    expect(table?.textContent).not.toContain("0 ms");
+    unmount();
+    // 旧后端：ewmaLatencyMs 字段本身缺失（undefined），同样回退到 —。
+    vi.mocked(gatewayStatus).mockResolvedValue(runningWithCandidate());
+    renderCard();
+    await screen.findByText("EWMA 延迟");
+    const table2 = document.querySelector("table");
+    expect(table2?.textContent).toContain("—");
+    expect(table2?.textContent).not.toContain("0 ms");
+  });
+
+  it("红线：EWMA 真为 0ms 时显示 0 ms，不得被真值判断吞成 —", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(
+      runningWithCandidate({ ewmaLatencyMs: { 7: 0 } }),
+    );
+    renderCard();
+    await screen.findByText("EWMA 延迟");
+    expect(screen.getByText("0 ms")).toBeInTheDocument();
+  });
+});
