@@ -241,7 +241,11 @@ function parseRoutingRules(
  * 与后端分叉，还可能拒传合法规则。
  */
 function RoutingRulesEditor({
-  routingRules,
+  // 合并修复（main ← feat-m46-ui）：老用例渲染 GatewayCard 时不传
+  // routingRules（M46-UI-5 之前不存在这个 prop），undefined 若直进
+  // parseRoutingRules 会在 .trim() 上炸掉整卡。空 = 无规则，与后端
+  // “空串 = 无规则”语义一致；这里缺省，不改 Props 的必填约定。
+  routingRules = "",
   onRoutingRulesChange,
   sites,
   tokenLabels,
