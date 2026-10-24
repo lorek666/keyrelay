@@ -693,3 +693,54 @@ describe("M46-UI B-255 回流（复审 P1-1 回归）", () => {
     expect((r0.querySelector("select") as HTMLSelectElement).value).toBe("codex");
   });
 });
+
+describe("合并回归（main ← feat-m46-ui）：老调用方不传 routingRules 不炸卡", () => {
+  it("routingRules 缺省时按空规则渲染，不在 parseRoutingRules 的 trim 上崩", async () => {
+    // M46-UI-5 之前没有 routingRules 这个 prop；老用例（GatewayTokens、
+    // SettingsModels）渲染 GatewayCard 时不传它。编辑器缺省 "" 后应按
+    // 空规则进结构化视图（增行按钮在），而不是整卡白屏。
+    vi.mocked(gatewayStatus).mockResolvedValue(status({ phase: "stopped" }));
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const props = {
+      enabled: true,
+      port: 8787,
+      multiSite: false,
+      collectModels: false,
+      modelsMinIntervalSecs: 1800,
+      maxRequestMib: 16,
+      perSiteBurst: 0,
+      perSiteConcurrency: 8,
+      perSiteRateLimit: 0,
+      maxAttempts: 0,
+      keyHealthIntervalSecs: 0,
+      onToggle: vi.fn(),
+      onPortChange: vi.fn(),
+      onMultiSiteChange: vi.fn(),
+      onCollectModelsChange: vi.fn(),
+      onModelsIntervalChange: vi.fn(),
+      onMaxRequestMibChange: vi.fn(),
+      onPerSiteBurstChange: vi.fn(),
+      onPerSiteConcurrencyChange: vi.fn(),
+      onPerSiteRateLimitChange: vi.fn(),
+      onMaxAttemptsChange: vi.fn(),
+      onKeyHealthIntervalChange: vi.fn(),
+      onRoutingRulesChange: vi.fn(),
+      settingsDirty: false,
+    } as unknown as Parameters<typeof GatewayCard>[0];
+    render(
+      <QueryClientProvider client={qc}>
+        <I18nProvider lang="zh-CN" initialDict={zhCN}>
+          <GatewayCard {...props} />
+        </I18nProvider>
+      </QueryClientProvider>,
+    );
+    // 空令牌列表时 .gateway-token-list 不渲染（只有空态文案），不能拿它
+    // 当渲染完成的信号；直接等结构化视图的增行按钮：它在，说明编辑器
+    // 按空规则进了结构化视图、没有在 trim 上崩、卡片也渲染出来了。
+    await waitFor(() =>
+      expect(screen.getByText(zhCN.gateway.routingRulesAddRow)).toBeInTheDocument(),
+    );
+  });
+});
