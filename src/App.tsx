@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
+  Activity,
   AlertTriangle,
   BarChart3,
   FlaskConical,
@@ -12,6 +13,7 @@ import {
   Settings as SettingsIcon,
 } from "lucide-react";
 import Cockpit from "./pages/Cockpit";
+import Traffic from "./pages/Traffic";
 import Usage from "./pages/Usage";
 import Sites from "./pages/Sites";
 import Keys from "./pages/Keys";
@@ -35,6 +37,7 @@ const NAV_GROUPS = [
 
 const PAGES = [
   { id: "cockpit", labelKey: "nav.cockpit", icon: LayoutDashboard, group: "nav.group.daily", render: () => <Cockpit /> },
+  { id: "traffic", labelKey: "nav.traffic", icon: Activity, group: "nav.group.daily", render: () => <Traffic /> },
   { id: "usage", labelKey: "nav.usage", icon: BarChart3, group: "nav.group.daily", render: () => <Usage /> },
   { id: "sites", labelKey: "nav.sites", icon: Server, group: "nav.group.asset", render: () => <Sites /> },
   { id: "keys", labelKey: "nav.keys", icon: KeyRound, group: "nav.group.asset", render: () => <Keys /> },
