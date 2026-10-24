@@ -1001,6 +1001,7 @@ export default function SettingsPage() {
             modelsMinIntervalSecs={draft.modelsMinIntervalSecs}
             maxRequestMib={draft.gatewayMaxRequestMib}
             perSiteBurst={draft.gatewayPerSiteBurst}
+            maxAttempts={draft.gatewayMaxAttempts}
             onToggle={(enabled) => setDraft({ ...draft, gatewayEnabled: enabled })}
             onPortChange={(port) => setDraft({ ...draft, gatewayPort: port })}
             onMultiSiteChange={(multiSite) =>
@@ -1017,6 +1018,9 @@ export default function SettingsPage() {
             }
             onPerSiteBurstChange={(gatewayPerSiteBurst) =>
               setDraft({ ...draft, gatewayPerSiteBurst })
+            }
+            onMaxAttemptsChange={(gatewayMaxAttempts) =>
+              setDraft({ ...draft, gatewayMaxAttempts })
             }
             settingsDirty={dirty}
           />

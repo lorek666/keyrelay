@@ -207,6 +207,7 @@ fn routed_config(upstreams: Vec<Upstream>, keys: &[(&str, &str)], port: u16) -> 
         route: RouteTable::new(upstreams),
         breaker: tianshu_relay_core::routing::BreakerPolicy::default(),
         lb_top_n: 1,
+        max_attempts: 0,
         guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
         keys_by_ref: map,
         upstream_timeout: UpstreamTimeout::default(),
@@ -231,6 +232,7 @@ fn upstream_of(site_id: i64, base_url: &str, key_ref: &str, models: &[&str]) -> 
         rate: None,
         balance_usd: None,
         latency_ms: None,
+        timeout_ms: None,
     }
 }
 

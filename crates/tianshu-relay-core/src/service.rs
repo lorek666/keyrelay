@@ -4765,6 +4765,8 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let settings = self.settings()?;
         // M39-S3 §4.6：负载均衡与每站保护策略（**下次启动网关生效**；不在请求路径热切换）。
         config.lb_top_n = settings.gateway_lb_top_n;
+        // M46-S4：重试预算（同口径：下次启动网关生效；0 = 走全部候选）。
+        config.max_attempts = settings.gateway_max_attempts;
         config.guard_policy = crate::routing::SiteGuardPolicy {
             max_concurrency: settings.gateway_per_site_concurrency,
             rate_limit_per_sec: settings.gateway_per_site_rate_limit,
@@ -5076,6 +5078,10 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     latency_ms: obs.latency_ms,
                     key_ref: row.secret_ref.clone(),
                     key_id: Some(row.id),
+                    // M46-S4：分站超时的数据源缺口（见 spec §4.4）：`sites` 表没有超时列，
+                    // 本步恒填 None ⇒ 生产路由回退全局超时，行为不变；列 + 迁移 +
+                    // 站点编辑 IPC/DTO + UI 落地后，这里改成从站点行取值。
+                    timeout_ms: None,
                 });
                 if !revoked.contains(&row.secret_ref) {
                     keys.insert(row.secret_ref.clone(), secret);

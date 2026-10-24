@@ -381,6 +381,8 @@ pub struct SettingsDto {
     gateway_per_site_rate_limit: u32,
     // M46-S3：每站限流 burst（默认 0 = 关；camelCase `gatewayPerSiteBurst`）。
     gateway_per_site_burst: u32,
+    // M46-S4：每请求最多尝试候选数（默认 0 = 走全部；camelCase `gatewayMaxAttempts`）。
+    gateway_max_attempts: usize,
     // ---- M6-S5：FR-9 界面与隐私 ----
     theme: String,
     language: String,
@@ -1645,6 +1647,7 @@ fn settings_from_dto(dto: &SettingsDto) -> tianshu_relay_core::settings::Setting
         gateway_per_site_concurrency: dto.gateway_per_site_concurrency,
         gateway_per_site_rate_limit: dto.gateway_per_site_rate_limit,
         gateway_per_site_burst: dto.gateway_per_site_burst,
+        gateway_max_attempts: dto.gateway_max_attempts,
         theme: dto.theme.clone(),
         language: dto.language.clone(),
         proxy_url: dto.proxy_url.clone(),
@@ -1683,6 +1686,7 @@ fn settings_to_dto(settings: &tianshu_relay_core::settings::Settings) -> Setting
         gateway_per_site_concurrency: settings.gateway_per_site_concurrency,
         gateway_per_site_rate_limit: settings.gateway_per_site_rate_limit,
         gateway_per_site_burst: settings.gateway_per_site_burst,
+        gateway_max_attempts: settings.gateway_max_attempts,
         theme: settings.theme.clone(),
         language: settings.language.clone(),
         proxy_url: settings.proxy_url.clone(),

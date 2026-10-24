@@ -41,6 +41,9 @@ pub const GATEWAY_PER_SITE_RATE_LIMIT_MAX: u32 = 10_000;
 /// 每站限流 burst 上限（M46-S3）。数值与 rate 上限同口径但另立常量：
 /// 两者将来调价互不牵连。
 pub const GATEWAY_PER_SITE_BURST_MAX: u32 = 10_000;
+/// 每请求最多尝试候选数上限（M46-S4）。候选数受路由规模约束（站点数 × 每站 key 数，
+/// 真实部署是个位数到两位数）；64 已是三倍于合理规模的上限，超大规模的值无害但无意义。
+pub const GATEWAY_MAX_ATTEMPTS_MAX: usize = 64;
 
 /// 网关请求体上限的默认值 / 硬上限（MiB，M42-S1 §4.4）。
 pub const DEFAULT_GATEWAY_MAX_REQUEST_MIB: u16 = 16;
@@ -76,6 +79,8 @@ const KEY_GATEWAY_PER_SITE_CONCURRENCY: &str = "gateway_per_site_concurrency";
 const KEY_GATEWAY_PER_SITE_RATE_LIMIT: &str = "gateway_per_site_rate_limit";
 // M46-S3：每站限流 burst（额外桶容量，0 = 关）
 const KEY_GATEWAY_PER_SITE_BURST: &str = "gateway_per_site_burst";
+// M46-S4：每请求最多尝试候选数（0 = 走全部候选，即今天行为）
+const KEY_GATEWAY_MAX_ATTEMPTS: &str = "gateway_max_attempts";
 const KEY_THEME: &str = "theme";
 const KEY_LANGUAGE: &str = "language";
 const KEY_PROXY_URL: &str = "proxy_url";
@@ -143,6 +148,9 @@ pub struct Settings {
     /// 桶容量 = `gateway_per_site_rate_limit + gateway_per_site_burst`，
     /// 每秒补充仍是 `gateway_per_site_rate_limit`；rate = 0（不限速）时无意义。
     pub gateway_per_site_burst: u32,
+    /// 每请求最多尝试的候选数（M46-S4）：**默认 0（走全部候选，即今天行为）**，
+    /// 范围 `0..=64`。只计实际发出去的上游尝试，本地保护拒绝的候选不计。
+    pub gateway_max_attempts: usize,
 
     // ---- M6-S5：FR-9 界面与隐私 ----
     /// 主题：`system` / `light` / `dark`。
@@ -226,6 +234,8 @@ impl Default for Settings {
             gateway_per_site_rate_limit: 0,
             // M46-S3：burst 默认关（默认行为与今天逐字相同）。
             gateway_per_site_burst: 0,
+            // M46-S4：0 = 走全部候选（默认行为与今天逐字相同）。
+            gateway_max_attempts: 0,
 
             theme: "system".to_string(),
             language: "zh-CN".to_string(),
@@ -316,6 +326,12 @@ impl Settings {
         if self.gateway_per_site_burst > GATEWAY_PER_SITE_BURST_MAX {
             return Err(Error::Store(format!(
                 "每站限流 burst 必须在 0..={GATEWAY_PER_SITE_BURST_MAX} 之间（0 = 关）"
+            )));
+        }
+        // M46-S4：重试预算越界 ⇒ Err 且不落库（与既有设置同口径）。
+        if self.gateway_max_attempts > GATEWAY_MAX_ATTEMPTS_MAX {
+            return Err(Error::Store(format!(
+                "每请求最多尝试候选数必须在 0..={GATEWAY_MAX_ATTEMPTS_MAX} 之间（0 = 走全部候选）"
             )));
         }
         if !THEMES.contains(&self.theme.as_str()) {
@@ -424,6 +440,7 @@ impl Settings {
             "gateway_per_site_concurrency": self.gateway_per_site_concurrency,
             "gateway_per_site_rate_limit": self.gateway_per_site_rate_limit,
             "gateway_per_site_burst": self.gateway_per_site_burst,
+            "gateway_max_attempts": self.gateway_max_attempts,
             "theme": self.theme,
             "language": self.language,
             "telemetry_enabled": self.telemetry_enabled,
@@ -599,6 +616,15 @@ impl Settings {
                         }
                     }
                 }
+                // M46-S4：与 burst 同口径（只做类型转换 + 上限过滤，
+                // 范围由写路径 validate 统一拒绝）。
+                KEY_GATEWAY_MAX_ATTEMPTS => {
+                    if let Ok(n) = value.parse::<usize>() {
+                        if n <= GATEWAY_MAX_ATTEMPTS_MAX {
+                            settings.gateway_max_attempts = n;
+                        }
+                    }
+                }
                 KEY_THEME => {
                     if THEMES.contains(&value) {
                         settings.theme = value.to_string();
@@ -751,6 +777,10 @@ impl Settings {
                 KEY_GATEWAY_PER_SITE_BURST,
                 self.gateway_per_site_burst.to_string(),
             ),
+            (
+                KEY_GATEWAY_MAX_ATTEMPTS,
+                self.gateway_max_attempts.to_string(),
+            ),
             (KEY_THEME, self.theme.clone()),
             (KEY_LANGUAGE, self.language.clone()),
             (KEY_PROXY_URL, self.proxy_url.clone()),
@@ -790,7 +820,7 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 33] = [
+    pub const KEYS: [&'static str; 34] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
@@ -810,6 +840,7 @@ impl Settings {
         KEY_GATEWAY_PER_SITE_CONCURRENCY,
         KEY_GATEWAY_PER_SITE_RATE_LIMIT,
         KEY_GATEWAY_PER_SITE_BURST,
+        KEY_GATEWAY_MAX_ATTEMPTS,
         KEY_THEME,
         KEY_LANGUAGE,
         KEY_PROXY_URL,
@@ -1155,6 +1186,7 @@ mod tests {
             gateway_per_site_concurrency: 8,
             gateway_per_site_rate_limit: 0,
             gateway_per_site_burst: 0,
+            gateway_max_attempts: 0,
             theme: "dark".to_string(),
             language: "en-US".to_string(),
             proxy_url: "socks5://127.0.0.1:1080".to_string(),

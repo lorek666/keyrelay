@@ -556,6 +556,10 @@ pub struct GatewayConfig {
     pub breaker: BreakerPolicy,
     /// M39-S3 §4.1：参与加权轮转的候选数（`1` = 关掉负载均衡，回到确定性首选）。
     pub lb_top_n: usize,
+    /// M46-S4：每请求最多尝试的候选数。`0` = 走全部候选（今天行为）；`>0` 则截断
+    /// （只计实际发出去的上游尝试，本地保护拒绝的候选不计；见代理循环）。
+    /// 下次启动网关生效（与 `lb_top_n` / `guard_policy` 同口径）。
+    pub max_attempts: usize,
     /// M39-S3 §4.2：每站并发/限速策略。
     pub guard_policy: SiteGuardPolicy,
     /// `key_ref` → 明文。**仅进程内**；`Debug` 不打印（见下方手写 `Debug`）。
@@ -619,7 +623,7 @@ pub struct GatewayConfig {
 ///
 /// 用的是 `connect_timeout` + `read_timeout`：后者计的是「多久没有新字节」，成功读到就重置，
 /// 它抓的是「接了连接却永远不回应」那种病态上游，不是「慢」。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct UpstreamTimeout {
     /// 连接阶段（TCP + TLS）。
     pub connect: Duration,
@@ -659,6 +663,28 @@ impl Default for UpstreamTimeout {
             connect: Duration::from_secs(5),
             read: Duration::from_secs(240),
         }
+    }
+}
+
+/// M46-S4：分站超时解析（纯函数，与发送解耦）。
+///
+/// **替代，不是取 min**：分站值比全局大时全局不得提前掐断；分站值比全局小时
+/// 分站值说了算。分站值同时作用于 connect 与 read 两维（见 `UpstreamTimeout` 的
+/// 注释：没有 total 维，`RequestBuilder::timeout` 的总 deadline 语义会砍合法长流，
+/// 故分站值绝不用它实现）。
+///
+/// `Some(0)` ≡ 未填：0 毫秒的超时永远不可能成功，把它当成配置值会直接 brick 掉
+/// 该站点；且与本仓库「0 = 关/不限」的惯例一致。
+pub fn effective_upstream_timeout(
+    global: UpstreamTimeout,
+    per_site_ms: Option<u64>,
+) -> UpstreamTimeout {
+    match per_site_ms {
+        Some(ms) if ms > 0 => UpstreamTimeout {
+            connect: Duration::from_millis(ms),
+            read: Duration::from_millis(ms),
+        },
+        _ => global,
     }
 }
 
@@ -770,6 +796,8 @@ impl GatewayConfig {
             // M39-S3：单上游（legacy）路径保持 `top_n=1` 与默认 guard，
             // 行为与今天逐字相同（单候选不读轮转计数器）。
             lb_top_n: 1,
+            // M46-S4：0 = 走全部候选；legacy 只有一个候选，预算恒不截断。
+            max_attempts: 0,
             guard_policy: SiteGuardPolicy::default(),
             keys_by_ref: HashMap::new(),
             on_failure: None,
@@ -1539,6 +1567,53 @@ fn bind_error_message(port: u16, e: &std::io::Error) -> String {
     }
 }
 
+/// M46-S4：建一个上游客户端（全局主客户端与分站懒建客户端共用）。
+///
+/// 超时写在 `build()` 时：connect + read 两维，不用 `ClientBuilder::timeout`
+///（总 deadline 会砍合法长流，见 `UpstreamTimeout` 的注释）。
+/// 代理校验复用 `proxy::validate_proxy_url`——非法代理在这里就 Err，不静默直连（M10-S2）。
+fn build_upstream_client(
+    timeout: UpstreamTimeout,
+    proxy_url: Option<&str>,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(timeout.connect)
+        .read_timeout(timeout.read);
+    if let Some(proxy_url) = proxy_url {
+        crate::proxy::validate_proxy_url(proxy_url)?;
+        let proxy = reqwest::Proxy::all(proxy_url.to_string()).map_err(|e| {
+            Error::Transport(format!(
+                "网关上游代理配置无效（{}），拒绝静默直连: {e}",
+                crate::proxy::mask_proxy(proxy_url)
+            ))
+        })?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|e| Error::Transport(format!("构造网关的上游客户端失败: {e}")))
+}
+
+/// M46-S4：按生效超时取客户端。生效超时 == 全局超时 ⇒ 共享主客户端（今天路径）；
+/// 否则按超时值缓存一个分站客户端（同值复用，不随请求膨胀）。
+/// 懒建失败 ⇒ 回退共享客户端（只可能因非法代理失败，而代理在 `start()` 时已校验；
+/// 回退时生效的是全局超时，与「没配分站值」一致，不产生新语义）。
+fn client_for_timeout(state: &AppState, timeout: UpstreamTimeout) -> reqwest::Client {
+    if timeout == state.config.upstream_timeout {
+        return state.upstream.clone();
+    }
+    if let Ok(mut cache) = state.upstream_by_timeout.lock() {
+        if let Some(client) = cache.get(&timeout) {
+            return client.clone();
+        }
+        if let Ok(client) = build_upstream_client(timeout, state.config.upstream_proxy.as_deref()) {
+            cache.insert(timeout, client.clone());
+            return client;
+        }
+    }
+    state.upstream.clone()
+}
+
 /// 启动网关（M42-S1：v4 必绑；v6 `[::1]` 同端口，失败降级）。
 pub async fn start(config: GatewayConfig) -> Result<GatewayHandle> {
     start_with_v6(config, V6BindMode::Real).await
@@ -1601,28 +1676,12 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
         }
     }
 
-    let mut builder = reqwest::Client::builder()
-        // §3.5-2：上游**必须**有超时。没有它，一个接了连接却不回应的上游会让请求永远挂着，
-        // 既不切下一个候选，也不喂熔断（实测：卡 8.5s、下一个上游收到 0 次、失败事件 0 条）。
-        .connect_timeout(config.upstream_timeout.connect)
-        .read_timeout(config.upstream_timeout.read);
-
-    // M10-S2：上游客户端走解析后的代理（与站点适配器 transport 同一份 resolve_proxy）。
-    // 校验复用 `proxy::validate_proxy_url`——非法代理在这里就 Err，不静默直连。
-    if let Some(proxy_url) = config.upstream_proxy.as_deref() {
-        crate::proxy::validate_proxy_url(proxy_url)?;
-        let proxy = reqwest::Proxy::all(proxy_url.to_string()).map_err(|e| {
-            Error::Transport(format!(
-                "网关上游代理配置无效（{}），拒绝静默直连: {e}",
-                crate::proxy::mask_proxy(proxy_url)
-            ))
-        })?;
-        builder = builder.proxy(proxy);
-    }
-
-    let upstream = builder
-        .build()
-        .map_err(|e| Error::Transport(format!("构造网关的上游客户端失败: {e}")))?;
+    // §3.5-2：上游**必须**有超时。没有它，一个接了连接却不回应的上游会让请求永远挂着，
+    // 既不切下一个候选，也不喂熔断（实测：卡 8.5s、下一个上游收到 0 次、失败事件 0 条）。
+    // M46-S4：主客户端仍用全局超时建；分站客户端由 `client_for_timeout` 懒建，
+    // 与这里共用同一个构造器（两处各写一份 builder 正是分叉的来源）。
+    let upstream =
+        build_upstream_client(config.upstream_timeout, config.upstream_proxy.as_deref())?;
 
     // P3-3：停止闸门。`AppState` 与 `GatewayHandle` 共享同一个标志——
     // 句柄置位（停止信号发出之前），请求路径读取。
@@ -1644,6 +1703,8 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
         local_rejects: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         config: config.clone(),
         upstream,
+        // M46-S4：分站客户端缓存（空起步；生效超时 ≠ 全局时才懒建）。
+        upstream_by_timeout: Arc::new(Mutex::new(HashMap::new())),
         stopping: Arc::clone(&stopping),
         // M43-S1：认证集合的运行态副本（创建/吊销**立即生效**，不重启网关）。
         // `start()` 从空集合起步（legacy 回退）；服务层随后用 `handle.set_tokens()` 播种。
@@ -1785,6 +1846,9 @@ struct AppState {
     /// 空 ⇒ 回退 `config.token`（legacy 单令牌，行为与今天逐字相同）。
     tokens: Arc<std::sync::RwLock<Vec<GatewayTokenEntry>>>,
     upstream: reqwest::Client,
+    /// M46-S4：按生效超时缓存的分站客户端（键 = 生效超时值本身，同值复用）。
+    /// 共享主客户端（`upstream`）不在这里——生效超时 == 全局时直接用它。
+    upstream_by_timeout: Arc<Mutex<HashMap<UpstreamTimeout, reqwest::Client>>>,
     /// M39-S3 §4.1：加权轮转计数器（跨请求共享；单候选时不读）。
     round_robin: Arc<Mutex<RoundRobinState>>,
     /// M39-S3 §4.2：每站 guard（信号量 + 令牌桶），按 `site_id` 索引。
@@ -2330,6 +2394,12 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     }
 
     let mut last_error: Option<String> = None;
+    // M46-S4：重试预算。cap = 0 ⇒ 走全部候选（今天行为）；>0 则每请求最多
+    // 尝试 cap 个候选。attempts_made 只计实际发出去的上游尝试（见循环内递增点）：
+    // 本地保护拒绝的候选不计（它没产生可返回的真实错误），探针被实际发出去时
+    // 与普通候选一样占 1 个预算（计数代码里没有任何按 probe 旗标的分支）。
+    let cap = state.config.max_attempts;
+    let mut attempts_made = 0usize;
     // M39-S3 §4.5：本次请求里「被本地保护跳过」的候选数（与上游故障分开计）。
     let mut local_rejected = 0usize;
     // M39-S3（Lead P2）：先记下「可重放的真实响应」（目前只有 429）。若它之后的候选
@@ -2345,7 +2415,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         meta: AttemptMeta,
     }
     let mut pending_replay: Option<PendingReplay> = None;
-    let attempts = order.len();
+    let order_len = order.len();
     for (index, upstream) in order.iter().enumerate() {
         // P3-3：**每一次上游尝试之前**都查停止闸门——信号可能在上一次尝试期间发出。
         // 在途请求允许跑完**当前**这一次（无法安全中断一个已发出的请求），
@@ -2354,7 +2424,9 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         if is_stopping(&state) {
             return stopping_response();
         }
-        let is_last = index + 1 == attempts;
+        // M46-S4：is_last 的判定移到实际发送处（见 `attempts_made` 递增点之后）：
+        // 预算是否耗尽只能在「本次发送计入之后」才知道，循环顶算不出来
+        // （本地拒绝的候选不计，本次迭代可能根本不发送）。
         // M39-S3 §4.4：有 model 用 `(site, Some(model))`，无 model 用 `(site, None)`。
         let breaker_key = if event_model.is_empty() {
             site_key(upstream.site_id)
@@ -2389,8 +2461,29 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         let url = format!("{}{}{}", upstream.base_url, path, query);
         let headers = upstream_headers(&state.config, &inbound, key);
 
+        // M46-S4：预算计数点——本地保护已放行，本次 `send_once` 就是一次真实
+        // 上游尝试。本地拒绝的分支在上面 `continue` 了，根本到不了这里。
+        attempts_made += 1;
+        // 最后一个候选 = order 末位，或预算在本次发送后耗尽（cap > 0 时）。
+        // 其余分支条件（`replayable && !is_last` / `!replayable || is_last`）逐字不动：
+        // 预算截断复用既有的「最后一个候选」语义，不新写一套终止逻辑。
+        // cap = 0 时右半恒假，退化为今天的 `index + 1 == order_len`。
+        let is_last = index + 1 == order_len || (cap > 0 && attempts_made >= cap);
         let started = Instant::now();
-        match send_once(&state, method.clone(), &url, headers, outbound.clone()).await {
+        // M46-S4：本次发送的生效超时 = 全局超时被该候选的分站值替代
+        // （替代不是取 min；未填 ⇒ 全局本身 ⇒ 共享主客户端）。
+        let effective_timeout =
+            effective_upstream_timeout(state.config.upstream_timeout, upstream.timeout_ms);
+        match send_once(
+            &state,
+            method.clone(),
+            &url,
+            headers,
+            outbound.clone(),
+            effective_timeout,
+        )
+        .await
+        {
             Ok(response) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let status = response.status().as_u16();
@@ -2531,7 +2624,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     // M39-S3 §4.5：**全部候选都被本地保护跳过** ⇒ 429（不是 502）。
     // 这里没有任何上游出过错：本地并发/限流拒绝不写事件、不喂熔断，
     // 客户端据 `kind == "local_rate_limited"` 就能把「本机限流」与「上游 429」分开。
-    if local_rejected > 0 && local_rejected == attempts {
+    if local_rejected > 0 && local_rejected == order_len {
         return local_error(
             StatusCode::TOO_MANY_REQUESTS,
             GatewayErrorKind::RateLimit,
@@ -2687,9 +2780,12 @@ async fn send_once(
     url: &str,
     headers: HeaderMap,
     body: bytes::Bytes,
+    // M46-S4：本次发送的生效超时。== 全局 ⇒ 共享主客户端；否则分站客户端
+    // （见 `client_for_timeout`）。绝不用 `RequestBuilder::timeout`（总 deadline
+    // 会砍合法长流，与全局两维语义不是同一维度）。
+    timeout: UpstreamTimeout,
 ) -> std::result::Result<reqwest::Response, AttemptFailure> {
-    state
-        .upstream
+    client_for_timeout(state, timeout)
         .request(method, url)
         .headers(headers)
         .body(body)
@@ -2738,7 +2834,17 @@ async fn forward_to(
         }
     };
     let started = Instant::now();
-    match send_once(state, method, url, headers, body).await {
+    // M46-S4：legacy 单上游恒走全局超时 ⇒ 共享主客户端，今天路径逐字相同。
+    match send_once(
+        state,
+        method,
+        url,
+        headers,
+        body,
+        state.config.upstream_timeout,
+    )
+    .await
+    {
         Ok(response) => {
             let latency_ms = started.elapsed().as_millis() as u64;
             state.metrics.record_attempt(
@@ -3644,6 +3750,33 @@ mod tests {
         assert!(
             accepted(Duration::from_secs(5)) && accepted(t.connect),
             "标定值 5s 必须落在可接受区间内"
+        );
+    }
+
+    /// M46-S4：分站超时解析——替代不是取 min；Some(0) ≡ 未填；两维同值。
+    #[test]
+    fn effective_upstream_timeout_replaces_both_dimensions_not_min() {
+        let global = UpstreamTimeout {
+            connect: Duration::from_secs(5),
+            read: Duration::from_secs(240),
+        };
+        // 未填 ⇒ 全局本身（不是 0、不是默认值）。
+        assert_eq!(effective_upstream_timeout(global, None), global);
+        // Some(0) ≡ 未填（0 毫秒的超时永远不可能成功，见函数注释）。
+        assert_eq!(effective_upstream_timeout(global, Some(0)), global);
+        // 分站值同时作用于 connect 与 read 两维。
+        let small = effective_upstream_timeout(global, Some(50));
+        assert_eq!(small.connect, Duration::from_millis(50));
+        assert_eq!(small.read, Duration::from_millis(50));
+        // 分站值大于全局 ⇒ 全局不得提前掐断：两维均为分站值，不是 min(全局, 分站)。
+        let big = effective_upstream_timeout(global, Some(30_000));
+        assert_eq!(big.connect, Duration::from_secs(30));
+        assert_eq!(big.read, Duration::from_secs(30));
+        // 区分「替代」与「逐维取 min」的关键在 connect：取 min 会给出 5s
+        // （全局 connect），替代给出 30s（分站值）。上面两条 assert_eq 已钉住 30s。
+        assert_ne!(
+            big.connect, global.connect,
+            "分站值 30s > 全局 connect 5s 时，生效 connect 必须是 30s 而非全局的 5s"
         );
     }
 

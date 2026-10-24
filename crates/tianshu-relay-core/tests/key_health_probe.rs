@@ -19,6 +19,7 @@ fn upstream(site_id: i64, key_ref: &str) -> Upstream {
         rate: Some(1.0),
         balance_usd: Some(100.0),
         latency_ms: None,
+        timeout_ms: None,
     }
 }
 
@@ -55,6 +56,7 @@ fn config() -> GatewayConfig {
         upstream_proxy: None,
         legacy_key_ref: None,
         lb_top_n: 3,
+        max_attempts: 0,
         guard_policy: SiteGuardPolicy::default(),
         runtime: None,
         on_failure: None,

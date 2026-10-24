@@ -33,6 +33,9 @@ pub struct Upstream {
     pub rate: Option<f64>,        // 站点倍率；None = 未知
     pub balance_usd: Option<f64>, // 余额；None = 未知
     pub latency_ms: Option<u64>,  // 最近一次观测延迟；None = 未观测
+    /// M46-S4：该上游的分站超时（毫秒）。None = 回退全局 UpstreamTimeout；
+    /// Some(0) 在网关解析时同样视为未填（见 `effective_upstream_timeout`）。
+    pub timeout_ms: Option<u64>,
 }
 
 /// 路由表：一组上游 + 别名映射。
@@ -191,6 +194,10 @@ pub struct SiteFacts {
     /// `None` = 旧单 key 路径（`build_route_table` 之外的历史构造点）；
     /// 多站路径里 `service::build_gateway_route` 会给每把可用 key 各产出一条事实。
     pub key_id: Option<i64>,
+    /// M46-S4：分站超时（毫秒），与 [`Upstream::timeout_ms`] 同口径；
+    /// `build_route_table` 原样搬运，不做任何 `unwrap_or` 降级。
+    /// 生产来源缺口见 M46-S4 spec §4.4：`build_gateway_route` 目前恒填 `None`。
+    pub timeout_ms: Option<u64>,
 }
 
 /// 从站点事实推导路由表。**纯函数**（不读钥匙串、不联网、不读时钟）。
@@ -217,6 +224,8 @@ pub fn build_route_table(facts: &[SiteFacts]) -> RouteTable {
                 rate: f.rate,
                 balance_usd: f.balance_usd,
                 latency_ms: f.latency_ms,
+                // M46-S4：原样搬运（None = 回退全局，不降级成任何数值）。
+                timeout_ms: f.timeout_ms,
             })
             .collect(),
     )
@@ -783,6 +792,7 @@ mod tests {
             balance_usd: balance,
             latency_ms: latency,
             key_id: None,
+            timeout_ms: None,
         }
     }
 
@@ -1111,7 +1121,44 @@ mod tests {
             balance_usd: None,
             latency_ms: None,
             key_id: None,
+            timeout_ms: None,
         }
+    }
+
+    #[test]
+    fn build_route_table_carries_per_site_timeout_verbatim() {
+        // M46-S4：SiteFacts.timeout_ms 原样搬进 Upstream，不做 unwrap_or 降级。
+        let facts = vec![
+            SiteFacts {
+                site_id: 1,
+                base_url: "http://a.example.com".to_string(),
+                models: vec![],
+                rate: None,
+                balance_usd: None,
+                latency_ms: None,
+                key_ref: "kr/key/1/secret".to_string(),
+                key_id: None,
+                timeout_ms: Some(5000),
+            },
+            SiteFacts {
+                site_id: 2,
+                base_url: "http://b.example.com".to_string(),
+                models: vec![],
+                rate: None,
+                balance_usd: None,
+                latency_ms: None,
+                key_ref: "kr/key/2/secret".to_string(),
+                key_id: None,
+                timeout_ms: None,
+            },
+        ];
+        let table = build_route_table(&facts);
+        let all = table.all_candidates();
+        assert_eq!(all.len(), 2);
+        let by_site: std::collections::HashMap<i64, Option<u64>> =
+            all.iter().map(|u| (u.site_id, u.timeout_ms)).collect();
+        assert_eq!(by_site[&1], Some(5000), "Some 值原样搬运");
+        assert_eq!(by_site[&2], None, "None 保持 None，不降级成数值");
     }
 
     #[test]
