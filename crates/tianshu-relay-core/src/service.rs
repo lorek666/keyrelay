@@ -8059,6 +8059,153 @@ mod tests {
         assert!(matches!(err, Error::AuthFailed(_)), "{err:?}");
     }
 
+    /// M43-S2 T13 外延（B-224 长尾）：原始条目正文不得出现在落库行 /
+    /// 事件表 / 诊断导出 / 备份导出里。T13 本体只扫了 core 的 sink 行
+    /// （`RawBill` 的 Debug 文本）；本用例走真实生产链
+    /// （`import_site_billing` → `site_bill_upsert` + 一条计数事件），
+    /// 证明原文在下游四个表面都到不了。
+    /// 结构注记：`site_bills` 表本身就没有存原文的列（只有
+    /// site_id/day/amount/currency/requests/source/fetched_at），导入事件
+    /// 的 payload 也只有计数；本用例的价值是回归防护——将来若有人给落库
+    /// 或事件加字段、或把原始 JSON 塞进导出物，这里会红。
+    /// 顺序约束（与 M43-S1 T7 扩展同理）：导出扫描必须在塞 canary 之前
+    /// ——导出物会把事件表打进去，塞完再导会把 canary 自身扫出来。
+    #[tokio::test]
+    async fn billing_import_raw_entry_text_never_reaches_store_events_or_exports() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        const CANARY: &str = "CANARY-BILL-9d2f4a";
+        // canary 先命中证明（与 T13 同标准）：把 canary 放进 SiteBillRow 的
+        // day 字段，证明「Debug 拼串 + contains」扫描器在行里真有 canary
+        // 时能命中，否则下面的零命中可能是扫描器空转。
+        let probe = vec![crate::store::SiteBillRow {
+            id: 0,
+            site_id: 0,
+            day: CANARY.to_string(),
+            amount: None,
+            currency: None,
+            requests: None,
+            source: "probe".to_string(),
+            fetched_at: 0,
+        }];
+        assert!(
+            format!("{probe:?}").contains(CANARY),
+            "扫描器必须能命中故意放进落库行的 canary，否则零命中是空转"
+        );
+
+        let dir = tempfile::tempdir().expect("临时目录");
+        let home = dir.keep();
+        let vault = Arc::new(crate::vault::MemoryVault::new());
+        let service = TianshuRelayService::new(
+            Store::open_in_memory().expect("内存库"),
+            MockTransport::new(vec![]),
+            ServiceConfig {
+                vault: Arc::clone(&vault) as Arc<dyn crate::vault::Vault>,
+                home: home.clone(),
+                backup_dir: home.join("backups"),
+            },
+        );
+        service.transport_push(json_ok_with(
+            json!({"success": true, "data": {"system_name": "示例 NewAPI", "version": "1.0.0-rc.45"}}),
+        ));
+        let site = service
+            .add_site("https://newapi.example.com")
+            .await
+            .expect("建站");
+        assert_eq!(site.kind, "newapi");
+        seed_session(
+            &service,
+            &vault,
+            site.id,
+            crate::site::Session {
+                cookies: vec![],
+                access_token: Some(newapi_jwt(9_999_999_999)),
+                user_id: Some("42".to_string()),
+                user_agent: None,
+            },
+        );
+
+        // 账单页：prompt/response/payload 里塞 canary；created_at 取今天，
+        // 让落库行落在 site_bills(30) 的窗口内（窗口上限 90 天）。
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("时钟")
+            .as_secs();
+        let body = format!(
+            r#"{{"success":true,"data":[{{"created_at":{now},"quota":500000,"prompt":"{CANARY}","response":"{CANARY}","payload":{{"text":"{CANARY}"}}}}],"total":1}}"#
+        );
+        service.transport_push(HttpResponse::new(200, body.as_str()));
+        let (outcome, rows) = service
+            .import_site_billing(site.id, None, None)
+            .await
+            .expect("导入");
+        assert_eq!(outcome.imported, 1);
+        assert_eq!(rows.len(), 1);
+
+        // ① 落库行（UI 读的公开路径）。
+        let bills = service.store.site_bills(30).expect("读账单");
+        assert_eq!(bills.len(), 1, "导入的一天必须落库: {bills:?}");
+        assert!(
+            !format!("{bills:?}").contains(CANARY),
+            "落库行不得含原始条目正文: {bills:?}"
+        );
+        // ② 事件表。
+        let events = service.store.list_events(200).expect("读事件");
+        let events_dump = events
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !events_dump.contains(CANARY),
+            "事件表不得含原始条目正文: {events_dump}"
+        );
+        // ③ 诊断导出（事件面重打包）。
+        let diag = service.export_diagnostics(200).expect("诊断导出");
+        assert!(!diag.contains(CANARY), "诊断包不得含原始条目正文");
+        // ④ 备份导出（与落盘同款脱敏序列化；bundle 本身不含 site_bills，
+        // 扫它等于扫事件面 + 站点/密钥/设置面）。
+        let bundle = service.export_bundle().expect("备份");
+        let bundle_text = crate::export::to_json(&bundle).expect("序列化");
+        assert!(!bundle_text.contains(CANARY), "备份包不得含原始条目正文");
+
+        // canary 证明：往事件表塞一条带 canary 的行，同一扫描必须命中。
+        service
+            .store
+            .insert_event(&crate::observability::Event {
+                ts: 1_700_000_000,
+                level: crate::observability::Level::Warn,
+                source: "site".to_string(),
+                message: format!("canary 泄漏行 {CANARY}"),
+                payload: None,
+            })
+            .expect("写 canary 事件");
+        let events_after = service.store.list_events(200).expect("重读事件");
+        let dump_after = events_after
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            dump_after.contains(CANARY),
+            "同一扫描必须能命中事件表里故意塞的 canary，否则零命中是空转"
+        );
+        // B224-TAIL-3 复审 P2-1：导出面扫描器也补正向对照——塞 canary 行后
+        // 重导诊断与备份，两处都必须命中。canary 文本非密钥形态（无前缀、
+        // 无 `=`、无 URL、无 JWT 结构、最长 hex 连续段仅 6 位），scrub
+        // 系对其为恒等变换，故该对照应为绿，不改生产代码。
+        let diag_after = service.export_diagnostics(200).expect("重导诊断");
+        assert!(
+            diag_after.contains(CANARY),
+            "塞 canary 行后重导诊断必须命中，否则导出扫描是空转"
+        );
+        let bundle_after = service.export_bundle().expect("重导备份");
+        let bundle_after_text = crate::export::to_json(&bundle_after).expect("序列化");
+        assert!(
+            bundle_after_text.contains(CANARY),
+            "塞 canary 行后重导备份必须命中，否则导出扫描是空转"
+        );
+    }
+
     #[tokio::test]
     async fn complete_newapi_webview_login_404_falls_back_to_cookie_only() {
         let (service, site_id, _vault, _handle) = newapi_awaiting_human().await;
