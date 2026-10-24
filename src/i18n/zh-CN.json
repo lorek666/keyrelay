@@ -1074,7 +1074,8 @@
         "site": "站点",
         "key": "密钥",
         "health": "健康",
-        "breaker": "熔断"
+        "breaker": "熔断",
+        "ewmaLatency": "EWMA 延迟"
       },
       "health": {
         "healthy": "健康",

@@ -1074,7 +1074,8 @@
         "site": "Site",
         "key": "Key",
         "health": "Health",
-        "breaker": "Breaker"
+        "breaker": "Breaker",
+        "ewmaLatency": "EWMA latency"
       },
       "health": {
         "healthy": "Healthy",

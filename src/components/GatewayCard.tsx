@@ -129,6 +129,7 @@ export function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
               <th>{t("gateway.metrics.candidate.key")}</th>
               <th>{t("gateway.metrics.candidate.health")}</th>
               <th>{t("gateway.metrics.candidate.breaker")}</th>
+              <th>{t("gateway.metrics.candidate.ewmaLatency")}</th>
             </tr>
           </thead>
           <tbody>
@@ -153,6 +154,18 @@ export function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
                   >
                     {t(`gateway.metrics.breaker.${c.breaker}`)}
                   </span>
+                </td>
+                {/*
+                  M46-UI B-240：每站 EWMA 延迟（毫秒，键为站点 id，见 M46-S2）。
+                  红线：无样本必须显示 `—`，绝不得画成 0——所以这里用 `== null`
+                  判空，不用 `||` / 三元真值判断（EWMA 真为 0ms 时必须显示 `0 ms`，
+                  不能被真值判断吞成 `—`）。旧后端无此字段时 map 为 undefined，
+                  同样回退到 `—`。
+                */}
+                <td className="mono">
+                  {(status.ewmaLatencyMs ?? {})[c.siteId] == null
+                    ? "—"
+                    : `${(status.ewmaLatencyMs ?? {})[c.siteId]} ms`}
                 </td>
               </tr>
             ))}
