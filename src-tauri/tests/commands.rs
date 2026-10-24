@@ -2916,6 +2916,43 @@ fn m39s3_guard_settings_out_of_range_are_not_persisted() {
     );
 }
 
+/// M46-S3：`gatewayPerSiteBurst` 的 DTO 双向直传 + 越界拒写。
+/// （M46-S1 的 B-238 教训：DTO 直传必须有自动化用例，不只读代码确认。）
+#[test]
+fn m46s3_per_site_burst_round_trips_and_rejects_out_of_range() {
+    let (_app, webview) = build_app();
+    let before = read_settings(&webview);
+    assert_eq!(before["gatewayPerSiteBurst"], json!(0), "burst 默认 0 = 关");
+
+    let mut payload = before.clone();
+    payload["gatewayPerSiteBurst"] = json!(3);
+    let result = invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": payload}}),
+    )
+    .expect("合法 burst 应能保存");
+    assert_eq!(result["settings"]["gatewayPerSiteBurst"], json!(3));
+    let read = read_settings(&webview);
+    assert_eq!(read["gatewayPerSiteBurst"], json!(3), "写后读必须一致");
+
+    let mut bad = read.clone();
+    bad["gatewayPerSiteBurst"] = json!(10_001);
+    let err = invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": bad}}),
+    )
+    .expect_err("越界 burst 必须被拒");
+    assert_not_acl_rejection("update_settings", &err);
+    let after = read_settings(&webview);
+    assert_eq!(
+        after["gatewayPerSiteBurst"],
+        json!(3),
+        "越界值不得落库：{err}"
+    );
+}
+
 /// M41-S2 F-2：DB 写入失败 ⇒ 轮换命令报错、旧令牌仍 200、`tokenGraceUntil` 为空。
 ///
 /// 失败注入点：`Store::fail_next_gateway_token_hash_update_for_test`（一次性开关，

@@ -521,6 +521,7 @@ async fn streaming_translation_holds_the_concurrency_lease() {
     config.guard_policy = SiteGuardPolicy {
         max_concurrency: 1,
         rate_limit_per_sec: 0,
+        rate_burst: 0, // M46-S3：机械补字段，行为不变
     };
     let h = start(config).await.expect("启动");
     let addr = h.addr.to_string();

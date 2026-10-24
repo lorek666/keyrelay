@@ -4768,6 +4768,8 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         config.guard_policy = crate::routing::SiteGuardPolicy {
             max_concurrency: settings.gateway_per_site_concurrency,
             rate_limit_per_sec: settings.gateway_per_site_rate_limit,
+            // M46-S3：burst 直传（唯一组装点；legacy 与多站路由共用同一份 policy）。
+            rate_burst: settings.gateway_per_site_burst,
         };
         // M42-S1 §4.4：请求体上限（MiB → 字节）。`1..=64` 已由 `Settings::validate` 保证；
         // 这里再夹一次硬上限，防止旧库里的越界值把内存撑爆。

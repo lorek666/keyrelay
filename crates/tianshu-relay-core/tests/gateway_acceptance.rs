@@ -498,6 +498,7 @@ async fn m44_c6_per_site_concurrency_cap() {
     cfg.guard_policy = SiteGuardPolicy {
         max_concurrency: 8,
         rate_limit_per_sec: 0,
+        rate_burst: 0, // M46-S3：机械补字段，行为不变
     };
     let h = gateway::start(cfg).await.unwrap();
     let p = port_of(&h);

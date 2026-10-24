@@ -183,6 +183,7 @@ fn config(
         guard_policy: SiteGuardPolicy {
             max_concurrency: 0,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         keys_by_ref,
         upstream_timeout: UpstreamTimeout::default(),
