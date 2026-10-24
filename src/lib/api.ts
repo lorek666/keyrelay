@@ -339,7 +339,7 @@ export type Settings = {
   modelsMinIntervalSecs: number;
   /** M39-S3：加权轮询参与的健康候选数（默认 3；1 = 关闭负载均衡）。 */
   gatewayLbTopN: number;
-  /** M39-S3：每站并发上限（默认 8；0 = 不限）。 */
+  /** M39-S3：每站并发上限（默认 8；1..=128）。 */
   gatewayPerSiteConcurrency: number;
   /** M39-S3：每站每秒请求上限（默认 0 = 不限速）。 */
   gatewayPerSiteRateLimit: number;

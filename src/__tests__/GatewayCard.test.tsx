@@ -58,6 +58,10 @@ function renderCard(
     onMaxRequestMibChange?: () => void;
     perSiteBurst?: number;
     onPerSiteBurstChange?: (burst: number) => void;
+    perSiteConcurrency?: number;
+    onPerSiteConcurrencyChange?: (n: number) => void;
+    perSiteRateLimit?: number;
+    onPerSiteRateLimitChange?: (n: number) => void;
     maxAttempts?: number;
     onMaxAttemptsChange?: (n: number) => void;
     keyHealthIntervalSecs?: number;
@@ -85,6 +89,8 @@ function renderCard(
       modelsMinIntervalSecs={1800}
       maxRequestMib={over.maxRequestMib ?? 16}
       perSiteBurst={over.perSiteBurst ?? 0}
+      perSiteConcurrency={over.perSiteConcurrency ?? 8}
+      perSiteRateLimit={over.perSiteRateLimit ?? 0}
       maxAttempts={over.maxAttempts ?? 0}
       keyHealthIntervalSecs={over.keyHealthIntervalSecs ?? 0}
       routingRules={over.routingRules ?? ""}
@@ -95,6 +101,8 @@ function renderCard(
       onModelsIntervalChange={vi.fn()}
       onMaxRequestMibChange={over.onMaxRequestMibChange ?? vi.fn()}
       onPerSiteBurstChange={over.onPerSiteBurstChange ?? vi.fn()}
+      onPerSiteConcurrencyChange={over.onPerSiteConcurrencyChange ?? vi.fn()}
+      onPerSiteRateLimitChange={over.onPerSiteRateLimitChange ?? vi.fn()}
       onMaxAttemptsChange={over.onMaxAttemptsChange ?? vi.fn()}
       onKeyHealthIntervalChange={over.onKeyHealthIntervalChange ?? vi.fn()}
       onRoutingRulesChange={over.onRoutingRulesChange ?? vi.fn()}
@@ -255,6 +263,38 @@ describe("M42-S1：监听地址 / IPv6 降级 / 请求体上限", () => {
     fireEvent.change(input, { target: { value: "5" } });
     expect(onChange).toHaveBeenCalledTimes(1);
     expect(onChange).toHaveBeenCalledWith(5);
+  });
+
+  it("M46-UI B-241 每站并发：输入 0 与 129 不触发回调；输入 16 触发一次", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(status({ phase: "stopped" }));
+    const onChange = vi.fn();
+    renderCard({ perSiteConcurrency: 8, onPerSiteConcurrencyChange: onChange });
+    const input = screen.getByLabelText(
+      zhCN.gateway.perSiteConcurrencyLabel,
+    ) as HTMLInputElement;
+    expect(input.value).toBe("8");
+    fireEvent.change(input, { target: { value: "0" } });
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: "129" } });
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: "16" } });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith(16);
+  });
+
+  it("M46-UI B-241 每站每秒上限：输入 10001 不触发回调；输入 10 触发一次", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(status({ phase: "stopped" }));
+    const onChange = vi.fn();
+    renderCard({ perSiteRateLimit: 0, onPerSiteRateLimitChange: onChange });
+    const input = screen.getByLabelText(
+      zhCN.gateway.perSiteRateLimitLabel,
+    ) as HTMLInputElement;
+    expect(input.value).toBe("0");
+    fireEvent.change(input, { target: { value: "10001" } });
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: "10" } });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith(10);
   });
 
   it("M46-S7 routingRules：文本域输入直传回调（前端不解析）", async () => {
