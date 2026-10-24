@@ -506,25 +506,38 @@ async fn m44_c6_per_site_concurrency_cap() {
     for _ in 0..32 {
         let results = Arc::clone(&results);
         joins.push(std::thread::spawn(move || {
+            // B-224 长尾（C6「无请求 > 5s」）：逐请求计时——本地保护不排队，
+            // 200 靠 200ms 上游延迟、429 靠立即拒绝，两者都应远小于 5s。
+            let started = Instant::now();
             let (status, text) = request(p, "POST", "/v1/chat/completions", Some(BODY));
-            results.lock().unwrap().push((status, text));
+            let elapsed = started.elapsed();
+            results.lock().unwrap().push((status, text, elapsed));
         }));
     }
     for j in joins {
         j.join().unwrap();
     }
     let results = results.lock().unwrap();
-    let ok = results.iter().filter(|(s, _)| *s == 200).count();
+    let ok = results.iter().filter(|(s, _, _)| *s == 200).count();
     assert!(ok > 0, "至少要有成功的");
     // 被拒的必须是本地 429（不是上游 429）：body error.code 为 local_rate_limited。
     let local_429 = results
         .iter()
-        .filter(|(s, text)| *s == 429 && text.contains(r#""code":"local_rate_limited""#))
+        .filter(|(s, text, _)| *s == 429 && text.contains(r#""code":"local_rate_limited""#))
         .count();
     assert!(
         local_429 > 0,
         "32 并发、双站各 8 上限 ⇒ 必然有请求在双站都满时被本地拒掉（429 local_rate_limited），实测各状态：{:?}",
-        results.iter().map(|(s, _)| s).collect::<Vec<_>>()
+        results.iter().map(|(s, _, _)| s).collect::<Vec<_>>()
+    );
+    let max_latency = results
+        .iter()
+        .map(|(_, _, elapsed)| *elapsed)
+        .max()
+        .expect("至少一条请求");
+    assert!(
+        max_latency < Duration::from_secs(5),
+        "无请求耗时可超过 5s，实测最慢 {max_latency:?}"
     );
     assert_eq!(
         a.current.load(Ordering::SeqCst),

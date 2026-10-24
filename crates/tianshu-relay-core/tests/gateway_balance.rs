@@ -188,6 +188,17 @@ async fn post(handle: &GatewayHandle, token: &str) -> (u16, String) {
         .expect("阻塞任务")
 }
 
+/// 与 [`post`] 相同，但指定请求模型（T3 单候选 cursor 用例：靠模型过滤
+/// 让候选集从单站扩到双站，验证单候选阶段没有消耗 cursor）。
+async fn post_model(handle: &GatewayHandle, token: &str, model: &str) -> (u16, String) {
+    let url = handle.local_url();
+    let token = token.to_string();
+    let body = format!(r#"{{"model":"{model}","messages":[]}}"#);
+    tokio::task::spawn_blocking(move || http_post(&url, &token, "/v1/chat/completions", &body))
+        .await
+        .expect("阻塞任务")
+}
+
 // ============================================================ 配置构造
 
 type Failures = Arc<Mutex<Vec<GatewayFailure>>>;
@@ -199,6 +210,26 @@ fn upstream(site_id: i64, base_url: &str, key_ref: &str, rate: f64) -> Upstream 
         base_url: base_url.to_string(),
         key_ref: key_ref.to_string(),
         models: vec![MODEL.to_string()],
+        rate: Some(rate),
+        balance_usd: Some(10.0),
+        latency_ms: Some(10),
+    }
+}
+
+/// 与 [`upstream`] 相同，但指定模型集合（T3 单候选 cursor 用例）。
+fn upstream_with_models(
+    site_id: i64,
+    base_url: &str,
+    key_ref: &str,
+    rate: f64,
+    models: &[&str],
+) -> Upstream {
+    Upstream {
+        site_id,
+        key_id: None,
+        base_url: base_url.to_string(),
+        key_ref: key_ref.to_string(),
+        models: models.iter().map(|m| m.to_string()).collect(),
         rate: Some(rate),
         balance_usd: Some(10.0),
         latency_ms: Some(10),
@@ -739,6 +770,52 @@ async fn half_open_probe_is_tried_before_the_rotated_candidates() {
     handle.shutdown_and_wait().await;
 }
 
+/// M39-S3 P2-1（探针半边，B-224 长尾）：探针请求不得消耗 cursor。
+///
+/// 与 T15 同一套脚手架，但断言更精确：T16 的「6 条里两站都 ≥2」在两种
+/// cursor 假设下都会过（奇偶平移后分布相同），判别不了。本用例只看探针
+/// 后的**第一条**轮转请求：探针不消耗 cursor ⇒ 下一条从 cursor 1 继续 ⇒
+/// 槽位 [A, B] 的第 1 位是 B；若探针消耗了 cursor，下条是 cursor 2 ⇒ A。
+/// 因此第三条必须打 B（b.count 0→1、a.count 停在 2），打 A 即红。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_request_does_not_advance_the_cursor() {
+    let a = spawn_upstream(1, &["503 Service Unavailable", "200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let (config, _failures) = config(
+        vec![
+            upstream(1, &a.base_url, REF_A, 1.0),
+            upstream(2, &b.base_url, REF_B, 1.0),
+        ],
+        keys(&[(REF_A, KEY_A), (REF_B, KEY_B)]),
+        3,
+        no_guard(),
+        BreakerPolicy {
+            threshold: 1,
+            cooldown: Duration::from_millis(50),
+        },
+    );
+    let handle = start(config).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    // 第 1 条：cursor 0 ⇒ A，503 熔断。
+    assert_eq!(post(&handle, &token).await.0, 503, "第一条打 A 且失败");
+    assert_eq!(a.count(), 1);
+    // 第 2 条：冷却后 A 是 HalfOpen 探针，优先且不消耗 cursor。
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(post(&handle, &token).await.0, 200, "第二条是成功的探针");
+    assert_eq!(a.count(), 2, "探针先打 A");
+    assert_eq!(b.count(), 0, "探针阶段 B 不该被请求");
+    // 第 3 条：A 已 Closed、无探针 ⇒ 从 cursor 1 继续 ⇒ 打 B。
+    assert_eq!(post(&handle, &token).await.0, 200, "第三条应成功");
+    assert_eq!(
+        b.count(),
+        1,
+        "探针不消耗 cursor：第三条必须打 B（cursor 1）；若打 A，说明探针偷消耗了 cursor"
+    );
+    assert_eq!(a.count(), 2, "第三条不该再打 A");
+    handle.shutdown_and_wait().await;
+}
+
 /// T16：探针成功后 A 回到 Closed ⇒ 轮转恢复（B 占绝对多数）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn after_a_successful_probe_rotation_resumes() {
@@ -779,6 +856,57 @@ async fn after_a_successful_probe_rotation_resumes() {
         a_extra >= 2 && b_extra >= 2,
         "轮转必须恢复：6 条里两站都该被轮到（A +{a_extra} / B +{b_extra}）"
     );
+    handle.shutdown_and_wait().await;
+}
+
+/// M39-S3 P2-1（单候选半边，B-224 长尾）：单候选请求不得消耗 cursor。
+///
+/// 纯函数侧的 T3 只证明了 `weighted_pick` 单候选时与 cursor 无关，没证明
+/// 网关侧「单候选时不调 `round_robin.next()`」。本用例用模型过滤让候选集
+/// 在运行时从单站扩到双站，以此观测 cursor：A 服 [m-single, m-both]，
+/// B 只服 [m-both]；先发 3 条 m-single（每条都只有 A 一个候选），再发
+/// 1 条 m-both（候选 [A, B]）。单候选不消耗 cursor ⇒ 这条从 cursor 0
+/// 继续 ⇒ 槽位 [A, B] 的第 0 位是 A；若单候选偷消耗了 cursor，这条会是
+/// cursor 3 ⇒ 槽位第 1 位 B。3 取奇数正是为了让两种假设落在不同槽位。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_candidate_requests_do_not_advance_the_cursor() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let (config, _failures) = config(
+        vec![
+            upstream_with_models(1, &a.base_url, REF_A, 1.0, &["m-single", "m-both"]),
+            upstream_with_models(2, &b.base_url, REF_B, 1.0, &["m-both"]),
+        ],
+        keys(&[(REF_A, KEY_A), (REF_B, KEY_B)]),
+        3,
+        no_guard(),
+        open_breaker(),
+    );
+    let handle = start(config).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    // 单候选阶段：3 条 m-single 都只打 A，B 一次不该被请求。
+    for _ in 0..3 {
+        assert_eq!(
+            post_model(&handle, &token, "m-single").await.0,
+            200,
+            "m-single 应由 A 成功服务"
+        );
+    }
+    assert_eq!(a.count(), 3, "单候选阶段 3 条都打 A");
+    assert_eq!(b.count(), 0, "单候选阶段 B 不该被请求");
+    // 扩候选：m-both 的候选是 [A, B]，cursor 若未被消耗应为 0 ⇒ 打 A。
+    assert_eq!(
+        post_model(&handle, &token, "m-both").await.0,
+        200,
+        "m-both 应成功"
+    );
+    assert_eq!(
+        a.count(),
+        4,
+        "单候选不消耗 cursor：扩候选后的第一条必须打 A（cursor 0）；若打 B，说明单候选偷消耗了 cursor"
+    );
+    assert_eq!(b.count(), 0, "扩候选后的第一条不该打 B");
     handle.shutdown_and_wait().await;
 }
 

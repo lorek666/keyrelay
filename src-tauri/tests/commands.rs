@@ -2878,6 +2878,44 @@ fn m41s2_grace_secs_above_3600_is_rejected() {
     assert!(err.to_string().contains("3600"), "{err}");
 }
 
+/// M39-S3 P2-2（B-224 长尾）：越界的保护设置必须被拒**且不落库**。
+/// 只测 `Settings::validate()` 不够——要钉「先 validate 再写库」的顺序：
+/// `update_settings` 报错后重读设置，越界值与其它字段都必须还是旧值
+/// （若实现先写库后校验，这里会红）。
+#[test]
+fn m39s3_guard_settings_out_of_range_are_not_persisted() {
+    let (_app, webview) = build_app();
+    let before = read_settings(&webview);
+    let mut payload = before.clone();
+    // 每站并发上限 128，129 越界；另把 top_n 改成一个合法但不同于旧值的数，
+    // 让「其它字段未改写」断言也有判别力（B224-TAIL-4 复审 P3-1：payload 若
+    // 只是旧值克隆，部分写入实现也会绿；改成不同值后，先写库后校验或逐字段
+    // 部分写入都会在这里红）。
+    let other = if before["gatewayLbTopN"] == json!(5) {
+        json!(4)
+    } else {
+        json!(5)
+    };
+    payload["gatewayLbTopN"] = other;
+    payload["gatewayPerSiteConcurrency"] = json!(129);
+    let err = invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": payload}}),
+    )
+    .expect_err("越界并发必须被拒");
+    assert_not_acl_rejection("update_settings", &err);
+    let after = read_settings(&webview);
+    assert_eq!(
+        after["gatewayPerSiteConcurrency"], before["gatewayPerSiteConcurrency"],
+        "越界值不得落库：{err}"
+    );
+    assert_eq!(
+        after["gatewayLbTopN"], before["gatewayLbTopN"],
+        "合法但不同的其它字段也不得被连带写入（否则就是先写库后校验或部分写入）"
+    );
+}
+
 /// M41-S2 F-2：DB 写入失败 ⇒ 轮换命令报错、旧令牌仍 200、`tokenGraceUntil` 为空。
 ///
 /// 失败注入点：`Store::fail_next_gateway_token_hash_update_for_test`（一次性开关，
