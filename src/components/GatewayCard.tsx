@@ -40,6 +40,8 @@ type Props = {
   perSiteBurst: number;
   /** 每请求最多尝试候选数（M46-S4）：0 = 走全部候选，0..=64。 */
   maxAttempts: number;
+  /** 密钥健康巡检间隔（秒，M46-UI B-237）：0 = 关，非 0 时 60..=86400。 */
+  keyHealthIntervalSecs: number;
   /** 按 agent 路由规则 JSON（M46-S7）：空 = 无规则，走全局加权。 */
   routingRules: string;
   onToggle: (enabled: boolean) => void;
@@ -50,6 +52,7 @@ type Props = {
   onMaxRequestMibChange: (mib: number) => void;
   onPerSiteBurstChange: (burst: number) => void;
   onMaxAttemptsChange: (n: number) => void;
+  onKeyHealthIntervalChange: (secs: number) => void;
   /** M46-S7：路由规则 JSON 文本变更（直传，不在前端解析）。 */
   onRoutingRulesChange: (text: string) => void;
   /** 设置还没保存时提示用户先保存（端口要保存后才生效） */
@@ -163,6 +166,7 @@ export default function GatewayCard({
   maxRequestMib,
   perSiteBurst,
   maxAttempts,
+  keyHealthIntervalSecs,
   routingRules,
   onToggle,
   onPortChange,
@@ -172,6 +176,7 @@ export default function GatewayCard({
   onMaxRequestMibChange,
   onPerSiteBurstChange,
   onMaxAttemptsChange,
+  onKeyHealthIntervalChange,
   onRoutingRulesChange,
   settingsDirty,
 }: Props) {
@@ -195,6 +200,18 @@ export default function GatewayCard({
     setIntervalText(String(modelsMinIntervalSecs));
     setClamped(false);
   }, [modelsMinIntervalSecs]);
+
+  // M46-UI B-237：巡检间隔输入框草稿，口径与采集间隔输入框相同（先输草稿，
+  // 失焦时才钳制）。合法值是 0（关）或 60..=86400：直接拒传会让用户输不出
+  // 60（先输 `6` 即被拒），所以必须走草稿 + 失焦钳制。
+  const [healthIntervalText, setHealthIntervalText] = useState(
+    String(keyHealthIntervalSecs),
+  );
+  const [healthClamped, setHealthClamped] = useState(false);
+  useEffect(() => {
+    setHealthIntervalText(String(keyHealthIntervalSecs));
+    setHealthClamped(false);
+  }, [keyHealthIntervalSecs]);
 
   const token = status.data?.token ?? "";
 
@@ -608,6 +625,44 @@ export default function GatewayCard({
         />
       </label>
       <p className="muted">{t("gateway.maxAttemptsHint")}</p>
+
+      {/*
+        M46-UI B-237：密钥健康巡检间隔。语义与 M46-S1 一致：0 = 关，非 0 时
+        60..=86400 秒；失焦时钳制（1..59 钳到 60、>86400 钳到 86400、非数字/
+        清空钳到 0 = 关），钳制后提示；与采集间隔输入框同口径，保存后下次
+        启动网关生效，后端 validate 是第二道。
+      */}
+      <label className="field">
+        <span>{t("gateway.keyHealthIntervalLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={0}
+          max={86400}
+          step={1}
+          value={healthIntervalText}
+          onChange={(e) => setHealthIntervalText(e.target.value)}
+          onBlur={() => {
+            const parsed = Number(healthIntervalText);
+            const clamped = !Number.isFinite(parsed)
+              ? 0
+              : Math.trunc(parsed) <= 0
+                ? 0
+                : Math.min(86400, Math.max(60, Math.trunc(parsed)));
+            setHealthIntervalText(String(clamped));
+            setHealthClamped(
+              clamped !== parsed || String(clamped) !== healthIntervalText,
+            );
+            if (clamped !== keyHealthIntervalSecs) {
+              onKeyHealthIntervalChange(clamped);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.keyHealthIntervalHint")}</p>
+      {healthClamped ? (
+        <p className="muted">{t("gateway.keyHealthIntervalClamped")}</p>
+      ) : null}
 
       {/*
         M46-S7：按 agent 路由规则 JSON。受控 textarea，直传 onChange（不在前端

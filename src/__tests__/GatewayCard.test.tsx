@@ -60,6 +60,8 @@ function renderCard(
     onPerSiteBurstChange?: (burst: number) => void;
     maxAttempts?: number;
     onMaxAttemptsChange?: (n: number) => void;
+    keyHealthIntervalSecs?: number;
+    onKeyHealthIntervalChange?: (secs: number) => void;
     routingRules?: string;
     onRoutingRulesChange?: (text: string) => void;
   } = {},
@@ -84,6 +86,7 @@ function renderCard(
       maxRequestMib={over.maxRequestMib ?? 16}
       perSiteBurst={over.perSiteBurst ?? 0}
       maxAttempts={over.maxAttempts ?? 0}
+      keyHealthIntervalSecs={over.keyHealthIntervalSecs ?? 0}
       routingRules={over.routingRules ?? ""}
       onToggle={vi.fn()}
       onPortChange={vi.fn()}
@@ -93,6 +96,7 @@ function renderCard(
       onMaxRequestMibChange={over.onMaxRequestMibChange ?? vi.fn()}
       onPerSiteBurstChange={over.onPerSiteBurstChange ?? vi.fn()}
       onMaxAttemptsChange={over.onMaxAttemptsChange ?? vi.fn()}
+      onKeyHealthIntervalChange={over.onKeyHealthIntervalChange ?? vi.fn()}
       onRoutingRulesChange={over.onRoutingRulesChange ?? vi.fn()}
       settingsDirty={false}
     />,
@@ -269,6 +273,44 @@ describe("M42-S1：监听地址 / IPv6 降级 / 请求体上限", () => {
     fireEvent.change(input, { target: { value: "{not json" } });
     expect(onChange).toHaveBeenCalledTimes(2);
     expect(onChange).toHaveBeenCalledWith("{not json");
+  });
+
+  it("M46-UI B-237 巡检间隔：输入 30 失焦钳制到 60 并回调一次 + 提示", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(status({ phase: "stopped" }));
+    const onChange = vi.fn();
+    renderCard({ keyHealthIntervalSecs: 0, onKeyHealthIntervalChange: onChange });
+    const input = screen.getByLabelText(
+      zhCN.gateway.keyHealthIntervalLabel,
+    ) as HTMLInputElement;
+    expect(input.value).toBe("0");
+    // 草稿阶段不回调（允许用户先输 `6` 再输 `60`）。
+    fireEvent.change(input, { target: { value: "30" } });
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.blur(input);
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith(60);
+    expect(input.value).toBe("60");
+    expect(
+      screen.getByText(zhCN.gateway.keyHealthIntervalClamped),
+    ).toBeInTheDocument();
+  });
+
+  it("M46-UI B-237 巡检间隔：0 = 关（清空失焦回调 0）；99999 钳制到 86400", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(status({ phase: "stopped" }));
+    const onChange = vi.fn();
+    renderCard({ keyHealthIntervalSecs: 300, onKeyHealthIntervalChange: onChange });
+    const input = screen.getByLabelText(
+      zhCN.gateway.keyHealthIntervalLabel,
+    ) as HTMLInputElement;
+    expect(input.value).toBe("300");
+    fireEvent.change(input, { target: { value: "" } });
+    fireEvent.blur(input);
+    expect(onChange).toHaveBeenCalledWith(0);
+    expect(input.value).toBe("0");
+    fireEvent.change(input, { target: { value: "99999" } });
+    fireEvent.blur(input);
+    expect(onChange).toHaveBeenCalledWith(86400);
+    expect(input.value).toBe("86400");
   });
 });
 
