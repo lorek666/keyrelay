@@ -36,12 +36,15 @@ type Props = {
   modelsMinIntervalSecs: number;
   /** 网关**请求体**上限（MiB，M42-S1）：1..=64。 */
   maxRequestMib: number;
+  /** 每站限流 burst（M46-S3）：令牌桶额外容量，0 = 关，0..=10000。 */
+  perSiteBurst: number;
   onToggle: (enabled: boolean) => void;
   onPortChange: (port: number) => void;
   onMultiSiteChange: (enabled: boolean) => void;
   onCollectModelsChange: (enabled: boolean) => void;
   onModelsIntervalChange: (secs: number) => void;
   onMaxRequestMibChange: (mib: number) => void;
+  onPerSiteBurstChange: (burst: number) => void;
   /** 设置还没保存时提示用户先保存（端口要保存后才生效） */
   settingsDirty: boolean;
 };
@@ -151,12 +154,14 @@ export default function GatewayCard({
   collectModels,
   modelsMinIntervalSecs,
   maxRequestMib,
+  perSiteBurst,
   onToggle,
   onPortChange,
   onMultiSiteChange,
   onCollectModelsChange,
   onModelsIntervalChange,
   onMaxRequestMibChange,
+  onPerSiteBurstChange,
   settingsDirty,
 }: Props) {
   const { t } = useTranslation();
@@ -544,6 +549,31 @@ export default function GatewayCard({
         />
       </label>
       <p className="muted">{t("gateway.maxRequestHint")}</p>
+
+      {/*
+        M46-S3：每站限流 burst。口径与请求体上限输入框相同（受控 number，
+        越界/非整数不调 onChange，后端 validate 是第二道）；保存后下次启动网关生效。
+        注意：设置页此前没有任何 per-site 字段的渲染位置（见 spec §4.6），本字段是
+        第一个落进网关卡的 per-site 字段；并发上限与每秒上限的控件仍缺，见 BACKLOG。
+      */}
+      <label className="field">
+        <span>{t("gateway.perSiteBurstLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={0}
+          max={10000}
+          step={1}
+          value={perSiteBurst}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isInteger(n) && n >= 0 && n <= 10000) {
+              onPerSiteBurstChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.perSiteBurstHint")}</p>
 
       {/* M40-S2：指标面板（**所有相位都渲染**；未运行时由面板自己显示一行占位）。 */}
       <GatewayMetricsPanel status={status.data} />

@@ -295,6 +295,7 @@ fn no_guard() -> SiteGuardPolicy {
     SiteGuardPolicy {
         max_concurrency: 0, // 0 = 不限
         rate_limit_per_sec: 0,
+        rate_burst: 0, // M46-S3：机械补字段，行为不变
     }
 }
 
@@ -523,6 +524,7 @@ async fn per_site_concurrency_caps_in_flight_requests() {
         SiteGuardPolicy {
             max_concurrency: 2,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         open_breaker(),
     );
@@ -569,6 +571,7 @@ async fn token_bucket_boundary_is_per_second() {
         SiteGuardPolicy {
             max_concurrency: 0,
             rate_limit_per_sec: 2,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         open_breaker(),
     );
@@ -588,6 +591,103 @@ async fn token_bucket_boundary_is_per_second() {
     handle.shutdown_and_wait().await;
 }
 
+/// M46-S3：burst 只抬容量上限，不提高补充速率。
+/// rate=2 + burst=3 ⇒ 同秒 5 放行第 6 拒绝；1.1 秒后**只**恢复 2 个
+/// （若补充速率被误写成 cap=5，这里第 3 个也会放行，测试变红）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn token_bucket_burst_allows_initial_burst_then_refills_at_rate() {
+    let fast = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let (config, failures) = config(
+        vec![upstream(1, &fast.base_url, REF_A, 0.1)],
+        keys(&[(REF_A, KEY_A)]),
+        3,
+        SiteGuardPolicy {
+            max_concurrency: 0,
+            rate_limit_per_sec: 2,
+            rate_burst: 3,
+        },
+        open_breaker(),
+    );
+    let handle = start(config).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    for i in 1..=5 {
+        assert_eq!(post(&handle, &token).await.0, 200, "同秒第 {i} 个应放行");
+    }
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 429, "同秒第 6 个必须被令牌桶拒绝: {body}");
+    assert!(body.contains("local_rate_limited"), "{body}");
+    assert!(failures.lock().expect("锁").is_empty(), "限流不是上游故障");
+
+    // 1.1 秒后只恢复 rate = 2 个令牌，不是 cap = 5 个。
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(post(&handle, &token).await.0, 200, "恢复后第 1 个应放行");
+    assert_eq!(post(&handle, &token).await.0, 200, "恢复后第 2 个应放行");
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(
+        status, 429,
+        "恢复后第 3 个必须再被拒绝（补充速率未变）: {body}"
+    );
+    assert!(body.contains("local_rate_limited"), "{body}");
+    handle.shutdown_and_wait().await;
+}
+
+/// M46-S3：burst=0 与旧语义等价——与 T6 同一脚本，只把 burst 置 0，
+/// 放行/拒绝序列必须与旧实现逐字相同。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn token_bucket_burst_zero_matches_legacy_semantics() {
+    let fast = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let (config, failures) = config(
+        vec![upstream(1, &fast.base_url, REF_A, 0.1)],
+        keys(&[(REF_A, KEY_A)]),
+        3,
+        SiteGuardPolicy {
+            max_concurrency: 0,
+            rate_limit_per_sec: 2,
+            rate_burst: 0,
+        },
+        open_breaker(),
+    );
+    let handle = start(config).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    assert_eq!(post(&handle, &token).await.0, 200);
+    assert_eq!(post(&handle, &token).await.0, 200);
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 429, "burst=0 时同一秒第 3 个必须被拒绝: {body}");
+    assert!(body.contains("local_rate_limited"), "{body}");
+    assert!(failures.lock().expect("锁").is_empty(), "限流不是上游故障");
+    handle.shutdown_and_wait().await;
+}
+
+/// M46-S3：rate=0（不限速）时 burst 被忽略——桶分支根本不执行。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn token_bucket_burst_ignored_when_rate_is_zero() {
+    let fast = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let (config, _) = config(
+        vec![upstream(1, &fast.base_url, REF_A, 0.1)],
+        keys(&[(REF_A, KEY_A)]),
+        3,
+        SiteGuardPolicy {
+            max_concurrency: 0,
+            rate_limit_per_sec: 0,
+            rate_burst: 5,
+        },
+        open_breaker(),
+    );
+    let handle = start(config).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    for i in 1..=10 {
+        assert_eq!(
+            post(&handle, &token).await.0,
+            200,
+            "rate=0 时第 {i} 个也应放行（burst 被忽略）"
+        );
+    }
+    handle.shutdown_and_wait().await;
+}
+
 /// T7：连续本地拒绝**不喂熔断**——之后正常请求仍然是 200（熔断仍 Closed）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_rejects_never_trip_the_breaker() {
@@ -599,6 +699,7 @@ async fn local_rejects_never_trip_the_breaker() {
         SiteGuardPolicy {
             max_concurrency: 1,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         // 阈值 1：只要本地拒绝被误算成一次失败，熔断立刻打开，下一条就会 503
         BreakerPolicy {
@@ -644,6 +745,7 @@ async fn all_candidates_locally_rejected_returns_429() {
         SiteGuardPolicy {
             max_concurrency: 1,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         open_breaker(),
     );
@@ -689,6 +791,7 @@ async fn same_site_keys_share_one_guard() {
         SiteGuardPolicy {
             max_concurrency: 1,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         open_breaker(),
     );
@@ -944,12 +1047,20 @@ fn gateway_guard_settings_are_validated() {
     s.gateway_per_site_rate_limit = 10_000;
     assert!(s.validate().is_ok());
 
-    // KV 往返：三个字段都要出现且能被读回
+    // M46-S3：burst 默认 0；10001 被拒、10000 通过（与 rate 上限同口径）。
+    assert_eq!(s.gateway_per_site_burst, 0, "默认 0 = 关");
+    s.gateway_per_site_burst = 10_001;
+    assert!(s.validate().is_err(), "burst 超过 10000 必须被拒");
+    s.gateway_per_site_burst = 10_000;
+    assert!(s.validate().is_ok(), "10000 是合法上界");
+
+    // KV 往返：四个字段都要出现且能被读回
     let pairs = s.to_pairs();
     for key in [
         "gateway_lb_top_n",
         "gateway_per_site_concurrency",
         "gateway_per_site_rate_limit",
+        "gateway_per_site_burst",
     ] {
         assert!(
             pairs.iter().any(|(k, _)| *k == key),
@@ -966,6 +1077,7 @@ fn gateway_guard_settings_are_validated() {
         back.gateway_per_site_rate_limit,
         s.gateway_per_site_rate_limit
     );
+    assert_eq!(back.gateway_per_site_burst, s.gateway_per_site_burst);
 }
 
 // ============================================================ T9：多 key（服务层）
@@ -1044,6 +1156,7 @@ fn site_guard_is_non_blocking_and_returns_the_lease() {
         SiteGuardPolicy {
             max_concurrency: 1,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         std::time::Instant::now(),
     );
@@ -1078,6 +1191,7 @@ async fn the_concurrency_lease_is_held_for_the_whole_body_stream() {
         SiteGuardPolicy {
             max_concurrency: 1,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         open_breaker(),
     );
@@ -1135,6 +1249,7 @@ async fn a_replayable_429_survives_a_locally_rejected_candidate() {
         SiteGuardPolicy {
             max_concurrency: 1,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         open_breaker(),
     );

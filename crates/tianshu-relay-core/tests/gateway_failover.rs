@@ -1617,6 +1617,7 @@ async fn non_success_body_holds_the_site_lease_until_read() {
         tianshu_relay_core::routing::SiteGuardPolicy {
             max_concurrency: 1,
             rate_limit_per_sec: 0,
+            rate_burst: 0, // M46-S3：机械补字段，行为不变
         },
         None,
     )

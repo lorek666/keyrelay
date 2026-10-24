@@ -343,6 +343,8 @@ export type Settings = {
   gatewayPerSiteConcurrency: number;
   /** M39-S3：每站每秒请求上限（默认 0 = 不限速）。 */
   gatewayPerSiteRateLimit: number;
+  /** M46-S3：每站限流 burst——令牌桶额外容量（默认 0 = 关；0..=10000）。 */
+  gatewayPerSiteBurst: number;
   // ---- M6-S5：FR-9 界面与隐私 ----
   /** "system" | "light" | "dark" */
   theme: string;
@@ -1762,6 +1764,7 @@ let mockSettings: Settings = {
   gatewayLbTopN: 3,
   gatewayPerSiteConcurrency: 8,
   gatewayPerSiteRateLimit: 0,
+  gatewayPerSiteBurst: 0,
   theme: "system",
   language: "zh-CN",
   proxyUrl: "",

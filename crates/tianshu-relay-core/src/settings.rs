@@ -38,6 +38,9 @@ pub const GATEWAY_LB_TOP_N_MAX: usize = 20;
 pub const GATEWAY_PER_SITE_CONCURRENCY_MIN: usize = 1;
 pub const GATEWAY_PER_SITE_CONCURRENCY_MAX: usize = 128;
 pub const GATEWAY_PER_SITE_RATE_LIMIT_MAX: u32 = 10_000;
+/// 每站限流 burst 上限（M46-S3）。数值与 rate 上限同口径但另立常量：
+/// 两者将来调价互不牵连。
+pub const GATEWAY_PER_SITE_BURST_MAX: u32 = 10_000;
 
 /// 网关请求体上限的默认值 / 硬上限（MiB，M42-S1 §4.4）。
 pub const DEFAULT_GATEWAY_MAX_REQUEST_MIB: u16 = 16;
@@ -71,6 +74,8 @@ const KEY_HEALTH_MAX_INTERVAL_SECS: u64 = 86_400;
 const KEY_GATEWAY_LB_TOP_N: &str = "gateway_lb_top_n";
 const KEY_GATEWAY_PER_SITE_CONCURRENCY: &str = "gateway_per_site_concurrency";
 const KEY_GATEWAY_PER_SITE_RATE_LIMIT: &str = "gateway_per_site_rate_limit";
+// M46-S3：每站限流 burst（额外桶容量，0 = 关）
+const KEY_GATEWAY_PER_SITE_BURST: &str = "gateway_per_site_burst";
 const KEY_THEME: &str = "theme";
 const KEY_LANGUAGE: &str = "language";
 const KEY_PROXY_URL: &str = "proxy_url";
@@ -134,6 +139,10 @@ pub struct Settings {
     /// 每站**每秒**请求上限（M39-S3 §4.6）：**默认 0（不限速）**，范围 `0..=10000`。
     /// 单位是**每秒**——不是每分钟（Lead 裁决，界面文案必须写清）。
     pub gateway_per_site_rate_limit: u32,
+    /// 每站限流的额外桶容量（M46-S3）：**默认 0（关）**，范围 `0..=10000`。
+    /// 桶容量 = `gateway_per_site_rate_limit + gateway_per_site_burst`，
+    /// 每秒补充仍是 `gateway_per_site_rate_limit`；rate = 0（不限速）时无意义。
+    pub gateway_per_site_burst: u32,
 
     // ---- M6-S5：FR-9 界面与隐私 ----
     /// 主题：`system` / `light` / `dark`。
@@ -215,6 +224,8 @@ impl Default for Settings {
             gateway_lb_top_n: 3,
             gateway_per_site_concurrency: 8,
             gateway_per_site_rate_limit: 0,
+            // M46-S3：burst 默认关（默认行为与今天逐字相同）。
+            gateway_per_site_burst: 0,
 
             theme: "system".to_string(),
             language: "zh-CN".to_string(),
@@ -299,6 +310,12 @@ impl Settings {
         if self.gateway_per_site_rate_limit > GATEWAY_PER_SITE_RATE_LIMIT_MAX {
             return Err(Error::Store(format!(
                 "每站每秒请求上限必须在 0..={GATEWAY_PER_SITE_RATE_LIMIT_MAX} 之间（0 = 不限速；单位是每秒）"
+            )));
+        }
+        // M46-S3：burst 越界 ⇒ Err 且不落库（与既有设置同口径）。
+        if self.gateway_per_site_burst > GATEWAY_PER_SITE_BURST_MAX {
+            return Err(Error::Store(format!(
+                "每站限流 burst 必须在 0..={GATEWAY_PER_SITE_BURST_MAX} 之间（0 = 关）"
             )));
         }
         if !THEMES.contains(&self.theme.as_str()) {
@@ -406,6 +423,7 @@ impl Settings {
             "gateway_lb_top_n": self.gateway_lb_top_n,
             "gateway_per_site_concurrency": self.gateway_per_site_concurrency,
             "gateway_per_site_rate_limit": self.gateway_per_site_rate_limit,
+            "gateway_per_site_burst": self.gateway_per_site_burst,
             "theme": self.theme,
             "language": self.language,
             "telemetry_enabled": self.telemetry_enabled,
@@ -572,6 +590,15 @@ impl Settings {
                         }
                     }
                 }
+                // M46-S3：与 rate_limit 同口径（只做类型转换 + 上限过滤，
+                // 范围由写路径 validate 统一拒绝）。
+                KEY_GATEWAY_PER_SITE_BURST => {
+                    if let Ok(n) = value.parse::<u32>() {
+                        if n <= GATEWAY_PER_SITE_BURST_MAX {
+                            settings.gateway_per_site_burst = n;
+                        }
+                    }
+                }
                 KEY_THEME => {
                     if THEMES.contains(&value) {
                         settings.theme = value.to_string();
@@ -720,6 +747,10 @@ impl Settings {
                 KEY_GATEWAY_PER_SITE_RATE_LIMIT,
                 self.gateway_per_site_rate_limit.to_string(),
             ),
+            (
+                KEY_GATEWAY_PER_SITE_BURST,
+                self.gateway_per_site_burst.to_string(),
+            ),
             (KEY_THEME, self.theme.clone()),
             (KEY_LANGUAGE, self.language.clone()),
             (KEY_PROXY_URL, self.proxy_url.clone()),
@@ -759,7 +790,7 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 32] = [
+    pub const KEYS: [&'static str; 33] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
@@ -778,6 +809,7 @@ impl Settings {
         KEY_GATEWAY_LB_TOP_N,
         KEY_GATEWAY_PER_SITE_CONCURRENCY,
         KEY_GATEWAY_PER_SITE_RATE_LIMIT,
+        KEY_GATEWAY_PER_SITE_BURST,
         KEY_THEME,
         KEY_LANGUAGE,
         KEY_PROXY_URL,
@@ -1122,6 +1154,7 @@ mod tests {
             gateway_lb_top_n: 3,
             gateway_per_site_concurrency: 8,
             gateway_per_site_rate_limit: 0,
+            gateway_per_site_burst: 0,
             theme: "dark".to_string(),
             language: "en-US".to_string(),
             proxy_url: "socks5://127.0.0.1:1080".to_string(),

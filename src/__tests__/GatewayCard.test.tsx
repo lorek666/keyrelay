@@ -53,7 +53,12 @@ const status = (over: Partial<GatewayStatus> = {}): GatewayStatus => ({
 });
 
 function renderCard(
-  over: { maxRequestMib?: number; onMaxRequestMibChange?: () => void } = {},
+  over: {
+    maxRequestMib?: number;
+    onMaxRequestMibChange?: () => void;
+    perSiteBurst?: number;
+    onPerSiteBurstChange?: (burst: number) => void;
+  } = {},
 ) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -73,12 +78,14 @@ function renderCard(
       collectModels={false}
       modelsMinIntervalSecs={1800}
       maxRequestMib={over.maxRequestMib ?? 16}
+      perSiteBurst={over.perSiteBurst ?? 0}
       onToggle={vi.fn()}
       onPortChange={vi.fn()}
       onMultiSiteChange={vi.fn()}
       onCollectModelsChange={vi.fn()}
       onModelsIntervalChange={vi.fn()}
       onMaxRequestMibChange={over.onMaxRequestMibChange ?? vi.fn()}
+      onPerSiteBurstChange={over.onPerSiteBurstChange ?? vi.fn()}
       settingsDirty={false}
     />,
     { wrapper },
@@ -206,6 +213,21 @@ describe("M42-S1：监听地址 / IPv6 降级 / 请求体上限", () => {
     fireEvent.change(input, { target: { value: "32" } });
     expect(onChange).toHaveBeenCalledTimes(1);
     expect(onChange).toHaveBeenCalledWith(32);
+  });
+
+  it("M46-S3 burst：输入 10001 不触发回调；输入 5 触发一次", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(status({ phase: "stopped" }));
+    const onChange = vi.fn();
+    renderCard({ perSiteBurst: 0, onPerSiteBurstChange: onChange });
+    const input = screen.getByLabelText(
+      zhCN.gateway.perSiteBurstLabel,
+    ) as HTMLInputElement;
+    expect(input.value).toBe("0");
+    fireEvent.change(input, { target: { value: "10001" } });
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: "5" } });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith(5);
   });
 });
 

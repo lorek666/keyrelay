@@ -516,6 +516,10 @@ pub struct SiteGuardPolicy {
     pub max_concurrency: usize,
     /// 每站每秒允许的新请求数。`0` ⇒ 不限速。
     pub rate_limit_per_sec: u32,
+    /// 令牌桶的额外容量（M46-S3）。`0` ⇒ 关（与今天逐字相同）。
+    /// 桶容量 = `rate_limit_per_sec + rate_burst`；每秒补充仍是
+    /// `rate_limit_per_sec`，burst 只抬高上限、不提高补充速率。
+    pub rate_burst: u32,
 }
 
 impl Default for SiteGuardPolicy {
@@ -523,6 +527,7 @@ impl Default for SiteGuardPolicy {
         Self {
             max_concurrency: 8,
             rate_limit_per_sec: 0,
+            rate_burst: 0,
         }
     }
 }
@@ -569,7 +574,9 @@ impl SiteGuard {
             policy,
             in_flight: Arc::new(AtomicUsize::new(0)),
             bucket: Mutex::new(TokenBucket {
-                tokens: policy.rate_limit_per_sec as f64,
+                // M46-S3：初始桶是满的（满 = rate + burst，与今天「初始满 rate」
+                // 同一规则的延伸；见 spec §4.2）。rate = 0 时桶分支根本不读它。
+                tokens: policy.rate_limit_per_sec as f64 + policy.rate_burst as f64,
                 last: now,
             }),
         }
@@ -603,10 +610,11 @@ impl SiteGuard {
                     });
                 }
             };
-            let cap = self.policy.rate_limit_per_sec as f64;
+            // M46-S3：容量 = rate + burst；补充速率仍是 rate（连续补充，
+            // 按真实流逝时间乘 rate，与今天同口径）。burst 只抬上限。
+            let cap = self.policy.rate_limit_per_sec as f64 + self.policy.rate_burst as f64;
             let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
-            // 每秒补满：`cap` 个/秒
-            b.tokens = (b.tokens + elapsed * cap).min(cap);
+            b.tokens = (b.tokens + elapsed * self.policy.rate_limit_per_sec as f64).min(cap);
             b.last = now;
             if b.tokens < 1.0 {
                 drop(b);
