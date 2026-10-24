@@ -628,6 +628,8 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::site_bill_probe,
             commands::site_bill_import,
             commands::site_bills,
+            // M46-S6：多源账单对账（只读）
+            commands::bill_reconciliation,
             // M14-S1：模型别名映射（B-110）
             commands::list_alias_map,
             commands::upsert_alias,

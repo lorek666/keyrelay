@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-bill-reconciliation"
+description = "Enables the bill_reconciliation command without any pre-configured scope."
+commands.allow = ["bill_reconciliation"]
+
+[[permission]]
+identifier = "deny-bill-reconciliation"
+description = "Denies the bill_reconciliation command without any pre-configured scope."
+commands.deny = ["bill_reconciliation"]

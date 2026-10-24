@@ -71,6 +71,7 @@
     "allow-recent-key-usage",
     "allow-usage-dashboard",
     "allow-site-bills",
+    "allow-bill-reconciliation",
     "allow-site-bill-import",
     "allow-site-bill-probe",
     "allow-model-price-delete",

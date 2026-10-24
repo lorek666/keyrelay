@@ -1597,6 +1597,33 @@ export async function siteBills(days = 30): Promise<SiteBill[]> {
   return invokeCommand<SiteBill[]>("site_bills", { days });
 }
 
+/**
+ * M46-S6：一行账单对账结果（只读报告；kind 为存在分区，billUsd/diffUsd 为空
+ * 只表示不可比——currency 非 USD、或为空、或 amount 为空；缺失侧按 0 计）。
+ * 仅 API 层接线（check-commands 要求命令有前端调用者）；页面卡片是 B-251，另立项。
+ */
+export type BillReconciliation = {
+  siteId: number;
+  day: string;
+  gatewayUsd: number;
+  billUsd: number | null;
+  diffUsd: number | null;
+  flagged: boolean;
+  kind: "matched" | "gateway_only" | "bill_only";
+  source: string | null;
+};
+
+export async function billReconciliation(
+  siteId?: number,
+  days = 30,
+): Promise<BillReconciliation[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<BillReconciliation[]>("bill_reconciliation", {
+    siteId: siteId ?? null,
+    days,
+  });
+}
+
 /** M14-S1：模型别名映射（B-110）—— agent 侧模型名 → 真实模型名。 */
 export type AliasEntry = { alias: string; realModel: string };
 
