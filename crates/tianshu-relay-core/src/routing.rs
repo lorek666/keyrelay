@@ -659,8 +659,13 @@ impl RoundRobinState {
 /// 算法（完整版见 `docs/specs/M39-S3-负载均衡与上游保护.md` §4.1）：
 /// 有 `probe` 就直接返回它且**不读 cursor**（否则探针可能永远轮不到，冷却恢复不了）；
 /// 否则取前 `top_n` 个（`0` 视为 1）；只剩一个就直接返回且不读 cursor（单候选与今天逐字相同）；
-/// 其余按 `unit = 1/max(rate, 0.01)` 以组内最小 unit 归一（clamp 到 `[1, 100]`）建槽位表，
-/// 用 `cursor % slots.len()` 取一个。
+/// 其余**按站点归一**：head 先按 `site_id` 分组（保持首次出现顺序），站点权重取该站
+/// `rate` 的 `unit = 1/max(rate, 0.01)`，以组内最小 unit 归一（clamp 到 `[1, 100]`）建槽位表，
+/// 用 `cursor % slots.len()` 选站点；站内 key 按 `(cursor / slots.len()) % key_count` 轮换。
+///
+/// 按站点归一而不是按 key 计权重（B-224 P2-5 决策，2026-10-24）：`rate` 是站点倍率
+/// （同站各 key 相同），guard 与熔断也按站点共享，站点才是容量单位；按 key 计会让
+/// 2 key 站点与倍率无关地占 2 份槽位，guard 饱和时只会多出本地 429，而不是多出容量。
 pub fn weighted_pick<'a>(
     candidates: &[Candidate<'a>],
     top_n: usize,
@@ -677,14 +682,23 @@ pub fn weighted_pick<'a>(
     if head.len() == 1 {
         return Some(head[0].upstream);
     }
-    let units: Vec<f64> = head
+    // 按站点分组：(site_id, 站点 unit, 该站在 head 内的 key 列表)。
+    // 同站各 key 的 rate 相同（站点倍率），取首个即可。
+    let mut sites: Vec<(i64, f64, Vec<&Upstream>)> = Vec::new();
+    for c in head {
+        let sid = c.upstream.site_id;
+        match sites.iter_mut().find(|(id, _, _)| *id == sid) {
+            Some((_, _, keys)) => keys.push(c.upstream),
+            None => sites.push((sid, rotation_weight(c.upstream.rate), vec![c.upstream])),
+        }
+    }
+    let base = sites
         .iter()
-        .map(|c| rotation_weight(c.upstream.rate))
-        .collect();
-    let base = units.iter().cloned().fold(f64::INFINITY, f64::min);
-    let weights: Vec<u64> = units
+        .map(|(_, u, _)| *u)
+        .fold(f64::INFINITY, f64::min);
+    let weights: Vec<u64> = sites
         .iter()
-        .map(|u| ((u / base).round() as i64).clamp(1, 100) as u64)
+        .map(|(_, u, _)| ((u / base).round() as i64).clamp(1, 100) as u64)
         .collect();
     let mut slots: Vec<usize> = Vec::new();
     for (i, w) in weights.iter().enumerate() {
@@ -692,8 +706,12 @@ pub fn weighted_pick<'a>(
             slots.push(i);
         }
     }
-    let idx = slots[(cursor % slots.len() as u64) as usize];
-    Some(head[idx].upstream)
+    let site_idx = slots[(cursor % slots.len() as u64) as usize];
+    let keys = &sites[site_idx].2;
+    // 站内轮换与站点选择解耦：单站时 slots.len() == 1，退化为 cursor 交替（与旧行为一致）；
+    // 多站时每过一轮槽位表站内 key 前进一步，两把 key 都轮得到。
+    let key_idx = ((cursor / slots.len() as u64) % keys.len() as u64) as usize;
+    Some(keys[key_idx])
 }
 
 #[cfg(test)]
