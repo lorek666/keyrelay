@@ -2695,9 +2695,21 @@ impl Store {
             params![site_id, key_id, period, limit_usd, now_secs()],
         )
         .map_err(|e| {
-            Error::Store(format!(
-                "该站点/密钥该周期已有预算（同一站同一周期只能有一行站级预算、同一 key 只能有一行 key 级预算）: {e}"
-            ))
+            // M46-S5 复审 P2-1：不把 SQLite 原文拼进错误。唯一约束失败给友好
+            // 文案，其它写失败给通用文案——两者都不带 SQLite 原文，且不把
+            // 真实写失败误报成重复行（旧代码是把所有错误都拼成重复行文案）。
+            if matches!(
+                &e,
+                rusqlite::Error::SqliteFailure(err, _)
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation
+            ) {
+                Error::Store(
+                    "该站点/密钥该周期已有预算（同一站同一周期只能有一行站级预算、同一 key 只能有一行 key 级预算）"
+                        .to_string(),
+                )
+            } else {
+                Error::Store("写入预算失败".to_string())
+            }
         })?;
         Ok(conn.last_insert_rowid())
     }

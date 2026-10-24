@@ -326,6 +326,46 @@ fn budget_breach_for_prefers_key_level_and_returns_none_when_under() {
         .is_none());
 }
 
+/// M46-S5 复审 P0-1：他 key 的 key 级预算行不得误拦本 key。
+/// 旧 bug：`budget_breach_for` 里 (Some, Some-不同) 只把 is_key_row 置 false
+/// 就继续往下算，K2 的超标行落入站级回落，K1 的请求也被拦。
+#[test]
+fn budget_breach_for_ignores_other_keys_key_level_rows() {
+    let (_dir, store, site) = store_with_site();
+    let k1 = store
+        .insert_key(site, "k1", "kr/key/1/secret", None, None)
+        .expect("写 key1");
+    let k2 = store
+        .insert_key(site, "k2", "kr/key/2/secret", None, None)
+        .expect("写 key2");
+    let base = now() - 40 * 86_400;
+    price(&store, "usd-model", 2.0, 4.0, "USD", base);
+    let t = now();
+    // K2 已花 4.0（1M prompt + 500K completion），K1 无用量。
+    store
+        .insert_gateway_usage(&usage(t, site, Some(k2), "usd-model", 1_000_000, 500_000))
+        .expect("写用量");
+    store
+        .budget_create(site, Some(k2), "day", 3.0)
+        .expect("K2 key 级预算（超）");
+    store
+        .budget_create(site, None, "day", 100.0)
+        .expect("站级预算（未超）");
+    // K1 的请求：K2 的行与未超的站级行均不得拦它。
+    assert!(
+        budget_breach_for(&store, site, Some(k1))
+            .expect("判定")
+            .is_none(),
+        "他 key 的超标行不得误拦本 key"
+    );
+    // 对照：K2 自己的请求仍应被 K2 的行拦住（防矫枉过正把 key 级行全忽略）。
+    let breach = budget_breach_for(&store, site, Some(k2))
+        .expect("判定")
+        .expect("K2 应被拦");
+    assert_eq!(breach.key_id, Some(k2));
+    assert_eq!(breach.limit_usd, 3.0);
+}
+
 #[test]
 fn budget_breach_for_propagates_store_error() {
     // fail-open 契约的前提：判定函数在 store 坏掉时返回 Err（而不是静默 None），
