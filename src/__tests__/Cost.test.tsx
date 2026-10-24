@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import Cost from "../pages/Cost";
@@ -32,6 +32,8 @@ vi.mock("../lib/api", async (importOriginal) => {
 import {
   listSites,
   modelPriceList,
+  siteBillImport,
+  siteBillProbe,
   siteBills,
   usageDashboard,
   type SiteRow,
@@ -156,6 +158,130 @@ describe("Cost", () => {
     render(<Cost />, { wrapper });
     await waitFor(() => {
       expect(screen.getByText("m1")).toBeTruthy();
+    });
+  });
+
+  // ---- M45-S8（B-230）：此前缺失的分支断言 ----
+
+  function billsCard() {
+    return screen.getByText("站点账单（站点自报）").closest(".hm-card") as HTMLElement;
+  }
+
+  async function selectBillSite(card: HTMLElement) {
+    // 必须等站点查询返回、选项出现后再改值；否则 select 里没有 value="1" 的选项，
+    // 改值会被忽略、探测按钮仍禁用（此前 3 个账单测试就是这么失败的，测试自身 bug）。
+    await waitFor(() => {
+      expect(within(card).getByRole("option", { name: "Alpha" })).toBeTruthy();
+    });
+    const selects = within(card).getAllByRole("combobox");
+    fireEvent.change(selects[0], { target: { value: "1" } });
+  }
+
+  it("B-230：账单探测四态文案各不相同", async () => {
+    const cases: Array<[string, string]> = [
+      ["supported", "该站点支持账单导入。"],
+      ["needsLogin", "需要先登录该站点。"],
+      ["unsupported", "该站点不支持账单导入。"],
+      ["failed", "探测失败：nope"],
+    ];
+    for (const [status, text] of cases) {
+      vi.mocked(siteBillProbe).mockResolvedValue({
+        status: status as "supported" | "needsLogin" | "unsupported" | "failed",
+        currency: null,
+        reason: status === "failed" ? "nope" : null,
+      });
+      const { unmount } = render(<Cost />, { wrapper });
+      await waitFor(() => {
+        expect(screen.getByText("站点账单（站点自报）")).toBeTruthy();
+      });
+      const card = billsCard();
+      await selectBillSite(card);
+      fireEvent.click(within(card).getByRole("button", { name: "探测能力" }));
+      await waitFor(() => {
+        expect(screen.getByText(text)).toBeTruthy();
+      });
+      unmount();
+    }
+  });
+
+  it("B-230：导入 partial 时必须警告只导入了最近 N 页", async () => {
+    vi.mocked(siteBillImport).mockResolvedValue({
+      imported: 5, pages: 2, partial: true, currency: null, currencyOverrideUsed: false,
+    });
+    render(<Cost />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("站点账单（站点自报）")).toBeTruthy();
+    });
+    const card = billsCard();
+    await selectBillSite(card);
+    fireEvent.click(within(card).getByRole("button", { name: "只读导入" }));
+    await waitFor(() => {
+      expect(screen.getByText(/注意：只导入了最近 2 页/)).toBeTruthy();
+    });
+  });
+
+  it("B-230：导入币种覆盖时标注所用币种", async () => {
+    vi.mocked(siteBillImport).mockResolvedValue({
+      imported: 5, pages: 1, partial: false, currency: "CNY", currencyOverrideUsed: true,
+    });
+    render(<Cost />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("站点账单（站点自报）")).toBeTruthy();
+    });
+    const card = billsCard();
+    await selectBillSite(card);
+    fireEvent.click(within(card).getByRole("button", { name: "只读导入" }));
+    await waitFor(() => {
+      expect(screen.getByText(/按你指定的 CNY 记录/)).toBeTruthy();
+    });
+  });
+
+  it("B-230：仪表盘出错时红行带真实原因", async () => {
+    vi.mocked(usageDashboard).mockRejectedValue(new Error("boom"));
+    render(<Cost />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("读取用量失败：boom")).toBeTruthy();
+    });
+  });
+
+  it("B-230：成本空态与账单空态", async () => {
+    vi.mocked(usageDashboard).mockResolvedValue({
+      rangeDays: 30,
+      siteId: null,
+      daily: [],
+      snapshots: [],
+      keyUsage: [],
+      byAgent: [],
+    });
+    vi.mocked(siteBills).mockResolvedValue([]);
+    render(<Cost />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText(/还没有可估算的用量/)).toBeTruthy();
+      expect(screen.getByText("还没有导入过账单。")).toBeTruthy();
+    });
+  });
+
+  it("B-230：成本为 null 的桶显示未定价而非 0", async () => {
+    vi.mocked(usageDashboard).mockResolvedValue({
+      rangeDays: 30,
+      siteId: null,
+      daily: [
+        {
+          date: "2026-10-20", siteId: 1, model: "m1", requests: 4,
+          promptTokens: 10, completionTokens: 10, totalTokens: 20,
+          currency: "USD", estimatedCost: null, unpricedRequests: 4, unpricedTokens: 20,
+        },
+      ],
+      snapshots: [],
+      keyUsage: [],
+      byAgent: [],
+    });
+    render(<Cost />, { wrapper });
+    await waitFor(() => {
+      const bucket = screen.getByText("估算成本（USD）").closest(".hm-card");
+      expect(bucket).toHaveTextContent("未知（未定价）");
+      expect(bucket).toHaveTextContent("4 条全部未定价");
+      expect(bucket).not.toHaveTextContent("0 USD");
     });
   });
 });
