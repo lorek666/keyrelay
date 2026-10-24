@@ -62,6 +62,30 @@
       "empty": "还没有预算。",
       "note": "超标即拦，没有预警分档；新建与删除立即生效，无需重启网关。"
     },
+    "reconciliation": {
+      "title": "账单对账（网关成本 vs 站点账单）",
+      "body": "按站点、按天对比网关侧成本与已导入的站点账单。注意覆盖度：目前账单来源基本只有 NewAPI 系导入，其它来源的账单只有被导入后才会出现；数据随导入节拍更新，有滞后，不是实时全来源对账。差异超过 max（5%，$1）标为超阈值。",
+      "daysLabel": "窗口（天）",
+      "daysOption": "{days} 天",
+      "flaggedOnly": "仅看超阈值",
+      "day": "日期",
+      "site": "站点",
+      "gateway": "网关成本",
+      "bill": "站点账单",
+      "diff": "差异",
+      "kind": "存在分区",
+      "flagged": "标记",
+      "kindValues": {
+        "matched": "双方都有",
+        "gateway_only": "仅网关",
+        "bill_only": "仅账单"
+      },
+      "flaggedYes": "超阈值",
+      "incomparableTitle": "不可比行",
+      "incomparableNote": "以下行的账单币种非 USD、为空，或账单金额为空，无法与网关侧 USD 成本比较，故不参与超阈值筛选；它们在 IPC 里同样 flagged=true，但这里单独立组，不与超阈值行混在一起。",
+      "empty": "该窗口内没有对账行。",
+      "flaggedEmpty": "该窗口内没有超阈值行。"
+    },
     "agents": {
       "title": "按 Agent 成本",
       "note": "按网关令牌的标签（认证时的快照）归因；空标签是启用归因之前的旧数据。",

@@ -16,6 +16,7 @@ import {
 import { formatTokens } from "../lib/usageAgg";
 import ModelPricesCard from "../components/ModelPricesCard";
 import BudgetsCard from "../components/BudgetsCard";
+import ReconciliationCard from "../components/ReconciliationCard";
 import { useTranslation } from "../i18n";
 
 /**
@@ -306,6 +307,7 @@ export default function Cost() {
 
       <ModelPricesCard />
       <BudgetsCard />
+      <ReconciliationCard />
     </section>
   );
 }

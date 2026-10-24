@@ -62,6 +62,30 @@
       "empty": "No budgets yet.",
       "note": "Exceeded means blocked, no warning tiers; create and delete take effect immediately, no gateway restart needed."
     },
+    "reconciliation": {
+      "title": "Billing reconciliation (gateway cost vs site bills)",
+      "body": "Compares gateway-side cost against imported site bills per site per day. Coverage note: bill sources are currently mostly NewAPI-family imports; bills from other sources only appear once imported. Data updates on the import cadence and lags; this is not real-time all-source reconciliation. Differences beyond max(5%, $1) are flagged as over threshold.",
+      "daysLabel": "Window (days)",
+      "daysOption": "{days} days",
+      "flaggedOnly": "Flagged only",
+      "day": "Day",
+      "site": "Site",
+      "gateway": "Gateway cost",
+      "bill": "Site bill",
+      "diff": "Difference",
+      "kind": "Presence",
+      "flagged": "Flag",
+      "kindValues": {
+        "matched": "Both sides",
+        "gateway_only": "Gateway only",
+        "bill_only": "Bill only"
+      },
+      "flaggedYes": "Over threshold",
+      "incomparableTitle": "Incomparable rows",
+      "incomparableNote": "The rows below cannot be compared against gateway-side USD cost because the bill currency is not USD, is empty, or the bill amount is empty, so they do not take part in over-threshold filtering. They are also flagged=true in the IPC, but they are grouped separately here instead of being mixed with over-threshold rows.",
+      "empty": "No reconciliation rows in this window.",
+      "flaggedEmpty": "No over-threshold rows in this window."
+    },
     "agents": {
       "title": "Cost by agent",
       "note": "Attributed by gateway token label (snapshot at auth time). Empty labels are pre-attribution data.",
