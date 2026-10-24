@@ -29,13 +29,13 @@
     "overview": "总览",
     "cockpit": "指挥舱",
     "traffic": "流量",
+    "cost": "成本",
     "sites": "站点",
     "keys": "密钥",
     "agents": "Agent 投递",
     "history": "变更历史",
     "settings": "设置",
-    "probe": "模型检测",
-    "usage": "用量"
+    "probe": "模型检测"
   },
   "usage": {
     "cost": {

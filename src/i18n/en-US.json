@@ -29,13 +29,13 @@
     "overview": "Overview",
     "cockpit": "Command Center",
     "traffic": "Traffic",
+    "cost": "Cost",
     "sites": "Sites",
     "keys": "Keys",
     "agents": "Agent Delivery",
     "history": "Change History",
     "settings": "Settings",
-    "probe": "Model Probe",
-    "usage": "Usage"
+    "probe": "Model Probe"
   },
   "usage": {
     "cost": {
