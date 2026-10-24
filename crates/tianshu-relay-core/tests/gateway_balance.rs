@@ -343,6 +343,71 @@ fn single_candidate_does_not_touch_the_cursor() {
     assert_eq!(state.next(), 1);
 }
 
+/// B-224 P2-5（2026-10-24，按站点归一）：站点份额只由站点倍率决定，不被 key 数放大；
+/// 且站内 key 都轮得到（不是只有首 key 被选中）。
+/// 关键判别点是 key 数不等的情形：等倍率下 A 站 2 key、B 站 1 key 时，
+/// 按 key 计权重会得到 2:1（A 占 2 组槽位），按站点归一得到 1:1——本测试锁定后者。
+/// 2v2 一档锁定倍率比与站内 key 全覆盖（10:1 倍率 ⇒ 站点 100:10，两站的 key 都用到）。
+#[test]
+fn multi_key_sites_share_by_site_not_by_key_count() {
+    use std::collections::BTreeSet;
+    // 判别档：等倍率，A 2 key、B 1 key ⇒ 站点 50/50（旧按 key 计会是 2:1），A 两把 key 都用到。
+    let a1 = upstream(1, "http://127.0.0.1:1", REF_A, 1.0);
+    let a2 = upstream(1, "http://127.0.0.1:1", "kr/key/a2/secret", 1.0);
+    let b1 = upstream(2, "http://127.0.0.1:2", REF_B, 1.0);
+    let candidates = vec![cand(&a1, false), cand(&a2, false), cand(&b1, false)];
+    let mut counts = [0usize; 2];
+    let mut keys_a: BTreeSet<&str> = BTreeSet::new();
+    for cursor in 0..100u64 {
+        let picked = weighted_pick(&candidates, 10, cursor).unwrap();
+        match picked.site_id {
+            1 => {
+                counts[0] += 1;
+                keys_a.insert(picked.key_ref.as_str());
+            }
+            2 => counts[1] += 1,
+            other => panic!("意外站点 {other}"),
+        }
+    }
+    assert_eq!(
+        counts,
+        [50, 50],
+        "等倍率 2 key v 1 key 时站点应当 50/50，而不是 2:1"
+    );
+    assert_eq!(keys_a.len(), 2, "A 站两把 key 都应当轮到");
+    // 倍率档：10:1 倍率 2v2 ⇒ 站点 100:10，两站的 key 都用到。
+    let a1 = upstream(1, "http://127.0.0.1:1", REF_A, 0.1);
+    let a2 = upstream(1, "http://127.0.0.1:1", "kr/key/a2/secret", 0.1);
+    let b1 = upstream(2, "http://127.0.0.1:2", REF_B, 1.0);
+    let b2 = upstream(2, "http://127.0.0.1:2", "kr/key/b2/secret", 1.0);
+    let candidates = vec![
+        cand(&a1, false),
+        cand(&a2, false),
+        cand(&b1, false),
+        cand(&b2, false),
+    ];
+    let mut counts = [0usize; 2];
+    let mut keys_a: BTreeSet<&str> = BTreeSet::new();
+    let mut keys_b: BTreeSet<&str> = BTreeSet::new();
+    for cursor in 0..110u64 {
+        let picked = weighted_pick(&candidates, 10, cursor).unwrap();
+        match picked.site_id {
+            1 => {
+                counts[0] += 1;
+                keys_a.insert(picked.key_ref.as_str());
+            }
+            2 => {
+                counts[1] += 1;
+                keys_b.insert(picked.key_ref.as_str());
+            }
+            other => panic!("意外站点 {other}"),
+        }
+    }
+    assert_eq!(counts, [100, 10], "10:1 倍率 2v2 时站点应当 100:10");
+    assert_eq!(keys_a.len(), 2, "A 站两把 key 都应当轮到");
+    assert_eq!(keys_b.len(), 2, "B 站两把 key 都应当轮到");
+}
+
 /// T4：统计补充——1000 次里便宜站点至少是贵站点的 50 倍（不替代 T1 的精确序列）。
 #[test]
 fn cheap_site_dominates_the_distribution() {
