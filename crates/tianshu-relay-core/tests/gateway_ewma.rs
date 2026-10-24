@@ -310,7 +310,7 @@ async fn no_ewma_keeps_static_order() {
     assert_eq!(a.count(), 3);
     assert_eq!(b.count(), 0, "site2 从未被打到");
     assert!(
-        handle.metrics().per_site.get(&2i64).is_none(),
+        !handle.metrics().per_site.contains_key(&2i64),
         "site2 从未被尝试，快照里不应有它的条目"
     );
 
