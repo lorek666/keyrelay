@@ -26,14 +26,13 @@
       "delivery": "投递",
       "system": "系统"
     },
-    "overview": "总览",
-    "sites": "站点",
-    "keys": "密钥",
-    "agents": "Agent 投递",
-    "history": "变更历史",
-    "settings": "设置",
-    "probe": "模型检测",
-    "usage": "用量"
+    "cockpit": "指挥舱",
+    "traffic": "流量",
+    "cost": "成本",
+    "health": "健康",
+    "assets": "资产",
+    "delivery": "投递",
+    "settings": "设置"
   },
   "usage": {
     "cost": {
@@ -278,6 +277,9 @@
       "balance": "{site}: 已用 {used} {currency} / 剩余 {remaining}{delta}",
       "delta": "（{delta}）"
     }
+  },
+  "cockpit": {
+    "live": "实时"
   },
   "sites": {
     "title": "接入新站点",
@@ -1178,6 +1180,16 @@
       "drift": "「总览」会一直把这个目标列为「需要处理」，每打开一次总览还会记一条「外部改动」告警——文件已经不是 天枢 Relay 最后一次投递写入的内容，这是预期的，不要据此重新投递（那等于撤销这次回滚）。",
       "rotation": "轮换这把密钥时这个文件会被重新写入；批量改指网关时它也仍在候选里。如果这次回滚把文件还原成了更早一次投递写下的**另一把**密钥：之后轮换或回收那把密钥时，天枢 Relay 不会重写这个文件，做完要回来给它投递一把仍然有效的密钥，否则 agent 会留在一把已被回收的密钥上。",
       "unbind": "不想再让 天枢 Relay 管它，到「Agent 投递」页解绑 {agent}。"
+    }
+  },
+  "health": {
+    "balance": {
+      "title": "余额",
+      "note": "各站点的余额总览；未知绝不当成 0。",
+      "error": "加载站点失败：{error}",
+      "empty": "还没有站点。",
+      "site": "站点",
+      "balance": "余额"
     }
   }
 }

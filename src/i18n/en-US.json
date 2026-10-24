@@ -26,14 +26,13 @@
       "delivery": "Delivery",
       "system": "System"
     },
-    "overview": "Overview",
-    "sites": "Sites",
-    "keys": "Keys",
-    "agents": "Agent Delivery",
-    "history": "Change History",
-    "settings": "Settings",
-    "probe": "Model Probe",
-    "usage": "Usage"
+    "cockpit": "Command Center",
+    "traffic": "Traffic",
+    "cost": "Cost",
+    "health": "Health",
+    "assets": "Assets",
+    "delivery": "Delivery",
+    "settings": "Settings"
   },
   "usage": {
     "cost": {
@@ -278,6 +277,9 @@
       "balance": "{site}: used {used} {currency} / remaining {remaining}{delta}",
       "delta": " ({delta})"
     }
+  },
+  "cockpit": {
+    "live": "LIVE"
   },
   "sites": {
     "title": "Add a new site",
@@ -1178,6 +1180,16 @@
       "drift": "Overview keeps listing this target as \"needs attention\", and every Overview open logs another \"external change\" alert—the file no longer matches Tianshu Relay's last delivered content. This is expected; do not re-deliver because of it (that would undo the rollback).",
       "rotation": "Rotating this key rewrites the file; it also stays a candidate when batch re-pointing to the gateway. If this rollback restored the file to a **different** key from an earlier delivery: later rotating or revoking that earlier key will not rewrite this file—come back and deliver a still-valid key, or the agent stays on a revoked key.",
       "unbind": "To stop Tianshu Relay from managing it, unbind {agent} on the Agent Delivery page."
+    }
+  },
+  "health": {
+    "balance": {
+      "title": "Balance",
+      "note": "Balance overview across sites; unknown is never shown as 0.",
+      "error": "Failed to load sites: {error}",
+      "empty": "No sites yet.",
+      "site": "Site",
+      "balance": "Balance"
     }
   }
 }
