@@ -31,8 +31,7 @@
     "traffic": "Traffic",
     "cost": "Cost",
     "health": "Health",
-    "sites": "Sites",
-    "keys": "Keys",
+    "assets": "Assets",
     "agents": "Agent Delivery",
     "history": "Change History",
     "settings": "Settings"

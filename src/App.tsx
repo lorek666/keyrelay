@@ -8,16 +8,15 @@ import {
   History as HistoryIcon,
   KeyRound,
   LayoutDashboard,
+  Layers,
   Plug,
-  Server,
   Settings as SettingsIcon,
 } from "lucide-react";
 import Cockpit from "./pages/Cockpit";
 import Traffic from "./pages/Traffic";
 import Cost from "./pages/Cost";
 import Health from "./pages/Health";
-import Sites from "./pages/Sites";
-import Keys from "./pages/Keys";
+import Assets from "./pages/Assets";
 import Agents from "./pages/Agents";
 import History from "./pages/History";
 import SettingsPage from "./pages/Settings";
@@ -40,8 +39,7 @@ const PAGES = [
   { id: "traffic", labelKey: "nav.traffic", icon: Activity, group: "nav.group.daily", render: () => <Traffic /> },
   { id: "cost", labelKey: "nav.cost", icon: Wallet, group: "nav.group.daily", render: () => <Cost /> },
   { id: "health", labelKey: "nav.health", icon: HeartPulse, group: "nav.group.daily", render: () => <Health /> },
-  { id: "sites", labelKey: "nav.sites", icon: Server, group: "nav.group.asset", render: () => <Sites /> },
-  { id: "keys", labelKey: "nav.keys", icon: KeyRound, group: "nav.group.asset", render: () => <Keys /> },
+  { id: "assets", labelKey: "nav.assets", icon: Layers, group: "nav.group.asset", render: () => <Assets /> },
   { id: "agents", labelKey: "nav.agents", icon: Plug, group: "nav.group.delivery", render: () => <Agents /> },
   { id: "history", labelKey: "nav.history", icon: HistoryIcon, group: "nav.group.daily", render: () => <History /> },
   { id: "settings", labelKey: "nav.settings", icon: SettingsIcon, group: "nav.group.system", render: () => <SettingsPage /> },
