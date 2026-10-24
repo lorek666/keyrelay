@@ -45,6 +45,23 @@
       "partial": "另有 {count} 条未定价",
       "allUnpriced": "{count} 条全部未定价"
     },
+    "budgets": {
+      "title": "硬预算（超了即停）",
+      "body": "当期已花达到上限时，网关会拦下该站点 / 密钥的候选（429 本地拒绝），新周期自动恢复。只计 USD 定价的用量；未定价与 CNY 定价的用量不计入。",
+      "site": "站点",
+      "sitePlaceholder": "选择站点",
+      "key": "密钥",
+      "keyAll": "全部密钥（全站合计）",
+      "period": "周期",
+      "periodDay": "按日",
+      "periodMonth": "按月",
+      "limit": "上限（USD）",
+      "spent": "当期已花",
+      "save": "保存",
+      "delete": "删除",
+      "empty": "还没有预算。",
+      "note": "超标即拦，没有预警分档；新建与删除立即生效，无需重启网关。"
+    },
     "agents": {
       "title": "按 Agent 成本",
       "note": "按网关令牌的标签（认证时的快照）归因；空标签是启用归因之前的旧数据。",

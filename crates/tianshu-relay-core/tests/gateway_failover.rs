@@ -225,6 +225,9 @@ async fn start_routed_full(
                 }
             }) as Arc<dyn Fn(tianshu_relay_core::gateway::GatewayUsage) + Send + Sync>
         }),
+        // M46-S5：既有用例默认不拦、不回调。
+        budget_check: None,
+        on_budget_breach: None,
     })
     .await
     .expect("网关应能启动");
@@ -291,6 +294,8 @@ async fn route_and_keys_by_ref_must_agree() {
             },
             on_observation: None,
             on_usage: None,
+            budget_check: None,
+            on_budget_breach: None,
             upstream_proxy: None,
             legacy_key_ref: None,
             // M42-S1：请求体上限（既有用例用默认 16 MiB）
@@ -798,6 +803,8 @@ async fn failure_event_scrubs_a_key_shaped_model() {
             revoked_refs: None,
             on_observation: None,
             on_usage: None,
+            budget_check: None,
+            on_budget_breach: None,
             upstream_proxy: None,
             legacy_key_ref: None,
             // M42-S1：请求体上限（既有用例用默认 16 MiB）
@@ -1065,6 +1072,8 @@ async fn a_missing_plaintext_is_refused_at_startup() {
         revoked_refs: None,
         on_observation: None,
         on_usage: None,
+        budget_check: None,
+        on_budget_breach: None,
         upstream_proxy: None,
         legacy_key_ref: None,
         // M42-S1：请求体上限（既有用例用默认 16 MiB）

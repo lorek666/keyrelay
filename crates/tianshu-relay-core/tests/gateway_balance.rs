@@ -16,7 +16,8 @@ use std::thread;
 use std::time::Duration;
 
 use tianshu_relay_core::gateway::{
-    start, GatewayConfig, GatewayFailure, GatewayHandle, UpstreamTimeout,
+    start, BudgetBreach, BudgetCheck, BudgetPeriod, GatewayConfig, GatewayFailure, GatewayHandle,
+    UpstreamTimeout,
 };
 use tianshu_relay_core::routing::{
     model_key, site_key, weighted_pick, Breaker, BreakerPolicy, BreakerState, Candidate,
@@ -278,6 +279,9 @@ fn config(
         })),
         on_observation: None,
         on_usage: None,
+        // M46-S5：既有用例默认不拦、不回调（行为与改动前逐字相同）。
+        budget_check: None,
+        on_budget_breach: None,
         upstream_proxy: None,
         legacy_key_ref: None,
         // M42-S1：请求体上限（既有用例用默认 16 MiB）
@@ -1599,5 +1603,204 @@ async fn per_site_timeout_absent_falls_back_to_global() {
         "未填分站值时应回退全局 100ms 读超时、快速 502: {body}"
     );
     assert!(body.contains("all_upstreams_failed"), "{body}");
+    handle.shutdown_and_wait().await;
+}
+
+// ============================================================ M46-S5：按站 / 按 key 硬预算
+//
+// 预算判定用固定桩（不连真实 store）：桩按站点号决定拦不拦；store 侧的真实判定
+// （读表 + 算已花）由 service 层单测覆盖。桩的 breach 一律为 day 周期、已花 10、上限 5。
+
+type Breaches = Arc<Mutex<Vec<BudgetBreach>>>;
+
+/// 拦指定站点的预算桩 + 回调收集器。未列出的站点一律放行。
+fn budget_blocking(blocked: &[i64]) -> (BudgetCheck, Breaches) {
+    let blocked: Vec<i64> = blocked.to_vec();
+    let sink: Breaches = Arc::new(Mutex::new(Vec::new()));
+    let check: BudgetCheck = Arc::new(move |site_id: i64, _key_id: Option<i64>| {
+        if blocked.contains(&site_id) {
+            Some(BudgetBreach {
+                site_id,
+                key_id: None,
+                period: BudgetPeriod::Day,
+                spent_usd: 10.0,
+                limit_usd: 5.0,
+            })
+        } else {
+            None
+        }
+    });
+    (check, sink)
+}
+
+fn install_budget(cfg: &mut GatewayConfig, blocked: &[i64]) -> Breaches {
+    let (check, sink) = budget_blocking(blocked);
+    let sink_clone = Arc::clone(&sink);
+    cfg.budget_check = Some(check);
+    cfg.on_budget_breach = Some(Arc::new(move |breach| {
+        if let Ok(mut log) = sink_clone.lock() {
+            log.push(breach);
+        }
+    }));
+    sink
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_blocks_all_candidates_with_local_rate_limited() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let c = spawn_upstream(3, &["200 OK"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    let breaches = install_budget(&mut cfg, &[1, 2, 3]);
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 429, "全部候选被预算拦时应为 429: {body}");
+    assert!(
+        body.contains("local_rate_limited"),
+        "kind 必须是 local_rate_limited: {body}"
+    );
+    assert!(body.contains("预算"), "全是预算拦时文案应点名预算: {body}");
+    assert_eq!(a.count(), 0, "1 号站必须没被打到");
+    assert_eq!(b.count(), 0, "2 号站必须没被打到");
+    assert_eq!(c.count(), 0, "3 号站必须没被打到");
+    assert_eq!(
+        breaches.lock().unwrap().len(),
+        3,
+        "三站各触发一次 breach 回调（同一请求内同一 breach 去重后仍是 3 条不同 breach）"
+    );
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_blocks_only_the_over_budget_candidate() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let c = spawn_upstream(3, &["200 OK"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    let breaches = install_budget(&mut cfg, &[1]);
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 200, "只拦 1 号站时应由其它站成功: {body}");
+    assert!(
+        !body.contains("site1"),
+        "响应体不应来自被拦的 1 号站: {body}"
+    );
+    assert_eq!(a.count(), 0, "被拦的 1 号站必须没被打到");
+    assert_eq!(breaches.lock().unwrap().len(), 1, "只应回调一次 breach");
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_block_does_not_consume_retry_attempts() {
+    // cap=2 + 首候选被预算拦 + 第 2 候选回 429 + 第 3 候选成功：
+    // 被拦不计 attempts_made 时，第 2 候选的 429 不是最后一个（attempts=1 < 2），
+    // 应进 pending 后继续切到第 3 站成功；若被拦误计预算，第 2 候选的 429 会
+    // 被当成最后一个而直接返回，3 号站见 0 次——用例以此区分。
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["429 Too Many Requests"], Duration::ZERO);
+    let c = spawn_upstream(3, &["200 OK"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    cfg.max_attempts = 2;
+    install_budget(&mut cfg, &[1]);
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 200, "被拦不计预算时应切到 3 号站成功: {body}");
+    assert!(body.contains("site3"), "响应体应当来自 3 号站: {body}");
+    assert_eq!(a.count(), 0, "被拦的 1 号站必须没被打到");
+    assert_eq!(c.count(), 1, "3 号站应被打到 1 次");
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_block_does_not_pollute_last_real_error() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["429 Too Many Requests"], Duration::ZERO);
+    let c = spawn_upstream(3, &["502 Bad Gateway"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    install_budget(&mut cfg, &[1]);
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(
+        status, 502,
+        "被拦候选不应产生错误体，应返回最后一条真实错误: {body}"
+    );
+    assert!(
+        body.contains("site3"),
+        "响应体应当来自 3 号站的真实 502: {body}"
+    );
+    assert!(!body.contains("预算"), "真实错误里不应混入预算文案: {body}");
+    assert_eq!(a.count(), 0, "被拦的 1 号站必须没被打到");
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_mixed_rejects_keep_generic_message() {
+    // 混拦（1 预算 + 2 guard）全拒时文案为既有通用文案、kind 仍是 local_rate_limited。
+    // 请求 1：1 号站预算拦、2/3 号站各回 429（各耗 1 个令牌）；请求 2（紧接着发）：
+    // 1 号站预算拦、2/3 号站 guard 拒绝（桶来不及补充）。
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["429 Too Many Requests"], Duration::ZERO);
+    let c = spawn_upstream(3, &["429 Too Many Requests"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(
+        &a,
+        &b,
+        &c,
+        SiteGuardPolicy {
+            max_concurrency: 8,
+            rate_limit_per_sec: 1,
+            rate_burst: 0,
+        },
+        open_breaker(),
+    );
+    install_budget(&mut cfg, &[1]);
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, _) = post(&handle, &token).await;
+    assert_eq!(status, 429, "请求 1 应由 3 号站的真实 429 收尾");
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 429, "请求 2 全部候选被拦时应为 429: {body}");
+    assert!(
+        body.contains("local_rate_limited"),
+        "kind 必须是 local_rate_limited: {body}"
+    );
+    assert!(
+        !body.contains("预算"),
+        "混拦时文案应为通用文案、不得点名预算: {body}"
+    );
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_legacy_single_upstream_blocked() {
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let mut cfg = GatewayConfig::single_upstream(
+        0,
+        "legacy-budget-token".to_string(),
+        a.base_url.clone(),
+        Zeroizing::new("k-test".to_string()),
+        "单站".to_string(),
+    );
+    // legacy 的 site_id / key_id 取 config 字段：single_upstream 默认 (0, None)。
+    let breaches = install_budget(&mut cfg, &[0]);
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 429, "legacy 单上游超预算时应为 429: {body}");
+    assert!(
+        body.contains("local_rate_limited"),
+        "kind 必须是 local_rate_limited: {body}"
+    );
+    assert_eq!(a.count(), 0, "被拦时上游必须没被打到");
+    assert_eq!(breaches.lock().unwrap().len(), 1, "应回调一次 breach");
     handle.shutdown_and_wait().await;
 }

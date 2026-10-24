@@ -621,6 +621,10 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::model_price_list,
             commands::model_price_upsert,
             commands::model_price_delete,
+            // M46-S5：站点 / key 硬预算
+            commands::site_budget_list,
+            commands::site_budget_create,
+            commands::site_budget_delete,
             commands::site_bill_probe,
             commands::site_bill_import,
             commands::site_bills,

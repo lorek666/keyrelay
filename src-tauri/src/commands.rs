@@ -1543,6 +1543,101 @@ pub fn model_price_delete(state: State<'_, AppState>, id: i64) -> Result<bool, S
         .map_err(|e| e.to_string())
 }
 
+// ============================================ M46-S5：站点 / key 硬预算
+//
+// 校验全部在 store::budget_create（validate 先行）；命令层只做 DTO 映射与
+// 当期已花计算（任一失败 ⇒ 整条命令报错，与 usage_dashboard 同口径）。
+
+/// M46-S5：一行预算（`spent_usd` = 当期已花，命令层逐行算）。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteBudgetDto {
+    pub id: i64,
+    pub site_id: i64,
+    pub key_id: Option<i64>,
+    pub period: String,
+    pub limit_usd: f64,
+    pub created_at: i64,
+    pub spent_usd: f64,
+}
+
+/// M46-S5：新建预算的输入（`id` 由服务端生成；更新 = 删除 + 重建，不另设命令）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteBudgetInputDto {
+    pub site_id: i64,
+    pub key_id: Option<i64>,
+    pub period: String,
+    pub limit_usd: f64,
+}
+
+fn site_budget_to_dto(
+    row: &tianshu_relay_core::store::SiteBudgetRow,
+    spent_usd: f64,
+) -> SiteBudgetDto {
+    SiteBudgetDto {
+        id: row.id,
+        site_id: row.site_id,
+        key_id: row.key_id,
+        period: row.period.clone(),
+        limit_usd: row.limit_usd,
+        created_at: row.created_at,
+        spent_usd,
+    }
+}
+
+/// 全部预算行（含当期已花）。
+#[tauri::command]
+pub fn site_budget_list(state: State<'_, AppState>) -> Result<Vec<SiteBudgetDto>, String> {
+    let store = state.service.store();
+    let rows = store.budget_list().map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let spent = store
+            .budget_spent_usd(row.site_id, row.key_id, &row.period)
+            .map_err(|e| e.to_string())?;
+        out.push(site_budget_to_dto(row, spent));
+    }
+    Ok(out)
+}
+
+/// 新建一行预算（非法输入由 store 拒绝，不落库）。
+#[tauri::command]
+pub fn site_budget_create(
+    state: State<'_, AppState>,
+    budget: SiteBudgetInputDto,
+) -> Result<SiteBudgetDto, String> {
+    let store = state.service.store();
+    let id = store
+        .budget_create(
+            budget.site_id,
+            budget.key_id,
+            &budget.period,
+            budget.limit_usd,
+        )
+        .map_err(|e| e.to_string())?;
+    let row = store
+        .budget_list()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| "写入后读回预算行失败".to_string())?;
+    let spent = store
+        .budget_spent_usd(row.site_id, row.key_id, &row.period)
+        .map_err(|e| e.to_string())?;
+    Ok(site_budget_to_dto(&row, spent))
+}
+
+/// 删除一行预算（不存在 ⇒ false，与 model_price_delete 同口径）。
+#[tauri::command]
+pub fn site_budget_delete(state: State<'_, AppState>, id: i64) -> Result<bool, String> {
+    state
+        .service
+        .store()
+        .budget_delete(id)
+        .map_err(|e| e.to_string())
+}
+
 /// 只读探测站点账单能力（一次 GET，不写库）。
 #[tauri::command]
 pub async fn site_bill_probe(

@@ -15,6 +15,7 @@ import {
 } from "../lib/usageCost";
 import { formatTokens } from "../lib/usageAgg";
 import ModelPricesCard from "../components/ModelPricesCard";
+import BudgetsCard from "../components/BudgetsCard";
 import { useTranslation } from "../i18n";
 
 /**
@@ -304,6 +305,7 @@ export default function Cost() {
       </div>
 
       <ModelPricesCard />
+      <BudgetsCard />
     </section>
   );
 }

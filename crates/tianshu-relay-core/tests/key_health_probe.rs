@@ -61,6 +61,8 @@ fn config() -> GatewayConfig {
         runtime: None,
         on_failure: None,
         on_usage: None,
+        budget_check: None,
+        on_budget_breach: None,
         max_request_bytes: gateway::DEFAULT_MAX_REQUEST_BYTES,
     }
 }
