@@ -121,6 +121,8 @@ fn routed_config(
         runtime: None,
         on_failure: None,
         on_usage: None,
+        budget_check: None,
+        on_budget_breach: None,
     }
 }
 

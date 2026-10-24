@@ -3109,3 +3109,96 @@ fn m43s2_price_and_bill_commands_are_registered_with_camel_case_dtos() {
         json!([])
     );
 }
+
+/// M46-S5：硬预算命令在 IPC 层可用（注册 + ACL + camelCase DTO + validate 拒写）。
+#[test]
+fn m46s5_site_budget_commands_round_trip_and_reject_bad_input() {
+    let (_app, webview) = build_app();
+    let invoke_on_app = |cmd: &str, args: Value| invoke_on(&webview, cmd, args);
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
+    let store = state.service.store();
+
+    let empty = invoke_on_app("site_budget_list", json!({})).expect("site_budget_list 应成功");
+    assert_eq!(empty, json!([]), "空库应返回空数组");
+
+    // 非法输入先行：站点不存在、周期非法、上限非正，全部被拒且不落库。
+    assert!(
+        invoke_on_app(
+            "site_budget_create",
+            json!({ "budget": { "siteId": 9999, "keyId": null, "period": "day", "limitUsd": 10.0 } }),
+        )
+        .is_err(),
+        "不存在的站点应被拒"
+    );
+    assert!(
+        invoke_on_app(
+            "site_budget_create",
+            json!({ "budget": { "siteId": 1, "keyId": null, "period": "week", "limitUsd": 10.0 } }),
+        )
+        .is_err(),
+        "非法周期应被拒"
+    );
+    assert!(
+        invoke_on_app(
+            "site_budget_create",
+            json!({ "budget": { "siteId": 1, "keyId": null, "period": "day", "limitUsd": 0.0 } }),
+        )
+        .is_err(),
+        "上限 0 应被拒"
+    );
+    assert_eq!(
+        invoke_on_app("site_budget_list", json!({})).expect("列"),
+        json!([]),
+        "拒写后表仍为空"
+    );
+
+    let site = store
+        .upsert_site("newapi", "https://relay.example.com", "预算测试站")
+        .expect("写站点");
+    let created = invoke_on_app(
+        "site_budget_create",
+        json!({ "budget": { "siteId": site, "keyId": null, "period": "month", "limitUsd": 25.5 } }),
+    )
+    .expect("site_budget_create 应成功");
+    for key in [
+        "id",
+        "siteId",
+        "keyId",
+        "period",
+        "limitUsd",
+        "createdAt",
+        "spentUsd",
+    ] {
+        assert!(created.get(key).is_some(), "缺字段 {key}: {created}");
+    }
+    assert!(created.get("limit_usd").is_none(), "线上键必须 camelCase");
+    assert_eq!(created["siteId"], site);
+    assert_eq!(created["keyId"], Value::Null);
+    assert_eq!(created["spentUsd"], 0.0, "新预算当期已花为 0");
+    let id = created["id"].as_i64().expect("id");
+
+    // 重复行被拒（同站同周期站级行只能有一行）。
+    assert!(
+        invoke_on_app(
+            "site_budget_create",
+            json!({ "budget": { "siteId": site, "keyId": null, "period": "month", "limitUsd": 30.0 } }),
+        )
+        .is_err(),
+        "重复预算行应被拒"
+    );
+
+    let after = invoke_on_app("site_budget_list", json!({})).expect("再列一次");
+    assert_eq!(after.as_array().map(|a| a.len()), Some(1));
+    assert_eq!(
+        invoke_on_app("site_budget_delete", json!({ "id": 9999 })).expect("删不存在"),
+        json!(false)
+    );
+    assert_eq!(
+        invoke_on_app("site_budget_delete", json!({ "id": id })).expect("删除"),
+        json!(true)
+    );
+    assert_eq!(
+        invoke_on_app("site_budget_list", json!({})).expect("列"),
+        json!([])
+    );
+}

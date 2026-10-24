@@ -1530,6 +1530,40 @@ export async function modelPriceDelete(id: number): Promise<boolean> {
   return invokeCommand<boolean>("model_price_delete", { id });
 }
 
+/** M46-S5：一行硬预算（`spentUsd` = 当期已花，后端逐行算）。 */
+export type SiteBudget = {
+  id: number;
+  siteId: number;
+  keyId: number | null;
+  period: string;
+  limitUsd: number;
+  createdAt: number;
+  spentUsd: number;
+};
+
+/** M46-S5：新建预算的输入（更新 = 删除 + 重建，不另设命令）。 */
+export type SiteBudgetInput = {
+  siteId: number;
+  keyId: number | null;
+  period: string;
+  limitUsd: number;
+};
+
+export async function siteBudgetList(): Promise<SiteBudget[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<SiteBudget[]>("site_budget_list");
+}
+
+export async function siteBudgetCreate(budget: SiteBudgetInput): Promise<SiteBudget> {
+  if (!hasTauri) return mock({ ...budget, id: 1, createdAt: 0, spentUsd: 0 });
+  return invokeCommand<SiteBudget>("site_budget_create", { budget });
+}
+
+export async function siteBudgetDelete(id: number): Promise<boolean> {
+  if (!hasTauri) return mock(true);
+  return invokeCommand<boolean>("site_budget_delete", { id });
+}
+
 export async function siteBillProbe(siteId: number): Promise<BillProbe> {
   if (!hasTauri) return mock({ status: "unsupported", currency: null, reason: null });
   return invokeCommand<BillProbe>("site_bill_probe", { siteId });

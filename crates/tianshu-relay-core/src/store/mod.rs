@@ -288,6 +288,27 @@ CREATE TABLE IF NOT EXISTS site_bills(
   UNIQUE(site_id, day, source)
 );
 CREATE INDEX IF NOT EXISTS idx_site_bills_site_day ON site_bills(site_id, day DESC);
+-- M46-S5：站点 / key 硬预算（一行 = 一个预算）。
+-- key_id 为空 = 该站全部 key 合计；有值 = 该 key 单独的预算。
+-- period 只认 'day' | 'month'（写路径 validate，不靠 CHECK 约束兜底）。
+-- 站级与 key 级各一条部分唯一索引：SQLite 里 NULL 互不相等，一条
+-- UNIQUE(site_id, key_id, period) 拦不住站级重复行，必须分开写。
+CREATE TABLE IF NOT EXISTS site_budgets(
+  id INTEGER PRIMARY KEY,
+  site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  key_id INTEGER REFERENCES keys(id) ON DELETE CASCADE,
+  period TEXT NOT NULL,
+  limit_usd REAL NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_site_budgets_site_period
+  ON site_budgets(site_id, period) WHERE key_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_site_budgets_key_period
+  ON site_budgets(site_id, key_id, period) WHERE key_id IS NOT NULL;
+-- M46-S5：预算已花 SUM 的范围扫描索引不在这里（见 migrate）：预算查询按
+-- (site_id, at) / (key_id, at) 过滤，而老库在 DDL 阶段还没有 at / key_id 列
+-- （M40-S1 才补），放进 DDL 批会在老库上报 no such column（与 idx_gateway_usage_at
+-- 同一个坑），故与它并排、在补列之后建。
 "#;
 
 fn now_secs() -> i64 {
@@ -629,6 +650,19 @@ pub struct ModelPriceRow {
     /// `"USD"` | `"CNY"`
     pub currency: String,
     pub effective_from: i64,
+    pub created_at: i64,
+}
+
+/// M46-S5：一行站点 / key 硬预算（`site_budgets` 表的一行）。
+/// `key_id` 为 `None` = 该站全部 key 合计；有值 = 该 key 单独的预算。
+/// `period` 只认 `"day"` | `"month"`（写路径 validate，见 `budget_create`）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct SiteBudgetRow {
+    pub id: i64,
+    pub site_id: i64,
+    pub key_id: Option<i64>,
+    pub period: String,
+    pub limit_usd: f64,
     pub created_at: i64,
 }
 
@@ -1056,6 +1090,19 @@ impl Store {
             [],
         )
         .map_err(|e| Error::Store(format!("建 gateway_usage_at 索引失败: {e}")))?;
+        // M46-S5：预算已花 SUM 的范围扫描索引。必须在 at / key_id 列补齐之后建
+        // （见 DDL 末尾注释）：老库的 DDL 阶段还没有这两列，放进 DDL 批会直接
+        // 让 migrate 在老库上失败（schema_v8 迁移测试即为此回归的哨兵）。
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gateway_usage_budget_site ON gateway_usage_log(site_id, at)",
+            [],
+        )
+        .map_err(|e| Error::Store(format!("建 gateway_usage_budget_site 索引失败: {e}")))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gateway_usage_budget_key ON gateway_usage_log(key_id, at)",
+            [],
+        )
+        .map_err(|e| Error::Store(format!("建 gateway_usage_budget_key 索引失败: {e}")))?;
         if version < 8 {
             // 一次性回填：旧行的 at 取 ts（**近似，不是观测**——当时没记完成时刻）。
             // 不回填成 0：否则看板会把旧账显示成 1970。
@@ -2595,6 +2642,163 @@ impl Store {
             .execute("DELETE FROM model_prices WHERE id = ?1", params![id])
             .map_err(|e| Error::Store(format!("删除模型单价失败: {e}")))?;
         Ok(affected > 0)
+    }
+
+    // ======================================================== M46-S5：站点 / key 硬预算
+    //
+    // 花销口径（spec §2）：主口径 = gateway_usage_log token 数 × model_prices
+    // USD 价格行，SQL 表达式与 usage_daily 的 USD 分组逐字同构（行级最新价版本、
+    // 每百万 token 单价、每行 ROUND 6 位后求和再 ROUND 6 位）。usage_samples
+    // 不用：只有 Sub2API 系写、cost 有「上报与否」问题、无币种列、日粒度快照。
+
+    /// 校验预算 period（store 层只认这两个值；网关侧枚举见 gateway::BudgetPeriod）。
+    fn validate_budget_period(period: &str) -> Result<()> {
+        if period != "day" && period != "month" {
+            return Err(Error::Store(format!(
+                "预算周期非法: {period}（只认 day / month）"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 建预算（validate 先行：周期枚举、上限有限且 > 0、站点存在、key 存在且属该站、
+    /// 重复 (site, key, period) 拒绝——唯一索引兜底，错误文案友好化，不抛 SQLite 原文）。
+    pub fn budget_create(
+        &self,
+        site_id: i64,
+        key_id: Option<i64>,
+        period: &str,
+        limit_usd: f64,
+    ) -> Result<i64> {
+        Self::validate_budget_period(period)?;
+        if !limit_usd.is_finite() || limit_usd <= 0.0 {
+            return Err(Error::Store(format!(
+                "预算上限非法: {limit_usd}（必须为有限正数）"
+            )));
+        }
+        if !self.list_sites()?.iter().any(|s| s.id == site_id) {
+            return Err(Error::Store(format!("预算站点不存在: {site_id}")));
+        }
+        if let Some(kid) = key_id {
+            match self.list_keys()?.iter().find(|k| k.id == kid) {
+                None => return Err(Error::Store(format!("预算密钥不存在: {kid}"))),
+                Some(row) if row.site_id != site_id => {
+                    return Err(Error::Store(format!("预算密钥 {kid} 不属于站点 {site_id}")));
+                }
+                _ => {}
+            }
+        }
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO site_budgets(site_id, key_id, period, limit_usd, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![site_id, key_id, period, limit_usd, now_secs()],
+        )
+        .map_err(|e| {
+            Error::Store(format!(
+                "该站点/密钥该周期已有预算（同一站同一周期只能有一行站级预算、同一 key 只能有一行 key 级预算）: {e}"
+            ))
+        })?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 全部预算行（按 id 升序；展示层按需再排）。
+    pub fn budget_list(&self) -> Result<Vec<SiteBudgetRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, site_id, key_id, period, limit_usd, created_at
+                 FROM site_budgets ORDER BY id ASC",
+            )
+            .map_err(|e| Error::Store(format!("prepare budget list: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SiteBudgetRow {
+                    id: row.get(0)?,
+                    site_id: row.get(1)?,
+                    key_id: row.get(2)?,
+                    period: row.get(3)?,
+                    limit_usd: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("query budget list: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect budget list: {e}")))
+    }
+
+    /// 删除预算行。不存在 -> Ok(false)，与 model_price_delete 同口径。
+    pub fn budget_delete(&self, id: i64) -> Result<bool> {
+        let conn = self.lock()?;
+        let affected = conn
+            .execute("DELETE FROM site_budgets WHERE id = ?1", params![id])
+            .map_err(|e| Error::Store(format!("删除预算失败: {e}")))?;
+        Ok(affected > 0)
+    }
+
+    /// 周期窗口（本地时区，unix 秒，左闭右开）。
+    ///
+    /// 与 `local_day_start` 同一条纪律：`date(...)` 给出本地日期串，SQLite 默认按
+    /// UTC 解释，`'utc'` 修饰符不能省；month 用 `'start of month','+1 month'`，
+    /// 不用起点 + 86400（夏令时切换日不是 86400 秒）。
+    pub fn budget_period_bounds(&self, period: &str) -> Result<(i64, i64)> {
+        Self::validate_budget_period(period)?;
+        let conn = self.lock()?;
+        let (start_sql, end_sql) = match period {
+            "day" => (
+                "strftime('%s', date('now','localtime'), 'utc')",
+                "strftime('%s', date('now','localtime','+1 day'), 'utc')",
+            ),
+            _ => (
+                "strftime('%s', date('now','localtime','start of month'), 'utc')",
+                "strftime('%s', date('now','localtime','start of month','+1 month'), 'utc')",
+            ),
+        };
+        conn.query_row(
+            &format!("SELECT CAST({start_sql} AS INTEGER), CAST({end_sql} AS INTEGER)"),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| Error::Store(format!("计算预算周期窗口失败: {e}")))
+    }
+
+    /// 当期已花（USD）。
+    ///
+    /// SQL 与 `usage_daily` 的 USD 分组逐字同构：行级关联「不晚于该行 at 的最新
+    /// USD 价格版本」，无价行 / CNY 价行因 INNER JOIN + currency='USD' 自然不计入
+    /// （已知漏口，见 spec §2.4，不静默换算）。`key_id` 为空的 legacy 行计入站级
+    /// 已花（属于该站），key 级查询因 `u.key_id = ?` 自然排除它们（无法归因）。
+    pub fn budget_spent_usd(&self, site_id: i64, key_id: Option<i64>, period: &str) -> Result<f64> {
+        let (start, end) = self.budget_period_bounds(period)?;
+        let conn = self.lock()?;
+        let mut sql = "SELECT COALESCE(ROUND(SUM(ROUND(
+                u.prompt_tokens / 1000000.0 * p.input_per_mtok
+              + u.completion_tokens / 1000000.0 * p.output_per_mtok, 6)), 6), 0)
+             FROM gateway_usage_log u
+             JOIN model_prices p
+               ON p.model = u.model AND p.currency = 'USD'
+              AND p.effective_from = (
+                    SELECT MAX(q.effective_from) FROM model_prices q
+                     WHERE q.model = u.model AND q.currency = 'USD'
+                       AND q.effective_from <= u.at
+                  )
+             WHERE u.at >= ?1 AND u.at < ?2 AND u.site_id = ?3"
+            .to_string();
+        if key_id.is_some() {
+            sql.push_str(" AND u.key_id = ?4");
+        }
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Store(format!("prepare budget spent: {e}")))?;
+        let spent: f64 = match key_id {
+            Some(kid) => stmt
+                .query_row(params![start, end, site_id, kid], |row| row.get(0))
+                .map_err(|e| Error::Store(format!("query budget spent: {e}")))?,
+            None => stmt
+                .query_row(params![start, end, site_id], |row| row.get(0))
+                .map_err(|e| Error::Store(format!("query budget spent: {e}")))?,
+        };
+        Ok(spent)
     }
 
     // ======================================================== M43-S2：站点账单
@@ -4615,6 +4819,8 @@ mod tests {
             let conn = store.lock().unwrap();
             conn.execute_batch(
                 "DROP INDEX IF EXISTS idx_gateway_usage_at;
+                 DROP INDEX IF EXISTS idx_gateway_usage_budget_site;
+                 DROP INDEX IF EXISTS idx_gateway_usage_budget_key;
                  ALTER TABLE gateway_usage_log DROP COLUMN at;
                  ALTER TABLE gateway_usage_log DROP COLUMN key_id;
                  ALTER TABLE gateway_usage_log DROP COLUMN status;

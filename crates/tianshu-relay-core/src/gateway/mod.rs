@@ -586,6 +586,15 @@ pub struct GatewayConfig {
     ///
     /// 与 `on_failure` 同形（注入出口），理由相同：网关不碰存储层。
     pub on_observation: Option<Arc<dyn Fn(UpstreamObservation) + Send + Sync>>,
+    /// M46-S5：预算判定注入出口。`None` = 不拦（`single_upstream` 默认 ⇒ 既有行为不变）。
+    ///
+    /// 签名刻意只有 `(site_id, key_id)`：网关不把 store 类型推进请求路径，判定逻辑
+    /// 活在 service 侧闭包里（读 `site_budgets` + 算已花）；网关只认返回的 breach。
+    /// 闭包返回 `None` = 未超标（含「查询出错时 fail-open」，见 spec §4.2）。
+    pub budget_check: Option<BudgetCheck>,
+    /// M46-S5：超预算回调注入出口。网关只在循环里首次遇到某 breach 时调一次
+    /// （同一请求内同一 breach 去重，见代理循环）；`None` = 不回调。
+    pub on_budget_breach: Option<BudgetBreachSink>,
     /// 上游客户端走的代理（M10-S2）。`None` = 直连。
     ///
     /// 由 `service::gateway_config` 从 settings 解析后填入（与站点适配器 transport 同一份
@@ -741,6 +750,49 @@ pub struct GatewayUsage {
 /// （`store/mod.rs:706-721` 直接 `params![event.payload]`，不做任何脱敏）。
 /// 「由出口负责」这个假设会让密钥形状的自由文本进事件表、再随导出与审计外流——
 /// 与 B-75 是同一类咽喉。
+/// M46-S5：预算周期（网关侧词汇；store 层只认同名字符串，见 store::budget_create）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum BudgetPeriod {
+    Day,
+    Month,
+}
+
+impl BudgetPeriod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetPeriod::Day => "day",
+            BudgetPeriod::Month => "month",
+        }
+    }
+
+    /// 解析周期名（`from_str` 之名会撞标准 trait 方法，clippy 会告警，故用 `parse`）。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "day" => Some(BudgetPeriod::Day),
+            "month" => Some(BudgetPeriod::Month),
+            _ => None,
+        }
+    }
+}
+
+/// M46-S5：预算判定注入出口的类型（字段类型过长会触发 clippy type_complexity，
+/// 故抽别名；`on_failure` 等回调同理只是本身较短）。
+pub type BudgetCheck = Arc<dyn Fn(i64, Option<i64>) -> Option<BudgetBreach> + Send + Sync>;
+/// M46-S5：超标回调注入出口的类型（同上，抽别名）。
+pub type BudgetBreachSink = Arc<dyn Fn(BudgetBreach) + Send + Sync>;
+
+/// M46-S5：一次预算超标事实（service 侧 `budget_check` 闭包构造，网关只认它）。
+/// 不含任何密钥 / base_url / webhook 地址，可直接进事件与通知 payload。
+#[derive(Clone, Debug, PartialEq)]
+pub struct BudgetBreach {
+    pub site_id: i64,
+    /// 预算行的 key：`None` = 站级预算行超标；`Some(id)` = 该 key 的预算行超标。
+    pub key_id: Option<i64>,
+    pub period: BudgetPeriod,
+    pub spent_usd: f64,
+    pub limit_usd: f64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewayFailure {
     pub site_id: i64,
@@ -805,6 +857,10 @@ impl GatewayConfig {
             revoked_refs: None,
             on_observation: None,
             on_usage: None,
+            // M46-S5：默认不拦、不回调（single_upstream 的调用方行为逐字不变；
+            // 服务层的 gateway_config 在构造完再赋值）。
+            budget_check: None,
+            on_budget_breach: None,
             upstream_proxy: None,
             // P3-4：构造器不知道引用（签名逐字不变，M7-S0 §3.1 冻结）。
             // `None` ⇒ legacy 路径的已回收守卫不生效，行为与改动前逐字相同；
@@ -2374,6 +2430,25 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     let ewma = state.metrics.ewma_latency_map();
     let sendable = reorder_by_effective_latency(sendable, &|site_id| ewma.get(&site_id).copied());
 
+    // M46-S5：请求级预算拦截表。sendable 里去重后的 (site_id, key_id) 对各查一次
+    // budget_check，命中即记入映射（循环内按它跳过候选）。
+    // 不在 eligible 阶段过滤：eligible 为空走的是熔断 503 尾巴，预算拦光不得报成熔断。
+    let mut budget_blocked: std::collections::HashMap<(i64, Option<i64>), BudgetBreach> =
+        std::collections::HashMap::new();
+    if let Some(check) = &state.config.budget_check {
+        for c in &sendable {
+            let pair = (c.upstream.site_id, c.upstream.key_id);
+            if let std::collections::hash_map::Entry::Vacant(entry) = budget_blocked.entry(pair) {
+                if let Some(breach) = check(pair.0, pair.1) {
+                    entry.insert(breach);
+                }
+            }
+        }
+    }
+    // 同一请求内同一 breach 的回调去重集合（循环内首次遇到时才回调）。
+    let mut budget_breach_fired: std::collections::HashSet<(i64, Option<i64>, BudgetPeriod)> =
+        std::collections::HashSet::new();
+
     // M39-S3 §4.1：加权轮转只决定**第一个**尝试谁；失败切换仍按确定性顺序走其余候选。
     // 单候选 / 有探针时不读计数器（`weighted_pick` 内部保证）。
     let top_n = state.config.lb_top_n;
@@ -2402,6 +2477,8 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     let mut attempts_made = 0usize;
     // M39-S3 §4.5：本次请求里「被本地保护跳过」的候选数（与上游故障分开计）。
     let mut local_rejected = 0usize;
+    // M46-S5：其中「因预算被拦」的候选数（全拦时文案区分用；kind 始终不变）。
+    let mut budget_rejected = 0usize;
     // M39-S3（Lead P2）：先记下「可重放的真实响应」（目前只有 429）。若它之后的候选
     // 全被本地保护跳过，也要把它原样返回——不能把上游真的回过的 429 变成 502。
     // 元组里带着 lease：body 还没被读，站点并发要等这条响应真正结束才归还。
@@ -2439,6 +2516,23 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         let Some(key) = view.keys().get(&upstream.key_ref) else {
             continue;
         };
+        // M46-S5：预算拦截——本地拒绝的一种，但刻意与 guard 拒绝不同：
+        // 不 record_failover（预算是策略拦停，不是失败切换）、不喂熔断、不写
+        // GatewayFailure；continue 发生在 attempts_made 递增之前，故不占 M46-S4
+        // 重试预算。回调只在同一请求内首次遇到该 breach 时发一次。
+        if let Some(breach) = budget_blocked.get(&(upstream.site_id, upstream.key_id)) {
+            state
+                .local_rejects
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            local_rejected += 1;
+            budget_rejected += 1;
+            if budget_breach_fired.insert((breach.site_id, breach.key_id, breach.period)) {
+                if let Some(sink) = &state.config.on_budget_breach {
+                    sink(breach.clone());
+                }
+            }
+            continue;
+        }
         // M39-S3 §4.2 / §4.5：**本地保护在发请求之前**——`try_admit` 绝不等待，
         // 拿不到就切下一个候选。**本地拒绝不是上游故障**：不调 `report_failure`、
         // 不喂熔断、不写 `GatewayFailure`（否则一个本机限流就能把好站点熔断）。
@@ -2625,11 +2719,18 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     // 这里没有任何上游出过错：本地并发/限流拒绝不写事件、不喂熔断，
     // 客户端据 `kind == "local_rate_limited"` 就能把「本机限流」与「上游 429」分开。
     if local_rejected > 0 && local_rejected == order_len {
+        // M46-S5：全是预算拦时文案点名预算（kind 始终是 local_rate_limited，
+        // 客户端据 kind 分流，不据文案）；混拦时保持既有通用文案。
+        let message = if budget_rejected == order_len {
+            "本地保护：预算已超支"
+        } else {
+            "本地保护：所有候选均被限流"
+        };
         return local_error(
             StatusCode::TOO_MANY_REQUESTS,
             GatewayErrorKind::RateLimit,
             "local_rate_limited",
-            "本地保护：所有候选均被限流",
+            message,
         );
     }
 
@@ -2816,6 +2917,21 @@ async fn forward_to(
     // 现与多上游路径同口径：发请求前 `try_admit`，拿不到即 429（不发上游、
     // 不喂熔断）；拿到的 lease 随响应 body 生命周期归还（流式泵内 `_lease`）。
     // 默认策略（8 并发、不限速）下对既有单上游部署的影响仅是 8 并发上限。
+    // M46-S5：legacy 单上游预算拦截（无循环、无尾巴可复用，直接 429；
+    // 不发上游、不喂熔断；回调语义与多上游路径相同）。
+    if let Some(check) = &state.config.budget_check {
+        if let Some(breach) = check(state.config.site_id, state.config.key_id) {
+            if let Some(sink) = &state.config.on_budget_breach {
+                sink(breach);
+            }
+            return local_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                GatewayErrorKind::RateLimit,
+                "local_rate_limited",
+                "本地保护：预算已超支",
+            );
+        }
+    }
     let lease: Option<SiteLease> = match site_guard(state, state.config.site_id)
         .map(|guard| guard.try_admit(Instant::now()))
     {

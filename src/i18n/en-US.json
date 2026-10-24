@@ -45,6 +45,23 @@
       "partial": "{count} more unpriced",
       "allUnpriced": "All {count} unpriced"
     },
+    "budgets": {
+      "title": "Hard budgets (stop when exceeded)",
+      "body": "When period spend reaches the limit, the gateway blocks that site / key's candidates (429 local rejection); the next period recovers automatically. Only USD-priced usage counts; unpriced and CNY-priced usage is excluded.",
+      "site": "Site",
+      "sitePlaceholder": "Pick a site",
+      "key": "Key",
+      "keyAll": "All keys (site total)",
+      "period": "Period",
+      "periodDay": "Daily",
+      "periodMonth": "Monthly",
+      "limit": "Limit (USD)",
+      "spent": "Spent this period",
+      "save": "Save",
+      "delete": "Delete",
+      "empty": "No budgets yet.",
+      "note": "Exceeded means blocked, no warning tiers; create and delete take effect immediately, no gateway restart needed."
+    },
     "agents": {
       "title": "Cost by agent",
       "note": "Attributed by gateway token label (snapshot at auth time). Empty labels are pre-attribution data.",

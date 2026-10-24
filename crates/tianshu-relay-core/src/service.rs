@@ -785,7 +785,10 @@ pub struct TianshuRelayService<T: HttpTransport + Clone + 'static> {
     /// 投递路径是同步的（不能 `.await`），所以「异步预热 → 同步读快照」两步走：
     /// `warm_model_meta` 填这份缓存，`meta_for` 在 `prepare_delivery` 里读。
     meta_cache: crate::model_meta::OnlineMetaCache,
-    store: Store,
+    /// M46-S5：`Arc` 包裹是预算接线的最小改动——`gateway_config` 要给网关一个
+    /// `'static` 的 `budget_check` 闭包，闭包必须自持 store；按值持有派生不出
+    /// `'static` 引用。调用点零改动（`Arc` 的 Deref 让 `self.store.foo()` 照常编译）。
+    store: std::sync::Arc<Store>,
     sessions: SessionCache,
     vault: Arc<dyn Vault>,
     home: PathBuf,
@@ -816,6 +819,17 @@ pub struct TianshuRelayService<T: HttpTransport + Clone + 'static> {
     /// M13-S1：网关 token 用量的内存缓冲（与  同形）。
     /// 回调里只 push，在  时落库——网关回调不该做 IO。
     gateway_usage_buffer: Arc<std::sync::Mutex<Vec<crate::gateway::GatewayUsage>>>,
+    /// M46-S5：网关预算超标的内存缓冲（与 gateway_failures 同形）。
+    /// 回调里只 push，在 refresh_all 的 drain_budget_breaches 里写事件 + 通知
+    /// ——网关回调不该做 IO、不该发网络请求（通知配置活在 service 侧）。
+    budget_breaches: BudgetBreachQueue,
+    /// M46-S5：预算缓冲满丢弃计数（与 gateway_failures_dropped 同口径）。
+    budget_breaches_dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// M46-S5：已通知过的预算键集合（节流：每周期只通知一次）。
+    /// 键 = (site_id, 预算行 key_id, period, 周期起点 epoch)；drain 时清扫 32 天前的旧键。
+    /// 只活在内存：服务重启后首 breach 会再通知一次（与既有通知重启行为同口径）。
+    budget_notified: BudgetNotifiedKeys,
+
     /// M13-S1：网关用量缓冲满时丢弃的计数（与 `gateway_failures_dropped` 同口径）。
     gateway_usage_dropped: Arc<std::sync::atomic::AtomicU64>,
     /// 网关**会话**代号（M8-S1 §11.1）。每次 `gateway_config` 递增一次，
@@ -897,6 +911,14 @@ struct SiteObservations {
 /// 网关失败的内存缓冲上限。见 [`TianshuRelayService::gateway_failures`] 的说明。
 pub const MAX_BUFFERED_GATEWAY_FAILURES: usize = 256;
 
+/// M46-S5：预算超标缓冲的类型（字段类型过长会触发 clippy type_complexity，故抽别名）。
+type BudgetBreachQueue =
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<crate::gateway::BudgetBreach>>>;
+
+/// M46-S5：已通知预算键集合的类型（同上，抽别名）。
+type BudgetNotifiedKeys =
+    std::sync::Mutex<std::collections::HashSet<(i64, Option<i64>, String, i64)>>;
+
 /// 一轮刷新里**同时在途**的站点数上限（M8-S3 §3.4 异议 O-1 的裁决 ①）。
 ///
 /// 取 4 的理由：
@@ -957,6 +979,52 @@ struct NotifyState {
     last: std::sync::Mutex<Option<crate::notify::Snapshot>>,
 }
 
+/// M46-S5：查 (site_id, key_id) 是否命中超标预算。
+///
+/// 闭包与测试共用同一条判定（判定逻辑不在闭包里展开）：适用行是该站的站级行
+/// 以及该 key 的 key 级行；每行 spent 是当期已花；`spent >= limit` 即 breach；
+/// key 级行优先返回（事件归因更具体），否则站级行；均未超则返回 None。
+/// store 查询出错则返回 Err（调用方闭包据此 fail-open，见 spec §4.2）。
+pub fn budget_breach_for(
+    store: &Store,
+    site_id: i64,
+    key_id: Option<i64>,
+) -> Result<Option<crate::gateway::BudgetBreach>> {
+    let mut site_breach: Option<crate::gateway::BudgetBreach> = None;
+    for row in store.budget_list()? {
+        if row.site_id != site_id {
+            continue;
+        }
+        // 适用性：站级行恒适用；key 级行只对该 key 的请求适用。
+        let is_key_row = match (row.key_id, key_id) {
+            (None, _) => false,
+            (Some(budget_key), Some(request_key)) => budget_key == request_key,
+            (Some(_), None) => continue,
+        };
+        let Some(period) = crate::gateway::BudgetPeriod::parse(&row.period) else {
+            continue; // 建行时已校验，库里非法 period 只可能是外部改库：跳过该行不拦
+        };
+        let spent = store.budget_spent_usd(row.site_id, row.key_id, &row.period)?;
+        if spent < row.limit_usd {
+            continue;
+        }
+        let breach = crate::gateway::BudgetBreach {
+            site_id: row.site_id,
+            key_id: row.key_id,
+            period,
+            spent_usd: spent,
+            limit_usd: row.limit_usd,
+        };
+        if is_key_row {
+            return Ok(Some(breach));
+        }
+        if site_breach.is_none() {
+            site_breach = Some(breach);
+        }
+    }
+    Ok(site_breach)
+}
+
 impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     pub fn new(store: Store, transport: T, config: ServiceConfig) -> Self {
         let svc = Self {
@@ -973,7 +1041,8 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             meta_transport: None,
             // 默认空缓存：冷缓存 ⇒ 同步读拿不到在线参数（不联网），语义与「没查到」一致。
             meta_cache: crate::model_meta::OnlineMetaCache::new(),
-            store,
+            // M46-S5：包一层 Arc（见 store 字段注释）；调用点靠 Deref 不动。
+            store: std::sync::Arc::new(store),
             sessions: SessionCache::new(),
             vault: config.vault,
             home: config.home,
@@ -982,6 +1051,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             notify: None,
             gateway_failures: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             gateway_failures_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            budget_breaches: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            budget_breaches_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            budget_notified: std::sync::Mutex::new(std::collections::HashSet::new()),
             gateway_usage_buffer: Arc::new(std::sync::Mutex::new(Vec::new())),
             gateway_usage_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gateway_session: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2528,6 +2600,8 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         // 早于本轮的余额/漂移事件出现，读起来是因果顺序。
         self.drain_gateway_failures();
         self.drain_gateway_usage();
+        // M46-S5：预算超标 drain（用量落库之后：事件里的已花口径与库内账一致）。
+        self.drain_budget_breaches();
         // M13-S1：裁剪用量日志，保留最近 90 天（P2-2）。
         let _ = self.store.prune_gateway_usage_log(90);
         let _ = self.store.prune_usage_snapshots(90);
@@ -2795,69 +2869,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let items = crate::notify::evaluate(Some(&baseline), &snapshot, &state.config, now);
 
         for item in &items {
-            self.log(observability::event_with_payload(
-                Level::Info,
-                "app",
-                format!("通知: {}", item.title),
-                serde_json::json!({
-                    "kind": format!("{:?}", item.kind),
-                    "site_id": item.site_id,
-                }),
-            ));
-
-            let mut failures: Vec<String> = Vec::new();
-            // `send` 是 `Notifier` trait 上的方法，必须把 trait 带进作用域才能调用。
-            use crate::notify::Notifier as _;
-            if state.config.system_enabled {
-                let notifier =
-                    crate::notify::SystemNotifier::new(Box::new(crate::notify::StdCommandRunner));
-                if let Err(err) = notifier.send(item) {
-                    failures.push(format!("系统通知: {err}"));
-                }
-            }
-            let has_webhook = state
-                .config
-                .webhook_url
-                .as_deref()
-                .is_some_and(|url| !url.trim().is_empty());
-            if has_webhook {
-                let notifier = crate::notify::WebhookNotifier::new(
-                    state.config.clone(),
-                    self.resolved_upstream_proxy(),
-                );
-                if let Err(err) = notifier.send(item) {
-                    // B-179：按 err 变体分流前缀。`Error::Store` 是配置非法（如零超时守卫），
-                    // 不是发送失败——读事件表的人据此不会去查网络。其他变体（IO / 超时 / 认证）
-                    // 仍是「webhook」前缀。
-                    let label = match &err {
-                        crate::error::Error::Store(_) => "webhook 配置非法",
-                        _ => "webhook",
-                    };
-                    failures.push(format!("{label}: {err}"));
-                }
-            }
-            if !failures.is_empty() {
-                // B-179：标题按 failures 内容分流。有「配置非法」前缀 ⇒ 标题也用「通知配置非法」，
-                // 否则「通知发送失败」。子串匹配够用：当前只有 webhook 零超时守卫用这个词；
-                // 复审要点是「将来新增含『配置非法』的 failure 文案时这条匹配是否仍准」。
-                let has_config_err = failures.iter().any(|f| f.contains("配置非法"));
-                let title = if has_config_err {
-                    "通知配置非法"
-                } else {
-                    "通知发送失败"
-                };
-                self.log(observability::event_with_payload(
-                    Level::Warn,
-                    "app",
-                    format!("{title}: {}", failures.join(" | ")),
-                    serde_json::json!({
-                        "kind": format!("{:?}", item.kind),
-                        "webhook": crate::redact::mask_webhook_url(
-                            state.config.webhook_url.as_deref().unwrap_or("")
-                        ),
-                    }),
-                ));
-            }
+            self.send_notification(item);
         }
 
         if let Ok(mut guard) = state.last.lock() {
@@ -2865,6 +2877,80 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         }
         // B-81：把本轮快照落库当下一轮的基线（进程重启后仍可用）。
         self.persist_notify_baseline(&snapshot, now);
+    }
+
+    /// M46-S5：发送一条通知（系统通知 + webhook + 失败事件）。
+    ///
+    /// 从 dispatch_notifications 循环里原样抽出，与预算 drain 共用——抽 helper 是
+    /// 复用，不是重做规则引擎：规则评估（evaluate）仍只在 dispatch 里跑，预算
+    /// breach 不经过 evaluate（见 spec §4.3）。notify 未接时直接返回（drain 路径用）。
+    fn send_notification(&self, item: &crate::notify::Notification) {
+        let Some(state) = &self.notify else {
+            return;
+        };
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "app",
+            format!("通知: {}", item.title),
+            serde_json::json!({
+                "kind": format!("{:?}", item.kind),
+                "site_id": item.site_id,
+            }),
+        ));
+
+        let mut failures: Vec<String> = Vec::new();
+        // `send` 是 `Notifier` trait 上的方法，必须把 trait 带进作用域才能调用。
+        use crate::notify::Notifier as _;
+        if state.config.system_enabled {
+            let notifier =
+                crate::notify::SystemNotifier::new(Box::new(crate::notify::StdCommandRunner));
+            if let Err(err) = notifier.send(item) {
+                failures.push(format!("系统通知: {err}"));
+            }
+        }
+        let has_webhook = state
+            .config
+            .webhook_url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty());
+        if has_webhook {
+            let notifier = crate::notify::WebhookNotifier::new(
+                state.config.clone(),
+                self.resolved_upstream_proxy(),
+            );
+            if let Err(err) = notifier.send(item) {
+                // B-179：按 err 变体分流前缀。`Error::Store` 是配置非法（如零超时守卫），
+                // 不是发送失败——读事件表的人据此不会去查网络。其他变体（IO / 超时 / 认证）
+                // 仍是「webhook」前缀。
+                let label = match &err {
+                    crate::error::Error::Store(_) => "webhook 配置非法",
+                    _ => "webhook",
+                };
+                failures.push(format!("{label}: {err}"));
+            }
+        }
+        if !failures.is_empty() {
+            // B-179：标题按 failures 内容分流。有「配置非法」前缀 ⇒ 标题也用「通知配置非法」，
+            // 否则「通知发送失败」。子串匹配够用：当前只有 webhook 零超时守卫用这个词；
+            // 复审要点是「将来新增含『配置非法』的 failure 文案时这条匹配是否仍准」。
+            let has_config_err = failures.iter().any(|f| f.contains("配置非法"));
+            let title = if has_config_err {
+                "通知配置非法"
+            } else {
+                "通知发送失败"
+            };
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "app",
+                format!("{title}: {}", failures.join(" | ")),
+                serde_json::json!({
+                    "kind": format!("{:?}", item.kind),
+                    "webhook": crate::redact::mask_webhook_url(
+                        state.config.webhook_url.as_deref().unwrap_or("")
+                    ),
+                }),
+            ));
+        }
     }
 
     /// 读**落库的**通知基线（B-81）。
@@ -4862,6 +4948,34 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 buffer.push(usage);
             }
         }));
+
+        // M46-S5：预算判定注入出口。闭包只包一层 Arc<Store>，判定走
+        // budget_breach_for（闭包与测试共用）；store 查询出错 ⇒ None（fail-open，
+        // 见 spec §4.2）。网关本身仍不依赖 store 类型（闭包签名只有 id）。
+        let budget_store = std::sync::Arc::clone(&self.store);
+        config.budget_check = Some(Arc::new(move |site_id, key_id| {
+            budget_breach_for(&budget_store, site_id, key_id)
+                .ok()
+                .flatten()
+        }));
+
+        // M46-S5：超标回调注入出口。只做有界 push（与 on_failure 闭包同口径：
+        // 会话比对 + 上限丢最旧 + 丢弃计数），事件与通知由 refresh_all 的 drain 做。
+        let breach_sink = Arc::clone(&self.budget_breaches);
+        let breach_dropped = Arc::clone(&self.budget_breaches_dropped);
+        let breach_session_current = Arc::clone(&self.gateway_session);
+        config.on_budget_breach = Some(Arc::new(move |breach: crate::gateway::BudgetBreach| {
+            if breach_session_current.load(std::sync::atomic::Ordering::SeqCst) != session {
+                return;
+            }
+            if let Ok(mut buffer) = breach_sink.lock() {
+                if buffer.len() >= MAX_BUFFERED_GATEWAY_FAILURES {
+                    buffer.pop_front();
+                    breach_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                buffer.push_back(breach);
+            }
+        }));
         Ok(config)
     }
 
@@ -4907,6 +5021,84 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 ),
                 serde_json::json!({ "dropped": dropped_this_round }),
             ));
+        }
+    }
+
+    /// M46-S5：把网关攒下的预算超标写成事件 + 通知（refresh_all 在 drain 用量之后调）。
+    ///
+    /// 节流：按 (site_id, 预算行 key_id, period, 周期起点) 去重，每周期只发一次事件 +
+    /// 通知；同周期后续 breach 在 drain 时丢弃（已花只增不减，超标是持续状态）。
+    /// 通知不走 `rules::evaluate`：breach 是请求路径的事实，不是快照比较的产物；
+    /// 直接构造 `BudgetExceeded` 通知走 `send_notification`（与 dispatch 共用的发送块）。
+    pub fn drain_budget_breaches(&self) {
+        let drained: Vec<crate::gateway::BudgetBreach> = match self.budget_breaches.lock() {
+            Ok(mut buffer) => buffer.drain(..).collect(),
+            Err(_) => return,
+        };
+        let dropped = self
+            .budget_breaches_dropped
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if dropped > 0 {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "gateway",
+                format!("本轮因缓冲满丢弃 {dropped} 条预算超标记录（仅记计数，不逐条记）"),
+                serde_json::json!({ "dropped": dropped }),
+            ));
+        }
+        if drained.is_empty() {
+            return;
+        }
+        // 旧节流键清扫（32 天前）：集合只增不减会随周期滚动膨胀，drain 时顺手清。
+        let now = unix_now_secs();
+        let mut notified = self.budget_notified.lock().ok();
+        if let Some(set) = notified.as_mut() {
+            set.retain(|entry| entry.3 >= now - 32 * 86400);
+        }
+        for breach in &drained {
+            let period_start = self
+                .store
+                .budget_period_bounds(breach.period.as_str())
+                .map(|(start, _)| start)
+                .unwrap_or(0);
+            let key = (
+                breach.site_id,
+                breach.key_id,
+                breach.period.as_str().to_string(),
+                period_start,
+            );
+            let is_first = notified.as_mut().is_none_or(|set| set.insert(key));
+            if !is_first {
+                continue;
+            }
+            let period_label = match breach.period {
+                crate::gateway::BudgetPeriod::Day => "本日",
+                crate::gateway::BudgetPeriod::Month => "本月",
+            };
+            let detail = format!(
+                "预算超支：站点 {} {period_label}已花 ${}，上限 ${}",
+                breach.site_id, breach.spent_usd, breach.limit_usd,
+            );
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "gateway",
+                detail.clone(),
+                serde_json::json!({
+                    "site_id": breach.site_id,
+                    "key_id": breach.key_id,
+                    "period": breach.period.as_str(),
+                    "spent_usd": breach.spent_usd,
+                    "limit_usd": breach.limit_usd,
+                }),
+            ));
+            let notification = crate::notify::Notification::new(
+                crate::notify::NotifyKind::BudgetExceeded,
+                Some(breach.site_id),
+                "预算超支",
+                detail,
+                now,
+            );
+            self.send_notification(&notification);
         }
     }
 
