@@ -339,10 +339,18 @@ export type Settings = {
   modelsMinIntervalSecs: number;
   /** M39-S3：加权轮询参与的健康候选数（默认 3；1 = 关闭负载均衡）。 */
   gatewayLbTopN: number;
-  /** M39-S3：每站并发上限（默认 8；0 = 不限）。 */
+  /** M39-S3：每站并发上限（默认 8；1..=128）。 */
   gatewayPerSiteConcurrency: number;
   /** M39-S3：每站每秒请求上限（默认 0 = 不限速）。 */
   gatewayPerSiteRateLimit: number;
+  /** M46-S3：每站限流 burst——令牌桶额外容量（默认 0 = 关；0..=10000）。 */
+  gatewayPerSiteBurst: number;
+  /** M46-S4：每请求最多尝试候选数（默认 0 = 走全部；0..=64）。 */
+  gatewayMaxAttempts: number;
+  /** M46-S7：按 agent 路由规则 JSON（空 = 无规则）；保存后下次启动网关生效。 */
+  routingRules: string;
+  /** M46-S1：密钥健康巡检间隔秒（默认 0 = 关；非 0 时 60..=86400）。 */
+  gatewayKeyHealthIntervalSecs: number;
   // ---- M6-S5：FR-9 界面与隐私 ----
   /** "system" | "light" | "dark" */
   theme: string;
@@ -458,12 +466,19 @@ export type GatewayStatus = {
   candidates: GatewayCandidate[];
   /** 最近 60s 滑动；启动不足 3s 时为 0（UI 显示 `—`）。 */
   qps: number;
+  /** B-224（M40-S2 P2-2）：网关运行秒数，与后端 QPS 守则同源；缺失时回退到 requestsTotal < 3。 */
+  uptimeSecs?: number;
   requestsTotal: number;
   inflight: number;
   failoversTotal: number;
   /** 已脱敏的最近错误；没有则为 null（UI 显示「无」）。 */
   lastError: string | null;
   generation: number;
+  /**
+   * M46-S2：每站 EWMA（毫秒，键为站点 id）。旧后端无此字段时为 undefined，
+   * 调用方回退为空 map；未运行 / 无样本时后端给空 map（UI 暂不渲染）。
+   */
+  ewmaLatencyMs?: Record<number, number>;
 };
 
 export type GatewayCandidate = {
@@ -1519,6 +1534,40 @@ export async function modelPriceDelete(id: number): Promise<boolean> {
   return invokeCommand<boolean>("model_price_delete", { id });
 }
 
+/** M46-S5：一行硬预算（`spentUsd` = 当期已花，后端逐行算）。 */
+export type SiteBudget = {
+  id: number;
+  siteId: number;
+  keyId: number | null;
+  period: string;
+  limitUsd: number;
+  createdAt: number;
+  spentUsd: number;
+};
+
+/** M46-S5：新建预算的输入（更新 = 删除 + 重建，不另设命令）。 */
+export type SiteBudgetInput = {
+  siteId: number;
+  keyId: number | null;
+  period: string;
+  limitUsd: number;
+};
+
+export async function siteBudgetList(): Promise<SiteBudget[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<SiteBudget[]>("site_budget_list");
+}
+
+export async function siteBudgetCreate(budget: SiteBudgetInput): Promise<SiteBudget> {
+  if (!hasTauri) return mock({ ...budget, id: 1, createdAt: 0, spentUsd: 0 });
+  return invokeCommand<SiteBudget>("site_budget_create", { budget });
+}
+
+export async function siteBudgetDelete(id: number): Promise<boolean> {
+  if (!hasTauri) return mock(true);
+  return invokeCommand<boolean>("site_budget_delete", { id });
+}
+
 export async function siteBillProbe(siteId: number): Promise<BillProbe> {
   if (!hasTauri) return mock({ status: "unsupported", currency: null, reason: null });
   return invokeCommand<BillProbe>("site_bill_probe", { siteId });
@@ -1548,6 +1597,33 @@ export async function siteBillImport(
 export async function siteBills(days = 30): Promise<SiteBill[]> {
   if (!hasTauri) return mock([]);
   return invokeCommand<SiteBill[]>("site_bills", { days });
+}
+
+/**
+ * M46-S6：一行账单对账结果（只读报告；kind 为存在分区，billUsd/diffUsd 为空
+ * 只表示不可比——currency 非 USD、或为空、或 amount 为空；缺失侧按 0 计）。
+ * 仅 API 层接线（check-commands 要求命令有前端调用者）；页面卡片是 B-251，另立项。
+ */
+export type BillReconciliation = {
+  siteId: number;
+  day: string;
+  gatewayUsd: number;
+  billUsd: number | null;
+  diffUsd: number | null;
+  flagged: boolean;
+  kind: "matched" | "gateway_only" | "bill_only";
+  source: string | null;
+};
+
+export async function billReconciliation(
+  siteId?: number,
+  days = 30,
+): Promise<BillReconciliation[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<BillReconciliation[]>("bill_reconciliation", {
+    siteId: siteId ?? null,
+    days,
+  });
 }
 
 /** M14-S1：模型别名映射（B-110）—— agent 侧模型名 → 真实模型名。 */
@@ -1755,6 +1831,10 @@ let mockSettings: Settings = {
   gatewayLbTopN: 3,
   gatewayPerSiteConcurrency: 8,
   gatewayPerSiteRateLimit: 0,
+  gatewayPerSiteBurst: 0,
+  gatewayMaxAttempts: 0,
+  routingRules: "",
+  gatewayKeyHealthIntervalSecs: 0,
   theme: "system",
   language: "zh-CN",
   proxyUrl: "",

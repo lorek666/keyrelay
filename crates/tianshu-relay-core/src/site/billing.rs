@@ -480,6 +480,76 @@ mod tests {
         assert!(err.to_string().contains("不支持账单导入"), "{err}");
     }
 
+    #[tokio::test]
+    async fn import_only_ever_issues_get_requests() {
+        // M43-S2 T11：账单导入是只读探测——全程只能发 GET。MockTransport
+        // 记录了每一次请求的方法与 body，断言「全部 GET 且无 body」，
+        // 而不是只看导入结果（结果正确时也可能偷偷写过）。
+        let page =
+            r#"{"success":true,"data":[{"created_at":1700000000,"quota":1000}],"total":999}"#;
+        let transport = MockTransport::new(vec![
+            HttpResponse::new(200, page),
+            HttpResponse::new(200, page),
+        ]);
+        let mut rows: Vec<RawBill> = Vec::new();
+        let out = import_site_bills(&transport, &site(), &session(), Some(2), None, &mut |b| {
+            rows.push(b)
+        })
+        .await
+        .expect("导入");
+        assert_eq!(out.pages, 2);
+        let reqs = transport.requests();
+        assert_eq!(reqs.len(), 2, "两页 ⇒ 恰好两次请求");
+        for req in &reqs {
+            assert_eq!(req.method, Method::Get, "账单导入不得发写请求: {req:?}");
+            assert!(
+                req.body.as_ref().map(|b| b.is_empty()).unwrap_or(true),
+                "GET 不得带 body: {req:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_drops_raw_entry_payloads_and_never_sinks_them() {
+        // M43-S2 T13：条目里可能带 prompt / response / payload 等原始
+        // 正文——导入后 sink 里只能有 {day, amount, requests}，canary
+        // 字符串必须在任何 sink 行的 Debug 文本里都找不到（证明不是
+        // 「RawBill 没字段所以没存」的形式主义，而是解析真的丢了它）。
+        let canary = "CANARY-PROMPT-7f3a9c";
+        let body = format!(
+            r#"{{"success":true,"data":[{{"created_at":1700000000,"quota":500000,"prompt":"{canary}","response":"{canary}","payload":{{"text":"{canary}"}}}}],"total":1}}"#
+        );
+        // B-224 长尾 canary 先命中证明（与 M43-S1 T7 同标准）：先证明
+        // 「Debug 拼串 + contains」这套扫描器在行里真有 canary 时能命中，
+        // 否则下面的零命中可能是扫描器空转。RawBill 只有 day/amount/
+        // requests 三个字段——把 canary 放进 day 字段即可证明扫描路径。
+        let probe = vec![RawBill {
+            day: canary.to_string(),
+            amount: None,
+            requests: None,
+        }];
+        assert!(
+            format!("{probe:?}").contains(canary),
+            "扫描器必须能命中故意放进 sink 行的 canary，否则零命中是空转"
+        );
+
+        let transport = MockTransport::new(vec![HttpResponse::new(200, body.as_str())]);
+        let mut rows: Vec<RawBill> = Vec::new();
+        let out = import_site_bills(&transport, &site(), &session(), None, None, &mut |b| {
+            rows.push(b)
+        })
+        .await
+        .expect("导入");
+        assert_eq!(out.imported, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].amount, Some(1.0));
+        let haystack = format!("{rows:?}");
+        assert!(
+            !haystack.contains(canary),
+            "原始条目正文不得进入 sink 行: {haystack}"
+        );
+    }
+
     #[test]
     fn utc_day_conversion_matches_known_dates() {
         assert_eq!(utc_day_from_unix(0), "1970-01-01");

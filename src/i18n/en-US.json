@@ -26,14 +26,13 @@
       "delivery": "Delivery",
       "system": "System"
     },
-    "overview": "Overview",
-    "sites": "Sites",
-    "keys": "Keys",
-    "agents": "Agent Delivery",
-    "history": "Change History",
-    "settings": "Settings",
-    "probe": "Model Probe",
-    "usage": "Usage"
+    "cockpit": "Command Center",
+    "traffic": "Traffic",
+    "cost": "Cost",
+    "health": "Health",
+    "assets": "Assets",
+    "delivery": "Delivery",
+    "settings": "Settings"
   },
   "usage": {
     "cost": {
@@ -45,6 +44,47 @@
       "unpriced": "Unknown (unpriced)",
       "partial": "{count} more unpriced",
       "allUnpriced": "All {count} unpriced"
+    },
+    "budgets": {
+      "title": "Hard budgets (stop when exceeded)",
+      "body": "When period spend reaches the limit, the gateway blocks that site / key's candidates (429 local rejection); the next period recovers automatically. Only USD-priced usage counts; unpriced and CNY-priced usage is excluded.",
+      "site": "Site",
+      "sitePlaceholder": "Pick a site",
+      "key": "Key",
+      "keyAll": "All keys (site total)",
+      "period": "Period",
+      "periodDay": "Daily",
+      "periodMonth": "Monthly",
+      "limit": "Limit (USD)",
+      "spent": "Spent this period",
+      "save": "Save",
+      "delete": "Delete",
+      "empty": "No budgets yet.",
+      "note": "Exceeded means blocked, no warning tiers; create and delete take effect immediately, no gateway restart needed."
+    },
+    "reconciliation": {
+      "title": "Billing reconciliation (gateway cost vs site bills)",
+      "body": "Compares gateway-side cost against imported site bills per site per day. Coverage note: bill sources are currently mostly NewAPI-family imports; bills from other sources only appear once imported. Data updates on the import cadence and lags; this is not real-time all-source reconciliation. Differences beyond max(5%, $1) are flagged as over threshold.",
+      "daysLabel": "Window (days)",
+      "daysOption": "{days} days",
+      "flaggedOnly": "Flagged only",
+      "day": "Day",
+      "site": "Site",
+      "gateway": "Gateway cost",
+      "bill": "Site bill",
+      "diff": "Difference",
+      "kind": "Presence",
+      "flagged": "Flag",
+      "kindValues": {
+        "matched": "Both sides",
+        "gateway_only": "Gateway only",
+        "bill_only": "Bill only"
+      },
+      "flaggedYes": "Over threshold",
+      "incomparableTitle": "Incomparable rows",
+      "incomparableNote": "The rows below cannot be compared against gateway-side USD cost because the bill currency is not USD, is empty, or the bill amount is empty, so they do not take part in over-threshold filtering. They are also flagged=true in the IPC, but they are grouped separately here instead of being mixed with over-threshold rows.",
+      "empty": "No reconciliation rows in this window.",
+      "flaggedEmpty": "No over-threshold rows in this window."
     },
     "agents": {
       "title": "Cost by agent",
@@ -278,6 +318,9 @@
       "balance": "{site}: used {used} {currency} / remaining {remaining}{delta}",
       "delta": " ({delta})"
     }
+  },
+  "cockpit": {
+    "live": "LIVE"
   },
   "sites": {
     "title": "Add a new site",
@@ -1055,7 +1098,8 @@
         "site": "Site",
         "key": "Key",
         "health": "Health",
-        "breaker": "Breaker"
+        "breaker": "Breaker",
+        "ewmaLatency": "EWMA latency"
       },
       "health": {
         "healthy": "Healthy",
@@ -1126,6 +1170,27 @@
     },
     "maxRequestLabel": "Request body limit (MiB, 1–64)",
     "maxRequestHint": "Limits the **request body** only (1–64 MiB). The response body cap is a fixed 64 MiB constant and is unrelated; changes apply the next time the gateway starts.",
+    "perSiteBurstLabel": "Per-site rate-limit burst (0–10000, 0=off)",
+    "perSiteBurstHint": "Only takes effect when the per-site per-second limit is greater than 0: the token bucket capacity becomes per-second limit + burst, so the first burst of requests is no longer killed by mistake; refill per second is still the per-second limit, so the long-term rate is unchanged. Applies the next time the gateway starts.",
+    "perSiteConcurrencyLabel": "Per-site concurrency cap (1–128)",
+    "perSiteConcurrencyHint": "Maximum in-flight upstream requests per site; excess requests are rejected locally (429 local_rate_limited) and never trip the breaker. Applies the next time the gateway starts.",
+    "perSiteRateLimitLabel": "Per-site per-second limit (0–10000, 0=unlimited)",
+    "perSiteRateLimitHint": "New requests allowed per site per second; 0 = unlimited, in which case burst has no effect either (burst only raises the token bucket capacity when the per-second limit is greater than 0). Applies the next time the gateway starts.",
+    "maxAttemptsLabel": "Max attempts per request (0–64, 0=walk all)",
+    "maxAttemptsHint": "0 = walk all candidates (today's behavior); greater than 0 caps each request at that many candidates, and once exceeded the last real error is returned without inventing a new one. Only actually-sent upstream attempts count; locally rejected candidates do not. Applies the next time the gateway starts.",
+    "keyHealthIntervalLabel": "Key health probe interval (seconds, 0=off)",
+    "keyHealthIntervalHint": "0 = probes disabled; otherwise probe with GET /v1/models every this many seconds so dead keys are flagged and removed early. Valid range is 60–86400 seconds; out-of-range input is clamped on blur. Probing spends upstream quota and is off by default. Applies the next time the gateway starts.",
+    "keyHealthIntervalClamped": "Clamped to the valid range (0=off, or 60–86400 seconds).",
+    "routingRulesLabel": "Per-agent routing rules (JSON, empty = no rules)",
+    "routingRulesHint": "Example: [{\"agentLabel\": \"codex\", \"siteIds\": [1, 2]}]. agentLabel must match the token label exactly (case-sensitive); a matched agent only uses the listed sites, an unmatched agent uses global weighting; empty = no rules. Invalid JSON is rejected on save. Applies the next time the gateway starts.",
+    "routingRulesAgent": "Agent",
+    "routingRulesAgentPlaceholder": "Select an agent",
+    "routingRulesSites": "Sites",
+    "routingRulesAddRow": "Add rule",
+    "routingRulesDeleteRow": "Delete",
+    "routingRulesRowIncomplete": "This row is incomplete: both agent and sites are required, otherwise the backend will reject the whole save.",
+    "routingRulesFallbackNote": "The current rules text is not in a structured shape (parse failed), so it is shown as raw text; once it becomes a valid JSON array, the structured editor returns.",
+    "routingRulesNoTokens": "No usable token labels yet: create a token in the token section below first, then pick an agent here.",
     "ipv6Degraded": "IPv6 loopback is not listening: {note} (only 127.0.0.1 is available; v4 is unaffected)",
     "batch": {
       "btn": "Re-point delivered channels at the gateway…",
@@ -1178,6 +1243,16 @@
       "drift": "Overview keeps listing this target as \"needs attention\", and every Overview open logs another \"external change\" alert—the file no longer matches Tianshu Relay's last delivered content. This is expected; do not re-deliver because of it (that would undo the rollback).",
       "rotation": "Rotating this key rewrites the file; it also stays a candidate when batch re-pointing to the gateway. If this rollback restored the file to a **different** key from an earlier delivery: later rotating or revoking that earlier key will not rewrite this file—come back and deliver a still-valid key, or the agent stays on a revoked key.",
       "unbind": "To stop Tianshu Relay from managing it, unbind {agent} on the Agent Delivery page."
+    }
+  },
+  "health": {
+    "balance": {
+      "title": "Balance",
+      "note": "Balance overview across sites; unknown is never shown as 0.",
+      "error": "Failed to load sites: {error}",
+      "empty": "No sites yet.",
+      "site": "Site",
+      "balance": "Balance"
     }
   }
 }

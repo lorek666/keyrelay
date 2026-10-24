@@ -18,6 +18,7 @@ fn facts(site_id: i64, balance: Option<f64>, rate: Option<f64>, latency: Option<
         rate,
         balance_usd: balance,
         latency_ms: latency,
+        timeout_ms: None,
         key_ref: format!("kr/key/{site_id}/secret"),
         key_id: None,
     }
@@ -33,6 +34,7 @@ fn build_route_table_maps_every_field() {
         rate: Some(0.5),
         balance_usd: Some(12.5),
         latency_ms: Some(180),
+        timeout_ms: None,
         key_ref: "kr/key/42/secret".to_string(),
         key_id: Some(7),
     };

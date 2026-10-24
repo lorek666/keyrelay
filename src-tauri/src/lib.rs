@@ -621,9 +621,15 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::model_price_list,
             commands::model_price_upsert,
             commands::model_price_delete,
+            // M46-S5：站点 / key 硬预算
+            commands::site_budget_list,
+            commands::site_budget_create,
+            commands::site_budget_delete,
             commands::site_bill_probe,
             commands::site_bill_import,
             commands::site_bills,
+            // M46-S6：多源账单对账（只读）
+            commands::bill_reconciliation,
             // M14-S1：模型别名映射（B-110）
             commands::list_alias_map,
             commands::upsert_alias,
@@ -649,11 +655,19 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
 /// 模型目录采集循环的醒来间隔（M39-S1）。真正的节流在每站的 `should_collect_models`。
 const MODEL_CATALOG_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// 密钥健康巡检循环的醒来间隔（M46-S1）。只是「醒来看看」：真正的节流是
+/// `gateway_key_health_interval_secs`（任务内记 `last_run`），改间隔不重启循环。
+const KEY_HEALTH_TICK_SECS: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// M41-S1：`gateway_auto_start` 的启动期尝试（只跑一次，失败**不阻断启动**）。
 ///
 /// 选组规则见 [`crate::commands::auto_start_target`]：优先「上次成功运行」的 site/key
 /// （四项校验全过才用），否则回退「第一个 health=ok 站点 + 其第一把 enabled key」，
 /// 都没有就跳过并记一行日志——**不自动重试、不循环**。
+///
+/// B-224 P2 补充：首选组**启动失败**时，按 [`crate::commands::auto_start_targets`]
+/// 的有序清单依次试其余健康组（首个成功即停）；此前首选失败只记一行日志就
+/// 结束，网关停在「未运行」。清单内每个组仍只试一次，全部失败才放弃。
 fn maybe_auto_start_gateway<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     use tauri::Manager as _;
     let Some(state) = app.try_state::<AppState>() else {
@@ -671,15 +685,16 @@ fn maybe_auto_start_gateway<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let Ok(keys) = state.service.stored_keys() else {
         return;
     };
-    let Some((site_id, key_id)) = commands::auto_start_target(
+    let targets = commands::auto_start_targets(
         &sites,
         &keys,
         settings.gateway_last_site_id,
         settings.gateway_last_key_id,
-    ) else {
+    );
+    if targets.is_empty() {
         eprintln!("[tianshu-relay] 自动启动网关：没有可用的健康站点 / 启用密钥，跳过（不重试）");
         return;
-    };
+    }
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let Some(state) = app_handle.try_state::<AppState>() else {
@@ -687,9 +702,17 @@ fn maybe_auto_start_gateway<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         };
         // 与手动启动共用同一把串行锁；auto-start 只在这里 spawn 一次。
         let _op = state.gateway_op.lock().await;
-        if let Err(err) = commands::start_gateway_locked(&state, site_id, key_id).await {
-            eprintln!("[tianshu-relay] 自动启动网关失败（不影响应用启动）: {err}");
+        for (site_id, key_id) in targets {
+            match commands::start_gateway_locked(&state, site_id, key_id).await {
+                Ok(()) => return,
+                Err(err) => {
+                    eprintln!(
+                        "[tianshu-relay] 自动启动网关：站点 {site_id} / 密钥 {key_id} 启动失败，尝试下一组（不影响应用启动）: {err}"
+                    );
+                }
+            }
         }
+        eprintln!("[tianshu-relay] 自动启动网关：全部候选组均启动失败，网关未运行");
     });
 }
 
@@ -792,6 +815,74 @@ pub fn spawn_maintenance_tasks<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
                 }
                 Err(err) => {
                     eprintln!("[tianshu-relay] 模型目录采集失败（下一轮继续）: {err}")
+                }
+            }
+        }
+    });
+
+    // M46-S1：密钥健康巡检循环（与目录采集循环并列的独立任务）。
+    //
+    // 醒来间隔固定 60 秒（`KEY_HEALTH_TICK_SECS`）；真正的节流是设置间隔本身
+    // （任务内记 `last_run`，未到间隔即跳过；失败轮次同样锚定——与目录采集
+    // 「失败也节流」的口径一致）。间隔为 0 ⇒ 连 `check_key_health_once` 都不调。
+    //
+    // 喂入时只在锁内取运行句柄（不跨 await 持壳层锁）；网关没在跑 / 已停 ⇒
+    // 只记事件、不喂（重启后熔断归零，下一轮会重新探活）。
+    // 循环体内无 unwrap：任何失败转 eprintln，不 panic、不退出循环。
+    let health_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut last_run: Option<std::time::Instant> = None;
+        loop {
+            tokio::time::sleep(KEY_HEALTH_TICK_SECS).await;
+            let Some(state) = health_handle.try_state::<AppState>() else {
+                continue;
+            };
+            let Ok(settings) = state.service.settings() else {
+                continue;
+            };
+            let interval = settings.gateway_key_health_interval_secs;
+            if interval == 0 {
+                continue;
+            }
+            let now = std::time::Instant::now();
+            if let Some(last) = last_run {
+                if now.duration_since(last).as_secs() < interval {
+                    continue;
+                }
+            }
+            // 跑前先锚定：本轮无论成败，下一轮都要等满间隔。
+            last_run = Some(now);
+            match state.service.check_key_health_once().await {
+                Ok(summary) => {
+                    if summary.attempted > 0 {
+                        eprintln!(
+                            "[tianshu-relay] 密钥健康巡检: 尝试 {} / 健康 {} / 死 key {} / 额度空 {} / 站点故障 {} / 未知 {}",
+                            summary.attempted,
+                            summary.healthy,
+                            summary.dead,
+                            summary.quota,
+                            summary.fault,
+                            summary.unknown
+                        );
+                        // 喂入运行中网关的 Breaker（同步操作，不跨 await 持锁）。
+                        if let Ok(guard) = state.gateway.lock() {
+                            if let Some(running) = guard.as_ref() {
+                                if running.handle.alive() {
+                                    for outcome in &summary.outcomes {
+                                        running.handle.record_probe_outcome(
+                                            outcome.site_id,
+                                            &outcome.models,
+                                            outcome.verdict,
+                                            std::time::Instant::now(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[tianshu-relay] 密钥健康巡检失败（下一轮继续）: {err}")
                 }
             }
         }

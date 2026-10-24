@@ -109,13 +109,13 @@ probe() {
 probe \
   "P1-W1-drift" \
   "crates/tianshu-relay-core/src/service.rs" \
-  's/drift: drift_by_site\.get\(&site\.id\)\.cloned\(\)\.unwrap_or_default\(\)/drift: Vec::new()/g' \
+  's/let drift = drift_by_site\.get\(&site\.id\)\.cloned\(\)\.unwrap_or_default\(\);/let drift = Vec::new();/' \
   "-p tianshu-relay-core --test notify_wiring"
 
 probe \
   "P2-W1-rotation" \
   "crates/tianshu-relay-core/src/service.rs" \
-  's/rotation_due: rotation_by_site\.get\(&site\.id\)\.cloned\(\)\.unwrap_or_default\(\)/rotation_due: Vec::new()/g' \
+  's/let rotation_due = rotation_by_site\.get\(&site\.id\)\.cloned\(\)\.unwrap_or_default\(\);/let rotation_due = Vec::new();/' \
   "-p tianshu-relay-core --test notify_wiring"
 
 probe \
@@ -128,7 +128,7 @@ probe \
   "P4-null-journal-id" \
   "crates/tianshu-relay-core/src/store/mod.rs" \
   "s/COALESCE\(b\.journal_id, ''\) AS journal_id,/b.journal_id,/" \
-  "-p tianshu-relay-core --test rotation_run"
+  "-p tianshu-relay-core --test delivery_history"
 
 probe \
   "P5-unmapped-refusal" \

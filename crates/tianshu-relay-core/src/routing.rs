@@ -33,6 +33,9 @@ pub struct Upstream {
     pub rate: Option<f64>,        // 站点倍率；None = 未知
     pub balance_usd: Option<f64>, // 余额；None = 未知
     pub latency_ms: Option<u64>,  // 最近一次观测延迟；None = 未观测
+    /// M46-S4：该上游的分站超时（毫秒）。None = 回退全局 UpstreamTimeout；
+    /// Some(0) 在网关解析时同样视为未填（见 `effective_upstream_timeout`）。
+    pub timeout_ms: Option<u64>,
 }
 
 /// 路由表：一组上游 + 别名映射。
@@ -191,6 +194,10 @@ pub struct SiteFacts {
     /// `None` = 旧单 key 路径（`build_route_table` 之外的历史构造点）；
     /// 多站路径里 `service::build_gateway_route` 会给每把可用 key 各产出一条事实。
     pub key_id: Option<i64>,
+    /// M46-S4：分站超时（毫秒），与 [`Upstream::timeout_ms`] 同口径；
+    /// `build_route_table` 原样搬运，不做任何 `unwrap_or` 降级。
+    /// 生产来源缺口见 M46-S4 spec §4.4：`build_gateway_route` 目前恒填 `None`。
+    pub timeout_ms: Option<u64>,
 }
 
 /// 从站点事实推导路由表。**纯函数**（不读钥匙串、不联网、不读时钟）。
@@ -217,6 +224,8 @@ pub fn build_route_table(facts: &[SiteFacts]) -> RouteTable {
                 rate: f.rate,
                 balance_usd: f.balance_usd,
                 latency_ms: f.latency_ms,
+                // M46-S4：原样搬运（None = 回退全局，不降级成任何数值）。
+                timeout_ms: f.timeout_ms,
             })
             .collect(),
     )
@@ -244,6 +253,208 @@ fn ordered<'a>(upstreams: impl Iterator<Item = &'a Upstream>) -> Vec<&'a Upstrea
     let mut keyed: Vec<(SortKey, &Upstream)> = upstreams.map(|u| (SortKey::of(u), u)).collect();
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
     keyed.into_iter().map(|(_, u)| u).collect()
+}
+
+/// M46-S2：EWMA 平滑系数（固定值，不可配——可配会让两台网关的选路行为不可复现）。
+pub const EWMA_ALPHA: f64 = 0.2;
+
+/// M46-S2：一次成功样本后的 EWMA。首次样本直接作为初值（不是 `alpha × 样本`）：
+/// `None ⇒ 样本`；`Some(prev) ⇒ alpha × 样本 + (1 − alpha) × prev`。
+/// 纯函数：只算数，不判定「成功」——调用方（网关成功分支）负责只喂成功样本。
+pub fn ewma_update(previous: Option<f64>, sample_ms: u64) -> f64 {
+    match previous {
+        None => sample_ms as f64,
+        Some(prev) => EWMA_ALPHA * sample_ms as f64 + (1.0 - EWMA_ALPHA) * prev,
+    }
+}
+
+/// M46-S2：按有效延迟重排候选（网关 handler 在 `weighted_pick` 前调用）。
+///
+/// 排序键与 [`SortKey`] 逐字同一套（余额档位 → 倍率 → 延迟 → `site_id`），
+/// 只把延迟一项换成有效延迟：`ewma_ms(site)` 有值（且有限）⇒ `round()` 到毫秒
+/// （静态延迟本就是 `u64` 毫秒，排序粒度即毫秒）；否则回退 `Upstream.latency_ms`。
+/// 输入输出都是 `Vec<Candidate>`：`probe` 旗标跟着候选走，不增不减；
+/// 权重公式不在这里（`weighted_pick` 的槽位份额只由 `rate` 定），
+/// 本函数只改变组首次出现顺序与失败切换顺序。
+/// 全序（末位 `site_id` 兜底），输出与输入顺序无关。
+pub fn reorder_by_effective_latency<'a>(
+    candidates: Vec<Candidate<'a>>,
+    ewma_ms: &dyn Fn(i64) -> Option<f64>,
+) -> Vec<Candidate<'a>> {
+    let mut keyed: Vec<(SortKey, Candidate<'a>)> = candidates
+        .into_iter()
+        .map(|c| {
+            let effective = ewma_ms(c.upstream.site_id)
+                .filter(|v| v.is_finite())
+                .map(|v| v.round().max(0.0) as u64)
+                .or(c.upstream.latency_ms);
+            (SortKey::of_with_latency(c.upstream, effective), c)
+        })
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.into_iter().map(|(_, c)| c).collect()
+}
+
+/// M46-S7：一条按 agent 路由规则。
+///
+/// `agent_label` 是网关令牌的 label（M43-S1 的认证快照）；匹配时精确相等、
+/// 大小写敏感。`site_ids` 是该 agent 只允许走的站点 id（解析时按序去重）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutingRule {
+    pub agent_label: String,
+    pub site_ids: Vec<i64>,
+}
+
+/// M46-S7：规则 JSON 文本上限（字符数）。65536 远高于真实规模
+/// （agent 数与站点数都是个位数到两位数），只拦病态大串。
+pub const MAX_ROUTING_RULES_JSON_LEN: usize = 65_536;
+/// M46-S7：规则条数上限（同上，只拦病态值）。
+pub const MAX_ROUTING_RULES: usize = 64;
+/// M46-S7：单条规则的站点数上限（去重后计）。
+pub const MAX_ROUTING_RULE_SITES: usize = 128;
+
+/// M46-S7：解析规则 JSON（纯函数，不读库、不读时钟）。
+///
+/// 空串 / 纯空白 ⇒ 空规则（等价于 `[]`）；顶层必须是数组，条目必须是对象，
+/// 字段为 camelCase（`agentLabel` / `siteIds`，与 DTO 命名同惯例）。
+/// `agentLabel` 解析时 trim，trim 后为空 ⇒ 非法；`siteIds` 非空、每项为正整数、
+/// 按序去重；同一 `agentLabel`（trim 后比较）出现两次 ⇒ 非法；
+/// 未知字段忽略（前向兼容）。任一条目非法 ⇒ 整串 Err，不做部分解析
+/// （部分解析会让用户以为规则全生效，实则部分生效，比整单拒更危险）。
+/// Err 文本是中文原因，不回显规则全文。
+pub fn parse_routing_rules(text: &str) -> Result<Vec<RoutingRule>, String> {
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    if text.chars().count() > MAX_ROUTING_RULES_JSON_LEN {
+        return Err(format!(
+            "路由规则文本超过 {MAX_ROUTING_RULES_JSON_LEN} 字符上限"
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("路由规则 JSON 解析失败：{e}"))?;
+    let items = match value.as_array() {
+        Some(items) => items,
+        None => return Err("路由规则顶层必须是数组".to_string()),
+    };
+    if items.len() > MAX_ROUTING_RULES {
+        return Err(format!("路由规则超过 {MAX_ROUTING_RULES} 条上限"));
+    }
+    let mut rules: Vec<RoutingRule> = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let rule_no = index + 1;
+        let obj = match item.as_object() {
+            Some(obj) => obj,
+            None => return Err(format!("第 {rule_no} 条路由规则必须是对象")),
+        };
+        let label = match obj.get("agentLabel").and_then(|v| v.as_str()) {
+            Some(label) => label.trim().to_string(),
+            None => {
+                return Err(format!("第 {rule_no} 条路由规则的 agentLabel 必须是字符串"));
+            }
+        };
+        if label.is_empty() {
+            return Err(format!("第 {rule_no} 条路由规则的 agentLabel 不能为空"));
+        }
+        if rules.iter().any(|r: &RoutingRule| r.agent_label == label) {
+            return Err(format!("路由规则的 agentLabel「{label}」重复"));
+        }
+        let raw_sites = match obj.get("siteIds").and_then(|v| v.as_array()) {
+            Some(sites) => sites,
+            None => {
+                return Err(format!(
+                    "第 {rule_no} 条路由规则的 siteIds 必须是非空整数数组"
+                ));
+            }
+        };
+        if raw_sites.is_empty() {
+            return Err(format!("第 {rule_no} 条路由规则的 siteIds 不能为空"));
+        }
+        let mut site_ids: Vec<i64> = Vec::new();
+        for site in raw_sites {
+            let id = match site.as_i64() {
+                Some(id) if id > 0 => id,
+                _ => {
+                    return Err(format!("第 {rule_no} 条路由规则的 siteIds 必须全为正整数"));
+                }
+            };
+            if !site_ids.contains(&id) {
+                site_ids.push(id);
+            }
+        }
+        if site_ids.len() > MAX_ROUTING_RULE_SITES {
+            return Err(format!(
+                "第 {rule_no} 条路由规则的站点数超过 {MAX_ROUTING_RULE_SITES} 上限"
+            ));
+        }
+        rules.push(RoutingRule {
+            agent_label: label,
+            site_ids,
+        });
+    }
+    Ok(rules)
+}
+
+/// M46-S7：查某 agent 命中的规则限定站点。
+///
+/// `Some(sites)` = 命中（`sites` 可能为空 allowlist：规则引用的站点全被剥离后
+/// 仍保留，见 `resolve_routing_rules`）；`None` = 未命中，走全局加权。
+/// 空 label（legacy 无 label 请求）恒为 `None`——没有身份就无法被按身份限制。
+pub fn routing_allowed_sites<'a>(rules: &'a [RoutingRule], agent_label: &str) -> Option<&'a [i64]> {
+    if agent_label.is_empty() {
+        return None;
+    }
+    rules
+        .iter()
+        .find(|r| r.agent_label == agent_label)
+        .map(|r| r.site_ids.as_slice())
+}
+
+/// M46-S7：剥离不存在站点（纯函数）。
+///
+/// 「不存在」= 不在调用方给的已知站点 id 集合里（网关启动时由 sites 表算出，
+/// 不是路由表缺席——路由表缺席可能是暂无可用 key 的运行态）。
+/// 返回（有效规则，未知条目 `[(agentLabel, siteId)]`）；未知条目按规则顺序、
+/// 站序输出（事件顺序确定）。剥离后 `site_ids` 为空的规则**保留**为空
+/// allowlist（命中后候选恒空 ⇒ 404），不静默消失成「未命中」。
+pub fn resolve_routing_rules(
+    rules: Vec<RoutingRule>,
+    known_site_ids: &HashSet<i64>,
+) -> (Vec<RoutingRule>, Vec<(String, i64)>) {
+    let mut effective: Vec<RoutingRule> = Vec::with_capacity(rules.len());
+    let mut unknown: Vec<(String, i64)> = Vec::new();
+    for rule in rules {
+        let mut kept: Vec<i64> = Vec::new();
+        for site_id in rule.site_ids {
+            if known_site_ids.contains(&site_id) {
+                kept.push(site_id);
+            } else {
+                unknown.push((rule.agent_label.clone(), site_id));
+            }
+        }
+        effective.push(RoutingRule {
+            agent_label: rule.agent_label,
+            site_ids: kept,
+        });
+    }
+    (effective, unknown)
+}
+
+/// M46-S7：按站点集合过滤候选（纯函数，保持输入顺序）。
+///
+/// `allowed` 为 `None` ⇒ 原样返回（未命中规则，全局加权）。
+/// 只操作 handler 传来的 `Vec<&Upstream>`，不碰 `RouteTable` 的任何函数。
+pub fn filter_upstreams_by_sites<'a>(
+    candidates: Vec<&'a Upstream>,
+    allowed: Option<&[i64]>,
+) -> Vec<&'a Upstream> {
+    let Some(allowed) = allowed else {
+        return candidates;
+    };
+    candidates
+        .into_iter()
+        .filter(|u| allowed.contains(&u.site_id))
+        .collect()
 }
 
 /// 余额健康度档位：0 = 有余额，1 = 未知（`None` 或 `NaN`），2 = 已耗尽。
@@ -286,11 +497,18 @@ struct SortKey {
 
 impl SortKey {
     fn of(u: &Upstream) -> Self {
+        Self::of_with_latency(u, u.latency_ms)
+    }
+
+    /// M46-S2：与 `of` 同一套键，只把延迟一项换成调用方给的有效延迟
+    /// （实测 EWMA 或回退后的静态值）。`None` = 延迟缺失（排最后），
+    /// 与 `of` 的 `latency_missing` 语义逐字一致。
+    fn of_with_latency(u: &Upstream, latency_ms: Option<u64>) -> Self {
         let (rate_missing, rate) = match u.rate {
             Some(x) if !x.is_nan() => (false, x),
             _ => (true, 0.0),
         };
-        let (latency_missing, latency) = match u.latency_ms {
+        let (latency_missing, latency) = match latency_ms {
             Some(x) => (false, x),
             None => (true, 0),
         };
@@ -469,6 +687,10 @@ pub struct SiteGuardPolicy {
     pub max_concurrency: usize,
     /// 每站每秒允许的新请求数。`0` ⇒ 不限速。
     pub rate_limit_per_sec: u32,
+    /// 令牌桶的额外容量（M46-S3）。`0` ⇒ 关（与今天逐字相同）。
+    /// 桶容量 = `rate_limit_per_sec + rate_burst`；每秒补充仍是
+    /// `rate_limit_per_sec`，burst 只抬高上限、不提高补充速率。
+    pub rate_burst: u32,
 }
 
 impl Default for SiteGuardPolicy {
@@ -476,6 +698,7 @@ impl Default for SiteGuardPolicy {
         Self {
             max_concurrency: 8,
             rate_limit_per_sec: 0,
+            rate_burst: 0,
         }
     }
 }
@@ -522,7 +745,9 @@ impl SiteGuard {
             policy,
             in_flight: Arc::new(AtomicUsize::new(0)),
             bucket: Mutex::new(TokenBucket {
-                tokens: policy.rate_limit_per_sec as f64,
+                // M46-S3：初始桶是满的（满 = rate + burst，与今天「初始满 rate」
+                // 同一规则的延伸；见 spec §4.2）。rate = 0 时桶分支根本不读它。
+                tokens: policy.rate_limit_per_sec as f64 + policy.rate_burst as f64,
                 last: now,
             }),
         }
@@ -556,10 +781,11 @@ impl SiteGuard {
                     });
                 }
             };
-            let cap = self.policy.rate_limit_per_sec as f64;
+            // M46-S3：容量 = rate + burst；补充速率仍是 rate（连续补充，
+            // 按真实流逝时间乘 rate，与今天同口径）。burst 只抬上限。
+            let cap = self.policy.rate_limit_per_sec as f64 + self.policy.rate_burst as f64;
             let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
-            // 每秒补满：`cap` 个/秒
-            b.tokens = (b.tokens + elapsed * cap).min(cap);
+            b.tokens = (b.tokens + elapsed * self.policy.rate_limit_per_sec as f64).min(cap);
             b.last = now;
             if b.tokens < 1.0 {
                 drop(b);
@@ -622,9 +848,14 @@ pub struct Candidate<'a> {
 /// `rate` 是站点倍率；`None`（未知）按 1.0 处理。
 /// 权重 = `1/max(rate, 0.01)`：**倍率越低（越便宜）权重越高**。
 /// 这是「组内未归一」的原始 unit，归一在 [`weighted_pick`] 里做（需要组内最小值）。
+///
+/// 注意 `rate = Some(0.0)`（免费分组）**不是**未知：按公式应得 `1/0.01 = 100`
+/// （最高权重），而不是落到 1.0 被长期冷落（B-224 P2 修复；此前 `0.0`
+/// 走 `_ => 1.0` 分支，与 spec 公式不一致）。
 pub fn rotation_weight(rate: Option<f64>) -> f64 {
     let r = match rate {
         Some(x) if x.is_finite() && x > 0.0 => x,
+        Some(x) if x.is_finite() && x == 0.0 => 0.01,
         _ => 1.0,
     };
     1.0 / r.max(0.01)
@@ -654,8 +885,13 @@ impl RoundRobinState {
 /// 算法（完整版见 `docs/specs/M39-S3-负载均衡与上游保护.md` §4.1）：
 /// 有 `probe` 就直接返回它且**不读 cursor**（否则探针可能永远轮不到，冷却恢复不了）；
 /// 否则取前 `top_n` 个（`0` 视为 1）；只剩一个就直接返回且不读 cursor（单候选与今天逐字相同）；
-/// 其余按 `unit = 1/max(rate, 0.01)` 以组内最小 unit 归一（clamp 到 `[1, 100]`）建槽位表，
-/// 用 `cursor % slots.len()` 取一个。
+/// 其余**按站点归一**：head 先按 `site_id` 分组（保持首次出现顺序），站点权重取该站
+/// `rate` 的 `unit = 1/max(rate, 0.01)`，以组内最小 unit 归一（clamp 到 `[1, 100]`）建槽位表，
+/// 用 `cursor % slots.len()` 选站点；站内 key 按 `(cursor / slots.len()) % key_count` 轮换。
+///
+/// 按站点归一而不是按 key 计权重（B-224 P2-5 决策，2026-10-24）：`rate` 是站点倍率
+/// （同站各 key 相同），guard 与熔断也按站点共享，站点才是容量单位；按 key 计会让
+/// 2 key 站点与倍率无关地占 2 份槽位，guard 饱和时只会多出本地 429，而不是多出容量。
 pub fn weighted_pick<'a>(
     candidates: &[Candidate<'a>],
     top_n: usize,
@@ -672,14 +908,23 @@ pub fn weighted_pick<'a>(
     if head.len() == 1 {
         return Some(head[0].upstream);
     }
-    let units: Vec<f64> = head
+    // 按站点分组：(site_id, 站点 unit, 该站在 head 内的 key 列表)。
+    // 同站各 key 的 rate 相同（站点倍率），取首个即可。
+    let mut sites: Vec<(i64, f64, Vec<&Upstream>)> = Vec::new();
+    for c in head {
+        let sid = c.upstream.site_id;
+        match sites.iter_mut().find(|(id, _, _)| *id == sid) {
+            Some((_, _, keys)) => keys.push(c.upstream),
+            None => sites.push((sid, rotation_weight(c.upstream.rate), vec![c.upstream])),
+        }
+    }
+    let base = sites
         .iter()
-        .map(|c| rotation_weight(c.upstream.rate))
-        .collect();
-    let base = units.iter().cloned().fold(f64::INFINITY, f64::min);
-    let weights: Vec<u64> = units
+        .map(|(_, u, _)| *u)
+        .fold(f64::INFINITY, f64::min);
+    let weights: Vec<u64> = sites
         .iter()
-        .map(|u| ((u / base).round() as i64).clamp(1, 100) as u64)
+        .map(|(_, u, _)| ((u / base).round() as i64).clamp(1, 100) as u64)
         .collect();
     let mut slots: Vec<usize> = Vec::new();
     for (i, w) in weights.iter().enumerate() {
@@ -687,8 +932,12 @@ pub fn weighted_pick<'a>(
             slots.push(i);
         }
     }
-    let idx = slots[(cursor % slots.len() as u64) as usize];
-    Some(head[idx].upstream)
+    let site_idx = slots[(cursor % slots.len() as u64) as usize];
+    let keys = &sites[site_idx].2;
+    // 站内轮换与站点选择解耦：单站时 slots.len() == 1，退化为 cursor 交替（与旧行为一致）；
+    // 多站时每过一轮槽位表站内 key 前进一步，两把 key 都轮得到。
+    let key_idx = ((cursor / slots.len() as u64) % keys.len() as u64) as usize;
+    Some(keys[key_idx])
 }
 
 #[cfg(test)]
@@ -705,7 +954,20 @@ mod tests {
             balance_usd: balance,
             latency_ms: latency,
             key_id: None,
+            timeout_ms: None,
         }
+    }
+
+    #[test]
+    fn rotation_weight_gives_free_sites_the_spec_maximum() {
+        // B-224 P2：`rate = Some(0.0)`（免费分组）按公式 `1/max(rate, 0.01)`
+        // 应得 100，而不是此前落到 1.0 被长期冷落。
+        assert_eq!(rotation_weight(Some(0.0)), 100.0);
+        assert_eq!(rotation_weight(Some(0.01)), 100.0);
+        assert_eq!(rotation_weight(Some(1.0)), 1.0);
+        assert_eq!(rotation_weight(None), 1.0);
+        assert_eq!(rotation_weight(Some(f64::NAN)), 1.0);
+        assert_eq!(rotation_weight(Some(-1.0)), 1.0);
     }
 
     #[test]
@@ -799,6 +1061,155 @@ mod tests {
         assert_eq!(b.state(&site_key(1), t3), BreakerState::HalfOpen);
     }
 
+    // ============================================================ M46-S2：EWMA
+
+    #[test]
+    fn ewma_update_first_sample_is_the_sample() {
+        // 首次样本直接作为初值，不是 alpha × 样本（0.2 × 200 = 40 是错的）。
+        assert_eq!(ewma_update(None, 200), 200.0);
+        assert_eq!(ewma_update(None, 0), 0.0);
+    }
+
+    #[test]
+    fn ewma_update_applies_alpha_0_2() {
+        assert_eq!(EWMA_ALPHA, 0.2);
+        assert!((ewma_update(Some(100.0), 200) - 120.0).abs() < 1e-9);
+        assert!((ewma_update(Some(120.0), 200) - 136.0).abs() < 1e-9);
+        assert!((ewma_update(Some(136.0), 0) - 108.8).abs() < 1e-9);
+    }
+
+    fn reorder_sites(
+        ups: &[Upstream],
+        probes: &[bool],
+        ewma: &dyn Fn(i64) -> Option<f64>,
+    ) -> Vec<i64> {
+        let candidates: Vec<Candidate<'_>> = ups
+            .iter()
+            .zip(probes.iter())
+            .map(|(u, p)| Candidate {
+                upstream: u,
+                probe: *p,
+            })
+            .collect();
+        reorder_by_effective_latency(candidates, ewma)
+            .iter()
+            .map(|c| c.upstream.site_id)
+            .collect()
+    }
+
+    #[test]
+    fn reorder_by_effective_latency_matches_static_order_without_ewma() {
+        // 回退用例：无 EWMA 时重排输出必须与 RouteTable::candidates 逐字相等。
+        let a = up(1, Some(1.0), Some(10.0), Some(200));
+        let b = up(2, Some(0.5), Some(10.0), Some(10));
+        let c = up(3, Some(1.0), None, Some(5));
+        let d = up(4, Some(1.0), Some(0.0), Some(1));
+        let ups = vec![a, b, c, d];
+        let route = RouteTable::new(ups.clone());
+        let expected: Vec<i64> = route
+            .candidates("gpt-5.6")
+            .iter()
+            .map(|u| u.site_id)
+            .collect();
+        let got = reorder_sites(&ups, &[false, false, false, false], &|_| None);
+        assert_eq!(got, expected, "无 EWMA 时重排不得改变静态顺序");
+    }
+
+    #[test]
+    fn reorder_by_effective_latency_substitutes_ewma_for_static() {
+        let a = up(1, Some(1.0), Some(10.0), Some(10));
+        let b = up(2, Some(1.0), Some(10.0), Some(200));
+        let ups = vec![a, b];
+        let got = reorder_sites(&ups, &[false, false], &|site| match site {
+            1 => Some(300.0),
+            2 => Some(50.0),
+            _ => None,
+        });
+        assert_eq!(got, vec![2, 1], "EWMA 必须替换静态延迟参与排序");
+    }
+
+    #[test]
+    fn reorder_by_effective_latency_falls_back_to_static_when_missing() {
+        let a = up(1, Some(1.0), Some(10.0), Some(10));
+        let b = up(2, Some(1.0), Some(10.0), Some(10));
+        let ups = vec![a, b];
+        // A 有 EWMA 300，B 无 EWMA、静态 10 ⇒ B 在前（回退，不是按缺失排最后）。
+        let got = reorder_sites(&ups, &[false, false], &|site| match site {
+            1 => Some(300.0),
+            _ => None,
+        });
+        assert_eq!(got, vec![2, 1]);
+        // 两边都缺失 ⇒ 静态平局 ⇒ site_id 兜底。
+        let got = reorder_sites(&ups, &[false, false], &|_| None);
+        assert_eq!(got, vec![1, 2]);
+    }
+
+    #[test]
+    fn reorder_by_effective_latency_keeps_rate_and_health_precedence() {
+        // 便宜慢站仍排在贵快站前面（倍率档位在延迟之前）。
+        let cheap_slow = up(1, Some(0.5), Some(10.0), Some(10));
+        let pricey_fast = up(2, Some(2.0), Some(10.0), Some(10));
+        let ups = vec![cheap_slow, pricey_fast];
+        let got = reorder_sites(&ups, &[false, false], &|site| match site {
+            1 => Some(500.0),
+            2 => Some(5.0),
+            _ => None,
+        });
+        assert_eq!(got, vec![1, 2], "EWMA 不得推翻倍率档位");
+        // 余额耗尽快站仍排在健康慢站后面（健康档位在延迟之前）。
+        let exhausted_fast = up(1, Some(1.0), Some(0.0), Some(10));
+        let healthy_slow = up(2, Some(1.0), Some(10.0), Some(10));
+        let ups = vec![exhausted_fast, healthy_slow];
+        let got = reorder_sites(&ups, &[false, false], &|site| match site {
+            1 => Some(5.0),
+            2 => Some(500.0),
+            _ => None,
+        });
+        assert_eq!(got, vec![2, 1], "EWMA 不得推翻健康档位");
+    }
+
+    #[test]
+    fn reorder_by_effective_latency_preserves_probe_flags() {
+        let slow_probe = up(1, Some(1.0), Some(10.0), Some(10));
+        let fast_plain = up(2, Some(1.0), Some(10.0), Some(200));
+        let ups = [slow_probe, fast_plain];
+        let candidates: Vec<Candidate<'_>> = vec![
+            Candidate {
+                upstream: &ups[0],
+                probe: true,
+            },
+            Candidate {
+                upstream: &ups[1],
+                probe: false,
+            },
+        ];
+        let reordered = reorder_by_effective_latency(candidates, &|site| match site {
+            1 => Some(300.0),
+            2 => Some(50.0),
+            _ => None,
+        });
+        assert_eq!(reordered.len(), 2);
+        // 快站排前，但探针旗标仍绑在慢站身上（不剥离、不重建）。
+        assert_eq!(reordered[0].upstream.site_id, 2);
+        assert!(!reordered[0].probe);
+        assert_eq!(reordered[1].upstream.site_id, 1);
+        assert!(reordered[1].probe);
+    }
+
+    #[test]
+    fn reorder_by_effective_latency_rounds_ewma_to_milliseconds() {
+        // 10.4 与 10.49 都舍入到 10ms ⇒ 平局 ⇒ site_id 兜底（毫秒粒度是设计）。
+        let a = up(2, Some(1.0), Some(10.0), Some(10));
+        let b = up(1, Some(1.0), Some(10.0), Some(10));
+        let ups = vec![a, b];
+        let got = reorder_sites(&ups, &[false, false], &|site| match site {
+            2 => Some(10.4),
+            1 => Some(10.49),
+            _ => None,
+        });
+        assert_eq!(got, vec![1, 2]);
+    }
+
     #[test]
     fn record_success_closes_breaker() {
         let mut b = Breaker::new(BreakerPolicy::default());
@@ -872,7 +1283,44 @@ mod tests {
             balance_usd: None,
             latency_ms: None,
             key_id: None,
+            timeout_ms: None,
         }
+    }
+
+    #[test]
+    fn build_route_table_carries_per_site_timeout_verbatim() {
+        // M46-S4：SiteFacts.timeout_ms 原样搬进 Upstream，不做 unwrap_or 降级。
+        let facts = vec![
+            SiteFacts {
+                site_id: 1,
+                base_url: "http://a.example.com".to_string(),
+                models: vec![],
+                rate: None,
+                balance_usd: None,
+                latency_ms: None,
+                key_ref: "kr/key/1/secret".to_string(),
+                key_id: None,
+                timeout_ms: Some(5000),
+            },
+            SiteFacts {
+                site_id: 2,
+                base_url: "http://b.example.com".to_string(),
+                models: vec![],
+                rate: None,
+                balance_usd: None,
+                latency_ms: None,
+                key_ref: "kr/key/2/secret".to_string(),
+                key_id: None,
+                timeout_ms: None,
+            },
+        ];
+        let table = build_route_table(&facts);
+        let all = table.all_candidates();
+        assert_eq!(all.len(), 2);
+        let by_site: std::collections::HashMap<i64, Option<u64>> =
+            all.iter().map(|u| (u.site_id, u.timeout_ms)).collect();
+        assert_eq!(by_site[&1], Some(5000), "Some 值原样搬运");
+        assert_eq!(by_site[&2], None, "None 保持 None，不降级成数值");
     }
 
     #[test]
@@ -930,5 +1378,147 @@ mod tests {
                 "两处判据必须同源：{model}"
             );
         }
+    }
+
+    // ============================================================ M46-S7：按 agent 路由规则
+
+    #[test]
+    fn parse_routing_rules_accepts_empty_and_valid_json() {
+        assert_eq!(parse_routing_rules("").unwrap(), Vec::<RoutingRule>::new());
+        assert_eq!(
+            parse_routing_rules("  \n ").unwrap(),
+            Vec::<RoutingRule>::new()
+        );
+        assert_eq!(
+            parse_routing_rules("[]").unwrap(),
+            Vec::<RoutingRule>::new()
+        );
+        let rules = parse_routing_rules(
+            r#"[{"agentLabel": "codex", "siteIds": [1, 2]}, {"agentLabel": "cc", "siteIds": [3]}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rules,
+            vec![
+                RoutingRule {
+                    agent_label: "codex".to_string(),
+                    site_ids: vec![1, 2],
+                },
+                RoutingRule {
+                    agent_label: "cc".to_string(),
+                    site_ids: vec![3],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_routing_rules_rejects_malformed() {
+        for bad in [
+            "{not json",
+            r#"{"agentLabel": "a", "siteIds": [1]}"#,
+            r#"["not-an-object"]"#,
+            r#"[{"agentLabel": 1, "siteIds": [1]}]"#,
+            r#"[{"agentLabel": "  ", "siteIds": [1]}]"#,
+            r#"[{"agentLabel": "a", "siteIds": []}]"#,
+            r#"[{"agentLabel": "a", "siteIds": [0]}]"#,
+            r#"[{"agentLabel": "a", "siteIds": [-2]}]"#,
+            r#"[{"agentLabel": "a", "siteIds": [1.5]}]"#,
+            r#"[{"agentLabel": "a", "siteIds": [1]}, {"agentLabel": "a", "siteIds": [2]}]"#,
+            r#"[{"agentLabel": "a"}]"#,
+            r#"[{"siteIds": [1]}]"#,
+        ] {
+            assert!(
+                parse_routing_rules(bad).is_err(),
+                "应当拒绝：{bad}，得到 {:?}",
+                parse_routing_rules(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_routing_rules_dedupes_site_ids_and_trims_label() {
+        let rules =
+            parse_routing_rules(r#"[{"agentLabel": "  codex  ", "siteIds": [2, 1, 2, 1]}]"#)
+                .unwrap();
+        assert_eq!(rules[0].agent_label, "codex");
+        assert_eq!(rules[0].site_ids, vec![2, 1], "去重保序");
+    }
+
+    #[test]
+    fn parse_routing_rules_enforces_caps() {
+        let many: Vec<String> = (0..65)
+            .map(|i| format!(r#"{{"agentLabel": "a{i}", "siteIds": [1]}}"#))
+            .collect();
+        assert!(
+            parse_routing_rules(&format!("[{}]", many.join(","))).is_err(),
+            "65 条规则应超 64 上限"
+        );
+        let sites: Vec<String> = (1..=129).map(|i| i.to_string()).collect();
+        assert!(
+            parse_routing_rules(&format!(
+                r#"[{{"agentLabel": "a", "siteIds": [{}]}}]"#,
+                sites.join(",")
+            ))
+            .is_err(),
+            "129 站应超 128 上限"
+        );
+        let long = format!(
+            r#"[{{"agentLabel": "{}", "siteIds": [1]}}]"#,
+            "x".repeat(MAX_ROUTING_RULES_JSON_LEN)
+        );
+        assert!(parse_routing_rules(&long).is_err(), "超长文本应被拒");
+    }
+
+    #[test]
+    fn routing_allowed_sites_matches_exactly() {
+        let rules = parse_routing_rules(r#"[{"agentLabel": "codex", "siteIds": [1, 2]}]"#).unwrap();
+        assert_eq!(routing_allowed_sites(&rules, "codex"), Some(&[1, 2][..]));
+        assert_eq!(routing_allowed_sites(&rules, "Codex"), None, "大小写敏感");
+        assert_eq!(routing_allowed_sites(&rules, "code"), None, "非前缀匹配");
+        assert_eq!(routing_allowed_sites(&rules, "other"), None);
+        assert_eq!(routing_allowed_sites(&rules, ""), None, "空 label 恒不命中");
+    }
+
+    #[test]
+    fn resolve_routing_rules_strips_unknown_and_reports_them() {
+        let rules = parse_routing_rules(
+            r#"[{"agentLabel": "a", "siteIds": [1, 99, 2]}, {"agentLabel": "b", "siteIds": [77]}]"#,
+        )
+        .unwrap();
+        let known: HashSet<i64> = [1, 2].into_iter().collect();
+        let (effective, unknown) = resolve_routing_rules(rules, &known);
+        assert_eq!(effective[0].site_ids, vec![1, 2]);
+        assert_eq!(
+            effective[1].site_ids,
+            Vec::<i64>::new(),
+            "全剥离后规则保留为空 allowlist"
+        );
+        assert_eq!(
+            unknown,
+            vec![("a".to_string(), 99), ("b".to_string(), 77)],
+            "未知条目按规则顺序、站序输出"
+        );
+    }
+
+    #[test]
+    fn filter_upstreams_by_sites_keeps_order_and_is_noop_without_rule() {
+        let a = up(1, Some(1.0), Some(10.0), None);
+        let b = up(2, Some(1.0), Some(10.0), None);
+        let c = up(3, Some(1.0), Some(10.0), None);
+        let all = vec![&a, &b, &c];
+        let kept = filter_upstreams_by_sites(all.clone(), None);
+        assert_eq!(
+            kept.iter().map(|u| u.site_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let kept = filter_upstreams_by_sites(all.clone(), Some(&[3, 1]));
+        assert_eq!(
+            kept.iter().map(|u| u.site_id).collect::<Vec<_>>(),
+            vec![1, 3],
+            "保输入顺序，不按规则顺序重排"
+        );
+        let kept = filter_upstreams_by_sites(all, Some(&[]));
+        assert!(kept.is_empty(), "空 allowlist ⇒ 空候选");
     }
 }

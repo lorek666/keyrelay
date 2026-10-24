@@ -373,10 +373,18 @@ pub struct SettingsDto {
     gateway_multi_site: bool,
     collect_models: bool,
     models_min_interval_secs: u64,
+    // M46-S1：密钥健康巡检间隔秒（0 = 关闭；camelCase `gatewayKeyHealthIntervalSecs`）。
+    gateway_key_health_interval_secs: u64,
     // M39-S3：负载均衡与每站保护（默认 3 / 8 / 0；UI 控件由 M41 落地）
     gateway_lb_top_n: usize,
     gateway_per_site_concurrency: usize,
     gateway_per_site_rate_limit: u32,
+    // M46-S3：每站限流 burst（默认 0 = 关；camelCase `gatewayPerSiteBurst`）。
+    gateway_per_site_burst: u32,
+    // M46-S4：每请求最多尝试候选数（默认 0 = 走全部；camelCase `gatewayMaxAttempts`）。
+    gateway_max_attempts: usize,
+    // M46-S7：按 agent 路由规则 JSON（默认空 = 无规则；camelCase `routingRules`）。
+    routing_rules: String,
     // ---- M6-S5：FR-9 界面与隐私 ----
     theme: String,
     language: String,
@@ -483,11 +491,18 @@ pub struct GatewayStatusDto {
     candidates: Vec<GatewayCandidateDto>,
     /// 最近 60s 滑动；启动不足 3s 时为 0（UI 显示 `—`）。
     qps: f64,
+    /// B-224（M40-S2 P2-2 修复）：核心快照本就有的 `uptime_secs`，此前
+    /// IPC 层没透出，前端只能用 `requestsTotal < 3` 另 invent 一套
+    /// 「样本不足」判据，与后端的「uptime < 3s」判据不一致。透出后
+    /// 前端以它为准（缺失时回退到 requestsTotal < 3）。
+    uptime_secs: u64,
     requests_total: u64,
     inflight: u64,
     failovers_total: u64,
     last_error: Option<String>,
     generation: u64,
+    /// M46-S2：每站 EWMA（毫秒）；未运行 / 无样本 ⇒ 空 map（字段恒在，IPC 形状稳定）。
+    ewma_latency_ms: std::collections::BTreeMap<i64, f64>,
     tokens: Vec<GatewayTokenDto>,
 }
 
@@ -1530,6 +1545,101 @@ pub fn model_price_delete(state: State<'_, AppState>, id: i64) -> Result<bool, S
         .map_err(|e| e.to_string())
 }
 
+// ============================================ M46-S5：站点 / key 硬预算
+//
+// 校验全部在 store::budget_create（validate 先行）；命令层只做 DTO 映射与
+// 当期已花计算（任一失败 ⇒ 整条命令报错，与 usage_dashboard 同口径）。
+
+/// M46-S5：一行预算（`spent_usd` = 当期已花，命令层逐行算）。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteBudgetDto {
+    pub id: i64,
+    pub site_id: i64,
+    pub key_id: Option<i64>,
+    pub period: String,
+    pub limit_usd: f64,
+    pub created_at: i64,
+    pub spent_usd: f64,
+}
+
+/// M46-S5：新建预算的输入（`id` 由服务端生成；更新 = 删除 + 重建，不另设命令）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteBudgetInputDto {
+    pub site_id: i64,
+    pub key_id: Option<i64>,
+    pub period: String,
+    pub limit_usd: f64,
+}
+
+fn site_budget_to_dto(
+    row: &tianshu_relay_core::store::SiteBudgetRow,
+    spent_usd: f64,
+) -> SiteBudgetDto {
+    SiteBudgetDto {
+        id: row.id,
+        site_id: row.site_id,
+        key_id: row.key_id,
+        period: row.period.clone(),
+        limit_usd: row.limit_usd,
+        created_at: row.created_at,
+        spent_usd,
+    }
+}
+
+/// 全部预算行（含当期已花）。
+#[tauri::command]
+pub fn site_budget_list(state: State<'_, AppState>) -> Result<Vec<SiteBudgetDto>, String> {
+    let store = state.service.store();
+    let rows = store.budget_list().map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let spent = store
+            .budget_spent_usd(row.site_id, row.key_id, &row.period)
+            .map_err(|e| e.to_string())?;
+        out.push(site_budget_to_dto(row, spent));
+    }
+    Ok(out)
+}
+
+/// 新建一行预算（非法输入由 store 拒绝，不落库）。
+#[tauri::command]
+pub fn site_budget_create(
+    state: State<'_, AppState>,
+    budget: SiteBudgetInputDto,
+) -> Result<SiteBudgetDto, String> {
+    let store = state.service.store();
+    let id = store
+        .budget_create(
+            budget.site_id,
+            budget.key_id,
+            &budget.period,
+            budget.limit_usd,
+        )
+        .map_err(|e| e.to_string())?;
+    let row = store
+        .budget_list()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| "写入后读回预算行失败".to_string())?;
+    let spent = store
+        .budget_spent_usd(row.site_id, row.key_id, &row.period)
+        .map_err(|e| e.to_string())?;
+    Ok(site_budget_to_dto(&row, spent))
+}
+
+/// 删除一行预算（不存在 ⇒ false，与 model_price_delete 同口径）。
+#[tauri::command]
+pub fn site_budget_delete(state: State<'_, AppState>, id: i64) -> Result<bool, String> {
+    state
+        .service
+        .store()
+        .budget_delete(id)
+        .map_err(|e| e.to_string())
+}
+
 /// 只读探测站点账单能力（一次 GET，不写库）。
 #[tauri::command]
 pub async fn site_bill_probe(
@@ -1612,6 +1722,50 @@ pub fn site_bills(
         .map_err(|e| e.to_string())
 }
 
+/// M46-S6：一行账单对账结果（kind 为 "matched" | "gateway_only" | "bill_only"；
+/// bill_usd / diff_usd 为空只表示不可比——currency 非 USD、或为空、或 amount 为空；
+/// 缺失侧按 0 计：gateway-only 行 bill_usd = 0.0、bill-only 行 gateway_usd = 0.0）。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BillReconciliationDto {
+    pub site_id: i64,
+    pub day: String,
+    pub gateway_usd: f64,
+    pub bill_usd: Option<f64>,
+    pub diff_usd: Option<f64>,
+    pub flagged: bool,
+    pub kind: String,
+    pub source: Option<String>,
+}
+
+/// M46-S6：网关成本与站点自报账单的只读对账（近 `days` 天，缺省 30，夹到 1..=90；
+/// `site_id` 缺省 = 全部站点）。任一查询失败 ⇒ 整条命令报错（不返回半份数据，
+/// 与 usage_dashboard 同口径）。不写库、不发通知。
+#[tauri::command]
+pub fn bill_reconciliation(
+    state: State<'_, AppState>,
+    site_id: Option<i64>,
+    days: Option<i64>,
+) -> Result<Vec<BillReconciliationDto>, String> {
+    let days = tianshu_relay_core::store::clamp_usage_days(days.unwrap_or(30));
+    tianshu_relay_core::service::reconcile_bills(state.service.store(), site_id, days)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| BillReconciliationDto {
+                    site_id: r.site_id,
+                    day: r.day,
+                    gateway_usd: r.gateway_usd,
+                    bill_usd: r.bill_usd,
+                    diff_usd: r.diff_usd,
+                    flagged: r.flagged,
+                    kind: r.kind.as_str().to_string(),
+                    source: r.source,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
 // ============================================ 漂移 / 设置 / 刷新（M3-S1）
 
 fn settings_from_dto(dto: &SettingsDto) -> tianshu_relay_core::settings::Settings {
@@ -1629,9 +1783,13 @@ fn settings_from_dto(dto: &SettingsDto) -> tianshu_relay_core::settings::Setting
         gateway_multi_site: dto.gateway_multi_site,
         collect_models: dto.collect_models,
         models_min_interval_secs: dto.models_min_interval_secs,
+        gateway_key_health_interval_secs: dto.gateway_key_health_interval_secs,
         gateway_lb_top_n: dto.gateway_lb_top_n,
         gateway_per_site_concurrency: dto.gateway_per_site_concurrency,
         gateway_per_site_rate_limit: dto.gateway_per_site_rate_limit,
+        gateway_per_site_burst: dto.gateway_per_site_burst,
+        gateway_max_attempts: dto.gateway_max_attempts,
+        routing_rules: dto.routing_rules.clone(),
         theme: dto.theme.clone(),
         language: dto.language.clone(),
         proxy_url: dto.proxy_url.clone(),
@@ -1665,9 +1823,13 @@ fn settings_to_dto(settings: &tianshu_relay_core::settings::Settings) -> Setting
         gateway_multi_site: settings.gateway_multi_site,
         collect_models: settings.collect_models,
         models_min_interval_secs: settings.models_min_interval_secs,
+        gateway_key_health_interval_secs: settings.gateway_key_health_interval_secs,
         gateway_lb_top_n: settings.gateway_lb_top_n,
         gateway_per_site_concurrency: settings.gateway_per_site_concurrency,
         gateway_per_site_rate_limit: settings.gateway_per_site_rate_limit,
+        gateway_per_site_burst: settings.gateway_per_site_burst,
+        gateway_max_attempts: settings.gateway_max_attempts,
+        routing_rules: settings.routing_rules.clone(),
         theme: settings.theme.clone(),
         language: settings.language.clone(),
         proxy_url: settings.proxy_url.clone(),
@@ -1857,11 +2019,13 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
         mode: "stopped".to_string(),
         candidates: Vec::new(),
         qps: 0.0,
+        uptime_secs: 0,
         requests_total: 0,
         inflight: 0,
         failovers_total: 0,
         last_error: None,
         generation: 0,
+        ewma_latency_ms: std::collections::BTreeMap::new(),
 
         tokens: tokens.clone(),
     };
@@ -1884,7 +2048,9 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
         .collect();
     let (ipv6_degraded, ipv6_note) = match &run.handle.ipv6 {
         tianshu_relay_core::gateway::Ipv6State::Listening => (false, None),
-        tianshu_relay_core::gateway::Ipv6State::Degraded { reason } => (true, Some(reason.clone())),
+        tianshu_relay_core::gateway::Ipv6State::Degraded { reason, .. } => {
+            (true, Some(reason.clone()))
+        }
     };
     if run.handle.alive() {
         let m = run.handle.metrics();
@@ -1918,6 +2084,12 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             .filter(|v| v.last_error.is_some())
             .max_by_key(|v| v.last_error_at.unwrap_or(0))
             .and_then(|v| v.last_error.clone());
+        // M46-S2：每站 EWMA（只有 Some 的站进 map；无样本的站不在 map 里）。
+        let ewma_latency_ms = m
+            .per_site
+            .iter()
+            .filter_map(|(site_id, v)| v.ewma_latency_ms.map(|ewma| (*site_id, ewma)))
+            .collect();
         GatewayStatusDto {
             running: true,
             phase: "running".to_string(),
@@ -1934,11 +2106,13 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             mode: if route_is_empty { "single" } else { "multi" }.to_string(),
             candidates,
             qps: m.qps,
+            uptime_secs: m.uptime_secs,
             requests_total: m.requests_total,
             inflight: m.inflight,
             failovers_total: m.failovers_total,
             last_error,
             generation: run.handle.generation(),
+            ewma_latency_ms,
 
             tokens,
         }
@@ -1962,11 +2136,13 @@ fn gateway_status_of(state: &AppState) -> GatewayStatusDto {
             mode: "stopped".to_string(),
             candidates: Vec::new(),
             qps: 0.0,
+            uptime_secs: 0,
             requests_total: 0,
             inflight: 0,
             failovers_total: 0,
             last_error: None,
             generation: 0,
+            ewma_latency_ms: std::collections::BTreeMap::new(),
 
             tokens,
         }
@@ -2006,6 +2182,41 @@ pub(crate) fn auto_start_target(
         .filter(|key| key.site_id == site.id && key.status == "enabled")
         .min_by_key(|key| key.id)?;
     Some((site.id, key.id))
+}
+
+/// auto-start 的**有序候选清单**（B-224 P2 修复）：首选是 [`auto_start_target`]，
+/// 其后是其余健康站点 / 启用密钥的组合（按站点 id、密钥 id 升序，去重）。
+///
+/// 此前选组本身有回退（上次组失效 ⇒ 第一个健康组），但**首选组启动失败**
+/// 后没有任何回退——只 eprintln 一句就结束，网关停在「未运行」。现在调用方
+/// 按此清单依次试启动，首个成功即停；全部失败才放弃（仍只试一轮，不循环）。
+pub(crate) fn auto_start_targets(
+    sites: &[tianshu_relay_core::service::SiteSummary],
+    keys: &[tianshu_relay_core::store::KeyRow],
+    last_site_id: i64,
+    last_key_id: i64,
+) -> Vec<(i64, i64)> {
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    if let Some(first) = auto_start_target(sites, keys, last_site_id, last_key_id) {
+        out.push(first);
+    }
+    let mut sites_sorted: Vec<&tianshu_relay_core::service::SiteSummary> =
+        sites.iter().filter(|site| site.health == "ok").collect();
+    sites_sorted.sort_by_key(|site| site.id);
+    for site in sites_sorted {
+        let mut site_keys: Vec<&tianshu_relay_core::store::KeyRow> = keys
+            .iter()
+            .filter(|key| key.site_id == site.id && key.status == "enabled")
+            .collect();
+        site_keys.sort_by_key(|key| key.id);
+        for key in site_keys {
+            let pair = (site.id, key.id);
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+    }
+    out
 }
 
 /// 设置变更需要网关做什么（M41-S1 §4.3 的纯函数，单测钉住矩阵）。
@@ -2181,21 +2392,18 @@ pub(crate) async fn start_gateway_locked(
         .await
         .map_err(|e| e.to_string())?;
     // M42-S1 §4.5：IPv6 降级必须**可见**——状态字段（`listenAddrs` / `ipv6Degraded`）之外，
-    // 再记一条 `Warn` 事件。payload **只含** port 与 kind（不放 reason 原文：
-    // 它可能带 OS 错误串，事件表只留可判定的事实）。
-    if let tianshu_relay_core::gateway::Ipv6State::Degraded { reason } = &handle.ipv6 {
-        let kind = if reason.contains("占用") {
-            "addr_in_use"
-        } else {
-            "unavailable"
-        };
+    // 再记一条 `Warn` 事件。payload **只含** port 与 kind，message 用固定文案：
+    // kind 直接取核心层在绑定失败时按 `ErrorKind` 定好的结构化分类
+    // （B-224 P2 修复；此前这里靠 `reason.contains("占用")` 反推 kind，且
+    // message 里还带了 reason 原文，与「事件表只留可判定事实」自述矛盾）。
+    if let tianshu_relay_core::gateway::Ipv6State::Degraded { kind, .. } = &handle.ipv6 {
         state
             .service
             .record_event(tianshu_relay_core::observability::event_with_payload(
                 tianshu_relay_core::observability::Level::Warn,
                 "gateway",
-                format!("网关 IPv6 回环未监听，仅监听 127.0.0.1：{reason}"),
-                serde_json::json!({ "port": handle.addr.port(), "kind": kind }),
+                "网关 IPv6 回环未监听，仅监听 127.0.0.1",
+                serde_json::json!({ "port": handle.addr.port(), "kind": kind.as_str() }),
             ));
     }
 
@@ -5661,6 +5869,28 @@ mod m41s1_tests {
         assert_eq!(auto_start_target(&sick, &keys, 2, 20), Some((1, 10)));
         // 0 = 无 ⇒ 直接兜底
         assert_eq!(auto_start_target(&sites, &keys, 0, 0), Some((1, 10)));
+    }
+
+    #[test]
+    fn auto_start_targets_lists_preferred_first_then_the_rest_in_order() {
+        let sites = vec![site(1, "ok"), site(2, "ok"), site(3, "error")];
+        let keys = vec![
+            key(10, 1, "enabled"),
+            key(11, 1, "enabled"),
+            key(20, 2, "enabled"),
+            key(30, 3, "enabled"),
+        ];
+        // 首选是上次组，其后按站点/密钥 id 升序，不含不健康站点。
+        assert_eq!(
+            auto_start_targets(&sites, &keys, 2, 20),
+            vec![(2, 20), (1, 10), (1, 11)]
+        );
+        // 无上次组时首选即第一个健康组，清单仍完整。
+        assert_eq!(
+            auto_start_targets(&sites, &keys, 0, 0),
+            vec![(1, 10), (1, 11), (2, 20)]
+        );
+        assert!(auto_start_targets(&[], &[], 0, 0).is_empty());
     }
 
     #[test]

@@ -68,6 +68,12 @@ impl KeychainVault {
 ///
 /// 刻意穷举匹配：`BadEncoding` / `BadDataFormat` 的载荷是密钥字节，
 /// 一旦用 `{:?}` 打印就会把密钥写进日志。
+///
+/// 平台说明（B-224 P3 / Linux 门禁）：生产调用点都在 `macos/windows`
+/// 的 impl 里，Linux 的 lib 目标上它只被测试用例调用，
+/// 因此非 macOS/Windows 的非测试编译会判 dead_code——这是平台条件造成
+/// 的，不是无用代码，故在此平台上放行该 lint。
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn describe(err: &keyring::Error) -> String {
     use keyring::Error as K;
     match err {

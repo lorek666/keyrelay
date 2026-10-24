@@ -288,6 +288,27 @@ CREATE TABLE IF NOT EXISTS site_bills(
   UNIQUE(site_id, day, source)
 );
 CREATE INDEX IF NOT EXISTS idx_site_bills_site_day ON site_bills(site_id, day DESC);
+-- M46-S5：站点 / key 硬预算（一行 = 一个预算）。
+-- key_id 为空 = 该站全部 key 合计；有值 = 该 key 单独的预算。
+-- period 只认 'day' | 'month'（写路径 validate，不靠 CHECK 约束兜底）。
+-- 站级与 key 级各一条部分唯一索引：SQLite 里 NULL 互不相等，一条
+-- UNIQUE(site_id, key_id, period) 拦不住站级重复行，必须分开写。
+CREATE TABLE IF NOT EXISTS site_budgets(
+  id INTEGER PRIMARY KEY,
+  site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  key_id INTEGER REFERENCES keys(id) ON DELETE CASCADE,
+  period TEXT NOT NULL,
+  limit_usd REAL NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_site_budgets_site_period
+  ON site_budgets(site_id, period) WHERE key_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_site_budgets_key_period
+  ON site_budgets(site_id, key_id, period) WHERE key_id IS NOT NULL;
+-- M46-S5：预算已花 SUM 的范围扫描索引不在这里（见 migrate）：预算查询按
+-- (site_id, at) / (key_id, at) 过滤，而老库在 DDL 阶段还没有 at / key_id 列
+-- （M40-S1 才补），放进 DDL 批会在老库上报 no such column（与 idx_gateway_usage_at
+-- 同一个坑），故与它并排、在补列之后建。
 "#;
 
 fn now_secs() -> i64 {
@@ -632,6 +653,19 @@ pub struct ModelPriceRow {
     pub created_at: i64,
 }
 
+/// M46-S5：一行站点 / key 硬预算（`site_budgets` 表的一行）。
+/// `key_id` 为 `None` = 该站全部 key 合计；有值 = 该 key 单独的预算。
+/// `period` 只认 `"day"` | `"month"`（写路径 validate，见 `budget_create`）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct SiteBudgetRow {
+    pub id: i64,
+    pub site_id: i64,
+    pub key_id: Option<i64>,
+    pub period: String,
+    pub limit_usd: f64,
+    pub created_at: i64,
+}
+
 /// M43-S2：一行站点自报账单。`amount` / `currency` 为 `None` = 站点没给（**不是 0**）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SiteBillRow {
@@ -733,6 +767,9 @@ pub struct Store {
     conn: Mutex<Connection>,
     /// 文件库的路径；内存库为 `None`。审计要用它定位 `*.db` / `-wal` / `-shm`。
     path: Option<std::path::PathBuf>,
+    /// 仅测试用：下一次 `update_gateway_token_hash` 强制失败（M41-S2 F-2 失败路径用例）。
+    /// 生产代码永不 arm；一次性，用后自动清零。
+    fail_next_token_hash_update: std::sync::atomic::AtomicBool,
 }
 
 /// `scheme://user:pass@host/...` 里的 `user:pass@host` 部分（**不含**路径 / query / fragment）。
@@ -948,6 +985,7 @@ impl Store {
         Ok(Self {
             conn: store.conn,
             path: Some(path.to_path_buf()),
+            fail_next_token_hash_update: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -963,6 +1001,7 @@ impl Store {
         let store = Self {
             conn: Mutex::new(conn),
             path: None,
+            fail_next_token_hash_update: std::sync::atomic::AtomicBool::new(false),
         };
         store.migrate()?;
         // P2-1：接线显示名 userinfo 剥离迁移（DEBUG-REPORT-v3 P2 #1）。
@@ -1051,6 +1090,19 @@ impl Store {
             [],
         )
         .map_err(|e| Error::Store(format!("建 gateway_usage_at 索引失败: {e}")))?;
+        // M46-S5：预算已花 SUM 的范围扫描索引。必须在 at / key_id 列补齐之后建
+        // （见 DDL 末尾注释）：老库的 DDL 阶段还没有这两列，放进 DDL 批会直接
+        // 让 migrate 在老库上失败（schema_v8 迁移测试即为此回归的哨兵）。
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gateway_usage_budget_site ON gateway_usage_log(site_id, at)",
+            [],
+        )
+        .map_err(|e| Error::Store(format!("建 gateway_usage_budget_site 索引失败: {e}")))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gateway_usage_budget_key ON gateway_usage_log(key_id, at)",
+            [],
+        )
+        .map_err(|e| Error::Store(format!("建 gateway_usage_budget_key 索引失败: {e}")))?;
         if version < 8 {
             // 一次性回填：旧行的 at 取 ts（**近似，不是观测**——当时没记完成时刻）。
             // 不回填成 0：否则看板会把旧账显示成 1970。
@@ -2258,7 +2310,20 @@ impl Store {
     }
 
     /// M41-S2 的轮换接口：**原地**改默认行的 hash（保留 id/label/created_at/is_default）。
+    /// 仅测试用：让下一次 `update_gateway_token_hash` 强制失败（M41-S2 F-2）。
+    /// 生产代码永不调用；一次性，用后自动清零。
+    pub fn fail_next_gateway_token_hash_update_for_test(&self) {
+        self.fail_next_token_hash_update
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn update_gateway_token_hash(&self, id: i64, token_hash: &str) -> Result<()> {
+        if self
+            .fail_next_token_hash_update
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Store("测试注入：令牌 hash 更新失败".to_string()));
+        }
         let conn = self.lock()?;
         conn.execute(
             "UPDATE gateway_tokens SET token_hash = ?2 WHERE id = ?1",
@@ -2577,6 +2642,268 @@ impl Store {
             .execute("DELETE FROM model_prices WHERE id = ?1", params![id])
             .map_err(|e| Error::Store(format!("删除模型单价失败: {e}")))?;
         Ok(affected > 0)
+    }
+
+    // ======================================================== M46-S5：站点 / key 硬预算
+    //
+    // 花销口径（spec §2）：主口径 = gateway_usage_log token 数 × model_prices
+    // USD 价格行，SQL 表达式与 usage_daily 的 USD 分组逐字同构（行级最新价版本、
+    // 每百万 token 单价、每行 ROUND 6 位后求和再 ROUND 6 位）。usage_samples
+    // 不用：只有 Sub2API 系写、cost 有「上报与否」问题、无币种列、日粒度快照。
+
+    /// 校验预算 period（store 层只认这两个值；网关侧枚举见 gateway::BudgetPeriod）。
+    fn validate_budget_period(period: &str) -> Result<()> {
+        if period != "day" && period != "month" {
+            return Err(Error::Store(format!(
+                "预算周期非法: {period}（只认 day / month）"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 建预算（validate 先行：周期枚举、上限有限且 > 0、站点存在、key 存在且属该站、
+    /// 重复 (site, key, period) 拒绝——唯一索引兜底，错误文案友好化，不抛 SQLite 原文）。
+    pub fn budget_create(
+        &self,
+        site_id: i64,
+        key_id: Option<i64>,
+        period: &str,
+        limit_usd: f64,
+    ) -> Result<i64> {
+        Self::validate_budget_period(period)?;
+        if !limit_usd.is_finite() || limit_usd <= 0.0 {
+            return Err(Error::Store(format!(
+                "预算上限非法: {limit_usd}（必须为有限正数）"
+            )));
+        }
+        if !self.list_sites()?.iter().any(|s| s.id == site_id) {
+            return Err(Error::Store(format!("预算站点不存在: {site_id}")));
+        }
+        if let Some(kid) = key_id {
+            match self.list_keys()?.iter().find(|k| k.id == kid) {
+                None => return Err(Error::Store(format!("预算密钥不存在: {kid}"))),
+                Some(row) if row.site_id != site_id => {
+                    return Err(Error::Store(format!("预算密钥 {kid} 不属于站点 {site_id}")));
+                }
+                _ => {}
+            }
+        }
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO site_budgets(site_id, key_id, period, limit_usd, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![site_id, key_id, period, limit_usd, now_secs()],
+        )
+        .map_err(|e| {
+            // M46-S5 复审 P2-1：不把 SQLite 原文拼进错误。唯一约束失败给友好
+            // 文案，其它写失败给通用文案——两者都不带 SQLite 原文，且不把
+            // 真实写失败误报成重复行（旧代码是把所有错误都拼成重复行文案）。
+            if matches!(
+                &e,
+                rusqlite::Error::SqliteFailure(err, _)
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation
+            ) {
+                Error::Store(
+                    "该站点/密钥该周期已有预算（同一站同一周期只能有一行站级预算、同一 key 只能有一行 key 级预算）"
+                        .to_string(),
+                )
+            } else {
+                Error::Store("写入预算失败".to_string())
+            }
+        })?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 全部预算行（按 id 升序；展示层按需再排）。
+    pub fn budget_list(&self) -> Result<Vec<SiteBudgetRow>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, site_id, key_id, period, limit_usd, created_at
+                 FROM site_budgets ORDER BY id ASC",
+            )
+            .map_err(|e| Error::Store(format!("prepare budget list: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SiteBudgetRow {
+                    id: row.get(0)?,
+                    site_id: row.get(1)?,
+                    key_id: row.get(2)?,
+                    period: row.get(3)?,
+                    limit_usd: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })
+            .map_err(|e| Error::Store(format!("query budget list: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("collect budget list: {e}")))
+    }
+
+    /// 删除预算行。不存在 -> Ok(false)，与 model_price_delete 同口径。
+    pub fn budget_delete(&self, id: i64) -> Result<bool> {
+        let conn = self.lock()?;
+        let affected = conn
+            .execute("DELETE FROM site_budgets WHERE id = ?1", params![id])
+            .map_err(|e| Error::Store(format!("删除预算失败: {e}")))?;
+        Ok(affected > 0)
+    }
+
+    /// 周期窗口（本地时区，unix 秒，左闭右开）。
+    ///
+    /// 与 `local_day_start` 同一条纪律：`date(...)` 给出本地日期串，SQLite 默认按
+    /// UTC 解释，`'utc'` 修饰符不能省；month 用 `'start of month','+1 month'`，
+    /// 不用起点 + 86400（夏令时切换日不是 86400 秒）。
+    pub fn budget_period_bounds(&self, period: &str) -> Result<(i64, i64)> {
+        Self::validate_budget_period(period)?;
+        let conn = self.lock()?;
+        let (start_sql, end_sql) = match period {
+            "day" => (
+                "strftime('%s', date('now','localtime'), 'utc')",
+                "strftime('%s', date('now','localtime','+1 day'), 'utc')",
+            ),
+            _ => (
+                "strftime('%s', date('now','localtime','start of month'), 'utc')",
+                "strftime('%s', date('now','localtime','start of month','+1 month'), 'utc')",
+            ),
+        };
+        conn.query_row(
+            &format!("SELECT CAST({start_sql} AS INTEGER), CAST({end_sql} AS INTEGER)"),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| Error::Store(format!("计算预算周期窗口失败: {e}")))
+    }
+
+    /// M46-S6：窗口内网关成本（USD）。SQL 逐字取自 S5 的 `budget_spent_usd`
+    /// 原实现（只把窗口起止从「当前周期」参数化为 `(start, end)`）；
+    /// 全仓库只有这一段定价 SQL 文本，`budget_spent_usd` 与对账共用它。
+    /// 行级关联「不晚于该行 at 的最新 USD 价格版本」，无价行 / CNY 价行因
+    /// INNER JOIN + currency='USD' 自然不计入（S5 已知漏口，不静默换算）。
+    /// `key_id` 为空的 legacy 行计入站级已花，key 级查询因 `u.key_id = ?`
+    /// 自然排除它们。错误文案沿用 S5 原文，使委托后的 `budget_spent_usd`
+    /// 对外可观测行为（签名、返回值、错误文案）不变。
+    pub fn gateway_cost_usd_in_window(
+        &self,
+        site_id: i64,
+        key_id: Option<i64>,
+        start: i64,
+        end: i64,
+    ) -> Result<f64> {
+        let conn = self.lock()?;
+        let mut sql = "SELECT COALESCE(ROUND(SUM(ROUND(
+                u.prompt_tokens / 1000000.0 * p.input_per_mtok
+              + u.completion_tokens / 1000000.0 * p.output_per_mtok, 6)), 6), 0)
+             FROM gateway_usage_log u
+             JOIN model_prices p
+               ON p.model = u.model AND p.currency = 'USD'
+              AND p.effective_from = (
+                    SELECT MAX(q.effective_from) FROM model_prices q
+                     WHERE q.model = u.model AND q.currency = 'USD'
+                       AND q.effective_from <= u.at
+                  )
+             WHERE u.at >= ?1 AND u.at < ?2 AND u.site_id = ?3"
+            .to_string();
+        if key_id.is_some() {
+            sql.push_str(" AND u.key_id = ?4");
+        }
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Store(format!("prepare budget spent: {e}")))?;
+        let spent: f64 = match key_id {
+            Some(kid) => stmt
+                .query_row(params![start, end, site_id, kid], |row| row.get(0))
+                .map_err(|e| Error::Store(format!("query budget spent: {e}")))?,
+            None => stmt
+                .query_row(params![start, end, site_id], |row| row.get(0))
+                .map_err(|e| Error::Store(format!("query budget spent: {e}")))?,
+        };
+        Ok(spent)
+    }
+
+    /// M46-S6：本地自然日 `[day 零点, day+1 零点)` 的 unix 秒窗口（左闭右开）。
+    ///
+    /// 与 `budget_period_bounds` 同一条纪律：`day` 是本地日期串，SQLite 默认按
+    /// UTC 解释，`'utc'` 修饰符不能省；`+1 day` 而不用起点 + 86400
+    /// （DST 日不是 86400 秒）。`day` 须为 `YYYY-MM-DD` 形，否则 Err
+    /// （fail loud：坏格式静默跳行会让坏数据在对账里隐身）。
+    pub fn local_day_bounds(&self, day: &str) -> Result<(i64, i64)> {
+        let bytes = day.as_bytes();
+        let shape_ok = bytes.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
+        if !shape_ok {
+            return Err(Error::Store(format!("非法本地日格式: {day}")));
+        }
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT CAST(strftime('%s', ?1, 'utc') AS INTEGER), \
+             CAST(strftime('%s', ?1, '+1 day', 'utc') AS INTEGER)",
+            params![day],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| Error::Store(format!("计算本地日窗口失败: {e}")))
+    }
+
+    /// M46-S6：窗口内有网关用量行的 `(site_id, 本地日)` 去重列表，
+    /// 本地日 = `date(at, 'unixepoch', 'localtime')`。
+    /// `site_id` 为空 = 全部站点；窗口 = 近 `days` 天（含今天），夹到 1..=90。
+    /// 窗口起止与 `site_bills(days)` 的 `local_day_ago(days-1)` 是同一组本地日。
+    pub fn gateway_usage_days(
+        &self,
+        site_id: Option<i64>,
+        days: i64,
+    ) -> Result<Vec<(i64, String)>> {
+        let days = clamp_usage_days(days);
+        let conn = self.lock()?;
+        let start = local_day_start(&conn, days - 1)?;
+        let end: i64 = conn
+            .query_row(
+                "SELECT CAST(strftime('%s', date('now','localtime','+1 day'), 'utc') AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Store(format!("计算本地日窗口失败: {e}")))?;
+        let mut sql = "SELECT DISTINCT site_id, date(at, 'unixepoch', 'localtime') AS d \
+             FROM gateway_usage_log WHERE at >= ?1 AND at < ?2"
+            .to_string();
+        if site_id.is_some() {
+            sql.push_str(" AND site_id = ?3");
+        }
+        sql.push_str(" ORDER BY site_id ASC, d ASC");
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Store(format!("prepare gateway usage days: {e}")))?;
+        let rows: Vec<(i64, String)> = match site_id {
+            Some(sid) => stmt
+                .query_map(params![start, end, sid], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|e| Error::Store(format!("query gateway usage days: {e}")))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::Store(format!("collect gateway usage days: {e}")))?,
+            None => stmt
+                .query_map(params![start, end], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| Error::Store(format!("query gateway usage days: {e}")))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::Store(format!("collect gateway usage days: {e}")))?,
+        };
+        Ok(rows)
+    }
+
+    /// 当期已花（USD）。M46-S6 起为委托版：`budget_period_bounds` 算窗口 +
+    /// `gateway_cost_usd_in_window` 算成本；SQL、签名、返回值、错误文案均不动。
+    ///
+    /// SQL 与 `usage_daily` 的 USD 分组逐字同构：行级关联「不晚于该行 at 的最新
+    /// USD 价格版本」，无价行 / CNY 价行因 INNER JOIN + currency='USD' 自然不计入
+    /// （已知漏口，见 spec §2.4，不静默换算）。`key_id` 为空的 legacy 行计入站级
+    /// 已花（属于该站），key 级查询因 `u.key_id = ?` 自然排除它们（无法归因）。
+    pub fn budget_spent_usd(&self, site_id: i64, key_id: Option<i64>, period: &str) -> Result<f64> {
+        let (start, end) = self.budget_period_bounds(period)?;
+        self.gateway_cost_usd_in_window(site_id, key_id, start, end)
     }
 
     // ======================================================== M43-S2：站点账单
@@ -4597,6 +4924,8 @@ mod tests {
             let conn = store.lock().unwrap();
             conn.execute_batch(
                 "DROP INDEX IF EXISTS idx_gateway_usage_at;
+                 DROP INDEX IF EXISTS idx_gateway_usage_budget_site;
+                 DROP INDEX IF EXISTS idx_gateway_usage_budget_key;
                  ALTER TABLE gateway_usage_log DROP COLUMN at;
                  ALTER TABLE gateway_usage_log DROP COLUMN key_id;
                  ALTER TABLE gateway_usage_log DROP COLUMN status;
@@ -4650,7 +4979,82 @@ mod tests {
     }
 
     #[test]
-    fn schema_v8_fresh_db_has_all_six_columns() {
+    // M43-S1 T4b（B-224 长尾）：**真 v8 夹具**——含 M40 六列、无令牌表、
+    // 无归因列、无 cost 标记，user_version = 8 ⇒ 打开后走 8→9→10。
+    // 区别于上面的 v7 夹具（v7 连 M40 六列都没有）和下面的 v10 新库用例。
+    fn schema_v9_migrates_v8_db_and_adds_token_tables() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("tianshu-relay.db");
+        let store = Store::open(&path).expect("建库");
+        let site_id = store
+            .upsert_site("newapi", "https://m40.example.com", "测试")
+            .expect("upsert_site");
+        {
+            let conn = store.lock().unwrap();
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_gateway_usage_token;
+                 ALTER TABLE gateway_usage_log DROP COLUMN token_id;
+                 ALTER TABLE gateway_usage_log DROP COLUMN agent_label;
+                 DROP TABLE IF EXISTS gateway_tokens;
+                 ALTER TABLE usage_samples DROP COLUMN cost_reported;
+                 PRAGMA user_version = 8;",
+            )
+            .expect("模拟 v8 老库");
+            conn.execute(
+                "INSERT INTO gateway_usage_log(ts, site_id, model, prompt_tokens, completion_tokens, total_tokens, at, key_id, status, latency_ms, attempts, stream) \
+                 VALUES (1700000000, ?1, 'legacy-v8', 3, 4, 7, 1700000000, NULL, 200, 33, 1, 0)",
+                params![site_id],
+            )
+            .expect("写一行 v8 旧数据");
+        }
+        drop(store);
+
+        let store = Store::open(&path).expect("重新打开 v8 旧库");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 10, "当前 schema 应为 v10");
+        // v9 产物：令牌表 + 归因两列。
+        let columns = usage_columns(&store);
+        for expected in ["token_id", "agent_label"] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "老库必须补出 {expected} 列"
+            );
+        }
+        {
+            let conn = store.lock().unwrap();
+            let table: String = conn
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='gateway_tokens'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("令牌表必须存在");
+            assert_eq!(table, "gateway_tokens");
+            let cost_col: String = conn
+                .query_row(
+                    "SELECT name FROM pragma_table_info('usage_samples') WHERE name='cost_reported'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("v10 的 cost_reported 列必须存在");
+            assert_eq!(cost_col, "cost_reported");
+            // 旧行保留：归因列取默认值（token_id NULL、agent_label ''），不丢账。
+            let row: (String, Option<i64>, String) = conn
+                .query_row(
+                    "SELECT model, token_id, agent_label FROM gateway_usage_log",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .expect("读旧行");
+            assert_eq!(row, ("legacy-v8".to_string(), None, String::new()));
+        }
+    }
+
+    #[test]
+    // B-224 P3（M43-S1 T4b 名实不符）：旧名写 v8、实际断言的是当前
+    // schema v10 的 15 列（其中 6 列是 M40 新增的），改名以免后人按
+    // 名去找一个不存在的 v8 夹具。
+    fn schema_v10_fresh_db_has_all_fifteen_columns() {
         let store = Store::open_in_memory().expect("内存库");
         assert_eq!(store.schema_version().unwrap(), 10);
         let columns = usage_columns(&store);
