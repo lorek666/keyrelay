@@ -120,6 +120,7 @@ impl FakeUpstream {
             rate: Some(rate),
             balance_usd: Some(10.0),
             latency_ms: Some(10),
+            timeout_ms: None,
         }
     }
 }
@@ -209,6 +210,7 @@ async fn start_routed_full(
         max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
         // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
         lb_top_n: 1,
+        max_attempts: 0,
         guard_policy: guard,
         runtime: None,
         on_failure: Some(Arc::new(move |f| {
@@ -252,6 +254,7 @@ fn dead_upstream(site_id: i64, key_ref: &str, rate: f64) -> Upstream {
         rate: Some(rate),
         balance_usd: Some(10.0),
         latency_ms: Some(10),
+        timeout_ms: None,
     }
 }
 
@@ -294,6 +297,7 @@ async fn route_and_keys_by_ref_must_agree() {
             max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
             // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
             lb_top_n: 1,
+            max_attempts: 0,
             guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
             runtime: None,
             on_failure: None,
@@ -800,6 +804,7 @@ async fn failure_event_scrubs_a_key_shaped_model() {
             max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
             // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
             lb_top_n: 1,
+            max_attempts: 0,
             guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
             runtime: None,
             on_failure: Some(Arc::new(move |f| {
@@ -1066,6 +1071,7 @@ async fn a_missing_plaintext_is_refused_at_startup() {
         max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
         // M39-S3：既有用例保持单候选（top_n=1）+ 默认 guard ⇒ 行为逐字不变
         lb_top_n: 1,
+        max_attempts: 0,
         guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
         runtime: None,
         on_failure: None,

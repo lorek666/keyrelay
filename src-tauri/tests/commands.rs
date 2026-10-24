@@ -2953,6 +2953,46 @@ fn m46s3_per_site_burst_round_trips_and_rejects_out_of_range() {
     );
 }
 
+/// M46-S4：`gatewayMaxAttempts` 的 DTO 双向直传 + 越界拒写（照 M46-S3 的 burst 用例）。
+#[test]
+fn m46s4_max_attempts_round_trips_and_rejects_out_of_range() {
+    let (_app, webview) = build_app();
+    let before = read_settings(&webview);
+    assert_eq!(
+        before["gatewayMaxAttempts"],
+        json!(0),
+        "max_attempts 默认 0 = 走全部候选"
+    );
+
+    let mut payload = before.clone();
+    payload["gatewayMaxAttempts"] = json!(2);
+    let result = invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": payload}}),
+    )
+    .expect("合法 max_attempts 应能保存");
+    assert_eq!(result["settings"]["gatewayMaxAttempts"], json!(2));
+    let read = read_settings(&webview);
+    assert_eq!(read["gatewayMaxAttempts"], json!(2), "写后读必须一致");
+
+    let mut bad = read.clone();
+    bad["gatewayMaxAttempts"] = json!(65);
+    let err = invoke_on(
+        &webview,
+        "update_settings",
+        json!({"args": {"settings": bad}}),
+    )
+    .expect_err("越界 max_attempts 必须被拒");
+    assert_not_acl_rejection("update_settings", &err);
+    let after = read_settings(&webview);
+    assert_eq!(
+        after["gatewayMaxAttempts"],
+        json!(2),
+        "越界值不得落库：{err}"
+    );
+}
+
 /// M41-S2 F-2：DB 写入失败 ⇒ 轮换命令报错、旧令牌仍 200、`tokenGraceUntil` 为空。
 ///
 /// 失败注入点：`Store::fail_next_gateway_token_hash_update_for_test`（一次性开关，

@@ -124,6 +124,7 @@ fn upstream(site_id: i64, base_url: &str, key_ref: &str) -> Upstream {
         rate: None,
         balance_usd: None,
         latency_ms: None,
+        timeout_ms: None,
     }
 }
 
@@ -163,6 +164,8 @@ fn base_config(
         max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
         // M39-S3：单候选 + 默认 guard（快照测试与负载均衡无关）
         lb_top_n: 1,
+        // M46-S4：机械补字段，行为不变（0 = 走全部候选）
+        max_attempts: 0,
         guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
         runtime: None,
     }

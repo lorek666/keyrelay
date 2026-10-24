@@ -91,6 +91,7 @@ fn routed_config(
             rate: None,
             balance_usd: Some(1.0),
             latency_ms: None,
+            timeout_ms: None,
         });
         keys.insert(
             (*key_ref).to_string(),
@@ -115,6 +116,7 @@ fn routed_config(
         upstream_proxy: None,
         legacy_key_ref: None,
         lb_top_n: 1,
+        max_attempts: 0,
         guard_policy: SiteGuardPolicy::default(),
         runtime: None,
         on_failure: None,

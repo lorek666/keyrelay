@@ -20,6 +20,7 @@ fn up(site_id: i64, rate: Option<f64>, balance: Option<f64>, latency: Option<u64
         rate,
         balance_usd: balance,
         latency_ms: latency,
+        timeout_ms: None,
     }
 }
 

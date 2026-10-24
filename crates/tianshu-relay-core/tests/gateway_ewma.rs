@@ -153,6 +153,7 @@ fn upstream(
         rate: Some(rate),
         balance_usd: Some(10.0),
         latency_ms,
+        timeout_ms: None,
     }
 }
 
@@ -180,6 +181,7 @@ fn config(
         route: RouteTable::new(route),
         breaker: BreakerPolicy::default(),
         lb_top_n: top_n,
+        max_attempts: 0,
         guard_policy: SiteGuardPolicy {
             max_concurrency: 0,
             rate_limit_per_sec: 0,

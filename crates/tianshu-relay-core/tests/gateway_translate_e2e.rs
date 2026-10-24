@@ -150,6 +150,7 @@ async fn start_routed(up: &FakeUpstream) -> GatewayHandle {
         rate: Some(1.0),
         balance_usd: Some(10.0),
         latency_ms: Some(1),
+        timeout_ms: None,
     }]);
     config.keys_by_ref = keys;
     config.breaker = BreakerPolicy {

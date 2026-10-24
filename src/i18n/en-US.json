@@ -1130,6 +1130,8 @@
     "maxRequestHint": "Limits the **request body** only (1–64 MiB). The response body cap is a fixed 64 MiB constant and is unrelated; changes apply the next time the gateway starts.",
     "perSiteBurstLabel": "Per-site rate-limit burst (0–10000, 0=off)",
     "perSiteBurstHint": "Only takes effect when the per-site per-second limit is greater than 0: the token bucket capacity becomes per-second limit + burst, so the first burst of requests is no longer killed by mistake; refill per second is still the per-second limit, so the long-term rate is unchanged. Applies the next time the gateway starts.",
+    "maxAttemptsLabel": "Max attempts per request (0–64, 0=walk all)",
+    "maxAttemptsHint": "0 = walk all candidates (today's behavior); greater than 0 caps each request at that many candidates, and once exceeded the last real error is returned without inventing a new one. Only actually-sent upstream attempts count; locally rejected candidates do not. Applies the next time the gateway starts.",
     "ipv6Degraded": "IPv6 loopback is not listening: {note} (only 127.0.0.1 is available; v4 is unaffected)",
     "batch": {
       "btn": "Re-point delivered channels at the gateway…",

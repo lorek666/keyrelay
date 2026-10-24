@@ -38,6 +38,8 @@ type Props = {
   maxRequestMib: number;
   /** 每站限流 burst（M46-S3）：令牌桶额外容量，0 = 关，0..=10000。 */
   perSiteBurst: number;
+  /** 每请求最多尝试候选数（M46-S4）：0 = 走全部候选，0..=64。 */
+  maxAttempts: number;
   onToggle: (enabled: boolean) => void;
   onPortChange: (port: number) => void;
   onMultiSiteChange: (enabled: boolean) => void;
@@ -45,6 +47,7 @@ type Props = {
   onModelsIntervalChange: (secs: number) => void;
   onMaxRequestMibChange: (mib: number) => void;
   onPerSiteBurstChange: (burst: number) => void;
+  onMaxAttemptsChange: (n: number) => void;
   /** 设置还没保存时提示用户先保存（端口要保存后才生效） */
   settingsDirty: boolean;
 };
@@ -155,6 +158,7 @@ export default function GatewayCard({
   modelsMinIntervalSecs,
   maxRequestMib,
   perSiteBurst,
+  maxAttempts,
   onToggle,
   onPortChange,
   onMultiSiteChange,
@@ -162,6 +166,7 @@ export default function GatewayCard({
   onModelsIntervalChange,
   onMaxRequestMibChange,
   onPerSiteBurstChange,
+  onMaxAttemptsChange,
   settingsDirty,
 }: Props) {
   const { t } = useTranslation();
@@ -574,6 +579,29 @@ export default function GatewayCard({
         />
       </label>
       <p className="muted">{t("gateway.perSiteBurstHint")}</p>
+
+      {/*
+        M46-S4：每请求最多尝试候选数。口径与 burst 输入框相同（受控 number，
+        越界/非整数不调 onChange，后端 validate 是第二道）；保存后下次启动网关生效。
+      */}
+      <label className="field">
+        <span>{t("gateway.maxAttemptsLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={0}
+          max={64}
+          step={1}
+          value={maxAttempts}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isInteger(n) && n >= 0 && n <= 64) {
+              onMaxAttemptsChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.maxAttemptsHint")}</p>
 
       {/* M40-S2：指标面板（**所有相位都渲染**；未运行时由面板自己显示一行占位）。 */}
       <GatewayMetricsPanel status={status.data} />
