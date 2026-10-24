@@ -11,7 +11,7 @@ import {
   Server,
   Settings as SettingsIcon,
 } from "lucide-react";
-import Overview from "./pages/Overview";
+import Cockpit from "./pages/Cockpit";
 import Usage from "./pages/Usage";
 import Sites from "./pages/Sites";
 import Keys from "./pages/Keys";
@@ -34,7 +34,7 @@ const NAV_GROUPS = [
 ] as const;
 
 const PAGES = [
-  { id: "overview", labelKey: "nav.overview", icon: LayoutDashboard, group: "nav.group.daily", render: () => <Overview /> },
+  { id: "cockpit", labelKey: "nav.cockpit", icon: LayoutDashboard, group: "nav.group.daily", render: () => <Cockpit /> },
   { id: "usage", labelKey: "nav.usage", icon: BarChart3, group: "nav.group.daily", render: () => <Usage /> },
   { id: "sites", labelKey: "nav.sites", icon: Server, group: "nav.group.asset", render: () => <Sites /> },
   { id: "keys", labelKey: "nav.keys", icon: KeyRound, group: "nav.group.asset", render: () => <Keys /> },
@@ -67,7 +67,7 @@ export default function App({ initialDict }: { initialDict?: Record<string, unkn
 
 function AppInner() {
   const { t } = useTranslation();
-  const [page, setPage] = useState<PageId>("overview");
+  const [page, setPage] = useState<PageId>("cockpit");
   const { data: info } = useQuery({ queryKey: ["app-info"], queryFn: appInfo });
   const current = PAGES.find((p) => p.id === page) ?? PAGES[0];
 
@@ -80,7 +80,7 @@ function AppInner() {
   }, []);
 
   return (
-    <div className="app">
+    <div className="app harmony">
       <aside className="sidebar">
         <div className="brand">
           <KeyRound size={18} aria-hidden />

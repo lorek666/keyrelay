@@ -27,6 +27,7 @@
       "system": "系统"
     },
     "overview": "总览",
+    "cockpit": "指挥舱",
     "sites": "站点",
     "keys": "密钥",
     "agents": "Agent 投递",
@@ -278,6 +279,9 @@
       "balance": "{site}: 已用 {used} {currency} / 剩余 {remaining}{delta}",
       "delta": "（{delta}）"
     }
+  },
+  "cockpit": {
+    "live": "实时"
   },
   "sites": {
     "title": "接入新站点",
