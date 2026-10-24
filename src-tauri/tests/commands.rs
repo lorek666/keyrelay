@@ -2249,21 +2249,38 @@ fn m43_t7_token_plaintext_never_reaches_events() {
     let plaintext = created["token"].as_str().expect("明文").to_string();
     let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
     let events = state.service.store().list_events(200).expect("事件");
-    // canary：扫描器必须能抓到「故意塞进去的副本」，否则下面的零命中是空转。
-    assert!(
-        events.iter().any(|_| true) || events.is_empty(),
-        "读事件不 panic"
-    );
     let haystack = events
         .iter()
         .map(|event| format!("{event:?}"))
         .collect::<Vec<_>>()
         .join("\n");
     assert!(!haystack.contains(&plaintext), "事件里不得出现令牌明文");
-    // canary 自检：同一个扫描函数对含明文的串必须命中。
+    // canary（B-224 P3 修复）：此前这里是恒真式
+    // `events.iter().any(|_| true) || events.is_empty()`，且「自检」只扫一个
+    // 现拼的字符串——扫描器根本没碰过事件表，零命中可能是空转。
+    // 现在**真的往事件表里塞一条带明文的行**（直接构造 Event 绕过
+    // scrub 构造器，模拟历史泄漏行），再用同一套「Debug 拼串 + contains」
+    // 扫表：必须命中，否则下面的「事件里无明文」断言没有证明力。
+    state
+        .service
+        .store()
+        .insert_event(&tianshu_relay_core::observability::Event {
+            ts: 1_700_000_000,
+            level: tianshu_relay_core::observability::Level::Warn,
+            source: "gateway".to_string(),
+            message: format!("canary 泄漏行 {plaintext}"),
+            payload: None,
+        })
+        .expect("写 canary 事件");
+    let events_after = state.service.store().list_events(200).expect("重读事件");
+    let haystack_after = events_after
+        .iter()
+        .map(|event| format!("{event:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        format!("prefix-{plaintext}-suffix").contains(&plaintext),
-        "扫描器必须能命中明文（证明不是空转）"
+        haystack_after.contains(&plaintext),
+        "同一扫描必须能命中事件表里故意塞的明文，否则零命中是空转"
     );
 }
 
@@ -2424,6 +2441,54 @@ fn m41s2_grace_zero_and_restart_kill_the_old_token() {
         health_status(port, &first_token),
         401,
         "重启后旧令牌必须 401"
+    );
+    assert_eq!(health_status(port, &current), 200, "重启后当前令牌可用");
+}
+
+/// B-224 P3（M41-S2 T-5 缺口）：grace>0 **进行中重启** ⇒ 旧令牌必须失效。
+/// 此前只有「grace 内不重启」（旧 200）与「grace=0 + 重启」（旧 401）两条
+/// 用例，宽限期「重启后是否还残留」恰好是未覆盖的组合——宽限是运行态，
+/// 重启后若旧令牌仍可用，就是一次未被守住的回归。
+#[test]
+fn m41s2_grace_positive_and_restart_kills_the_old_token() {
+    let (_app, webview) = build_app();
+    let (site, key_id) = seed_gateway_site(&webview);
+    let port = free_port();
+    enable_gateway(&webview, port);
+    let started = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("启动网关");
+    let first_token = started["token"].as_str().expect("令牌").to_string();
+
+    // 宽限 60 秒：轮换后旧令牌在宽限内仍可用（先复现不重启的基线）。
+    set_grace(&webview, 60);
+    let rotated = invoke_on(&webview, "gateway_rotate_token", json!({"args": null})).expect("轮换");
+    let new_token = rotated["token"].as_str().expect("新令牌").to_string();
+    assert_ne!(first_token, new_token, "必须是新令牌");
+    assert_eq!(
+        health_status(port, &first_token),
+        200,
+        "宽限内旧令牌应仍可用（重启前基线）"
+    );
+    assert_eq!(health_status(port, &new_token), 200);
+
+    // 重启（stop → start）：宽限是运行态，重启后旧令牌必然 401，
+    // 而网关本身仍可用（重启返回的当前令牌 200）。
+    invoke_on(&webview, "gateway_stop", json!({})).expect("停止");
+    let restarted = invoke_on(
+        &webview,
+        "gateway_start",
+        json!({"args": {"siteId": site, "keyId": key_id}}),
+    )
+    .expect("重启");
+    let current = restarted["token"].as_str().expect("重启后令牌").to_string();
+    assert_eq!(
+        health_status(port, &first_token),
+        401,
+        "grace>0 进行中重启后旧令牌必须 401（宽限不跨重启）"
     );
     assert_eq!(health_status(port, &current), 200, "重启后当前令牌可用");
 }

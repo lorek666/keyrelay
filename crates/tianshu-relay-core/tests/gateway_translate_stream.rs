@@ -238,3 +238,27 @@ fn two_tool_calls_across_multiple_deltas_start_once_each() {
     );
     assert_eq!(parts[1]["functionCall"]["args"]["b"], 2, "{v}");
 }
+
+// ---------------------------------------------------------------- B-224 P2：SSE 缓冲上限
+
+#[test]
+fn sse_decoder_flags_overflow_instead_of_growing_unbounded() {
+    use tianshu_relay_core::gateway::translate::stream::MAX_SSE_EVENT_BYTES;
+    let mut d = SseDecoder::new();
+    // 正常小事件不受影响
+    let evs = d.push(b"data: hi\n\n");
+    assert_eq!(evs.len(), 1);
+    assert!(!d.is_overflowed());
+    // 一个永不发空行的超大事件：分两次喂，跨过上限即溢出，缓冲被清空
+    let big = vec![b'x'; MAX_SSE_EVENT_BYTES + 1];
+    let evs = d.push(&big);
+    assert!(evs.is_empty(), "超限事件不应产出半截事件");
+    assert!(
+        d.is_overflowed(),
+        "超 1 MiB 且无空行 ⇒ 必须记溢出（调用方据此发 error 关闭）"
+    );
+    // 溢出后仍可继续解新事件（缓冲已清空，不会把旧垃圾拼进来）
+    let evs = d.push(b"data: ok\n\n");
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0].data, "ok");
+}

@@ -965,13 +965,43 @@ fn sanitize_metric_error(reason: &str) -> String {
     crate::redact::scrub(&out).chars().take(200).collect()
 }
 
+/// IPv6 降级原因的**结构化分类**（B-224 P2 修复）。
+///
+/// 分类必须在 v6 绑定失败的那一刻、按 `std::io::ErrorKind` 定下来，
+/// 绝不能事后靠「原因文案里含不含『占用』」反推——OS 文案会随平台 /
+/// 语言环境变化，反推一变就误分类。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ipv6DegradedKind {
+    /// v6 端口被占用。
+    AddrInUse,
+    /// v6 不可用（不支持 / 地址不可用等其他绑定失败）。
+    Unavailable,
+    /// port 0 测试路径：内核分配端口，主动跳过 v6。
+    Skipped,
+}
+
+impl Ipv6DegradedKind {
+    /// 事件 payload / 指标里用的稳定字符串（与任何 OS 文案无关）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Ipv6DegradedKind::AddrInUse => "addr_in_use",
+            Ipv6DegradedKind::Unavailable => "unavailable",
+            Ipv6DegradedKind::Skipped => "skipped",
+        }
+    }
+}
+
 /// IPv6 回环监听状态（M42-S1 §4.5）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ipv6State {
     /// `[::1]:port` 已监听。
     Listening,
-    /// 未监听，附原因（OS 不支持 / 端口被占用 / port 0 测试路径）。
-    Degraded { reason: String },
+    /// 未监听：`kind` 是结构化分类（调用方按它判，不解析文案）；
+    /// `reason` 是**固定文案**，不含任何 OS 错误原文（事件表只留可判定事实）。
+    Degraded {
+        reason: String,
+        kind: Ipv6DegradedKind,
+    },
 }
 
 /// v6 绑定的测试注入模式（`#[doc(hidden)]`，只给集成测试用）。
@@ -1013,11 +1043,14 @@ pub struct GatewayMetricsSnapshot {
     pub per_site: std::collections::BTreeMap<i64, SiteMetrics>,
 }
 
-/// 60 个 1 秒槽的 QPS 环。
+/// 60 个 1 秒槽的 QPS 环（真正的滑动窗口，M40-S2 P2-3 修复）。
 #[derive(Debug)]
 struct QpsRing {
     slots: [u64; 60],
-    epoch: Option<Instant>,
+    /// 样本窗口的起点：连续流量下**不重置**（只在空闲 ≥60s 后重置，见下）。
+    started: Option<Instant>,
+    /// 上次推进的时刻：槽位老化按「距上次推进」算，而不是「距起点」。
+    last: Option<Instant>,
     current: usize,
 }
 
@@ -1025,7 +1058,8 @@ impl Default for QpsRing {
     fn default() -> Self {
         Self {
             slots: [0; 60],
-            epoch: None,
+            started: None,
+            last: None,
             current: 0,
         }
     }
@@ -1033,18 +1067,23 @@ impl Default for QpsRing {
 
 impl QpsRing {
     /// 推进到 `now` 对应的槽（按 `Instant`，系统改墙钟不影响）。
+    ///
+    /// 此前实现按「距起点 elapsed」算目标槽，连续流量下每过 60s 就
+    /// `elapsed / 60 > 0` ⇒ **整环清零**：QPS 在每分钟边界掉到 0，
+    /// 所谓「滑动窗口」实际是翻滚窗口（M40-S2 复审 P2-3 属实）。
+    /// 现在老化只清「上次推进以来经过的槽」：连续流量下每次推进
+    /// 最多清 59 个槽，60s 前的旧槽逐个过期、新槽正常计入；
+    /// 只有空闲 ≥60s（全部槽都已过期）时才整环清零并重置起点。
     fn advance(&mut self, now: Instant) {
-        let epoch = *self.epoch.get_or_insert(now);
-        let elapsed = now.saturating_duration_since(epoch).as_secs() as usize;
-        let target = elapsed % 60;
-        if elapsed / 60 > 0 {
-            // 跨过整圈：全部清零（保守：宁可少算，也不把一圈前的数当现在）
+        self.started.get_or_insert(now);
+        let last = self.last.replace(now).unwrap_or(now);
+        let elapsed = now.saturating_duration_since(last).as_secs() as usize;
+        if elapsed >= 60 {
             self.slots = [0; 60];
-            self.current = target;
-            self.epoch = Some(now - std::time::Duration::from_secs((elapsed % 60) as u64));
+            self.started = Some(now);
             return;
         }
-        while self.current != target {
+        for _ in 0..elapsed {
             self.current = (self.current + 1) % 60;
             self.slots[self.current] = 0;
         }
@@ -1054,12 +1093,16 @@ impl QpsRing {
         self.slots[self.current] += 1;
     }
     fn qps(&self) -> f64 {
+        self.qps_at(Instant::now())
+    }
+    /// 可注入时刻的版本（单测用真实 `Instant` 无法等 60s，故拆出来）。
+    fn qps_at(&self, now: Instant) -> f64 {
         let sum: u64 = self.slots.iter().sum();
-        let epoch = match self.epoch {
-            Some(e) => e,
+        let started = match self.started {
+            Some(s) => s,
             None => return 0.0,
         };
-        let uptime = epoch.elapsed().as_secs();
+        let uptime = now.saturating_duration_since(started).as_secs();
         if uptime < 3 {
             return 0.0;
         }
@@ -1125,11 +1168,15 @@ impl GatewayMetrics {
     }
 
     /// 一次失败（原因先剥 URL，再 scrub + 截断；M40-S2 复审 P1）。
+    ///
+    /// **不加 `requests`**（B-224 P2 修复）：`requests` 的口径是「一次上游尝试」，
+    /// 由 `record_attempt` 在尝试发生时记一次；失败路径若再 +1，一次失败尝试
+    /// 会被计两遍。`record_failure` 只记失败元数据（状态 / 原因 / 时间），
+    /// 未实际尝试的失败（熔断中、不可发送候选）因此也不虚增尝试数。
     fn record_failure(&self, site_id: i64, status: u16, reason: &str) {
         let cleaned = sanitize_metric_error(reason);
         if let Ok(mut map) = self.per_site.lock() {
             let e = map.entry(site_id).or_default();
-            e.requests += 1;
             e.last_status = Some(status);
             e.last_error = Some(cleaned);
             e.last_error_at = Some(now_unix_secs());
@@ -1319,6 +1366,11 @@ impl GatewayHandle {
     pub fn set_tokens(&self, entries: Vec<GatewayTokenEntry>) {
         if let Ok(mut guard) = self.tokens.write() {
             *guard = entries;
+        } else {
+            // B-224 P3：此前锁中毒时静默保留旧集合、无任何日志——网关跑着
+            // 旧令牌集，排障时没有任何线索。可用性仍优先（不因此停网关），
+            // 但必须留下一行可查的记录。
+            eprintln!("[tianshu-relay] 播种网关令牌集合失败：令牌锁已中毒，保留旧集合");
         }
     }
 
@@ -1408,14 +1460,21 @@ async fn bind_ipv6(port: u16) -> std::io::Result<tokio::net::TcpListener> {
 }
 
 /// v6 失败一律降级（M42-S1 §4.5 / Lead 裁决 2）：**IPv6 永远不阻断 v4**。
+///
+/// 分类与文案都在此处一次定死：`kind` 按 `ErrorKind` 分，`reason` 用固定
+/// 文案——**不把 `{error}` 的 OS 原文塞进 reason**（B-224 P2 修复；此前
+/// 非占用分支的 reason 带 OS 原文，事件 message 因此与「不放原文」的
+/// 注释自述矛盾，且调用方只能靠中文子串反推 kind）。
 fn classify_ipv6_error(error: &std::io::Error) -> Ipv6State {
     if error.kind() == std::io::ErrorKind::AddrInUse {
         Ipv6State::Degraded {
             reason: "IPv6 回环端口被占用，仅监听 127.0.0.1".to_string(),
+            kind: Ipv6DegradedKind::AddrInUse,
         }
     } else {
         Ipv6State::Degraded {
-            reason: format!("IPv6 回环不可用，仅监听 127.0.0.1：{error}"),
+            reason: "IPv6 回环不可用，仅监听 127.0.0.1".to_string(),
+            kind: Ipv6DegradedKind::Unavailable,
         }
     }
 }
@@ -1577,6 +1636,7 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
             None,
             Ipv6State::Degraded {
                 reason: "端口 0 由内核分配，跳过 IPv6 监听（仅测试路径）".to_string(),
+                kind: Ipv6DegradedKind::Skipped,
             },
         )
     } else {
@@ -2433,8 +2493,9 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     // 根因却是密钥映射空着——**没有任何线索**。
     //
     // **只在失败路径上报**（即上面那个 `for` 没有 `return`）。理由不是省事：
-    // `report_failure` 同时**喂熔断**，而「某个候选被跳过」在请求**成功**时不是故障——
-    // 若那时也上报，一个长期缺明文的候选会把熔断喂开，进而影响别的判断。
+    // 「某个候选被跳过」在请求**成功**时不是故障——若那时也上报，一个长期
+    // 缺明文的候选会污染失败信号。且本循环走**不喂熔断**的版本（B-224 P2）：
+    // 不可发送是配置问题，不是上游故障，绝不能因此把站点熔断。
     // 契约的原话是「不得静默 **502**」，指的正是这条路径。
     //
     // 文案区分两种原因（缺明文 / 已回收），但**都不写 `key_ref` 原文**：
@@ -2444,11 +2505,6 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         .filter(|c| !is_sendable(&state, view.keys(), c.upstream))
     {
         let upstream = cand.upstream;
-        let key = if event_model.is_empty() {
-            site_key(upstream.site_id)
-        } else {
-            model_key(upstream.site_id, &event_model)
-        };
         let (status, reason) = if is_revoked(&state, upstream) {
             (0u16, "该密钥已被回收，不再使用")
         } else {
@@ -2460,15 +2516,11 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         if last_error.is_none() {
             last_error = Some(format!("上游站点 {}: {reason}", upstream.site_id));
         }
-        report_failure(
-            &state,
-            &key,
-            upstream.site_id,
-            status,
-            &event_model,
-            reason,
-            Instant::now(),
-        );
+        // B-224 P2：不可发送是**配置问题**（缺明文 / 已回收），不是上游故障，
+        // 走不喂熔断的版本——否则一个长期缺明文的候选会把整个站点熔断。
+        // （注意：这里不用 `report_event_only` 而是用带指标的版本，否则这类
+        // 失败在 per_site 指标里连最后错误都看不到。）
+        report_failure_without_breaker(&state, upstream.site_id, status, &event_model, reason);
     }
 
     local_error(
@@ -2845,9 +2897,31 @@ fn streaming_translate_response(
         let mut saw_done = false;
 
         loop {
-            match upstream.chunk().await {
+            // B-224 P2：同时等客户端断开——上游停顿时不等 read_timeout，
+            // 断开即退出、lease 随 `_lease` drop 归还。`tx.closed()` 在接收端
+            // 全部 drop 时完成；下面各分支里 `tx.send` 失败才发现断开的
+            // 旧路径仍保留（双重保障）。
+            tokio::select! {
+                _ = tx.closed() => {
+                    return;
+                }
+                result = upstream.chunk() => {
+                    match result {
                 Ok(Some(chunk)) => {
                     let events = dec.push(&chunk);
+                    // B-224 P2：单个 SSE 事件超 1 MiB ⇒ 畸形流，发 error 关闭，
+                    // 不继续缓冲（否则上游永不发空行即可无界涨内存）。
+                    if dec.is_overflowed() {
+                        let frame = format!(
+                            "event: error\ndata: {}\n\n",
+                            serde_json::json!({
+                                "type": "error",
+                                "error": { "type": "upstream_error", "message": "上游 SSE 事件超过上限" }
+                            })
+                        );
+                        let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
+                        return;
+                    }
                     for e in &events {
                         // P2（复审）：`[DONE]` 之外、解析不出增量的事件 ⇒ 明确报错并关闭，
                         // 不静默跳过（静默跳过 = 客户端拿到残缺回答却以为完整）。
@@ -2937,6 +3011,8 @@ fn streaming_translate_response(
                     );
                     let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
                     return;
+                }
+                    }
                 }
             }
         }
@@ -3106,6 +3182,24 @@ fn report_failure(
     if let Ok(mut guard) = state.breaker.lock() {
         guard.record_failure(key, now);
     }
+    report_event_only(state, site_id, status, model, reason);
+}
+
+/// 记一次**配置类**失败：记指标 + 上报事件，**不喂熔断**（B-224 P2 修复）。
+///
+/// 与 [`report_failure`] 的唯一区别就是不碰熔断：缺明文 / 已回收这类本地
+/// 配置问题不是上游故障，喂熔断会把站点熔断、进而影响后续正常请求。
+/// 指标仍要记（`record_failure` 现在只记失败元数据、不加尝试数），
+/// 否则这类失败在指标里完全不可见。
+#[allow(clippy::too_many_arguments)]
+fn report_failure_without_breaker(
+    state: &AppState,
+    site_id: i64,
+    status: u16,
+    model: &str,
+    reason: &str,
+) {
+    state.metrics.record_failure(site_id, status, reason);
     report_event_only(state, site_id, status, model, reason);
 }
 
@@ -3307,6 +3401,49 @@ mod tests {
         assert!(cleaned.contains("<url>"), "{cleaned}");
         assert!(cleaned.contains("传输层失败"), "{cleaned}");
         assert!(!cleaned.contains("sk-secret"), "{cleaned}");
+    }
+
+    /// M40-S2 P2-3（B-224 待验证项，实测属实后修复）：QPS 环必须是
+    /// 滑动窗口——连续流量跨过 60s 边界时，60s 内的样本不得被整环清零。
+    #[test]
+    fn qps_ring_is_sliding_not_tumbling_across_the_60s_boundary() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut ring = QpsRing::default();
+        for _ in 0..10 {
+            ring.bump(t0);
+        }
+        for _ in 0..10 {
+            ring.bump(t0 + Duration::from_secs(30));
+        }
+        // 连续流量：t0 的 10 次在 t0+61 时已过期（>60s），但 t0+30 的
+        // 10 次仍在窗口内 ⇒ 和为 10，分母 clamp 到 60。
+        for _ in 0..10 {
+            ring.bump(t0 + Duration::from_secs(61));
+        }
+        let qps = ring.qps_at(t0 + Duration::from_secs(61));
+        assert!(
+            (qps - 20.0 / 60.0).abs() < 1e-9,
+            "滑动窗口下 t0+61 的 QPS 应为 20/60，实测 {qps}（翻滚实现会清零到 10/60 以下）"
+        );
+    }
+
+    #[test]
+    fn qps_ring_resets_after_a_full_idle_window() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut ring = QpsRing::default();
+        ring.bump(t0);
+        // 空闲 ≥60s 后再来：旧样本全部过期，起点重置，<3s 内仍按
+        // 样本不足判 0（与 M40-S2 §6.3 的守则一致）。
+        ring.bump(t0 + Duration::from_secs(120));
+        assert_eq!(ring.qps_at(t0 + Duration::from_secs(120)), 0.0);
+        ring.bump(t0 + Duration::from_secs(121));
+        let qps = ring.qps_at(t0 + Duration::from_secs(124));
+        assert!(
+            (qps - 2.0 / 4.0).abs() < 1e-9,
+            "空闲重置后窗口应只含新样本：2/4，实测 {qps}"
+        );
     }
 
     /// 无 URL 的原因原样保留（除了 scrub 既有规则）。
@@ -3896,6 +4033,7 @@ mod tests {
             addrs: vec![addr],
             ipv6: Ipv6State::Degraded {
                 reason: "单测：未监听 v6".to_string(),
+                kind: Ipv6DegradedKind::Unavailable,
             },
             token: "t".into(),
             site_display_name: "已停的站点".into(),
