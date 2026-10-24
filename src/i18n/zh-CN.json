@@ -32,8 +32,7 @@
     "cost": "成本",
     "health": "健康",
     "assets": "资产",
-    "agents": "Agent 投递",
-    "history": "变更历史",
+    "delivery": "投递",
     "settings": "设置"
   },
   "usage": {
