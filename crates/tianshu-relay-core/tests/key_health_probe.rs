@@ -12,7 +12,7 @@ use tianshu_relay_core::routing::{BreakerPolicy, RouteTable, SiteGuardPolicy, Up
 fn upstream(site_id: i64, key_ref: &str) -> Upstream {
     Upstream {
         site_id,
-        base_url: format!("http://127.0.0.1:9"),
+        base_url: "http://127.0.0.1:9".to_string(),
         key_ref: key_ref.to_string(),
         key_id: Some(site_id),
         models: vec!["gpt-4o".to_string()],
