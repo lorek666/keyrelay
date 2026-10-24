@@ -1002,6 +1002,7 @@ export default function SettingsPage() {
             maxRequestMib={draft.gatewayMaxRequestMib}
             perSiteBurst={draft.gatewayPerSiteBurst}
             maxAttempts={draft.gatewayMaxAttempts}
+            routingRules={draft.routingRules}
             onToggle={(enabled) => setDraft({ ...draft, gatewayEnabled: enabled })}
             onPortChange={(port) => setDraft({ ...draft, gatewayPort: port })}
             onMultiSiteChange={(multiSite) =>
@@ -1021,6 +1022,9 @@ export default function SettingsPage() {
             }
             onMaxAttemptsChange={(gatewayMaxAttempts) =>
               setDraft({ ...draft, gatewayMaxAttempts })
+            }
+            onRoutingRulesChange={(routingRules) =>
+              setDraft({ ...draft, routingRules })
             }
             settingsDirty={dirty}
           />

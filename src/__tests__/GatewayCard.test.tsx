@@ -60,6 +60,8 @@ function renderCard(
     onPerSiteBurstChange?: (burst: number) => void;
     maxAttempts?: number;
     onMaxAttemptsChange?: (n: number) => void;
+    routingRules?: string;
+    onRoutingRulesChange?: (text: string) => void;
   } = {},
 ) {
   const qc = new QueryClient({
@@ -82,6 +84,7 @@ function renderCard(
       maxRequestMib={over.maxRequestMib ?? 16}
       perSiteBurst={over.perSiteBurst ?? 0}
       maxAttempts={over.maxAttempts ?? 0}
+      routingRules={over.routingRules ?? ""}
       onToggle={vi.fn()}
       onPortChange={vi.fn()}
       onMultiSiteChange={vi.fn()}
@@ -90,6 +93,7 @@ function renderCard(
       onMaxRequestMibChange={over.onMaxRequestMibChange ?? vi.fn()}
       onPerSiteBurstChange={over.onPerSiteBurstChange ?? vi.fn()}
       onMaxAttemptsChange={over.onMaxAttemptsChange ?? vi.fn()}
+      onRoutingRulesChange={over.onRoutingRulesChange ?? vi.fn()}
       settingsDirty={false}
     />,
     { wrapper },
@@ -247,6 +251,24 @@ describe("M42-S1：监听地址 / IPv6 降级 / 请求体上限", () => {
     fireEvent.change(input, { target: { value: "5" } });
     expect(onChange).toHaveBeenCalledTimes(1);
     expect(onChange).toHaveBeenCalledWith(5);
+  });
+
+  it("M46-S7 routingRules：文本域输入直传回调（前端不解析）", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(status({ phase: "stopped" }));
+    const onChange = vi.fn();
+    renderCard({ routingRules: "", onRoutingRulesChange: onChange });
+    const input = screen.getByLabelText(
+      zhCN.gateway.routingRulesLabel,
+    ) as HTMLTextAreaElement;
+    expect(input.value).toBe("");
+    const text = '[{"agentLabel": "codex", "siteIds": [1, 2]}]';
+    fireEvent.change(input, { target: { value: text } });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith(text);
+    // 非法 JSON 也不在前端拦截：解析权威在后端 validate。
+    fireEvent.change(input, { target: { value: "{not json" } });
+    expect(onChange).toHaveBeenCalledTimes(2);
+    expect(onChange).toHaveBeenCalledWith("{not json");
   });
 });
 

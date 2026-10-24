@@ -217,6 +217,7 @@ fn routed_config(upstreams: Vec<Upstream>, keys: &[(&str, &str)], port: u16) -> 
         on_usage: None,
         budget_check: None,
         on_budget_breach: None,
+        routing_rules: Vec::new(),
         upstream_proxy: None,
         legacy_key_ref: None,
         max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,

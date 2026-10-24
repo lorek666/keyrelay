@@ -123,6 +123,7 @@ fn routed_config(
         on_usage: None,
         budget_check: None,
         on_budget_breach: None,
+        routing_rules: Vec::new(),
     }
 }
 

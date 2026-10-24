@@ -81,6 +81,8 @@ const KEY_GATEWAY_PER_SITE_RATE_LIMIT: &str = "gateway_per_site_rate_limit";
 const KEY_GATEWAY_PER_SITE_BURST: &str = "gateway_per_site_burst";
 // M46-S4：每请求最多尝试候选数（0 = 走全部候选，即今天行为）
 const KEY_GATEWAY_MAX_ATTEMPTS: &str = "gateway_max_attempts";
+// M46-S7：按 agent 路由规则 JSON（空 = 无规则；schema 见 routing.rs）。
+const KEY_ROUTING_RULES: &str = "routing_rules";
 const KEY_THEME: &str = "theme";
 const KEY_LANGUAGE: &str = "language";
 const KEY_PROXY_URL: &str = "proxy_url";
@@ -151,6 +153,10 @@ pub struct Settings {
     /// 每请求最多尝试的候选数（M46-S4）：**默认 0（走全部候选，即今天行为）**，
     /// 范围 `0..=64`。只计实际发出去的上游尝试，本地保护拒绝的候选不计。
     pub gateway_max_attempts: usize,
+    /// 按 agent 路由规则 JSON（M46-S7）：**默认空（无规则，走全局加权）**。
+    /// Schema 见 `crate::routing::parse_routing_rules`；非法值由 `validate` 拒绝，
+    /// 不落库。保存后下次启动网关生效。
+    pub routing_rules: String,
 
     // ---- M6-S5：FR-9 界面与隐私 ----
     /// 主题：`system` / `light` / `dark`。
@@ -236,6 +242,8 @@ impl Default for Settings {
             gateway_per_site_burst: 0,
             // M46-S4：0 = 走全部候选（默认行为与今天逐字相同）。
             gateway_max_attempts: 0,
+            // M46-S7：空 = 无规则（默认行为与今天逐字相同）。
+            routing_rules: String::new(),
 
             theme: "system".to_string(),
             language: "zh-CN".to_string(),
@@ -333,6 +341,13 @@ impl Settings {
             return Err(Error::Store(format!(
                 "每请求最多尝试候选数必须在 0..={GATEWAY_MAX_ATTEMPTS_MAX} 之间（0 = 走全部候选）"
             )));
+        }
+        // M46-S7：路由规则写路径校验（非法 ⇒ Err 且不落库；空 = 无规则，直接放行）。
+        // 解析权威在 routing.rs；这里只转译错误，不复写 schema。
+        if !self.routing_rules.trim().is_empty() {
+            if let Err(reason) = crate::routing::parse_routing_rules(&self.routing_rules) {
+                return Err(Error::Store(format!("路由规则无效：{reason}")));
+            }
         }
         if !THEMES.contains(&self.theme.as_str()) {
             return Err(Error::Store(format!(
@@ -441,6 +456,8 @@ impl Settings {
             "gateway_per_site_rate_limit": self.gateway_per_site_rate_limit,
             "gateway_per_site_burst": self.gateway_per_site_burst,
             "gateway_max_attempts": self.gateway_max_attempts,
+            // M46-S7：只报配没配，不报全文（与 proxy_url 全文不进快照同理）。
+            "routing_rules_configured": !self.routing_rules.trim().is_empty(),
             "theme": self.theme,
             "language": self.language,
             "telemetry_enabled": self.telemetry_enabled,
@@ -625,6 +642,12 @@ impl Settings {
                         }
                     }
                 }
+                // M46-S7：规则 JSON 原样收下（解析只在 validate 与 gateway_config 做；
+                // from_pairs 的「非法项退回默认」口径不适用于整串 JSON——非法串的
+                // 唯一 gate 是 validate）。
+                KEY_ROUTING_RULES => {
+                    settings.routing_rules = value.to_string();
+                }
                 KEY_THEME => {
                     if THEMES.contains(&value) {
                         settings.theme = value.to_string();
@@ -781,6 +804,7 @@ impl Settings {
                 KEY_GATEWAY_MAX_ATTEMPTS,
                 self.gateway_max_attempts.to_string(),
             ),
+            (KEY_ROUTING_RULES, self.routing_rules.clone()),
             (KEY_THEME, self.theme.clone()),
             (KEY_LANGUAGE, self.language.clone()),
             (KEY_PROXY_URL, self.proxy_url.clone()),
@@ -820,7 +844,7 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 34] = [
+    pub const KEYS: [&'static str; 35] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
@@ -841,6 +865,7 @@ impl Settings {
         KEY_GATEWAY_PER_SITE_RATE_LIMIT,
         KEY_GATEWAY_PER_SITE_BURST,
         KEY_GATEWAY_MAX_ATTEMPTS,
+        KEY_ROUTING_RULES,
         KEY_THEME,
         KEY_LANGUAGE,
         KEY_PROXY_URL,
@@ -1187,6 +1212,7 @@ mod tests {
             gateway_per_site_rate_limit: 0,
             gateway_per_site_burst: 0,
             gateway_max_attempts: 0,
+            routing_rules: String::new(),
             theme: "dark".to_string(),
             language: "en-US".to_string(),
             proxy_url: "socks5://127.0.0.1:1080".to_string(),
@@ -1392,5 +1418,37 @@ mod tests {
         let pairs = wanted.to_pairs();
         let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
         assert_eq!(Settings::from_pairs(borrowed), wanted);
+    }
+
+    #[test]
+    fn routing_rules_validate_and_round_trip_through_pairs() {
+        let good = Settings {
+            routing_rules: r#"[{"agentLabel": "codex", "siteIds": [1, 2]}]"#.to_string(),
+            ..Settings::default()
+        };
+        assert!(good.validate().is_ok(), "合法规则应当通过 validate");
+        let pairs = good.to_pairs();
+        let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(
+            Settings::from_pairs(borrowed),
+            good,
+            "规则 JSON 经 pairs 往返不变"
+        );
+        let missing = Settings::from_pairs(Vec::<(&str, &str)>::new());
+        assert_eq!(missing.routing_rules, "", "缺失键 ⇒ 默认空（无规则）");
+        for bad in [
+            "{not json",
+            r#"[{"agentLabel": "a", "siteIds": []}]"#,
+            r#"[{"agentLabel": "a", "siteIds": [1]}, {"agentLabel": "a", "siteIds": [2]}]"#,
+        ] {
+            let settings = Settings {
+                routing_rules: bad.to_string(),
+                ..Settings::default()
+            };
+            assert!(
+                matches!(settings.validate(), Err(Error::Store(_))),
+                "非法规则必须被 validate 拒绝：{bad}"
+            );
+        }
     }
 }

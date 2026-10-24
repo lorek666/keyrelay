@@ -595,6 +595,12 @@ pub struct GatewayConfig {
     /// M46-S5：超预算回调注入出口。网关只在循环里首次遇到某 breach 时调一次
     /// （同一请求内同一 breach 去重，见代理循环）；`None` = 不回调。
     pub on_budget_breach: Option<BudgetBreachSink>,
+    /// M46-S7：按 agent 路由规则（启动时快照，见 `service::gateway_config`）。
+    ///
+    /// 空 = 无规则（全局加权）。网关只按 `identity.label` 精确匹配查表，
+    /// 不读 store、不解析 JSON——解析与不存在站点剥离都在 service 侧启动时做完。
+    /// legacy 单上游路径不读本字段（见 spec §4.6 的边界说明）。
+    pub routing_rules: Vec<crate::routing::RoutingRule>,
     /// 上游客户端走的代理（M10-S2）。`None` = 直连。
     ///
     /// 由 `service::gateway_config` 从 settings 解析后填入（与站点适配器 transport 同一份
@@ -861,6 +867,9 @@ impl GatewayConfig {
             // 服务层的 gateway_config 在构造完再赋值）。
             budget_check: None,
             on_budget_breach: None,
+            // M46-S7：默认无规则（single_upstream 的调用方行为逐字不变；
+            // 服务层的 gateway_config 在构造完再赋值）。
+            routing_rules: Vec::new(),
             upstream_proxy: None,
             // P3-4：构造器不知道引用（签名逐字不变，M7-S0 §3.1 冻结）。
             // `None` ⇒ legacy 路径的已回收守卫不生效，行为与改动前逐字相同；
@@ -2370,6 +2379,32 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
             "model_not_found",
             format!(
                 "没有可服务模型 {} 的上游",
+                model.as_deref().unwrap_or("(请求里未指定)")
+            ),
+        );
+    }
+
+    // M46-S7：按 agent 路由规则过滤（在 eligible 之前，见 spec §4.3）。
+    // identity.label 是认证当时的 label 快照（M43-S1）；legacy 令牌 label 为空，
+    // 恒不命中（routing_allowed_sites 的空 label 分支），走全局加权。
+    // 过滤只缩小候选集：后续的熔断 / sendable / EWMA / 预算 / 权重 / 限流 /
+    // 重试环节公式逐字不动，输入是规则子集。被规则排除的候选不进 order，
+    // 故不占 attempts、不进 local_rejects、不产生 breach 回调。
+    let allowed = crate::routing::routing_allowed_sites(
+        &state.config.routing_rules,
+        &identity.label.clone().unwrap_or_default(),
+    );
+    let candidates = crate::routing::filter_upstreams_by_sites(candidates, allowed);
+    if candidates.is_empty() {
+        // 命中规则但规则内无此模型候选（规则站点不在路由内，或不服务该模型）：
+        // kind 与既有 404 分支相同，不新造错误码；文案点名路由规则，
+        // 让客户端能把它与全局 404 区分开。
+        return local_error(
+            StatusCode::NOT_FOUND,
+            GatewayErrorKind::InvalidRequest,
+            "model_not_found",
+            format!(
+                "没有可服务模型 {} 的上游（该 agent 的路由规则限定站点内无此模型）",
                 model.as_deref().unwrap_or("(请求里未指定)")
             ),
         );

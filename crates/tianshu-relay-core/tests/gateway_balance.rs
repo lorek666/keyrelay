@@ -282,6 +282,7 @@ fn config(
         // M46-S5：既有用例默认不拦、不回调（行为与改动前逐字相同）。
         budget_check: None,
         on_budget_breach: None,
+        routing_rules: Vec::new(),
         upstream_proxy: None,
         legacy_key_ref: None,
         // M42-S1：请求体上限（既有用例用默认 16 MiB）

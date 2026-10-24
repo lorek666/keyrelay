@@ -228,6 +228,7 @@ async fn start_routed_full(
         // M46-S5：既有用例默认不拦、不回调。
         budget_check: None,
         on_budget_breach: None,
+        routing_rules: Vec::new(),
     })
     .await
     .expect("网关应能启动");
@@ -296,6 +297,7 @@ async fn route_and_keys_by_ref_must_agree() {
             on_usage: None,
             budget_check: None,
             on_budget_breach: None,
+            routing_rules: Vec::new(),
             upstream_proxy: None,
             legacy_key_ref: None,
             // M42-S1：请求体上限（既有用例用默认 16 MiB）
@@ -805,6 +807,7 @@ async fn failure_event_scrubs_a_key_shaped_model() {
             on_usage: None,
             budget_check: None,
             on_budget_breach: None,
+            routing_rules: Vec::new(),
             upstream_proxy: None,
             legacy_key_ref: None,
             // M42-S1：请求体上限（既有用例用默认 16 MiB）
@@ -1074,6 +1077,7 @@ async fn a_missing_plaintext_is_refused_at_startup() {
         on_usage: None,
         budget_check: None,
         on_budget_breach: None,
+        routing_rules: Vec::new(),
         upstream_proxy: None,
         legacy_key_ref: None,
         // M42-S1：请求体上限（既有用例用默认 16 MiB）
