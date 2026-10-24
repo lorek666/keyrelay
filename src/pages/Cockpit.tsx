@@ -93,11 +93,11 @@ export default function Cockpit() {
         </div>
         <div className="hm-card hm-metric" style={{ margin: 0 }}>
           <div className="hm-label">{t("overview.stat.alerts")}</div>
-          <div className="hm-num">{warnings.length}</div>
+          <div className="hm-num">{events.isLoading ? "—" : warnings.length}</div>
         </div>
         <div className="hm-card hm-metric" style={{ margin: 0 }}>
           <div className="hm-label">{t("overview.stat.drift")}</div>
-          <div className="hm-num">{drifted.length}</div>
+          <div className="hm-num">{drift.isLoading ? "—" : drifted.length}</div>
         </div>
         <div className="hm-card hm-metric" style={{ margin: 0 }}>
           <div className="hm-label">{t("overview.runState.dataDir")}</div>

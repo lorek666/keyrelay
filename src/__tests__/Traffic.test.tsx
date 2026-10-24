@@ -184,4 +184,71 @@ describe("Traffic", () => {
       expect(betaRow).toHaveTextContent("不提供");
     });
   });
+
+  // ---- M45-S8（B-228/B-229）：此前缺失的分支断言 ----
+
+  it("B-228：仪表盘加载中时汇总卡显示 — 而不是 0", async () => {
+    vi.mocked(usageDashboard).mockImplementation(() => new Promise(() => {}));
+    render(<Traffic />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("Token 总量").closest(".hm-card")).toHaveTextContent("—");
+    });
+  });
+
+  it("B-228/B-229：仪表盘出错时红行带真实原因", async () => {
+    vi.mocked(usageDashboard).mockRejectedValue(new Error("boom"));
+    render(<Traffic />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("读取用量失败：boom")).toBeTruthy();
+    });
+    // S8 复审 P2-1：error 输入的汇总卡 — 也要有直接断言，不能只靠红行
+    expect(screen.getByText("Token 总量").closest(".hm-card")).toHaveTextContent("—");
+  });
+
+  it("B-229：所选范围无用量时显示空态文案", async () => {
+    vi.mocked(usageDashboard).mockResolvedValue({
+      rangeDays: 30,
+      siteId: null,
+      daily: [],
+      snapshots: [],
+      keyUsage: [],
+      byAgent: [],
+    });
+    render(<Traffic />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText(/所选范围内还没有用量数据/)).toBeTruthy();
+    });
+  });
+
+  it("B-229：全部站点都无能力时按密钥表显示 noCapability 文案", async () => {
+    vi.mocked(listSites).mockResolvedValue([
+      {
+        id: 2, kind: "sub2api", baseUrl: "https://beta.example.test", displayName: "Beta",
+        health: "ok", loginField: "email", capabilities: caps(false),
+      },
+    ] satisfies SiteRow[]);
+    render(<Traffic />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("所有站点都不提供每密钥用量（能力位 keyUsage = false）。")).toBeTruthy();
+    });
+  });
+
+  it("B-229：按密钥表成本为 null 时显示未定价而非 0", async () => {
+    vi.mocked(usageDashboard).mockResolvedValue({
+      ...dashboardFixture(),
+      keyUsage: [
+        {
+          keyId: 11, siteId: 1, keyName: "alpha-key", requests: 10,
+          inputTokens: 100, outputTokens: 50, totalTokens: 150, cost: null, currency: null,
+        },
+      ],
+    });
+    render(<Traffic />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("alpha-key")).toBeTruthy();
+    });
+    const keyRow = screen.getByText("alpha-key").closest("tr");
+    expect(keyRow).toHaveTextContent("未知（未定价）");
+    expect(keyRow).not.toHaveTextContent("0.00");
+  });
 });

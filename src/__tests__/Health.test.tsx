@@ -144,4 +144,126 @@ describe("Health", () => {
       expect(screen.getByText("检测历史")).toBeTruthy();
     });
   });
+
+  // ---- M45-S8（B-231）：此前缺失的分支断言 ----
+
+  function balanceCard() {
+    return screen
+      .getByText("各站点的余额总览；未知绝不当成 0。")
+      .closest(".hm-card") as HTMLElement;
+  }
+
+  it("B-231：余额失败分型——凭证问题显示需登录而非查询失败", async () => {
+    vi.mocked(siteBalance).mockImplementation((id: number) =>
+      id === 1
+        ? Promise.resolve({ currency: "USD", known: true, remaining: 12.5, used: 1 })
+        : Promise.reject(new Error("认证失败")),
+    );
+    render(<Health />, { wrapper });
+    await waitFor(() => {
+      const gammaRow = within(balanceCard()).getByText("Gamma").closest("tr");
+      expect(gammaRow).toHaveTextContent("（需登录）");
+    });
+  });
+
+  it("B-231：余额未知——known 为 false 与 remaining 为 null 都显示不可观测", async () => {
+    vi.mocked(siteBalance).mockImplementation((id: number) =>
+      id === 1
+        ? Promise.resolve({ currency: "USD", known: false, remaining: null, used: 0 })
+        : Promise.reject(new Error("boom")),
+    );
+    const { unmount: unmountFirst } = render(<Health />, { wrapper });
+    await waitFor(() => {
+      const alphaRow = within(balanceCard()).getByText("Alpha").closest("tr");
+      expect(alphaRow).toHaveTextContent("不可观测");
+      expect(alphaRow).not.toHaveTextContent("0.00");
+    });
+    unmountFirst();
+    vi.mocked(siteBalance).mockImplementation((id: number) =>
+      id === 1
+        ? Promise.resolve({ currency: "USD", known: true, remaining: null, used: 0 })
+        : Promise.reject(new Error("boom")),
+    );
+    const { unmount } = render(<Health />, { wrapper });
+    await waitFor(() => {
+      const alphaRow = within(balanceCard()).getByText("Alpha").closest("tr");
+      expect(alphaRow).toHaveTextContent("不可观测");
+    });
+    unmount();
+  });
+
+  it("B-231：余额查询进行中时单元格显示 …", async () => {
+    vi.mocked(siteBalance).mockImplementation((id: number) =>
+      id === 1 ? new Promise(() => {}) : Promise.reject(new Error("boom")),
+    );
+    render(<Health />, { wrapper });
+    await waitFor(() => {
+      const alphaRow = within(balanceCard()).getByText("Alpha").closest("tr");
+      expect(alphaRow).toHaveTextContent("…");
+    });
+  });
+
+  it("B-231：余额区加载中/出错/空态", async () => {
+    vi.mocked(listSites).mockImplementation(() => new Promise(() => {}));
+    const { unmount } = render(<Health />, { wrapper });
+    await waitFor(() => {
+      expect(within(balanceCard()).getByText("加载中…")).toBeTruthy();
+    });
+    unmount();
+    vi.mocked(listSites).mockRejectedValue(new Error("boom"));
+    const { unmount: unmountErr } = render(<Health />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("加载站点失败：boom")).toBeTruthy();
+    });
+    unmountErr();
+    vi.mocked(listSites).mockResolvedValue([]);
+    render(<Health />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("还没有站点。")).toBeTruthy();
+    });
+  });
+
+  it("B-231：漂移 missing/unreadable 行在列且 hint3 出现", async () => {
+    vi.mocked(driftReport).mockResolvedValue([
+      { targetPath: "/m.json", agentId: "codex", channel: "codex-config", state: "missing", journalId: "j1" },
+      { targetPath: "/u.json", agentId: "codex", channel: "codex-config", state: "unreadable", journalId: "j2" },
+    ]);
+    render(<Health />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("/m.json")).toBeTruthy();
+      expect(screen.getByText("/u.json")).toBeTruthy();
+    });
+    const driftCard = screen.getByText("/u.json").closest(".hm-card");
+    expect(driftCard).toHaveTextContent("文件还在");
+    expect(driftCard).toHaveTextContent("只是读不到");
+  });
+
+  it("B-231：事件空态与出错红行", async () => {
+    vi.mocked(recentEvents).mockResolvedValue([]);
+    const { unmount } = render(<Health />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText(/还没有事件/)).toBeTruthy();
+    });
+    unmount();
+    vi.mocked(recentEvents).mockRejectedValue(new Error("boom"));
+    render(<Health />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("读取失败：boom")).toBeTruthy();
+    });
+  });
+
+  it("B-231：事件其余级别徽章（warn/error/debug）", async () => {
+    vi.mocked(recentEvents).mockResolvedValue([
+      { id: 1, ts: 1, level: "warn", source: "gateway", message: "wmsg", payload: null },
+      { id: 2, ts: 2, level: "error", source: "gateway", message: "emsg", payload: null },
+      { id: 3, ts: 3, level: "debug", source: "gateway", message: "dmsg", payload: null },
+    ]);
+    render(<Health />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("wmsg")).toBeTruthy();
+    });
+    expect(screen.getByText("wmsg").closest("tr")?.querySelector("span.badge-warn")).toHaveTextContent("warn");
+    expect(screen.getByText("emsg").closest("tr")?.querySelector("span.badge-danger")).toHaveTextContent("error");
+    expect(screen.getByText("dmsg").closest("tr")?.querySelector("span.badge-muted")).toHaveTextContent("debug");
+  });
 });

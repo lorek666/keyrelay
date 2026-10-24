@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import Cockpit from "../pages/Cockpit";
@@ -38,6 +38,7 @@ import {
   driftReport,
   recentGatewayUsage,
   recentUsageSnapshots,
+  refreshAll,
   type AppInfo,
   type ConsentRow,
   type DriftReport,
@@ -153,6 +154,73 @@ describe("Cockpit", () => {
     await waitFor(() => {
       // Alpha 两行 100 + 50 = 150；输入 90 / 输出 60
       expect(screen.getByText(/Alpha: 150 tokens/, { exact: false })).toBeTruthy();
+    });
+  });
+
+  // ---- M45-S8（B-227）：此前缺失的四类断言 ----
+
+  it("告警卡只列 top5，6 条告警时第 6 条不得出现", async () => {
+    vi.mocked(recentEvents).mockResolvedValue(
+      [1, 2, 3, 4, 5, 6].map((i) => ({
+        id: i, ts: i, level: "warn", source: "gateway", message: `msg-${i}`,
+      })) as unknown as EventRow[],
+    );
+    render(<Cockpit />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("msg-5")).toBeTruthy();
+    });
+    expect(screen.queryByText("msg-6")).toBeNull();
+    // 指标仍计 6 条（截断只影响卡片行数，不影响计数）
+    expect(screen.getByText("告警事件").closest(".hm-card")).toHaveTextContent("6");
+  });
+
+  it("刷新失败时红行带真实原因", async () => {
+    vi.mocked(refreshAll).mockRejectedValue(new Error("boom"));
+    render(<Cockpit />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "立即刷新全部站点" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "立即刷新全部站点" }));
+    await waitFor(() => {
+      expect(screen.getByText(/刷新失败：boom/)).toBeTruthy();
+    });
+  });
+
+  it("内存 vault 时警告红行在列", async () => {
+    vi.mocked(appInfo).mockResolvedValue({
+      name: "Tianshu Relay",
+      version: "9.9.9-test",
+      dbPath: "/tmp/test.db",
+      dataDir: "/tmp/test-data",
+      siteCount: 2,
+      vaultBackend: "memory",
+      rebrand: { status: "noLegacy", to: "/tmp/test-data", files: 0, bytes: 0, warnings: [] },
+    } satisfies AppInfo);
+    render(<Cockpit />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText(/内存保险库/)).toBeTruthy();
+    });
+  });
+
+  it("7d 快照 delta 按最新减上一条计算", async () => {
+    vi.mocked(recentUsageSnapshots).mockResolvedValue([
+      { id: 1, ts: 2, siteId: 1, used: 10, remaining: 90, currency: "USD", known: true },
+      { id: 2, ts: 1, siteId: 1, used: 8, remaining: 92, currency: "USD", known: true },
+    ] satisfies UsageSnapshotRow[]);
+    render(<Cockpit />, { wrapper });
+    await waitFor(() => {
+      // 最新 10 - 上一条 8 = +2.00
+      expect(screen.getByText(/\+2\.00/, { exact: false })).toBeTruthy();
+    });
+  });
+
+  it("B-225：事件/漂移查询加载中时指标显示 — 而不是 0", async () => {
+    vi.mocked(recentEvents).mockImplementation(() => new Promise(() => {}));
+    vi.mocked(driftReport).mockImplementation(() => new Promise(() => {}));
+    render(<Cockpit />, { wrapper });
+    await waitFor(() => {
+      expect(screen.getByText("告警事件").closest(".hm-card")).toHaveTextContent("—");
+      expect(screen.getByText("配置漂移").closest(".hm-card")).toHaveTextContent("—");
     });
   });
 });
