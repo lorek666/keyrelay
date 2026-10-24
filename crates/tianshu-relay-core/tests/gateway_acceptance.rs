@@ -121,6 +121,7 @@ fn config(route: Vec<Upstream>, keys: Vec<(&str, &str)>) -> GatewayConfig {
         on_usage: None,
         budget_check: None,
         on_budget_breach: None,
+        routing_rules: Vec::new(),
         max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
     }
 }

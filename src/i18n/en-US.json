@@ -1149,6 +1149,8 @@
     "perSiteBurstHint": "Only takes effect when the per-site per-second limit is greater than 0: the token bucket capacity becomes per-second limit + burst, so the first burst of requests is no longer killed by mistake; refill per second is still the per-second limit, so the long-term rate is unchanged. Applies the next time the gateway starts.",
     "maxAttemptsLabel": "Max attempts per request (0–64, 0=walk all)",
     "maxAttemptsHint": "0 = walk all candidates (today's behavior); greater than 0 caps each request at that many candidates, and once exceeded the last real error is returned without inventing a new one. Only actually-sent upstream attempts count; locally rejected candidates do not. Applies the next time the gateway starts.",
+    "routingRulesLabel": "Per-agent routing rules (JSON, empty = no rules)",
+    "routingRulesHint": "Example: [{\"agentLabel\": \"codex\", \"siteIds\": [1, 2]}]. agentLabel must match the token label exactly (case-sensitive); a matched agent only uses the listed sites, an unmatched agent uses global weighting; empty = no rules. Invalid JSON is rejected on save. Applies the next time the gateway starts.",
     "ipv6Degraded": "IPv6 loopback is not listening: {note} (only 127.0.0.1 is available; v4 is unaffected)",
     "batch": {
       "btn": "Re-point delivered channels at the gateway…",

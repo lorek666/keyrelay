@@ -5135,6 +5135,57 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 buffer.push_back(breach);
             }
         }));
+
+        // M46-S7：按 agent 路由规则（启动时快照；解析与剥离都在这里做完，
+        // 网关请求路径只按 label 查表，不读 store、不解析 JSON）。
+        // 三条路径（见 spec §4.5 的区分表，绝不互换）：
+        // ① 解析成功 + 站表可读 ⇒ 剥离不存在站点（逐条 Warn 事件），有效规则进 config；
+        // ② 站表读失败 ⇒ 规则原样进 config（未知 id 在请求层自然匹配不到候选，无害），
+        //    只写一条 Warn；绝不因此让网关起不来；
+        // ③ 解析失败（仅手改库等旁路可达，正常写路径已被 validate 拦）⇒ fail-open：
+        //    规则置空 + 一条 Warn 事件（payload 只写原因摘要，不回显规则全文），
+        //    网关照常启动、全局加权。
+        config.routing_rules = match crate::routing::parse_routing_rules(&settings.routing_rules) {
+            Ok(rules) => match self.store.list_sites() {
+                Ok(rows) => {
+                    let known: std::collections::HashSet<i64> =
+                        rows.iter().map(|row| row.id).collect();
+                    let (effective, unknown) = crate::routing::resolve_routing_rules(rules, &known);
+                    for (label, site_id) in unknown {
+                        self.log(observability::event_with_payload(
+                            Level::Warn,
+                            "gateway",
+                            format!(
+                                "路由规则引用了不存在的站点 {site_id}（agent {label}），该条已忽略"
+                            ),
+                            serde_json::json!({
+                                "agent_label": label,
+                                "site_id": site_id,
+                            }),
+                        ));
+                    }
+                    effective
+                }
+                Err(_) => {
+                    self.log(observability::event_with_payload(
+                        Level::Warn,
+                        "gateway",
+                        "路由规则启动解析：站表读失败，未知站点不剥离、规则原样生效",
+                        serde_json::json!({}),
+                    ));
+                    rules
+                }
+            },
+            Err(reason) => {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "gateway",
+                    "路由规则解析失败，已按全局加权放行（请在设置页修正规则后重启网关）",
+                    serde_json::json!({ "reason": reason }),
+                ));
+                Vec::new()
+            }
+        };
         Ok(config)
     }
 

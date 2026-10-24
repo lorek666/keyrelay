@@ -186,6 +186,7 @@ fn base_config(
         on_usage: None,
         budget_check: None,
         on_budget_breach: None,
+        routing_rules: Vec::new(),
         upstream_proxy: None,
         legacy_key_ref: None,
         // M42-S1：请求体上限（既有用例用默认 16 MiB）

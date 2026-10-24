@@ -40,6 +40,8 @@ type Props = {
   perSiteBurst: number;
   /** 每请求最多尝试候选数（M46-S4）：0 = 走全部候选，0..=64。 */
   maxAttempts: number;
+  /** 按 agent 路由规则 JSON（M46-S7）：空 = 无规则，走全局加权。 */
+  routingRules: string;
   onToggle: (enabled: boolean) => void;
   onPortChange: (port: number) => void;
   onMultiSiteChange: (enabled: boolean) => void;
@@ -48,6 +50,8 @@ type Props = {
   onMaxRequestMibChange: (mib: number) => void;
   onPerSiteBurstChange: (burst: number) => void;
   onMaxAttemptsChange: (n: number) => void;
+  /** M46-S7：路由规则 JSON 文本变更（直传，不在前端解析）。 */
+  onRoutingRulesChange: (text: string) => void;
   /** 设置还没保存时提示用户先保存（端口要保存后才生效） */
   settingsDirty: boolean;
 };
@@ -159,6 +163,7 @@ export default function GatewayCard({
   maxRequestMib,
   perSiteBurst,
   maxAttempts,
+  routingRules,
   onToggle,
   onPortChange,
   onMultiSiteChange,
@@ -167,6 +172,7 @@ export default function GatewayCard({
   onMaxRequestMibChange,
   onPerSiteBurstChange,
   onMaxAttemptsChange,
+  onRoutingRulesChange,
   settingsDirty,
 }: Props) {
   const { t } = useTranslation();
@@ -602,6 +608,24 @@ export default function GatewayCard({
         />
       </label>
       <p className="muted">{t("gateway.maxAttemptsHint")}</p>
+
+      {/*
+        M46-S7：按 agent 路由规则 JSON。受控 textarea，直传 onChange（不在前端
+        解析：解析权威在后端 validate，非法时保存失败并由既有设置保存错误路径
+        回显；前端复写一份解析必然与后端分叉）。保存后下次启动网关生效。
+      */}
+      <label className="field">
+        <span>{t("gateway.routingRulesLabel")}</span>
+        <textarea
+          className="input"
+          rows={4}
+          value={routingRules}
+          onChange={(e) => {
+            onRoutingRulesChange(e.target.value);
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.routingRulesHint")}</p>
 
       {/* M40-S2：指标面板（**所有相位都渲染**；未运行时由面板自己显示一行占位）。 */}
       <GatewayMetricsPanel status={status.data} />

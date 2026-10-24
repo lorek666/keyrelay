@@ -470,6 +470,8 @@ fn update_settings_round_trips_and_rejects_bad_values() {
     payload["notifyWebhookUrl"] = json!("https://hooks.example.com/kr");
     payload["rotationMaxAgeDays"] = json!(45);
     payload["rotationWarnBeforeDays"] = json!(10);
+    // M46-S7：路由规则 JSON 也走一遍 IPC 与校验
+    payload["routingRules"] = json!("[{\"agentLabel\": \"codex\", \"siteIds\": [1, 2]}]");
 
     let result = invoke_on(
         &webview,
@@ -494,6 +496,10 @@ fn update_settings_round_trips_and_rejects_bad_values() {
     assert_eq!(updated["notifyWebhookUrl"], "https://hooks.example.com/kr");
     assert_eq!(updated["rotationMaxAgeDays"], 45);
     assert_eq!(updated["rotationWarnBeforeDays"], 10);
+    assert_eq!(
+        updated["routingRules"],
+        "[{\"agentLabel\": \"codex\", \"siteIds\": [1, 2]}]"
+    );
 
     let read = invoke_on(&webview, "get_settings", json!({})).expect("get_settings");
     assert_eq!(read, updated, "同一实例内写后读必须一致");
@@ -525,6 +531,17 @@ fn update_settings_round_trips_and_rejects_bad_values() {
     assert_not_acl_rejection("update_settings", &err);
     assert!(
         err.as_str().unwrap_or_default().contains("提前提醒"),
+        "{err}"
+    );
+
+    // M46-S7：非法路由规则同样在 IPC 层被验到
+    let mut bad_rules = read.clone();
+    bad_rules["routingRules"] = json!("{not json");
+    let err = invoke_impl("update_settings", json!({"args": {"settings": bad_rules}}))
+        .expect_err("非法路由规则应被拒绝");
+    assert_not_acl_rejection("update_settings", &err);
+    assert!(
+        err.as_str().unwrap_or_default().contains("路由规则"),
         "{err}"
     );
 

@@ -295,6 +295,168 @@ pub fn reorder_by_effective_latency<'a>(
     keyed.into_iter().map(|(_, c)| c).collect()
 }
 
+/// M46-S7：一条按 agent 路由规则。
+///
+/// `agent_label` 是网关令牌的 label（M43-S1 的认证快照）；匹配时精确相等、
+/// 大小写敏感。`site_ids` 是该 agent 只允许走的站点 id（解析时按序去重）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutingRule {
+    pub agent_label: String,
+    pub site_ids: Vec<i64>,
+}
+
+/// M46-S7：规则 JSON 文本上限（字符数）。65536 远高于真实规模
+/// （agent 数与站点数都是个位数到两位数），只拦病态大串。
+pub const MAX_ROUTING_RULES_JSON_LEN: usize = 65_536;
+/// M46-S7：规则条数上限（同上，只拦病态值）。
+pub const MAX_ROUTING_RULES: usize = 64;
+/// M46-S7：单条规则的站点数上限（去重后计）。
+pub const MAX_ROUTING_RULE_SITES: usize = 128;
+
+/// M46-S7：解析规则 JSON（纯函数，不读库、不读时钟）。
+///
+/// 空串 / 纯空白 ⇒ 空规则（等价于 `[]`）；顶层必须是数组，条目必须是对象，
+/// 字段为 camelCase（`agentLabel` / `siteIds`，与 DTO 命名同惯例）。
+/// `agentLabel` 解析时 trim，trim 后为空 ⇒ 非法；`siteIds` 非空、每项为正整数、
+/// 按序去重；同一 `agentLabel`（trim 后比较）出现两次 ⇒ 非法；
+/// 未知字段忽略（前向兼容）。任一条目非法 ⇒ 整串 Err，不做部分解析
+/// （部分解析会让用户以为规则全生效，实则部分生效，比整单拒更危险）。
+/// Err 文本是中文原因，不回显规则全文。
+pub fn parse_routing_rules(text: &str) -> Result<Vec<RoutingRule>, String> {
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    if text.chars().count() > MAX_ROUTING_RULES_JSON_LEN {
+        return Err(format!(
+            "路由规则文本超过 {MAX_ROUTING_RULES_JSON_LEN} 字符上限"
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("路由规则 JSON 解析失败：{e}"))?;
+    let items = match value.as_array() {
+        Some(items) => items,
+        None => return Err("路由规则顶层必须是数组".to_string()),
+    };
+    if items.len() > MAX_ROUTING_RULES {
+        return Err(format!("路由规则超过 {MAX_ROUTING_RULES} 条上限"));
+    }
+    let mut rules: Vec<RoutingRule> = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let rule_no = index + 1;
+        let obj = match item.as_object() {
+            Some(obj) => obj,
+            None => return Err(format!("第 {rule_no} 条路由规则必须是对象")),
+        };
+        let label = match obj.get("agentLabel").and_then(|v| v.as_str()) {
+            Some(label) => label.trim().to_string(),
+            None => {
+                return Err(format!("第 {rule_no} 条路由规则的 agentLabel 必须是字符串"));
+            }
+        };
+        if label.is_empty() {
+            return Err(format!("第 {rule_no} 条路由规则的 agentLabel 不能为空"));
+        }
+        if rules.iter().any(|r: &RoutingRule| r.agent_label == label) {
+            return Err(format!("路由规则的 agentLabel「{label}」重复"));
+        }
+        let raw_sites = match obj.get("siteIds").and_then(|v| v.as_array()) {
+            Some(sites) => sites,
+            None => {
+                return Err(format!(
+                    "第 {rule_no} 条路由规则的 siteIds 必须是非空整数数组"
+                ));
+            }
+        };
+        if raw_sites.is_empty() {
+            return Err(format!("第 {rule_no} 条路由规则的 siteIds 不能为空"));
+        }
+        let mut site_ids: Vec<i64> = Vec::new();
+        for site in raw_sites {
+            let id = match site.as_i64() {
+                Some(id) if id > 0 => id,
+                _ => {
+                    return Err(format!("第 {rule_no} 条路由规则的 siteIds 必须全为正整数"));
+                }
+            };
+            if !site_ids.contains(&id) {
+                site_ids.push(id);
+            }
+        }
+        if site_ids.len() > MAX_ROUTING_RULE_SITES {
+            return Err(format!(
+                "第 {rule_no} 条路由规则的站点数超过 {MAX_ROUTING_RULE_SITES} 上限"
+            ));
+        }
+        rules.push(RoutingRule {
+            agent_label: label,
+            site_ids,
+        });
+    }
+    Ok(rules)
+}
+
+/// M46-S7：查某 agent 命中的规则限定站点。
+///
+/// `Some(sites)` = 命中（`sites` 可能为空 allowlist：规则引用的站点全被剥离后
+/// 仍保留，见 `resolve_routing_rules`）；`None` = 未命中，走全局加权。
+/// 空 label（legacy 无 label 请求）恒为 `None`——没有身份就无法被按身份限制。
+pub fn routing_allowed_sites<'a>(rules: &'a [RoutingRule], agent_label: &str) -> Option<&'a [i64]> {
+    if agent_label.is_empty() {
+        return None;
+    }
+    rules
+        .iter()
+        .find(|r| r.agent_label == agent_label)
+        .map(|r| r.site_ids.as_slice())
+}
+
+/// M46-S7：剥离不存在站点（纯函数）。
+///
+/// 「不存在」= 不在调用方给的已知站点 id 集合里（网关启动时由 sites 表算出，
+/// 不是路由表缺席——路由表缺席可能是暂无可用 key 的运行态）。
+/// 返回（有效规则，未知条目 `[(agentLabel, siteId)]`）；未知条目按规则顺序、
+/// 站序输出（事件顺序确定）。剥离后 `site_ids` 为空的规则**保留**为空
+/// allowlist（命中后候选恒空 ⇒ 404），不静默消失成「未命中」。
+pub fn resolve_routing_rules(
+    rules: Vec<RoutingRule>,
+    known_site_ids: &HashSet<i64>,
+) -> (Vec<RoutingRule>, Vec<(String, i64)>) {
+    let mut effective: Vec<RoutingRule> = Vec::with_capacity(rules.len());
+    let mut unknown: Vec<(String, i64)> = Vec::new();
+    for rule in rules {
+        let mut kept: Vec<i64> = Vec::new();
+        for site_id in rule.site_ids {
+            if known_site_ids.contains(&site_id) {
+                kept.push(site_id);
+            } else {
+                unknown.push((rule.agent_label.clone(), site_id));
+            }
+        }
+        effective.push(RoutingRule {
+            agent_label: rule.agent_label,
+            site_ids: kept,
+        });
+    }
+    (effective, unknown)
+}
+
+/// M46-S7：按站点集合过滤候选（纯函数，保持输入顺序）。
+///
+/// `allowed` 为 `None` ⇒ 原样返回（未命中规则，全局加权）。
+/// 只操作 handler 传来的 `Vec<&Upstream>`，不碰 `RouteTable` 的任何函数。
+pub fn filter_upstreams_by_sites<'a>(
+    candidates: Vec<&'a Upstream>,
+    allowed: Option<&[i64]>,
+) -> Vec<&'a Upstream> {
+    let Some(allowed) = allowed else {
+        return candidates;
+    };
+    candidates
+        .into_iter()
+        .filter(|u| allowed.contains(&u.site_id))
+        .collect()
+}
+
 /// 余额健康度档位：0 = 有余额，1 = 未知（`None` 或 `NaN`），2 = 已耗尽。
 ///
 /// `NaN` 归入「未知」而不是「已耗尽」：`NaN` 表示**算不出来**，不是「没钱了」。
@@ -1216,5 +1378,147 @@ mod tests {
                 "两处判据必须同源：{model}"
             );
         }
+    }
+
+    // ============================================================ M46-S7：按 agent 路由规则
+
+    #[test]
+    fn parse_routing_rules_accepts_empty_and_valid_json() {
+        assert_eq!(parse_routing_rules("").unwrap(), Vec::<RoutingRule>::new());
+        assert_eq!(
+            parse_routing_rules("  \n ").unwrap(),
+            Vec::<RoutingRule>::new()
+        );
+        assert_eq!(
+            parse_routing_rules("[]").unwrap(),
+            Vec::<RoutingRule>::new()
+        );
+        let rules = parse_routing_rules(
+            r#"[{"agentLabel": "codex", "siteIds": [1, 2]}, {"agentLabel": "cc", "siteIds": [3]}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rules,
+            vec![
+                RoutingRule {
+                    agent_label: "codex".to_string(),
+                    site_ids: vec![1, 2],
+                },
+                RoutingRule {
+                    agent_label: "cc".to_string(),
+                    site_ids: vec![3],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_routing_rules_rejects_malformed() {
+        for bad in [
+            "{not json",
+            r#"{"agentLabel": "a", "siteIds": [1]}"#,
+            r#"["not-an-object"]"#,
+            r#"[{"agentLabel": 1, "siteIds": [1]}]"#,
+            r#"[{"agentLabel": "  ", "siteIds": [1]}]"#,
+            r#"[{"agentLabel": "a", "siteIds": []}]"#,
+            r#"[{"agentLabel": "a", "siteIds": [0]}]"#,
+            r#"[{"agentLabel": "a", "siteIds": [-2]}]"#,
+            r#"[{"agentLabel": "a", "siteIds": [1.5]}]"#,
+            r#"[{"agentLabel": "a", "siteIds": [1]}, {"agentLabel": "a", "siteIds": [2]}]"#,
+            r#"[{"agentLabel": "a"}]"#,
+            r#"[{"siteIds": [1]}]"#,
+        ] {
+            assert!(
+                parse_routing_rules(bad).is_err(),
+                "应当拒绝：{bad}，得到 {:?}",
+                parse_routing_rules(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_routing_rules_dedupes_site_ids_and_trims_label() {
+        let rules =
+            parse_routing_rules(r#"[{"agentLabel": "  codex  ", "siteIds": [2, 1, 2, 1]}]"#)
+                .unwrap();
+        assert_eq!(rules[0].agent_label, "codex");
+        assert_eq!(rules[0].site_ids, vec![2, 1], "去重保序");
+    }
+
+    #[test]
+    fn parse_routing_rules_enforces_caps() {
+        let many: Vec<String> = (0..65)
+            .map(|i| format!(r#"{{"agentLabel": "a{i}", "siteIds": [1]}}"#))
+            .collect();
+        assert!(
+            parse_routing_rules(&format!("[{}]", many.join(","))).is_err(),
+            "65 条规则应超 64 上限"
+        );
+        let sites: Vec<String> = (1..=129).map(|i| i.to_string()).collect();
+        assert!(
+            parse_routing_rules(&format!(
+                r#"[{{"agentLabel": "a", "siteIds": [{}]}}]"#,
+                sites.join(",")
+            ))
+            .is_err(),
+            "129 站应超 128 上限"
+        );
+        let long = format!(
+            r#"[{{"agentLabel": "{}", "siteIds": [1]}}]"#,
+            "x".repeat(MAX_ROUTING_RULES_JSON_LEN)
+        );
+        assert!(parse_routing_rules(&long).is_err(), "超长文本应被拒");
+    }
+
+    #[test]
+    fn routing_allowed_sites_matches_exactly() {
+        let rules = parse_routing_rules(r#"[{"agentLabel": "codex", "siteIds": [1, 2]}]"#).unwrap();
+        assert_eq!(routing_allowed_sites(&rules, "codex"), Some(&[1, 2][..]));
+        assert_eq!(routing_allowed_sites(&rules, "Codex"), None, "大小写敏感");
+        assert_eq!(routing_allowed_sites(&rules, "code"), None, "非前缀匹配");
+        assert_eq!(routing_allowed_sites(&rules, "other"), None);
+        assert_eq!(routing_allowed_sites(&rules, ""), None, "空 label 恒不命中");
+    }
+
+    #[test]
+    fn resolve_routing_rules_strips_unknown_and_reports_them() {
+        let rules = parse_routing_rules(
+            r#"[{"agentLabel": "a", "siteIds": [1, 99, 2]}, {"agentLabel": "b", "siteIds": [77]}]"#,
+        )
+        .unwrap();
+        let known: HashSet<i64> = [1, 2].into_iter().collect();
+        let (effective, unknown) = resolve_routing_rules(rules, &known);
+        assert_eq!(effective[0].site_ids, vec![1, 2]);
+        assert_eq!(
+            effective[1].site_ids,
+            Vec::<i64>::new(),
+            "全剥离后规则保留为空 allowlist"
+        );
+        assert_eq!(
+            unknown,
+            vec![("a".to_string(), 99), ("b".to_string(), 77)],
+            "未知条目按规则顺序、站序输出"
+        );
+    }
+
+    #[test]
+    fn filter_upstreams_by_sites_keeps_order_and_is_noop_without_rule() {
+        let a = up(1, Some(1.0), Some(10.0), None);
+        let b = up(2, Some(1.0), Some(10.0), None);
+        let c = up(3, Some(1.0), Some(10.0), None);
+        let all = vec![&a, &b, &c];
+        let kept = filter_upstreams_by_sites(all.clone(), None);
+        assert_eq!(
+            kept.iter().map(|u| u.site_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let kept = filter_upstreams_by_sites(all.clone(), Some(&[3, 1]));
+        assert_eq!(
+            kept.iter().map(|u| u.site_id).collect::<Vec<_>>(),
+            vec![1, 3],
+            "保输入顺序，不按规则顺序重排"
+        );
+        let kept = filter_upstreams_by_sites(all, Some(&[]));
+        assert!(kept.is_empty(), "空 allowlist ⇒ 空候选");
     }
 }
