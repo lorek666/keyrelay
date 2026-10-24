@@ -347,6 +347,8 @@ export type Settings = {
   gatewayPerSiteBurst: number;
   /** M46-S4：每请求最多尝试候选数（默认 0 = 走全部；0..=64）。 */
   gatewayMaxAttempts: number;
+  /** M46-S1：密钥健康巡检间隔秒（默认 0 = 关；非 0 时 60..=86400）。 */
+  gatewayKeyHealthIntervalSecs: number;
   // ---- M6-S5：FR-9 界面与隐私 ----
   /** "system" | "light" | "dark" */
   theme: string;
@@ -1802,6 +1804,7 @@ let mockSettings: Settings = {
   gatewayPerSiteRateLimit: 0,
   gatewayPerSiteBurst: 0,
   gatewayMaxAttempts: 0,
+  gatewayKeyHealthIntervalSecs: 0,
   theme: "system",
   language: "zh-CN",
   proxyUrl: "",

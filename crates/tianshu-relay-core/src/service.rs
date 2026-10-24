@@ -996,10 +996,12 @@ pub fn budget_breach_for(
             continue;
         }
         // 适用性：站级行恒适用；key 级行只对该 key 的请求适用。
+        // M46-S5 复审 P0-1：他 key 的 key 级行必须 continue——此前 (Some, Some-不同)
+        // 只把 is_key_row 置 false 就继续往下算，超标后落入站级回落，误拦无关 key。
         let is_key_row = match (row.key_id, key_id) {
             (None, _) => false,
-            (Some(budget_key), Some(request_key)) => budget_key == request_key,
-            (Some(_), None) => continue,
+            (Some(budget_key), Some(request_key)) if budget_key == request_key => true,
+            (Some(_), _) => continue,
         };
         let Some(period) = crate::gateway::BudgetPeriod::parse(&row.period) else {
             continue; // 建行时已校验，库里非法 period 只可能是外部改库：跳过该行不拦
