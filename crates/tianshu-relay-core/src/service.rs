@@ -364,6 +364,40 @@ pub struct RefreshSummary {
     pub needs_login: Vec<i64>,
 }
 
+/// 一站的巡检结论（M46-S1）。**可安全打印**：只有 id 与结论，不含密钥、不含响应正文。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyHealthOutcome {
+    pub site_id: i64,
+    pub key_id: i64,
+    pub verdict: crate::notify::KeyHealthVerdict,
+    /// 该站已知的模型名（库里目录 ∪ 本轮探活返回），供壳层喂模型熔断键。
+    pub models: Vec<String>,
+}
+
+/// 一趟密钥健康巡检的摘要（M46-S1）。**可安全打印**：不含密钥、不含响应正文。
+#[derive(Clone, Debug, Default)]
+pub struct KeyHealthSummary {
+    /// 真的发出探活请求的站点数（受间隔开关 / 有可用 key 两重过滤之后）。
+    pub attempted: usize,
+    pub healthy: usize,
+    pub dead: usize,
+    pub quota: usize,
+    pub fault: usize,
+    pub unknown: usize,
+    pub outcomes: Vec<KeyHealthOutcome>,
+}
+
+/// 一趟巡检里**同时在途**的站点数上限（M46-S1）。
+///
+/// 与 `MODEL_CATALOG_CONCURRENCY` 同值（2）但独立常量：巡检与目录采集是两条
+/// 任务，任一方的并发上限调整都不应静默改变另一方。
+pub const KEY_HEALTH_CONCURRENCY: usize = 2;
+
+/// 单站探活 deadline（M46-S1）：10 秒，远短于网关上游读超时 240 秒。
+/// `/v1/models` 是小 JSON、无流式长尾，10 秒足够区分「活」与「挂」；
+/// 超时按 `UpstreamFault` 计（站点侧无响应，不是 key 之死）。
+const KEY_HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 一趟模型目录采集的摘要（M39-S1）。**可安全打印**：不含密钥、不含响应正文。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelCatalogSummary {
@@ -5292,6 +5326,124 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         Ok(summary)
     }
 
+    /// **一趟**密钥健康巡检（M46-S1）。
+    ///
+    /// 与 `refresh_model_catalog_once` **同构但解耦**：取 key 口径相同
+    /// （`pick_gateway_key` + 已回收跳过 + `secret_for_row` 内存明文），
+    /// 探活调用相同（`site::fetch_models`），但结论与副作用完全不同——
+    /// 巡检**不写库**（目录、健康列一律不动）、**不发布快照**，只记可观测事件
+    /// 并返回摘要；把结论喂给运行中网关的 `Breaker` 是壳层循环的事
+    /// （服务层没有熔断句柄，见 spec §4.2）。
+    ///
+    /// 间隔为 0 ⇒ 立刻返回空摘要，**一个请求都不发、一条事件都不记**。
+    /// 明文只活在 job 里（`Zeroizing`），调完即 drop；事件 payload 只有
+    /// `site_id` / `key_id` / `verdict`，不含密钥、不含 base_url。
+    pub async fn check_key_health_once(&self) -> Result<KeyHealthSummary> {
+        let mut summary = KeyHealthSummary::default();
+        let settings = self.settings()?;
+        // 巡检的**唯一**门槛是间隔非 0（默认关；壳层循环里还会再判一次，纵深防御）。
+        if settings.gateway_key_health_interval_secs == 0 {
+            return Ok(summary);
+        }
+
+        // ① 选出「有可用 key」的站点。**同步段，不 await**（拿明文与判据都在这里）。
+        struct HealthJob {
+            site_id: i64,
+            key_id: i64,
+            base_url: String,
+            secret: zeroize::Zeroizing<String>,
+        }
+        let revoked = self
+            .revoked_refs
+            .lock()
+            .map(|set| set.clone())
+            .unwrap_or_default();
+        let mut jobs: Vec<HealthJob> = Vec::new();
+        for site in self.store.list_sites()? {
+            let Some(row) = self.pick_gateway_key(site.id)? else {
+                continue;
+            };
+            if revoked.contains(&row.secret_ref) {
+                continue;
+            }
+            // 钥匙串里没有明文是本地配置问题，不是探活结论：跳过，不记失败、不喂熔断。
+            let Ok(secret) = self.secret_for_row(&row) else {
+                continue;
+            };
+            jobs.push(HealthJob {
+                site_id: site.id,
+                key_id: row.id,
+                base_url: site.base_url.clone(),
+                secret,
+            });
+        }
+        if jobs.is_empty() {
+            return Ok(summary);
+        }
+
+        // ② 有界并发 + 单站 deadline：探活本身不重试，失败只等下一间隔轮次。
+        let transport = &self.transport;
+        let results = futures_util::stream::iter(jobs.into_iter().map(|job| async move {
+            let timed = tokio::time::timeout(
+                KEY_HEALTH_PROBE_TIMEOUT,
+                crate::site::fetch_models(transport, &job.base_url, &job.secret),
+            )
+            .await;
+            // 超时不是 `fetch_models` 的结果：单独标成 UpstreamFault（站点无响应）。
+            let (verdict, fetched) = match timed {
+                Err(_) => (crate::notify::KeyHealthVerdict::UpstreamFault, None),
+                Ok(result) => (crate::notify::classify_probe_result(&result), result.ok()),
+            };
+            (job, verdict, fetched)
+        }))
+        .buffer_unordered(KEY_HEALTH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        // ③ 记事件 + 写摘要（串行；不写库）。
+        for (job, verdict, fetched) in results {
+            summary.attempted += 1;
+            match verdict {
+                crate::notify::KeyHealthVerdict::Healthy => summary.healthy += 1,
+                crate::notify::KeyHealthVerdict::DeadKey => summary.dead += 1,
+                crate::notify::KeyHealthVerdict::QuotaExhausted => summary.quota += 1,
+                crate::notify::KeyHealthVerdict::UpstreamFault => summary.fault += 1,
+                crate::notify::KeyHealthVerdict::Unknown => summary.unknown += 1,
+            }
+            let level = match verdict {
+                crate::notify::KeyHealthVerdict::DeadKey
+                | crate::notify::KeyHealthVerdict::QuotaExhausted => Level::Warn,
+                _ => Level::Debug,
+            };
+            self.log(observability::event_with_payload(
+                level,
+                "gateway",
+                format!("密钥健康巡检：{}", verdict.as_str()),
+                serde_json::json!({
+                    "site_id": job.site_id,
+                    "key_id": job.key_id,
+                    "verdict": verdict.as_str(),
+                }),
+            ));
+            // 模型键集合 = 库里目录 ∪ 本轮返回（去重保序）；本轮清单**不落库**。
+            let mut models = self.store.site_models(job.site_id).unwrap_or_default();
+            if let Some(fetched) = fetched {
+                for name in fetched {
+                    if !models.iter().any(|kept| kept == &name) {
+                        models.push(name);
+                    }
+                }
+            }
+            summary.outcomes.push(KeyHealthOutcome {
+                site_id: job.site_id,
+                key_id: job.key_id,
+                verdict,
+                models,
+            });
+        }
+        Ok(summary)
+    }
+
     /// **诊断 / 测试用**：当前 `site_facts` 里的模型镜像。
     ///
     /// 表是唯一事实来源（路由读表）；这里只是既有通知路径（B-80 `ModelsChanged`）的镜像。
@@ -7016,6 +7168,132 @@ mod tests {
             .insert_key(site.id, "probe-key", &reference, Some("remote-1"), None)
             .expect("insert_key");
         (service, key_id, mock, sleeper)
+    }
+
+    /// M46-S1 巡检测试装配：1 站 + 1 把假密钥（内存 vault），巡检间隔已开（300 秒）。
+    /// 调用方在 `responses` 里先放 `status_response()`（供 `add_site` 消耗），再放探活响应。
+    async fn health_service(
+        responses: Vec<HttpResponse>,
+    ) -> (TianshuRelayService<MockTransport>, MockTransport) {
+        let store = Store::open_in_memory().expect("内存库");
+        let mock = MockTransport::new(responses);
+        let service = TianshuRelayService::new(store, mock.clone(), test_config());
+        let site = service
+            .add_site("https://relay.example.com")
+            .await
+            .expect("add_site");
+        let reference = crate::vault::secret_ref("key", 1, "secret");
+        service
+            .vault
+            .put(&reference, "sk-test-health-fake")
+            .expect("vault.put");
+        service
+            .store
+            .insert_key(site.id, "health-key", &reference, Some("remote-1"), None)
+            .expect("insert_key");
+        let mut settings = service.settings().expect("settings");
+        settings.gateway_key_health_interval_secs = 300;
+        service.update_settings(&settings).expect("update_settings");
+        (service, mock)
+    }
+
+    fn health_models_response() -> HttpResponse {
+        HttpResponse::json(200, json!({"data": [{"id": "gpt-4o"}, {"id": "claude-x"}]}))
+            .expect("构造响应")
+    }
+
+    fn health_unauthorized_response() -> HttpResponse {
+        HttpResponse::json(
+            401,
+            json!({"error": {"code": "invalid_api_key", "message": "bad key"}}),
+        )
+        .expect("构造响应")
+    }
+
+    #[tokio::test]
+    async fn key_health_disabled_sends_no_requests() {
+        // 默认间隔 0：巡检不开，零请求（Mock 计数以 add_site 的 1 次为准，不再增加）。
+        let (service, mock) = health_service(vec![status_response()]).await;
+        let mut settings = service.settings().expect("settings");
+        settings.gateway_key_health_interval_secs = 0;
+        service.update_settings(&settings).expect("update_settings");
+        let before = mock.request_count();
+        let summary = service.check_key_health_once().await.expect("巡检");
+        assert_eq!(summary.attempted, 0, "间隔为 0 时不得探活");
+        assert_eq!(mock.request_count(), before, "间隔为 0 时不得发出任何请求");
+    }
+
+    #[tokio::test]
+    async fn key_health_healthy_and_dead_key_roundtrip() {
+        let (service, mock) = health_service(vec![
+            status_response(),
+            health_models_response(),
+            health_unauthorized_response(),
+        ])
+        .await;
+        // 第一轮：200 模型清单 ⇒ Healthy，模型键集合 = 本轮返回。
+        let first = service.check_key_health_once().await.expect("巡检");
+        assert_eq!(first.attempted, 1);
+        assert_eq!(first.healthy, 1);
+        assert_eq!(first.outcomes.len(), 1);
+        assert_eq!(
+            first.outcomes[0].verdict,
+            crate::notify::KeyHealthVerdict::Healthy
+        );
+        assert_eq!(
+            first.outcomes[0].models,
+            vec!["gpt-4o".to_string(), "claude-x".to_string()]
+        );
+        // 第二轮：401 ⇒ DeadKey；目录不被巡检改写（巡检不落库）。
+        let second = service.check_key_health_once().await.expect("巡检");
+        assert_eq!(second.dead, 1);
+        assert_eq!(
+            second.outcomes[0].verdict,
+            crate::notify::KeyHealthVerdict::DeadKey
+        );
+        assert!(
+            service
+                .store
+                .site_models(second.outcomes[0].site_id)
+                .expect("读目录")
+                .is_empty(),
+            "巡检不得写目录"
+        );
+        // 事件表里有巡检事件，且不含假密钥原文。
+        let dump = service
+            .store
+            .list_events(200)
+            .expect("读事件")
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(dump.contains("dead_key"), "事件里应有死 key 结论: {dump}");
+        assert!(
+            !dump.contains("sk-test-health-fake"),
+            "事件不得含密钥原文: {dump}"
+        );
+        assert_eq!(mock.request_count(), 3, "add_site 1 次 + 巡检 2 次");
+    }
+
+    #[tokio::test]
+    async fn key_health_skips_site_without_usable_key() {
+        // 只有站点、没有 key：巡检不产生请求、不进摘要。
+        let store = Store::open_in_memory().expect("内存库");
+        let mock = MockTransport::new(vec![status_response()]);
+        let service = TianshuRelayService::new(store, mock.clone(), test_config());
+        service
+            .add_site("https://relay.example.com")
+            .await
+            .expect("add_site");
+        let mut settings = service.settings().expect("settings");
+        settings.gateway_key_health_interval_secs = 300;
+        service.update_settings(&settings).expect("update_settings");
+        let before = mock.request_count();
+        let summary = service.check_key_health_once().await.expect("巡检");
+        assert_eq!(summary.attempted, 0);
+        assert!(summary.outcomes.is_empty());
+        assert_eq!(mock.request_count(), before, "无可用 key 时不得发请求");
     }
 
     #[tokio::test]

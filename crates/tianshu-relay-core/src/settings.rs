@@ -59,6 +59,14 @@ const KEY_GATEWAY_LAST_KEY_ID: &str = "gateway_last_key_id";
 const KEY_GATEWAY_TOKEN_GRACE_SECS: &str = "gateway_token_grace_secs";
 const KEY_COLLECT_MODELS: &str = "collect_models";
 const KEY_MODELS_MIN_INTERVAL: &str = "models_min_interval_secs";
+// M46-S1：密钥健康巡检间隔（秒，0 = 关闭）
+const KEY_GATEWAY_KEY_HEALTH_INTERVAL: &str = "gateway_key_health_interval_secs";
+/// 巡检间隔非 0 时的下限（秒）。60 秒是「死 key 最多晚 60 秒被摘除」与
+/// 「不把上游打爆」之间的保守折中；巡检结论直接改变选路，比只读目录后果更强，
+/// 故下限高于模型采集间隔的 30 秒。
+const KEY_HEALTH_MIN_INTERVAL_SECS: u64 = 60;
+/// 巡检间隔的上限（秒），与 `MAX_REFRESH_INTERVAL_SECS` 同口径（24 小时）。
+const KEY_HEALTH_MAX_INTERVAL_SECS: u64 = 86_400;
 // M39-S3：负载均衡与每站保护（三个新设置）
 const KEY_GATEWAY_LB_TOP_N: &str = "gateway_lb_top_n";
 const KEY_GATEWAY_PER_SITE_CONCURRENCY: &str = "gateway_per_site_concurrency";
@@ -114,6 +122,10 @@ pub struct Settings {
     pub collect_models: bool,
     /// 模型采集最小间隔秒（M14-S1）：**默认 1800（30min）**。`0` = 不节流（仅测试用）。
     pub models_min_interval_secs: u64,
+    /// 密钥健康巡检间隔秒（M46-S1）：**默认 0（关闭）**。非 0 时范围 `60..=86_400`。
+    /// 默认关的理由与 `collect_models` 相同：巡检是替用户花上游配额的行为，
+    /// 用户显式 opt-in 才生效；`0` 以外的下限见 `KEY_HEALTH_MIN_INTERVAL_SECS`。
+    pub gateway_key_health_interval_secs: u64,
     /// 参与加权轮转的健康候选数（M39-S3 §4.6）：**默认 3**，范围 `1..=20`。
     /// `1` = 关掉负载均衡（永远首选，与 M39-S3 之前逐字相同）。
     pub gateway_lb_top_n: usize,
@@ -197,6 +209,8 @@ impl Default for Settings {
             gateway_multi_site: false,
             collect_models: false,
             models_min_interval_secs: 1800,
+            // M46-S1：巡检默认关（不替用户花上游配额）。
+            gateway_key_health_interval_secs: 0,
             // M39-S3：默认「前 3 个候选轮转 + 每站 8 并发 + 不限速」
             gateway_lb_top_n: 3,
             gateway_per_site_concurrency: 8,
@@ -258,6 +272,15 @@ impl Settings {
         {
             return Err(Error::Store(format!(
                 "模型采集间隔必须在 {MODELS_MIN_INTERVAL_SECS}..={MODELS_MAX_INTERVAL_SECS} 秒之间"
+            )));
+        }
+        // M46-S1：巡检间隔 0 = 关闭；非 0 必须在 60..=86_400 之间。
+        if self.gateway_key_health_interval_secs != 0
+            && (self.gateway_key_health_interval_secs < KEY_HEALTH_MIN_INTERVAL_SECS
+                || self.gateway_key_health_interval_secs > KEY_HEALTH_MAX_INTERVAL_SECS)
+        {
+            return Err(Error::Store(format!(
+                "密钥健康巡检间隔必须为 0（关闭）或在 {KEY_HEALTH_MIN_INTERVAL_SECS}..={KEY_HEALTH_MAX_INTERVAL_SECS} 秒之间"
             )));
         }
         // M39-S3：三个新设置的取值范围（越界 ⇒ Err 且不落库，与既有设置同口径）
@@ -518,6 +541,13 @@ impl Settings {
                         settings.models_min_interval_secs = secs;
                     }
                 }
+                // M46-S1：只做类型转换，范围由 `validate()` 在写路径统一拒绝
+                //（与模型采集间隔同口径）。
+                KEY_GATEWAY_KEY_HEALTH_INTERVAL => {
+                    if let Ok(secs) = value.parse::<u64>() {
+                        settings.gateway_key_health_interval_secs = secs;
+                    }
+                }
                 // M39-S3：三个字段各自按范围过滤（读路径的纵深防御；写路径由 `validate` 拒）
                 KEY_GATEWAY_LB_TOP_N => {
                     if let Ok(n) = value.parse::<usize>() {
@@ -676,6 +706,10 @@ impl Settings {
                 KEY_MODELS_MIN_INTERVAL,
                 self.models_min_interval_secs.to_string(),
             ),
+            (
+                KEY_GATEWAY_KEY_HEALTH_INTERVAL,
+                self.gateway_key_health_interval_secs.to_string(),
+            ),
             // M39-S3：负载均衡与每站保护
             (KEY_GATEWAY_LB_TOP_N, self.gateway_lb_top_n.to_string()),
             (
@@ -725,7 +759,7 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 31] = [
+    pub const KEYS: [&'static str; 32] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
@@ -740,6 +774,7 @@ impl Settings {
         KEY_GATEWAY_MULTI_SITE,
         KEY_COLLECT_MODELS,
         KEY_MODELS_MIN_INTERVAL,
+        KEY_GATEWAY_KEY_HEALTH_INTERVAL,
         KEY_GATEWAY_LB_TOP_N,
         KEY_GATEWAY_PER_SITE_CONCURRENCY,
         KEY_GATEWAY_PER_SITE_RATE_LIMIT,
@@ -1083,6 +1118,7 @@ mod tests {
             gateway_multi_site: false,
             collect_models: false,
             models_min_interval_secs: 1800,
+            gateway_key_health_interval_secs: 300,
             gateway_lb_top_n: 3,
             gateway_per_site_concurrency: 8,
             gateway_per_site_rate_limit: 0,
@@ -1106,6 +1142,23 @@ mod tests {
         assert_eq!(Settings::from_pairs(borrowed), s);
         // 每一个字段都要有对应的键，漏一个就会在往返里静默丢失
         assert_eq!(pairs.len(), Settings::KEYS.len());
+    }
+
+    #[test]
+    fn key_health_interval_defaults_to_disabled_and_validates_range() {
+        // 默认关：不替用户花上游配额。
+        assert_eq!(Settings::default().gateway_key_health_interval_secs, 0);
+        let mut s = Settings::default();
+        // 0（关）/ 60 / 86_400 通过。
+        for ok in [0u64, 60, 86_400] {
+            s.gateway_key_health_interval_secs = ok;
+            assert!(s.validate().is_ok(), "{ok} 应通过");
+        }
+        // 1..=59 与超上限被拒（且不落库：写路径先 validate）。
+        for bad in [1u64, 59, 86_401] {
+            s.gateway_key_health_interval_secs = bad;
+            assert!(s.validate().is_err(), "{bad} 必须被拒");
+        }
     }
 
     #[test]
