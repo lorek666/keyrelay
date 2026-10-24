@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Copy, Play, RefreshCw, Square } from "lucide-react";
 import {
@@ -172,6 +172,199 @@ export function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
           </tbody>
         </table>
       )}
+    </div>
+  );
+}
+
+type RoutingRuleRow = {
+  agentLabel: string;
+  siteIds: number[];
+};
+
+/**
+ * 解析路由规则 JSON 文本为结构化行（M46-UI B-255）。
+ * - "" / "[]" ⇒ 空行表（结构化视图）。
+ * - 非数组、行不是对象、agentLabel 不是字符串、siteIds 不是数组、站 id 不是
+ *   正整数 ⇒ 不可解析（回退原文编辑，不丢用户文本）。
+ * - 行内 siteIds 按序去重（与后端 validate 的归一方向一致，但这里只是展示
+ *   归一，不拒传：解析权威仍在后端）。
+ * - agent 为空或站点为空的行仍可解析（渲染时挂未填完整提示，保存时由后端
+ *   拒绝整单并回显后端文案）。
+ */
+function parseRoutingRules(
+  text: string,
+): { ok: true; rows: RoutingRuleRow[] } | { ok: false } {
+  const trimmed = text.trim();
+  if (trimmed === "") return { ok: true, rows: [] };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { ok: false };
+  }
+  if (!Array.isArray(parsed)) return { ok: false };
+  const rows: RoutingRuleRow[] = [];
+  for (const entry of parsed) {
+    if (typeof entry !== "object" || entry === null) return { ok: false };
+    const { agentLabel, siteIds } = entry as {
+      agentLabel?: unknown;
+      siteIds?: unknown;
+    };
+    if (typeof agentLabel !== "string" || !Array.isArray(siteIds)) {
+      return { ok: false };
+    }
+    const ids: number[] = [];
+    for (const id of siteIds) {
+      if (typeof id !== "number" || !Number.isInteger(id) || id <= 0) {
+        return { ok: false };
+      }
+      if (!ids.includes(id)) ids.push(id);
+    }
+    rows.push({ agentLabel, siteIds: ids });
+  }
+  return { ok: true, rows };
+}
+
+/**
+ * M46-UI B-255：按 agent 路由规则的结构化编辑器。
+ *
+ * 同步策略（关键，别改错）：行状态是本地 state，prop 变化时只有「外部变化」
+ * 才重解析——结构化编辑器自己发出的文本经草稿回流到 prop 时（`=== lastEmitted`）
+ * 必须跳过，否则每改一次都会把编辑中的行重置。保存重载、切页回来等外部
+ * 变化会走到重解析分支。回退 textarea 是例外：它的值直接就是 prop，没有
+ * 编辑中状态可言，故 onChange 故意不写 lastEmitted，每次回流都重解析——
+ * 非法→仍回落（不丢文本），合法→立即翻回结构化视图。不可解析的文本不丢：
+ * 回退到原文 textarea（即今天的行为）+ 一行提示。
+ *
+ * 校验分工：前端只做「未填完整」的行级提示（agent 为空或站点为空），不拦
+ * 截、不拒传；解析权威与报错文案都在后端 validate——前端复写一套校验必然
+ * 与后端分叉，还可能拒传合法规则。
+ */
+function RoutingRulesEditor({
+  routingRules,
+  onRoutingRulesChange,
+  sites,
+  tokenLabels,
+}: {
+  routingRules: string;
+  onRoutingRulesChange: (text: string) => void;
+  sites: { id: number; displayName: string }[];
+  tokenLabels: string[];
+}) {
+  const { t } = useTranslation();
+  const initial = parseRoutingRules(routingRules);
+  const [rows, setRows] = useState<RoutingRuleRow[]>(initial.ok ? initial.rows : []);
+  const [fallback, setFallback] = useState(!initial.ok);
+  const lastEmitted = useRef(routingRules);
+  useEffect(() => {
+    if (routingRules !== lastEmitted.current) {
+      lastEmitted.current = routingRules;
+      const parsed = parseRoutingRules(routingRules);
+      setFallback(!parsed.ok);
+      setRows(parsed.ok ? parsed.rows : []);
+    }
+  }, [routingRules]);
+
+  const emit = (next: RoutingRuleRow[]) => {
+    const text = JSON.stringify(next);
+    lastEmitted.current = text;
+    onRoutingRulesChange(text);
+  };
+  const updateRow = (index: number, patch: Partial<RoutingRuleRow>) => {
+    const next = rows.map((r, i) => (i === index ? { ...r, ...patch } : r));
+    setRows(next);
+    emit(next);
+  };
+  const addRow = () => {
+    const next = [...rows, { agentLabel: "", siteIds: [] }];
+    setRows(next);
+    emit(next);
+  };
+  const deleteRow = (index: number) => {
+    const next = rows.filter((_, i) => i !== index);
+    setRows(next);
+    emit(next);
+  };
+
+  if (fallback) {
+    return (
+      <div>
+        <p className="muted">{t("gateway.routingRulesFallbackNote")}</p>
+        <textarea
+          className="input"
+          rows={4}
+          aria-label={t("gateway.routingRulesLabel")}
+          value={routingRules}
+          onChange={(e) => {
+            // M46-UI-5 复审 P1-1：回退 textarea 故意不写 lastEmitted。它的值
+            // 直接就是 prop，没有“编辑中状态会被重解析冲掉”的风险；若也写
+            // lastEmitted，保存重载回来的字符串与它相等，useEffect 永远
+            // 跳过，fallback 会粘住、合法文本也回不到结构化视图。不写它，
+            // 每次回流都会重解析：非法→仍回落（不丢文本），合法→立即翻回
+            // 结构化视图（比文案承诺的“保存重载”更早，但不矛盾）。
+            onRoutingRulesChange(e.target.value);
+          }}
+        />
+      </div>
+    );
+  }
+
+  // 下拉选项 = 可用令牌 label + 各行已有的 label（后者兜底：某行引用的令牌
+  // 若已被吊销，选项里仍保留它，否则该行 agent 会显示空白、值还会被改写掉）。
+  const options = [...new Set([...tokenLabels, ...rows.map((r) => r.agentLabel)])].filter(
+    (l) => l !== "",
+  );
+  return (
+    <div>
+      {tokenLabels.length === 0 ? (
+        <p className="muted">{t("gateway.routingRulesNoTokens")}</p>
+      ) : null}
+      {rows.map((row, i) => {
+        const incomplete =
+          row.agentLabel.trim() === "" || row.siteIds.length === 0;
+        return (
+          <div key={i} data-routing-row={i} className="row">
+            <select
+              className="input"
+              aria-label={t("gateway.routingRulesAgent")}
+              value={row.agentLabel}
+              onChange={(e) => updateRow(i, { agentLabel: e.target.value })}
+            >
+              <option value="">{t("gateway.routingRulesAgentPlaceholder")}</option>
+              {options.map((label) => (
+                <option key={label} value={label}>
+                  {label}
+                </option>
+              ))}
+            </select>
+            <span>{t("gateway.routingRulesSites")}</span>
+            {sites.map((s) => (
+              <label key={s.id} className="checkline">
+                <input
+                  type="checkbox"
+                  checked={row.siteIds.includes(s.id)}
+                  onChange={(e) => {
+                    const next = e.target.checked
+                      ? [...row.siteIds, s.id]
+                      : row.siteIds.filter((id) => id !== s.id);
+                    updateRow(i, { siteIds: next });
+                  }}
+                />
+                <span>{s.displayName}</span>
+              </label>
+            ))}
+            <button type="button" className="btn btn-ghost" onClick={() => deleteRow(i)}>
+              {t("gateway.routingRulesDeleteRow")}
+            </button>
+            {incomplete ? (
+              <p className="muted">{t("gateway.routingRulesRowIncomplete")}</p>
+            ) : null}
+          </div>
+        );
+      })}
+      <button type="button" className="btn" onClick={addRow}>
+        {t("gateway.routingRulesAddRow")}
+      </button>
     </div>
   );
 }
@@ -732,21 +925,23 @@ export default function GatewayCard({
       ) : null}
 
       {/*
-        M46-S7：按 agent 路由规则 JSON。受控 textarea，直传 onChange（不在前端
-        解析：解析权威在后端 validate，非法时保存失败并由既有设置保存错误路径
-        回显；前端复写一份解析必然与后端分叉）。保存后下次启动网关生效。
+        M46-UI B-255：按 agent 路由规则改为结构化编辑器（agent 下拉取令牌
+        label、站点多选、增删行、逐条未填完整提示）。解析权威仍在后端
+        validate：前端不复写解析、不拦截保存，非法时保存失败并由既有设置
+        保存错误路径回显后端文案。不可解析的文本回退到原文 textarea（见
+        RoutingRulesEditor）。保存后下次启动网关生效。
       */}
-      <label className="field">
+      <div className="field">
         <span>{t("gateway.routingRulesLabel")}</span>
-        <textarea
-          className="input"
-          rows={4}
-          value={routingRules}
-          onChange={(e) => {
-            onRoutingRulesChange(e.target.value);
-          }}
+        <RoutingRulesEditor
+          routingRules={routingRules}
+          onRoutingRulesChange={onRoutingRulesChange}
+          sites={sites.data ?? []}
+          tokenLabels={(tokenList.data ?? [])
+            .filter((tok) => tok.active)
+            .map((tok) => tok.label)}
         />
-      </label>
+      </div>
       <p className="muted">{t("gateway.routingRulesHint")}</p>
 
       {/* M40-S2：指标面板（**所有相位都渲染**；未运行时由面板自己显示一行占位）。 */}

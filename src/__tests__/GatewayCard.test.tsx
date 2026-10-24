@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import GatewayCard from "../components/GatewayCard";
 import { I18nProvider } from "../i18n";
 import zhCN from "../i18n/zh-CN.json";
@@ -21,11 +21,13 @@ vi.mock("../lib/api", async (importOriginal) => {
     listSites: vi.fn(),
     listStoredKeys: vi.fn(),
     listChannelBindings: vi.fn(),
+    gatewayTokenList: vi.fn(),
   };
 });
 
 import {
   gatewayStatus,
+  gatewayTokenList,
   listChannelBindings,
   listSites,
   listStoredKeys,
@@ -120,6 +122,7 @@ beforeEach(() => {
   vi.mocked(listSites).mockResolvedValue([]);
   vi.mocked(listStoredKeys).mockResolvedValue([]);
   vi.mocked(listChannelBindings).mockResolvedValue([]);
+  vi.mocked(gatewayTokenList).mockResolvedValue([]);
 });
 
 describe("GatewayCard 三态（M41-S1）", () => {
@@ -297,22 +300,23 @@ describe("M42-S1：监听地址 / IPv6 降级 / 请求体上限", () => {
     expect(onChange).toHaveBeenCalledWith(10);
   });
 
-  it("M46-S7 routingRules：文本域输入直传回调（前端不解析）", async () => {
+  it("M46-S7 routingRules：回退原文模式下输入直传回调（前端不解析）", async () => {
     vi.mocked(gatewayStatus).mockResolvedValue(status({ phase: "stopped" }));
     const onChange = vi.fn();
-    renderCard({ routingRules: "", onRoutingRulesChange: onChange });
+    // M46-UI B-255：空规则走结构化视图；不可解析文本才走原文 textarea，
+    // 原文模式下输入仍直传、不在前端拦截（解析权威在后端 validate）。
+    renderCard({ routingRules: "{not json", onRoutingRulesChange: onChange });
     const input = screen.getByLabelText(
       zhCN.gateway.routingRulesLabel,
     ) as HTMLTextAreaElement;
-    expect(input.value).toBe("");
+    expect(input.value).toBe("{not json");
     const text = '[{"agentLabel": "codex", "siteIds": [1, 2]}]';
     fireEvent.change(input, { target: { value: text } });
     expect(onChange).toHaveBeenCalledTimes(1);
     expect(onChange).toHaveBeenCalledWith(text);
-    // 非法 JSON 也不在前端拦截：解析权威在后端 validate。
-    fireEvent.change(input, { target: { value: "{not json" } });
+    fireEvent.change(input, { target: { value: "{still bad" } });
     expect(onChange).toHaveBeenCalledTimes(2);
-    expect(onChange).toHaveBeenCalledWith("{not json");
+    expect(onChange).toHaveBeenCalledWith("{still bad");
   });
 
   it("M46-UI B-237 巡检间隔：输入 30 失焦钳制到 60 并回调一次 + 提示", async () => {
@@ -469,5 +473,223 @@ describe("M46-UI B-240 EWMA 列", () => {
     renderCard();
     await screen.findByText("EWMA 延迟");
     expect(screen.getByText("0 ms")).toBeInTheDocument();
+  });
+});
+
+describe("M46-UI B-255 结构化路由规则编辑器", () => {
+  const site = (id: number, displayName: string) => ({
+    id,
+    kind: "newapi",
+    baseUrl: "https://example.invalid",
+    displayName,
+    health: "unknown",
+  });
+  const tok = (id: number, label: string, active = true) => ({
+    id,
+    label,
+    createdAt: 0,
+    revokedAt: null,
+    lastUsedAt: null,
+    active,
+    isDefault: false,
+  });
+  const setup = async (routingRules: string) => {
+    vi.mocked(gatewayStatus).mockResolvedValue(status({ phase: "stopped" }));
+    vi.mocked(listSites).mockResolvedValue([site(1, "Alpha"), site(2, "Beta")]);
+    vi.mocked(gatewayTokenList).mockResolvedValue([
+      tok(1, "codex"),
+      tok(2, "opencode"),
+    ]);
+    const onChange = vi.fn();
+    renderCard({ routingRules, onRoutingRulesChange: onChange });
+    // 等令牌查询回落（令牌列表 <ul> 出现才说明 mock 查询已解析；只等标题
+    // 不够——标题是同步渲染的，查询回落前编辑器里还没有站点复选框与令牌选项）。
+    await waitFor(() =>
+      expect(document.querySelector(".gateway-token-list")).toBeInTheDocument(),
+    );
+    return onChange;
+  };
+  const row = (i: number) =>
+    document.querySelector(`[data-routing-row="${i}"]`) as HTMLElement;
+
+  it("已有规则渲染为行：agent 下拉选中 + 站点多选勾选", async () => {
+    await setup('[{"agentLabel":"codex","siteIds":[1,2]}]');
+    await waitFor(() =>
+      expect(row(0).querySelectorAll('input[type="checkbox"]')).toHaveLength(2),
+    );
+    const r = row(0);
+    expect(r).toBeInTheDocument();
+    const select = r.querySelector("select") as HTMLSelectElement;
+    expect(select.value).toBe("codex");
+    const boxes = r.querySelectorAll('input[type="checkbox"]');
+    expect(boxes).toHaveLength(2);
+    expect((boxes[0] as HTMLInputElement).checked).toBe(true);
+    expect((boxes[1] as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("增行 + 选 agent + 勾站点：每次变更都把整表 JSON 回调出去", async () => {
+    const onChange = await setup("");
+    fireEvent.click(screen.getByText(zhCN.gateway.routingRulesAddRow));
+    expect(onChange).toHaveBeenLastCalledWith(
+      '[{"agentLabel":"","siteIds":[]}]',
+    );
+    await waitFor(() =>
+      expect(row(0).querySelectorAll('input[type="checkbox"]')).toHaveLength(2),
+    );
+    const r = row(0);
+    fireEvent.change(r.querySelector("select") as HTMLSelectElement, {
+      target: { value: "opencode" },
+    });
+    expect(onChange).toHaveBeenLastCalledWith(
+      '[{"agentLabel":"opencode","siteIds":[]}]',
+    );
+    fireEvent.click(r.querySelectorAll('input[type="checkbox"]')[0]);
+    expect(onChange).toHaveBeenLastCalledWith(
+      '[{"agentLabel":"opencode","siteIds":[1]}]',
+    );
+  });
+
+  it("删行：回调只剩剩余行", async () => {
+    const onChange = await setup(
+      '[{"agentLabel":"codex","siteIds":[1]},{"agentLabel":"opencode","siteIds":[2]}]',
+    );
+    fireEvent.click(
+      row(0).querySelector("button") as HTMLButtonElement,
+    );
+    expect(onChange).toHaveBeenLastCalledWith(
+      '[{"agentLabel":"opencode","siteIds":[2]}]',
+    );
+  });
+
+  it("未填完整的行挂提示（不拦截：提示只是提示，保存由后端裁决）", async () => {
+    await setup('[{"agentLabel":"","siteIds":[]}]');
+    expect(
+      screen.getByText(zhCN.gateway.routingRulesRowIncomplete),
+    ).toBeInTheDocument();
+  });
+
+  it("不可解析文本回退原文编辑 + 提示，不丢文本", async () => {
+    const onChange = await setup('{"agentLabel": "codex"}');
+    expect(
+      screen.getByText(zhCN.gateway.routingRulesFallbackNote),
+    ).toBeInTheDocument();
+    expect(document.querySelector("[data-routing-row]")).toBeNull();
+    const input = screen.getByLabelText(
+      zhCN.gateway.routingRulesLabel,
+    ) as HTMLTextAreaElement;
+    expect(input.value).toBe('{"agentLabel": "codex"}');
+    fireEvent.change(input, { target: { value: "{still bad" } });
+    expect(onChange).toHaveBeenCalledWith("{still bad");
+  });
+});
+
+describe("M46-UI B-255 回流（复审 P1-1 回归）", () => {
+  // 模拟真实 Settings：onChange 写回父级 state 再以 prop 回流，而非静态 mock。
+  const renderReflowCard = (initial: string) => {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const Harness = () => {
+      const [rules, setRules] = useState(initial);
+      return (
+        <QueryClientProvider client={qc}>
+          <I18nProvider lang="zh-CN" initialDict={zhCN}>
+            <GatewayCard
+              enabled
+              port={8787}
+              multiSite={false}
+              collectModels={false}
+              modelsMinIntervalSecs={1800}
+              maxRequestMib={16}
+              perSiteBurst={0}
+              perSiteConcurrency={8}
+              perSiteRateLimit={0}
+              maxAttempts={0}
+              keyHealthIntervalSecs={0}
+              routingRules={rules}
+              onToggle={vi.fn()}
+              onPortChange={vi.fn()}
+              onMultiSiteChange={vi.fn()}
+              onCollectModelsChange={vi.fn()}
+              onModelsIntervalChange={vi.fn()}
+              onMaxRequestMibChange={vi.fn()}
+              onPerSiteBurstChange={vi.fn()}
+              onPerSiteConcurrencyChange={vi.fn()}
+              onPerSiteRateLimitChange={vi.fn()}
+              onMaxAttemptsChange={vi.fn()}
+              onKeyHealthIntervalChange={vi.fn()}
+              onRoutingRulesChange={setRules}
+              settingsDirty={false}
+            />
+          </I18nProvider>
+        </QueryClientProvider>
+      );
+    };
+    return render(<Harness />);
+  };
+  const site = (id: number, displayName: string) => ({
+    id,
+    kind: "newapi",
+    baseUrl: "https://example.invalid",
+    displayName,
+    health: "unknown",
+  });
+  const tok = (id: number, label: string) => ({
+    id,
+    label,
+    createdAt: 0,
+    revokedAt: null,
+    lastUsedAt: null,
+    active: true,
+    isDefault: false,
+  });
+  const setupReflow = async (initial: string) => {
+    vi.mocked(gatewayStatus).mockResolvedValue(status({ phase: "stopped" }));
+    vi.mocked(listSites).mockResolvedValue([site(1, "Alpha"), site(2, "Beta")]);
+    vi.mocked(gatewayTokenList).mockResolvedValue([tok(1, "codex")]);
+    renderReflowCard(initial);
+    await waitFor(() =>
+      expect(document.querySelector(".gateway-token-list")).toBeInTheDocument(),
+    );
+  };
+
+  it("回退文本在 textarea 里改合法后，父级回流即翻回结构化（不粘住）", async () => {
+    await setupReflow("{not json");
+    const input = screen.getByLabelText(
+      zhCN.gateway.routingRulesLabel,
+    ) as HTMLTextAreaElement;
+    expect(input.value).toBe("{not json");
+    fireEvent.change(input, {
+      target: { value: '[{"agentLabel":"codex","siteIds":[1]}]' },
+    });
+    await waitFor(() =>
+      expect(document.querySelector('[data-routing-row="0"]')).toBeInTheDocument(),
+    );
+    // 原文 textarea 已卸载，行内解析结果与输入一致（非空翻）。
+    expect(screen.queryByLabelText(zhCN.gateway.routingRulesLabel)).toBeNull();
+    const r = document.querySelector('[data-routing-row="0"]') as HTMLElement;
+    expect((r.querySelector("select") as HTMLSelectElement).value).toBe("codex");
+    expect(
+      (r.querySelectorAll('input[type="checkbox"]')[0] as HTMLInputElement).checked,
+    ).toBe(true);
+  });
+
+  it("结构化增行后父级回流不重置行", async () => {
+    await setupReflow('[{"agentLabel":"codex","siteIds":[1]}]');
+    await waitFor(() =>
+      expect(
+        document.querySelector('[data-routing-row="0"]'),
+      ).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByText(zhCN.gateway.routingRulesAddRow));
+    // 回流后的 prop 是增行后的整表 JSON；行数仍为 2（未被重解析冲掉），
+    // 第 0 行 agent 仍为 codex。
+    await waitFor(() =>
+      expect(
+        document.querySelector('[data-routing-row="1"]'),
+      ).toBeInTheDocument(),
+    );
+    const r0 = document.querySelector('[data-routing-row="0"]') as HTMLElement;
+    expect((r0.querySelector("select") as HTMLSelectElement).value).toBe("codex");
   });
 });
