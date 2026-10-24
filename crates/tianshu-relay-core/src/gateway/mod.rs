@@ -1362,6 +1362,23 @@ impl GatewayHandle {
         Arc::clone(&self.tokens)
     }
 
+    /// M46-S1：把一站的巡检结论喂给运行中网关的 `Breaker`（与 `AppState`
+    /// 共享的同一份，`eligible_candidates` 下一次选路即见效）。
+    ///
+    /// 锁中毒 ⇒ 静默丢弃：巡检结论丢了，下一轮还会再探；可用性优先，
+    /// 不因此让巡检循环或网关请求失败。
+    pub fn record_probe_outcome(
+        &self,
+        site_id: i64,
+        models: &[String],
+        verdict: crate::notify::KeyHealthVerdict,
+        now: Instant,
+    ) {
+        if let Ok(mut guard) = self.breaker.lock() {
+            crate::notify::apply_probe_outcome(&mut guard, site_id, models, verdict, now);
+        }
+    }
+
     /// M43-S1：把库里读出的集合播种进运行态（`start()` 之后由服务层调用）。
     pub fn set_tokens(&self, entries: Vec<GatewayTokenEntry>) {
         if let Ok(mut guard) = self.tokens.write() {

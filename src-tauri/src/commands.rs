@@ -373,6 +373,8 @@ pub struct SettingsDto {
     gateway_multi_site: bool,
     collect_models: bool,
     models_min_interval_secs: u64,
+    // M46-S1：密钥健康巡检间隔秒（0 = 关闭；camelCase `gatewayKeyHealthIntervalSecs`）。
+    gateway_key_health_interval_secs: u64,
     // M39-S3：负载均衡与每站保护（默认 3 / 8 / 0；UI 控件由 M41 落地）
     gateway_lb_top_n: usize,
     gateway_per_site_concurrency: usize,
@@ -1634,6 +1636,7 @@ fn settings_from_dto(dto: &SettingsDto) -> tianshu_relay_core::settings::Setting
         gateway_multi_site: dto.gateway_multi_site,
         collect_models: dto.collect_models,
         models_min_interval_secs: dto.models_min_interval_secs,
+        gateway_key_health_interval_secs: dto.gateway_key_health_interval_secs,
         gateway_lb_top_n: dto.gateway_lb_top_n,
         gateway_per_site_concurrency: dto.gateway_per_site_concurrency,
         gateway_per_site_rate_limit: dto.gateway_per_site_rate_limit,
@@ -1670,6 +1673,7 @@ fn settings_to_dto(settings: &tianshu_relay_core::settings::Settings) -> Setting
         gateway_multi_site: settings.gateway_multi_site,
         collect_models: settings.collect_models,
         models_min_interval_secs: settings.models_min_interval_secs,
+        gateway_key_health_interval_secs: settings.gateway_key_health_interval_secs,
         gateway_lb_top_n: settings.gateway_lb_top_n,
         gateway_per_site_concurrency: settings.gateway_per_site_concurrency,
         gateway_per_site_rate_limit: settings.gateway_per_site_rate_limit,
