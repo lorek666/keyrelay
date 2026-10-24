@@ -1720,6 +1720,50 @@ pub fn site_bills(
         .map_err(|e| e.to_string())
 }
 
+/// M46-S6：一行账单对账结果（kind 为 "matched" | "gateway_only" | "bill_only"；
+/// bill_usd / diff_usd 为空只表示不可比——currency 非 USD、或为空、或 amount 为空；
+/// 缺失侧按 0 计：gateway-only 行 bill_usd = 0.0、bill-only 行 gateway_usd = 0.0）。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BillReconciliationDto {
+    pub site_id: i64,
+    pub day: String,
+    pub gateway_usd: f64,
+    pub bill_usd: Option<f64>,
+    pub diff_usd: Option<f64>,
+    pub flagged: bool,
+    pub kind: String,
+    pub source: Option<String>,
+}
+
+/// M46-S6：网关成本与站点自报账单的只读对账（近 `days` 天，缺省 30，夹到 1..=90；
+/// `site_id` 缺省 = 全部站点）。任一查询失败 ⇒ 整条命令报错（不返回半份数据，
+/// 与 usage_dashboard 同口径）。不写库、不发通知。
+#[tauri::command]
+pub fn bill_reconciliation(
+    state: State<'_, AppState>,
+    site_id: Option<i64>,
+    days: Option<i64>,
+) -> Result<Vec<BillReconciliationDto>, String> {
+    let days = tianshu_relay_core::store::clamp_usage_days(days.unwrap_or(30));
+    tianshu_relay_core::service::reconcile_bills(state.service.store(), site_id, days)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| BillReconciliationDto {
+                    site_id: r.site_id,
+                    day: r.day,
+                    gateway_usd: r.gateway_usd,
+                    bill_usd: r.bill_usd,
+                    diff_usd: r.diff_usd,
+                    flagged: r.flagged,
+                    kind: r.kind.as_str().to_string(),
+                    source: r.source,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
 // ============================================ 漂移 / 设置 / 刷新（M3-S1）
 
 fn settings_from_dto(dto: &SettingsDto) -> tianshu_relay_core::settings::Settings {

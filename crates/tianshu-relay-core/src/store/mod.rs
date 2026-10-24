@@ -2774,14 +2774,21 @@ impl Store {
         .map_err(|e| Error::Store(format!("计算预算周期窗口失败: {e}")))
     }
 
-    /// 当期已花（USD）。
-    ///
-    /// SQL 与 `usage_daily` 的 USD 分组逐字同构：行级关联「不晚于该行 at 的最新
-    /// USD 价格版本」，无价行 / CNY 价行因 INNER JOIN + currency='USD' 自然不计入
-    /// （已知漏口，见 spec §2.4，不静默换算）。`key_id` 为空的 legacy 行计入站级
-    /// 已花（属于该站），key 级查询因 `u.key_id = ?` 自然排除它们（无法归因）。
-    pub fn budget_spent_usd(&self, site_id: i64, key_id: Option<i64>, period: &str) -> Result<f64> {
-        let (start, end) = self.budget_period_bounds(period)?;
+    /// M46-S6：窗口内网关成本（USD）。SQL 逐字取自 S5 的 `budget_spent_usd`
+    /// 原实现（只把窗口起止从「当前周期」参数化为 `(start, end)`）；
+    /// 全仓库只有这一段定价 SQL 文本，`budget_spent_usd` 与对账共用它。
+    /// 行级关联「不晚于该行 at 的最新 USD 价格版本」，无价行 / CNY 价行因
+    /// INNER JOIN + currency='USD' 自然不计入（S5 已知漏口，不静默换算）。
+    /// `key_id` 为空的 legacy 行计入站级已花，key 级查询因 `u.key_id = ?`
+    /// 自然排除它们。错误文案沿用 S5 原文，使委托后的 `budget_spent_usd`
+    /// 对外可观测行为（签名、返回值、错误文案）不变。
+    pub fn gateway_cost_usd_in_window(
+        &self,
+        site_id: i64,
+        key_id: Option<i64>,
+        start: i64,
+        end: i64,
+    ) -> Result<f64> {
         let conn = self.lock()?;
         let mut sql = "SELECT COALESCE(ROUND(SUM(ROUND(
                 u.prompt_tokens / 1000000.0 * p.input_per_mtok
@@ -2811,6 +2818,92 @@ impl Store {
                 .map_err(|e| Error::Store(format!("query budget spent: {e}")))?,
         };
         Ok(spent)
+    }
+
+    /// M46-S6：本地自然日 `[day 零点, day+1 零点)` 的 unix 秒窗口（左闭右开）。
+    ///
+    /// 与 `budget_period_bounds` 同一条纪律：`day` 是本地日期串，SQLite 默认按
+    /// UTC 解释，`'utc'` 修饰符不能省；`+1 day` 而不用起点 + 86400
+    /// （DST 日不是 86400 秒）。`day` 须为 `YYYY-MM-DD` 形，否则 Err
+    /// （fail loud：坏格式静默跳行会让坏数据在对账里隐身）。
+    pub fn local_day_bounds(&self, day: &str) -> Result<(i64, i64)> {
+        let bytes = day.as_bytes();
+        let shape_ok = bytes.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
+        if !shape_ok {
+            return Err(Error::Store(format!("非法本地日格式: {day}")));
+        }
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT CAST(strftime('%s', ?1, 'utc') AS INTEGER), \
+             CAST(strftime('%s', ?1, '+1 day', 'utc') AS INTEGER)",
+            params![day],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| Error::Store(format!("计算本地日窗口失败: {e}")))
+    }
+
+    /// M46-S6：窗口内有网关用量行的 `(site_id, 本地日)` 去重列表，
+    /// 本地日 = `date(at, 'unixepoch', 'localtime')`。
+    /// `site_id` 为空 = 全部站点；窗口 = 近 `days` 天（含今天），夹到 1..=90。
+    /// 窗口起止与 `site_bills(days)` 的 `local_day_ago(days-1)` 是同一组本地日。
+    pub fn gateway_usage_days(
+        &self,
+        site_id: Option<i64>,
+        days: i64,
+    ) -> Result<Vec<(i64, String)>> {
+        let days = clamp_usage_days(days);
+        let conn = self.lock()?;
+        let start = local_day_start(&conn, days - 1)?;
+        let end: i64 = conn
+            .query_row(
+                "SELECT CAST(strftime('%s', date('now','localtime','+1 day'), 'utc') AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Store(format!("计算本地日窗口失败: {e}")))?;
+        let mut sql = "SELECT DISTINCT site_id, date(at, 'unixepoch', 'localtime') AS d \
+             FROM gateway_usage_log WHERE at >= ?1 AND at < ?2"
+            .to_string();
+        if site_id.is_some() {
+            sql.push_str(" AND site_id = ?3");
+        }
+        sql.push_str(" ORDER BY site_id ASC, d ASC");
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Store(format!("prepare gateway usage days: {e}")))?;
+        let rows: Vec<(i64, String)> = match site_id {
+            Some(sid) => stmt
+                .query_map(params![start, end, sid], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|e| Error::Store(format!("query gateway usage days: {e}")))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::Store(format!("collect gateway usage days: {e}")))?,
+            None => stmt
+                .query_map(params![start, end], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| Error::Store(format!("query gateway usage days: {e}")))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::Store(format!("collect gateway usage days: {e}")))?,
+        };
+        Ok(rows)
+    }
+
+    /// 当期已花（USD）。M46-S6 起为委托版：`budget_period_bounds` 算窗口 +
+    /// `gateway_cost_usd_in_window` 算成本；SQL、签名、返回值、错误文案均不动。
+    ///
+    /// SQL 与 `usage_daily` 的 USD 分组逐字同构：行级关联「不晚于该行 at 的最新
+    /// USD 价格版本」，无价行 / CNY 价行因 INNER JOIN + currency='USD' 自然不计入
+    /// （已知漏口，见 spec §2.4，不静默换算）。`key_id` 为空的 legacy 行计入站级
+    /// 已花（属于该站），key 级查询因 `u.key_id = ?` 自然排除它们（无法归因）。
+    pub fn budget_spent_usd(&self, site_id: i64, key_id: Option<i64>, period: &str) -> Result<f64> {
+        let (start, end) = self.budget_period_bounds(period)?;
+        self.gateway_cost_usd_in_window(site_id, key_id, start, end)
     }
 
     // ======================================================== M43-S2：站点账单

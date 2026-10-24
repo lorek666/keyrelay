@@ -1027,6 +1027,163 @@ pub fn budget_breach_for(
     Ok(site_breach)
 }
 
+/// M46-S6：对账行种类——**存在分区**，不是金额结论（见 spec §4.2）：
+/// `matched` = 账单行存在且网关成本 > 0；`gateway_only` = 网关成本 > 0 且
+/// 该 (site, day) 无任何账单行；`bill_only` = 账单行存在且网关成本为 0 或无行；
+/// 两边都空 ⇒ 不出任何行。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BillReconciliationKind {
+    Matched,
+    GatewayOnly,
+    BillOnly,
+}
+
+impl BillReconciliationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BillReconciliationKind::Matched => "matched",
+            BillReconciliationKind::GatewayOnly => "gateway_only",
+            BillReconciliationKind::BillOnly => "bill_only",
+        }
+    }
+}
+
+/// M46-S6：一行对账结果。`bill_usd / diff_usd` 为空**只**表示不可比
+/// （currency 非 USD、或为空、或 amount 为空），不表示「无账单」：
+/// 缺失侧在算术上按 0 计（gateway-only 行 `bill_usd = 0.0`、
+/// bill-only 行 `gateway_usd = 0.0`）。`flagged` 可比时 = 超阈值，
+/// 不可比时恒为 true（需人工看）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct BillReconciliationRow {
+    pub site_id: i64,
+    pub day: String,
+    pub gateway_usd: f64,
+    pub bill_usd: Option<f64>,
+    pub diff_usd: Option<f64>,
+    pub flagged: bool,
+    pub kind: BillReconciliationKind,
+    pub source: Option<String>,
+}
+
+/// 6 位舍入（与成本口径同位数；与 SQLite `ROUND` 同为半值远离零），
+/// `-0.0` 归一化为 `0.0`，避免 DTO 里出现 `-0.0`。
+fn round6_usd(value: f64) -> f64 {
+    let rounded = (value * 1_000_000.0).round() / 1_000_000.0;
+    if rounded == 0.0 {
+        0.0
+    } else {
+        rounded
+    }
+}
+
+/// M46-S6：按 (site, day) 对账。只读：只调 `site_bills` / `gateway_usage_days` /
+/// `local_day_bounds` / `gateway_cost_usd_in_window`，不写任何表、不发通知、
+/// 不感知导入来源（`source` 只是把 `site_bills.source` 原样透传）。
+/// `site_id` 为空 = 全部站点；不存在的站 ⇒ 空数组（读侧不做存在性校验）。
+/// `days` 夹到 1..=90（含今天）。任一查询失败 ⇒ Err（不返回半份数据）。
+/// 阈值：`threshold = max(5% × max(gateway, bill), $1)`，`flagged = |diff| > threshold`
+/// （严格大于；等于不标——与 S5 的 `>=` 拦停语义不同，各从其字面语义）。
+fn reconciliation_gateway_cost(
+    store: &Store,
+    cache: &mut std::collections::HashMap<(i64, String), f64>,
+    site_id: i64,
+    day: &str,
+) -> Result<f64> {
+    let key = (site_id, day.to_string());
+    if let Some(cost) = cache.get(&key) {
+        return Ok(*cost);
+    }
+    // 顺带校验账单 day 格式：非法 ⇒ Err（fail loud，不静默跳行）。
+    let (start, end) = store.local_day_bounds(day)?;
+    let cost = store.gateway_cost_usd_in_window(site_id, None, start, end)?;
+    cache.insert(key, cost);
+    Ok(cost)
+}
+
+pub fn reconcile_bills(
+    store: &Store,
+    site_id: Option<i64>,
+    days: i64,
+) -> Result<Vec<BillReconciliationRow>> {
+    let days = crate::store::clamp_usage_days(days);
+    let bills = store.site_bills(days)?;
+    let usage_days = store.gateway_usage_days(site_id, days)?;
+    let billed_days: std::collections::HashSet<(i64, String)> = bills
+        .iter()
+        .filter(|b| site_id.is_none_or(|s| s == b.site_id))
+        .map(|b| (b.site_id, b.day.clone()))
+        .collect();
+    let mut cost_cache: std::collections::HashMap<(i64, String), f64> =
+        std::collections::HashMap::new();
+    let mut rows: Vec<BillReconciliationRow> = Vec::new();
+    for bill in bills
+        .iter()
+        .filter(|b| site_id.is_none_or(|s| s == b.site_id))
+    {
+        let gateway_usd =
+            reconciliation_gateway_cost(store, &mut cost_cache, bill.site_id, &bill.day)?;
+        // 可比当且仅当 currency 大小写不敏感等于 USD 且 amount 非空；
+        // currency 为空（站点未报）是「未知」，不能默认 USD。
+        let comparable = bill.amount.is_some()
+            && bill
+                .currency
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case("USD"));
+        let kind = if gateway_usd > 0.0 {
+            BillReconciliationKind::Matched
+        } else {
+            BillReconciliationKind::BillOnly
+        };
+        let (bill_usd, diff_usd, flagged) = if comparable {
+            let amount = bill.amount.expect("可比行 amount 非空");
+            let diff = round6_usd(gateway_usd - amount);
+            let threshold = (0.05 * gateway_usd.max(amount)).max(1.0);
+            (Some(amount), Some(diff), diff.abs() > threshold)
+        } else {
+            (None, None, true)
+        };
+        rows.push(BillReconciliationRow {
+            site_id: bill.site_id,
+            day: bill.day.clone(),
+            gateway_usd,
+            bill_usd,
+            diff_usd,
+            flagged,
+            kind,
+            source: Some(bill.source.clone()),
+        });
+    }
+    for (site, day) in &usage_days {
+        if billed_days.contains(&(*site, day.clone())) {
+            continue; // 该天已有账单方，差异体现在各来源行里，不出 gateway-only 行。
+        }
+        let gateway_usd = reconciliation_gateway_cost(store, &mut cost_cache, *site, day)?;
+        if gateway_usd <= 0.0 {
+            continue; // 网关成本 0 且无账单 ⇒ 两边都空，无可对项。
+        }
+        let diff = round6_usd(gateway_usd);
+        let threshold = (0.05 * gateway_usd).max(1.0);
+        rows.push(BillReconciliationRow {
+            site_id: *site,
+            day: day.clone(),
+            gateway_usd,
+            bill_usd: Some(0.0),
+            diff_usd: Some(diff),
+            flagged: diff.abs() > threshold,
+            kind: BillReconciliationKind::GatewayOnly,
+            source: None,
+        });
+    }
+    // 输出顺序是契约：day 倒序、site_id 升序、source 升序。
+    rows.sort_by(|a, b| {
+        b.day
+            .cmp(&a.day)
+            .then(a.site_id.cmp(&b.site_id))
+            .then(a.source.cmp(&b.source))
+    });
+    Ok(rows)
+}
+
 impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     pub fn new(store: Store, transport: T, config: ServiceConfig) -> Self {
         let svc = Self {

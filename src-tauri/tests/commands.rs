@@ -3202,3 +3202,121 @@ fn m46s5_site_budget_commands_round_trip_and_reject_bad_input() {
         json!([])
     );
 }
+
+/// M46-S6：账单对账命令在 IPC 层可用（注册 + ACL + camelCase DTO + site 过滤）。
+/// 当日 day 字符串不硬编码：先调一次拿到 gateway-only 行的 day，再按该 day 写账单复调。
+#[test]
+fn m46s6_bill_reconciliation_commands_round_trip() {
+    let (_app, webview) = build_app();
+    let invoke_on_app = |cmd: &str, args: Value| invoke_on(&webview, cmd, args);
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
+    let store = state.service.store();
+
+    let empty = invoke_on_app("bill_reconciliation", json!({})).expect("空库应成功");
+    assert_eq!(empty, json!([]), "空库应返回空数组");
+
+    let site = store
+        .upsert_site("newapi", "https://relay.example.com", "对账测试站")
+        .expect("写站点");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("时钟")
+        .as_secs() as i64;
+    store
+        .model_price_upsert("usd-model", 2.0, 4.0, "USD", now - 40 * 86_400)
+        .expect("写价格");
+    store
+        .insert_gateway_usage(&tianshu_relay_core::gateway::GatewayUsage {
+            at: now,
+            site_id: site,
+            key_id: None,
+            model: "usd-model".to_string(),
+            prompt_tokens: 5_000_000,
+            completion_tokens: 0,
+            total_tokens: 5_000_000,
+            status: 200,
+            latency_ms: 10,
+            attempts: 1,
+            stream: false,
+            token_id: None,
+            agent_label: String::new(),
+        })
+        .expect("写用量");
+
+    // 第一次：只有网关侧 ⇒ gateway-only 行，顺带取当日 day。
+    let first = invoke_on_app("bill_reconciliation", json!({})).expect("首调");
+    let first_rows = first.as_array().expect("数组");
+    assert_eq!(first_rows.len(), 1, "无账单时应恰好一行 gateway-only");
+    let row = &first_rows[0];
+    for key in [
+        "siteId",
+        "day",
+        "gatewayUsd",
+        "billUsd",
+        "diffUsd",
+        "flagged",
+        "kind",
+        "source",
+    ] {
+        assert!(row.get(key).is_some(), "缺字段 {key}: {row}");
+    }
+    assert!(row.get("site_id").is_none(), "线上键必须 camelCase");
+    assert_eq!(row["kind"], "gateway_only");
+    assert_eq!(row["gatewayUsd"], 10.0, "5M prompt × 2.0 = 10.0");
+    assert_eq!(row["billUsd"], 0.0, "缺失侧按 0 计");
+    assert_eq!(row["source"], Value::Null, "gateway-only 行无来源");
+    let today = row["day"].as_str().expect("day 字符串").to_string();
+
+    // 按该 day 写账单 ⇒ 第二次应为 matched 行。
+    store
+        .site_bill_upsert(
+            site,
+            &today,
+            Some(10.0),
+            Some("USD"),
+            None,
+            "newapi-log-self",
+        )
+        .expect("写账单");
+    let second = invoke_on_app("bill_reconciliation", json!({})).expect("复调");
+    let second_rows = second.as_array().expect("数组");
+    assert_eq!(second_rows.len(), 1);
+    assert_eq!(second_rows[0]["kind"], "matched");
+    assert_eq!(second_rows[0]["gatewayUsd"], 10.0);
+    assert_eq!(second_rows[0]["billUsd"], 10.0);
+    assert_eq!(second_rows[0]["diffUsd"], 0.0);
+    assert_eq!(second_rows[0]["flagged"], false);
+    assert_eq!(second_rows[0]["source"], "newapi-log-self");
+
+    // site 过滤：别站有网关行但不过滤不到；只查本战时只回本行。
+    let other = store
+        .upsert_site("newapi", "https://other.example.com", "别站")
+        .expect("写别站");
+    store
+        .insert_gateway_usage(&tianshu_relay_core::gateway::GatewayUsage {
+            at: now,
+            site_id: other,
+            key_id: None,
+            model: "usd-model".to_string(),
+            prompt_tokens: 5_000_000,
+            completion_tokens: 0,
+            total_tokens: 5_000_000,
+            status: 200,
+            latency_ms: 10,
+            attempts: 1,
+            stream: false,
+            token_id: None,
+            agent_label: String::new(),
+        })
+        .expect("写别站用量");
+    let filtered = invoke_on_app("bill_reconciliation", json!({ "siteId": site })).expect("过滤调");
+    let filtered_rows = filtered.as_array().expect("数组");
+    assert_eq!(filtered_rows.len(), 1, "site 过滤只回该站");
+    assert_eq!(filtered_rows[0]["siteId"], site);
+    let unfiltered = invoke_on_app("bill_reconciliation", json!({})).expect("不过滤");
+    assert_eq!(
+        unfiltered.as_array().map(|a| a.len()),
+        Some(2),
+        "不过滤时两站各一行"
+    );
+}
