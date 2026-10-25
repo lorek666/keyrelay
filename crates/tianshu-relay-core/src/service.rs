@@ -485,9 +485,13 @@ pub struct RotationPlan {
     pub key_name: String,
     /// 固定三步（`rotation::rotation_steps()`；顺序不可重排）
     pub steps: Vec<crate::rotation::RotationStep>,
-    /// 会被重注入的通道（`channel.as_str()`，升序去重）
+    /// 会被重注入的通道（`channel.as_str()`，升序去重；DEBUG P1-13：
+    /// 非默认 Cline 变体写成 `"cline (code-insiders)"` 这种带变体名的形式，
+    /// 默认变体仍只写 `"cline"`，保持既有前端与测试的读取口径）。
     pub channels: Vec<String>,
     /// 绑定了这把 key、但 `agent_id` 认不出通道的目标，升序去重。
+    /// DEBUG P1-13：Cline 绑定落点不在三变体白名单里时也进这一列（记的是
+    /// 目标路径而非 agent_id）——变体无法认定就不能猜一个默认落点去写。
     /// **非空 = 不能轮换**（见 [`TianshuRelayService::rotate_key`] 的前置拒绝）。
     pub unmapped_targets: Vec<String>,
     /// 旧 key 的站点侧 id；`None` = 本地记录里就没有，第三步会被跳过并说明
@@ -524,12 +528,41 @@ pub enum RevokeOutcome {
     Failed(String),
 }
 
+/// 轮换的一条重注入目标（DEBUG P1-13）：通道 + 落点变体 + 目标路径。
+///
+/// 旧实现只传通道（`Vec<DeliveryChannel>`），Cline 三变体共享 `agent_id="cline"`，
+/// 轮换因此丢了 `binding.target_path`，Insiders/Cursor 绑定会被写进默认 Code 路径。
+/// 现在目标按 `(通道, 目标路径)` 去重：同一把 key 同时绑 Code 与 Insiders 时是
+/// 两条目标，各写各的文件；非 Cline 通道 `variant` 恒为 `None`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RotationTarget {
+    pub channel: DeliveryChannel,
+    /// Cline 变体名（`"code"` / `"code-insiders"` / `"cursor"`），其余通道为 `None`。
+    /// 默认变体也记 `"code"` 而不是 `None`，以便报告与预检明确区分「没变体」与
+    /// 「默认变体」——`prepare_delivery` 对两者解析结果相同，不影响写盘。
+    pub variant: Option<String>,
+    pub target_path: String,
+}
+
+impl RotationTarget {
+    /// 报告里的人话名：默认变体只写通道名（保持既有口径），非默认变体后缀变体名。
+    pub fn display_name(&self) -> String {
+        match self.variant.as_deref() {
+            Some(variant) if variant != "code" => {
+                format!("{} ({})", self.channel.as_str(), variant)
+            }
+            _ => self.channel.as_str().to_string(),
+        }
+    }
+}
+
 /// 一次轮换的完整结果。**不含密钥明文**（新 key 只有掩码形态）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RotationRun {
     /// 新建的 key（明文只进钥匙串）
     pub new_key: StoredKey,
-    /// 已成功重注入的通道（按注入顺序）
+    /// 已成功重注入的通道（按注入顺序；DEBUG P1-13：非默认 Cline 变体带变体名，
+    /// 如 `"cline (code-insiders)"`，其余与旧口径相同）
     pub reinjected: Vec<String>,
     pub revoke: RevokeOutcome,
     /// 停在哪一步（`None` = 三步全部走完，或第三步按规跳过）
@@ -2724,9 +2757,29 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             )
         }) {
             return match inject::rollback(&journal) {
-                Ok(()) => Err(Error::Store(format!(
-                    "记账失败，已自动回滚（文件内容未改动）: {err}"
-                ))),
+                Ok(()) => {
+                    // DEBUG P1-11：与 Codex 双单记账失败分支（P0-2 复审 P1-1）对齐——
+                    // 只滚文件不够：journals 行若仍为 `applied`，漂移会拿新内容的
+                    // `after_sha256` 比对已还原的旧文件报 `Modified`，历史页也仍显示
+                    // 可回滚、而点回滚又被哈希校验拒绝。文件回滚成功后必须补
+                    // `mark_journal_rolled_back`；记状态失败按 `rollback_delivery`
+                    // 的既有口径记 warn、不翻转结果；文件回滚本身失败时**不**标记
+                    // ——文件仍是新内容，账面就该仍是 applied。
+                    if let Err(mark_err) = self.store.mark_journal_rolled_back(&journal.id) {
+                        self.log(observability::event_with_payload(
+                            Level::Warn,
+                            "delivery",
+                            "单通道记账失败回滚后，本地状态没记上",
+                            serde_json::json!({
+                                "journal_id": journal.id,
+                                "error": crate::redact::scrub(&mark_err.to_string()),
+                            }),
+                        ));
+                    }
+                    Err(Error::Store(format!(
+                        "记账失败，已自动回滚（文件内容未改动）: {err}"
+                    )))
+                }
                 Err(rollback_err) => Err(Error::Store(format!(
                     "记账失败且自动回滚也失败，需要人工处理: {err} / {rollback_err}"
                 ))),
@@ -3987,12 +4040,18 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         }
     }
 
-    /// 这把 key 当前服务的投递通道（升序去重）+ 认不出通道的目标（升序去重）。
+    /// 这把 key 当前服务的投递目标（升序去重）+ 认不出通道的目标（升序去重）。
     ///
     /// 只查库、不读文件哈希：这是**归属关系**查询，`binding_drift_rows` 顺带给出的
     /// 哈希列在这里没有任何用处（漂移检测才需要它）。
-    fn rotation_targets(&self, key_id: i64) -> Result<(Vec<DeliveryChannel>, Vec<String>)> {
-        let mut channels: Vec<DeliveryChannel> = Vec::new();
+    ///
+    /// DEBUG P1-13：返回的是**目标**而非通道——Cline 变体靠 `target_path` 区分，
+    /// 只给通道会把 Insiders/Cursor 绑定写进默认 Code 路径。变体由目标路径
+    /// 反查白名单认定（`allowed_targets` 的三条路径各归其位）；落点不在白名单
+    /// 里的 Cline 绑定进 `unmapped`（记目标路径），轮换在建新 key 之前拒绝，
+    /// 不猜默认落点。
+    fn rotation_targets(&self, key_id: i64) -> Result<(Vec<RotationTarget>, Vec<String>)> {
+        let mut targets: Vec<RotationTarget> = Vec::new();
         let mut unmapped: Vec<String> = Vec::new();
         for binding in self.store.binding_drift_rows()? {
             // 只看「这个目标**现在**由这把 key 服务」的绑定：查询已经按
@@ -4006,8 +4065,31 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             }
             match DeliveryChannel::from_agent_id(&binding.agent_id) {
                 Some(channel) => {
-                    if !channels.contains(&channel) {
-                        channels.push(channel);
+                    let variant = if channel == DeliveryChannel::Cline {
+                        let allowed = delivery::allowed_targets(DeliveryChannel::Cline, &self.home);
+                        let found = allowed
+                            .iter()
+                            .position(|p| p.display().to_string() == binding.target_path)
+                            .and_then(|idx| ["code", "code-insiders", "cursor"].get(idx).copied());
+                        match found {
+                            Some(name) => Some(name.to_string()),
+                            None => {
+                                if !unmapped.contains(&binding.target_path) {
+                                    unmapped.push(binding.target_path.clone());
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let target = RotationTarget {
+                        channel,
+                        variant,
+                        target_path: binding.target_path.clone(),
+                    };
+                    if !targets.contains(&target) {
+                        targets.push(target);
                     }
                 }
                 // 认不出来的 `agent_id` 说明这个目标曾经由本产品投递过、而现在本产品
@@ -4021,9 +4103,45 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 }
             }
         }
-        channels.sort_by_key(|channel| channel.as_str());
+        targets.sort_by(|a, b| {
+            a.channel
+                .as_str()
+                .cmp(b.channel.as_str())
+                .then_with(|| a.target_path.cmp(&b.target_path))
+        });
         unmapped.sort();
-        Ok((channels, unmapped))
+        Ok((targets, unmapped))
+    }
+
+    /// DEBUG P1-12：轮换要保留的 Codex 模型——读**现盘** `config.toml` 的顶层
+    /// `model`，而不是凭空给一个。
+    ///
+    /// 为什么只在这里读盘、不改 `codex_config` 的 `model=None` 语义：其余 18 条
+    /// 通道在 `model=None` 时只插不删、模型本来就保留，只有 Codex config 是
+    /// strip 后重写型；把 writer 改成「None 时保留原模型」会改变所有
+    /// `codex-config` 直接投递的语义（用户想清掉模型时也清不掉），而轮换的
+    /// 语义恰恰是「只换密钥，不动模型」——保留应当是轮换这一步的责任，不是
+    /// writer 的。读不到文件 / 没有顶层 model 时返回 `None`（退回旧行为），
+    /// 预检会把真正写不进的情形拦在建新 key 之前。
+    fn rotation_codex_model(&self) -> Option<String> {
+        let path = self
+            .home
+            .join(DeliveryChannel::CodexConfig.relative_target());
+        let text = std::fs::read_to_string(path).ok()?;
+        delivery::codex_config::top_model_from_text(&text)
+    }
+
+    /// 轮换时某通道用的模型：只有 Codex 两通道透传现盘模型（auth 写入器本身
+    /// 不写模型，透传无害；config 靠它保留），其余通道一律 `None`——它们在
+    /// `None` 时只插不删，透传反而会把模型写进本来没有模型的通道。
+    fn rotation_model_for<'a>(
+        channel: DeliveryChannel,
+        codex_model: &'a Option<String>,
+    ) -> Option<&'a str> {
+        match channel {
+            DeliveryChannel::CodexAuthJson | DeliveryChannel::CodexConfig => codex_model.as_deref(),
+            _ => None,
+        }
     }
 
     /// 轮换预检（§9-8）：逐通道用占位密钥空跑一次 `plan()`，返回**写不进去的**那些。
@@ -4033,35 +4151,41 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     ///
     /// 为什么是 `plan()` 而不是 `apply_delivery`：`plan()` 不落盘、不读钥匙串、不改任何状态，
     /// 因此「预检」不会产生任何需要回滚的东西。**预检失败不建新 key** 是这条的全部意义。
-    fn rotation_precheck(&self, key_id: i64, channels: &[DeliveryChannel]) -> Vec<BlockedTarget> {
+    fn rotation_precheck(
+        &self,
+        key_id: i64,
+        targets: &[RotationTarget],
+        codex_model: &Option<String>,
+    ) -> Vec<BlockedTarget> {
         let mut blocked = Vec::new();
-        for channel in channels {
+        for target in targets {
+            let channel = target.channel;
+            let variant = target.variant.as_deref();
             let writer = match self.prepare_delivery(
                 key_id,
-                *channel,
-                None,
+                channel,
+                Self::rotation_model_for(channel, codex_model),
                 delivery::DeliverySource::Site,
-                None,
+                variant,
             ) {
                 Ok(writer) => writer,
                 Err(err) => {
                     blocked.push(BlockedTarget {
-                        channel: channel.as_str().to_string(),
-                        target: self
-                            .home
-                            .join(channel.relative_target())
-                            .display()
-                            .to_string(),
+                        channel: target.display_name(),
+                        target: target.target_path.clone(),
                         reason: crate::redact::scrub(&err.to_string()),
                     });
                     continue;
                 }
             };
+            let display_name = target.display_name();
             let target = writer.target_path();
             // P2-2 / DEBUG-REPORT-v3 §2-2：`plan()` 只验「文件写得进」，验不出「同意被撤销」
             // 和「目标是符号链接」——这两种在 `apply_delivery` 时才失败，而那时 `create_key`
             // 已经在站点建了新 key，每重试一次站点多一把。预检里就地补这两条。
-            match self.consent_state(*channel, &target) {
+            // DEBUG P1-13：同意按变体目标路径查——Insiders 的同意在 Insiders 路径上，
+            // 用默认路径去查会误判为「尚未同意」或误用默认路径的同意。
+            match self.consent_state(channel, &target) {
                 Ok(state) if state.is_granted() => {}
                 Ok(state) => {
                     let label = match state {
@@ -4070,7 +4194,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                         crate::delivery::ConsentState::Granted { .. } => unreachable!(),
                     };
                     blocked.push(BlockedTarget {
-                        channel: channel.as_str().to_string(),
+                        channel: display_name.clone(),
                         target: target.display().to_string(),
                         reason: format!(
                             "{label}，轮换会在建新密钥后才停在这里——每重试一次站点多一把"
@@ -4080,7 +4204,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 }
                 Err(err) => {
                     blocked.push(BlockedTarget {
-                        channel: channel.as_str().to_string(),
+                        channel: display_name.clone(),
                         target: target.display().to_string(),
                         reason: crate::redact::scrub(&err.to_string()),
                     });
@@ -4089,7 +4213,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             }
             if target.is_symlink() {
                 blocked.push(BlockedTarget {
-                    channel: channel.as_str().to_string(),
+                    channel: display_name.clone(),
                     target: target.display().to_string(),
                     reason: "目标是符号链接，轮换会在建新密钥后才在写入时失败".to_string(),
                 });
@@ -4098,10 +4222,13 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             // P0-1：轮换预检同样跑整单校验——writer 回归在建新 key 之前就暴露，
             // 而不是等到重注入那一步才停在半路。
             let precheck = writer.plan(delivery::PLACEHOLDER_KEY).and_then(|_| {
-                let opts =
-                    self.delivery_field_options(key_id, None, &delivery::DeliverySource::Site)?;
+                let opts = self.delivery_field_options(
+                    key_id,
+                    Self::rotation_model_for(channel, codex_model),
+                    &delivery::DeliverySource::Site,
+                )?;
                 delivery::validate_plan_fields(
-                    *channel,
+                    channel,
                     &writer.fields(delivery::PLACEHOLDER_KEY),
                     &opts,
                     &target,
@@ -4109,7 +4236,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             });
             if let Err(err) = precheck {
                 blocked.push(BlockedTarget {
-                    channel: channel.as_str().to_string(),
+                    channel: display_name,
                     target: target.display().to_string(),
                     reason: crate::redact::scrub(&err.to_string()),
                 });
@@ -4126,16 +4253,16 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             .ok_or_else(|| Error::NotFound(format!("密钥 #{key_id} 不存在")))?;
         // `rotate_key` 的第一步就是本函数：在这里拒绝 = 在**建新 key 之前**拒绝。
         ensure_not_revoked(&row)?;
-        let (channels, unmapped_targets) = self.rotation_targets(key_id)?;
+        let (targets, unmapped_targets) = self.rotation_targets(key_id)?;
 
         Ok(RotationPlan {
             key_id,
             site_id: row.site_id,
             key_name: row.name,
             steps: crate::rotation::rotation_steps().to_vec(),
-            channels: channels
+            channels: targets
                 .into_iter()
-                .map(|channel| channel.as_str().to_string())
+                .map(|target| target.display_name())
                 .collect(),
             unmapped_targets,
             old_remote_id: row.remote_id,
@@ -4300,9 +4427,12 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     .to_string(),
             });
         }
-        // 通道用**解析好的枚举**迭代（而不是回头 `parse` 一遍 `plan.channels` 的字符串）：
+        // 目标用**解析好的结构**迭代（而不是回头 `parse` 一遍 `plan.channels` 的字符串）：
         // 认不出通道这件事上面已经拒绝过了，循环里不该再有一个「理论上不可达」的分支。
-        let (channels, _) = self.rotation_targets(key_id)?;
+        // DEBUG P1-13：这里是目标（含变体），不是通道——变体在循环里全程携带。
+        let (targets, _) = self.rotation_targets(key_id)?;
+        // DEBUG P1-12：现盘 Codex 模型在预检与重注入两处共用同一份读数。
+        let codex_model = self.rotation_codex_model();
 
         // ①′ 预检（§9-8 / P2-3）：**在 `create_key` 之前**证明「每个通道都写得进去」。
         //
@@ -4312,7 +4442,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         //
         // 空跑用的是 `PLACEHOLDER_KEY`（不是任何真实密钥形态）且只调 `plan()`：
         // `plan()` 读目标文件、生成 `Patch`，**不落盘、不读钥匙串**⇒ 对站点与本地都无副作用。
-        let blocked = self.rotation_precheck(key_id, &channels);
+        let blocked = self.rotation_precheck(key_id, &targets, &codex_model);
         if !blocked.is_empty() {
             return Err(Error::Inject {
                 path: blocked
@@ -4371,8 +4501,118 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         // P1-2：按原绑定的 delivery_mode 走，不把网关模式改成站点模式（写明文 key）。
         let port = self.settings()?.gateway_port;
         let gateway_token = self.gateway_token().0;
-        for channel in channels {
-            let channel_name = channel.as_str();
+        // DEBUG P1-14：Codex 两文件在轮换里**不再**是两次独立单投递。
+        // 排序保证 `codex-auth-json` 紧邻 `codex-config`（见 `rotation_targets` 的
+        // 通道名字排序），循环到 auth 时若下一条正是 config，就把两条合成一次
+        // `apply_codex_in_with_variant`：共享一个 journal、任一失败整体回滚，
+        // auth 成功而 config 失败的半注入窗口不再出现；旧 key 不回收的好行为不变
+        // （失败仍停在 `ReinjectAll`，第三步不走）。
+        // 显性降级（不得静默）：两文件的原绑定 delivery_mode 不一致时，单一一单
+        // 装不下两种来源（bundle 只接受一个 `DeliverySource`），只能退回逐文件
+        // 重注入——此时半注入窗口与旧行为相同，循环里记一条 Warn 事件明示，
+        // 不假装这一次是原子的。两文件同为网关模式时 base_url 相同
+        // （两 Codex 通道都取 `local_url/v1`），用 config 的口径建端点即可。
+        let mut idx = 0;
+        while idx < targets.len() {
+            let target = &targets[idx];
+            let channel = target.channel;
+            let channel_name = target.display_name();
+            if channel == DeliveryChannel::CodexAuthJson
+                && idx + 1 < targets.len()
+                && targets[idx + 1].channel == DeliveryChannel::CodexConfig
+            {
+                let mode_auth = self.rotation_delivery_mode(key_id, &channel)?;
+                let mode_config =
+                    self.rotation_delivery_mode(key_id, &DeliveryChannel::CodexConfig)?;
+                if mode_auth == mode_config {
+                    let bundle_result = match mode_auth.as_str() {
+                        "gateway" => {
+                            let local_url = format!("http://127.0.0.1:{}", port);
+                            let base_url = delivery::gateway_base_url_for(
+                                &DeliveryChannel::CodexConfig,
+                                &local_url,
+                            );
+                            let endpoint = delivery::GatewayEndpoint {
+                                base_url,
+                                // P3-32 边界：`GatewayEndpoint.token` 是冻结的 `String`
+                                // （非本包写域），这一处 `.to_string()` 是**必需**的唯一拷贝。
+                                token: gateway_token.to_string(),
+                            };
+                            self.apply_codex_in_with_variant(
+                                new_key.id,
+                                codex_model.as_deref(),
+                                delivery::DeliverySource::Gateway(&endpoint),
+                                false,
+                                None,
+                            )
+                        }
+                        _ => self.apply_codex_in_with_variant(
+                            new_key.id,
+                            codex_model.as_deref(),
+                            delivery::DeliverySource::Site,
+                            false,
+                            None,
+                        ),
+                    };
+                    match bundle_result {
+                        Ok(outcome) => {
+                            self.log(observability::event_with_payload(
+                                Level::Info,
+                                "key",
+                                "轮换: Codex 双文件同单重注入完成",
+                                serde_json::json!({
+                                    "step": crate::rotation::RotationStep::ReinjectAll.as_str(),
+                                    "site_id": plan.site_id,
+                                    "new_key_id": new_key.id,
+                                    "journal_id": outcome.journal_id,
+                                }),
+                            ));
+                            reinjected.push(DeliveryChannel::CodexAuthJson.as_str().to_string());
+                            reinjected.push(DeliveryChannel::CodexConfig.as_str().to_string());
+                            idx += 2;
+                            continue;
+                        }
+                        Err(err) => {
+                            let reason = crate::redact::scrub(&err.to_string());
+                            self.log(observability::event_with_payload(
+                                Level::Warn,
+                                "key",
+                                "轮换中断: 重注入失败",
+                                serde_json::json!({
+                                    "step": crate::rotation::RotationStep::ReinjectAll.as_str(),
+                                    "site_id": plan.site_id,
+                                    "new_key_id": new_key.id,
+                                    "channel": "codex 双文件同单",
+                                    "reinjected": &reinjected,
+                                }),
+                            ));
+                            return Ok(RotationRun {
+                                new_key,
+                                reinjected,
+                                revoke: RevokeOutcome::NotAttempted,
+                                stopped_at: Some(crate::rotation::RotationStep::ReinjectAll),
+                                stop_reason: Some(format!("重注入 codex 双文件同单失败: {reason}")),
+                            });
+                        }
+                    }
+                }
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "key",
+                    "轮换: Codex 两文件投递模式不一致，无法走双文件同单，退回逐文件重注入",
+                    serde_json::json!({
+                        "step": crate::rotation::RotationStep::ReinjectAll.as_str(),
+                        "site_id": plan.site_id,
+                        "new_key_id": new_key.id,
+                        "auth_mode": mode_auth,
+                        "config_mode": mode_config,
+                    }),
+                ));
+                // 落到下面的单通道分支：先写 auth，下一次循环再写 config。
+            }
+            // DEBUG P1-12 / P1-13：单通道也全程携带变体与（仅 Codex 的）现盘模型。
+            // 同意门禁、原子写、回读校验都在 `apply_delivery_in_with_variant` 内，
+            // 轮换不放宽其中任何一项；旧 key 不回收的好行为由失败分支保证。
             let mode = self.rotation_delivery_mode(key_id, &channel)?;
             let result = match mode.as_str() {
                 "gateway" => {
@@ -4384,18 +4624,20 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                         // 这一处 `.to_string()` 是**必需**的唯一拷贝。
                         token: gateway_token.to_string(),
                     };
-                    self.apply_delivery_in(
+                    self.apply_delivery_in_with_variant(
                         new_key.id,
                         channel,
-                        None,
+                        Self::rotation_model_for(channel, &codex_model),
                         delivery::DeliverySource::Gateway(&endpoint),
+                        target.variant.as_deref(),
                     )
                 }
-                _ => self.apply_delivery_in(
+                _ => self.apply_delivery_in_with_variant(
                     new_key.id,
                     channel,
-                    None,
+                    Self::rotation_model_for(channel, &codex_model),
                     delivery::DeliverySource::Site,
+                    target.variant.as_deref(),
                 ),
             };
             if let Err(err) = result {
@@ -4420,7 +4662,8 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     stop_reason: Some(format!("重注入 {channel_name} 失败: {reason}")),
                 });
             }
-            reinjected.push(channel_name.to_string());
+            reinjected.push(channel_name);
+            idx += 1;
         }
 
         // ③ 回收旧 key
