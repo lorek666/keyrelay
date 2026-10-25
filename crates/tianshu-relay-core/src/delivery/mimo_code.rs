@@ -178,7 +178,11 @@ mod tests {
     fn errors_never_echo_the_key() {
         // DEBUG-G7 P2-K4：畸形旧文件 + 双 canary，见 codex_auth 同名用例。
         let dir = tmp();
-        std::fs::write(w(dir.path(), BASE).path(), "{\"api_key\": \"CANARY-FILE-9x7z").unwrap();
+        std::fs::write(
+            w(dir.path(), BASE).path(),
+            "{\"api_key\": \"CANARY-FILE-9x7z",
+        )
+        .unwrap();
         let err = w(dir.path(), BASE).plan("CANARY-KEY-4k2m").unwrap_err();
         assert!(!err.to_string().contains("CANARY-KEY-4k2m"), "{err}");
         assert!(!err.to_string().contains("CANARY-FILE-9x7z"), "{err}");

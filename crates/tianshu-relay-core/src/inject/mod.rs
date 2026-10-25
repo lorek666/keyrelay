@@ -274,7 +274,10 @@ fn write_verified(path: &Path, contents: &str, new_file_mode: Option<u32>) -> Re
     // 空写盘只可能是上游 plan 出错，写进去等于静默毁掉用户配置。
     // 守门只放这里，不放 `write_atomic`：回滚路径合法地恢复可能为空的备份。
     if contents.is_empty() {
-        return Err(Error::inject(path, "拒绝写入空内容：投递内容为空，配置不会被截断成 0 字节"));
+        return Err(Error::inject(
+            path,
+            "拒绝写入空内容：投递内容为空，配置不会被截断成 0 字节",
+        ));
     }
     write_atomic(path, contents, new_file_mode, None)?;
     let read_back =

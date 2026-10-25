@@ -416,14 +416,17 @@ pub fn probe_cline_cli(home: &Path) -> ClineCliProbe {
             version: version.clone(),
             note: match version {
                 Some(_) => "已找到 cline CLI。".to_string(),
-                None => "已找到 cline CLI，但版本未确认（--version 未返回可解析的版本号）。".to_string(),
+                None => {
+                    "已找到 cline CLI，但版本未确认（--version 未返回可解析的版本号）。".to_string()
+                }
             },
         },
         VersionRun::TimedOut => ClineCliProbe {
             found: true,
             path: Some(path_display),
             version: None,
-            note: "已找到 cline CLI，但版本探测超时（5 秒），版本未确认；可点“重新检测”再试一次。".to_string(),
+            note: "已找到 cline CLI，但版本探测超时（5 秒），版本未确认；可点“重新检测”再试一次。"
+                .to_string(),
         },
         VersionRun::Failed(reason) => ClineCliProbe {
             found: true,
@@ -886,7 +889,10 @@ mod tests {
         let found = probe_cline_cli(dir.path());
         assert!(found.found);
         assert_eq!(found.version.as_deref(), Some("1.2.3"));
-        assert_eq!(found.path.as_deref(), Some(script.display().to_string().as_str()));
+        assert_eq!(
+            found.path.as_deref(),
+            Some(script.display().to_string().as_str())
+        );
 
         // 注：本断言假设运行环境的 PATH 与系统目录里没有 cline（CI/VM 成立）；
         // 若机器上装有 cline，find_bin 会在系统目录/PATH 里找到它，found 即为真。

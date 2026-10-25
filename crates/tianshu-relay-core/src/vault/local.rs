@@ -93,7 +93,10 @@ impl LocalVault {
         {
             use std::os::unix::fs::PermissionsExt;
             let mut candidates = vec![db_path.to_path_buf()];
-            if let Some(name) = db_path.file_name().map(|n| n.to_string_lossy().into_owned()) {
+            if let Some(name) = db_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+            {
                 candidates.push(db_path.with_file_name(format!("{name}-wal")));
                 candidates.push(db_path.with_file_name(format!("{name}-shm")));
             }
@@ -102,8 +105,10 @@ impl LocalVault {
                     let cur = meta.permissions().mode() & 0o777;
                     let tight = cur & 0o600;
                     if tight != cur {
-                        let _ =
-                            std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(tight));
+                        let _ = std::fs::set_permissions(
+                            &candidate,
+                            std::fs::Permissions::from_mode(tight),
+                        );
                     }
                 }
             }

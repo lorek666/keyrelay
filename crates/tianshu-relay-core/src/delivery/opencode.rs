@@ -373,8 +373,14 @@ mod tests {
         );
         let patch = writer.plan(SECRET).unwrap();
         let after = parsed(&patch.after);
-        assert_eq!(after["provider"][PROVIDER]["models"][PROVIDER]["limit"]["context"], 200_000);
-        assert_eq!(after["provider"][PROVIDER]["models"][PROVIDER]["limit"]["output"], 32_000);
+        assert_eq!(
+            after["provider"][PROVIDER]["models"][PROVIDER]["limit"]["context"],
+            200_000
+        );
+        assert_eq!(
+            after["provider"][PROVIDER]["models"][PROVIDER]["limit"]["output"],
+            32_000
+        );
         let names = writer_in(dir.path(), BASE, Some(MODEL)).field_names();
         assert!(!names.iter().any(|n| n.contains("limit")), "{names:?}");
         // 整单校验仍放行（limit 键既不在必填表、也不在 fields 里，不触发误杀/缺失）。

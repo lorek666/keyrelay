@@ -559,8 +559,16 @@ mod tests {
         let refs_pos = patch.after.find("refs:").unwrap();
         let key_pos = patch.after.find("KEYRELAY_API_KEY:").unwrap();
         let records_pos = patch.after.find("records:").unwrap();
-        assert!(refs_pos < key_pos && key_pos < records_pos, "{}", patch.after);
-        assert!(patch.after.contains("  some-key:\n    kind: grant\n"), "{}", patch.after);
+        assert!(
+            refs_pos < key_pos && key_pos < records_pos,
+            "{}",
+            patch.after
+        );
+        assert!(
+            patch.after.contains("  some-key:\n    kind: grant\n"),
+            "{}",
+            patch.after
+        );
     }
 
     #[test]
@@ -571,12 +579,28 @@ mod tests {
         let before = "version: 1\nrefs:\n  TIANSHU_API_KEY: sk-other\nother:\n  KEYRELAY_API_KEY: sk-elsewhere\n";
         std::fs::write(writer_in(dir.path()).path(), before).unwrap();
         let patch = writer_in(dir.path()).plan(SECRET).unwrap();
-        assert!(patch.after.contains("KEYRELAY_API_KEY: sk-elsewhere"), "{}", patch.after);
-        assert_eq!(patch.after.matches("KEYRELAY_API_KEY:").count(), 2, "{}", patch.after);
+        assert!(
+            patch.after.contains("KEYRELAY_API_KEY: sk-elsewhere"),
+            "{}",
+            patch.after
+        );
+        assert_eq!(
+            patch.after.matches("KEYRELAY_API_KEY:").count(),
+            2,
+            "{}",
+            patch.after
+        );
         let refs_pos = patch.after.find("refs:").unwrap();
         let other_pos = patch.after.find("other:").unwrap();
-        let new_key_pos = patch.after.find(&format!("KEYRELAY_API_KEY: {SECRET}")).unwrap();
-        assert!(refs_pos < new_key_pos && new_key_pos < other_pos, "{}", patch.after);
+        let new_key_pos = patch
+            .after
+            .find(&format!("KEYRELAY_API_KEY: {SECRET}"))
+            .unwrap();
+        assert!(
+            refs_pos < new_key_pos && new_key_pos < other_pos,
+            "{}",
+            patch.after
+        );
     }
 
     #[test]
@@ -587,7 +611,11 @@ mod tests {
         let profiles = dir.path().join("profiles");
         let real = profiles.join("desktop");
         std::fs::create_dir_all(&real).unwrap();
-        std::fs::write(real.join("cordis.patch.yml"), "apiKeyEnv: KEYRELAY_API_KEY\n").unwrap();
+        std::fs::write(
+            real.join("cordis.patch.yml"),
+            "apiKeyEnv: KEYRELAY_API_KEY\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&profiles, profiles.join("loop")).unwrap();
         let check = check_credential_reference_in(&profiles);
