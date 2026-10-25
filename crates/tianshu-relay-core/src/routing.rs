@@ -607,6 +607,11 @@ impl Default for BreakerPolicy {
     }
 }
 
+/// DEBUG P1-2：HalfOpen 探针「在飞」标记的过期时限（见 `Breaker::probe_in_flight`）。
+/// 正常探针在响应头到达时即由 `record_*` 清除（秒级）；时限只给「取走后没走到
+/// 发送」的泄漏标记一个自愈上界，不参与 Closed/Open 判定。
+const PROBE_IN_FLIGHT_TTL: Duration = Duration::from_secs(600);
+
 /// 按 `site_id` 计数的连续失败熔断。
 #[derive(Clone, Debug, Default)]
 pub struct Breaker {
@@ -616,7 +621,16 @@ pub struct Breaker {
     /// 请求都会看到 HalfOpen（`state` 只读不改），不限流就全部去试坏上游。第一个
     /// 放进探针的请求在这里标记，其余看到标记即跳过，等探针结果回来
     /// （`record_success` / `record_failure` 清除）。
-    probe_in_flight: HashSet<BreakerKey>,
+    ///
+    /// DEBUG P1-2：标记带时间戳、过期自愈。探针被取走后若请求没走到真实发送
+    /// （预算/限流跳过、首候选成功提前返回、cap 截断……），没有任何
+    /// `record_*` 会回来清标记，旧的 `HashSet` 会让该键永久报 HalfOpen 却再也
+    /// 取不到探针。过期只放宽「在飞」互斥的**时限**，不改 Closed/Open 判定：
+    /// 过期后下一次 `try_take_half_open_probe` 可再放一个探针；迟到的旧探针结果
+    /// 回来时仍经 `record_*` 清除（`remove` 对过期/未过期一视同仁）。
+    /// 时限取 10 分钟：探针在飞的合法上限是「响应头耗时」——全局默认
+    /// connect 5s + read 240s ≈ 245s，10 分钟留有余量，正常探针（秒级）不受影响。
+    probe_in_flight: HashMap<BreakerKey, Instant>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -631,7 +645,7 @@ impl Breaker {
         Self {
             policy,
             entries: HashMap::new(),
-            probe_in_flight: HashSet::new(),
+            probe_in_flight: HashMap::new(),
         }
     }
 
@@ -706,12 +720,22 @@ impl Breaker {
     /// HalfOpen）。**会改状态**——与 [`Self::state`] 的只读不同：`state` 谁调都看到
     /// HalfOpen，本方法只有第一个调用者拿到探针，其余并发请求看到标记即跳过，
     /// 不会全部涌向坏上游。探针结果回来后由 `record_success` / `record_failure` 清除。
+    ///
+    /// DEBUG P1-2：标记过期自愈（见 `probe_in_flight` 字段注释）。过期标记先被
+    /// 清掉再放新探针，因此「探针被取走却没走到发送」不再永久卡死；时限内
+    /// 的互斥语义与旧 `HashSet` 逐字相同（第二并发请求仍为 `false`）。
     pub fn try_take_half_open_probe(&mut self, key: &BreakerKey, now: Instant) -> bool {
-        if self.state(key, now) == BreakerState::HalfOpen {
-            self.probe_in_flight.insert(key.clone())
-        } else {
-            false
+        if self.state(key, now) != BreakerState::HalfOpen {
+            return false;
         }
+        // 先清过期标记：不然一个泄漏的旧标记会挡住所有后续探针。
+        self.probe_in_flight
+            .retain(|_, taken| now.saturating_duration_since(*taken) < PROBE_IN_FLIGHT_TTL);
+        if self.probe_in_flight.contains_key(key) {
+            return false;
+        }
+        self.probe_in_flight.insert(key.clone(), now);
+        true
     }
 }
 
@@ -1286,6 +1310,37 @@ mod tests {
         assert!(
             b.try_take_half_open_probe(&site_key(1), t2),
             "探针结果回来后标记清除，冷却过后可再放探针"
+        );
+    }
+
+    #[test]
+    fn half_open_probe_mark_expires_without_a_result() {
+        // DEBUG P1-2：探针被取走后没有任何 record_* 回来（预算/限流跳过、
+        // 首候选成功提前返回等），旧 HashSet 会让该键永久 HalfOpen 却取不到探针。
+        // 新行为：时限内仍互斥，时限过后可再放探针；state 本身仍是 HalfOpen。
+        let mut b = Breaker::new(BreakerPolicy::default());
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            b.record_failure(&site_key(1), t0);
+        }
+        let t1 = t0 + Duration::from_secs(61);
+        assert_eq!(b.state(&site_key(1), t1), BreakerState::HalfOpen);
+        assert!(b.try_take_half_open_probe(&site_key(1), t1));
+        // 时限内：第二个并发请求仍被挡（互斥语义不变）。
+        assert!(
+            !b.try_take_half_open_probe(&site_key(1), t1 + Duration::from_secs(599)),
+            "过期前探针仍在飞，不得再放第二个探针"
+        );
+        // 时限过后、且无任何结果回来：标记自愈，可再放探针。
+        let t_expired = t1 + Duration::from_secs(601);
+        assert_eq!(
+            b.state(&site_key(1), t_expired),
+            BreakerState::HalfOpen,
+            "过期只清标记，不改熔断态"
+        );
+        assert!(
+            b.try_take_half_open_probe(&site_key(1), t_expired),
+            "泄漏的探针标记过期后应可再放探针"
         );
     }
 

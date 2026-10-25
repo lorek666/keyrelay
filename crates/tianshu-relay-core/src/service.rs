@@ -6240,10 +6240,13 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     latency_ms: obs.latency_ms,
                     key_ref: row.secret_ref.clone(),
                     key_id: Some(row.id),
-                    // M46-S4：分站超时的数据源缺口（见 spec §4.4）：`sites` 表没有超时列，
-                    // 本步恒填 None ⇒ 生产路由回退全局超时，行为不变；列 + 迁移 +
-                    // 站点编辑 IPC/DTO + UI 落地后，这里改成从站点行取值。
-                    timeout_ms: None,
+                    // DEBUG P1-4：分站超时的数据源已接通——`sites.timeout_ms`
+                    // 列（store 层，NULL = 未填）+ `set_site_timeout_ms` 落点。
+                    // `<= 0` 归为未填（与网关 `effective_upstream_timeout` 的
+                    // `Some(0)` 口径一致）；未填 ⇒ `None` ⇒ 回退全局超时，
+                    // 全局值本身不在此改动。残留：站点编辑 IPC/DTO/UI 仍未接
+                    // （见 M46-S4 spec §4.4），值目前只能经 store 层写入。
+                    timeout_ms: site.timeout_ms.filter(|ms| *ms > 0).map(|ms| ms as u64),
                 });
                 if !revoked.contains(&row.secret_ref) {
                     keys.insert(row.secret_ref.clone(), secret);

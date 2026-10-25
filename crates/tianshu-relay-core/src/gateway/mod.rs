@@ -688,6 +688,20 @@ impl Default for UpstreamTimeout {
 /// 注释：没有 total 维，`RequestBuilder::timeout` 的总 deadline 语义会砍合法长流，
 /// 故分站值绝不用它实现）。
 ///
+/// DEBUG P2-G6（选 (b) 单值语义，显性声明）：分站超时**刻意保持单标量**，
+/// 不做 connect/read 分维。理由有二：(1) 单值是「全优先」——只改 read 的话，
+/// 一个 TLS 慢于全局 connect 5s 的站点即使配了 30s 分站值仍会被全局 connect
+/// 掐断，分站值就成了「半优先」（M46-S4 spec §4.2 原论证）；分维要么要求两维
+/// 齐填、要么引入逐维回退，都会扩大 P1-4 刚落地的存储面（第二列 + 第二 setter
+/// + 第二透传字段）；(2) 下游 `UpstreamTimeout` 本身已是两维结构，分维是
+/// 将来可加的纯加法，不必在本波次预支。
+/// 取舍与推荐取值（管理员必读）：单值同时是「连接挂起的上界」与「无字节期
+/// 的上界」。合法非流式推理 TTFB 观测最大 100.7s、重尾 >120s——给慢推理站
+/// 配低于 240s 的分站值会直接杀合法慢请求；配高值则连接挂起要等满该值才
+/// 失败。因此**默认（未填 ⇒ 全局 connect 5s / read 240s）是已标定的那对值**；
+/// 分站值只给「已知很快」的站配快速失败（如 30s），或给「已知很慢」的站配
+/// 不低于 240s 的值；不要用一个 5s 级的小值去「顺带掐连接」——那会连读一起掐。
+///
 /// `Some(0)` ≡ 未填：0 毫秒的超时永远不可能成功，把它当成配置值会直接 brick 掉
 /// 该站点；且与本仓库「0 = 关/不限」的惯例一致。
 pub fn effective_upstream_timeout(
@@ -2446,6 +2460,18 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         None => body,
     };
     let event_model = model.unwrap_or_default();
+    // DEBUG P1-3：用量行的模型名必须跟随改写后的真实名。`event_model` 是
+    // body 原始名（可能为别名），而出站 body 已由 `rewrite_model` 改成真实名、
+    // 上游按真实名计费、价格 JOIN 也按真实名；用量若记别名，JOIN 命中不了
+    // 价格行，预算 spent 记 0。熔断键与失败事件仍用 `event_model`（调用方
+    // 视角的原始名），只有用量口径改用真实名；未命中别名时两者恒等。
+    // `usage_daily`（LEFT JOIN）与预算（INNER JOIN）的口径差异不在此改动：
+    // 本步只改用量行写什么名，不改任何一条 JOIN。
+    let usage_model = if event_model.is_empty() {
+        String::new()
+    } else {
+        view.route().resolve_model(&event_model)
+    };
 
     // §3.5-3 / §10：先把候选分成「发得出去」与「发不出去」两类。
     //
@@ -2635,12 +2661,14 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                 let status = response.status().as_u16();
                 // DELIVERY-P2-10：一次真实发送即记一次尝试（含随后被重放的 429）。
                 attempted.push((upstream.site_id, format!("HTTP {status}")));
-                observe(
-                    &state,
-                    upstream.site_id,
-                    latency_ms,
-                    !should_failover(status),
-                );
+                // DEBUG P1-1：「成功」只认 2xx。`should_failover` 只决定「是否喂
+                // 熔断失败」，不能兼任「是否成功」：旧代码用 `!should_failover`
+                // 当成功，使 401/403/404/400 也清零熔断计数、把快速拒绝延迟喂进
+                // EWMA 与服务侧 `site_facts.latency_ms`（死站反而显得「快」）。
+                // 三段互斥：failover ⇒ 喂失败；2xx ⇒ 记成功；其余 4xx ⇒ 两者都不做
+                // （既不攒失败、也不清零、不喂延迟——它是一个答案，不是故障也不是成功）。
+                let is_success = (200..300).contains(&status);
+                observe(&state, upstream.site_id, latency_ms, is_success);
                 state
                     .metrics
                     .record_attempt(upstream.site_id, status, latency_ms);
@@ -2664,14 +2692,16 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                         &reason,
                         Instant::now(),
                     );
-                } else {
+                } else if is_success {
                     record_success(&state, &breaker_key, Instant::now());
                     // M46-S2：唯一 EWMA 更新点，与 record_success 同分支
-                    // （成功定义同源；429 / 5xx / 传输失败不走到这里）。
+                    // （成功定义同源；429 / 5xx / 传输失败 / 非熔断 4xx 不走到这里）。
                     state
                         .metrics
                         .record_measured_latency(upstream.site_id, latency_ms);
                 }
+                // 非 failover 且非 2xx（401/403/404/400 等）：刻意空分支——
+                // 不清零、不喂 EWMA、不喂熔断。响应本身仍按既有路径原样返回。
                 // M16-S4 / P2-13：**只有 429 才重放**（上游明确没处理这个请求）。
                 // 其余状态码——含 5xx / 524 / 504 这类可能已经计费的——一律**原样返回**：
                 // 重复计费不可逆，可用性由「熔断 → 下一个请求换上游」承接。
@@ -2684,7 +2714,8 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                     pending_replay = Some(PendingReplay {
                         response,
                         site_id: upstream.site_id,
-                        model: event_model.clone(),
+                        // 429 不产生用量行，此处跟随用量口径只是为了一致（见上文 P1-3）。
+                        model: usage_model.clone(),
                         lease,
                         meta: AttemptMeta {
                             key_id: upstream.key_id,
@@ -2699,7 +2730,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                     translate_proto,
                     response,
                     upstream.site_id,
-                    &event_model,
+                    &usage_model,
                     lease,
                     // M40-S1：key_id 取**实际命中的上游**（不是 config 那把）。
                     AttemptMeta {
@@ -3114,13 +3145,15 @@ fn gemini_model_from_path(path: &str) -> Option<String> {
 ///
 /// **usage**：按上游 Chat 的 `usage` 记**一次**（`site_id` / `key_id` / 原始 prompt/completion），
 /// 与被替换掉的 `into_upstream_response` 内部 `UsageCapture` 等价——**不重复计费**。
+/// DEBUG P1-3：本函数的模型参数是**用量口径**——主循环调用点传改写后的真实名，
+/// legacy 调用点无别名表故恒等；失败事件与熔断键不在本函数里用原始名。
 #[allow(clippy::too_many_arguments)]
 async fn maybe_translate_response(
     state: &AppState,
     proto: Option<translate::Protocol>,
     upstream_response: reqwest::Response,
     site_id: i64,
-    event_model: &str,
+    usage_model: &str,
     lease: Option<SiteLease>,
     meta: AttemptMeta,
     identity: &AuthIdentity,
@@ -3131,7 +3164,7 @@ async fn maybe_translate_response(
             state,
             upstream_response,
             site_id,
-            event_model,
+            usage_model,
             lease,
             meta,
             identity,
@@ -3143,7 +3176,7 @@ async fn maybe_translate_response(
             state,
             upstream_response,
             site_id,
-            event_model,
+            usage_model,
             lease,
             meta,
             identity,
@@ -3156,7 +3189,7 @@ async fn maybe_translate_response(
             proto,
             upstream_response,
             site_id,
-            event_model,
+            usage_model,
             meta,
             identity,
             lease,
@@ -3218,7 +3251,7 @@ async fn maybe_translate_response(
             at: unix_now_secs(),
             site_id,
             key_id: meta.key_id,
-            model: event_model.to_string(),
+            model: usage_model.to_string(),
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
             total_tokens: u.total_tokens,
@@ -3290,7 +3323,7 @@ fn streaming_translate_response(
     proto: translate::Protocol,
     mut upstream: reqwest::Response,
     site_id: i64,
-    event_model: &str,
+    usage_model: &str,
     meta: AttemptMeta,
     identity: &AuthIdentity,
     lease: Option<SiteLease>,
@@ -3300,7 +3333,7 @@ fn streaming_translate_response(
     let (tx, rx) =
         tokio::sync::mpsc::channel::<std::result::Result<bytes::Bytes, std::io::Error>>(16);
     let on_usage = state.config.on_usage.clone();
-    let model = event_model.to_string();
+    let model = usage_model.to_string();
     let token_id = identity.token_id;
     let label = identity.label.clone().unwrap_or_default();
     let status_code = upstream.status().as_u16();

@@ -363,3 +363,80 @@ async fn failed_attempts_do_not_pollute_ewma() {
 
     handle.shutdown_and_wait().await;
 }
+
+/// DEBUG P1-1：非 2xx 的非熔断状态（401）既不算成功、也不算失败。
+/// 序列：500、500（熔断计数 2/3，仍 Closed）→ 401 → 500。
+/// 若 401 被当成成功，它会清零计数，第 4 个 500 后计数仅为 1、熔断不开；
+/// 正确行为是第 4 个 500 后计数满 3、熔断打开，第 5 个请求由 site2 承接。
+/// 全程 site1 无 2xx，故其 EWMA 恒为 None（快速拒绝延迟不得喂进 EWMA）。
+/// 429 口径不受此改动影响（见 `failed_attempts_do_not_pollute_ewma`，仍全绿）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_failover_401_neither_clears_breaker_nor_feeds_ewma() {
+    let a = spawn_upstream(
+        1,
+        &[
+            "500 Internal Server Error",
+            "500 Internal Server Error",
+            "401 Unauthorized",
+            "500 Internal Server Error",
+        ],
+        Duration::ZERO,
+    );
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let handle = start(config(
+        vec![
+            upstream(1, &a.base_url, REF_A, 1.0, Some(10)),
+            upstream(2, &b.base_url, REF_B, 1.0, Some(10)),
+        ],
+        keys(&[(REF_A, KEY_A), (REF_B, KEY_B)]),
+        1,
+    ))
+    .await
+    .expect("网关应能启动");
+    let tok = handle.token.clone();
+
+    assert_eq!(post(&handle, &tok).await.0, 500, "第 1 个 500 原样返回");
+    assert_eq!(post(&handle, &tok).await.0, 500, "第 2 个 500 原样返回");
+    assert_eq!(post(&handle, &tok).await.0, 401, "401 原样返回（不切换）");
+    assert_eq!(
+        handle.metrics().per_site[&1i64].ewma_latency_ms,
+        None,
+        "401 的快速拒绝延迟不得喂进 EWMA"
+    );
+    let breaker_after_401 = handle
+        .candidates()
+        .into_iter()
+        .find(|c| c.site_id == 1)
+        .expect("site1 应在候选里")
+        .breaker;
+    assert_eq!(
+        breaker_after_401, "closed",
+        "401 后熔断仍为 Closed（计数 2/3 未被清零也未被攒满）"
+    );
+    assert_eq!(
+        post(&handle, &tok).await.0,
+        500,
+        "第 4 个 500 原样返回并攒满阈值"
+    );
+    let breaker_after_third_failure = handle
+        .candidates()
+        .into_iter()
+        .find(|c| c.site_id == 1)
+        .expect("site1 应在候选里")
+        .breaker;
+    assert_eq!(
+        breaker_after_third_failure, "open",
+        "401 未清零时，第 4 个 500 应使熔断打开；若 401 清过零，此处仍为 closed"
+    );
+    let (status, body) = post(&handle, &tok).await;
+    assert_eq!(status, 200, "熔断打开后应由 site2 承接");
+    assert!(body.contains("site2"), "实测 {body}");
+    assert_eq!(a.count(), 4, "熔断打开后 site1 不应再被打");
+    assert_eq!(
+        handle.metrics().per_site[&1i64].ewma_latency_ms,
+        None,
+        "site1 全程无 2xx，EWMA 恒为 None"
+    );
+
+    handle.shutdown_and_wait().await;
+}

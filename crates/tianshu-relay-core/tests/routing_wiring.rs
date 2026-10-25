@@ -393,6 +393,54 @@ mod production_wiring {
         );
     }
 
+    /// DEBUG P1-4：生产构造层供给分站超时。A 站在 `sites.timeout_ms` 里填了
+    /// 30000，B 站未填 ⇒ 路由里 A 的 `timeout_ms` 为 `Some(30000)`、B 为 `None`
+    ///（回退全局，全局值本身不动）。修前 `build_gateway_route` 恒填 `None`，
+    /// 两站都会断言失败。
+    #[tokio::test]
+    async fn build_gateway_route_supplies_per_site_timeout_from_sites_table() {
+        let (_dir, service, site_a, key_a, _ref_a, _ref_b) = service_with_two_sites().await;
+        service
+            .store()
+            .set_setting("gateway_multi_site", "true")
+            .unwrap();
+        service
+            .store()
+            .set_site_timeout_ms(site_a, Some(30_000))
+            .unwrap();
+        // store 层往返：get_site 应读回同一值（排除「构造层硬编码」的假绿）。
+        let row_a = service
+            .store()
+            .get_site(site_a)
+            .unwrap()
+            .expect("A 站应存在");
+        assert_eq!(row_a.timeout_ms, Some(30_000), "store 层应读回分站超时");
+        let config = service
+            .gateway_config(site_a, key_a, 0)
+            .expect("组装网关配置");
+        assert!(!config.route.is_empty(), "多站开关开时 route 非空");
+        let mut by_site: std::collections::HashMap<i64, Option<u64>> =
+            std::collections::HashMap::new();
+        for up in config.route.all_candidates() {
+            by_site.insert(up.site_id, up.timeout_ms);
+        }
+        assert_eq!(
+            by_site.get(&site_a),
+            Some(&Some(30_000)),
+            "填了 timeout_ms 的站应把值供给路由"
+        );
+        // B 站 id：service_with_two_sites 只返回了 A 的 id，取另一条候选断言未填。
+        for (site_id, timeout) in &by_site {
+            if *site_id != site_a {
+                assert_eq!(
+                    *timeout, None,
+                    "未填 timeout_ms 的站应为 None（回退全局，不编默认值）"
+                );
+            }
+        }
+        assert_eq!(by_site.len(), 2, "两站都应进路由表");
+    }
+
     /// W11：alias 表空时 `resolve_model` 恒等（不 panic、不报错）。
     #[tokio::test]
     async fn empty_alias_map_is_identity() {
