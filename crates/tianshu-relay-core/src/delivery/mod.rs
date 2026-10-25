@@ -718,7 +718,257 @@ fn text_contains_key(text: &str, leaf: &str) -> bool {
     false
 }
 
-/// apply 后回读比对：读回目标文件，确认必填表里每个字段的叶键都在文件中。
+/// 标记块内文本（不含起止标记行本身）：Hermes / MCode / OpenClaw 的
+/// keyrelay 块都用这对标记界定归属，块外同名键与本通道无关。
+fn marker_slice<'a>(text: &'a str, begin: &str, end: &str) -> Option<&'a str> {
+    let start = text.find(begin)? + begin.len();
+    let rest = &text[start..];
+    let end_pos = rest.find(end)?;
+    Some(&rest[..end_pos])
+}
+
+/// TOML 里某段的文本：从 `header` 行之后、到下一个段头行之前。
+/// 段头行判定与各 TOML writer 一致：去空白后恰为 `[…]` 形态的行。
+fn toml_section_slice<'a>(text: &'a str, header: &str) -> Option<&'a str> {
+    let mut offset = 0usize;
+    let mut start: Option<usize> = None;
+    let mut end = text.len();
+    for chunk in text.split_inclusive('\n') {
+        let trimmed = chunk.trim();
+        if start.is_none() {
+            if trimmed == header {
+                start = Some(offset + chunk.len());
+            }
+        } else if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            end = offset;
+            break;
+        }
+        offset += chunk.len();
+    }
+    start.map(|s| &text[s..end])
+}
+
+/// TOML 里第一个段头行之前的文本（顶层键所在区）。
+fn toml_top_slice(text: &str) -> &str {
+    let mut offset = 0usize;
+    for chunk in text.split_inclusive('\n') {
+        let trimmed = chunk.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            return &text[..offset];
+        }
+        offset += chunk.len();
+    }
+    text
+}
+
+/// YAML 里 `refs:` 段的文本：从 `refs:` 行之后、到下一个顶层键行之前。
+/// 顶层键行 = 行首无缩进且含 `:` 的行（DSH 凭据文件只在该段写
+/// `KEYRELAY_API_KEY`，段外同名引用与写盘归属无关）。
+fn yaml_refs_slice(text: &str) -> Option<&str> {
+    let mut offset = 0usize;
+    let mut start: Option<usize> = None;
+    let mut end = text.len();
+    for chunk in text.split_inclusive('\n') {
+        let trimmed_end = chunk.trim_end();
+        if start.is_none() {
+            if trimmed_end == "refs:" {
+                start = Some(offset + chunk.len());
+            }
+        } else if !chunk.starts_with([' ', '\t'])
+            && !trimmed_end.is_empty()
+            && trimmed_end.contains(':')
+        {
+            end = offset;
+            break;
+        }
+        offset += chunk.len();
+    }
+    start.map(|s| &text[s..end])
+}
+
+/// JSON 值里按段走访：段不存在、或中途不是对象时返回 `None`
+/// （与「键存在但值为 null」区分：后者 `get` 返回 `Some(Null)`，
+/// 仍算键存在，与旧的全文件存在性口径一致）。
+fn json_walk<'a>(
+    value: &'a serde_json::Value,
+    segments: &[String],
+) -> Option<&'a serde_json::Value> {
+    let mut cur = value;
+    for seg in segments {
+        cur = cur.get(seg)?;
+    }
+    Some(cur)
+}
+
+/// 按归属位置校验单个字段（P1-16，收敛 P2-C7）。
+///
+/// 旧行为是全文件搜叶键：opencode 任一 provider 的 `apiKey`、
+/// Cline 任一条目的 `apiKey`、MiMo / OpenClaw / Pi 的别家条目都能
+/// 顶替 keyrelay 条目，写错归属、keyrelay 条目缺失都拦不住。
+/// 现在每个通道都在**自己写盘的归属位置**内找叶键：
+/// - JSON 对象通道：按写盘路径走访（opencode 用限定键全路径；
+///   MiMo `providers.keyrelay`、OpenClaw `models.providers.keyrelay`、
+///   Pi `keyrelay`、Qwen `model`、Claude 系 `env`、ClineDesktop
+///   `providers.keyrelay.settings`、单租户根写盘通道只认根键，
+///   不认嵌套对象里的同名键）；
+/// - Cline：`providers` 数组只认 `id == "keyrelay"` 的条目；
+/// - OpenClaw：有标记块时只认块内（JSON5 形态解析不成 JSON，
+///   块是唯一可信的归属边界），无块时走严格 JSON 路径；
+/// - TOML 通道：CodexConfig 的 `name` / `base_url` / `wire_api` 只认
+///   `[model_providers.custom]` 段内，其余顶层键只认段前区；
+///   GrokBuild 全字段只认 `[models.custom]` 段内；
+/// - 标记块通道（Hermes / MCode）：只认 keyrelay 块内，块缺失即缺失；
+/// - DSH：只认 `refs:` 段内，段缺失即缺失。
+/// 返回 `None` = 该通道无位置感知口径，走旧的全文件叶键搜寻。
+/// 目前只有 GeminiCli 走这条回退：它的 `.env` 没有 provider 段或
+/// 嵌套结构，每行就是一个赋值，行首键判定本身就是归属判定，
+/// 且键名带 `GEMINI_` / `GOOGLE_GEMINI_` 通道专属前缀，不存在
+/// 别家 provider 用同一叶键顶替的形态——这不是「弱检查声明」，
+/// 而是该文件格式下叶键即归属。不得把这条回退扩到多 provider 通道。
+/// JSON 通道解析失败时返回 `Some(false)` 而非回退：写盘器只产
+/// 严格 JSON（OpenClaw 标记形态除外），解析失败说明文件已被外部
+/// 改成写盘器产不出的形态，fail-closed，不以全文件搜寻放行。
+fn scoped_verify_present(channel: DeliveryChannel, qualified: &str, text: &str) -> Option<bool> {
+    let leaf = leaf_key(qualified);
+    match channel {
+        DeliveryChannel::OpenClaw => {
+            if let Some(block) = marker_slice(text, openclaw::BLOCK_BEGIN, openclaw::BLOCK_END) {
+                return Some(text_contains_key(block, leaf));
+            }
+            let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+            match parsed {
+                Some(v) => {
+                    let path = vec![
+                        "models".to_string(),
+                        "providers".to_string(),
+                        "keyrelay".to_string(),
+                        leaf.to_string(),
+                    ];
+                    Some(json_walk(&v, &path).is_some())
+                }
+                None => Some(false),
+            }
+        }
+        DeliveryChannel::Hermes => {
+            let block = match marker_slice(text, hermes::BLOCK_BEGIN, hermes::BLOCK_END) {
+                Some(b) => b,
+                None => return Some(false),
+            };
+            Some(text_contains_key(block, leaf))
+        }
+        DeliveryChannel::MCode => {
+            let block = match marker_slice(text, mcode::BLOCK_BEGIN, mcode::BLOCK_END) {
+                Some(b) => b,
+                None => return Some(false),
+            };
+            Some(text_contains_key(block, leaf))
+        }
+        DeliveryChannel::DeepSeekHarness => {
+            let refs = match yaml_refs_slice(text) {
+                Some(r) => r,
+                None => return Some(false),
+            };
+            Some(text_contains_key(refs, leaf))
+        }
+        DeliveryChannel::CodexConfig => {
+            if matches!(leaf, "name" | "base_url" | "wire_api") {
+                let section = match toml_section_slice(
+                    text,
+                    codex_config::CodexConfigWriter::SECTION_PROVIDER,
+                ) {
+                    Some(s) => s,
+                    None => return Some(false),
+                };
+                Some(text_contains_key(section, leaf))
+            } else {
+                Some(text_contains_key(toml_top_slice(text), leaf))
+            }
+        }
+        DeliveryChannel::GrokBuild => {
+            let section = match toml_section_slice(text, "[models.custom]") {
+                Some(s) => s,
+                None => return Some(false),
+            };
+            Some(text_contains_key(section, leaf))
+        }
+        DeliveryChannel::Cline
+        | DeliveryChannel::OpenCode
+        | DeliveryChannel::OpenCodeJsonc
+        | DeliveryChannel::ClaudeCodeSettings
+        | DeliveryChannel::ClaudeDesktop
+        | DeliveryChannel::QwenCode
+        | DeliveryChannel::MiMoCode
+        | DeliveryChannel::Pi
+        | DeliveryChannel::ClineDesktop
+        | DeliveryChannel::Cursor
+        | DeliveryChannel::DeepSeek
+        | DeliveryChannel::Trae
+        | DeliveryChannel::CodexAuthJson => {
+            let parsed = match serde_json::from_str::<serde_json::Value>(text) {
+                Ok(v) => v,
+                Err(_) => return Some(false),
+            };
+            let present = match channel {
+                DeliveryChannel::Cline => parsed
+                    .get("providers")
+                    .and_then(|p| p.as_array())
+                    .and_then(|arr| {
+                        arr.iter().find(|item| {
+                            item.get("id").and_then(|i| i.as_str()) == Some("keyrelay")
+                        })
+                    })
+                    .is_some_and(|entry| entry.get(leaf).is_some()),
+                DeliveryChannel::OpenCode | DeliveryChannel::OpenCodeJsonc => {
+                    json_walk(&parsed, &split_qualified_key(qualified)).is_some()
+                }
+                DeliveryChannel::ClaudeCodeSettings | DeliveryChannel::ClaudeDesktop => {
+                    json_walk(&parsed, &["env".to_string(), leaf.to_string()]).is_some()
+                }
+                DeliveryChannel::QwenCode => {
+                    json_walk(&parsed, &["model".to_string(), leaf.to_string()]).is_some()
+                }
+                DeliveryChannel::MiMoCode => json_walk(
+                    &parsed,
+                    &[
+                        "providers".to_string(),
+                        "keyrelay".to_string(),
+                        leaf.to_string(),
+                    ],
+                )
+                .is_some(),
+                DeliveryChannel::Pi => {
+                    json_walk(&parsed, &["keyrelay".to_string(), leaf.to_string()]).is_some()
+                }
+                DeliveryChannel::ClineDesktop => json_walk(
+                    &parsed,
+                    &[
+                        "providers".to_string(),
+                        "keyrelay".to_string(),
+                        "settings".to_string(),
+                        leaf.to_string(),
+                    ],
+                )
+                .is_some(),
+                _ => json_walk(&parsed, &[leaf.to_string()]).is_some(),
+            };
+            Some(present)
+        }
+        // GeminiCli：见本函数文档，`.env` 行首赋值即归属，走回退。
+        DeliveryChannel::GeminiCli => None,
+    }
+}
+
+/// 字段是否在其归属位置内存在：有位置感知口径时用它，否则回退到
+/// 全文件叶键搜寻（目前仅 GeminiCli，理由见 `scoped_verify_present`）。
+fn field_present_in_scope(channel: DeliveryChannel, qualified: &str, text: &str) -> bool {
+    match scoped_verify_present(channel, qualified, text) {
+        Some(present) => present,
+        None => text_contains_key(text, leaf_key(qualified)),
+    }
+}
+
+/// apply 后回读比对：读回目标文件，确认必填表里每个字段都在其
+/// **归属位置**内存在（见 `scoped_verify_present`，P1-16）。
 ///
 /// 只做**键存在性**比对，不做值比对——值相等已由 `inject` 的字节级回读保证
 /// （落盘内容必须与 `patch.after` 逐字节相等）；这里补的是「写完后文件又被改动」
@@ -742,7 +992,7 @@ pub fn verify_applied_fields(
     let missing: Vec<&str> = expected
         .iter()
         .map(|k| k.as_str())
-        .filter(|k| !text_contains_key(&text, leaf_key(k)))
+        .filter(|k| !field_present_in_scope(channel, k, &text))
         .collect();
     if missing.is_empty() {
         return Ok(());
@@ -783,15 +1033,24 @@ pub fn verify_applied_fields(
 // 提取规则（两路，JSON 成功只走 JSON 路，JSON 失败才走行扫描）：
 // - JSON 路：把文件解析成 JSON 对象后按**路径**匹配。限定键
 //   （opencode 的 `provider.<id>.options.<leaf>`，含方括号形态的带点
-//   provider 名）必须整条路径逐段相等；裸叶键取路径末段相等的
-//   第一项（文档顺序）。Cline 的 `providers` 数组只认 `id == "keyrelay"`
-//   的条目——数组里别的 provider 的密钥绝不能被当成 keyrelay 的旧值。
+//   provider 名）必须整条路径逐段相等；裸叶键**只在 keyrelay 归属
+//   子树内**取第一项（P1-17，收敛 P2-C8）：Cline 的 `providers` 数组
+//   只认 `id == "keyrelay"` 的条目，MiMo 只认 `providers.keyrelay`、
+//   OpenClaw 只认 `models.providers.keyrelay`、Pi 只认顶层 `keyrelay`、
+//   Qwen 只认 `model`、Claude 系只认 `env`、ClineDesktop 只认
+//   `providers.keyrelay.settings`、根写盘通道只认根级标量——数组 /
+//   对象里别的 provider 的密钥绝不能被当成 keyrelay 的旧值。
+//   OpenClaw 的 JSON5 标记形态解析不成 JSON：改走标记块内 JSON
+//   对象（块是写盘归属边界），块缺失或块解析失败时不猜。
 // - 行扫描路（TOML / YAML / .env / 失去 JSON 形态的文件）：逐行按
 //   「行首可选 `export ` + 可选引号 + 叶键 + 分隔符（`"` / `:` / `=` /
 //   空白）」匹配，与 P0-1 回读 `text_contains_key` 的分隔符口径一致，
 //   因此 `model` 不会撞上 `model_provider`。值取引号内原文，
-//   无引号取第一个空白分隔的 token（并去尾随逗号）。
-// - 保守规则：opencode 两通道与 Cline 通道**不走行扫描**——它们的
+//   无引号取第一个空白分隔的 token（并去尾随逗号）。行扫描同样
+//   按归属切片：Hermes / MCode 只扫 keyrelay 标记块内、DSH 只扫
+//   `refs:` 段内、CodexConfig / GrokBuild 按 TOML 段切片（与回读
+//   口径同源）；切片缺失时不扫全文。
+// - 保守规则：opencode 两通道、Cline 与 OpenClaw 通道**不走行扫描**——它们的
 //   文件里可能有多个 provider 条目，行扫描分不清「这行属于哪个
 //   provider」，而 JSON 路能按路径 / id 分清；JSON 解析失败
 //   （如 .jsonc 带注释）时导入为空，不猜。`expected` 表外的键一律不导入
@@ -900,6 +1159,70 @@ fn collect_json_values(
     }
 }
 
+/// 多 provider 对象文件的 keyrelay 定向过滤（P1-17，收敛 P2-C8）。
+///
+/// 返回 `Some` = 该通道的 JSON 导入只认 keyrelay 归属子树内的值；
+/// `None` = 沿用全文档走访（opencode 靠限定键全路径已定向；
+/// Cline 靠 `collect_json_values` 内的数组过滤）。
+/// - MiMo：`providers.keyrelay`；OpenClaw：`models.providers.keyrelay`；
+///   Pi：顶层 `keyrelay`；Qwen：`model`；Claude 系：`env`；
+///   ClineDesktop：`providers.keyrelay.settings`；
+/// - 根写盘通道（Cursor / DeepSeek / Trae / CodexAuthJson）：只认根级
+///   标量，不认嵌套对象里的同名键（写盘器只写根级）。
+/// 归属子树缺失时返回空序列（宁缺不猜），不回退全文档。
+fn scoped_json_values(
+    channel: DeliveryChannel,
+    parsed: &serde_json::Value,
+) -> Option<Vec<(Vec<String>, String)>> {
+    if matches!(
+        channel,
+        DeliveryChannel::Cursor
+            | DeliveryChannel::DeepSeek
+            | DeliveryChannel::Trae
+            | DeliveryChannel::CodexAuthJson
+    ) {
+        let mut out: Vec<(Vec<String>, String)> = Vec::new();
+        if let Some(map) = parsed.as_object() {
+            for (key, child) in map {
+                match child {
+                    serde_json::Value::String(s) => {
+                        out.push((vec![key.clone()], s.clone()));
+                    }
+                    serde_json::Value::Number(n) => {
+                        out.push((vec![key.clone()], n.to_string()));
+                    }
+                    serde_json::Value::Bool(b) => {
+                        out.push((vec![key.clone()], b.to_string()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return Some(out);
+    }
+    let scope: Vec<String> = match channel {
+        DeliveryChannel::MiMoCode => vec!["providers".into(), "keyrelay".into()],
+        DeliveryChannel::OpenClaw => {
+            vec!["models".into(), "providers".into(), "keyrelay".into()]
+        }
+        DeliveryChannel::Pi => vec!["keyrelay".into()],
+        DeliveryChannel::QwenCode => vec!["model".into()],
+        DeliveryChannel::ClaudeCodeSettings | DeliveryChannel::ClaudeDesktop => {
+            vec!["env".into()]
+        }
+        DeliveryChannel::ClineDesktop => {
+            vec!["providers".into(), "keyrelay".into(), "settings".into()]
+        }
+        _ => return None,
+    };
+    let Some(subtree) = json_walk(parsed, &scope) else {
+        return Some(Vec::new());
+    };
+    let mut out: Vec<(Vec<String>, String)> = Vec::new();
+    collect_json_values(subtree, &mut scope.clone(), channel, &mut out);
+    Some(out)
+}
+
 /// 行扫描路的值解析：引号内取原文，无引号取首个 token（去尾随逗号）。
 /// 返回 `None` = 该行没有可用值（空值行不算「找到」）。
 fn parse_line_value(rest: &str) -> Option<String> {
@@ -969,12 +1292,47 @@ pub fn import_existing_fields(
         return Vec::new();
     }
     let mut out: Vec<DeliveryField> = Vec::new();
+    // OpenClaw 标记形态：整份是 JSON5（带注释 / 标记块），解析不成
+    // JSON 时不走行扫描——只认标记块内的 JSON 对象，块缺失或块
+    // 解析失败时返回空（宁缺不猜，别家条目在块外）。
+    if channel == DeliveryChannel::OpenClaw {
+        if let Some(block) = marker_slice(text, openclaw::BLOCK_BEGIN, openclaw::BLOCK_END) {
+            let Ok(block_value) = serde_json::from_str::<serde_json::Value>(block) else {
+                return Vec::new();
+            };
+            let Some(block_map) = block_value.as_object() else {
+                return Vec::new();
+            };
+            for key in expected {
+                let leaf = leaf_key(key);
+                let found = block_map.get(leaf).and_then(|v| match v {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    serde_json::Value::Bool(b) => Some(b.to_string()),
+                    _ => None,
+                });
+                if let Some(value) = found {
+                    out.push(DeliveryField {
+                        key: key.clone(),
+                        masked: import_display_value(leaf, &value),
+                    });
+                }
+            }
+            return out;
+        }
+    }
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
         if !parsed.is_object() {
             return Vec::new();
         }
-        let mut collected: Vec<(Vec<String>, String)> = Vec::new();
-        collect_json_values(&parsed, &mut Vec::new(), channel, &mut collected);
+        let collected: Vec<(Vec<String>, String)> = match scoped_json_values(channel, &parsed) {
+            Some(scoped) => scoped,
+            None => {
+                let mut all: Vec<(Vec<String>, String)> = Vec::new();
+                collect_json_values(&parsed, &mut Vec::new(), channel, &mut all);
+                all
+            }
+        };
         for key in expected {
             let segments = split_qualified_key(key);
             let leaf = segments.last().cloned().unwrap_or_default();
@@ -999,16 +1357,41 @@ pub fn import_existing_fields(
         return out;
     }
     // JSON 解析失败：只有非 provider 作用域的通道才走行扫描；
-    // opencode / Cline 的文件可能含多 provider 条目，行扫描分不清归属，宁缺。
+    // opencode / Cline / OpenClaw 的文件可能含多 provider 条目，行扫描
+    // 分不清归属，宁缺（OpenClaw 标记块已在上文处理，无块即无导入）。
     if matches!(
         channel,
-        DeliveryChannel::OpenCode | DeliveryChannel::OpenCodeJsonc | DeliveryChannel::Cline
+        DeliveryChannel::OpenCode
+            | DeliveryChannel::OpenCodeJsonc
+            | DeliveryChannel::Cline
+            | DeliveryChannel::OpenClaw
     ) {
         return Vec::new();
     }
     for key in expected {
         let leaf = leaf_key(key);
-        if let Some(value) = scan_line_value(text, leaf) {
+        // 行扫描同样按归属切片（与回读口径同源），切片缺失时不扫全文。
+        let value = match channel {
+            DeliveryChannel::Hermes => marker_slice(text, hermes::BLOCK_BEGIN, hermes::BLOCK_END)
+                .and_then(|block| scan_line_value(block, leaf)),
+            DeliveryChannel::MCode => marker_slice(text, mcode::BLOCK_BEGIN, mcode::BLOCK_END)
+                .and_then(|block| scan_line_value(block, leaf)),
+            DeliveryChannel::DeepSeekHarness => {
+                yaml_refs_slice(text).and_then(|refs| scan_line_value(refs, leaf))
+            }
+            DeliveryChannel::CodexConfig => {
+                let slice = if matches!(leaf, "name" | "base_url" | "wire_api") {
+                    toml_section_slice(text, codex_config::CodexConfigWriter::SECTION_PROVIDER)
+                } else {
+                    Some(toml_top_slice(text))
+                };
+                slice.and_then(|part| scan_line_value(part, leaf))
+            }
+            DeliveryChannel::GrokBuild => toml_section_slice(text, "[models.custom]")
+                .and_then(|section| scan_line_value(section, leaf)),
+            _ => scan_line_value(text, leaf),
+        };
+        if let Some(value) = value {
             out.push(DeliveryField {
                 key: key.clone(),
                 masked: import_display_value(leaf, &value),
@@ -2606,8 +2989,9 @@ mod tests {
         assert_eq!(got[0].masked, "…6666");
         assert_eq!(got[1].masked, "https://env.example.com");
 
-        // TOML：`model` 不得撞上 `model_provider`（后跟 `_` 不是分隔符）。
-        let toml = "model_provider = \"custom\"\nmodel = \"gpt-4o\"\nbase_url = \"https://toml.example.com\"\n";
+        // TOML：`model` 不得撞上 `model_provider`（后跟 `_` 不是分隔符）；
+        // `base_url` 只认 `[model_providers.custom]` 段内（与写盘归属一致）。
+        let toml = "model_provider = \"custom\"\nmodel = \"gpt-4o\"\n\n[model_providers.custom]\nbase_url = \"https://toml.example.com\"\n";
         let expected = vec![
             "model_provider".to_string(),
             "model".to_string(),
@@ -3058,11 +3442,12 @@ mod tests {
     #[test]
     fn verify_applied_fields_checks_leaf_keys() {
         let dir = tempfile::tempdir().expect("临时目录");
-        // JSON：引号键；`model` 不得误撞 `model_provider`。
+        // TOML：`model` 不得误撞 `model_provider`；`name` 只认
+        // `[model_providers.custom]` 段内，不认段外同名键（P1-16 归属校验）。
         let json_path = dir.path().join("a.json");
         std::fs::write(
             &json_path,
-            "{\n  \"model_provider\": \"custom\",\n  \"name\": \"x\"\n}\n",
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"x\"\n",
         )
         .unwrap();
         assert!(verify_applied_fields(
@@ -3077,6 +3462,18 @@ mod tests {
             &json_path
         )
         .is_ok());
+        // 段外 `name` 不顶替段内 `name`：段内无 name 即缺失。
+        std::fs::write(
+            &json_path,
+            "model_provider = \"custom\"\nname = \"other\"\n\n[model_providers.custom]\nwire_api = \"responses\"\n",
+        )
+        .unwrap();
+        assert!(verify_applied_fields(
+            DeliveryChannel::CodexConfig,
+            &["name".to_string()],
+            &json_path
+        )
+        .is_err());
         // 紧凑 JSON：整份只有一行，键在行中而非行首（回归：单行预置文件曾让回读误报缺失）。
         let compact_path = dir.path().join("d.json");
         std::fs::write(
@@ -3204,5 +3601,164 @@ mod tests {
         assert!(text.contains("gemini-cli"), "{text}");
         assert!(text.contains("GEMINI_MODEL"), "{text}");
         assert!(text.contains("c.env"), "{text}");
+    }
+
+    #[test]
+    fn verify_applied_fields_rejects_wrong_provider_ownership() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        // P1-16 验收：opencode 文件只留其它 provider 的 apiKey、删除
+        // keyrelay 条目后，回读必须失败（旧的全文件搜叶键会放行）。
+        let opencode_path = dir.path().join("opencode.json");
+        std::fs::write(
+            &opencode_path,
+            r#"{"provider":{"anthropic":{"options":{"apiKey":"sk-other","baseURL":"https://api.anthropic.com"}}}}"#,
+        )
+        .unwrap();
+        let err = verify_applied_fields(
+            DeliveryChannel::OpenCode,
+            &["provider.keyrelay.options.apiKey".to_string()],
+            &opencode_path,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("apiKey"), "{err}");
+        // 写对归属时仍通过。
+        std::fs::write(
+            &opencode_path,
+            r#"{"provider":{"anthropic":{"options":{"apiKey":"sk-other"}},"keyrelay":{"options":{"apiKey":"sk-mine"}}}}"#,
+        )
+        .unwrap();
+        verify_applied_fields(
+            DeliveryChannel::OpenCode,
+            &["provider.keyrelay.options.apiKey".to_string()],
+            &opencode_path,
+        )
+        .unwrap();
+
+        // MiMo：只留其它 provider 的 apiKey 时必须失败。
+        let mimo_path = dir.path().join("mimo.json");
+        std::fs::write(
+            &mimo_path,
+            r#"{"providers":{"anthropic":{"apiKey":"sk-other"}}}"#,
+        )
+        .unwrap();
+        assert!(verify_applied_fields(
+            DeliveryChannel::MiMoCode,
+            &["apiKey".to_string()],
+            &mimo_path
+        )
+        .is_err());
+        std::fs::write(
+            &mimo_path,
+            r#"{"providers":{"anthropic":{"apiKey":"sk-other"},"keyrelay":{"apiKey":"sk-mine"}}}"#,
+        )
+        .unwrap();
+        verify_applied_fields(
+            DeliveryChannel::MiMoCode,
+            &["apiKey".to_string()],
+            &mimo_path,
+        )
+        .unwrap();
+
+        // Pi：顶层其它 provider 的 apiKey 不顶替 keyrelay 条目。
+        let pi_path = dir.path().join("pi.json");
+        std::fs::write(&pi_path, r#"{"official":{"api_key":"sk-other"}}"#).unwrap();
+        assert!(
+            verify_applied_fields(DeliveryChannel::Pi, &["api_key".to_string()], &pi_path).is_err()
+        );
+
+        // Cline：数组里只有其它条目时必须失败。
+        let cline_path = dir.path().join("cline.json");
+        std::fs::write(
+            &cline_path,
+            r#"{"providers":[{"id":"other","apiKey":"sk-other"}]}"#,
+        )
+        .unwrap();
+        assert!(verify_applied_fields(
+            DeliveryChannel::Cline,
+            &["apiKey".to_string()],
+            &cline_path
+        )
+        .is_err());
+
+        // OpenClaw JSON 形态：models.providers 里只有其它条目时失败。
+        let claw_path = dir.path().join("openclaw.json");
+        std::fs::write(
+            &claw_path,
+            r#"{"models":{"providers":{"other":{"api_key":"sk-other"}}}}"#,
+        )
+        .unwrap();
+        assert!(verify_applied_fields(
+            DeliveryChannel::OpenClaw,
+            &["api_key".to_string()],
+            &claw_path
+        )
+        .is_err());
+        std::fs::write(
+            &claw_path,
+            r#"{"models":{"providers":{"keyrelay":{"api_key":"sk-mine"}}}}"#,
+        )
+        .unwrap();
+        verify_applied_fields(
+            DeliveryChannel::OpenClaw,
+            &["api_key".to_string()],
+            &claw_path,
+        )
+        .unwrap();
+
+        // OpenClaw 标记块形态：块外同名键不顶替块内键。
+        std::fs::write(&claw_path, "{\n  \"api_key\": \"sk-outside\"\n}\n").unwrap();
+        assert!(verify_applied_fields(
+            DeliveryChannel::OpenClaw,
+            &["api_key".to_string()],
+            &claw_path
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn import_existing_fields_filters_multi_provider_objects_to_keyrelay() {
+        // P1-17 验收：MiMo 文件里其它 provider 在前，首次预览导入的
+        // 必须是 keyrelay 的值（旧的裸叶键首项会取到别家密钥末 4 位）。
+        let mimo = r#"{"providers":{"anthropic":{"apiKey":"sk-aaa-1111"},"keyrelay":{"apiKey":"sk-bbb-2222","baseUrl":"https://old.example.com"}}}"#;
+        let expected = vec!["apiKey".to_string(), "baseUrl".to_string()];
+        let got = import_existing_fields(DeliveryChannel::MiMoCode, &expected, mimo);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].masked, "…2222");
+        assert_eq!(got[1].masked, "https://old.example.com");
+        assert!(!got.iter().any(|f| f.masked.contains("1111")));
+
+        // OpenClaw JSON 形态：同理只认 keyrelay 条目。
+        let claw = r#"{"models":{"providers":{"other":{"api_key":"sk-aaa-1111"},"keyrelay":{"api_key":"sk-bbb-2222"}}}}"#;
+        let got = import_existing_fields(DeliveryChannel::OpenClaw, &["api_key".to_string()], claw);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].masked, "…2222");
+
+        // Pi：顶层其它 provider 在前，仍只认 keyrelay 条目。
+        let pi = r#"{"official":{"api_key":"sk-aaa-1111"},"keyrelay":{"api_key":"sk-bbb-2222"}}"#;
+        let got = import_existing_fields(DeliveryChannel::Pi, &["api_key".to_string()], pi);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].masked, "…2222");
+
+        // OpenClaw 标记块形态：块内值可导入，块外别家值不导入。
+        let claw_block = format!(
+            "{{\n  \"other\": {{\"api_key\": \"sk-aaa-1111\"}},\n  {}\n  {{ \"api_key\": \"sk-bbb-2222\" }}\n  {}\n}}\n",
+            openclaw::BLOCK_BEGIN, openclaw::BLOCK_END
+        );
+        let got = import_existing_fields(
+            DeliveryChannel::OpenClaw,
+            &["api_key".to_string()],
+            &claw_block,
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].masked, "…2222");
+
+        // 归属子树缺失时宁缺：只有别家条目，不导入别家值。
+        let mimo_other_only = r#"{"providers":{"anthropic":{"apiKey":"sk-aaa-1111"}}}"#;
+        assert!(import_existing_fields(
+            DeliveryChannel::MiMoCode,
+            &["apiKey".to_string()],
+            mimo_other_only
+        )
+        .is_empty());
     }
 }

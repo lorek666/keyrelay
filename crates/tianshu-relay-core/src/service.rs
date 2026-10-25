@@ -1457,6 +1457,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// `apply_delivery` 里、写盘之前再调一次）：验证本身**不写盘、不记账、
     /// 不写绑定、不进持久化表**，结果只随本次调用返回。
     ///
+    /// P1-15：Codex 入口统一按 bundle 验证（见函数体内的映射注释）：
+    /// plan 与 apply 都调本函数，一处映射即两处生效。
+    ///
     /// 行为分层（理由见 `delivery::model_check` 模块文档）：
     /// - 静态层先行：无模型 / 通道不写模型 ⇒ 探针跳过（`skipped`），不拦；
     ///   格式无效 ⇒ 直接硬拦，不再发探针（写进去必错，没必要再问端点）；
@@ -1488,7 +1491,21 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         model: Option<&str>,
         source: delivery::DeliverySource<'_>,
     ) -> delivery::model_check::ModelValidation {
-        let static_check = delivery::model_check::check_static(channel, model);
+        // P1-15：Codex 双单按 bundle 验证，不按入口通道。两入口
+        // （codex-auth-json / codex-config）写的是同一单：auth.json 只写
+        // 密钥，config.toml 写模型——`build_codex_plan` 无论入口如何都用
+        // 同一模型再建 config 计划。若验证拿入口通道，auth 入口会因
+        // `channel_writes_model` 排除 CodexAuthJson 而得 `not_applicable`，
+        // 格式无效 / 探针 401 / 不在目录一律跳过，随后 config 照写该模型。
+        // 故此处把验证通道统一映射为 CodexConfig；四通道表本身不动
+        // （单看 auth.json 它确实不写模型，表述仍为真，映射只属于
+        // 「双单 bundle」这一层，不属于通道属性）。
+        let validation_channel = if channel == delivery::DeliveryChannel::CodexAuthJson {
+            delivery::DeliveryChannel::CodexConfig
+        } else {
+            channel
+        };
+        let static_check = delivery::model_check::check_static(validation_channel, model);
         if static_check.outcome == "not_applicable" {
             return delivery::model_check::ModelValidation::skipped(static_check, "skipped");
         }
@@ -8722,6 +8739,72 @@ mod tests {
         assert_eq!(v.probe.outcome, "failed");
         assert_eq!(v.probe.code, "unauthorized");
         assert!(v.blocks_delivery);
+    }
+
+    // P1-15：Codex 双单模型验证按 bundle 而非入口通道。auth 入口与
+    // config 入口对同一模型必须同判：格式无效、探针 401、不在目录
+    // 三种硬拦在 auth 入口下同样生效；config 入口行为不变（对照组
+    // 在既有 `validate_model_site_not_in_catalog_blocks` 等用例里）。
+    #[tokio::test]
+    async fn validate_model_codex_auth_entry_blocks_like_config_entry() {
+        // 格式无效：静态层即硬拦（`blocks_delivery` 由静态 fail
+        // 本身决定，与探针结果无关；仍给一个目录响应供探针消耗）。
+        let (service, key_id) = probe_service(vec![catalog_probe_response(&["gpt-4o"])]).await;
+        let v = service
+            .validate_delivery_model(
+                key_id,
+                DeliveryChannel::CodexAuthJson,
+                Some("https://relay.example.com/v1"),
+                delivery::DeliverySource::Site,
+            )
+            .await;
+        assert_eq!(v.static_check.outcome, "fail");
+        assert!(v.blocks_delivery, "auth 入口的无效格式模型必须硬拦");
+
+        // 探针 401：auth 入口同样硬拦。
+        let (service, key_id) =
+            probe_service(vec![
+                HttpResponse::json(401, json!({ "error": "bad key" })).expect("构造 401 响应")
+            ])
+            .await;
+        let v = service
+            .validate_delivery_model(
+                key_id,
+                DeliveryChannel::CodexAuthJson,
+                Some("gpt-4o"),
+                delivery::DeliverySource::Site,
+            )
+            .await;
+        assert_eq!(v.probe.code, "unauthorized");
+        assert!(v.blocks_delivery, "auth 入口的探针 401 必须硬拦");
+
+        // 不在目录：auth 入口同样硬拦。
+        let (service, key_id) =
+            probe_service(vec![catalog_probe_response(&["some-other-model"])]).await;
+        let v = service
+            .validate_delivery_model(
+                key_id,
+                DeliveryChannel::CodexAuthJson,
+                Some("gpt-4o"),
+                delivery::DeliverySource::Site,
+            )
+            .await;
+        assert_eq!(v.probe.code, "not_in_catalog");
+        assert!(v.blocks_delivery, "auth 入口的不在目录模型必须硬拦");
+
+        // 无模型时仍不拦：映射只改变「有模型时按 config 判」，不把
+        // 无模型投递变成硬拦（config 通道本身对无模型也是 not_applicable）。
+        let (service, key_id) = probe_service(vec![catalog_probe_response(&["gpt-4o"])]).await;
+        let v = service
+            .validate_delivery_model(
+                key_id,
+                DeliveryChannel::CodexAuthJson,
+                None,
+                delivery::DeliverySource::Site,
+            )
+            .await;
+        assert!(!v.blocks_delivery);
+        assert_eq!(v.static_check.outcome, "not_applicable");
     }
 
     #[tokio::test]
