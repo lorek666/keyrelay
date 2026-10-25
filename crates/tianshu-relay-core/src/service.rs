@@ -2466,6 +2466,324 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         })
     }
 
+    // ============================================================== Codex 双文件同单（P0-2）
+    //
+    // 为什么单通道入口不够：Codex 调通上游必须同时写 auth.json（密钥）与
+    // config.toml（端点 / provider / 模型）。两次独立投递之间存在半注入窗口——
+    // 第一单成功、第二单失败时，agent 拿着新密钥去旧端点（或旧密钥去新端点），
+    // 两边又各自报成功，401 的根因要用户自己拼出来。
+    //
+    // 同单的执行语义（与单通道 `apply_delivery_in` 的安全动作逐字相同，
+    // 只是作用对象从「一个文件」变成「两个文件」）：
+    // - 同意：双文件模式要求**两文件各自的同意都已授予**（同意按
+    //   `(agent_id, channel, target_path)` 存，auth 与 config 是两条记录，
+    //   授一条不等于授两条）；保留模式只要求 config 的同意——auth 根本不写，
+    //   要求它的同意没有意义，且会把「保留官方登录」变成「先授 auth 同意」，
+    //   与保留的本意相悖。缺哪条就报哪条的 `ConsentRequired`，不猜。
+    // - 锁：固定顺序 auth → config 取两把锁（顺序固定才不会死锁），
+    //   锁内**重新**确认同意（与单通道同理：等锁期间同意可能被撤销）。
+    // - 校验：P0-1 整单校验对两文件**各自**跑一遍（auth 表 / config 表分开），
+    //   任一文件不合格，落盘前整单拒绝。
+    // - 写：一次 `apply_holding_lock` 调用写全部补丁 ⇒ 一个 journal id、
+    //   全量预检（任一 before 不符则一个字节都不动）、写中失败则补偿已写文件。
+    // - 回读：`verify_applied_fields` 对两文件各自跑一遍，任一失败则回滚整单。
+    // - 记账：`record_journal` 一次（journal 含两条 entry），`record_binding`
+    //   按文件各记一条、journal_id 填同一个（见 `CodexDeliveryOutcome` 的注释）。
+    //   记账失败同样整体回滚——否则用户拿不到 journal_id 就永远滚不回双文件。
+    // - 保留模式的「不碰」是字面意义：auth 不进补丁列表、不取锁、不校验、
+    //   不记绑定；唯一能证明「没碰」的是字节比对（测试钉住）。
+
+    /// Codex 双文件投递预览（站点模式）。不落盘、不写库。
+    pub fn delivery_plan_codex(
+        &self,
+        key_id: i64,
+        model: Option<&str>,
+        preserve_auth: bool,
+    ) -> Result<delivery::CodexDeliveryPlan> {
+        self.delivery_plan_codex_in(key_id, model, delivery::DeliverySource::Site, preserve_auth)
+    }
+
+    /// 按**来源**（站点 / 本地网关）的 Codex 双文件投递预览。
+    ///
+    /// 复用单通道的 `delivery_plan_in` 拼两份计划：每份的字段、掩码预览、
+    /// 同意状态都与单通道预览逐字同源，不存在「双文件预览是另一套算法」。
+    /// 保留模式下 auth 计划根本不生成——不是「生成了再藏起来」。
+    pub fn delivery_plan_codex_in(
+        &self,
+        key_id: i64,
+        model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
+        preserve_auth: bool,
+    ) -> Result<delivery::CodexDeliveryPlan> {
+        let mode = source.mode();
+        let auth = if preserve_auth {
+            None
+        } else {
+            Some(self.delivery_plan_in(key_id, DeliveryChannel::CodexAuthJson, model, source)?)
+        };
+        let config = self.delivery_plan_in(key_id, DeliveryChannel::CodexConfig, model, source)?;
+        Ok(delivery::CodexDeliveryPlan {
+            preserve_auth,
+            mode,
+            auth,
+            config,
+        })
+    }
+
+    /// Codex 双文件投递（站点模式）。
+    pub fn apply_codex(
+        &self,
+        key_id: i64,
+        model: Option<&str>,
+        preserve_auth: bool,
+    ) -> Result<delivery::CodexDeliveryOutcome> {
+        self.apply_codex_in(key_id, model, delivery::DeliverySource::Site, preserve_auth)
+    }
+
+    /// 按**来源**（站点 / 本地网关）真正落盘双文件（或保留模式下只写 config）。
+    ///
+    /// `preserve_auth` 必须是调用方**显式**传入的 `bool`：本函数没有第三态，
+    /// 也没有「auth.json 已存在 ⇒ 保留」的推断——存在只说明以前投递过，
+    /// 不能说明这次用户想保留官方登录。命令层把「参数没传」翻译成 `false`
+    /// （双文件），见命令层 `DeliveryArgs::preserve_auth` 的注释。
+    pub fn apply_codex_in(
+        &self,
+        key_id: i64,
+        model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
+        preserve_auth: bool,
+    ) -> Result<delivery::CodexDeliveryOutcome> {
+        let delivery_mode = match &source {
+            delivery::DeliverySource::Gateway(_) => "gateway",
+            delivery::DeliverySource::Site => "site",
+        };
+        // ① 写入器与目标：先定死「这次写哪几个文件」，不读钥匙串。
+        //    保留模式下 auth 写入器根本不构造——构造本身无写盘副作用，
+        //    但「不构造」让「保留分支绝不碰 auth」在代码层面可审计，
+        //    而不是靠「构造了但没用它」来保证。
+        let auth_writer = if preserve_auth {
+            None
+        } else {
+            Some(self.prepare_delivery(key_id, DeliveryChannel::CodexAuthJson, model, source)?)
+        };
+        let config_writer =
+            self.prepare_delivery(key_id, DeliveryChannel::CodexConfig, model, source)?;
+        // 写顺序固定：auth → config（journal entry 顺序与之一致；
+        // 回滚按逆序走，先还 config 再还 auth）。
+        let mut to_write: Vec<(DeliveryChannel, PathBuf)> = Vec::new();
+        if let Some(writer) = &auth_writer {
+            let target = self.checked_target(writer.channel(), &writer.target_path())?;
+            to_write.push((writer.channel(), target));
+        }
+        let config_target =
+            self.checked_target(config_writer.channel(), &config_writer.target_path())?;
+        to_write.push((config_writer.channel(), config_target));
+
+        // ② 同意（未同意时**不读钥匙串、不取锁、不落盘**）。缺哪条报哪条。
+        for (channel, target) in &to_write {
+            if !self.consent_state(*channel, target)?.is_granted() {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "delivery",
+                    "Codex 双文件投递被拒绝：缺少用户同意",
+                    serde_json::json!({ "channel": channel.as_str() }),
+                ));
+                return Err(Error::ConsentRequired {
+                    agent_id: channel.agent_id().to_string(),
+                    channel: channel.as_str().to_string(),
+                    target_path: target.display().to_string(),
+                });
+            }
+        }
+
+        // ③ 取锁：全部目标一次取齐，顺序固定（auth → config）。
+        //    第二把取失败时，已取到的锁随 guards 析构自动释放，不留半锁。
+        let lock_dir = inject::default_lock_dir();
+        let mut guards: Vec<inject::lock::FileLock> = Vec::with_capacity(to_write.len());
+        for (_, target) in &to_write {
+            guards.push(inject::lock::FileLock::acquire(target, &lock_dir)?);
+        }
+
+        // ④ 在锁内**重新**确认同意（与单通道同理：等锁期间同意可能被撤销）。
+        for (channel, target) in &to_write {
+            if !self.consent_state(*channel, target)?.is_granted() {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "delivery",
+                    "Codex 双文件投递被拒绝：取锁期间同意被撤销",
+                    serde_json::json!({ "channel": channel.as_str() }),
+                ));
+                return Err(Error::ConsentRequired {
+                    agent_id: channel.agent_id().to_string(),
+                    channel: channel.as_str().to_string(),
+                    target_path: target.display().to_string(),
+                });
+            }
+        }
+
+        // ⑤ 取密钥并生成计划（网关模式取的是本地令牌，见 `secret_for_source`）。
+        let api_key = self.secret_for_source(key_id, source)?;
+        let field_options = self.delivery_field_options(key_id, model, &source)?;
+        let mut patches: Vec<inject::Patch> = Vec::with_capacity(to_write.len());
+        let mut expected: Vec<(DeliveryChannel, Vec<String>, PathBuf)> =
+            Vec::with_capacity(to_write.len());
+        if let Some(writer) = &auth_writer {
+            let target = writer.target_path();
+            patches.push(writer.plan(&api_key)?);
+            let fields = writer.fields(&api_key);
+            delivery::validate_plan_fields(
+                DeliveryChannel::CodexAuthJson,
+                &fields,
+                &field_options,
+                &target,
+            )?;
+            expected.push((
+                DeliveryChannel::CodexAuthJson,
+                delivery::expected_fields(DeliveryChannel::CodexAuthJson, &field_options),
+                target,
+            ));
+        }
+        {
+            let target = config_writer.target_path();
+            patches.push(config_writer.plan(&api_key)?);
+            let fields = config_writer.fields(&api_key);
+            delivery::validate_plan_fields(
+                DeliveryChannel::CodexConfig,
+                &fields,
+                &field_options,
+                &target,
+            )?;
+            expected.push((
+                DeliveryChannel::CodexConfig,
+                delivery::expected_fields(DeliveryChannel::CodexConfig, &field_options),
+                target,
+            ));
+        }
+
+        // ⑥ 写入：一次调用写全部补丁 ⇒ 一个 journal id（预检 → 备份 → 原子写 →
+        //    回读校验 → 失败补偿都在 apply 内部，与单通道同一条代码）。
+        let journal = match inject::apply_holding_lock(&patches, &self.backup_dir, &guards) {
+            Ok(journal) => journal,
+            Err(err) => {
+                self.log(observability::event_with_payload(
+                    Level::Error,
+                    "delivery",
+                    format!("Codex 双文件投递失败: {}", error_kind(&err)),
+                    serde_json::json!({ "preserve_auth": preserve_auth }),
+                ));
+                return Err(err);
+            }
+        };
+
+        // ⑦ 回读比对：两文件各自跑一遍，任一失败则回滚**整单**（两文件一起还）。
+        for (channel, expected_fields, target) in &expected {
+            if let Err(err) = delivery::verify_applied_fields(*channel, expected_fields, target) {
+                return match inject::rollback(&journal) {
+                    Ok(()) => Err(Error::Store(format!(
+                        "Codex 双文件投递后回读比对失败，已自动回滚（文件内容未改动）: {err}"
+                    ))),
+                    Err(rollback_err) => Err(Error::Store(format!(
+                        "Codex 双文件投递后回读比对失败且自动回滚也失败，需要人工处理: {err} / {rollback_err}"
+                    ))),
+                };
+            }
+        }
+
+        // ⑧ 记账：journal 一次，两文件各一条绑定、同一个 journal_id。
+        //    记账失败必须**补偿回滚整单**：文件已经改了，但用户拿不到 journal_id
+        //    就永远回滚不了（与单通道 M1-S2 复审 P1-4 同一条纪律）。
+        //    P0-2 复审 P1-1：只滚文件不够——若第一条绑定已写、第二条失败，
+        //    光滚文件会留下「auth 绑定行存在、journal 仍为 applied」的账面半状态：
+        //    历史显示「已投递、可回滚」、漂移误报 modified、历史回滚又被哈希校验拒绝。
+        //    所以文件回滚成功后必须补 `mark_journal_rolled_back`（按 journal 前缀
+        //    匹配，两行 journal 状态同变），与正常回滚后的历史 / 漂移口径一致。
+        //    补偿范围写清楚，不夸大：绑定行**不删除**（与正常回滚一致，历史仍可见
+        //    这次投递、标为已回滚）；`current_bindings` 不过滤回滚状态（与正常回滚
+        //    一致），所以这不是「账面全清」，只是不再让历史 / 漂移 / 回滚三处读数说谎。
+        //    记状态失败按 `rollback_delivery` 的既有口径记 warn、不翻转结果；
+        //    文件回滚本身失败时**不**标记——文件仍是新内容，账面就该仍是 applied。
+        let record_result = (|| -> Result<()> {
+            self.store.record_journal(&journal)?;
+            for (channel, target) in &to_write {
+                self.store.record_binding(
+                    channel.agent_id(),
+                    key_id,
+                    &target.display().to_string(),
+                    &journal.id,
+                    delivery_mode,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = record_result {
+            return match inject::rollback(&journal) {
+                Ok(()) => {
+                    if let Err(mark_err) = self.store.mark_journal_rolled_back(&journal.id) {
+                        self.log(observability::event_with_payload(
+                            Level::Warn,
+                            "delivery",
+                            "Codex 双文件记账失败回滚后，本地状态没记上",
+                            serde_json::json!({
+                                "journal_id": journal.id,
+                                "error": crate::redact::scrub(&mark_err.to_string()),
+                            }),
+                        ));
+                    }
+                    Err(Error::Store(format!(
+                        "Codex 双文件记账失败，已自动回滚（文件内容未改动）: {err}"
+                    )))
+                }
+                Err(rollback_err) => Err(Error::Store(format!(
+                    "Codex 双文件记账失败且自动回滚也失败，需要人工处理: {err} / {rollback_err}"
+                ))),
+            };
+        }
+
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "delivery",
+            format!("Codex 双文件投递完成: preserve_auth={preserve_auth}"),
+            serde_json::json!({
+                "journal_id": journal.id,
+                "preserve_auth": preserve_auth,
+            }),
+        ));
+
+        let backup_of = |target: &Path| {
+            journal
+                .entries
+                .iter()
+                .find(|e| e.path == target)
+                .and_then(|e| e.backup.clone())
+        };
+        let outcome_of = |channel: DeliveryChannel, target: &Path| DeliveryOutcome {
+            channel,
+            target_path: target.to_path_buf(),
+            journal_id: journal.id.clone(),
+            backup_path: backup_of(target),
+        };
+        let mut outcome = delivery::CodexDeliveryOutcome {
+            journal_id: journal.id.clone(),
+            preserve_auth,
+            auth: None,
+            config: outcome_of(
+                DeliveryChannel::CodexConfig,
+                &to_write
+                    .iter()
+                    .find(|(c, _)| *c == DeliveryChannel::CodexConfig)
+                    .expect("config 一定在写列表里")
+                    .1,
+            ),
+        };
+        if let Some((_, auth_target)) = to_write
+            .iter()
+            .find(|(c, _)| *c == DeliveryChannel::CodexAuthJson)
+        {
+            outcome.auth = Some(outcome_of(DeliveryChannel::CodexAuthJson, auth_target));
+        }
+        Ok(outcome)
+    }
+
     /// 按 journal 回滚（校验文件未被外部改动）。
     pub fn rollback_delivery(&self, journal_id: &str) -> Result<()> {
         let entries = self.store.journal_entries(journal_id)?;

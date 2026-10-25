@@ -260,6 +260,32 @@ export type DeliveryPlan = {
   warnings: string[];
   /** 生效策略。文案由这个取值派生，**不得**在页面里按通道判断。 */
   restartHint: RestartHint;
+  /**
+   * P0-2：Codex 保留模式（只写 config，auth.json 不动）时为 true；其余一律 false。
+   *
+   * 仅类型层接线：界面上的保留复选框与双文件预览渲染是后续项，在此之前
+   * 旧界面仍只读顶层字段（顶层描述入口文件，见后端 DTO 注释）。
+   */
+  preserveAuth: boolean;
+  /**
+   * P0-2：本次投递实际覆盖的全部文件。单通道 = 1 条；Codex 双文件 = 2 条
+   * （auth + config，写顺序）；Codex 保留 = 1 条（config）。
+   * 新界面必须读它才算看到整单，只看顶层会漏掉另一半文件。
+   */
+  files: DeliveryFilePlan[];
+};
+
+/** 一单里某一个文件的预览（P0-2）。字段含义与 DeliveryPlan 的同名项一致。 */
+export type DeliveryFilePlan = {
+  channel: string;
+  targetPath: string;
+  targetExists: boolean;
+  fields: DeliveryField[];
+  /** 已脱敏的 diff 预览（只含这一个文件的变化行） */
+  preview: string;
+  consent: ConsentState;
+  consentGrantedAt?: number | null;
+  consentRevokedAt?: number | null;
 };
 
 /** 投递模式（M8-S4 §6.2）。缺省 = `"site"`：既有调用点的行为一字不变。 */
@@ -279,6 +305,21 @@ export type DeliveryOutcome = {
   channel: string;
   targetPath: string;
   journalId: string;
+  backupPath?: string | null;
+  /** P0-2：Codex 保留模式时为 true；其余一律 false。 */
+  preserveAuth: boolean;
+  /**
+   * P0-2：本次投递实际写了的全部文件（单通道 = 1 条；Codex 双文件 = 2 条，
+   * 写顺序；Codex 保留 = 1 条 config）。各条的 `journalId` 与顶层相同
+   * （同一单、同一 journal），`backupPath` 各取各文件的备份。
+   */
+  files: DeliveryFileOutcome[];
+};
+
+/** 一单里某一个文件的投递结果（P0-2）。 */
+export type DeliveryFileOutcome = {
+  channel: string;
+  targetPath: string;
   backupPath?: string | null;
 };
 
@@ -586,6 +627,16 @@ export type DeliveryArgs = {
    * `"gateway"` 时后端要求网关**正在运行**：此时才有一个可信的本地地址可写。
    */
   mode?: DeliveryMode;
+  /**
+   * P0-2：Codex 保留选项。只对两条 Codex 通道有意义，其余通道传 `true`
+   * 会被后端直接拒绝（不是静默忽略）。
+   *
+   * - 缺省：Codex 通道走**双文件**（auth + config 同单）；非 Codex 通道走既有单通道。
+   * - `false`：Codex 双文件（与缺省同义，但显式写出来便于调用方自证）。
+   * - `true`：Codex 保留——只写 config.toml，auth.json 一个字节都不碰；
+   *   必须由调用方显式传入，绝不能从「auth.json 已存在」推断。
+   */
+  preserveAuth?: boolean;
 };
 
 const hasTauri =
@@ -772,6 +823,22 @@ const MOCK_PLAN: DeliveryPlan = {
   warnings: [],
   // codex 只在进程启动时读 auth.json（M7-S3 的 `restart_hint` 表）
   restartHint: "needed",
+  preserveAuth: false,
+  files: [
+    {
+      channel: "codex-auth-json",
+      targetPath: "/Users/you/.codex/auth.json",
+      targetExists: true,
+      fields: [
+        { key: "auth_mode", masked: "apikey" },
+        { key: "OPENAI_API_KEY", masked: "…cdef" },
+      ],
+      preview: '- "OPENAI_API_KEY": "…0000"\n+ "OPENAI_API_KEY": "…cdef"\n',
+      consent: "missing",
+      consentGrantedAt: null,
+      consentRevokedAt: null,
+    },
+  ],
 };
 
 const MOCK_EVENTS: EventRow[] = [
@@ -1225,6 +1292,14 @@ export async function applyDelivery(
       targetPath: MOCK_PLAN.targetPath,
       journalId: "j-mock-0",
       backupPath: "/Users/you/.tianshu-relay/backups/j-mock-0/0-auth.json",
+      preserveAuth: false,
+      files: [
+        {
+          channel: args.channel,
+          targetPath: MOCK_PLAN.targetPath,
+          backupPath: "/Users/you/.tianshu-relay/backups/j-mock-0/0-auth.json",
+        },
+      ],
     });
   }
   return invokeCommand<DeliveryOutcome>("apply_delivery", { args });

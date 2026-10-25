@@ -609,6 +609,8 @@
       "removedValueMasked": "…(old value hidden)",
       "noChange": "Config is already up to date; no change needed.",
       "agree": "I consent to writing the above key into this agent's config (backup is taken before write; rollback is available)",
+      "agreeAll": "I have reviewed the diffs of all files above and consent to writing the above key into these configs (backup is taken before write; rollback is available)",
+      "fileTitle": "File {index} of {total}",
       "generating": "Generating preview…"
     },
     "restartHint": {
@@ -743,6 +745,7 @@
     },
     "notice": {
       "delivered": "Delivered to {path} (change {journal}). {hint}",
+      "deliveredFiles": "Delivered to {paths} (change {journal}). {hint}",
       "revoked": "Consent revoked. Written files won't auto-rollback—use the Change History page to restore.",
       "rolledBack": "Rolled back {journal}."
     },
