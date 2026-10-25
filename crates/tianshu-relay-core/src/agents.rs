@@ -900,9 +900,13 @@ mod tests {
         let found = probe_cline_cli(dir.path());
         assert!(found.found);
         assert_eq!(found.version.as_deref(), Some("1.2.3"));
+        // 生产侧候选路径里 `.local/bin` 一段是写死的 `/` 拼接，Windows 上与
+        // PathBuf 拼出的 `\` 混用（功能无碍，CreateProcess 接受 `/`）；断言前
+        // 两边统一归一化分隔符（与扩展目录断言同款写法），只比路径本身。
+        let normalize = |p: &str| p.replace('\\', "/");
         assert_eq!(
-            found.path.as_deref(),
-            Some(script.display().to_string().as_str())
+            found.path.as_deref().map(normalize),
+            Some(normalize(&script.display().to_string()))
         );
 
         // 注：本断言假设运行环境的 PATH 与系统目录里没有 cline（CI/VM 成立）；

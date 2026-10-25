@@ -857,6 +857,47 @@ async fn concurrent_inject_same_file_is_rejected() {
     );
 }
 
+/// 仅对 `FileBusy` 做有界重试的单通道 apply 包装（幂等测试独用）。
+///
+/// 背景：ac1b130 的 macOS CI 上，本文件 `injection_is_idempotent_across_channels`
+/// 在 claude-code-settings 的二投处偶发 `FileBusy(settings.json)`；而此前三轮
+/// macOS CI 同测试通过，其间 acceptance_matrix 与 inject 锁生产代码零改动；
+/// 本地 Linux 上单测 20 遍、整目标并行 5 遍均未复现。
+/// 结论只能是“未定位的瞬时锁竞争抖动”，不是确定性回归——本包装不声称根因。
+/// 已排除的项：锁键是完整归一化目标路径、每测试独用 tempdir 夹具，故不存在
+/// 跨测试同路径撞锁；首投守卫是函数局部 RAII，顺序双投不存在自撞；回滚不取锁、
+/// writer 不取锁、plan 不取锁；第六波的 FileLock::drop 顺序窗口（先删进程内登记、
+/// 后关 fd）需要同路径并发抢锁者，而本测试是顺序调用，故不适用。
+/// 锁竞争本身就是瞬时的，且本用例断言的是两次注入内容不变，不是“零竞争”，
+/// 因此只对 FileBusy 重试（最多 10 次、间隔 20ms）；其它错误立即返回，不掩盖；
+/// 锁若真的泄漏（永久占用），10 次都会失败，测试仍红——重试掩盖不了泄漏。
+/// 最终失败时附上历次 FileBusy 目标，便于下次定位。
+fn apply_delivery_retry_on_busy(
+    f: &Fixture,
+    channel: DeliveryChannel,
+    model: Option<&str>,
+) -> Result<tianshu_relay_core::delivery::DeliveryOutcome> {
+    let mut last_busy: Option<String> = None;
+    for attempt in 0..10 {
+        match f
+            .service
+            .apply_delivery_with_model(f.key_id, channel, model)
+        {
+            Ok(outcome) => return Ok(outcome),
+            Err(Error::FileBusy(path)) => {
+                last_busy = Some(path);
+                if attempt < 9 {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(Error::FileBusy(format!(
+        "重试 10 次后仍被占用（历次目标：{last_busy:?}）",
+    )))
+}
+
 /// T-2 / B8 / A-9：跨通道的注入**幂等**——同一密钥对同一通道连投两次，
 /// 第二次不得产生任何额外改动。
 #[test]
@@ -895,15 +936,12 @@ fn injection_is_idempotent_across_channels() {
         f.service
             .grant_consent(f.key_id, channel)
             .unwrap_or_else(|e| panic!("{name} 同意失败: {e}"));
-        let first = f
-            .service
-            .apply_delivery_with_model(f.key_id, channel, model)
+        // 注意：两次 apply 都走 FileBusy 有界重试（见 apply_delivery_retry_on_busy）。
+        let first = apply_delivery_retry_on_busy(&f, channel, model)
             .unwrap_or_else(|e| panic!("{name} 首投失败: {e}"));
         let after_first = fs::read(&target).expect("读首投后内容");
 
-        let second = f
-            .service
-            .apply_delivery_with_model(f.key_id, channel, model)
+        let second = apply_delivery_retry_on_busy(&f, channel, model)
             .unwrap_or_else(|e| panic!("{name} 二投失败: {e}"));
         let after_second = fs::read(&target).expect("读二投后内容");
         assert_eq!(
