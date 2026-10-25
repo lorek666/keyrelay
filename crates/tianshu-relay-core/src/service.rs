@@ -2211,6 +2211,11 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let api_key = self.secret_for_source(key_id, source)?;
         let patch = writer.plan(&api_key)?;
         let target_path = writer.target_path();
+        // P0-1：plan 阶段整单校验——字段集与必填表不一致时整单拒绝，
+        // 此时一个字节都还没写（`DeliveryPlan` 也不会生成）。
+        let field_options = self.delivery_field_options(key_id, model, &source)?;
+        let fields = writer.fields(&api_key);
+        delivery::validate_plan_fields(channel, &fields, &field_options, &target_path)?;
         let consent = self.consent_state(channel, &target_path)?;
         self.log(observability::event_with_payload(
             Level::Debug,
@@ -2232,7 +2237,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             channel,
             target_exists: target_path.exists(),
             mode,
-            fields: writer.fields(&api_key),
+            fields,
             preview: delivery::diff_preview(&patch.before, &patch.after, &secret_refs),
             consent,
             target_path,
@@ -2384,6 +2389,11 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let api_key = self.secret_for_source(key_id, source)?;
         let patch = writer.plan(&api_key)?;
 
+        // P0-1：plan 阶段整单校验——在落盘之前拒绝，不动磁盘。
+        let field_options = self.delivery_field_options(key_id, model, &source)?;
+        let expected = delivery::expected_fields(channel, &field_options);
+        delivery::validate_plan_fields(channel, &writer.fields(&api_key), &field_options, &target)?;
+
         // ⑤ 写入（加锁已在上面完成；预检 → 备份 → 原子写 → 回读校验 → 失败补偿在 apply 内部）
         let journal = match inject::apply_holding_lock(
             &[patch],
@@ -2401,6 +2411,19 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 return Err(err);
             }
         };
+
+        // P0-1：apply 后回读比对——落盘文件里的字段集与必填表不一致即视为投递失败，
+        // 走与记账失败相同的补偿路径（回滚已写入的文件），不得报成功。
+        if let Err(err) = delivery::verify_applied_fields(channel, &expected, &target) {
+            return match inject::rollback(&journal) {
+                Ok(()) => Err(Error::Store(format!(
+                    "投递后回读比对失败，已自动回滚（文件内容未改动）: {err}"
+                ))),
+                Err(rollback_err) => Err(Error::Store(format!(
+                    "投递后回读比对失败且自动回滚也失败，需要人工处理: {err} / {rollback_err}"
+                ))),
+            };
+        }
 
         // ⑥ 记账：变更记录 + 投递绑定。两者都不含密钥。
         //
@@ -3387,7 +3410,19 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 });
                 continue;
             }
-            if let Err(err) = writer.plan(delivery::PLACEHOLDER_KEY) {
+            // P0-1：轮换预检同样跑整单校验——writer 回归在建新 key 之前就暴露，
+            // 而不是等到重注入那一步才停在半路。
+            let precheck = writer.plan(delivery::PLACEHOLDER_KEY).and_then(|_| {
+                let opts =
+                    self.delivery_field_options(key_id, None, &delivery::DeliverySource::Site)?;
+                delivery::validate_plan_fields(
+                    *channel,
+                    &writer.fields(delivery::PLACEHOLDER_KEY),
+                    &opts,
+                    &target,
+                )
+            });
+            if let Err(err) = precheck {
                 blocked.push(BlockedTarget {
                     channel: channel.as_str().to_string(),
                     target: target.display().to_string(),
@@ -6594,6 +6629,40 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             model,
             meta,
         )
+    }
+
+    /// P0-1 整单校验用的构造输入快照：从**构造 writer 的同一批输入**算出，
+    /// 而不是从 writer 的产出反推（反推会把「writer 漏写」也算成「本来就不写」）。
+    ///
+    /// 口径与 writer 的 gating 逐字对应：endpoint 看 base_url 是否**非空**
+    /// （不 trim——writer 的 gating 就是 `!base_url.is_empty()`）；
+    /// model 看 trim 后是否非空（`resolve_for_binding_with_meta` 会 trim 并过滤空串）；
+    /// meta 看 `meta_for` 的缓存快照（与 `prepare_delivery` 同一个来源）。
+    /// 服务层投递一律用默认 provider 名，因此这里固定传默认 provider；
+    /// 绑定专用的 provider 名路径要自己把 provider_id 传给 `validate_plan_fields`。
+    fn delivery_field_options(
+        &self,
+        key_id: i64,
+        model: Option<&str>,
+        source: &delivery::DeliverySource<'_>,
+    ) -> Result<delivery::FieldSetOptions<'static>> {
+        let has_endpoint = match source {
+            delivery::DeliverySource::Site => {
+                let row = self
+                    .store
+                    .get_key(key_id)?
+                    .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
+                let site = self.site(row.site_id)?;
+                !site.base_url.is_empty()
+            }
+            delivery::DeliverySource::Gateway(endpoint) => !endpoint.base_url.is_empty(),
+        };
+        Ok(delivery::FieldSetOptions::new(
+            delivery::opencode::OpenCodeWriter::DEFAULT_PROVIDER_ID,
+            has_endpoint,
+            model.map(str::trim).filter(|m| !m.is_empty()).is_some(),
+            self.meta_for(model).is_some(),
+        ))
     }
 
     /// 从钥匙串取密钥明文。调用方必须立刻用掉，不得记录。
