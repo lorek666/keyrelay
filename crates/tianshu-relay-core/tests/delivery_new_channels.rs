@@ -74,6 +74,10 @@ fn setup() -> Fixture {
     setup_with_base(BASE_URL)
 }
 
+/// Unix 权限位读取：Windows 没有 Unix mode 位，生产侧的权限收紧
+/// （inject/mod.rs 的 resolve_mode / clamp_secret_mode）本身就是 cfg(unix)，
+/// 非 Unix 路径写文件时直接忽略 mode——因此 mode 断言只在 Unix 上有意义。
+#[cfg(unix)]
 fn mode_of(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     fs::metadata(path).expect("stat").permissions().mode() & 0o777
@@ -185,16 +189,26 @@ fn new_file_is_created_with_0600() {
         f.service.grant_consent(f.key_id, channel).unwrap();
         f.service.apply_delivery(f.key_id, channel).unwrap();
 
+        // 0600 断言只在 Unix 上成立（见 mode_of 的注释）；Windows 没有
+        // mode 位，投递成功 + 文件落盘即是该平台下可验证的全部。
+        #[cfg(unix)]
         assert_eq!(
             mode_of(&target),
             0o600,
             "{} 的新建文件必须是 0600（不是 umask 决定的 0644）",
             channel.as_str()
         );
+        #[cfg(not(unix))]
+        assert!(target.exists(), "{} 投递后目标文件应存在", channel.as_str());
     }
 }
 
+/// Unix 专属：0644 预置文件在投递后必须被收紧到 0600。Windows 上
+/// 「0644」这个前提本身不存在（无 Unix mode 位），且生产侧收紧在非 Unix
+/// 下是 no-op，因此本测试只在 Unix 上编译运行；Windows 下的投递成功路径
+/// 由本文件的 round_trip 系列测试覆盖。
 #[test]
+#[cfg(unix)]
 fn existing_world_readable_file_is_tightened() {
     let f = setup();
     for channel in [DeliveryChannel::OpenCode, DeliveryChannel::GeminiCli] {

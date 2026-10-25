@@ -243,7 +243,11 @@ async fn ewma_flips_first_pick_under_weighted_rotation() {
     assert_eq!(a.count(), 3, "第 5 次不该再打 site1");
     assert_eq!(b.count(), 2, "第 5 次应打 site2");
 
-    // EWMA 本身可见：site1 ≈ 200ms，site2 很小。
+    // EWMA 本身可见：site1 慢、site2 快。断言口径必须是「下限 + 分离度」，
+    // 不能是 150–250ms 绝对窗口：TTFB 从 send_once 前计时，含上游 200ms
+    // 睡眠（下限）与网关调度/排队开销（无上限）——CI 负载下样本膨胀到
+    // 300ms+ 是合理解释（实测 318.48），不是选路 bug；翻转行为本身已由
+    // 上面的 body/count 断言钉住，这里只钉「慢站显著慢于快站」这一信号。
     let snap = handle.metrics();
     let ewma_a = snap.per_site[&1i64]
         .ewma_latency_ms
@@ -252,10 +256,14 @@ async fn ewma_flips_first_pick_under_weighted_rotation() {
         .ewma_latency_ms
         .expect("site2 应有 EWMA");
     assert!(
-        (150.0..=250.0).contains(&ewma_a),
-        "site1 EWMA 应在 200ms 附近，实测 {ewma_a}"
+        ewma_a >= 150.0,
+        "site1 EWMA 应反映 200ms 上游延迟的下限，实测 {ewma_a}"
     );
     assert!(ewma_b < 50.0, "site2 EWMA 应很小，实测 {ewma_b}");
+    assert!(
+        ewma_a > ewma_b + 100.0,
+        "site1 EWMA 应显著大于 site2（翻转信号），实测 {ewma_a} vs {ewma_b}"
+    );
 
     handle.shutdown_and_wait().await;
 }

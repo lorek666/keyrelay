@@ -523,6 +523,17 @@ async fn m44_c6_per_site_concurrency_cap() {
     for j in joins {
         j.join().unwrap();
     }
+    // 在途归零必须等排空，不是 join 后立刻读：fake 的计数在 write_all 之后、
+    // 连接关闭之前才 fetch_sub，而网关按 Content-Length 转发、不等上游 FIN 就能
+    // 关掉客户端连接——客户端 join 完成时，fake 处理线程可能还没被调度到
+    // fetch_sub 那一行（CI 负载下实测残留 4）。因此这里轮询到双站归零为止
+    // （上限 5s）；超时仍不归零才是真泄漏，断言照样红，不是放水。
+    let drain_deadline = Instant::now() + Duration::from_secs(5);
+    while (a.current.load(Ordering::SeqCst) != 0 || b.current.load(Ordering::SeqCst) != 0)
+        && Instant::now() < drain_deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     // 锁只在断言段持有：先在块内读完 results 做断言、块结束即放锁，
     // 再 await 关停（clippy::await_holding_lock；join 已全部回收，块内无并发写）。
     {
