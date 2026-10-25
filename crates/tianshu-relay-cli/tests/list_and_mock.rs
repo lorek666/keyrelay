@@ -50,12 +50,31 @@ fn mock_agent_fatal_when_file_absent() {
 #[test]
 fn mock_agent_ok_after_smoke_apply_for_every_channel() {
     for channel in DeliveryChannel::ALL {
+        // B-292：ClineDesktop 已下线（文件直写已拒，走 cline auth CLI），
+        // smoke 投递不再适用；下线通道的拒绝行为由 core 的下线断言钉住。
+        // （与 delivery/mod.rs 里 every_deliverable_channel_resolves 同款处理。）
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         let dir = tempfile::tempdir().expect("tmp");
         let home = dir.path().join("home");
         let store = dir.path().join("tianshu-relay.db");
         let backup = dir.path().join("backups");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&backup).unwrap();
+
+        // P0-3 DSH 引用校验：dsh 投递要求至少一个 profile patch 文件引用
+        // KEYRELAY_API_KEY，否则 fail-closed 拒绝；测试里按 spec 例建一个
+        // 引用了该凭据的 profile（真实 DSH 用户须自己先在 DSH 里建好）。
+        if channel == DeliveryChannel::DeepSeekHarness {
+            let profile = home.join(".dsh").join("profiles").join("desktop");
+            fs::create_dir_all(&profile).unwrap();
+            fs::write(
+                profile.join("cordis.patch.yml"),
+                "provider:\n  apiKeyEnv: KEYRELAY_API_KEY\n",
+            )
+            .unwrap();
+        }
 
         // M14-S3 起 19 通道均不要求 model。
         let model_arg: Vec<&str> = Vec::new();
