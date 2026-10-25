@@ -73,7 +73,7 @@ impl DeliveryWriter for PiWriter {
 
     fn field_names(&self) -> Vec<String> {
         let mut names = vec![Self::FIELD_API_KEY.to_string()];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             names.push(Self::FIELD_BASE_URL.to_string());
         }
         if self.model.is_some() {
@@ -88,7 +88,7 @@ impl DeliveryWriter for PiWriter {
 
     fn fields(&self, api_key: &str) -> Vec<DeliveryField> {
         let mut fields = vec![masked_field(Self::FIELD_API_KEY, api_key)];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
         if let Some(m) = &self.model {
@@ -141,7 +141,7 @@ fn build_after(
         PiWriter::FIELD_API_KEY.to_string(),
         Value::String(api_key.to_string()),
     );
-    if !base_url.is_empty() {
+    if !base_url.trim().is_empty() {
         provider.insert(
             PiWriter::FIELD_BASE_URL.to_string(),
             Value::String(base_url.to_string()),

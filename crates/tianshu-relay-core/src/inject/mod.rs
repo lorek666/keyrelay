@@ -270,6 +270,12 @@ fn write_atomic(
 /// journal 记录的哈希就会与磁盘不一致，后续 `rollback` 会误判为「外部改动」而拒绝，
 /// 因此必须在写入当步发现并补偿。
 fn write_verified(path: &Path, contents: &str, new_file_mode: Option<u32>) -> Result<String> {
+    // DEBUG-G7 P3-D3：空内容拒绝——投递路径（apply）绝不把一个配置截断成 0 字节：
+    // 空写盘只可能是上游 plan 出错，写进去等于静默毁掉用户配置。
+    // 守门只放这里，不放 `write_atomic`：回滚路径合法地恢复可能为空的备份。
+    if contents.is_empty() {
+        return Err(Error::inject(path, "拒绝写入空内容：投递内容为空，配置不会被截断成 0 字节"));
+    }
     write_atomic(path, contents, new_file_mode, None)?;
     let read_back =
         fs::read(path).map_err(|e| Error::inject(path, format!("写入后回读失败: {e}")))?;
@@ -624,6 +630,18 @@ mod tests {
 
     fn patch_for(dir: &Path, before: &str, after: &str) -> Patch {
         Patch::new(dir.join("config.toml"), before, after)
+    }
+
+    /// DEBUG-G7 P3-D3：空内容在投递写盘层拒绝——既有配置不得被截断成 0 字节；
+    /// 回滚路径（直接走 `write_atomic`）不受此门禁影响，空备份仍可恢复。
+    #[test]
+    fn write_verified_rejects_empty_contents_without_touching_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        fs::write(&target, "model = \"old\"\n").unwrap();
+        let err = write_verified(&target, "", None).unwrap_err();
+        assert!(err.to_string().contains("空内容"), "{err}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "model = \"old\"\n");
     }
 
     #[test]

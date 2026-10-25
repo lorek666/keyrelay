@@ -76,7 +76,7 @@ impl GeminiCliWriter {
 
         let mut assignments: Vec<(&str, String)> =
             vec![(Self::FIELD_API_KEY, render_value(api_key))];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             assignments.push((Self::FIELD_BASE_URL, render_value(&self.base_url)));
         }
         if let Some(m) = model {
@@ -181,7 +181,7 @@ impl DeliveryWriter for GeminiCliWriter {
 
     fn field_names(&self) -> Vec<String> {
         let mut names = vec![Self::FIELD_API_KEY.to_string()];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             names.push(Self::FIELD_BASE_URL.to_string());
         }
         if self.model.is_some() {
@@ -192,7 +192,7 @@ impl DeliveryWriter for GeminiCliWriter {
 
     fn fields(&self, api_key: &str) -> Vec<DeliveryField> {
         let mut fields = vec![masked_field(Self::FIELD_API_KEY, api_key)];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
         if let Some(m) = &self.model {

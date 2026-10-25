@@ -86,6 +86,28 @@ impl LocalVault {
         }
         let conn =
             Connection::open(db_path).map_err(|e| Error::Vault(format!("打开保险库失败: {e}")))?;
+        // DEBUG-G7 P2-K5：与 Store::open 同口径——Unix 上把 vault.db 权限只收紧
+        // 不放宽（`mode & 0o600`，含 -wal / -shm 若存在）；best-effort。
+        // 注意：vault.db 本身是密文，收紧是纵深防御，不是唯一防线。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut candidates = vec![db_path.to_path_buf()];
+            if let Some(name) = db_path.file_name().map(|n| n.to_string_lossy().into_owned()) {
+                candidates.push(db_path.with_file_name(format!("{name}-wal")));
+                candidates.push(db_path.with_file_name(format!("{name}-shm")));
+            }
+            for candidate in candidates {
+                if let Ok(meta) = std::fs::metadata(&candidate) {
+                    let cur = meta.permissions().mode() & 0o777;
+                    let tight = cur & 0o600;
+                    if tight != cur {
+                        let _ =
+                            std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(tight));
+                    }
+                }
+            }
+        }
         conn.busy_timeout(BUSY_TIMEOUT)
             .map_err(|e| Error::Vault(format!("设置忙等超时失败: {e}")))?;
         // WAL 与主库同口径；内存库/只读介质上失败不该阻止使用，退化为默认日志模式即可。

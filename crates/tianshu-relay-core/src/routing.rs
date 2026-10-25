@@ -114,18 +114,33 @@ impl RouteTable {
     /// **这是「枚举」而不是「可达性判据」**：`models` 为空的站点（= 目录未知，M8-S1 §4.2 的
     /// fail-open）不贡献任何模型名，但它**依然是候选**——所以「列表里没有 `m`」不等于
     /// 「`m` 会 404」。可达性判据只看 [`Self::supports_model`]。
+    ///
+    /// DEBUG-G7 P2-G4：[`Self::available_models_for_sites`] 是本函数的规则过滤版。
     pub fn available_models(&self) -> Vec<String> {
+        self.available_models_for_sites(None)
+    }
+
+    /// `available_models` 的规则过滤版（DEBUG-G7 P2-G4）。
+    ///
+    /// `None` = 不过滤（与 `available_models` 逐字相同）；`Some(allowed)` = 只算
+    /// 允许站点上游的并集，别名可服务性判定也只看允许站点。`GET /v1/models`
+    /// 本地聚合分支用它按请求令牌的 label 过滤，否则聚合分支会在规则过滤之前
+    /// 返回，把规则外站点的模型名泄露给受限 agent（泄露面仅模型名字符串，
+    /// 但规则的存在意义就是隔离，名字也不应漏）。
+    pub fn available_models_for_sites(&self, allowed: Option<&[i64]>) -> Vec<String> {
         let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let in_scope = |site_id: i64| allowed.map_or(true, |list| list.contains(&site_id));
         for upstream in &self.upstreams {
-            out.extend(upstream.models.iter().cloned());
+            if in_scope(upstream.site_id) {
+                out.extend(upstream.models.iter().cloned());
+            }
         }
         for (alias, real) in &self.aliases {
             // 别名与它的真实名都只在**可服务**时列出：指向不存在模型的别名列出来
-            // 就是伪造候选（M39-S2 §6）。
-            let serviceable = self
-                .upstreams
-                .iter()
-                .any(|u| u.models.is_empty() || u.models.iter().any(|m| m == real));
+            // 就是伪造候选（M39-S2 §6）。过滤版里“可服务”只看允许站点。
+            let serviceable = self.upstreams.iter().any(|u| {
+                in_scope(u.site_id) && (u.models.is_empty() || u.models.iter().any(|m| m == real))
+            });
             if !serviceable {
                 continue;
             }
@@ -134,7 +149,7 @@ impl RouteTable {
             if self
                 .upstreams
                 .iter()
-                .any(|u| u.models.iter().any(|m| m == real))
+                .any(|u| in_scope(u.site_id) && u.models.iter().any(|m| m == real))
             {
                 out.insert(real.clone());
             }
@@ -261,10 +276,37 @@ pub const EWMA_ALPHA: f64 = 0.2;
 /// M46-S2：一次成功样本后的 EWMA。首次样本直接作为初值（不是 `alpha × 样本`）：
 /// `None ⇒ 样本`；`Some(prev) ⇒ alpha × 样本 + (1 − alpha) × prev`。
 /// 纯函数：只算数，不判定「成功」——调用方（网关成功分支）负责只喂成功样本。
+///
+/// DEBUG-G7 P2-G1（异常值截断，先于衰减做）：样本先截断到上一值的 5 倍再
+/// 平滑——单次离群样本最多让 EWMA 上涨 80%（`0.2 × 5 + 0.8 × 1`），而不是无界
+/// 抬升。下跌不截断（样本可以任意小）：一次极快样本最多让 EWMA 下跌 20%，本身有界。
+///
+/// DEBUG-G7 补齐 P2-G1（时间衰减，取 TTL 路线而非连续加权）：EWMA 值本身
+/// 不带时间加权——陈旧值由网关层 `SiteMetrics::ewma_latency_at_secs` +
+/// `EWMA_STALE_AFTER_SECS`（600 秒）兜底：超期未更新的 EWMA 在选路 map
+/// 与快照里一律视为无 EWMA，回退静态延迟。取 TTL 而非按（站点，模型）
+/// 分键，是改动最小的选择（分键要改快照键类型与选路闭包签名，另立项）；
+/// 残留：EWMA 仍按站聚合（不同模型延迟差异仍被抹平）；被挤出窗口的站
+/// 若静态延迟也慢，TTL 过期后仍进不了窗口、拿不到新样本，自纠正只闭合
+/// “过期快值占优”一半，窗口轮换/探针需另立项。
+///
+/// 语义（不得谎称 EWMA 决定首选）：EWMA 只改变候选进入 `lb_top_n` 窗口的集合
+/// 与失败切换尾巴的顺序；首选的加权分布由 `weighted_pick` 的 rate 定。
+/// `lb_top_n >=` 候选数时 EWMA 对首选分布**零影响**；只有 `top_n = 1` 时
+/// EWMA 才决定同档首选。另：EWMA 按站聚合（不按模型），见上段残留。
 pub fn ewma_update(previous: Option<f64>, sample_ms: u64) -> f64 {
     match previous {
         None => sample_ms as f64,
-        Some(prev) => EWMA_ALPHA * sample_ms as f64 + (1.0 - EWMA_ALPHA) * prev,
+        Some(prev) => {
+            // prev == 0（曾采到 0ms 样本）时不截断：否则 0 × 5 = 0 会把 EWMA
+            // 永远钉在 0；0 本身不是“离群高值”，放行即恢复。
+            let capped = if prev > 0.0 {
+                (sample_ms as f64).min(prev * 5.0)
+            } else {
+                sample_ms as f64
+            };
+            EWMA_ALPHA * capped + (1.0 - EWMA_ALPHA) * prev
+        }
     }
 }
 
@@ -400,6 +442,10 @@ pub fn parse_routing_rules(text: &str) -> Result<Vec<RoutingRule>, String> {
 /// `Some(sites)` = 命中（`sites` 可能为空 allowlist：规则引用的站点全被剥离后
 /// 仍保留，见 `resolve_routing_rules`）；`None` = 未命中，走全局加权。
 /// 空 label（legacy 无 label 请求）恒为 `None`——没有身份就无法被按身份限制。
+///
+/// DEBUG-G7 P2-G3（显性声明，不得静默）：空 label 即 legacy 单令牌（无 label 的
+/// 旧令牌）**永远不命中任何规则**，返回 `None` = 全局加权——这是有意的兼容
+/// 行为，不是“规则没配好”：legacy 令牌不受任何规则限制。
 pub fn routing_allowed_sites<'a>(rules: &'a [RoutingRule], agent_label: &str) -> Option<&'a [i64]> {
     if agent_label.is_empty() {
         return None;
@@ -458,6 +504,11 @@ pub fn filter_upstreams_by_sites<'a>(
 }
 
 /// DELIVERY-P2-10：按用户配置的优先级排备用顺序（纯函数）。
+///
+/// DEBUG-G7 P2-G2（语义澄清，不改首选行为）：`priority`（规则 `siteIds` 顺序）
+/// **只排备用尾巴**——首选仍由加权轮转 / EWMA / 探针定出，本函数不动它。界面
+/// 上“优先级”一词不得被理解成“首选顺序”：把某站排在 `siteIds` 首位，不会让它
+/// 成为首选，只会让它在首选失败后第一个被尝试。
 ///
 /// `rest` 是「首选之后」的候选：首选已由加权轮转 / EWMA / 探针定出，本函数不动它，
 /// 只排它之后的备用尝试顺序。`priority` 是用户配置的站点顺序——当前唯一来源是
@@ -886,6 +937,10 @@ impl SiteGuard {
 /// **额度耗尽的 403 也落在 `false` 里**——这是**决策**不是遗漏：
 /// 上游回「额度不足」是**一个答案**，不是**一次故障**；静默切到另一个站点等于花用户没指定的那份钱。
 /// 缓解在**选路时**做（`balance_usd` 把余额耗尽的站点排到最后），见 M7-S0 §3.1 的 D-2 裁决。
+/// DEBUG-G7 P3-D1 命名陷阱，注释澄清、不改名：本函数对 5xx 返回 true，
+/// 但那只是**熔断语义**（该 (站点, 模型) 记一次失败、喂 EWMA），**不是重放语义**——
+/// 网关主循环只对 429 / 连接层失败重放下一候选，5xx 不重放。
+/// 读到 `should_failover(status) == true` 时不得推断“会换候选重试”。
 pub fn should_failover(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
 }
@@ -1142,6 +1197,18 @@ mod tests {
         // 首次样本直接作为初值，不是 alpha × 样本（0.2 × 200 = 40 是错的）。
         assert_eq!(ewma_update(None, 200), 200.0);
         assert_eq!(ewma_update(None, 0), 0.0);
+    }
+
+    #[test]
+    fn ewma_update_caps_single_outlier_to_five_times_previous() {
+        // DEBUG-G7 P2-G1：单次离群样本（100ms 基线后采到 10000ms）截断后 EWMA
+        // 最多涨到 180（+80%），而不是无截断的 2080。
+        assert!((ewma_update(Some(100.0), 10_000) - 180.0).abs() < 1e-9);
+        // 正常样本不受影响；下跌不截断（本身有界）。
+        assert!((ewma_update(Some(100.0), 200) - 120.0).abs() < 1e-9);
+        assert!((ewma_update(Some(100.0), 10) - 82.0).abs() < 1e-9);
+        // 0 基线不钉死：下一个真实样本能把 EWMA 拉起来。
+        assert!((ewma_update(Some(0.0), 200) - 40.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1492,6 +1559,33 @@ mod tests {
             !route.supports_model("zzz"),
             "全部目录明确且不含 ⇒ 不可服务"
         );
+    }
+
+    #[test]
+    fn available_models_for_sites_restricts_to_allowed_sites() {
+        // DEBUG-G7 P2-G4：过滤版只算允许站点；别名可服务性也只看允许站点
+        // （指向规则外站点的别名不得列出；规则内站点服务的别名照常列出）。
+        let route = RouteTable::new(vec![
+            upstream_of(1, &["a", "b"]),
+            upstream_of(2, &["c"]),
+        ])
+        .with_alias("fast", "c")
+        .with_alias("slow", "a");
+        assert_eq!(
+            route.available_models_for_sites(Some(&[1])),
+            vec!["a", "b", "slow"],
+            "站点 2 的 c 与指向它的 fast 不得漏出"
+        );
+        assert_eq!(
+            route.available_models_for_sites(Some(&[2])),
+            vec!["c", "fast"]
+        );
+        assert_eq!(
+            route.available_models_for_sites(None),
+            route.available_models(),
+            "None 必须与不过滤逐字相同"
+        );
+        assert!(route.available_models_for_sites(Some(&[99])).is_empty());
     }
 
     #[test]

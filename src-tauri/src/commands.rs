@@ -317,6 +317,14 @@ pub struct DeliveryPlanDto {
 
 /// 一单里某一个文件的预览（P0-2）。字段含义与顶层同名项一致，
 /// 只是作用域收窄到这一个文件；`consent` 同样按文件各自的同意记录取。
+///
+/// DEBUG-G7 P2-C6（B-276/277）：per-file 的 `warnings` / `restart_hint` /
+/// `restart_hint_source` / `restart_hint_action` / `endpoint_in_channel` /
+/// `agent_id` 与顶层同源（按该文件自己的通道与路径算），不再只有顶层（入口文件）
+/// 才有——双文件单里另一文件的提示此前在计划视图里看不到。
+/// 旧二进制兼容：新增字段均为加法字段——旧前端反序列化时忽略未知字段，
+/// 顶层字段仍是入口文件视图，语义不变；新前端把这些字段声明为可选，
+/// 旧后端（不返回它们）的前端仍能渲染顶层视图。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeliveryFilePlanDto {
@@ -334,6 +342,12 @@ pub struct DeliveryFilePlanDto {
     /// 双文件时两文件各自判定、各自导入）。
     is_first_delivery: bool,
     imported_fields: Vec<DeliveryFieldDto>,
+    warnings: Vec<String>,
+    restart_hint: String,
+    restart_hint_source: String,
+    restart_hint_action: String,
+    endpoint_in_channel: bool,
+    agent_id: String,
 }
 
 /// [`tianshu_relay_core::delivery::RestartHint`] 的线格式。
@@ -925,6 +939,15 @@ fn parse_channel(raw: &str) -> Result<tianshu_relay_core::delivery::DeliveryChan
     tianshu_relay_core::delivery::DeliveryChannel::parse(raw).map_err(|e| e.to_string())
 }
 
+/// DEBUG-G7 P2-K4：投递命令层的统一错误脱敏——只 scrub 密钥形态
+/// （`crate::redact::scrub`：密钥形长串 → 掩码），正常错误文案逐字不变。
+/// 只用于投递命令（`delivery_plan` / `grant_consent` / `revoke_consent` /
+/// `apply_delivery` / `rollback_delivery`）；其它命令的错误形态不在本组范围，
+/// 不顺手扩大（避免误改正常文案）。
+fn scrub_err<E: std::fmt::Display>(e: E) -> String {
+    tianshu_relay_core::redact::scrub(&e.to_string())
+}
+
 /// 同意状态 → DTO 三元组（与既有 `delivery_plan` 的映射逐字一致）。
 fn consent_parts(consent: &ConsentState) -> (&'static str, Option<i64>, Option<i64>) {
     match consent {
@@ -997,6 +1020,9 @@ fn model_block_message(v: &tianshu_relay_core::delivery::model_check::ModelValid
 /// 计划时，先用它从借用建 `files`，再移动原计划建顶层）。
 fn file_plan_dto(plan: &tianshu_relay_core::delivery::DeliveryPlan) -> DeliveryFilePlanDto {
     let (consent, granted_at, revoked_at) = consent_parts(&plan.consent);
+    // DEBUG-G7 P2-C6：per-file 提示与顶层同源——warnings 按该文件路径算，
+    // restart 三件套与 endpoint 判定按该文件通道算，agent_id 取该计划自身。
+    let hint_detail = tianshu_relay_core::delivery::restart_hint_detail(plan.channel);
     DeliveryFilePlanDto {
         channel: plan.channel.as_str().to_string(),
         target_path: plan.target_path.display().to_string(),
@@ -1023,6 +1049,12 @@ fn file_plan_dto(plan: &tianshu_relay_core::delivery::DeliveryPlan) -> DeliveryF
                 masked: f.masked.clone(),
             })
             .collect(),
+        warnings: delivery_warnings(&plan.target_path),
+        restart_hint: restart_hint_str(hint_detail.hint).to_string(),
+        restart_hint_source: restart_hint_source_str(hint_detail.source).to_string(),
+        restart_hint_action: restart_hint_action_str(hint_detail.action).to_string(),
+        endpoint_in_channel: tianshu_relay_core::delivery::channel_carries_endpoint(plan.channel),
+        agent_id: plan.agent_id.clone(),
     }
 }
 
@@ -1188,9 +1220,14 @@ pub async fn delivery_plan(
         Some(endpoint) => tianshu_relay_core::delivery::DeliverySource::Gateway(endpoint),
         None => tianshu_relay_core::delivery::DeliverySource::Site,
     };
+    // DEBUG-G7 P2-C9（B-286）：preview_only 时跳过预热——预览模式的契约是
+    // 零副作用（连事件日志都不写），而 warm_model_meta 在 lookup_online == None
+    // 时写 1 条 Debug 事件；非预览计划仍预热（缓存已在预览时预热过亦无妨）。
     // M14-S7 §4.2：先把「内置表没覆盖的模型」的在线参数预热进缓存，再走同步的 plan。
     // best-effort：网络失败/超时只是没有参数行，预览照常出（失败不阻断投递）。
-    let _ = state.service.warm_model_meta(args.model.as_deref()).await;
+    if !args.preview_only.unwrap_or(false) {
+        let _ = state.service.warm_model_meta(args.model.as_deref()).await;
+    }
     // P2-8：投递前模型验证（静态配对 + 真实 /v1/models 探针），在计划阶段跑、
     // 写盘前可见。验证本身不使计划失败：结果随计划返回前端展示，硬拦项
     // （`blocks_delivery`）由前端禁用投递按钮、并由 apply 再探一次后执行；
@@ -1225,7 +1262,7 @@ pub async fn delivery_plan(
                     variant,
                 )
                 .map(|plan| codex_plan_dto(channel, plan, model_validation.clone()))
-                .map_err(|e| e.to_string());
+                .map_err(scrub_err);
         }
         return state
             .service
@@ -1237,7 +1274,7 @@ pub async fn delivery_plan(
                 variant,
             )
             .map(|plan| codex_plan_dto(channel, plan, model_validation))
-            .map_err(|e| e.to_string());
+            .map_err(scrub_err);
     }
     // 非 Codex 通道没有「保留 auth」这个概念：传 `true` 必须拒绝，
     // 不能静默忽略——忽略会让调用方以为「已保留」而实际没保留。
@@ -1249,13 +1286,13 @@ pub async fn delivery_plan(
             .service
             .delivery_preview_in(args.key_id, channel, args.model.as_deref(), source, variant)
             .map(|plan| single_plan_dto(plan, model_validation))
-            .map_err(|e| e.to_string());
+            .map_err(scrub_err);
     }
     state
         .service
         .delivery_plan_in_with_variant(args.key_id, channel, args.model.as_deref(), source, variant)
         .map(|plan| single_plan_dto(plan, model_validation))
-        .map_err(|e| e.to_string())
+        .map_err(scrub_err)
 }
 
 /// 投递预览的提示项。**不是错误**：投递照常可以做，只是用户该知道这件事。
@@ -1280,6 +1317,10 @@ fn delivery_warnings(target: &std::path::Path) -> Vec<String> {
 
 /// P1-7：预览模式下的写入口守门——`preview_only = true` 时任何写操作
 /// （同意授予 / 撤销、落盘）都直接拒绝，不得静默降级成普通调用。
+/// DEBUG-G7 P3-D4 层归属声明：本函数与 apply 的模型复核都是 **Tauri 命令层
+/// 门禁，不是核心层保证**——直接调核心服务 `apply_delivery_in*` / `delivery_plan_in*`
+/// 的调用方绕过这两道门（核心 apply 本身不查 preview_only、不跑模型验证）。
+/// 任何“核心层已拦住”的表述都是错的；门禁只对走 Tauri 命令的调用成立。
 fn reject_preview_write(args: &DeliveryArgs) -> Result<(), String> {
     if args.preview_only == Some(true) {
         return Err(
@@ -1296,7 +1337,7 @@ pub fn grant_consent(state: State<'_, AppState>, args: DeliveryArgs) -> Result<(
     state
         .service
         .grant_consent_with_variant(args.key_id, channel, args.target_variant.as_deref())
-        .map_err(|e| e.to_string())
+        .map_err(scrub_err)
 }
 
 #[tauri::command]
@@ -1306,7 +1347,7 @@ pub fn revoke_consent(state: State<'_, AppState>, args: DeliveryArgs) -> Result<
     state
         .service
         .revoke_consent_with_variant(args.key_id, channel, args.target_variant.as_deref())
-        .map_err(|e| e.to_string())
+        .map_err(scrub_err)
 }
 
 #[tauri::command]
@@ -1363,6 +1404,25 @@ pub async fn apply_delivery(
 ) -> Result<DeliveryOutcomeDto, String> {
     let channel = parse_channel(&args.channel)?;
     let mode = parse_delivery_mode(args.mode.as_deref())?;
+    // DEBUG-G7 P2-C9（B-282）：Codex 与 Claude Desktop 通道在整个服务 apply 期间
+    // 持 restart_op——服务层停写（写盘前停进程）与命令层重启（restart_agent 持
+    // 同一把锁）至此互斥；此前两者并发时重启可在停写后、写盘前把应用拉起来，
+    // 写盘随即被启动覆盖。其它通道不停进程，不持锁（不扩大锁范围）。
+    // DEBUG-G7 补齐 P2-C9：服务层 apply 本身亦持服务层写锁（见核心层
+    // `restart_write_op`），轮换直调服务层 apply 时同样受约束，重启命令亦持
+    // 同一把服务层锁；命令层锁仍保留作外层，两层锁序一致，无环。
+    // 死锁检查：restart 持锁期间只调核心重启（不调 apply）；apply 持锁期间只调
+    // 同步服务 apply（不调 Tauri 命令），无嵌套加锁环。
+    let _restart_op = if matches!(
+        channel,
+        tianshu_relay_core::delivery::DeliveryChannel::CodexAuthJson
+            | tianshu_relay_core::delivery::DeliveryChannel::CodexConfig
+            | tianshu_relay_core::delivery::DeliveryChannel::ClaudeDesktop
+    ) {
+        Some(state.restart_op.lock().await)
+    } else {
+        None
+    };
     let endpoint = match mode {
         tianshu_relay_core::delivery::DeliveryMode::Site => None,
         tianshu_relay_core::delivery::DeliveryMode::LocalGateway => {
@@ -1373,11 +1433,15 @@ pub async fn apply_delivery(
         Some(endpoint) => tianshu_relay_core::delivery::DeliverySource::Gateway(endpoint),
         None => tianshu_relay_core::delivery::DeliverySource::Site,
     };
+    // DEBUG-G7 P2-C9（B-286）：门禁先于预热——此前先 warm_model_meta 后
+    // reject_preview_write，preview_only 的拒绝路径仍先写了 1 条 Debug 事件，
+    // 违背预览模式“零副作用”契约（连事件日志都不写）。顺序调换后，拒绝
+    // 路径在任何副作用之前返回。
+    // P1-7：预览模式不得落盘（见 `reject_preview_write`）；变体随参数透传。
+    reject_preview_write(&args)?;
     // M14-S7 §4.2：同 `delivery_plan`——直接投递（没先预览）时也要拿到在线参数。
     // 缓存已在预览时预热过，这里通常是一次纯读；best-effort，失败不阻断。
     let _ = state.service.warm_model_meta(args.model.as_deref()).await;
-    // P1-7：预览模式不得落盘（见 `reject_preview_write`）；变体随参数透传。
-    reject_preview_write(&args)?;
     // P2-8：apply 前复核——plan 里看到的验证可能已过期（模型/端点换过），
     // 且直接投递根本没走过 plan；硬拦项（静态格式无效、探针 401、站点模式
     // 下模型不在非空目录）在这里再探一次并拒绝写盘，警告项不拦——网关模式
@@ -1410,7 +1474,7 @@ pub async fn apply_delivery(
                 variant,
             )
             .map(|outcome| codex_outcome_dto(channel, outcome))
-            .map_err(|e| e.to_string());
+            .map_err(scrub_err);
     }
     if args.preserve_auth == Some(true) {
         return Err("preserve_auth 只对 Codex 双文件投递有意义，该通道不支持保留".to_string());
@@ -1425,7 +1489,7 @@ pub async fn apply_delivery(
             variant,
         )
         .map(single_outcome_dto)
-        .map_err(|e| e.to_string())
+        .map_err(scrub_err)
 }
 
 /// 投递历史的一行（M9-S4）。字段语义见 `store::DeliveryHistoryRow`。
@@ -1473,7 +1537,7 @@ pub fn list_deliveries(
                 })
                 .collect()
         })
-        .map_err(|e| e.to_string())
+        .map_err(scrub_err)
 }
 
 #[tauri::command]
@@ -3808,6 +3872,20 @@ pub async fn detect_agents(
         .map_err(|error| format!("Agent 探测线程异常退出：{error}"))
 }
 
+/// Cline CLI 探针（DEBUG-G7 P2-C3，B-291 应用内路径之 ①）。
+///
+/// 只读检测：不写盘、不调 `cline auth`。返回找到与否、路径、版本与人话说明；
+/// “没找到”不等于“未安装”（见核心层 `probe_cline_cli` 的 note）。
+#[tauri::command]
+pub async fn cline_cli_probe(
+    state: State<'_, AppState>,
+) -> Result<tianshu_relay_core::agents::ClineCliProbe, String> {
+    let home = state.service.home().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || tianshu_relay_core::agents::probe_cline_cli(&home))
+        .await
+        .map_err(|error| format!("Cline CLI 探测线程异常退出：{error}"))
+}
+
 /// 检查 Agent 更新（M34-S1，**只读**）。
 ///
 /// 先跑既有的 `detect_agents`（blocking 线程池），再按去重后的更新源并发拉最新版本
@@ -5268,8 +5346,19 @@ async fn restart_agent(
     }
     // 串行化：两次重启不得交错（见 AppState::restart_op 的注释）。
     let _op = state.restart_op.lock().await;
+    // DEBUG-G7 补齐 P2-C9（B-282）：重启还要与服务层写盘共用服务层写锁——
+    // 轮换直调服务层 apply 时只持服务层锁、不经过命令层 restart_op，只靠
+    // 命令层锁拦不住“轮换停写后、写盘前重启拉起”。锁在阻塞线程里取（不得
+    // 在 async 上下文里取 std 锁）；中毒 ⇒ 拒绝重启（fail-closed）。锁序与
+    // apply 路径一致（命令层锁在外、服务层锁在内），无环。
+    let write_op = state.service.restart_write_op();
     // 核心重启是同步阻塞调用（轮询里 sleep），必须走 spawn_blocking，不得占 async 运行时。
-    tauri::async_runtime::spawn_blocking(move || tianshu_relay_core::restart::restart(target))
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = write_op
+            .lock()
+            .map_err(|_| "桌面通道写锁中毒：上一任写盘中异常，拒绝重启以免交错".to_string())?;
+        tianshu_relay_core::restart::restart(target).map_err(|e| e.to_string())
+    })
         .await
         .map_err(|e| format!("重启任务异常中断: {e}"))?
         .map(restart_outcome_dto)

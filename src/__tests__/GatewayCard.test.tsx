@@ -22,10 +22,14 @@ vi.mock("../lib/api", async (importOriginal) => {
     listStoredKeys: vi.fn(),
     listChannelBindings: vi.fn(),
     gatewayTokenList: vi.fn(),
+    deliveryPlan: vi.fn(),
+    applyDelivery: vi.fn(),
   };
 });
 
 import {
+  applyDelivery,
+  deliveryPlan,
   gatewayStatus,
   gatewayTokenList,
   listChannelBindings,
@@ -802,5 +806,53 @@ describe("DEBUG-G6 P2-F1 批量改指：下线与未知行分流", () => {
       b.textContent?.includes(zhCN.gateway.batch.applyBtnIdle),
     )!;
     expect(applyBtn.disabled).toBe(true);
+  });
+});
+
+describe("DEBUG-G7 P2-F3 批量改指：未映射行字符串预览即锁死执行", () => {
+  it("只勾未映射行 → 预览记字符串 → 执行禁用，且即使点执行也不会调 applyDelivery", async () => {
+    // 与上组 openBatch 同口径，但只留一条真正未知的行：安全门必须对“单条
+    // 未映射”也成立，不能只在“下线 + 未知混勾”时才禁用。
+    vi.mocked(gatewayStatus).mockResolvedValue(
+      status({
+        running: true,
+        phase: "running",
+        url: "http://127.0.0.1:8787",
+        site: "示例站",
+        tokenPersistent: true,
+      }),
+    );
+    vi.mocked(listChannelBindings).mockResolvedValue([
+      { bindingId: 9, agentId: "weird-old", keyId: 7, targetPath: "/home/u/.weird/config.json", siteId: 0 },
+    ]);
+    renderCard();
+    await waitFor(() => expect(phaseLine()?.dataset.gatewayPhase).toBe("running"));
+    const batchBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes(zhCN.gateway.batch.btn),
+    )!;
+    fireEvent.click(batchBtn);
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("/home/u/.weird/config.json"),
+    );
+    const label = Array.from(document.querySelectorAll("label")).find((l) =>
+      l.textContent?.includes("/home/u/.weird/config.json"),
+    )!;
+    fireEvent.click(label.querySelector<HTMLInputElement>("input[type=checkbox]")!);
+    const previewBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes(zhCN.gateway.batch.previewBtnIdle),
+    )!;
+    fireEvent.click(previewBtn);
+    // 预览是字符串（不是 DeliveryPlan）：这是锁死执行的判据本身。
+    await waitFor(() =>
+      expect(document.body.textContent).toContain(zhCN.gateway.batch.unmappedFull),
+    );
+    const applyBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes(zhCN.gateway.batch.applyBtnIdle),
+    )!;
+    expect(applyBtn.disabled).toBe(true);
+    // 纵深防御：即使绕过禁用点下执行，未映射行在 apply 侧也不走 applyDelivery。
+    fireEvent.click(applyBtn);
+    expect(vi.mocked(applyDelivery)).not.toHaveBeenCalled();
+    expect(vi.mocked(deliveryPlan)).not.toHaveBeenCalled();
   });
 });

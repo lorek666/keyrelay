@@ -89,8 +89,12 @@ fn vault_error(reason: impl Into<String>) -> Error {
 /// 打开已有密钥文件，或首次生成。
 ///
 /// **已存在但读不出来时绝不覆盖**：那意味着用户的密钥还在，只是当前环境解不开
+/// （DEBUG-G7 P2-K5：读之前先把已存在文件的权限**只收紧不放宽**
+/// 到 `mode & 0o600`——0644/0666 之类会收成 0600，0400 保持 0400 不放宽；
+/// Unix only，chmod 失败时 best-effort 继续、不阻断启动，见 `tighten_existing_file`）。
 pub fn load_or_create(path: &Path, machine: &dyn MachineId) -> Result<VaultKey> {
     if path.exists() {
+        tighten_existing_file(path);
         return read_existing(path, machine);
     }
 
@@ -356,6 +360,25 @@ fn set_file_private(path: &Path) -> Result<()> {
         .map_err(|e| vault_error(format!("设置密钥文件权限失败: {e}")))
 }
 
+/// DEBUG-G7 P2-K5：已存在文件的“只收紧不放宽”——新掩码 = 旧掩码 `& 0o600`，
+/// 只清组/其它位，绝不给属主加位（0400 保持 0400）。Unix only；非 Unix 为 no-op。
+/// chmod 失败时静默继续：收紧是纵深防御，不得因此阻断启动（创建路径仍硬报错，
+/// 见 `set_file_private` 的调用方）；正常 Unix 文件系统上每次 open 都会收紧到位。
+#[cfg(unix)]
+fn tighten_existing_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(path) {
+        let cur = meta.permissions().mode() & 0o777;
+        let tight = cur & 0o600;
+        if tight != cur {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(tight));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn tighten_existing_file(_path: &Path) {}
+
 #[cfg(not(unix))]
 fn set_file_private(_path: &Path) -> Result<()> {
     Ok(())
@@ -450,6 +473,34 @@ mod tests {
         }
         let second = load_or_create(&path, &m).unwrap();
         assert_eq!(first.dek.as_ref(), second.dek.as_ref());
+    }
+
+    #[test]
+    fn existing_file_permissions_are_only_tightened_never_widened() {
+        // DEBUG-G7 P2-K5：已存在文件 0644 → 0600；已是 0400 的只读文件保持 0400
+        // （不放宽到 0600）。root 下 chmod 仍生效，与运行身份无关。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = temp_dir();
+            let path = dir.path().join("vault.key");
+            let m = StaticMachineId(Some("machine-a".into()));
+            load_or_create(&path, &m).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            load_or_create(&path, &m).unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "0644 必须收紧到 0600"
+            );
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+            load_or_create(&path, &m).unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o400,
+                "0400 不得放宽"
+            );
+        }
     }
 
     #[test]

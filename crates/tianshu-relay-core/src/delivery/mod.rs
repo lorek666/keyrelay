@@ -250,7 +250,8 @@ impl DeliveryChannel {
     }
 }
 
-/// 投递后该 agent 是否需要重启才能读到新配置（PRD FR-4:137 / 章程 R-11：**只标注，不重启**）。
+/// 投递后该 agent 是否需要重启才能读到新配置（PRD FR-4:137 / 章程 R-11 现行裁定：
+/// **标注 + 用户确认后一键重启**；旧裁定“只标注、不重启”已被取代）。
 ///
 /// P2-3（后端半）：该通道的**落点文件里是否含 endpoint**。
 ///
@@ -2052,6 +2053,15 @@ pub fn resolve_for(
 
 /// 完整入口：`provider_id` / `model` 对 `OpenCode`、`OpenCodeJsonc` 两条通道生效；
 /// 其余通道忽略。
+///
+/// DEBUG-G7 P2-D8（文档级约定，不改行为）：服务层投递路径（`service.rs`
+/// `prepare_delivery` / `delivery_field_options`）**永远传默认 provider**
+/// （`DEFAULT_PROVIDER_ID`）。`resolve_for_binding` 允许调用方传自定义 provider，
+/// 但那只是换了写盘键里的 provider 段——整单校验的必填表（`expected_fields`）
+/// 必须由调用方用**同一 provider**的 `FieldSetOptions` 去算，否则校验会把自定义
+/// 键当“多出必填表外字段”误杀（或把默认键当缺失误报）。换言之：自定义 provider
+/// 不是“只传一个参数就能用”的开关，调用方必须自带匹配的选项；服务层不走这条路，
+/// 故服务层行为不变。
 ///
 /// `provider_id` 为空（trim 后）时**在这里就报错**，而不是等到 `plan()`：
 /// 调用方传空 provider 名是接线错误，早报比写到一个 `provider.""` 上强。

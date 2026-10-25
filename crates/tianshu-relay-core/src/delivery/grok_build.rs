@@ -70,7 +70,7 @@ impl DeliveryWriter for GrokBuildWriter {
 
     fn field_names(&self) -> Vec<String> {
         let mut names = vec![Self::FIELD_API_KEY.to_string()];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             names.push(Self::FIELD_BASE_URL.to_string());
         }
         if self.model.is_some() {
@@ -84,7 +84,7 @@ impl DeliveryWriter for GrokBuildWriter {
 
     fn fields(&self, api_key: &str) -> Vec<DeliveryField> {
         let mut fields = vec![masked_field(Self::FIELD_API_KEY, api_key)];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
         if let Some(m) = &self.model {
@@ -153,7 +153,7 @@ fn build_after(
             result.push_str("api_key = \"");
             result.push_str(api_key);
             result.push_str("\"\n");
-            if !base_url.is_empty() {
+            if !base_url.trim().is_empty() {
                 result.push_str("base_url = \"");
                 result.push_str(base_url);
                 result.push_str("\"\n");
@@ -210,7 +210,7 @@ fn replace_in_section(
     let lines: Vec<&str> = section.lines().collect();
     let mut out = String::with_capacity(section.len() + 64);
     let mut wrote_api_key = false;
-    let mut wrote_base_url = base_url.is_empty();
+    let mut wrote_base_url = base_url.trim().is_empty();
     let mut wrote_model = model.is_none();
     let mut wrote_context = meta.is_none() || model.is_none();
 
@@ -223,7 +223,7 @@ fn replace_in_section(
             wrote_api_key = true;
             continue;
         }
-        if !base_url.is_empty() && trimmed.starts_with("base_url") && trimmed.contains('=') {
+        if !base_url.trim().is_empty() && trimmed.starts_with("base_url") && trimmed.contains('=') {
             out.push_str("base_url = \"");
             out.push_str(base_url);
             out.push_str("\"\n");
@@ -265,7 +265,7 @@ fn replace_in_section(
         out.push_str(api_key);
         out.push_str("\"\n");
     }
-    if !wrote_base_url && !base_url.is_empty() {
+    if !wrote_base_url && !base_url.trim().is_empty() {
         out.push_str("base_url = \"");
         out.push_str(base_url);
         out.push_str("\"\n");

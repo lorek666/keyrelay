@@ -62,6 +62,11 @@ pub struct AppState {
     /// 重启是「停旧 → 拉新」的序列：两个并发重启交错时，第二个的退出请求可能杀掉
     /// 第一个刚拉起的新进程，随后两个都报成功、实际只剩一个旧进程——结果不可归因。
     /// 锁只串行化命令层入口，不跨进核心层（核心的轮询 sleep 在 `spawn_blocking` 里）。
+    ///
+    /// DEBUG-G7 P2-C9（B-282）：`apply_delivery` 对 Codex 与 Claude Desktop 通道
+    /// 也持这把锁走完整次服务 apply——服务层的停写锁（写盘前停进程）此前不经过
+    /// 这把锁，重启与投递并发时，重启可能在投递停写后、写盘前把应用拉起来，
+    /// 写盘随即被启动覆盖。持锁串行化后，apply 与 restart 互斥，不再交错。
     pub restart_op: tokio::sync::Mutex<()>,
     /// 托盘图标是否真的建起来了（M6-S5）。
     ///
@@ -601,6 +606,7 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::purge_keychain,
             commands::detect_unmanaged_targets,
             commands::detect_agents,
+            commands::cline_cli_probe,
             commands::gateway_token_create,
             commands::gateway_token_list,
             commands::gateway_token_revoke,

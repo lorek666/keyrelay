@@ -64,7 +64,7 @@ impl DeliveryWriter for MiMoCodeWriter {
     }
     fn field_names(&self) -> Vec<String> {
         let mut n = vec![format!("{}.{}", Self::PROVIDERS_KEY, Self::FIELD_API_KEY)];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             n.push(format!("{}.{}", Self::PROVIDERS_KEY, Self::FIELD_BASE_URL));
         }
         if self.model.is_some() {
@@ -86,7 +86,7 @@ impl DeliveryWriter for MiMoCodeWriter {
     }
     fn fields(&self, api_key: &str) -> Vec<DeliveryField> {
         let mut f = vec![masked_field(Self::FIELD_API_KEY, api_key)];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             f.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
         if let Some(m) = &self.model {
@@ -137,7 +137,7 @@ fn build_after(
         MiMoCodeWriter::FIELD_API_KEY.to_string(),
         Value::String(api_key.to_string()),
     );
-    if !base_url.is_empty() {
+    if !base_url.trim().is_empty() {
         entry.insert(
             MiMoCodeWriter::FIELD_BASE_URL.to_string(),
             Value::String(base_url.to_string()),
@@ -172,6 +172,16 @@ mod tests {
     }
     fn w(dir: &Path, b: &str) -> MiMoCodeWriter {
         MiMoCodeWriter::with_path(dir.join("c.json"), b)
+    }
+
+    #[test]
+    fn errors_never_echo_the_key() {
+        // DEBUG-G7 P2-K4：畸形旧文件 + 双 canary，见 codex_auth 同名用例。
+        let dir = tmp();
+        std::fs::write(w(dir.path(), BASE).path(), "{\"api_key\": \"CANARY-FILE-9x7z").unwrap();
+        let err = w(dir.path(), BASE).plan("CANARY-KEY-4k2m").unwrap_err();
+        assert!(!err.to_string().contains("CANARY-KEY-4k2m"), "{err}");
+        assert!(!err.to_string().contains("CANARY-FILE-9x7z"), "{err}");
     }
 
     #[test]

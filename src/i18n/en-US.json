@@ -617,6 +617,7 @@
       "agree": "I consent to writing the above key into this agent's config (backup is taken before write; rollback is available)",
       "agreeAll": "I have reviewed the diffs of all files above and consent to writing the above key into these configs (backup is taken before write; rollback is available)",
       "fileTitle": "File {index} of {total}",
+      "fileWarningsTitle": "Warnings for this file",
       "generating": "Generating preview…",
       "previewOnlyToggle": "Preview only (writes nothing, records nothing)",
       "previewOnlyBanner": "Preview-only mode: what follows is what would be written. Nothing was written to disk, no journal was recorded, no binding was created. Turn off preview-only to deliver.",
@@ -666,7 +667,8 @@
         "failClosed": "Before applying, the check runs again under the lock: an unreferenced credential is refused, so passing in preview does not guarantee passing at apply time (a profile edited in between is still blocked).",
         "referencingLabel": "Profiles referencing this credential:",
         "checkedLabel": "Profiles checked:",
-        "unreadableLabel": "Unreadable (not counted as references):"
+        "unreadableLabel": "Unreadable (not counted as references):",
+      "unreadableDirsLabel": "Directories that failed to scan (not “no profiles”; fix permissions and re-deliver):"
       }
     },
     "restartHint": {
@@ -820,7 +822,10 @@
       "applyAgreePre": "I understand this writes to the above file with ",
       "applyAgreeMid": " 0600 ",
       "applyAgreePost": " permissions, and a backup is taken first.",
-      "stopCodex": "Before writing, any running Codex will be stopped first (including terminal codex sessions and the desktop app): graceful quit first, forced kill if it is still running after the timeout. Delivery itself will not relaunch it for you—restart it from the restart section or its launch command after writing."
+      "stopCodex": "Before writing, any running Codex will be stopped first (including terminal codex sessions and the desktop app): graceful quit first, forced kill if it is still running after the timeout. Delivery itself will not relaunch it for you—restart it from the restart section or its launch command after writing.",
+      "stopClaudeDesktop": "Before writing, any running Claude Desktop will be stopped first (the desktop app only reads its config at startup, so writing while it runs may be overwritten on launch): graceful quit first, forced kill if it is still running after the timeout. Delivery itself will not relaunch it for you—restart it from the restart section after writing.",
+      "cliNotStopped": "This channel is CLI-based and will not be stopped before writing: if the tool is running, it may write its old config back on exit and overwrite this delivery. Quit it before confirming, and relaunch it afterwards to verify.",
+      "preserveAuth": "Keep the official login (only write config, leave auth.json untouched)"
     },
     "rollbackDialog": {
       "title": "Roll back this delivery",
@@ -845,8 +850,8 @@
       "alsoRevokePost": ": deleted on the site, programs using it elsewhere fail immediately)"
     },
     "notice": {
-      "delivered": "Delivered to {path} (change {journal}). {hint}",
-      "deliveredFiles": "Delivered to {paths} (change {journal}). {hint}",
+      "delivered": "Delivered to {path} (change {journal}). {hint} Action: {action}; source: {source}.",
+      "deliveredFiles": "Delivered to {paths} (change {journal}). {hint} Action: {action}; source: {source}.",
       "revoked": "Consent revoked. Written files won't auto-rollback—use the Change History page to restore.",
       "rolledBack": "Rolled back {journal}."
     },
@@ -1289,7 +1294,7 @@
     "keyHealthIntervalHint": "0 = probes disabled; otherwise probe with GET /v1/models every this many seconds so dead keys are flagged and removed early. Valid range is 60–86400 seconds; out-of-range input is clamped on blur. Probing spends upstream quota and is off by default. Applies the next time the gateway starts.",
     "keyHealthIntervalClamped": "Clamped to the valid range (0=off, or 60–86400 seconds).",
     "routingRulesLabel": "Per-agent routing rules (JSON, empty = no rules)",
-    "routingRulesHint": "Example: [{\"agentLabel\": \"codex\", \"siteIds\": [1, 2]}]. agentLabel must match the token label exactly (case-sensitive); a matched agent only uses the listed sites, an unmatched agent uses global weighting; empty = no rules. Invalid JSON is rejected on save. Applies the next time the gateway starts.",
+    "routingRulesHint": "Example: [{\"agentLabel\": \"codex\", \"siteIds\": [1, 2]}]. agentLabel must match the token label exactly (case-sensitive); a matched agent only uses the listed sites, an unmatched agent uses global weighting; empty = no rules. siteIds order only orders the failover tail, not the first pick: the first pick is still set by weighting/EWMA/probe, and the first siteId only means it is tried first after the first pick fails; a legacy token without a label is not restricted by any rule and still uses global weighting; Invalid JSON is rejected on save. Applies the next time the gateway starts.",
     "routingRulesAgent": "Agent",
     "routingRulesAgentPlaceholder": "Select an agent",
     "routingRulesSites": "Sites",
@@ -1336,7 +1341,19 @@
       "delistedPost": ")—Cline Desktop direct file writing is delisted and cannot be re-pointed here; use the cline auth CLI instead",
       "delistedFull": "Cline Desktop direct file writing is delisted and cannot be re-pointed here; use the cline auth CLI",
       "delistedApplyDetail": "Cline Desktop direct file writing is delisted and cannot be re-pointed here; use the cline auth CLI",
-      "delistedStrong": "Delisted channel"
+      "delistedStrong": "Delisted channel",
+      "stopCodex": "For Codex rows, any running Codex will be stopped before writing in this batch (restart it from the restart section or its launch command after writing; delivery will not relaunch it).",
+      "bundleMerged": "Executed together with the other row of the same bundle",
+      "clineProbeBtn": "Probing…",
+      "clineProbeBtnIdle": "Probe cline CLI",
+      "clineProbeBtnRetry": "Probe again",
+      "clineAuthCopy": "Copy cline auth command",
+      "clineAuthCopied": "Copied",
+      "clineAuthCommand": "cline auth -p openai -b <gateway-url> -k <key> -m <model>",
+      "clineAuthPlaceholderNote": "Replace every <…> part with your own values: <gateway-url> e.g. http://127.0.0.1:port/v1, <key> is the gateway token, <model> may be omitted. Never paste a real key anywhere public; pasting it into a shell keeps it in shell history.",
+      "clineProbeFound": "Found cline CLI: {path}, version {version}.",
+      "clineProbeVersionUnknown": "unknown",
+      "clineProbeNotFound": "No cline CLI found in the app's search scope."
     },
     "copyFail": "Copy failed ({error})—select the token text above manually.",
     "collectModelsLabel": "Collect site model catalog (for model-change notifications and multi-site routing)",

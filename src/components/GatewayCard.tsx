@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Copy, Play, RefreshCw, Square } from "lucide-react";
 import {
   channelOfBinding,
+  clineCliProbe,
   isDelistedBindingAgent,
   deliveryPlan,
   gatewayRotateToken,
@@ -17,6 +18,7 @@ import {
   listStoredKeys,
   applyDelivery,
   type ChannelBinding,
+  type ClineCliProbe,
   type DeliveryPlan,
   type GatewayStatus,
   type CreatedGatewayToken as GatewayTokenCreated,
@@ -515,6 +517,17 @@ export default function GatewayCard({
   /** 每条候选的勾选状态，key 是**绑定行 id**（`binding.bindingId` 的字符串形式）。 */
   const [batchPicked, setBatchPicked] = useState<Record<string, boolean>>({});
   /**
+   * DEBUG-G7 P2-C3：Cline CLI 探针结果（下线行用）。重新检测即再跑一次探针；
+   * 探针只检测、不写盘，真正的改指走下方可复制命令（用户在终端自己跑）。
+   */
+  const [clineProbe, setClineProbe] = useState<ClineCliProbe | null>(null);
+  const [clineProbeCopied, setClineProbeCopied] = useState(false);
+  const clineProbeMutation = useMutation({
+    mutationFn: clineCliProbe,
+    onSuccess: (probe) => setClineProbe(probe),
+    onError: (err: Error) => setError(err.message),
+  });
+  /**
    * 逐条预览的结果（硬约束 1）。key 同上；值是后端给的**已脱敏 diff**与提示项。
    *
    * 为什么要单独一步：预览的结果必须**显示给人看**才叫「逐条预览」。
@@ -597,6 +610,10 @@ export default function GatewayCard({
   const batchPreview = useMutation({
     mutationFn: async () => {
       const out: Record<string, DeliveryPlan | string> = {};
+      // DEBUG-G7 P2-C5（B-275）：按 bundle 去重——Codex 的 auth + config 两行是
+      // 同一个双文件单（同一 key），只问一次后端；第二行复用第一行的计划
+      // （Codex 计划本身含两文件，预览合并显示 files），不得调两次 deliveryPlan。
+      const bundleFirstKey = new Map<string, string>();
       for (const { binding, channel, delisted, key } of batchCandidates) {
         if (!batchPicked[key]) continue;
         if (channel === null) {
@@ -607,6 +624,16 @@ export default function GatewayCard({
             : t("gateway.batch.unmappedFull");
           continue;
         }
+        const bundleKey =
+          channel === "codex-auth-json" || channel === "codex-config"
+            ? `codex:${binding.keyId}`
+            : key;
+        const firstKey = bundleFirstKey.get(bundleKey);
+        if (firstKey !== undefined) {
+          out[key] = out[firstKey];
+          continue;
+        }
+        bundleFirstKey.set(bundleKey, key);
         try {
           out[key] = await deliveryPlan({
             keyId: binding.keyId,
@@ -627,6 +654,9 @@ export default function GatewayCard({
   const batchApply = useMutation({
     mutationFn: async () => {
       const results: { label: string; ok: boolean; detail: string }[] = [];
+      // DEBUG-G7 P2-C5：与预览同口径的 bundle 去重——同 bundle 第二行不调
+      // applyDelivery，复用第一行的结果（合并执行），不得写两次。
+      const bundleResult = new Map<string, { ok: boolean; detail: string }>();
       for (const { binding, channel, delisted, key } of batchCandidates) {
         if (!batchPicked[key]) continue;
         if (channel === null) {
@@ -639,6 +669,19 @@ export default function GatewayCard({
           });
           continue;
         }
+        const bundleKey =
+          channel === "codex-auth-json" || channel === "codex-config"
+            ? `codex:${binding.keyId}`
+            : key;
+        const prior = bundleResult.get(bundleKey);
+        if (prior !== undefined) {
+          results.push({
+            label: `${binding.agentId} → ${binding.targetPath}`,
+            ok: prior.ok,
+            detail: t("gateway.batch.bundleMerged"),
+          });
+          continue;
+        }
         const label = `${binding.agentId} → ${binding.targetPath}`;
         try {
           // 预览已经在下面那步做给用户看过了（`batchPreviews`）；这里直接写。
@@ -648,10 +691,13 @@ export default function GatewayCard({
             channel,
             mode: "gateway",
           });
+          bundleResult.set(bundleKey, { ok: true, detail: t("gateway.batch.appliedOk") });
           results.push({ label, ok: true, detail: t("gateway.batch.appliedOk") });
         } catch (err) {
           // 失败不中断：记录原因，继续下一条（硬约束 3）
-          results.push({ label, ok: false, detail: (err as Error).message });
+          const detail = (err as Error).message;
+          bundleResult.set(bundleKey, { ok: false, detail });
+          results.push({ label, ok: false, detail });
         }
       }
       return results;
@@ -1148,6 +1194,58 @@ export default function GatewayCard({
                   {channel === null && delisted ? (
                     <>
                       {t("gateway.batch.delistedPre")}{binding.targetPath}{t("gateway.batch.delistedPost")}
+                      {/* DEBUG-G7 P2-C3：下线行的应用内路径——① PATH 检测（探针按钮，
+                          点一次跑一次，可重复点）+ ② 可复制 cline auth 命令（密钥与模型
+                          位均为占位符，用户自行替换；粘真实密钥进 shell 会留 history）。
+                          直写不在本组范围，不给第三条“重新投递”入口。 */}
+                      <span className="row">
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={clineProbeMutation.isPending}
+                          onClick={(e) => {
+                            e.preventDefault();
+                            clineProbeMutation.mutate();
+                          }}
+                        >
+                          {clineProbeMutation.isPending
+                            ? t("gateway.batch.clineProbeBtn")
+                            : clineProbe === null
+                              ? t("gateway.batch.clineProbeBtnIdle")
+                              : t("gateway.batch.clineProbeBtnRetry")}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn"
+                          onClick={async (e) => {
+                            e.preventDefault();
+                            try {
+                              await navigator.clipboard.writeText(
+                                t("gateway.batch.clineAuthCommand"),
+                              );
+                              setClineProbeCopied(true);
+                            } catch (err) {
+                              setError(t("gateway.copyFail", { error: (err as Error).message }));
+                            }
+                          }}
+                        >
+                          <Copy size={14} aria-hidden /> {t("gateway.batch.clineAuthCopy")}
+                        </button>
+                        {clineProbeCopied ? <span className="muted">{t("gateway.batch.clineAuthCopied")}</span> : null}
+                      </span>
+                      {clineProbe !== null ? (
+                        <span className="muted">
+                          {clineProbe.found
+                            ? t("gateway.batch.clineProbeFound", {
+                                path: clineProbe.path ?? "",
+                                version: clineProbe.version ?? t("gateway.batch.clineProbeVersionUnknown"),
+                              })
+                            : t("gateway.batch.clineProbeNotFound")}{" "}
+                          {clineProbe.note}
+                        </span>
+                      ) : null}
+                      <span className="mono">{t("gateway.batch.clineAuthCommand")}</span>
+                      <span className="muted">{t("gateway.batch.clineAuthPlaceholderNote")}</span>
                     </>
                   ) : channel === null ? (
                     <>
@@ -1165,6 +1263,11 @@ export default function GatewayCard({
                         keyId: binding.keyId,
                         site: site ? ` · ${site.displayName}` : "",
                       })}
+                      {/* DEBUG-G7 P2-6-1：批量路径的停 Codex 提示（只 Codex 通道）——
+                          与 Agents 页 Group 6 的提示同口径：写盘前会先停 Codex。 */}
+                      {channel === "codex-auth-json" || channel === "codex-config" ? (
+                        <span className="muted"> {t("gateway.batch.stopCodex")}</span>
+                      ) : null}
                     </>
                   )}
                 </span>
@@ -1197,6 +1300,10 @@ export default function GatewayCard({
                         <strong>{plan.mode === "gateway" ? t("gateway.batch.previewModeGateway") : t("gateway.batch.previewModeSite")}</strong>
                         {plan.warnings.length > 0 ? t("gateway.batch.previewWarnings", { count: plan.warnings.length }) : ""}
                       </p>
+                      {/* DEBUG-G7 P2-6-1：预览块的停 Codex 提示（只 Codex 通道）。 */}
+                      {planOf(key).channel === "codex-auth-json" || planOf(key).channel === "codex-config" ? (
+                        <p className="muted">{t("gateway.batch.stopCodex")}</p>
+                      ) : null}
                       {/* 与投递页同一处理（P2-5）：删除行的旧值不渲染出来 */}
                       <pre className="mono">
                         {maskRemovedValues(plan.preview, t("agents.plan.removedValueMasked"))}
@@ -1208,6 +1315,15 @@ export default function GatewayCard({
             </div>
           ) : null}
 
+          {/* DEBUG-G7 P2-6-1：执行区的停 Codex 提示——勾选且已预览的 Codex 行存在时出现。 */}
+          {batchCandidates.some(
+            ({ channel, key }) =>
+              (channel === "codex-auth-json" || channel === "codex-config") &&
+              batchPicked[key] &&
+              key in batchPreviews,
+          ) ? (
+            <p className="muted">{t("gateway.batch.stopCodex")}</p>
+          ) : null}
           <div className="row">
             <button
               type="button"

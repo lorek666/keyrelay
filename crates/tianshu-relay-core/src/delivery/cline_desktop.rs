@@ -104,7 +104,7 @@ impl DeliveryWriter for ClineDesktopWriter {
             Self::PROVIDER_ID,
             Self::FIELD_API_KEY
         )];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             names.push(format!(
                 "{}.{}.{}",
                 Self::PROVIDERS_KEY,
@@ -139,7 +139,7 @@ impl DeliveryWriter for ClineDesktopWriter {
 
     fn fields(&self, api_key: &str) -> Vec<DeliveryField> {
         let mut fields = vec![masked_field(Self::FIELD_API_KEY, api_key)];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
         if let Some(m) = &self.model {
@@ -203,7 +203,7 @@ fn build_after(
         ClineDesktopWriter::FIELD_API_KEY.to_string(),
         Value::String(api_key.to_string()),
     );
-    if !base_url.is_empty() {
+    if !base_url.trim().is_empty() {
         settings.insert(
             ClineDesktopWriter::FIELD_BASE_URL.to_string(),
             Value::String(base_url.to_string()),

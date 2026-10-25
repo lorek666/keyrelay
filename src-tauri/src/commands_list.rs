@@ -56,6 +56,8 @@ pub const COMMANDS: &[&str] = &[
     "detect_unmanaged_targets",
     // M31-S1：Agent 安装/版本发现（只读）
     "detect_agents",
+    // DEBUG-G7 P2-C3：Cline CLI 探针（只读；与 detect_agents 同批只读命令）
+    "cline_cli_probe",
     // M43-S1：Agent 网关令牌
     "gateway_token_create",
     "gateway_token_list",

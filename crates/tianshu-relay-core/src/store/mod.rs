@@ -930,6 +930,30 @@ fn map_gateway_token_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GatewayTok
     })
 }
 
+/// DEBUG-G7 P2-K5：Unix 上把 DB 文件（及 WAL 附属文件，若存在）权限只收紧
+/// 不放宽（`mode & 0o600`）。best-effort：任一 chmod 失败都不阻断打开。
+#[cfg(unix)]
+fn tighten_db_files(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut candidates = vec![path.to_path_buf()];
+    if let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) {
+        candidates.push(path.with_file_name(format!("{name}-wal")));
+        candidates.push(path.with_file_name(format!("{name}-shm")));
+    }
+    for candidate in candidates {
+        if let Ok(meta) = std::fs::metadata(&candidate) {
+            let cur = meta.permissions().mode() & 0o777;
+            let tight = cur & 0o600;
+            if tight != cur {
+                let _ = std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(tight));
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn tighten_db_files(_path: &Path) {}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_budget(path, WAL_LOCK_BUDGET)
@@ -943,6 +967,10 @@ impl Store {
         }
         let conn =
             Connection::open(path).map_err(|e| Error::Store(format!("打开数据库失败: {e}")))?;
+        // DEBUG-G7 P2-K5：Unix 上每次打开都把库文件权限只收紧不放宽
+        // （`mode & 0o600`，含 -wal / -shm 若存在）；best-effort，不阻断打开。
+        // 非 Unix 分支无实跑环境，记为阻塞、不伪造（见提交说明）。
+        tighten_db_files(path);
         // **忙等超时**（M16-S1 / P3-1 的另一半）：并发首次打开同一个库时
         // （多进程 / 多线程），建表与其它语句都要拿写锁——不设忙等的话，
         // 另一个连接正在建表就会立刻 `database is locked`，`Store::open` 失败。
@@ -3550,6 +3578,32 @@ mod tests {
     use super::*;
     use crate::inject::JournalEntry;
     use std::path::PathBuf;
+
+    #[test]
+    fn open_tightens_existing_db_file_permissions_unix_only() {
+        // DEBUG-G7 P2-K5：已存在库文件 0644 → 0600（只收紧）。
+        // 不测 0400 重开：SQLite 以读写打开只读库本身就会失败，那是另一条路径，
+        // 与收紧掩码（0400 & 0600 = 0400，不放宽）无关；掩码不放宽由 keyfile
+        // 同名用例覆盖（读路径可测）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().expect("临时目录");
+            let path = dir.path().join("tianshu-relay.db");
+            {
+                let _store = Store::open(&path).expect("首次建库");
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            {
+                let _store = Store::open(&path).expect("重新打开");
+            }
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "0644 必须收紧到 0600"
+            );
+        }
+    }
 
     #[test]
     fn migrate_adds_new_tables_to_an_existing_database() {

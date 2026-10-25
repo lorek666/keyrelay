@@ -51,6 +51,7 @@
     "allow-purge-keychain",
     "allow-detect-unmanaged-targets",
     "allow-detect-agents",
+    "allow-cline-cli-probe",
     "allow-gateway-token-create",
     "allow-gateway-token-list",
     "allow-gateway-token-revoke",

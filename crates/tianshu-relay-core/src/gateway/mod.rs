@@ -212,6 +212,8 @@ pub(crate) struct AttemptMeta {
     /// send → 响应头（TTFB）。
     pub latency_ms: u64,
     /// 本次请求成功前的尝试次数（1 = 第一次就成功）。
+    /// DEBUG-G7 P3-G3：与 `GatewayUsage.attempts` 同口径——候选序号，不是实际
+    /// 发送次数（本地拒绝的候选占序号、不占 `attempts_made`）。
     pub attempts: u32,
 }
 
@@ -229,6 +231,13 @@ fn unix_now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// DEBUG-G7 P2-G5/K2/K3 统一标记（不得凭空估算用量记账）：
+/// 流式响应以 2xx 结束却**从未见到 usage 事件**时，上游可能已对已生成内容计费，
+/// 本地却没有用量行——对账与预算会系统性低估。标记只说“可能已计费、本地无行”，
+/// 绝不反推 token 数补记。非流式无 usage 不发此标记（常只是上游不报 usage，
+/// 不是断开形态）；非 2xx 也不发（失败路径已有 GatewayFailure 行）。
+pub const MAYBE_BILLED_NO_USAGE_ROW: &str = "可能已计费未入账：本地无用量行";
+
 /// 一次响应的用量采集器（M40-S1）。
 ///
 /// 职责：
@@ -239,6 +248,10 @@ fn unix_now_secs() -> i64 {
 /// 3. 只把 [`GatewayUsage`] 交给 `sink`（内存 push，不做 IO、不 panic）。
 pub(crate) struct UsageCapture {
     sink: Option<Arc<dyn Fn(GatewayUsage) + Send + Sync>>,
+    /// DEBUG-G7 P2-G5/K2：流式 2xx 无 usage 时的“可能已计费”标记出口（生产接
+    /// `state.config.on_failure`，与失败事件同一通道；测试可注入计数闭包）。
+    /// 不改 `new` 签名（测试调用点多），用 `with_maybe_billed_sink` 挂接。
+    maybe_billed_sink: Option<Arc<dyn Fn(GatewayFailure) + Send + Sync>>,
     /// 时钟注入：生产 = [`unix_now_secs`]；测试 = 固定/递增。
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
     site_id: i64,
@@ -280,6 +293,7 @@ impl UsageCapture {
     ) -> Self {
         Self {
             sink,
+            maybe_billed_sink: None,
             now,
             site_id,
             key_id,
@@ -303,6 +317,15 @@ impl UsageCapture {
     pub(crate) fn with_identity(mut self, token_id: Option<i64>, agent_label: String) -> Self {
         self.token_id = token_id;
         self.agent_label = agent_label;
+        self
+    }
+
+    /// DEBUG-G7 P2-G5/K2：挂接“可能已计费未入账”标记出口。
+    pub(crate) fn with_maybe_billed_sink(
+        mut self,
+        sink: Option<Arc<dyn Fn(GatewayFailure) + Send + Sync>>,
+    ) -> Self {
+        self.maybe_billed_sink = sink;
         self
     }
 
@@ -364,6 +387,20 @@ impl UsageCapture {
             extract_usage_from_json(&self.body)
         };
         let Some((prompt_tokens, completion_tokens, total_tokens)) = usage else {
+            // DEBUG-G7 P2-G5/K2：流式 2xx 结束却无 usage 事件——正常结束、流错误、
+            // 客户端断开（Drop）三路都走到这里；发统一标记，不补记用量。
+            if self.stream && (200..300).contains(&self.status) {
+                if let Some(sink) = &self.maybe_billed_sink {
+                    sink(GatewayFailure {
+                        site_id: self.site_id,
+                        status: self.status,
+                        model: self.model.clone(),
+                        reason: format!(
+                            "{MAYBE_BILLED_NO_USAGE_ROW}（流式响应结束时未见 usage 事件；上游可能已对已生成内容计费）"
+                        ),
+                    });
+                }
+            }
             return;
         };
         if let Some(sink) = &self.sink {
@@ -559,6 +596,9 @@ pub struct GatewayConfig {
     /// M46-S4：每请求最多尝试的候选数。`0` = 走全部候选（今天行为）；`>0` 则截断
     /// （只计实际发出去的上游尝试，本地保护拒绝的候选不计；见代理循环）。
     /// 下次启动网关生效（与 `lb_top_n` / `guard_policy` 同口径）。
+    /// DEBUG-G7 P3-G4：本文件无总请求时限——`0`（默认）时 429 / 连接层失败链上
+    /// 各候选的读超时串行叠加，最坏总耗时 = 候选数 × 单候选超时；需要封顶时
+    /// 配非零 `max_attempts`。默认值不动（改默认会改变既有重试语义）。
     pub max_attempts: usize,
     /// M39-S3 §4.2：每站并发/限速策略。
     pub guard_policy: SiteGuardPolicy,
@@ -749,6 +789,9 @@ pub struct GatewayUsage {
     /// 从发起 send 到**收到响应头**的耗时（TTFB，首字节时间；不是总耗时）。
     pub latency_ms: u64,
     /// 本次请求成功前尝试过的上游次数（1 = 第一次就成功；失败切换后成功 = 命中的候选序号）。
+    /// DEBUG-G7 P3-G3：这是**候选序号（1-based ordinal）**，不是实际发送次数——
+    /// 本地保护拒绝的候选不占一次发送（`attempts_made` 才计实际发送），但占一个序号。
+    /// 两数混读会把“本地拒绝也算一次上游尝试”读进对账。
     pub attempts: u32,
     /// 响应是否为 SSE。
     pub stream: bool,
@@ -980,11 +1023,16 @@ impl GatewayConfig {
     ///
     /// `runtime == None`（`single_upstream` / 既有测试）⇒ 借用静态配置，行为与今天逐字相同。
     /// 锁中毒时退回静态配置：可用性优先，而且「快照读不出来」不该让每个请求 500。
+    /// DEBUG-G7 P3-G1：中毒路径打一条日志——此前静默回落，热更新失效会被读成
+    /// “配置本来就是旧的”；与本文件其它中毒路径的 eprintln 口径一致。
     pub fn view(&self) -> RouteView<'_> {
         match &self.runtime {
             Some(runtime) => match runtime.read() {
                 Ok(guard) => RouteView::Snapshot(Arc::clone(&guard)),
-                Err(_) => RouteView::Static(self),
+                Err(_) => {
+                    eprintln!("gateway: 路由快照读锁中毒，退回静态配置（热更新可能已失效）");
+                    RouteView::Static(self)
+                }
             },
             None => RouteView::Static(self),
         }
@@ -1134,6 +1182,13 @@ pub struct SiteMetrics {
     /// M46-S2：成功请求的 TTFB 的 EWMA（毫秒，alpha 0.2）。
     /// `None` = 尚无成功样本（选路回退静态延迟；不是「实测 0ms」）。
     pub ewma_latency_ms: Option<f64>,
+    /// DEBUG-G7 补齐 P2-G1：上一次成功样本写入 EWMA 的 unix 秒（与
+    /// `last_error_at` 同口径）。选路只认 600 秒内的 EWMA（见
+    /// `EWMA_STALE_AFTER_SECS`）：陈旧的“快”值过期后回退静态延迟，
+    /// 已变慢的站不再凭过期快值长期占优；被挤出窗口的站若静态延迟
+    /// 仍慢，过期后仍进不了窗口、拿不到新样本——那一半自纠正未解，
+    /// 需窗口轮换/探针另立项，不得谎称 TTL 已闭合它。
+    pub ewma_latency_at_secs: Option<i64>,
     pub last_status: Option<u16>,
     /// 已 `scrub` 且截断到 200 字符。
     pub last_error: Option<String>,
@@ -1220,7 +1275,23 @@ impl QpsRing {
     }
 }
 
-/// 网关实例的内存指标（M40-S2 §4.1）。
+/// DEBUG-G7 补齐 P2-G1：EWMA 陈旧阈值（秒）。与探针在飞 TTL（600s，
+/// `routing::PROBE_IN_FLIGHT_TTL`）同量级、取同一值纯为口径一致，
+/// 不是由它推导出的：600 秒无成功样本的站，其延迟画像已不可信，
+/// 选路与快照都应把它当成“无 EWMA”而非继续用旧值排序。
+/// 按（站点，模型）分键未做（改动面：快照键类型、选路闭包签名、
+/// 全部网关 EWMA 用例；本项取改动最小的 TTL 路线，见提交说明）。
+pub const EWMA_STALE_AFTER_SECS: i64 = 600;
+
+/// 判断一条 EWMA 是否已陈旧（选路与快照共用同一判据，不得分叉）。
+/// 无时间戳的条目视为新鲜：时间戳只由 `record_measured_latency` 写，
+/// 与 EWMA 成对出现；缺失时间戳只可能是旧内存态，路由提示层 fail-open。
+fn ewma_is_stale(metrics: &SiteMetrics, now_unix_secs: i64) -> bool {
+    match metrics.ewma_latency_at_secs {
+        None => false,
+        Some(at) => now_unix_secs.saturating_sub(at) > EWMA_STALE_AFTER_SECS,
+    }
+}
 ///
 /// **红线**：只以 `site_id`（数字）为键；不含 token / key_ref / base_url / display_name。
 /// **不写事件表**：本结构里没有任何 `log()` / 存储层调用。
@@ -1284,16 +1355,27 @@ impl GatewayMetrics {
         if let Ok(mut map) = self.per_site.lock() {
             let e = map.entry(site_id).or_default();
             e.ewma_latency_ms = Some(ewma_update(e.ewma_latency_ms, latency_ms));
+            e.ewma_latency_at_secs = Some(now_unix_secs());
         }
     }
 
     /// M46-S2：选路用的每站 EWMA 快照（只有 `Some` 的站进 map）。
     /// 锁中毒 ⇒ 空 map（选路退化为静态顺序）。
+    /// DEBUG-G7 补齐 P2-G1：陈旧条目（超 `EWMA_STALE_AFTER_SECS` 未更新）
+    /// 不进 map——选路回退该站静态延迟，而非继续用过期快值。
     fn ewma_latency_map(&self) -> std::collections::BTreeMap<i64, f64> {
+        self.ewma_latency_map_at(now_unix_secs())
+    }
+
+    /// 可注入时刻的版本（单测用真实时钟无法等 600 秒，故拆出来）。
+    fn ewma_latency_map_at(&self, now_unix_secs: i64) -> std::collections::BTreeMap<i64, f64> {
         self.per_site
             .lock()
             .map(|map| {
                 map.iter()
+                    .filter(|(_, metrics)| {
+                        metrics.ewma_latency_ms.is_some() && !ewma_is_stale(metrics, now_unix_secs)
+                    })
                     .filter_map(|(site_id, metrics)| metrics.ewma_latency_ms.map(|v| (*site_id, v)))
                     .collect()
             })
@@ -1326,7 +1408,16 @@ impl GatewayMetrics {
 
     fn snapshot(&self) -> GatewayMetricsSnapshot {
         let by_status = self.by_status.lock().map(|m| m.clone()).unwrap_or_default();
-        let per_site = self.per_site.lock().map(|m| m.clone()).unwrap_or_default();
+        let mut per_site = self.per_site.lock().map(|m| m.clone()).unwrap_or_default();
+        // DEBUG-G7 补齐 P2-G1：快照 TTL 贯通——与选路同一判据，陈旧 EWMA
+        // 在快照里置 None（时间戳保留，调用方可据此判断“上次样本是何时”），
+        // 快照消费者不得再把过期值当成当前延迟画像。
+        let now = now_unix_secs();
+        for metrics in per_site.values_mut() {
+            if metrics.ewma_latency_ms.is_some() && ewma_is_stale(metrics, now) {
+                metrics.ewma_latency_ms = None;
+            }
+        }
         let qps = self.qps.lock().map(|r| r.qps()).unwrap_or(0.0);
         GatewayMetricsSnapshot {
             uptime_secs: self.started_at.elapsed().as_secs(),
@@ -1690,6 +1781,10 @@ fn client_for_timeout(state: &AppState, timeout: UpstreamTimeout) -> reqwest::Cl
             return client;
         }
     }
+    // DEBUG-G7 P3-G2：分站客户端建失败（或缓存锁中毒）时静默回落全局客户端——
+    // 此前无任何日志，分站超时失效会被读成“分站超时本来就没生效”。
+    // 回落本身不变（可用性优先），只补一条警告。
+    eprintln!("gateway: 分站超时客户端获取失败，回落全局客户端（分站超时未生效）");
     state.upstream.clone()
 }
 
@@ -2308,8 +2403,16 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     //
     // 判定顺序（spec §4.2）：非该路径 → 空路由（走 legacy）→ 目录为空（回退到既有透传）→ 聚合。
     // 目录为空时的「旧透传」= 落到下面的 ④（`all_candidates()` 的第一个），与加本分支之前逐字一致。
+    //
+    // DEBUG-G7 P2-G4：聚合分支同样过规则过滤（按请求令牌的 label）。过滤后为空时
+    // 不返回空列表——落到正常路径（规则内站点透传，或规则内无候选时走规则 404），
+    // 而不是用“空列表”掩盖“规则内无模型”。
     if method == axum::http::Method::GET && path == "/v1/models" && !view.route().is_empty() {
-        let models = view.route().available_models();
+        let allowed = crate::routing::routing_allowed_sites(
+            &state.config.routing_rules,
+            &identity.label.clone().unwrap_or_default(),
+        );
+        let models = view.route().available_models_for_sites(allowed);
         if !models.is_empty() {
             return models_list_response(&models);
         }
@@ -2413,6 +2516,8 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         // 命中规则但规则内无此模型候选（规则站点不在路由内，或不服务该模型）：
         // kind 与既有 404 分支相同，不新造错误码；文案点名路由规则，
         // 让客户端能把它与全局 404 区分开。
+        // DEBUG-G7 P3-G5 已核对：错误码刻意保持 `model_not_found` 不变（客户端
+        // 可能按码分流），文案里的路由规则限定语就是区分信号，不另立码。
         return local_error(
             StatusCode::NOT_FOUND,
             GatewayErrorKind::InvalidRequest,
@@ -2530,6 +2635,8 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     // DELIVERY-P2-10：命中路由规则时，备用顺序按规则 `siteIds` 数组顺序重排。
     // 只动首选之后的尾巴：首选仍是加权轮转 / EWMA / 探针定出的那一个（探针优先
     // 的恢复语义不动）；未命中规则（`allowed` 为 `None`）时不重排，行为与今天相同。
+    // DEBUG-G7 P2-G2：界面文案里的“优先级”即此处的尾巴顺序，不是首选顺序——
+    // 把某站排在 `siteIds` 首位不会让它成为首选，只会让首选失败后先试它。
     // 这里不增删候选——规则过滤已把候选集限定在规则内，优先级只改尝试顺序，
     // 不把用户没配过的站点拉进来；未列出的站点排在已列出之后、保持原顺序
     // （见 `reorder_failover_tail`）。把优先级提升为主用选择（首选也按规则顺序）
@@ -2621,6 +2728,9 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         // M39-S3 §4.2 / §4.5：**本地保护在发请求之前**——`try_admit` 绝不等待，
         // 拿不到就切下一个候选。**本地拒绝不是上游故障**：不调 `report_failure`、
         // 不喂熔断、不写 `GatewayFailure`（否则一个本机限流就能把好站点熔断）。
+        // DEBUG-G7 P3-D2：因此这里的 `continue` 是发送前跳过、不是上游失败切换——
+        // “只在 429 / 连接层失败时切换候选”的表述不涵盖它（它连一次发送都没发生）；
+        // 下方 M40-S2 的 `record_failover` 只是切换计数口径，不代表它是上游故障切换。
         // guard 表锁中毒 ⇒ `None`：放行（可用性优先，行为与没有保护层时相同）。
         let lease: Option<SiteLease> = match site_guard(&state, upstream.site_id)
             .map(|guard| guard.try_admit(Instant::now()))
@@ -2689,7 +2799,10 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                     let reason = if replayable {
                         format!("上游返回 HTTP {status}（限流：未进入处理，已切下一个候选）")
                     } else {
-                        format!("上游返回 HTTP {status}（可能已计费，按 P2-13 不重放）")
+                        // DEBUG-G7 P2-K3：与 G5/K2 同一标记口径——5xx 等不重放失败
+                        // 只留 GatewayFailure 行、无用量行时，“可能已计费”必须显性
+                        // 带上“本地无行”半句，否则对账侧看不出这行对应着缺失的用量。
+                        format!("上游返回 HTTP {status}（可能已计费，按 P2-13 不重放；{MAYBE_BILLED_NO_USAGE_ROW}）")
                     };
                     report_failure(
                         &state,
@@ -2782,8 +2895,10 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                         crate::redact::scrub(&message)
                     )
                 } else {
+                    // DEBUG-G7 P2-K3：Ambiguous / 读超时类失败同上——统一标记口径，
+                    // 不另立第二套标记。
                     format!(
-                        "传输层失败（请求可能已送达，按 P2-13 不重放）: {}",
+                        "传输层失败（请求可能已送达，按 P2-13 不重放；{MAYBE_BILLED_NO_USAGE_ROW}）: {}",
                         crate::redact::scrub(&message)
                     )
                 };
@@ -3298,6 +3413,8 @@ async fn maybe_translate_response(
 /// `at` 取任务结束时刻（与 `GatewayUsage.at`「流结束或被客户端断开的那一刻」一致）。
 struct StreamUsageFlush {
     sink: Option<std::sync::Arc<dyn Fn(GatewayUsage) + Send + Sync>>,
+    /// DEBUG-G7 P2-G5/K2：与 UsageCapture 同口径的“可能已计费”标记出口。
+    maybe_billed_sink: Option<std::sync::Arc<dyn Fn(GatewayFailure) + Send + Sync>>,
     site_id: i64,
     key_id: Option<i64>,
     model: String,
@@ -3327,6 +3444,19 @@ impl Drop for StreamUsageFlush {
                 token_id: self.token_id,
                 agent_label: self.label.clone(),
             });
+        } else if self.pending.is_none() && (200..300).contains(&self.status) {
+            // DEBUG-G7 P2-G5/K2：流式翻译任务结束（正常、错误、客户端断开）时
+            // 仍无 pending usage——与 UsageCapture 同一标记口径，不补记用量。
+            if let Some(sink) = &self.maybe_billed_sink {
+                sink(GatewayFailure {
+                    site_id: self.site_id,
+                    status: self.status,
+                    model: self.model.clone(),
+                    reason: format!(
+                        "{MAYBE_BILLED_NO_USAGE_ROW}（流式翻译结束时未见 usage 事件；上游可能已对已生成内容计费）"
+                    ),
+                });
+            }
         }
     }
 }
@@ -3346,6 +3476,7 @@ fn streaming_translate_response(
     let (tx, rx) =
         tokio::sync::mpsc::channel::<std::result::Result<bytes::Bytes, std::io::Error>>(16);
     let on_usage = state.config.on_usage.clone();
+    let on_failure = state.config.on_failure.clone();
     let model = usage_model.to_string();
     let token_id = identity.token_id;
     let label = identity.label.clone().unwrap_or_default();
@@ -3360,6 +3491,7 @@ fn streaming_translate_response(
         // 任务结束时由 Drop 恰好发一行；首帧即发会在上游发多次 usage 时记少。
         let mut usage_flush = StreamUsageFlush {
             sink: on_usage.clone(),
+            maybe_billed_sink: on_failure.clone(),
             site_id,
             key_id: meta.key_id,
             model: model.clone(),
@@ -3535,6 +3667,7 @@ fn into_upstream_response(
         is_sse,
         Arc::new(unix_now_secs),
     )
+    .with_maybe_billed_sink(state.config.on_failure.clone())
     .with_identity(
         identity.token_id,
         identity.label.clone().unwrap_or_default(),
@@ -3882,6 +4015,30 @@ mod tests {
         let snap = metrics.snapshot();
         assert_eq!(snap.per_site[&9].ewma_latency_ms, None);
         assert_eq!(snap.per_site[&9].last_latency_ms, Some(33));
+    }
+
+    /// DEBUG-G7 补齐 P2-G1：EWMA 带时间戳 + 600 秒 TTL——新鲜值进选路
+    /// map 与快照，陈旧值两边都不进（选路回退静态延迟）；恰好 600 秒
+    /// 不算陈旧（判据是严格大于），边界不得差一秒。
+    #[test]
+    fn stale_ewma_expires_from_routing_map_and_snapshot() {
+        let metrics = GatewayMetrics::new();
+        metrics.record_measured_latency(7, 200);
+        metrics.record_measured_latency(8, 200);
+        let now = now_unix_secs();
+        {
+            let mut map = metrics.per_site.lock().unwrap();
+            // 站 7：601 秒前，陈旧；站 8：恰好 600 秒前，新鲜。
+            map.get_mut(&7).unwrap().ewma_latency_at_secs = Some(now - 601);
+            map.get_mut(&8).unwrap().ewma_latency_at_secs = Some(now - 600);
+        }
+        assert_eq!(metrics.ewma_latency_map().len(), 1);
+        assert!(metrics.ewma_latency_map().contains_key(&8));
+        assert!(!metrics.ewma_latency_map().contains_key(&7));
+        let snap = metrics.snapshot();
+        assert_eq!(snap.per_site[&7].ewma_latency_ms, None);
+        assert_eq!(snap.per_site[&7].ewma_latency_at_secs, Some(now - 601));
+        assert_eq!(snap.per_site[&8].ewma_latency_ms, Some(200.0));
     }
 
     /// M40-S2 复审 P1：`lastError` 不得带 URL/域名，且仍保留分类与状态码。
@@ -4903,6 +5060,34 @@ mod tests {
     }
 
     #[test]
+    fn stream_usage_flush_marks_maybe_billed_when_no_usage_on_2xx() {
+        // DEBUG-G7 P2-G5/K2：流式翻译路径的 Drop 与 UsageCapture 同口径——
+        // 2xx 结束无 pending usage 时发标记；有 usage 时只记用量不发标记。
+        let failures: Arc<Mutex<Vec<GatewayFailure>>> = Arc::new(Mutex::new(Vec::new()));
+        let f = Arc::clone(&failures);
+        let sink: Arc<dyn Fn(GatewayFailure) + Send + Sync> =
+            Arc::new(move |failure| f.lock().unwrap().push(failure));
+        {
+            let _flush = StreamUsageFlush {
+                sink: None,
+                maybe_billed_sink: Some(sink),
+                site_id: 7,
+                key_id: None,
+                model: "m".to_string(),
+                status: 200,
+                latency_ms: 10,
+                attempts: 1,
+                token_id: None,
+                label: String::new(),
+                pending: None,
+            };
+        }
+        let failures = failures.lock().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].reason.contains(MAYBE_BILLED_NO_USAGE_ROW));
+    }
+
+    #[test]
     fn usage_capture_silent_when_no_usage_seen() {
         let (mut capture, log) = capture_for(true, fixed_clock(1));
         capture.feed(b"data: {\"choices\":[]}\n\n");
@@ -4910,6 +5095,53 @@ mod tests {
         capture.flush();
         drop(capture);
         assert!(log.lock().unwrap().is_empty(), "没有 usage 不得调用 sink");
+    }
+
+    #[test]
+    fn usage_capture_marks_maybe_billed_when_stream_2xx_has_no_usage() {
+        // DEBUG-G7 P2-G5/K2：流式 2xx 结束无 usage 时发统一标记（不补记用量）；
+        // 非流式无 usage、非 2xx、有 usage 三种情况都不发。
+        let failures: Arc<Mutex<Vec<GatewayFailure>>> = Arc::new(Mutex::new(Vec::new()));
+        let f = Arc::clone(&failures);
+        let sink: Arc<dyn Fn(GatewayFailure) + Send + Sync> =
+            Arc::new(move |failure| f.lock().unwrap().push(failure));
+        let (capture, log) = capture_for(true, fixed_clock(1));
+        let mut capture = capture.with_maybe_billed_sink(Some(sink));
+        capture.feed(b"data: {\"choices\":[]}\n\n");
+        capture.feed(b"data: [DONE]\n\n");
+        capture.flush();
+        assert!(log.lock().unwrap().is_empty(), "标记不是用量行，不得进用量 sink");
+        let failures = failures.lock().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].reason.contains(MAYBE_BILLED_NO_USAGE_ROW),
+            "{}",
+            failures[0].reason
+        );
+        assert_eq!(failures[0].status, 200);
+
+        // 非流式无 usage：不发标记（常只是上游不报 usage）。
+        let failures2: Arc<Mutex<Vec<GatewayFailure>>> = Arc::new(Mutex::new(Vec::new()));
+        let f2 = Arc::clone(&failures2);
+        let sink2: Arc<dyn Fn(GatewayFailure) + Send + Sync> =
+            Arc::new(move |failure| f2.lock().unwrap().push(failure));
+        let (capture, _) = capture_for(false, fixed_clock(1));
+        let mut capture = capture.with_maybe_billed_sink(Some(sink2));
+        capture.feed(b"{\"id\":\"x\"}");
+        capture.flush();
+        assert!(failures2.lock().unwrap().is_empty());
+
+        // 流式有 usage：只记用量，不发标记。
+        let failures3: Arc<Mutex<Vec<GatewayFailure>>> = Arc::new(Mutex::new(Vec::new()));
+        let f3 = Arc::clone(&failures3);
+        let sink3: Arc<dyn Fn(GatewayFailure) + Send + Sync> =
+            Arc::new(move |failure| f3.lock().unwrap().push(failure));
+        let (capture, log) = capture_for(true, fixed_clock(1));
+        let mut capture = capture.with_maybe_billed_sink(Some(sink3));
+        capture.feed(b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n");
+        capture.flush();
+        assert_eq!(log.lock().unwrap().len(), 1);
+        assert!(failures3.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -70,7 +70,7 @@ impl DeliveryWriter for QwenCodeWriter {
 
     fn field_names(&self) -> Vec<String> {
         let mut names = vec![format!("{}.{}", Self::MODEL_KEY, Self::FIELD_API_KEY)];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             names.push(format!("{}.{}", Self::MODEL_KEY, Self::FIELD_BASE_URL));
         }
         if self.model.is_some() {
@@ -89,7 +89,7 @@ impl DeliveryWriter for QwenCodeWriter {
 
     fn fields(&self, api_key: &str) -> Vec<DeliveryField> {
         let mut fields = vec![masked_field(Self::FIELD_API_KEY, api_key)];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
         if let Some(m) = &self.model {
@@ -140,7 +140,7 @@ fn build_after(
         QwenCodeWriter::FIELD_API_KEY.to_string(),
         Value::String(api_key.to_string()),
     );
-    if !base_url.is_empty() {
+    if !base_url.trim().is_empty() {
         model_obj.insert(
             QwenCodeWriter::FIELD_BASE_URL.to_string(),
             Value::String(base_url.to_string()),
@@ -174,6 +174,22 @@ mod tests {
     }
     fn writer_in(dir: &Path, base_url: &str) -> QwenCodeWriter {
         QwenCodeWriter::with_path(dir.join("settings.json"), base_url)
+    }
+
+    #[test]
+    fn errors_never_echo_the_key() {
+        // DEBUG-G7 P2-K4：畸形旧文件 + 双 canary，见 codex_auth 同名用例。
+        let dir = tmp();
+        std::fs::write(
+            writer_in(dir.path(), BASE).path(),
+            "{\"api_key\": \"CANARY-FILE-9x7z",
+        )
+        .unwrap();
+        let err = writer_in(dir.path(), BASE)
+            .plan("CANARY-KEY-4k2m")
+            .unwrap_err();
+        assert!(!err.to_string().contains("CANARY-KEY-4k2m"), "{err}");
+        assert!(!err.to_string().contains("CANARY-FILE-9x7z"), "{err}");
     }
 
     #[test]

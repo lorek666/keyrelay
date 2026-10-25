@@ -46,7 +46,7 @@ impl DeliveryWriter for CursorWriter {
 
     fn field_names(&self) -> Vec<String> {
         let mut names = vec![Self::FIELD_API_KEY.to_string()];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             names.push(Self::FIELD_BASE_URL.to_string());
         }
         names
@@ -54,7 +54,7 @@ impl DeliveryWriter for CursorWriter {
 
     fn fields(&self, api_key: &str) -> Vec<DeliveryField> {
         let mut fields = vec![masked_field(Self::FIELD_API_KEY, api_key)];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
         fields
@@ -77,7 +77,7 @@ fn build_after(before: &str, api_key: &str, base_url: &str, path: &Path) -> Resu
         CursorWriter::FIELD_API_KEY.to_string(),
         Value::String(api_key.to_string()),
     );
-    if !base_url.is_empty() {
+    if !base_url.trim().is_empty() {
         root.insert(
             CursorWriter::FIELD_BASE_URL.to_string(),
             Value::String(base_url.to_string()),
@@ -99,6 +99,22 @@ mod tests {
     }
     fn writer_in(dir: &Path, base_url: &str) -> CursorWriter {
         CursorWriter::with_path(dir.join("settings.json"), base_url)
+    }
+
+    #[test]
+    fn errors_never_echo_the_key() {
+        // DEBUG-G7 P2-K4：畸形旧文件 + 双 canary，见 codex_auth 同名用例。
+        let dir = tmp();
+        std::fs::write(
+            writer_in(dir.path(), BASE).path(),
+            "{\"api_key\": \"CANARY-FILE-9x7z",
+        )
+        .unwrap();
+        let err = writer_in(dir.path(), BASE)
+            .plan("CANARY-KEY-4k2m")
+            .unwrap_err();
+        assert!(!err.to_string().contains("CANARY-KEY-4k2m"), "{err}");
+        assert!(!err.to_string().contains("CANARY-FILE-9x7z"), "{err}");
     }
 
     #[test]

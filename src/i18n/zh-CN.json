@@ -617,6 +617,7 @@
       "agree": "我同意把上述密钥写入该 agent 的配置（写入前会备份，可回滚）",
       "agreeAll": "我已看过上面全部文件的差异，同意把上述密钥写入这些配置（写入前会备份，可回滚）",
       "fileTitle": "第 {index} 个文件（共 {total} 个）",
+      "fileWarningsTitle": "该文件的提示",
       "generating": "生成预览…",
       "previewOnlyToggle": "仅预览（不写盘、不记账）",
       "previewOnlyBanner": "仅预览模式：下面是「将要写入」的内容，本次没有写盘、没有记账、没有写绑定。关掉「仅预览」后才能投递。",
@@ -666,7 +667,8 @@
         "failClosed": "投递前会在锁内重新校验：未引用时拒绝写盘，预览时通过不代表投递时一定通过（期间改过 profile 也会拦）。",
         "referencingLabel": "引用该凭据的 profile：",
         "checkedLabel": "已查 profile：",
-        "unreadableLabel": "读失败（不算引用）："
+        "unreadableLabel": "读失败（不算引用）：",
+      "unreadableDirsLabel": "扫描时读失败的目录（不是“无 profile”，请先修权限再重投）："
       }
     },
     "restartHint": {
@@ -820,7 +822,10 @@
       "applyAgreePre": "我明白这会以",
       "applyAgreeMid": " 0600 ",
       "applyAgreePost": "权限写入上述文件，且会先留一份备份。",
-      "stopCodex": "写入前会先停掉正在跑的 Codex（含终端 codex 会话与桌面应用）：先优雅退出，超时仍在跑则强制结束；投递本身不会替你重新拉起它，写完请用重启区或启动命令自行重开。"
+      "stopCodex": "写入前会先停掉正在跑的 Codex（含终端 codex 会话与桌面应用）：先优雅退出，超时仍在跑则强制结束；投递本身不会替你重新拉起它，写完请用重启区或启动命令自行重开。",
+      "stopClaudeDesktop": "写入前会先停掉正在跑的 Claude Desktop（桌面应用只在启动时读配置，不停可能被启动时覆盖）：先优雅退出，超时仍在跑则强制结束；投递本身不会替你重新拉起它，写完请用重启区自行重开。",
+      "cliNotStopped": "该通道是 CLI 类，写盘前不会自动停进程：若该工具正在运行，它退出时可能写回旧配置、覆盖本次投递；投递前请先退出它，投递后请重开验证。",
+      "preserveAuth": "保留官方登录（只写 config，不动 auth.json）"
     },
     "rollbackDialog": {
       "title": "回滚这次投递",
@@ -845,8 +850,8 @@
       "alsoRevokePost": "：站点上删掉就没有了，正在别处使用它的程序会立刻失效）"
     },
     "notice": {
-      "delivered": "已投递到 {path}（变更 {journal}）。{hint}",
-      "deliveredFiles": "已投递到 {paths}（变更 {journal}）。{hint}",
+      "delivered": "已投递到 {path}（变更 {journal}）。{hint} 动作：{action}；来源：{source}。",
+      "deliveredFiles": "已投递到 {paths}（变更 {journal}）。{hint} 动作：{action}；来源：{source}。",
       "revoked": "已撤销同意。已写入的文件不会被自动回滚——如需还原请用「变更历史」页。",
       "rolledBack": "已回滚 {journal}。"
     },
@@ -1289,7 +1294,7 @@
     "keyHealthIntervalHint": "0 = 关闭巡检；非 0 时每隔这么多秒用 GET /v1/models 探活一次，死 key 提前标红摘除。合法范围 60–86400 秒，超出会在失焦时钳制。巡检花上游配额，默认关闭。保存后下次启动网关生效。",
     "keyHealthIntervalClamped": "已钳制到合法范围（0=关，或 60–86400 秒）。",
     "routingRulesLabel": "按 agent 路由规则（JSON，空 = 无规则）",
-    "routingRulesHint": "示例：[{\"agentLabel\": \"codex\", \"siteIds\": [1, 2]}]。agentLabel 与令牌 label 精确匹配（大小写敏感）；命中规则的 agent 只走规则列出的站点，未命中走全局加权；空 = 无规则。非法 JSON 保存时会被拒绝。保存后下次启动网关生效。",
+    "routingRulesHint": "示例：[{\"agentLabel\": \"codex\", \"siteIds\": [1, 2]}]。agentLabel 与令牌 label 精确匹配（大小写敏感）；命中规则的 agent 只走规则列出的站点，未命中走全局加权；空 = 无规则。siteIds 顺序只排备用尝试顺序，不排首选：首选仍由加权/EWMA/探针决定，siteIds 首位只表示首选失败后先试它；无 label 的 legacy 令牌不受任何规则限制，仍走全局加权；非法 JSON 保存时会被拒绝。保存后下次启动网关生效。",
     "routingRulesAgent": "Agent",
     "routingRulesAgentPlaceholder": "选择 Agent",
     "routingRulesSites": "站点",
@@ -1336,7 +1341,19 @@
       "delistedPost": "）——Cline Desktop 文件直写已下线，无法在此改指，请走 cline auth CLI 处理",
       "delistedFull": "Cline Desktop 文件直写已下线，无法在此改指，请走 cline auth CLI",
       "delistedApplyDetail": "Cline Desktop 文件直写已下线，无法在此改指，请走 cline auth CLI",
-      "delistedStrong": "已下线通道"
+      "delistedStrong": "已下线通道",
+      "stopCodex": "批量改指时，Codex 行写入前会先停掉正在跑的 Codex（写完请用重启区或启动命令自行重开，投递不会替你拉起它）。",
+      "bundleMerged": "已随同 bundle 另一行合并执行",
+      "clineProbeBtn": "检测中…",
+      "clineProbeBtnIdle": "检测 cline CLI",
+      "clineProbeBtnRetry": "重新检测",
+      "clineAuthCopy": "复制 cline auth 命令",
+      "clineAuthCopied": "已复制",
+      "clineAuthCommand": "cline auth -p openai -b <网关地址> -k <密钥> -m <模型>",
+      "clineAuthPlaceholderNote": "尖括号部分都要换成你自己的值：<网关地址> 如 http://127.0.0.1:端口/v1，<密钥> 填网关令牌，<模型> 可不填。不要把真实密钥粘贴到公开处；粘进 shell 会留在 history 里。",
+      "clineProbeFound": "已找到 cline CLI：{path}，版本 {version}。",
+      "clineProbeVersionUnknown": "未确认",
+      "clineProbeNotFound": "在应用的搜索范围里没找到 cline CLI。"
     },
     "copyFail": "复制失败（{error}）——请手动选中上面的令牌文本。",
     "collectModelsLabel": "采集站点模型目录（用于模型变化通知与跨站选路）",

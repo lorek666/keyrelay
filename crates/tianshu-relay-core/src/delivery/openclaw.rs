@@ -81,7 +81,7 @@ impl DeliveryWriter for OpenClawWriter {
 
     fn field_names(&self) -> Vec<String> {
         let mut names = vec![Self::FIELD_API_KEY.to_string()];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             names.push(Self::FIELD_BASE_URL.to_string());
         }
         if self.model.is_some() {
@@ -96,7 +96,7 @@ impl DeliveryWriter for OpenClawWriter {
 
     fn fields(&self, api_key: &str) -> Vec<DeliveryField> {
         let mut fields = vec![masked_field(Self::FIELD_API_KEY, api_key)];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
         if let Some(m) = &self.model {
@@ -145,7 +145,7 @@ fn build_after(
         before.lines().any(|l| l.trim_start().starts_with("//")) || before.contains("/*");
 
     if has_comments || before.contains(BLOCK_BEGIN) {
-        build_with_marker_block(before, api_key, base_url, model, meta)
+        build_with_marker_block(before, api_key, base_url, model, meta, path)
     } else {
         build_with_json(before, api_key, base_url, model, meta, path)
     }
@@ -157,12 +157,20 @@ fn build_with_marker_block(
     base_url: &str,
     model: &Option<String>,
     meta: Option<ModelMeta>,
+    path: &Path,
 ) -> Result<String> {
     let block_content = build_block_content(api_key, base_url, model, meta);
     let new_block = format!("{BLOCK_BEGIN}\n{block_content}\n{BLOCK_END}\n");
 
     if let Some(begin_pos) = before.find(BLOCK_BEGIN) {
-        if let Some(end_pos) = before[begin_pos..].find(BLOCK_END) {
+        // DEBUG-G7 P2-D2：孤 BEGIN（有 BEGIN 无 END）时拒绝，不得静默追加第二块。
+        let Some(end_pos) = before[begin_pos..].find(BLOCK_END) else {
+            return Err(Error::inject(
+                path,
+                "标记块只有起始标记、没有结束标记，拒绝写入：请先手工修复该文件里的 keyrelay 标记块（补结束标记或删掉残块）再重新投递",
+            ));
+        };
+        {
             let absolute_end = begin_pos + end_pos + BLOCK_END.len();
             let after_end = if before[absolute_end..].starts_with('\n') {
                 absolute_end + 1
@@ -216,7 +224,7 @@ fn build_with_json(
         OpenClawWriter::FIELD_API_KEY.to_string(),
         Value::String(api_key.to_string()),
     );
-    if !base_url.is_empty() {
+    if !base_url.trim().is_empty() {
         entry.insert(
             OpenClawWriter::FIELD_BASE_URL.to_string(),
             Value::String(base_url.to_string()),
@@ -252,7 +260,7 @@ fn build_block_content(
     content.push_str("\"api_key\": \"");
     content.push_str(api_key);
     content.push('"');
-    if !base_url.is_empty() {
+    if !base_url.trim().is_empty() {
         content.push_str(", \"base_url\": \"");
         content.push_str(base_url);
         content.push('"');
@@ -341,6 +349,16 @@ mod tests {
         let patch = writer_in(dir.path(), "").plan(SECRET).unwrap();
         assert!(patch.after.contains("https://keep.example.com"));
         assert!(patch.after.contains(SECRET));
+    }
+
+    #[test]
+    fn rejects_orphan_begin_block() {
+        // DEBUG-G7 P2-D2：孤 BEGIN（无 END）不得静默追加第二块，必须拒绝。
+        let dir = tmp();
+        let before = format!("{{\n{BLOCK_BEGIN}\n\"api_key\": \"sk-old\"\n}}\n");
+        std::fs::write(writer_in(dir.path(), BASE).path(), &before).unwrap();
+        let err = writer_in(dir.path(), BASE).plan(SECRET).unwrap_err();
+        assert!(err.to_string().contains("没有结束标记"), "{err}");
     }
 
     #[test]
