@@ -162,6 +162,7 @@ fn corrupt_legacy_db_fails_and_falls_back() {
 #[test]
 fn symlinks_are_skipped_and_reported() {
     let h = home();
+    #[cfg(unix)]
     let legacy = h.path().join(LEGACY_APP_DIR_NAME);
     add_legacy(h.path());
     let outside = h.path().join("outside-secret.txt");
