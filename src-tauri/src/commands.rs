@@ -4962,6 +4962,100 @@ pub fn get_probe_run(
         .map_err(|e| e.to_string())
 }
 
+// ================================================================ 一键重启（投递改进 P1-5）
+//
+// 只做 Codex 与 Claude Desktop（完全退出重开）。其余 CLI 类 agent 不进命令表：
+// 前端只给可复制启动命令，绝不替用户拉终端进程。
+//
+// 两层确认，缺一不可：
+// 1. 前端确认框（Agents 页重启区）：明确告知「正在进行的操作会中断」，用户点确认后
+//    前端才把 `confirmed: true` 传进来；
+// 2. 后端硬门禁：`confirmed` 不是 `true` 就直接拒绝（包括缺字段的调用）。前端确认框
+//    被绕过（旧前端、直接调 IPC）时，后端这一层仍能挡住一次无确认的重启。
+// 命令层只做「串行 + 转 DTO」：退出/轮询/强制杀/拉起的全部语义在核心层 `restart` 模块。
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartArgs {
+    pub confirmed: bool,
+}
+
+/// 一次重启结果的线格式。`app_server_daemon_status` 恒为 `"unverified"`（核心层保证），
+/// 前端必须把它渲染成「未验证」的清单项，不得渲染成已通过。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartOutcomeDto {
+    target: String,
+    was_running: bool,
+    quit_method: String,
+    force_killed: bool,
+    relaunched: bool,
+    appeared: bool,
+    manual_launch_command: Option<String>,
+    app_server_daemon_status: String,
+    app_server_daemon_note: String,
+}
+
+fn restart_outcome_dto(outcome: tianshu_relay_core::restart::RestartOutcome) -> RestartOutcomeDto {
+    RestartOutcomeDto {
+        target: outcome.target.as_str().to_string(),
+        was_running: outcome.was_running,
+        quit_method: outcome.quit_method.to_string(),
+        force_killed: outcome.force_killed,
+        relaunched: outcome.relaunched,
+        appeared: outcome.appeared,
+        manual_launch_command: outcome.manual_launch_command,
+        app_server_daemon_status: outcome.app_server_daemon.status.to_string(),
+        app_server_daemon_note: outcome.app_server_daemon.note,
+    }
+}
+
+async fn restart_agent(
+    state: State<'_, AppState>,
+    args: RestartArgs,
+    target: tianshu_relay_core::restart::RestartTarget,
+) -> Result<RestartOutcomeDto, String> {
+    if !args.confirmed {
+        return Err(
+            "重启需要用户确认：该操作会中断正在进行的会话，请在确认框里确认后再试".to_string(),
+        );
+    }
+    // 串行化：两次重启不得交错（见 AppState::restart_op 的注释）。
+    let _op = state.restart_op.lock().await;
+    // 核心重启是同步阻塞调用（轮询里 sleep），必须走 spawn_blocking，不得占 async 运行时。
+    tauri::async_runtime::spawn_blocking(move || tianshu_relay_core::restart::restart(target))
+        .await
+        .map_err(|e| format!("重启任务异常中断: {e}"))?
+        .map(restart_outcome_dto)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn restart_codex(
+    state: State<'_, AppState>,
+    args: RestartArgs,
+) -> Result<RestartOutcomeDto, String> {
+    restart_agent(
+        state,
+        args,
+        tianshu_relay_core::restart::RestartTarget::Codex,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn restart_claude_desktop(
+    state: State<'_, AppState>,
+    args: RestartArgs,
+) -> Result<RestartOutcomeDto, String> {
+    restart_agent(
+        state,
+        args,
+        tianshu_relay_core::restart::RestartTarget::ClaudeDesktop,
+    )
+    .await
+}
+
 /// 落盘一份环境/自启计划。
 ///
 /// Windows 形态（`EnvPlan::Registry`）走 `reg.exe`，**不经 shell**——值里的空格、
@@ -5018,6 +5112,38 @@ mod tests {
 
     fn to_value<T: Serialize>(value: &T) -> Value {
         serde_json::to_value(value).expect("序列化 DTO")
+    }
+
+    /// P1-5：重启结果 DTO 的线上字段名（camelCase）与 daemon 未验证态。
+    /// 字面量字段齐全：缺一个字段编译就失败，不得用部分字面量蒙过去。
+    #[test]
+    fn restart_outcome_dto_serializes_in_camel_case_with_unverified_daemon() {
+        let dto = restart_outcome_dto(tianshu_relay_core::restart::RestartOutcome {
+            target: tianshu_relay_core::restart::RestartTarget::Codex,
+            was_running: true,
+            quit_method: "bundle",
+            force_killed: false,
+            relaunched: true,
+            appeared: true,
+            manual_launch_command: Some("codex".to_string()),
+            app_server_daemon: tianshu_relay_core::restart::daemon_check(),
+        });
+        let value = to_value(&dto);
+        assert_eq!(value["target"], "codex");
+        assert_eq!(value["wasRunning"], true);
+        assert_eq!(value["quitMethod"], "bundle");
+        assert_eq!(value["forceKilled"], false);
+        assert_eq!(value["relaunched"], true);
+        assert_eq!(value["appeared"], true);
+        assert_eq!(value["manualLaunchCommand"], "codex");
+        // daemon 状态恒为未验证：这里钉死，前端据此渲染「未验证」清单项。
+        assert_eq!(value["appServerDaemonStatus"], "unverified");
+        assert!(
+            value["appServerDaemonNote"]
+                .as_str()
+                .is_some_and(|n| n.contains("独立验证项")),
+            "daemon 说明必须点明独立验证项：{value}"
+        );
     }
 
     /// 复审 P2-4：IPC 测试此前只覆盖「命令可达」，没有返回值结构断言。

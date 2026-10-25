@@ -781,6 +781,8 @@ const DTO_ALIASES = {
   SiteSummaryDto: "SiteRow",
   ConsentDto: "ConsentRow",
   EventDto: "EventRow",
+  // 投递改进 P1-5：重启结果 DTO 在前端叫 RestartOutcome（字段逐字同名，见 api.ts）。
+  RestartOutcomeDto: "RestartOutcome",
 };
 
 /**

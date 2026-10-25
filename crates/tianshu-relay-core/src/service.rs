@@ -2340,11 +2340,43 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         self.apply_delivery_in(key_id, channel, model, delivery::DeliverySource::Site)
     }
 
+    /// 投递改进 P1-5：写 Codex 配置前先停 Codex 并探查写进程。
+    ///
+    /// 接入点：单通道与 Codex 双文件两条写盘路径都在「计划与整单校验已过、真正写盘
+    /// 之前」调它（此时 FileLock 已持有、同意已在锁内重确认）。语义：
+    /// - Codex 桌面进程与 `codex` CLI 进程都不在跑 ⇒ 直接放行（VM / 无 Codex 环境零开销）；
+    /// - 任一在跑 ⇒ 先优雅退出、轮询、强制杀兜底，停下来才放行；停不下来或探查失败
+    ///   ⇒ 返回 Err，写盘、记账、回读一律不发生（锁随 guard 析构释放，同意不受影响）。
+    /// - 只停、不拉起：CLI 会话与桌面应用的重开由用户在前端点重启按钮（或按可复制命令）
+    ///   完成；投递本身绝不替用户拉起任何进程。
+    /// - 只对 Codex 通道调用：其余通道（包括 Claude Desktop）不在此拦截——Claude Desktop
+    ///   的重开只走前端重启按钮，不在投递时自动停它。
+    /// - 残留窗口（诚实说明）：停 → 探查 → 写盘不是原子的，Codex 若在这之间自己重起并
+    ///   写回，仍可能覆盖；事后漂移检测（既有）会报出来，本项不宣称已消除该窗口。
+    fn ensure_codex_stopped_before_write(&self) -> Result<()> {
+        let outcome = crate::restart::stop_for_write(crate::restart::RestartTarget::Codex)?;
+        if outcome.was_running {
+            self.log(observability::event_with_payload(
+                Level::Info,
+                "delivery",
+                format!(
+                    "写盘前已停止 Codex（强制杀：{}），开始写入 Codex 配置",
+                    outcome.force_killed
+                ),
+                serde_json::json!({ "channel": "codex" }),
+            ));
+        }
+        Ok(())
+    }
+
     /// 按**来源**（站点 / 本地网关）真正落盘（M8-S4 §6.2）。
     ///
     /// 步骤与顺序与站点模式**逐字相同**（同意 → 取锁 → 锁内再确认同意 → 取密钥 → 写 → 记账）：
     /// 网关模式只换「`base_url` 与 `api_key` 取哪一对值」，其余一个字节都不改。
     /// 这很关键——同意、备份、回读校验、失败补偿这些安全动作**不因为模式而放松**。
+    ///
+    /// P1-5 补充一步（只对 Codex 通道）：写盘前先停 Codex 并探查写进程，见
+    /// [`TianshuRelayService::ensure_codex_stopped_before_write`]。
     pub fn apply_delivery_in(
         &self,
         key_id: i64,
@@ -2420,6 +2452,15 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 ));
                 return Err(delivery::dsh::unreferenced_error(&check, &target));
             }
+        }
+
+        // P1-5：写 Codex 配置前先停 Codex 并探查写进程（只对两条 Codex 通道）。
+        // 位置在锁内、写盘前：停不下来 ⇒ Err，⑤ 的写盘、记账、回读一律不发生。
+        if matches!(
+            channel,
+            DeliveryChannel::CodexAuthJson | DeliveryChannel::CodexConfig
+        ) {
+            self.ensure_codex_stopped_before_write()?;
         }
 
         // ⑤ 写入（加锁已在上面完成；预检 → 备份 → 原子写 → 回读校验 → 失败补偿在 apply 内部）
@@ -2687,6 +2728,11 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 target,
             ));
         }
+
+        // P1-5：写 Codex 配置前先停 Codex 并探查写进程（双文件同单只拦一次，位置在
+        // 锁内、两文件补丁都已校验过、真正写盘之前）。停不下来 ⇒ Err，⑥ 的写盘、
+        // 记账、回读一律不发生；auth 与 config 两个文件都不动。
+        self.ensure_codex_stopped_before_write()?;
 
         // ⑥ 写入：一次调用写全部补丁 ⇒ 一个 journal id（预检 → 备份 → 原子写 →
         //    回读校验 → 失败补偿都在 apply 内部，与单通道同一条代码）。

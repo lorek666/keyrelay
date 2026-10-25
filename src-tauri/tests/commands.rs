@@ -3337,3 +3337,51 @@ fn m46s6_bill_reconciliation_commands_round_trip() {
         "不过滤时两站各一行"
     );
 }
+
+// ---------- 投递改进 P1-5：一键重启 ----------
+//
+// 守护点：后端确认门禁必须在任何进程操作之前生效。守护测试（every_declared_command…）
+// 以空参数调全部命令：重启命令因缺 `args.confirmed` 而反序列化失败，绝不会真的去停进程；
+// 下面两条再把门禁与「已确认但本机无应用可拉」的业务错误分别钉死。
+
+#[test]
+fn restart_codex_without_confirmation_is_rejected_before_touching_processes() {
+    let err = invoke_impl("restart_codex", json!({"args": {"confirmed": false}}))
+        .expect_err("未确认的重启必须被拒绝");
+    assert_not_acl_rejection("restart_codex", &err);
+    let message = err.to_string();
+    assert!(
+        message.contains("确认"),
+        "拒绝原因必须点明需要用户确认：{message}"
+    );
+}
+
+#[test]
+fn restart_claude_desktop_without_confirmation_is_rejected() {
+    let err = invoke_impl(
+        "restart_claude_desktop",
+        json!({"args": {"confirmed": false}}),
+    )
+    .expect_err("未确认的重启必须被拒绝");
+    assert_not_acl_rejection("restart_claude_desktop", &err);
+    assert!(
+        err.to_string().contains("确认"),
+        "拒绝原因必须点明需要用户确认：{err}"
+    );
+}
+
+#[test]
+fn restart_codex_confirmed_on_machine_without_the_app_reports_launch_failure() {
+    // 本 VM 没有 chatgpt/codex 桌面进程：探查为「没在跑」→ 拉起 chatgpt 失败 → 业务错误。
+    // 不断言拉起成功（那需要真机应用）；只断言不是 ACL/注册问题，且错误点明了拉起失败。
+    // 注意：本用例只在无该应用的机器上成立；有该应用的真机上它会真的拉起应用，
+    // 因此不得放进守护测试的无参循环里（无参调用因缺 confirmed 而提前失败，见上）。
+    let err = invoke_impl("restart_codex", json!({"args": {"confirmed": true}}))
+        .expect_err("本机无 Codex 桌面应用时重启应报错");
+    assert_not_acl_rejection("restart_codex", &err);
+    let message = err.to_string();
+    assert!(
+        message.contains("拉起"),
+        "错误信息应点明拉起失败（而不是含糊的失败）：{message}"
+    );
+}

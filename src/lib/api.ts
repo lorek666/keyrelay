@@ -2633,6 +2633,72 @@ export async function updateAgent(channel: string): Promise<AgentUpdateOutcome> 
   return invokeCommand<AgentUpdateOutcome>("update_agent", { channel });
 }
 
+// ============================================================ 一键重启（投递改进 P1-5）
+//
+// 只做 Codex 与 Claude Desktop（完全退出重开）。`confirmed` 是后端硬门禁的一部分：
+// 前端只在用户点了重启确认框之后才传 `true`，后端缺确认时直接拒绝，绝不静默重启。
+// 其余 CLI 类 agent 不走这里——前端只给可复制启动命令（见 Agents 页的 CLI_LAUNCH_COMMANDS）。
+
+export type RestartArgs = {
+  confirmed: boolean;
+};
+
+/**
+ * 一次重启结果（与后端 `RestartOutcomeDto` 逐字段同名，见 check-commands 的 DTO 对账）。
+ * `appServerDaemonStatus` 恒为 `"unverified"`：daemon 是独立验证项，前端必须渲染成
+ * 「未验证」，不得渲染成已通过。
+ */
+export type RestartOutcome = {
+  target: string;
+  wasRunning: boolean;
+  quitMethod: string;
+  forceKilled: boolean;
+  relaunched: boolean;
+  appeared: boolean;
+  manualLaunchCommand: string | null;
+  appServerDaemonStatus: string;
+  appServerDaemonNote: string;
+};
+
+export async function restartCodex(): Promise<RestartOutcome> {
+  if (!hasTauri) {
+    // 浏览器预览：没有桌面应用可重启，绝不谎称已拉起。
+    return mock({
+      target: "codex",
+      wasRunning: false,
+      quitMethod: "none",
+      forceKilled: false,
+      relaunched: false,
+      appeared: false,
+      manualLaunchCommand: "codex",
+      appServerDaemonStatus: "unverified",
+      appServerDaemonNote: "",
+    });
+  }
+  return invokeCommand<RestartOutcome>("restart_codex", {
+    args: { confirmed: true },
+  });
+}
+
+export async function restartClaudeDesktop(): Promise<RestartOutcome> {
+  if (!hasTauri) {
+    return mock({
+      target: "claude-desktop",
+      wasRunning: false,
+      quitMethod: "none",
+      forceKilled: false,
+      relaunched: false,
+      appeared: false,
+      manualLaunchCommand: null,
+      appServerDaemonStatus: "unverified",
+      appServerDaemonNote: "",
+    });
+  }
+  return invokeCommand<RestartOutcome>("restart_claude_desktop", {
+    args: { confirmed: true },
+  });
+}
+
 /**
  * 按 FR-2:113 的命名规范给一个默认名：`<app-id>/<agent-id>/<yyyymmdd>`。
  *

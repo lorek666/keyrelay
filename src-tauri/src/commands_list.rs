@@ -103,4 +103,7 @@ pub const COMMANDS: &[&str] = &[
     "probe_run",
     "list_probe_runs",
     "get_probe_run",
+    // 投递改进 P1-5：一键重启（Codex / Claude Desktop；其余 CLI 类不进命令表）
+    "restart_codex",
+    "restart_claude_desktop",
 ];

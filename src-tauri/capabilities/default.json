@@ -86,6 +86,8 @@
     "allow-probe-run",
     "allow-list-probe-runs",
     "allow-get-probe-run",
+    "allow-restart-codex",
+    "allow-restart-claude-desktop",
     "updater:default",
     "process:allow-restart"
   ]
