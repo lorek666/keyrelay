@@ -17,6 +17,7 @@ const SECRET: &str = "sk-audit-0123456789abcdefSECRET";
 
 struct Fixture {
     _dir: tempfile::TempDir,
+    home: PathBuf,
     db_path: PathBuf,
     backup_dir: PathBuf,
     service: TianshuRelayService<MockTransport>,
@@ -28,7 +29,6 @@ fn setup() -> Fixture {
     let home = dir.path().join("home");
     fs::create_dir_all(&home).expect("home");
     let db_path = dir.path().join("tianshu-relay.db");
-    let _ = &home;
     let backup_dir = dir.path().join("backups");
 
     let store = Store::open(&db_path).expect("文件库");
@@ -55,6 +55,7 @@ fn setup() -> Fixture {
 
     Fixture {
         _dir: dir,
+        home,
         db_path,
         backup_dir,
         service,
@@ -78,6 +79,19 @@ fn full_delivery_flow_stays_clean() {
     for channel in DeliveryChannel::ALL {
         // Continue 的条目必须有模型名（Continue 的 schema 必填），其余通道不需要
         let model = (channel == DeliveryChannel::OpenClaw).then_some("gpt-4o");
+        // P0-3：DSH 投递要求至少一个 profile 引用 KEYRELAY_API_KEY，
+        // 否则 apply 在落盘前拒绝；本用例测的是审计不泄漏而非引用校验，
+        // 因此先给 DSH 备一个已引用的 profile。
+        if channel == DeliveryChannel::DeepSeekHarness {
+            let profile = f
+                .home
+                .join(".dsh")
+                .join("profiles")
+                .join("desktop")
+                .join("cordis.patch.yml");
+            fs::create_dir_all(profile.parent().unwrap()).expect("建 profile 目录");
+            fs::write(&profile, "apiKeyEnv: KEYRELAY_API_KEY\n").expect("写 profile");
+        }
         f.service.grant_consent(f.key_id, channel).unwrap();
         f.service
             .apply_delivery_with_model(f.key_id, channel, model)

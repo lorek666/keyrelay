@@ -225,6 +225,20 @@ export type ConsentState = "missing" | "granted" | "revoked";
  */
 export type RestartHint = "notNeeded" | "needed" | "dependsOnNewSession";
 
+/**
+ * P0-3：DSH 通道的凭据引用校验结果（后端 `DshReferenceCheck` 的 camelCase 线格式）。
+ *
+ * 路径均为字符串；不含任何密钥材料。仅 DSH 通道的 plan 带非 null 值，
+ * 其余通道的 `dshCredentialReference` 为 null（null 不得读成空对象）。
+ */
+export type DshReferenceCheck = {
+  credentialName: string;
+  profilesDir: string;
+  checkedFiles: string[];
+  referencingFiles: string[];
+  unreadableFiles: string[];
+};
+
 export type DeliveryPlan = {
   agentId: string;
   channel: string;
@@ -273,6 +287,14 @@ export type DeliveryPlan = {
    * 新界面必须读它才算看到整单，只看顶层会漏掉另一半文件。
    */
   files: DeliveryFilePlan[];
+  /**
+   * P0-3：DSH 通道的凭据引用校验结果；仅 DSH 通道为非 null，其余通道为 null。
+   *
+   * 语义与后端 `DeliveryPlanDto.dshCredentialReference` 一致。
+   * 仅类型层接线：Agents 页渲染是后续项（BACKLOG B-280），在此之前
+   * 不得宣称预览已展示该结果。
+   */
+  dshCredentialReference: DshReferenceCheck | null;
 };
 
 /** 一单里某一个文件的预览（P0-2）。字段含义与 DeliveryPlan 的同名项一致。 */
@@ -839,6 +861,8 @@ const MOCK_PLAN: DeliveryPlan = {
       consentRevokedAt: null,
     },
   ],
+  // P0-3：mock 是 Codex 通道，非 DSH ⇒ 引用校验为 null。
+  dshCredentialReference: null,
 };
 
 const MOCK_EVENTS: EventRow[] = [

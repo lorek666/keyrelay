@@ -258,6 +258,20 @@ fn inject_rollback_roundtrip_is_byte_identical() {
         let model = model_for(channel);
         let name = channel.as_str();
 
+        // P0-3：DSH 投递要求至少一个 profile 引用 KEYRELAY_API_KEY，
+        // 否则 apply 在落盘前拒绝；本用例测的是注入/回滚字节比对而非
+        // 引用校验本身，因此先给 DSH 备一个已引用的 profile。
+        if channel == DeliveryChannel::DeepSeekHarness {
+            let profile = f
+                .home
+                .join(".dsh")
+                .join("profiles")
+                .join("desktop")
+                .join("cordis.patch.yml");
+            fs::create_dir_all(profile.parent().unwrap()).expect("建 profile 目录");
+            fs::write(&profile, "apiKeyEnv: KEYRELAY_API_KEY\n").expect("写 profile");
+        }
+
         // ---- 形态一：目标不存在 ⇒ 回滚后必须不存在
         let plan = f
             .service
@@ -847,6 +861,19 @@ fn injection_is_idempotent_across_channels() {
     for channel in DeliveryChannel::ALL {
         let model = model_for(channel);
         let name = channel.as_str();
+        // P0-3：DSH 投递要求至少一个 profile 引用 KEYRELAY_API_KEY，
+        // 否则 apply 在落盘前拒绝；本用例测的是跨通道幂等而非引用校验
+        // 本身，因此先给 DSH 备一个已引用的 profile。
+        if channel == DeliveryChannel::DeepSeekHarness {
+            let profile = f
+                .home
+                .join(".dsh")
+                .join("profiles")
+                .join("desktop")
+                .join("cordis.patch.yml");
+            fs::create_dir_all(profile.parent().unwrap()).expect("建 profile 目录");
+            fs::write(&profile, "apiKeyEnv: KEYRELAY_API_KEY\n").expect("写 profile");
+        }
         let target = f
             .service
             .delivery_plan_with_model(f.key_id, channel, model)
