@@ -635,7 +635,7 @@ pub struct UnbindOutcome {
 
 /// 当前 unix 秒。
 ///
-/// 只给 [`TianshuRelayService::dispatch_notifications`] 与 [`TianshuRelayService::rotation_due`] 用：
+/// 只给 [`TianshuRelayService::dispatch_notifications`]、[`TianshuRelayService::rotation_due`] 与用量 drain 用：
 /// `notify::evaluate` 与 `rotation::due_keys` 都是纯函数，时间必须由调用方传入
 /// （这样它们才能被单测）。这里是唯一的「读时钟」点。
 fn unix_now_secs() -> i64 {
@@ -5828,14 +5828,38 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             }
         }));
 
-        // M46-S5：预算判定注入出口。闭包只包一层 Arc<Store>，判定走
-        // budget_breach_for（闭包与测试共用）；store 查询出错 ⇒ None（fail-open，
-        // 见 spec §4.2）。网关本身仍不依赖 store 类型（闭包签名只有 id）。
+        // M46-S5：预算判定注入出口。闭包包一层 Arc<Store> + 用量缓冲 Arc，判定走
+        // budget_breach_for（闭包与测试共用）。
+        // P0-1 修法 b：判定前先把缓冲落库（与 refresh/stop 的 drain 同一实现），
+        // 否则运行中用量对判定不可见；计价仍走既有 SQL，不改 USD 口径。
+        // P1-6：store 查询出错 ⇒ None（fail-open，见 spec §4.2），但不再静默：
+        // 立即写一条 Warn 事件（直接 insert_event，不经 refresh 的事件缓冲，
+        // 否则默认关刷新时这条告警同样不可见）；事件表本身也坏时写失败静默，
+        // 已无更低一层的可观测出口。
         let budget_store = std::sync::Arc::clone(&self.store);
+        let budget_usage_buffer = std::sync::Arc::clone(&self.gateway_usage_buffer);
+        let budget_usage_dropped = std::sync::Arc::clone(&self.gateway_usage_dropped);
         config.budget_check = Some(Arc::new(move |site_id, key_id| {
-            budget_breach_for(&budget_store, site_id, key_id)
-                .ok()
-                .flatten()
+            Self::drain_gateway_usage_buffer(
+                budget_store.as_ref(),
+                budget_usage_buffer.as_ref(),
+                budget_usage_dropped.as_ref(),
+                |event| {
+                    let _ = budget_store.insert_event(&event);
+                },
+            );
+            match budget_breach_for(&budget_store, site_id, key_id) {
+                Ok(breach) => breach,
+                Err(err) => {
+                    let _ = budget_store.insert_event(&observability::event_with_payload(
+                        Level::Warn,
+                        "gateway",
+                        "预算判定读库失败，已按 fail-open 放行（预算暂不拦截）",
+                        serde_json::json!({ "site_id": site_id, "key_id": key_id, "error": err.to_string() }),
+                    ));
+                    None
+                }
+            }
         }));
 
         // M46-S5：超标回调注入出口。只做有界 push（与 on_failure 闭包同口径：
@@ -5909,41 +5933,47 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         Ok(config)
     }
 
-    /// M13-S1：把网关攒下的 token 用量落库。
-    pub fn drain_gateway_usage(&self) {
-        let drained: Vec<crate::gateway::GatewayUsage> = match self.gateway_usage_buffer.lock() {
+    /// 网关用量缓冲落库（refresh/stop 的 drain 与网关 budget_check 共用同一实现）。
+    ///
+    /// 为什么 budget_check 也要先 drain 再判定（P0-1 修法 b）：网关运行中用量只进
+    /// 内存缓冲，判定只读库内表时永远看不到本轮用量；先 drain 再走既有
+    /// `budget_breach_for`，已花 = 库内 + 缓冲之和，且计价仍是同一条 SQL，不另起
+    /// 一套缓冲计价口径（USD 价行、CNY 排除、逐行 6 位舍入都不动）。写失败静默
+    /// 跳过（与既有 drain 同口径）；缓冲锁中毒时只报已丢计数后返回。
+    fn drain_gateway_usage_buffer(
+        store: &crate::store::Store,
+        buffer: &std::sync::Mutex<Vec<crate::gateway::GatewayUsage>>,
+        dropped: &std::sync::atomic::AtomicU64,
+        mut warn: impl FnMut(Event),
+    ) {
+        let drained: Vec<crate::gateway::GatewayUsage> = match buffer.lock() {
             Ok(mut buffer) => buffer.drain(..).collect(),
             Err(_) => {
-                let dropped = self
-                    .gateway_usage_dropped
-                    .swap(0, std::sync::atomic::Ordering::Relaxed);
-                if dropped > 0 {
-                    self.log(observability::event_with_payload(
+                let dropped_count = dropped.swap(0, std::sync::atomic::Ordering::Relaxed);
+                if dropped_count > 0 {
+                    warn(observability::event_with_payload(
                         Level::Warn,
                         "gateway",
-                        format!("本轮因缓冲满丢弃 {dropped} 条网关用量记录（缓冲锁中毒，未落库）"),
-                        serde_json::json!({ "dropped": dropped }),
+                        format!(
+                            "本轮因缓冲满丢弃 {dropped_count} 条网关用量记录（缓冲锁中毒，未落库）"
+                        ),
+                        serde_json::json!({ "dropped": dropped_count }),
                     ));
                 }
                 return;
             }
         };
-        let dropped_this_round = self
-            .gateway_usage_dropped
-            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        let dropped_this_round = dropped.swap(0, std::sync::atomic::Ordering::Relaxed);
         for usage in &drained {
-            let _ = self.store.insert_gateway_usage(usage);
+            let _ = store.insert_gateway_usage(usage);
             // M43-S1：归因到的令牌记一次 last_used_at（每分钟最多一次；失败静默）。
             if let Some(token_id) = usage.token_id {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                let _ = self.store.touch_gateway_token_throttled(token_id, now);
+                let now = unix_now_secs();
+                let _ = store.touch_gateway_token_throttled(token_id, now);
             }
         }
         if dropped_this_round > 0 {
-            self.log(observability::event_with_payload(
+            warn(observability::event_with_payload(
                 Level::Warn,
                 "gateway",
                 format!(
@@ -5952,6 +5982,16 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 serde_json::json!({ "dropped": dropped_this_round }),
             ));
         }
+    }
+
+    /// M13-S1：把网关攒下的 token 用量落库。
+    pub fn drain_gateway_usage(&self) {
+        Self::drain_gateway_usage_buffer(
+            self.store.as_ref(),
+            self.gateway_usage_buffer.as_ref(),
+            self.gateway_usage_dropped.as_ref(),
+            |event| self.log(event),
+        );
     }
 
     /// M46-S5：把网关攒下的预算超标写成事件 + 通知（refresh_all 在 drain 用量之后调）。
