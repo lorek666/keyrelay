@@ -7,9 +7,9 @@ name: release
 #
 # 前置条件（缺一不可，否则签名步骤失败）：
 #   1. Secrets.TAURI_SIGNING_PRIVATE_KEY：须与 src-tauri/tauri.conf.json 里
-#      updater.pubkey 配对的 minisign 私钥（现仓库 Secrets 为空，未配置）。
-#      若原私钥已丢失，须重新生成密钥对并同步换掉 pubkey（见下方注意）。
-#   2. 仓库公开后 updater 才能匿名拉取——私有仓的 release 附件下载需身份验证。
+#      updater.pubkey 配对的 minisign 私钥（2026-10-26 已换新密钥对，
+#      私钥仅存于仓库 Secrets，本地不留存）。
+#   2. 仓库已公开（2026-10-26），updater 可匿名拉取 release 附件。
 #
 # 发版规矩：
 #   - 标签只从 CI 全绿的 main 上切；发版前先把 tauri.conf.json 的 version
