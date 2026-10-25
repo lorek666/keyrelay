@@ -73,6 +73,13 @@ impl FakeUpstream {
 }
 
 fn spawn_upstream(site_id: i64, statuses: &[&str]) -> FakeUpstream {
+    spawn_upstream_delayed(site_id, statuses, Duration::from_millis(0))
+}
+
+/// 带固定响应延迟的假上游：延迟计入网关实测 TTFB，从而固定 EWMA 顺序。
+/// 回环 TTFB 本身是亚毫秒级、毫秒取整后在 0/1ms 间抖动，见
+/// `routing_rule_hit_only_uses_listed_sites` 的注释。
+fn spawn_upstream_delayed(site_id: i64, statuses: &[&str], delay: Duration) -> FakeUpstream {
     let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
     let addr = listener.local_addr().expect("读取地址");
     let seen = Arc::new(AtomicUsize::new(0));
@@ -82,6 +89,9 @@ fn spawn_upstream(site_id: i64, statuses: &[&str]) -> FakeUpstream {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let _ = read_request(&mut stream);
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
             counter.fetch_add(1, Ordering::SeqCst);
             let idx = counter.load(Ordering::SeqCst).saturating_sub(1);
             let status = statuses
@@ -220,7 +230,18 @@ fn seed_labeled_token(handle: &GatewayHandle) {
 async fn routing_rule_hit_only_uses_listed_sites() {
     let a = spawn_upstream(1, &["200 OK"]);
     let b = spawn_upstream(2, &["200 OK"]);
-    let c = spawn_upstream(3, &["200 OK"]);
+    // DEBUG 收尾（m46s7_routing 抖动，选 (a) 改测试不断言、不动网关语义）：
+    // 本测试曾在 main 上偶发失败（站点 2 被打 1 次而非 2 次）。根因是网关
+    // `reorder_by_effective_latency`：请求 1、2 之后 2、3 号站都有 EWMA，
+    // 回环 TTFB 是亚毫秒级、毫秒取整后在 0/1ms 间抖动，head 顺序 [2, 3] 与
+    // [3, 2] 之间翻转，cursor 2 命中的槽位随之翻转，2/1 分配变成 1/2。
+    // 规则本身保证的只是“只用 listed 站点”，不是“毫秒级延迟下每站精确
+    // 命中几次”——原测试对每站精确计数的断言属于过度断言。
+    // 本测试改用固定延迟固定 EWMA 顺序（3 号站固定 100ms，远大于回环抖动），
+    // 保留精确计数断言：固定延迟下 EWMA 顺序确定，精确计数不再是过度
+    // 断言，而是对槽位轮转的确定性校验；网关语义一字未动。EWMA 重排与
+    // 已声明顺序之间的张力本身未消除，见 BACKLOG B-305（后续项）。
+    let c = spawn_upstream_delayed(3, &["200 OK"], Duration::from_millis(100));
     let mut cfg = three_site_config(&a, &b, &c, BreakerPolicy::default());
     cfg.routing_rules = vec![rule("codex", &[2, 3])];
     let handle = start(cfg).await.expect("网关应能启动");
