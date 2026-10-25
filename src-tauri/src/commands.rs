@@ -6389,6 +6389,7 @@ mod tests {
     /// ② 符号链接被拒（不跟随）。
     #[test]
     fn bundle_refuses_a_symlinked_target() {
+        #[cfg(unix)]
         let home = tempfile::tempdir().expect("临时 home");
         let dir = tempfile::tempdir().expect("临时目录");
         let real = dir.path().join("real.json");

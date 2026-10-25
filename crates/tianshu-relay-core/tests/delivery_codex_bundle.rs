@@ -324,6 +324,38 @@ fn auth_symlink_failure_leaves_config_untouched() {
     assert_eq!(fs::read_to_string(&real).unwrap(), auth_old);
 }
 
+/// 仅对 `FileBusy` 做有界重试的 apply 包装（本测试独用）。
+///
+/// 背景：0df04eb 的 macOS CI 上，本文件 `preserve_leaves_auth_bytes_untouched_and_records_only_config`
+/// 在保留 apply 处偶发 `FileBusy(config.toml)`；而 589bd9b/72602bc 两轮 macOS CI 同测试通过，
+/// 其间锁与投递生产代码零改动；本地 Linux 上单测 30 遍、整目标并行 30 遍、32 线程 20 遍均未复现。
+/// 结论只能是“未定位的瞬时锁竞争抖动”，不是确定性回归——本包装不声称根因。
+/// 锁竞争本身就是瞬时的，且本用例断言的是文件内容与记账，不是“零竞争”，
+/// 因此只对 FileBusy 重试（最多 10 次、间隔 20ms）；其它错误立即返回，不掩盖；
+/// 锁若真的泄漏（永久占用），10 次都会失败，测试仍红——重试掩盖不了泄漏。
+/// 最终失败时附上历次 FileBusy 目标，便于下次定位。
+fn apply_codex_retry_on_busy(
+    f: &Fixture,
+    preserve_auth: bool,
+) -> Result<tianshu_relay_core::delivery::CodexDeliveryOutcome, Error> {
+    let mut last_busy: Option<String> = None;
+    for attempt in 0..10 {
+        match f.service.apply_codex(f.key_id, None, preserve_auth) {
+            Ok(outcome) => return Ok(outcome),
+            Err(Error::FileBusy(path)) => {
+                last_busy = Some(path);
+                if attempt < 9 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(Error::FileBusy(format!(
+        "重试 10 次后仍被占用（历次目标：{last_busy:?}）",
+    )))
+}
+
 #[test]
 fn preserve_leaves_auth_bytes_untouched_and_records_only_config() {
     // 保留分支的硬核场景：auth 里是官方 ChatGPT 登录态——双文件会拒绝，
@@ -335,11 +367,12 @@ fn preserve_leaves_auth_bytes_untouched_and_records_only_config() {
     // 双文件先确认会拒绝（ChatGPT 登录态保护），且两文件都不动——
     // 为走到计划阶段，双文件这步先把两条同意都授上；保留那步只靠 config 同意。
     grant_both(&f);
-    let dual_err = f.service.apply_codex(f.key_id, None, false).unwrap_err();
+    // 注意：两次 apply 都走 FileBusy 有界重试（见 apply_codex_retry_on_busy）。
+    let dual_err = apply_codex_retry_on_busy(&f, false).unwrap_err();
     assert!(matches!(dual_err, Error::Inject { .. }), "{dual_err:?}");
     assert_eq!(fs::read_to_string(&f.auth_target).unwrap(), official);
 
-    let outcome = f.service.apply_codex(f.key_id, None, true).unwrap();
+    let outcome = apply_codex_retry_on_busy(&f, true).unwrap();
     assert!(outcome.preserve_auth);
     assert!(outcome.auth.is_none(), "保留结果不得含 auth");
     assert_eq!(
