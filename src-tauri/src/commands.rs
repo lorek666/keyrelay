@@ -944,6 +944,14 @@ fn parse_channel(raw: &str) -> Result<tianshu_relay_core::delivery::DeliveryChan
 /// 只用于投递命令（`delivery_plan` / `grant_consent` / `revoke_consent` /
 /// `apply_delivery` / `rollback_delivery`）；其它命令的错误形态不在本组范围，
 /// 不顺手扩大（避免误改正常文案）。
+///
+/// DEBUG-G7 补齐 P2-K4（全命令层扩大评估，结论：不扩，记残留）：① 核心层
+/// 已在咽喉处 scrub（站点错误经 `scrub_error`、传输层 `describe` 先 scrub），
+/// 非投递命令的错误多为库内校验/存储错，本身不带上游回显，扩面边际收益低；
+/// ② `scrub` 会掩 ≥32 位 hex 串——诊断串里的 journal/sha256 标识同样会被掩，
+/// 逐条 103 处未逐一审计诊断损失；③ 命令层集成套件在本 VM 无法链接运行
+/// （缺 webkitgtk/gtk）， blanket 改动无验证手段。故扩面留待可在 Mac 上跑
+/// 通命令层集成套件时按命令逐条评估，不得以本段为“已全量 scrub”背书。
 fn scrub_err<E: std::fmt::Display>(e: E) -> String {
     tianshu_relay_core::redact::scrub(&e.to_string())
 }
@@ -2247,6 +2255,9 @@ pub struct BillReconciliationDto {
     pub flagged: bool,
     pub kind: String,
     pub source: Option<String>,
+    /// DEBUG-G7 补齐 P3-K3：该站最近一次账单导入是否 partial（站级信号，
+    /// 见核心层 `BillReconciliationRow::import_partial` 的语义说明）。
+    pub import_partial: bool,
 }
 
 /// M46-S6：网关成本与站点自报账单的只读对账（近 `days` 天，缺省 30，夹到 1..=90；
@@ -2271,6 +2282,7 @@ pub fn bill_reconciliation(
                     flagged: r.flagged,
                     kind: r.kind.as_str().to_string(),
                     source: r.source,
+                    import_partial: r.import_partial,
                 })
                 .collect()
         })
@@ -5359,10 +5371,10 @@ async fn restart_agent(
             .map_err(|_| "桌面通道写锁中毒：上一任写盘中异常，拒绝重启以免交错".to_string())?;
         tianshu_relay_core::restart::restart(target).map_err(|e| e.to_string())
     })
-        .await
-        .map_err(|e| format!("重启任务异常中断: {e}"))?
-        .map(restart_outcome_dto)
-        .map_err(|e| e.to_string())
+    .await
+    .map_err(|e| format!("重启任务异常中断: {e}"))?
+    .map(restart_outcome_dto)
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

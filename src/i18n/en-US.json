@@ -84,6 +84,9 @@
       "flaggedYes": "Over threshold",
       "incomparableTitle": "Incomparable rows",
       "incomparableNote": "The rows below cannot be compared against gateway-side USD cost because the bill currency is not USD, is empty, or the bill amount is empty, so they do not take part in over-threshold filtering. They are also flagged=true in the IPC, but they are grouped separately here instead of being mixed with over-threshold rows.",
+      "gatewayOnlyTitle": "Gateway-only rows (no site bill)",
+      "gatewayOnlyNote": "The rows below have gateway cost but no matching site bill. They are grouped separately regardless of amount and are not affected by the “flagged only” filter; no over-threshold mark is shown on them—“no bill” is itself the signal, and small rows used to be hidden by that filter.",
+      "importPartialNote": "Note: a site's latest bill import did not finish (only the most recent pages were imported), so missing days may be import truncation rather than genuinely missing bills. Re-import before drawing conclusions.",
       "empty": "No reconciliation rows in this window.",
       "flaggedEmpty": "No over-threshold rows in this window."
     },

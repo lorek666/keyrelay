@@ -161,6 +161,12 @@ pub fn profiles_dir(home: &Path) -> PathBuf {
 /// - 规范路径 visited 集 + 深度上限（`MAX_SCAN_DEPTH`）：同一目录经不同路径
 ///   到达只扫一次，超深嵌套直接截断。
 /// - 「任一引用即通过」的判定语义不变（见 `check_credential_reference_in`）。
+/// - DEBUG-G7 补齐 P2-C4（深度上限声明，取“文档声明”分支）：`MAX_SCAN_DEPTH`
+///   = 8 是硬性口径——第 9 层及更深目录不扫，其中 `*.patch.yml` 不计入引用
+///   判定，且截断不在前端单列（截断不是读失败，不得混进 `unreadable_dirs`）。
+///   profiles 正常布局是扁平文件，8 层已远超实际；超深布局的用户须把
+///   profile 移到 8 层内，否则引用判定会漏算（fail-closed 方向：漏算只会
+///   导致拒绝投递，不会放行半注入）。
 const MAX_SCAN_DEPTH: usize = 8;
 
 fn profile_patch_files(profiles_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
@@ -600,6 +606,34 @@ mod tests {
         assert_eq!(check.unreadable_dirs, vec![missing.clone()]);
         let err = unreferenced_error(&check, writer_in(dir.path()).path()).to_string();
         assert!(err.contains("读失败"), "{err}");
+    }
+
+    #[test]
+    fn scan_truncates_beyond_max_depth_but_scans_at_max_depth() {
+        // DEBUG-G7 补齐 P2-C4：深度上限 8 的钉子——第 8 层目录里的引用文件
+        // 计入，第 9 层的不计入（且不算读失败、不进 unreadable_dirs）。
+        let dir = tmp();
+        let profiles = dir.path().join("profiles");
+        let mut at8 = profiles.clone();
+        for level in 0..8 {
+            at8 = at8.join(format!("d{level}"));
+        }
+        let at9 = at8.join("d8");
+        std::fs::create_dir_all(&at9).unwrap();
+        std::fs::write(
+            at8.join("shallow.patch.yml"),
+            "providers:\n  x:\n    apiKeyEnv: KEYRELAY_API_KEY\n",
+        )
+        .unwrap();
+        std::fs::write(
+            at9.join("deep.patch.yml"),
+            "providers:\n  x:\n    apiKeyEnv: KEYRELAY_API_KEY\n",
+        )
+        .unwrap();
+        let check = check_credential_reference_in(&profiles);
+        assert_eq!(check.checked_files, vec![at8.join("shallow.patch.yml")]);
+        assert!(check.is_referenced());
+        assert!(check.unreadable_dirs.is_empty());
     }
     #[test]
     fn replaces_existing_key() {

@@ -20,6 +20,13 @@ import { useTranslation } from "../i18n";
  * - 不可比组：`diffUsd === null` 的行单独立组，永远不进可比表的 flagged
  *   筛选，也不挂「超阈值」标记（只挂「不可比」说明）。
  *
+ * DEBUG-G7 补齐 P3-K6：`gateway_only` 行同样单独立组——“网关有成本、站点
+ * 无账单”本身就是信号，不应只由阈值决定可见性（小额行在旧版里开
+ * 「仅看超阈值」时会被隐藏）。该组不受 flagged 筛选影响，行内不挂
+ * 「超阈值」标记（阈值对“无账单”没有意义）。
+ * DEBUG-G7 补齐 P3-K3：任一行 `importPartial` 为真时，卡片顶部出横幅——
+ * 该站最近一次账单导入未取完，缺失天数可能是导入截断而非真无账单。
+ *
  * 覆盖度文案必须如实（B-251 要求）：目前账单来源基本只有 NewAPI 系导入，
  * 其它来源的账单只有被导入后才会出现；数据随导入节拍更新，有滞后——
  * 绝不写成实时全来源对账。
@@ -39,9 +46,11 @@ export default function ReconciliationCard() {
   const money = (v: number | null) => (v === null ? "—" : `${v.toFixed(2)} USD`);
 
   const all = rows.data ?? [];
-  const comparable = all.filter((r) => r.diffUsd !== null);
+  const comparable = all.filter((r) => r.diffUsd !== null && r.kind !== "gateway_only");
+  const gatewayOnly = all.filter((r) => r.kind === "gateway_only");
   const incomparable = all.filter((r) => r.diffUsd === null);
   const shown = flaggedOnly ? comparable.filter((r) => r.flagged) : comparable;
+  const hasPartialImport = all.some((r) => r.importPartial);
 
   const renderRows = (list: BillReconciliation[], withFlag: boolean) =>
     list.map((row) => (
@@ -62,6 +71,11 @@ export default function ReconciliationCard() {
     <div className="hm-card">
       <h3>{t("usage.reconciliation.title")}</h3>
       <p className="muted">{t("usage.reconciliation.body")}</p>
+      {hasPartialImport ? (
+        <p className="warnline" role="alert">
+          <AlertTriangle size={14} aria-hidden /> {t("usage.reconciliation.importPartialNote")}
+        </p>
+      ) : null}
       <div className="row">
         <select
           className="input"
@@ -111,6 +125,26 @@ export default function ReconciliationCard() {
             : t("usage.reconciliation.empty")}
         </p>
       )}
+      {gatewayOnly.length > 0 ? (
+        <div>
+          <h4>{t("usage.reconciliation.gatewayOnlyTitle")}</h4>
+          <p className="muted">{t("usage.reconciliation.gatewayOnlyNote")}</p>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>{t("usage.reconciliation.day")}</th>
+                <th>{t("usage.reconciliation.site")}</th>
+                <th>{t("usage.reconciliation.gateway")}</th>
+                <th>{t("usage.reconciliation.bill")}</th>
+                <th>{t("usage.reconciliation.diff")}</th>
+                <th>{t("usage.reconciliation.kind")}</th>
+                <th>{t("usage.reconciliation.flagged")}</th>
+              </tr>
+            </thead>
+            <tbody>{renderRows(gatewayOnly, false)}</tbody>
+          </table>
+        </div>
+      ) : null}
       {incomparable.length > 0 ? (
         <div>
           <h4>{t("usage.reconciliation.incomparableTitle")}</h4>
