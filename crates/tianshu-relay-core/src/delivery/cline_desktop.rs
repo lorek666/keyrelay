@@ -6,6 +6,18 @@
 //! 与 VS Code 扩展的 `cline` 通道是**不同产品**：VS Code 扩展写入 globalStorage 下的
 //! `settings.json`（数组结构），桌面端写入 `.cline/data/settings/providers.json`
 //!（对象结构）。
+//!
+//! 下线说明（B-292，2026-10-25）：本 writer 已下线，不再接线到任何投递入口
+//! （`delivery/mod.rs` 的解析函数对 `ClineDesktop` 一律返回下线错误），
+//! 本文件本体及其实测留仓备复活，不得删除。
+//! 下线原因有二：① 同行做法——cc-switch 根本不把 Cline 当可写文件目标，
+//! LoongPort 干脆不提供 Cline，magpie 即使标支持 Cline 也只做最小单键编辑；
+//! ② 本 writer 已核实的风险——`build_after` 每次以全新 settings 对象覆盖整个
+//! `keyrelay` 条目并强制 `tokenSource: "api-key"`，条目原有未知字段（如 OAuth
+//! 的 `auth` 对象）会被静默删除；且无视应用自身的 `.oauth-*.lock` 锁、不停应用，
+//! 应用退出时可能覆盖外部改动。
+//! 复活条件见 ADR-0006 §9 复活清单：schema 公开核实、定向字段合并替代整条目替换、
+//! `.oauth-*.lock` 锁策略、写前停应用、重启生效验证——复核通过不等于直接恢复上架。
 
 use std::path::{Path, PathBuf};
 

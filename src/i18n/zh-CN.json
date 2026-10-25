@@ -836,6 +836,9 @@
       "revoked": "已撤销同意。已写入的文件不会被自动回滚——如需还原请用「变更历史」页。",
       "rolledBack": "已回滚 {journal}。"
     },
+    "delivery": {
+      "clineDesktopDelisted": "Cline Desktop 暂不支持文件直写，请走 cline auth CLI"
+    },
     "workbench": {
       "title": "支持的 Agent（{count}）",
       "hint": "一行一个落点。已安装的直接选密钥/模型后展开预览；未安装的先按命令装好再重新检测。",

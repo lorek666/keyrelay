@@ -1306,9 +1306,31 @@ export async function siteBalance(siteId: number): Promise<Balance> {
   return invokeCommand<Balance>("site_balance", { siteId });
 }
 
+/**
+ * 「这个投递错误是不是 Cline Desktop 下线」——界面据此展示本地化文案，
+ * 而不是后端中文原文（B-292；与 isCaptchaRequired 同款后端原文匹配）。
+ * 匹配的是后端 resolve 的 Display 原文（`invokeCommand` 已把后端错误
+ * 转成 `Error(message)`，这里只看 message）。
+ */
+export function isClineDesktopDelistedError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes("暂不支持文件直写");  // i18n:skip
+}
+
+/** 下线错误 → 本地化文案；不是下线错误时返回 null（调用方原样透传）。 */
+function localizeDelistedError(err: unknown): string | null {
+  if (!isClineDesktopDelistedError(err)) return null;
+  return translate(getCurrentDict(), "agents.delivery.clineDesktopDelisted");
+}
+
 export async function deliveryPlan(args: DeliveryArgs): Promise<DeliveryPlan> {
   if (!hasTauri) return mock(MOCK_PLAN);
-  return invokeCommand<DeliveryPlan>("delivery_plan", { args });
+  try {
+    return await invokeCommand<DeliveryPlan>("delivery_plan", { args });
+  } catch (err) {
+    const localized = localizeDelistedError(err);
+    if (localized !== null) throw new Error(localized);
+    throw err;
+  }
 }
 
 export async function grantConsent(args: DeliveryArgs): Promise<void> {
@@ -1360,7 +1382,8 @@ export async function listChannelBindings(): Promise<ChannelBinding[]> {
  * 与 `Agents.tsx` 的 `CHANNELS` **同源不同处**：那张表驱动投递页的落点卡片，
  * 这张只服务「从一条 binding 反查它属于哪条通道」。两边都由
  * `scripts/check-commands.mjs` 的通道名对账守着 id 集合一致（B-101），
- * 所以不会静默分叉。
+ * 所以不会静默分叉。B-292 例外：cline-desktop 已下线，本表因此比后端
+ * 通道集合少一条——对账脚本 §5/§5b 对此有显式豁免，不是分叉。
  *
  * `file` 是**文件名**（不是整条路径）：一个 agent 可能对应多条通道
  * （`opencode` 同时有 `opencode.json` 与 `opencode.jsonc` 两条），靠它二分。
@@ -1398,7 +1421,8 @@ const AGENT_CHANNELS: Record<string, string> = {
   deepseek: "deepseek",
   trae: "trae",
   "mimo-code": "mimo-code",
-  "cline-desktop": "cline-desktop",
+  // B-292：Cline Desktop 已下线，不再属于可投递通道——旧绑定行至此查不到通道，
+  // 批量改指页按「无法识别通道」列出（行本身不隐藏），不再为其发起新的投递计划。
   "dsh": "dsh",
 };
 
@@ -1438,7 +1462,13 @@ export async function applyDelivery(
       ],
     });
   }
-  return invokeCommand<DeliveryOutcome>("apply_delivery", { args });
+  try {
+    return await invokeCommand<DeliveryOutcome>("apply_delivery", { args });
+  } catch (err) {
+    const localized = localizeDelistedError(err);
+    if (localized !== null) throw new Error(localized);
+    throw err;
+  }
 }
 
 /**

@@ -16,7 +16,7 @@ import zhCN from "../i18n/zh-CN.json";
  * ③ 成功：提示含新旧版本；重取后徽标消失、版本更新；`updateAgent` 只调用一次（pending 防重复）。
  * ④ 失败：展示 attempts 的退出码与 `outputTail`；行仍显示可更新；不崩溃。
  * ⑤ `autoUpdate:false` 的可更新行只有徽标，没有可点击的「更新」按钮。
- * ⑥ `checkAgentUpdates` 失败：汇总卡显示错误 + 重试按钮，工作台 20 行照常渲染。
+ * ⑥ `checkAgentUpdates` 失败：汇总卡显示错误 + 重试按钮，工作台 19 行照常渲染（B-292）。
  *
  * 不依赖网络：所有查询都 mock 成固定数据；`updateAgent` 在用例内按需换实现。
  */
@@ -445,7 +445,7 @@ describe("M34-S1 Agent 更新", () => {
     expect(text).not.toContain("未知");
   });
 
-  it("⑥ checkAgentUpdates 失败：汇总卡显示错误 + 重试，20 行照常渲染", async () => {
+  it("⑥ checkAgentUpdates 失败：汇总卡显示错误 + 重试，19 行照常渲染", async () => {
     const { checkAgentUpdates } = await import("../lib/api");
     (checkAgentUpdates as unknown as { mockRejectedValueOnce: (e: Error) => void }).mockRejectedValueOnce(
       new Error("网络不可用"),
@@ -462,7 +462,7 @@ describe("M34-S1 Agent 更新", () => {
     expect(Array.from(card.querySelectorAll("button")).some((b) => (b.textContent ?? "").includes("重试"))).toBe(
       true,
     );
-    // 工作台 20 行照常渲染
+    // 工作台 19 行照常渲染（B-292）
     expect(rows().length).toBe(CHANNELS.length);
   });
 });

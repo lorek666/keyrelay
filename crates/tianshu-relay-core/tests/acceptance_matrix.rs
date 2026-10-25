@@ -255,6 +255,10 @@ fn inject_rollback_roundtrip_is_byte_identical() {
     let original = b"{\n  \"user_comment\": \"keep my own bytes\"\n}\n".to_vec();
 
     for channel in DeliveryChannel::ALL {
+        // B-292：ClineDesktop 已下线，不再投递，跳过。
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         let model = model_for(channel);
         let name = channel.as_str();
 
@@ -859,6 +863,10 @@ async fn concurrent_inject_same_file_is_rejected() {
 fn injection_is_idempotent_across_channels() {
     let f = setup();
     for channel in DeliveryChannel::ALL {
+        // B-292：ClineDesktop 已下线，不再投递，跳过。
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         let model = model_for(channel);
         let name = channel.as_str();
         // P0-3：DSH 投递要求至少一个 profile 引用 KEYRELAY_API_KEY，

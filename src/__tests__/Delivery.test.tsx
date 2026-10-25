@@ -84,8 +84,9 @@ describe("Delivery", () => {
   it("Agent 通道区与投递记录区同时在列", async () => {
     render(<Delivery />, { wrapper });
     await waitFor(() => {
-      // 通道区标题的 count 是 CHANNELS 常量（20 条含 DeepSeek Harness），与探测结果无关
-      expect(screen.getByText("支持的 Agent（20）")).toBeTruthy();
+      // 通道区标题的 count 是 CHANNELS 常量（19 条，B-292 下线 Cline Desktop 后），与探测结果无关
+      // B-292：Cline Desktop 已下线，工作台标题计数随 CHANNELS 变为 19。
+      expect(screen.getByText("支持的 Agent（19）")).toBeTruthy();
     });
     // 投递记录区是异步查询渲染的，需等它出现（通道区标题先出现不代表记录行已出现）
     await waitFor(() => {

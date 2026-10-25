@@ -220,8 +220,26 @@ fn existing_world_readable_file_is_tightened() {
 fn target_path_matches_relative_target_for_all_channels() {
     // **安全边界端到端钉住**：`service.rs::checked_target` 用
     // `home.join(channel.relative_target())` 逐字比对投递目标。
+    // B-292：ClineDesktop 已下线，服务层计划同样拒绝——它不进本测试的循环，
+    // 而是在这里钉住计划失败本身（失败原因必须提到 cline auth CLI 去向）。
     let f = setup();
+    let delisted = f.service.delivery_plan_with_model(
+        f.key_id,
+        DeliveryChannel::ClineDesktop,
+        model_for(DeliveryChannel::ClineDesktop),
+    );
+    let delisted_err = match delisted {
+        Ok(_) => panic!("ClineDesktop 应已下线，不应生成计划"),
+        Err(e) => e,
+    };
+    assert!(
+        delisted_err.to_string().contains("cline auth"),
+        "ClineDesktop 下线错误必须指明 cline auth CLI 去向：{delisted_err}"
+    );
     for channel in DeliveryChannel::ALL {
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         let target = target_of(&f, channel);
         assert_eq!(
             target,
@@ -250,8 +268,21 @@ fn target_path_matches_relative_target_for_all_channels() {
 #[test]
 fn writer_target_is_inside_home_and_equals_declared_relative_target() {
     // 不经服务层，直接对写入器比对（`checked_target` 的**必要条件**）。
+    // B-292：ClineDesktop 已下线，不再能解析出 writer——它不进本测试的计数，
+    // 而是在这里钉住下线错误本身（下线错误必须提到 cline auth CLI 去向）。
     let home = Path::new("/tmp/nobody");
+    let delisted_err = match resolve_for(DeliveryChannel::ClineDesktop, home, BASE_URL) {
+        Ok(_) => panic!("ClineDesktop 应已下线，不应解析出 writer"),
+        Err(e) => e,
+    };
+    assert!(
+        delisted_err.to_string().contains("cline auth"),
+        "ClineDesktop 下线错误必须指明 cline auth CLI 去向：{delisted_err}"
+    );
     for channel in DeliveryChannel::ALL {
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         let writer = resolve_for(channel, home, BASE_URL).expect("可解析");
         assert_eq!(
             writer.target_path(),
