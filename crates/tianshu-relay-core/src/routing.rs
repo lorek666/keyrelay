@@ -608,8 +608,9 @@ impl Default for BreakerPolicy {
 }
 
 /// DEBUG P1-2：HalfOpen 探针「在飞」标记的过期时限（见 `Breaker::probe_in_flight`）。
-/// 正常探针在响应头到达时即由 `record_*` 清除（秒级）；时限只给「取走后没走到
-/// 发送」的泄漏标记一个自愈上界，不参与 Closed/Open 判定。
+/// 正常探针在响应头到达时即清除（秒级）：2xx / failover 结果经 `record_*`，
+/// 非 failover 非 2xx 结果（DEBUG P2-1）经 `release_half_open_probe`；
+/// 时限只给「取走后没走到发送」的泄漏标记一个自愈上界，不参与 Closed/Open 判定。
 const PROBE_IN_FLIGHT_TTL: Duration = Duration::from_secs(600);
 
 /// 按 `site_id` 计数的连续失败熔断。
@@ -627,7 +628,8 @@ pub struct Breaker {
     /// `record_*` 会回来清标记，旧的 `HashSet` 会让该键永久报 HalfOpen 却再也
     /// 取不到探针。过期只放宽「在飞」互斥的**时限**，不改 Closed/Open 判定：
     /// 过期后下一次 `try_take_half_open_probe` 可再放一个探针；迟到的旧探针结果
-    /// 回来时仍经 `record_*` 清除（`remove` 对过期/未过期一视同仁）。
+    /// 回来时按结果分流清除：2xx / failover 经 `record_*`，非 failover 非 2xx
+    /// 经 `release_half_open_probe`（`remove` 对过期/未过期一视同仁）。
     /// 时限取 10 分钟：探针在飞的合法上限是「响应头耗时」——全局默认
     /// connect 5s + read 240s ≈ 245s，10 分钟留有余量，正常探针（秒级）不受影响。
     probe_in_flight: HashMap<BreakerKey, Instant>,
@@ -683,6 +685,17 @@ impl Breaker {
         self.probe_in_flight.remove(key);
     }
 
+    /// DEBUG P2-1：只释放 HalfOpen 探针标记，**不动 `entries`**。
+    ///
+    /// 供主循环「非 failover 且非 2xx」分支调用：这类结果按 P1-1 的三段互斥
+    /// 既不喂失败也不记成功，故不能走 `record_*`，但探针本身已经回来，
+    /// 标记再留着就会等到 TTL（最长 600s）才可再探。对非探针键是无害 no-op
+    /// （`remove` 一个不存在的键），且与 `record_*` 的 remove 共享同一竞态
+    /// 模型（迟到结果删掉后来探针的标记这一竞态本来就存在，不新引入）。
+    pub fn release_half_open_probe(&mut self, key: &BreakerKey) {
+        self.probe_in_flight.remove(key);
+    }
+
     /// 只读查询，**不**改状态。`Open` 且冷却已过 ⇒ `HalfOpen`（允许一个探活请求）。
     /// M40-S2：该站点**任意模型**上最坏的那个熔断态（`Open > HalfOpen > Closed`）。
     ///
@@ -719,7 +732,9 @@ impl Breaker {
     /// `true`（本次调用方就是那个唯一的探针）；否则 `false`（已有探针在飞，或非
     /// HalfOpen）。**会改状态**——与 [`Self::state`] 的只读不同：`state` 谁调都看到
     /// HalfOpen，本方法只有第一个调用者拿到探针，其余并发请求看到标记即跳过，
-    /// 不会全部涌向坏上游。探针结果回来后由 `record_success` / `record_failure` 清除。
+    /// 不会全部涌向坏上游。探针结果回来后按结果分流清除：2xx / failover 由
+    /// `record_success` / `record_failure`，非 failover 非 2xx 由
+    /// `release_half_open_probe`（只清标记，不动熔断计数）。
     ///
     /// DEBUG P1-2：标记过期自愈（见 `probe_in_flight` 字段注释）。过期标记先被
     /// 清掉再放新探针，因此「探针被取走却没走到发送」不再永久卡死；时限内
@@ -1341,6 +1356,46 @@ mod tests {
         assert!(
             b.try_take_half_open_probe(&site_key(1), t_expired),
             "泄漏的探针标记过期后应可再放探针"
+        );
+    }
+
+    #[test]
+    fn release_half_open_probe_clears_mark_without_touching_entries() {
+        // DEBUG P2-1：释放只删探针标记，不动熔断 entries——state 仍为 HalfOpen
+        // （若误清 entries，state 会退回 Closed；若误攒失败，冷却会刷新）。
+        let mut b = Breaker::new(BreakerPolicy::default());
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            b.record_failure(&site_key(1), t0);
+        }
+        let t1 = t0 + Duration::from_secs(61);
+        assert_eq!(b.state(&site_key(1), t1), BreakerState::HalfOpen);
+        assert!(b.try_take_half_open_probe(&site_key(1), t1));
+        assert!(
+            !b.try_take_half_open_probe(&site_key(1), t1),
+            "探针在飞时不得再放第二个探针"
+        );
+        // 对非探针键释放是无害 no-op：不改 site1 的标记，也不凭空建 entries。
+        b.release_half_open_probe(&site_key(2));
+        assert_eq!(
+            b.state(&site_key(2), t1),
+            BreakerState::Closed,
+            "非探针键释放不得凭空建熔断条目"
+        );
+        assert!(
+            !b.try_take_half_open_probe(&site_key(1), t1),
+            "释放他键不得放行 site1 的探针"
+        );
+        // 释放本键：下一次可再取探针，且熔断态仍为 HalfOpen（计数/冷却未动）。
+        b.release_half_open_probe(&site_key(1));
+        assert_eq!(
+            b.state(&site_key(1), t1),
+            BreakerState::HalfOpen,
+            "释放不得清零熔断计数或刷新冷却"
+        );
+        assert!(
+            b.try_take_half_open_probe(&site_key(1), t1),
+            "释放后下一次请求应可再次取探针"
         );
     }
 

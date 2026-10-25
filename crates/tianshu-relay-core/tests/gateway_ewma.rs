@@ -440,3 +440,91 @@ async fn non_failover_401_neither_clears_breaker_nor_feeds_ewma() {
 
     handle.shutdown_and_wait().await;
 }
+
+/// DEBUG P2-1（P1-1 × P1-2 联动）：HalfOpen 探针返回 401 后，下一次请求
+/// 必须可再次取探针，且熔断计数与 EWMA 均未被该 401 改变。
+/// 序列：500（threshold=1 ⇒ Open）→ 冷却 300ms 过后探针 401 → 立即再请求。
+/// 若 401 不释放探针标记，第二次请求会在 eligible 里跳过 site1、改打 site2
+/// （200，b=1，a 停在 2），本用例即红；若 401 被误当失败/成功，探针后熔断
+/// 会是 open（冷却被刷新）或 closed（计数被清零），halfOpen 断言即红。
+/// 正确行为：两次探针都打 site1（401 原样返回），EWMA 恒为 None，熔断恒为
+/// HalfOpen——P1-1 的「4xx 两者都不做」仍成立，变的只是探针标记被释放。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn half_open_probe_401_releases_probe_without_touching_breaker_or_ewma() {
+    let a = spawn_upstream(
+        1,
+        &[
+            "500 Internal Server Error",
+            "401 Unauthorized",
+            "401 Unauthorized",
+        ],
+        Duration::ZERO,
+    );
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let mut cfg = config(
+        vec![
+            upstream(1, &a.base_url, REF_A, 1.0, Some(10)),
+            upstream(2, &b.base_url, REF_B, 1.0, Some(10)),
+        ],
+        keys(&[(REF_A, KEY_A), (REF_B, KEY_B)]),
+        1,
+    );
+    cfg.breaker = BreakerPolicy {
+        threshold: 1,
+        cooldown: Duration::from_millis(300),
+    };
+    let handle = start(cfg).await.expect("网关应能启动");
+    let tok = handle.token.clone();
+
+    assert_eq!(post(&handle, &tok).await.0, 500, "第 1 个 500 应打开熔断");
+    assert_eq!(a.count(), 1);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let (status, body) = post(&handle, &tok).await;
+    assert_eq!(status, 401, "探针 401 应原样返回");
+    assert!(body.contains("site1"), "探针应打 site1，实测 {body}");
+    assert_eq!(a.count(), 2, "探针应打到 site1");
+    assert_eq!(b.count(), 0, "探针在场时 site2 不应被打");
+    assert_eq!(
+        handle.metrics().per_site[&1i64].ewma_latency_ms,
+        None,
+        "探针 401 不得喂进 EWMA"
+    );
+    let breaker_after_probe = handle
+        .candidates()
+        .into_iter()
+        .find(|c| c.site_id == 1)
+        .expect("site1 应在候选里")
+        .breaker;
+    assert_eq!(
+        breaker_after_probe, "halfOpen",
+        "探针 401 后熔断仍为 HalfOpen（既未清零成 Closed，也未刷新冷却成 Open）"
+    );
+
+    // 立即再请求（远在 600s TTL 内）：若标记未释放，此处必改打 site2。
+    let (status, body) = post(&handle, &tok).await;
+    assert_eq!(status, 401, "第二次探针 401 应原样返回");
+    assert!(
+        body.contains("site1"),
+        "释放后下一次请求应再次取探针打 site1，实测 {body}"
+    );
+    assert_eq!(a.count(), 3, "第二次探针应再次打到 site1");
+    assert_eq!(b.count(), 0, "标记已释放时 site2 仍不应被打");
+    assert_eq!(
+        handle.metrics().per_site[&1i64].ewma_latency_ms,
+        None,
+        "两次探针 401 均不得喂进 EWMA"
+    );
+    let breaker_after_second_probe = handle
+        .candidates()
+        .into_iter()
+        .find(|c| c.site_id == 1)
+        .expect("site1 应在候选里")
+        .breaker;
+    assert_eq!(
+        breaker_after_second_probe, "halfOpen",
+        "第二次探针 401 后熔断仍为 HalfOpen"
+    );
+
+    handle.shutdown_and_wait().await;
+}

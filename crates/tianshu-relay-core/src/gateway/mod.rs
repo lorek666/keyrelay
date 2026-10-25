@@ -2666,7 +2666,8 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                 // 当成功，使 401/403/404/400 也清零熔断计数、把快速拒绝延迟喂进
                 // EWMA 与服务侧 `site_facts.latency_ms`（死站反而显得「快」）。
                 // 三段互斥：failover ⇒ 喂失败；2xx ⇒ 记成功；其余 4xx ⇒ 两者都不做
-                // （既不攒失败、也不清零、不喂延迟——它是一个答案，不是故障也不是成功）。
+                // （既不攒失败、也不清零、不喂延迟——它是一个答案，不是故障也不是成功；
+                // DEBUG P2-1 的探针标记释放不属「两者」：它只删标记，不动熔断计数）。
                 let is_success = (200..300).contains(&status);
                 observe(&state, upstream.site_id, latency_ms, is_success);
                 state
@@ -2699,9 +2700,14 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                     state
                         .metrics
                         .record_measured_latency(upstream.site_id, latency_ms);
+                } else {
+                    // DEBUG P2-1：非 failover 且非 2xx（401/403/404/400 等）：
+                    // 三段互斥不变——不清零、不喂 EWMA、不喂熔断；但探针本身已经
+                    // 回来，只释放探针标记（对非探针键是无害 no-op），否则该标记
+                    // 只能等 TTL（最长 600s），期间同键不可再探。响应本身仍按
+                    // 既有路径原样返回。
+                    release_half_open_probe(&state, &breaker_key);
                 }
-                // 非 failover 且非 2xx（401/403/404/400 等）：刻意空分支——
-                // 不清零、不喂 EWMA、不喂熔断。响应本身仍按既有路径原样返回。
                 // M16-S4 / P2-13：**只有 429 才重放**（上游明确没处理这个请求）。
                 // 其余状态码——含 5xx / 524 / 504 这类可能已经计费的——一律**原样返回**：
                 // 重复计费不可逆，可用性由「熔断 → 下一个请求换上游」承接。
@@ -3566,7 +3572,9 @@ fn eligible_candidates<'a>(
             BreakerState::Open => continue,
             BreakerState::HalfOpen => {
                 // P2-8：第一个拿到探针的请求在 Breaker 里标记，其余并发请求看到标记
-                // 即跳过。探针结果回来后由 record_success / record_failure 清除标记。
+                // 即跳过。探针结果回来后按结果分流清除标记：2xx / failover 由
+                // record_success / record_failure，非 failover 非 2xx 由
+                // release_half_open_probe（DEBUG P2-1，只清标记）。
                 if guard.try_take_half_open_probe(&key, now) {
                     // M39-S3 §4.1：探针**不参与加权轮转**，由 `weighted_pick` 优先返回。
                     out.push(Candidate {
@@ -3605,6 +3613,14 @@ fn now_unix_secs() -> i64 {
 fn record_success(state: &AppState, key: &BreakerKey, now: Instant) {
     if let Ok(mut guard) = state.breaker.lock() {
         guard.record_success(key, now);
+    }
+}
+
+/// DEBUG P2-1：只释放探针标记，不动熔断计数、不喂 EWMA。
+/// 供「非 failover 且非 2xx」分支调用；对非探针键是无害 no-op。
+fn release_half_open_probe(state: &AppState, key: &BreakerKey) {
+    if let Ok(mut guard) = state.breaker.lock() {
+        guard.release_half_open_probe(key);
     }
 }
 
