@@ -26,7 +26,10 @@ import {
   unbindAgent,
   checkAgentUpdates,
   updateAgent,
+  restartCodex,
+  restartClaudeDesktop,
   type DeliveryMode,
+  type RestartOutcome,
   type AgentStatus,
   type DeliveryOutcome,
   type DeliveryPlan,
@@ -748,6 +751,9 @@ export default function Agents() {
                         onRevoke={() => setRevoking(true)}
                       />
                     ) : null}
+                    {/* P1-5：一键重启区。key 换通道即重置结果/错误，不串台。
+                        放在预览条件之外：重启不需要先选 key，投递失败时也能用。 */}
+                    <RestartSection key={channel} channel={channel} />
                   </div>
                 ) : null}
               </li>
@@ -1248,6 +1254,216 @@ function UpdateAttempts({ outcome }: { outcome: AgentUpdateOutcome }) {
           ) : null}
         </div>
       ))}
+    </div>
+  );
+}
+
+/**
+ * 一键重启区（投递改进 P1-5）。
+ *
+ * 第一批只做两类目标：Codex（两条通道共用一个桌面重启）与 Claude Desktop，都是
+ * 「完全退出重开」。Codex 行的标题/确认/结果文案必须点名实际目标 ChatGPT 桌面应用，
+ * 不得复用「Codex CLI」之名；终端 codex 会话不受按钮影响，靠可复制命令自行重开。
+ * 其余 CLI 类 agent 不给重启按钮，只给可复制的启动命令——
+ * 应用绝不替用户拉终端进程（启动命令的 bin 名与后端 agents.rs 的探测 bin 同源）。
+ * App / 扩展类通道（Cursor、Trae、Cline、Cline Desktop、DSH）既无重启按钮也无
+ * 启动命令：本项不做它们，不给点了才报错的按钮。
+ *
+ * daemon 清单项永远是「未验证」：后端结果的 daemon 状态恒为 unverified，这里只负责
+ * 原样渲染，不得把它画成已通过。只杀窗口可能不生效的说明见 i18n 文案。
+ */
+const RESTART_TARGET_BY_CHANNEL: Record<string, "codex" | "claude-desktop"> = {
+  "codex-auth-json": "codex",
+  "codex-config": "codex",
+  "claude-desktop": "claude-desktop",
+};
+
+const CLI_LAUNCH_COMMANDS: Record<string, string> = {
+  "claude-code-settings": "claude",
+  opencode: "opencode",
+  "opencode-jsonc": "opencode",
+  "gemini-cli": "gemini",
+  "grok-build": "grok",
+  openclaw: "openclaw",
+  hermes: "hermes",
+  mcode: "mcode",
+  pi: "pi",
+  "qwen-code": "qwen",
+  deepseek: "reasonix",
+  "mimo-code": "mimocode",
+};
+
+function RestartSection({ channel }: { channel: string }) {
+  const { t } = useTranslation();
+  const target = RESTART_TARGET_BY_CHANNEL[channel];
+  const cliCommand = CLI_LAUNCH_COMMANDS[channel];
+  const [confirming, setConfirming] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [result, setResult] = useState<RestartOutcome | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
+
+  if (!target && !cliCommand) return null;
+
+  const name = channelName(CHANNELS.find((c) => c.id === channel)?.label ?? channel);
+
+  const copy = async (key: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(key);
+      setTimeout(() => setCopied(null), 1500);
+    } catch {
+      setCopied(`failed:${key}`);
+      setTimeout(() => setCopied(null), 1500);
+    }
+  };
+
+  const run = async () => {
+    if (!target || pending) return;
+    setPending(true);
+    setError(null);
+    try {
+      const outcome =
+        target === "codex" ? await restartCodex() : await restartClaudeDesktop();
+      setResult(outcome);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setPending(false);
+      setConfirming(false);
+    }
+  };
+
+  const copyRow = (key: string, command: string) => (
+    <p className="install-cmd">
+      <code className="mono install-cmd-text">{command}</code>
+      <button type="button" className="btn" onClick={() => copy(key, command)}>
+        <Copy size={14} aria-hidden />{" "}
+        {copied === key
+          ? t("agents.install.copied")
+          : copied === `failed:${key}`
+            ? t("agents.install.copyFailed")
+            : t("agents.install.copy")}
+      </button>
+    </p>
+  );
+
+  return (
+    <div className="card">
+      {target ? (
+        <>
+          <div className="row row-between">
+            <h4>
+              {target === "codex"
+                ? t("agents.restart.codexTitle")
+                : t("agents.restart.title", { name })}
+            </h4>
+          </div>
+          <p className="muted">
+            {target === "codex"
+              ? t("agents.restart.codexHint")
+              : t("agents.restart.hint")}
+          </p>
+          <div className="row">
+            <button
+              type="button"
+              className="btn btn-danger"
+              disabled={pending}
+              onClick={() => {
+                setError(null);
+                setConfirming(true);
+              }}
+            >
+              <RotateCcw size={14} aria-hidden /> {t("agents.restart.button")}
+            </button>
+          </div>
+          {error ? (
+            <p className="error" role="alert">
+              <AlertTriangle size={14} aria-hidden /> {error}
+            </p>
+          ) : null}
+          {result ? (
+            <div role="status">
+              <p className="ok">
+                {result.wasRunning
+                  ? target === "codex"
+                    ? t("agents.restart.codexResultWasRunning")
+                    : t("agents.restart.resultWasRunning")
+                  : target === "codex"
+                    ? t("agents.restart.codexResultWasNotRunning")
+                    : t("agents.restart.resultWasNotRunning")}
+              </p>
+              {result.forceKilled ? (
+                <p className="muted">{t("agents.restart.resultForceKilled")}</p>
+              ) : null}
+              <p className="muted">
+                {result.relaunched && result.appeared
+                  ? target === "codex"
+                    ? t("agents.restart.codexResultAppeared")
+                    : t("agents.restart.resultAppeared")
+                  : result.relaunched
+                    ? t("agents.restart.resultNotAppeared")
+                    : t("agents.restart.resultNotLaunched")}
+              </p>
+            </div>
+          ) : null}
+          {/* daemon 独立验证项：状态只取后端给的 unverified 渲染，绝不画成已通过。 */}
+          <ul className="list">
+            <li>
+              <span className="badge badge-warn">
+                {t("agents.restart.daemonUnverified")}
+              </span>{" "}
+              <strong>{t("agents.restart.daemonTitle")}</strong>
+              <div className="muted">{t("agents.restart.daemonNote")}</div>
+              {result?.appServerDaemonNote ? (
+                <div className="muted">{result.appServerDaemonNote}</div>
+              ) : null}
+            </li>
+          </ul>
+          {/* Codex 的终端会话不受桌面重启影响：可复制命令常驻，投递时停掉的 CLI
+              会话也靠它重开。Claude Desktop 没有 CLI 命令，不渲染这一行。 */}
+          {target === "codex" ? (
+            <div>
+              <p className="muted">{t("agents.restart.codexCliHint")}</p>
+              {copyRow("restart-cli", result?.manualLaunchCommand ?? "codex")}
+            </div>
+          ) : null}
+          <ConfirmDialog
+            open={confirming}
+            title={
+              target === "codex"
+                ? t("agents.restart.codexConfirmTitle")
+                : t("agents.restart.confirmTitle", { name })
+            }
+            danger
+            confirmLabel={pending ? t("agents.restart.restarting") : t("agents.restart.confirm")}
+            confirmDisabled={pending}
+            onCancel={() => {
+              if (pending) return;
+              setConfirming(false);
+            }}
+            onConfirm={run}
+          >
+            <p>
+              {target === "codex"
+                ? t("agents.restart.codexConfirmBody")
+                : t("agents.restart.confirmBody", { name })}
+            </p>
+            <p className="muted">{t("agents.restart.confirmDaemon")}</p>
+            {target === "codex" ? (
+              <p className="muted">{t("agents.restart.codexConfirmCliNote")}</p>
+            ) : null}
+          </ConfirmDialog>
+        </>
+      ) : (
+        <>
+          <div className="row row-between">
+            <h4>{t("agents.restart.cliTitle")}</h4>
+          </div>
+          <p className="muted">{t("agents.restart.cliHint")}</p>
+          {cliCommand ? copyRow("restart-cli", cliCommand) : null}
+        </>
+      )}
     </div>
   );
 }

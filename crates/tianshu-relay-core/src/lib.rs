@@ -24,6 +24,7 @@ pub mod probe;
 pub mod proxy;
 pub mod rebrand;
 pub mod redact;
+pub mod restart;
 pub mod rotation;
 pub mod routing;
 pub mod service;

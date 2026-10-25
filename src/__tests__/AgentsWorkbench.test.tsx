@@ -69,10 +69,21 @@ vi.mock("../lib/api", async (importOriginal) => {
       targetExists: true, mode: "site", fields: [], endpointInChannel: false,
       preview: "@@ -1 +1 @@\n-A\n+B\n", consent: "granted", restartHint: "none", warnings: [],
     })),
+    // P1-5：一键重启 mock（daemon 状态恒为 unverified，前端不得画成已通过）。
+    restartCodex: vi.fn(async () => ({
+      target: "codex", wasRunning: true, quitMethod: "pkill", forceKilled: false,
+      relaunched: true, appeared: true, manualLaunchCommand: "codex",
+      appServerDaemonStatus: "unverified", appServerDaemonNote: "后端 daemon 说明",
+    })),
+    restartClaudeDesktop: vi.fn(async () => ({
+      target: "claude-desktop", wasRunning: false, quitMethod: "none", forceKilled: false,
+      relaunched: true, appeared: true, manualLaunchCommand: null,
+      appServerDaemonStatus: "unverified", appServerDaemonNote: "",
+    })),
   };
 });
 
-import { deliveryPlan, listKeyModels } from "../lib/api";
+import { deliveryPlan, listKeyModels, restartCodex } from "../lib/api";
 
 const rows = () => Array.from(document.querySelectorAll<HTMLElement>("[data-agent-channel]"));
 const row = (id: string) => document.querySelector<HTMLElement>(`[data-agent-channel="${id}"]`)!;
@@ -440,5 +451,50 @@ describe("M31-S1 Agent 工作台", () => {
     fireEvent.click(row("codex-auth-json").querySelector(".agent-row-toggle")!);
     await waitFor(() => expect(consent()).not.toBeNull());
     expect(consent()!.checked).toBe(false);
+  });
+
+  it("⑫ P1-5：Codex 行有重启按钮，确认框先说明中断、确认后才调重启", async () => {
+    renderPage();
+    await waitFor(() => expect(keySelect("codex-auth-json")).not.toBeNull());
+    fireEvent.click(row("codex-auth-json").querySelector(".agent-row-toggle")!);
+    await waitFor(() => expect(document.querySelector(".agent-row-plan")).not.toBeNull());
+
+    const plan = document.querySelector(".agent-row-plan")!;
+    expect(plan.textContent).toContain(zhCN.agents.restart.codexTitle);
+    expect(plan.textContent).toContain(zhCN.agents.restart.button);
+    expect(plan.textContent).toContain(zhCN.agents.restart.daemonUnverified);
+
+    // 点重启按钮只开确认框，不调后端。
+    const restartBtn = Array.from(plan.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes(zhCN.agents.restart.button),
+    )!;
+    fireEvent.click(restartBtn);
+    await waitFor(() => expect(document.querySelector("dialog[open]")).not.toBeNull());
+    expect(restartCodex).not.toHaveBeenCalled();
+    const dialog = document.querySelector("dialog[open]")!;
+    expect(dialog.textContent).toContain(zhCN.agents.restart.codexConfirmBody);
+    expect(dialog.textContent).toContain(zhCN.agents.restart.codexConfirmCliNote);
+
+    // 点确认才调重启；结果渲染「ChatGPT 桌面应用已退出并重新拉起」与 daemon 未验证项，
+    // 且成功文案只说桌面应用已出现、不暗示终端 codex 会话已重读新配置。
+    const confirmBtn = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes(zhCN.agents.restart.confirm),
+    )!;
+    fireEvent.click(confirmBtn);
+    await waitFor(() => expect(restartCodex).toHaveBeenCalled());
+    await waitFor(() => expect(plan.textContent).toContain(zhCN.agents.restart.codexResultWasRunning));
+    await waitFor(() => expect(plan.textContent).toContain(zhCN.agents.restart.codexResultAppeared));
+    expect(plan.textContent).toContain("后端 daemon 说明");
+  });
+
+  it("⑬ P1-5：CLI 行没有重启按钮，只有可复制启动命令", async () => {
+    renderPage();
+    await waitFor(() => expect(keySelect("claude-code-settings")).not.toBeNull());
+    fireEvent.click(row("claude-code-settings").querySelector(".agent-row-toggle")!);
+    await waitFor(() => expect(document.querySelector(".agent-row-plan")).not.toBeNull());
+    const plan = document.querySelector(".agent-row-plan")!;
+    expect(plan.textContent).not.toContain(zhCN.agents.restart.button);
+    expect(plan.textContent).toContain(zhCN.agents.restart.cliTitle);
+    expect(plan.textContent).toContain("claude");
   });
 });

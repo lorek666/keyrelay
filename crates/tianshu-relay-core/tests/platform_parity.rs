@@ -128,6 +128,10 @@ fn platform_specific_files_match_the_known_inventory() {
         // M35-S1：旧数据目录迁移的 0700/0600 只在 unix 上有 mode；
         // 非 unix 分支是空实现（继承 ACL），文件已在本清单登记。
         "rebrand.rs".to_string(),
+        // 投递改进 P1-5：重启按平台分派——macOS 走 osascript/open bundle id、
+        // Windows 走 taskkill/tasklist、Linux 走 pkill//proc 扫描；argv 构造类函数显式收
+        // 平台参数，macOS/Windows 分支在 Linux 上也有单测（未真机执行，见 restart.rs 模块文档）。
+        "restart.rs".to_string(),
         "vault/keychain.rs".to_string(),
         "vault/keyfile.rs".to_string(),
     ];

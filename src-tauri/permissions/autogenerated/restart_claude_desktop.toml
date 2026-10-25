@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-restart-claude-desktop"
+description = "Enables the restart_claude_desktop command without any pre-configured scope."
+commands.allow = ["restart_claude_desktop"]
+
+[[permission]]
+identifier = "deny-restart-claude-desktop"
+description = "Denies the restart_claude_desktop command without any pre-configured scope."
+commands.deny = ["restart_claude_desktop"]

@@ -57,6 +57,12 @@ pub struct AppState {
     ///
     /// 与 `gateway_op` 同款（必须是异步锁：要跨 `await` 持有）。
     pub captcha_op: tokio::sync::Mutex<()>,
+    /// 把两次重启串起来（投递改进 P1-5）。
+    ///
+    /// 重启是「停旧 → 拉新」的序列：两个并发重启交错时，第二个的退出请求可能杀掉
+    /// 第一个刚拉起的新进程，随后两个都报成功、实际只剩一个旧进程——结果不可归因。
+    /// 锁只串行化命令层入口，不跨进核心层（核心的轮询 sleep 在 `spawn_blocking` 里）。
+    pub restart_op: tokio::sync::Mutex<()>,
     /// 托盘图标是否真的建起来了（M6-S5）。
     ///
     /// 这个标志位决定「能不能隐藏窗口」：托盘不可用时隐藏窗口会把应用变成
@@ -448,6 +454,7 @@ fn state_with_config(
         gateway: std::sync::Mutex::new(None),
         gateway_op: tokio::sync::Mutex::new(()),
         captcha_op: tokio::sync::Mutex::new(()),
+        restart_op: tokio::sync::Mutex::new(()),
         // 真实结果由 `setup` 里的 `tray::build` 覆盖；测试里永远保持 false
         tray_available: std::sync::atomic::AtomicBool::new(false),
     }
@@ -637,7 +644,10 @@ pub fn configure_with_state<R: tauri::Runtime>(
             // M15-S1：模型检测（bazaarlink probe）
             commands::probe_run,
             commands::list_probe_runs,
-            commands::get_probe_run
+            commands::get_probe_run,
+            // 投递改进 P1-5：一键重启（Codex / Claude Desktop）
+            commands::restart_codex,
+            commands::restart_claude_desktop
         ])
 }
 
