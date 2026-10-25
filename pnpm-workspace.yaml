@@ -1,3 +1,10 @@
 # pnpm 11 默认拦截依赖的构建脚本；esbuild 的安装脚本需要执行以校验平台二进制。
 allowBuilds:
   esbuild: true
+
+# 单包仓库：根 package.json 即唯一包。packages 字段必须非空——
+# CI 用 pnpm 9，缺了它 setup-node 的缓存探测（pnpm store path）会报
+# “packages field missing or empty”，两条 CI 在 setup-node 一步就红
+# （本地 pnpm 11 不校验此项，故本地复现不了）。
+packages:
+  - "."
