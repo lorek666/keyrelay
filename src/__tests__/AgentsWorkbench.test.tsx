@@ -249,8 +249,12 @@ describe("M31-S1 Agent 工作台", () => {
     fireEvent.change(modelSelect("opencode"), { target: { value: "gpt-x" } });
     // 模型输入有 400ms 防抖；等它进查询键后再展开，否则 plan 拿到的是空 model。
     await new Promise((resolve) => setTimeout(resolve, 450));
-    // 页面上唯一的 checkbox 是顶部「指向本地网关」
-    fireEvent.click(document.querySelector<HTMLInputElement>('input[type="checkbox"]')!);
+    // P0-4：投递方式默认就是网关（双单选的第一项、带「推荐」），无需再点选；
+    // 展开后首次 plan 即应为 gateway，直连是次选、默认不选中。
+    const radios = document.querySelectorAll<HTMLInputElement>('input[type="radio"]');
+    expect(radios.length).toBe(2);
+    expect(radios[0].checked).toBe(true);
+    expect(radios[1].checked).toBe(false);
     fireEvent.click(row("opencode").querySelector(".agent-row-toggle")!);
 
     await waitFor(() => expect(deliveryPlan).toHaveBeenCalled());
@@ -260,6 +264,13 @@ describe("M31-S1 Agent 工作台", () => {
       channel: "opencode",
       model: "gpt-x",
       mode: "gateway",
+    });
+
+    // 切到次选的站点直连后，plan 参数随之变为 site（仍可选，只是不默认）。
+    fireEvent.click(radios[1]);
+    await waitFor(() => {
+      const last = (deliveryPlan as unknown as { mock: { calls: unknown[][] } }).mock.calls.at(-1)![0];
+      expect(last).toMatchObject({ mode: "site" });
     });
   });
 

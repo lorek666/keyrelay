@@ -586,7 +586,11 @@
       "label": "指向本地网关：写进去的是网关地址（/v1）与本地令牌，不是站点密钥。之后换站只要重启网关，agent 侧不用改。需要网关正在运行。",
       "title": "本地网关令牌（不是站点密钥）",
       "siteKey": "站点密钥",
-      "unknownMode": "未知的投递模式：{mode}"
+      "unknownMode": "未知的投递模式：{mode}",
+      "modeLabel": "投递方式",
+      "recommended": "推荐",
+      "siteLabel": "站点直连：写进去的是站点密钥与站点地址，换站需逐个 agent 重新投递。",
+      "secondary": "次选"
     },
     "emptyKey": {
       "noSiteKey": "该站点下还没有本地密钥，先去「密钥」页新建一把。",
