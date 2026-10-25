@@ -757,6 +757,266 @@ pub fn verify_applied_fields(
     ))
 }
 
+// ==================================================== P1-7：首次导入（只读）
+//
+// 触发条件（服务层定，见 `delivery_plan` 的构造处）：该目标文件上
+// **没有任何生效中的绑定**（`bindings_of_target` 里 `unbound_at` 全为空
+// 之外，即从未成功投递过、或此前投递已解绑）时，本次预览才算「首次投递」
+// 并做导入；已投递过的通道不再导入——文件里的内容已是本产品上次写下
+// 的，diff 预览本身就是它与新内容的对照，再导入是重复信息。
+//
+// 只读保证（四层，缺一层都不算只读）：
+// 1. 本函数是纯函数：入参只有通道、必填键表、文件文本、provider 名，
+//    不读环境变量、不触磁盘；读盘只发生在调用方那一次 `read`，
+//    且读盘函数（`json_text::read_text_or_empty`）在文件不存在时返回空串、
+//    绝不创建文件；
+// 2. 导入的值**只进预览结构体**（`DeliveryPlan.imported_fields`），
+//    绝不 feed 回 `writer.plan()` / `fields()` / apply 路径——写进去的
+//    永远是本次投递构造的字段，不是文件里旧值。用户想沿用旧值，
+//    必须自己把它填成投递参数并确认后才写盘；
+// 3. 密钥类叶键一律掩码（`mask_secret`，只露末 4 位），与 `fields()` 的
+//    掩码口径一致；非密钥值（端点、模型、窗口数）按原文展示；
+// 4. 拿不准就不导入：见下文「保守规则」，宁可少导入一项，也不把
+//    别人的值安到本通道名下。
+//
+// 提取规则（两路，JSON 成功只走 JSON 路，JSON 失败才走行扫描）：
+// - JSON 路：把文件解析成 JSON 对象后按**路径**匹配。限定键
+//   （opencode 的 `provider.<id>.options.<leaf>`，含方括号形态的带点
+//   provider 名）必须整条路径逐段相等；裸叶键取路径末段相等的
+//   第一项（文档顺序）。Cline 的 `providers` 数组只认 `id == "keyrelay"`
+//   的条目——数组里别的 provider 的密钥绝不能被当成 keyrelay 的旧值。
+// - 行扫描路（TOML / YAML / .env / 失去 JSON 形态的文件）：逐行按
+//   「行首可选 `export ` + 可选引号 + 叶键 + 分隔符（`"` / `:` / `=` /
+//   空白）」匹配，与 P0-1 回读 `text_contains_key` 的分隔符口径一致，
+//   因此 `model` 不会撞上 `model_provider`。值取引号内原文，
+//   无引号取第一个空白分隔的 token（并去尾随逗号）。
+// - 保守规则：opencode 两通道与 Cline 通道**不走行扫描**——它们的
+//   文件里可能有多个 provider 条目，行扫描分不清「这行属于哪个
+//   provider」，而 JSON 路能按路径 / id 分清；JSON 解析失败
+//   （如 .jsonc 带注释）时导入为空，不猜。`expected` 表外的键一律不导入
+//   （导入范围 = 本次投递的必填表，与整单校验同一张表）。
+//
+// 返回：只含「找到了」的项（键 + 展示值）；没找到的键不在返回里，
+// 调用方不得把它解读成「旧值为空」——没找到只说明「本次导入没拿到」。
+
+/// 导入展示里算「密钥」的叶键：含 `api_key` / `apikey` / `token` 任一子串
+/// 即掩码。`auth_mode`（值为字面量 `"apikey"`）不在此列——它不含上述子串，
+/// 按原文展示，与 `fields()` 里它是字面量字段的口径一致。
+fn is_secret_import_key(leaf: &str) -> bool {
+    let lower = leaf.to_ascii_lowercase();
+    lower.contains("api_key") || lower.contains("apikey") || lower.contains("token")
+}
+
+/// 导入项的展示值：密钥掩码，非密钥原文。
+fn import_display_value(leaf: &str, value: &str) -> String {
+    if is_secret_import_key(leaf) {
+        mask_secret(value)
+    } else {
+        value.to_string()
+    }
+}
+
+/// 限定键名切段：`provider.keyrelay.options.apiKey` → 4 段；
+/// `provider["a.b"].options.apiKey` → `provider` / `a.b` / `options` / `apiKey`。
+/// 方括号内按 JSON 字符串解析，解析失败则按原文取段（不因此拒绝整单导入）。
+fn split_qualified_key(qualified: &str) -> Vec<String> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = qualified.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '.' => {
+                segments.push(std::mem::take(&mut current));
+            }
+            '[' => {
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+                let mut bracket = String::new();
+                for bc in chars.by_ref() {
+                    if bc == ']' {
+                        break;
+                    }
+                    bracket.push(bc);
+                }
+                let unquoted = serde_json::from_str::<String>(&bracket)
+                    .unwrap_or_else(|_| bracket.trim_matches('"').to_string());
+                segments.push(unquoted);
+                if chars.peek() == Some(&'.') {
+                    chars.next();
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// JSON 值走访：产出（路径段，标量字符串）序列（文档顺序）。
+///
+/// Cline 通道专属规则：`providers` 数组里只走访 `id == "keyrelay"` 的
+/// 对象条目，其余条目整个跳过（它们的密钥不是本通道的旧值）。
+/// 其余通道：数组元素一律走访（单租户配置文件，叶键无归属歧义）。
+fn collect_json_values(
+    value: &serde_json::Value,
+    path: &mut Vec<String>,
+    channel: DeliveryChannel,
+    out: &mut Vec<(Vec<String>, String)>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                path.push(key.clone());
+                collect_json_values(child, path, channel, out);
+                path.pop();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let in_providers = path.last().map(|s| s.as_str()) == Some("providers");
+            for item in items {
+                if channel == DeliveryChannel::Cline
+                    && in_providers
+                    && item.get("id").and_then(|i| i.as_str()) != Some("keyrelay")
+                {
+                    continue;
+                }
+                collect_json_values(item, path, channel, out);
+            }
+        }
+        serde_json::Value::String(s) => {
+            out.push((path.clone(), s.clone()));
+        }
+        serde_json::Value::Number(n) => {
+            out.push((path.clone(), n.to_string()));
+        }
+        serde_json::Value::Bool(b) => {
+            out.push((path.clone(), b.to_string()));
+        }
+        serde_json::Value::Null => {}
+    }
+}
+
+/// 行扫描路的值解析：引号内取原文，无引号取首个 token（去尾随逗号）。
+/// 返回 `None` = 该行没有可用值（空值行不算「找到」）。
+fn parse_line_value(rest: &str) -> Option<String> {
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    if let Some(quoted) = rest.strip_prefix('"').or_else(|| rest.strip_prefix('\'')) {
+        let quote = rest.chars().next().unwrap();
+        let end = quoted.find(quote)?;
+        let value = &quoted[..end];
+        return if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        };
+    }
+    let token: String = rest
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '#')
+        .collect();
+    let token = token.trim_end_matches(',');
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+/// 行扫描路：某叶键在文本里的首个值（见本节头部的行匹配口径）。
+fn scan_line_value(text: &str, leaf: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let after_export = match trimmed.strip_prefix("export") {
+            Some(tail) if tail.starts_with(' ') || tail.starts_with('\t') => tail.trim_start(),
+            _ => trimmed,
+        };
+        let stripped = after_export.strip_prefix('"').unwrap_or(after_export);
+        if !stripped.starts_with(leaf) {
+            continue;
+        }
+        let next = stripped[leaf.len()..].chars().next()?;
+        if !matches!(next, '"' | ':' | '=' | ' ' | '\t') {
+            continue;
+        }
+        let after_key = stripped[leaf.len()..].trim_start_matches(['"', ' ', '\t']);
+        let after_sep = after_key
+            .strip_prefix(':')
+            .or_else(|| after_key.strip_prefix('='))?;
+        if let Some(value) = parse_line_value(after_sep) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// 从现有配置文件文本里只读提取必填键的现有值（纯函数，见本节头部）。
+///
+/// `expected` 是本次投递的必填键表（与 P0-1 整单校验同一张表）；
+/// opencode 的 provider 段已含在限定键名里，不另传 provider 名。
+pub fn import_existing_fields(
+    channel: DeliveryChannel,
+    expected: &[String],
+    text: &str,
+) -> Vec<DeliveryField> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<DeliveryField> = Vec::new();
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+        if !parsed.is_object() {
+            return Vec::new();
+        }
+        let mut collected: Vec<(Vec<String>, String)> = Vec::new();
+        collect_json_values(&parsed, &mut Vec::new(), channel, &mut collected);
+        for key in expected {
+            let segments = split_qualified_key(key);
+            let leaf = segments.last().cloned().unwrap_or_default();
+            let found = if segments.len() > 1 {
+                collected
+                    .iter()
+                    .find(|(path, _)| *path == segments)
+                    .map(|(_, v)| v.clone())
+            } else {
+                collected
+                    .iter()
+                    .find(|(path, _)| path.last().map(|s| s.as_str()) == Some(leaf.as_str()))
+                    .map(|(_, v)| v.clone())
+            };
+            if let Some(value) = found {
+                out.push(DeliveryField {
+                    key: key.clone(),
+                    masked: import_display_value(&leaf, &value),
+                });
+            }
+        }
+        return out;
+    }
+    // JSON 解析失败：只有非 provider 作用域的通道才走行扫描；
+    // opencode / Cline 的文件可能含多 provider 条目，行扫描分不清归属，宁缺。
+    if matches!(
+        channel,
+        DeliveryChannel::OpenCode | DeliveryChannel::OpenCodeJsonc | DeliveryChannel::Cline
+    ) {
+        return Vec::new();
+    }
+    for key in expected {
+        let leaf = leaf_key(key);
+        if let Some(value) = scan_line_value(text, leaf) {
+            out.push(DeliveryField {
+                key: key.clone(),
+                masked: import_display_value(leaf, &value),
+            });
+        }
+    }
+    out
+}
+
 /// 纯函数、无 IO。UI **必须**调用它取文案，不得在界面里硬编码判断——否则新增通道时又会漏一处。
 ///
 /// P1-6 生效分表：不再一刀切 Needed。
@@ -996,23 +1256,143 @@ pub(crate) fn current_host_os() -> HostOs {
     }
 }
 
-/// VS Code 的 `globalStorage` 目录（相对 `home`）——三个平台的约定不同。
-pub(crate) fn global_storage_dir(os: HostOs) -> PathBuf {
+/// 某编辑器的 `globalStorage` 目录（相对 `home`）——三个平台的约定不同。
+///
+/// `editor` 是编辑器目录名：VS Code 稳定版为 `"Code"`、Insiders 为
+/// `"Code - Insiders"`、Cursor 为 `"Cursor"`（Cursor 是 VS Code 分支，
+/// 其扩展 globalStorage 与 Code 同构）。P1-7 只把这三者列入白名单，
+/// 其余编辑器名一律不在白名单里（见 `target_variant_names`）。
+pub(crate) fn editor_global_storage_dir(os: HostOs, editor: &str) -> PathBuf {
     match os {
         HostOs::MacOs => PathBuf::from("Library")
             .join("Application Support")
-            .join("Code")
+            .join(editor)
             .join("User")
             .join("globalStorage"),
         HostOs::Linux => PathBuf::from(".config")
-            .join("Code")
+            .join(editor)
             .join("User")
             .join("globalStorage"),
         HostOs::Windows => PathBuf::from("AppData")
             .join("Roaming")
-            .join("Code")
+            .join(editor)
             .join("User")
             .join("globalStorage"),
+    }
+}
+
+/// VS Code 的 `globalStorage` 目录（相对 `home`）——三个平台的约定不同。
+pub(crate) fn global_storage_dir(os: HostOs) -> PathBuf {
+    editor_global_storage_dir(os, "Code")
+}
+
+// ==================================================== P1-7：写路径白名单与落点变体
+//
+// 背景：`checked_target` 原先只认 `relative_target()` 那一条路径。
+// P1-7 要求白名单覆盖「同类变体」——opencode 的 `.json` / `.jsonc`
+// 选择、VS Code 的 Code / Insiders / Cursor 变体——但**不开放任意路径**：
+// 用户自选路径若不在白名单内必须拒绝，不得静默接受、不得静默回落默认。
+//
+// 两条边界（缺一不可，否则白名单就是摆设）：
+// - opencode 的 `.json` / `.jsonc` 选择**由通道承载**（`OpenCode` 与
+//   `OpenCodeJsonc` 是两条独立通道、两个独立 agent_id，见 P0-1 的漂移归属
+//   说明）：`allowed_targets(OpenCode)` 只有 `.json`，
+//   `allowed_targets(OpenCodeJsonc)` 只有 `.jsonc`。用户拿着 `.jsonc` 的
+//   路径去投 `opencode` 通道时是越界，必须拒绝——不能因为「同目录同主名」
+//   就替他换通道，那会让同意与漂移记到另一条通道名下。
+// - VS Code 变体**只属于 Cline 通道**：Cline 的配置在编辑器的
+//   globalStorage 里，编辑器有稳定版 / Insiders / Cursor 三种宿主。
+//   其余通道（包括 Cursor 自己的 `~/.cursor/settings.json` 通道与独立的
+//   Cline Desktop 应用通道）没有任何变体，传变体名一律拒绝。
+// - 变体用**名字**选，不用自由路径选：`resolve_variant_target` 的入参
+//   是变体名（`"code"` / `"code-insiders"` / `"cursor"` / `"default"`），
+//   不是路径。任何不在名字表里的字符串——包括看起来像路径的字符串
+//   （`"/tmp/x/settings.json"`、`"../x"`）——都直接拒绝；
+//   本模块**没有**「按用户给的路径写」的入口，白名单外无路可走。
+// - Cursor 变体的诚实线：它只是白名单里的一个候选落点（与 Code 同构的
+//   globalStorage 布局），**不是**「Cline 在 Cursor 里可用」的实测结论；
+//   Cline 落点本身的核实仍是 P2-9 的范围，本项不动默认落点、不改核实结论。
+
+/// Cline 通道的白名单变体名（顺序固定：默认在前，UI 与测试都依赖它稳定）。
+pub const CLINE_VARIANT_NAMES: [&str; 3] = ["code", "code-insiders", "cursor"];
+
+/// 该通道可选的落点变体名。非 Cline 通道只有 `"default"`（即「无变体」，
+/// 传它等于不传）；Cline 通道为三编辑器变体。
+pub fn target_variant_names(channel: DeliveryChannel) -> Vec<&'static str> {
+    match channel {
+        DeliveryChannel::Cline => CLINE_VARIANT_NAMES.to_vec(),
+        _ => vec!["default"],
+    }
+}
+
+/// Cline 通道某编辑器变体的目标路径（相对 `home`）。
+fn cline_variant_relative_target(os: HostOs, editor: &str) -> PathBuf {
+    editor_global_storage_dir(os, editor)
+        .join("saoudrizwan.claude-dev")
+        .join("settings.json")
+}
+
+/// 该通道的全部白名单目标（绝对路径，`home` 下）。
+///
+/// - 非 Cline 通道：只有 `relative_target()` 一条；
+/// - Cline 通道：默认 Code + Insiders + Cursor 三条。
+/// 服务层 `checked_target` 按**成员关系**判定，不再是单路径相等——
+/// 白名单外的任何路径（哪怕落在 `home` 内）一律拒绝。
+pub fn allowed_targets(channel: DeliveryChannel, home: &Path) -> Vec<PathBuf> {
+    match channel {
+        DeliveryChannel::Cline => {
+            let os = current_host_os();
+            vec![
+                home.join(channel.relative_target()),
+                home.join(cline_variant_relative_target(os, "Code - Insiders")),
+                home.join(cline_variant_relative_target(os, "Cursor")),
+            ]
+        }
+        _ => vec![home.join(channel.relative_target())],
+    }
+}
+
+/// 按变体名解析目标路径（fail-closed）。
+///
+/// - `None` / `"default"`：默认落点。Cline 的有效变体名是 `"code"`；
+///   其余通道的有效变体名只有 `"default"`。
+/// - 返回 `(目标路径, 生效变体名)`：Cline 的 `None` / `"default"` /
+///   `"code"` 都生效为 `"code"`（DTO 与前端下拉用它做当前值，
+///   而不是把「没选」与「选了 Code」显示成两种状态）；
+///   其余通道生效为 `"default"`。
+/// - 其余一切取值（未知变体名、路径形态的字符串、给非 Cline 通道传
+///   编辑器变体名）都返回 `Err`，错误里逐字列出该通道的变体名表——
+///   调用方不得把它翻译成默认落点后继续写。
+pub fn resolve_variant_target(
+    channel: DeliveryChannel,
+    home: &Path,
+    variant: Option<&str>,
+) -> Result<(PathBuf, &'static str)> {
+    let os = current_host_os();
+    match (channel, variant) {
+        (_, None) | (_, Some("default")) => match channel {
+            DeliveryChannel::Cline => Ok((home.join(channel.relative_target()), "code")),
+            _ => Ok((home.join(channel.relative_target()), "default")),
+        },
+        (DeliveryChannel::Cline, Some("code")) => {
+            Ok((home.join(channel.relative_target()), "code"))
+        }
+        (DeliveryChannel::Cline, Some("code-insiders")) => Ok((
+            home.join(cline_variant_relative_target(os, "Code - Insiders")),
+            "code-insiders",
+        )),
+        (DeliveryChannel::Cline, Some("cursor")) => Ok((
+            home.join(cline_variant_relative_target(os, "Cursor")),
+            "cursor",
+        )),
+        (_, Some(other)) => Err(Error::inject(
+            home.join(channel.relative_target()),
+            format!(
+                "通道 {} 不支持落点变体 {other:?}，可选变体为 [{}]；白名单外的路径一律拒绝，不静默回落默认落点",
+                channel.as_str(),
+                target_variant_names(channel).join(", ")
+            ),
+        )),
     }
 }
 
@@ -1094,6 +1474,27 @@ pub struct DeliveryPlan {
     /// 已脱敏的 diff 预览
     pub preview: String,
     pub consent: ConsentState,
+    // ==================================================== P1-7：预览模式 / 首次导入 / 落点变体
+    //
+    // - `preview_only`：`true` = 本计划由预览专用入口产出，全程不写盘、
+    //   不记 journal、不写绑定（连预览事件日志都不写，见服务层
+    //   `delivery_preview_in`）。`false` = 既有 `delivery_plan` 入口
+    //   （它仍会写一条 Debug 事件日志，那是既有行为，本项不改它）。
+    //   前端据此渲染「仅预览，未写入」横幅，并禁用投递按钮。
+    // - `is_first_delivery` / `imported_fields`：首次投递判定与只读导入
+    //   （规则见本文件 P1-7 导入节）。非首次时 `imported_fields` 为空——
+    //   不是「旧值为空」，是「本次不导入」。
+    // - `target_variant`：本次生效的落点变体名（见 `resolve_variant_target`）；
+    //   非 Cline 通道恒为 `"default"`。
+    /// 本计划是否由预览专用入口产出（零副作用模式）。
+    pub preview_only: bool,
+    /// 该目标文件上是否没有任何生效中的绑定（首次投递判定）。
+    pub is_first_delivery: bool,
+    /// 首次投递时从现有文件只读导入的现有值（已掩码处理）；非首次为空。
+    /// 这些值**不是**投递内容：写盘仍按 `fields` 走，导入值不自动写入。
+    pub imported_fields: Vec<DeliveryField>,
+    /// 本次生效的落点变体名。
+    pub target_variant: &'static str,
     // ==================================================== P0-3：DSH 凭据引用校验
     //
     // 仅 DSH 通道为 `Some`，其余通道一律为 `None`——DSH 是唯一“凭据文件
@@ -1122,6 +1523,10 @@ impl std::fmt::Debug for DeliveryPlan {
             .field("fields", &self.fields)
             .field("preview_len", &self.preview.len())
             .field("consent", &self.consent)
+            .field("preview_only", &self.preview_only)
+            .field("is_first_delivery", &self.is_first_delivery)
+            .field("imported_fields", &self.imported_fields)
+            .field("target_variant", &self.target_variant)
             .field("dsh_credential_reference", &self.dsh_credential_reference)
             .finish()
     }
@@ -2111,6 +2516,180 @@ mod tests {
         assert_eq!(jsonc_hazard("{\"a\": [1, 2]}"), None);
         // 转义引号不会提前结束字符串
         assert_eq!(jsonc_hazard("{\"a\": \"x\\\"//y\"}"), None);
+    }
+
+    // ==================================================== P1-7：首次导入与落点变体
+
+    #[test]
+    fn import_existing_fields_reads_json_nested_and_masks_secrets() {
+        let text = r#"{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "sk-old-00001111",
+    "ANTHROPIC_BASE_URL": "https://old.example.com",
+    "ANTHROPIC_MODEL": "old-model"
+  }
+}"#;
+        let expected = vec![
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            "ANTHROPIC_BASE_URL".to_string(),
+            "ANTHROPIC_MODEL".to_string(),
+        ];
+        let got = import_existing_fields(DeliveryChannel::ClaudeCodeSettings, &expected, text);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].key, "ANTHROPIC_AUTH_TOKEN");
+        assert_eq!(got[0].masked, "…1111");
+        assert_eq!(got[1].masked, "https://old.example.com");
+        assert_eq!(got[2].masked, "old-model");
+    }
+
+    #[test]
+    fn import_existing_fields_ignores_other_providers_in_cline_array() {
+        let text = r#"{"providers": [
+          {"id": "other", "apiKey": "sk-other-2222", "baseUrl": "https://other.example.com"},
+          {"id": "keyrelay", "apiKey": "sk-mine-3333", "baseUrl": "https://old.example.com"}
+        ]}"#;
+        let expected = vec!["apiKey".to_string(), "baseUrl".to_string()];
+        let got = import_existing_fields(DeliveryChannel::Cline, &expected, text);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].masked, "…3333");
+        assert_eq!(got[1].masked, "https://old.example.com");
+        assert!(!got.iter().any(|f| f.masked.contains("2222")));
+    }
+
+    #[test]
+    fn import_existing_fields_opencode_matches_only_its_provider() {
+        let text = r#"{"provider": {
+          "other": {"options": {"apiKey": "sk-other-2222"}},
+          "keyrelay": {"options": {"apiKey": "sk-mine-4444", "baseURL": "https://old.example.com"}}
+        }}"#;
+        let expected = vec![
+            "provider.keyrelay.options.apiKey".to_string(),
+            "provider.keyrelay.options.baseURL".to_string(),
+        ];
+        let got = import_existing_fields(DeliveryChannel::OpenCode, &expected, text);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].masked, "…4444");
+        assert_eq!(got[1].masked, "https://old.example.com");
+
+        // 带点 provider 名走方括号形态，路径逐段相等才算命中。
+        let dotted = r#"{"provider": {"a.b": {"options": {"apiKey": "sk-dot-5555"}}}}"#;
+        let expected = vec!["provider[\"a.b\"].options.apiKey".to_string()];
+        let got = import_existing_fields(DeliveryChannel::OpenCode, &expected, dotted);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].masked, "…5555");
+    }
+
+    #[test]
+    fn import_existing_fields_line_scan_for_env_and_toml() {
+        // .env：export 前缀剥离、空值行不算找到。
+        let env = "export GEMINI_API_KEY=sk-env-6666\nGOOGLE_GEMINI_BASE_URL=https://env.example.com\nGEMINI_MODEL=\n";
+        let expected = vec![
+            "GEMINI_API_KEY".to_string(),
+            "GOOGLE_GEMINI_BASE_URL".to_string(),
+            "GEMINI_MODEL".to_string(),
+        ];
+        let got = import_existing_fields(DeliveryChannel::GeminiCli, &expected, env);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].masked, "…6666");
+        assert_eq!(got[1].masked, "https://env.example.com");
+
+        // TOML：`model` 不得撞上 `model_provider`（后跟 `_` 不是分隔符）。
+        let toml = "model_provider = \"custom\"\nmodel = \"gpt-4o\"\nbase_url = \"https://toml.example.com\"\n";
+        let expected = vec![
+            "model_provider".to_string(),
+            "model".to_string(),
+            "base_url".to_string(),
+        ];
+        let got = import_existing_fields(DeliveryChannel::CodexConfig, &expected, toml);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].masked, "custom");
+        assert_eq!(got[1].masked, "gpt-4o");
+        assert_eq!(got[2].masked, "https://toml.example.com");
+    }
+
+    #[test]
+    fn import_existing_fields_jsonc_comments_yield_nothing_for_provider_channels() {
+        // 带注释的 .jsonc 解析不成 JSON：opencode 宁缺不猜（行扫描分不清归属）。
+        let text = "{\n  // old provider\n  \"provider\": {\"keyrelay\": {\"options\": {\"apiKey\": \"sk-x-7777\"}}}\n}\n";
+        let expected = vec!["provider.keyrelay.options.apiKey".to_string()];
+        assert!(import_existing_fields(DeliveryChannel::OpenCodeJsonc, &expected, text).is_empty());
+        // 对照：单租户文件走行扫描，同一行能被认出来（规则只对多 provider 通道收紧）。
+        let single = "{\n  // note\n  \"OPENAI_API_KEY\": \"sk-x-7777\"\n}\n";
+        let expected = vec!["OPENAI_API_KEY".to_string()];
+        let got = import_existing_fields(DeliveryChannel::Cursor, &expected, single);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].masked, "…7777");
+    }
+
+    #[test]
+    fn variant_allowlist_is_exact_and_fail_closed() {
+        let home = Path::new("/home/u");
+        // Cline：三条（本机 Linux 布局）；其余通道：只有默认一条。
+        let cline_targets = allowed_targets(DeliveryChannel::Cline, home);
+        assert_eq!(cline_targets.len(), 3);
+        assert!(cline_targets[0]
+            .ends_with("Code/User/globalStorage/saoudrizwan.claude-dev/settings.json"));
+        assert!(cline_targets[1]
+            .ends_with("Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings.json"));
+        assert!(cline_targets[2]
+            .ends_with("Cursor/User/globalStorage/saoudrizwan.claude-dev/settings.json"));
+        assert_eq!(allowed_targets(DeliveryChannel::OpenCode, home).len(), 1);
+        assert_eq!(
+            allowed_targets(DeliveryChannel::OpenCodeJsonc, home).len(),
+            1
+        );
+        assert_ne!(
+            allowed_targets(DeliveryChannel::OpenCode, home),
+            allowed_targets(DeliveryChannel::OpenCodeJsonc, home),
+            "opencode 的 .json / .jsonc 选择由通道承载，不得串味"
+        );
+
+        // 变体名解析：默认 / code / insiders / cursor 各归其位。
+        let (target, name) = resolve_variant_target(DeliveryChannel::Cline, home, None).unwrap();
+        assert_eq!(name, "code");
+        assert_eq!(target, cline_targets[0]);
+        let (target, name) =
+            resolve_variant_target(DeliveryChannel::Cline, home, Some("code-insiders")).unwrap();
+        assert_eq!(name, "code-insiders");
+        assert_eq!(target, cline_targets[1]);
+        let (target, name) =
+            resolve_variant_target(DeliveryChannel::Cline, home, Some("cursor")).unwrap();
+        assert_eq!(name, "cursor");
+        assert_eq!(target, cline_targets[2]);
+        let (target, name) =
+            resolve_variant_target(DeliveryChannel::ClaudeCodeSettings, home, None).unwrap();
+        assert_eq!(name, "default");
+        assert_eq!(
+            target,
+            home.join(DeliveryChannel::ClaudeCodeSettings.relative_target())
+        );
+
+        // 越界一律拒绝：未知名、路径形态、给非 Cline 通道传编辑器变体、
+        // 给 opencode 传编辑器变体（.json/.jsonc 选择只能走通道）。
+        for (channel, variant) in [
+            (DeliveryChannel::Cline, "vscode-foo"),
+            (DeliveryChannel::Cline, "/tmp/evil/settings.json"),
+            (DeliveryChannel::Cline, "../x"),
+            (DeliveryChannel::ClaudeCodeSettings, "cursor"),
+            (DeliveryChannel::OpenCode, "code-insiders"),
+            (DeliveryChannel::OpenCodeJsonc, "cursor"),
+            (DeliveryChannel::Cursor, "code"),
+        ] {
+            let err = resolve_variant_target(channel, home, Some(variant)).unwrap_err();
+            assert!(
+                err.to_string().contains("可选变体"),
+                "{} + {variant:?} 应被拒绝并列出变体表: {err}",
+                channel.as_str()
+            );
+        }
+        assert_eq!(
+            target_variant_names(DeliveryChannel::Cline),
+            vec!["code", "code-insiders", "cursor"]
+        );
+        assert_eq!(
+            target_variant_names(DeliveryChannel::OpenCode),
+            vec!["default"]
+        );
     }
 
     #[test]

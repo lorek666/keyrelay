@@ -328,6 +328,22 @@ export type DeliveryPlan = {
    * 不得宣称预览已展示该结果。
    */
   dshCredentialReference: DshReferenceCheck | null;
+  /**
+   * P1-7：本计划是否由预览专用入口产出（零副作用模式）。
+   * `true` 时界面必须渲染「仅预览，未写入」并禁用投递按钮。
+   */
+  previewOnly: boolean;
+  /** P1-7：该目标文件上是否没有任何生效中的绑定（首次投递判定）。 */
+  isFirstDelivery: boolean;
+  /**
+   * P1-7：首次投递时从现有文件只读导入的现有值（已掩码处理）；
+   * 非首次为空。**不是**投递内容：写盘仍按 `fields` 走。
+   */
+  importedFields: DeliveryField[];
+  /** P1-7：本次生效的落点变体名（Cline 为 code / code-insiders / cursor）。 */
+  targetVariant: string;
+  /** P1-7：该通道可选的落点变体名表（下拉直接用它渲染，不得硬编码）。 */
+  targetVariants: string[];
 };
 
 /** 一单里某一个文件的预览（P0-2）。字段含义与 DeliveryPlan 的同名项一致。 */
@@ -341,6 +357,9 @@ export type DeliveryFilePlan = {
   consent: ConsentState;
   consentGrantedAt?: number | null;
   consentRevokedAt?: number | null;
+  /** P1-7：该文件的首次投递判定与只读导入（与顶层同口径）。 */
+  isFirstDelivery: boolean;
+  importedFields: DeliveryField[];
 };
 
 /** 投递模式（M8-S4 §6.2）。缺省 = `"site"`：既有调用点的行为一字不变。 */
@@ -683,6 +702,16 @@ export type DeliveryArgs = {
    */
   mode?: DeliveryMode;
   /**
+   * P1-7：落点变体名（白名单名字，不是自由路径）。只对 Cline 通道有意义
+   * （`"code"` / `"code-insiders"` / `"cursor"`）；其余通道不传或传 `"default"`。
+   */
+  targetVariant?: string;
+  /**
+   * P1-7：只打印不写盘的预览模式。只对 `deliveryPlan` 有意义；
+   * 对投递 / 同意入口传 `true` 会被后端直接拒绝。
+   */
+  previewOnly?: boolean;
+  /**
    * P0-2：Codex 保留选项。只对两条 Codex 通道有意义，其余通道传 `true`
    * 会被后端直接拒绝（不是静默忽略）。
    *
@@ -895,10 +924,18 @@ const MOCK_PLAN: DeliveryPlan = {
       consent: "missing",
       consentGrantedAt: null,
       consentRevokedAt: null,
+      isFirstDelivery: false,
+      importedFields: [],
     },
   ],
   // P0-3：mock 是 Codex 通道，非 DSH ⇒ 引用校验为 null。
   dshCredentialReference: null,
+  // P1-7：mock 是既有预览入口、非首次（顶层字段与 files[] 各自带一份）。
+  previewOnly: false,
+  isFirstDelivery: false,
+  importedFields: [],
+  targetVariant: "default",
+  targetVariants: ["default"],
 };
 
 const MOCK_EVENTS: EventRow[] = [

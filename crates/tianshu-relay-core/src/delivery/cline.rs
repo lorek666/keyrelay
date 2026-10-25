@@ -56,6 +56,24 @@ impl ClineWriter {
         w
     }
 
+    /// P1-7：落点变体构造器——与 `with_model` 同语义，只是目标路径
+    /// 由调用方按白名单变体名解析后传入（必须是 `allowed_targets` 内的
+    /// 路径，服务层 `checked_target` 会再按成员关系验一遍）。
+    pub fn with_path_and_model(
+        path: impl Into<PathBuf>,
+        base_url: &str,
+        model: Option<&str>,
+        meta: Option<ModelMeta>,
+    ) -> Self {
+        let mut w = Self::with_path(path, base_url);
+        w.model = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        w.meta = meta;
+        w
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

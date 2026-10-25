@@ -129,6 +129,34 @@ function restartHintSourceLabel(source: string | undefined): string {
   return translate(getCurrentDict(), "agents.restartHint.source.unverified");
 }
 
+/**
+ * P1-7：落点变体名 → 展示文案。取值只来自后端 `targetVariants` 清单，
+ * 这里只做文案映射（未知取值回落默认文案，绝不静默留空）。
+ */
+function variantLabel(variant: string): string {
+  switch (variant) {
+    case "code":
+      return translate(getCurrentDict(), "agents.plan.variant.code");
+    case "code-insiders":
+      return translate(getCurrentDict(), "agents.plan.variant.codeInsiders");
+    case "cursor":
+      return translate(getCurrentDict(), "agents.plan.variant.cursor");
+    default:
+      return translate(getCurrentDict(), "agents.plan.variant.default");
+  }
+}
+
+/**
+ * P1-7 修复（复审 P1-1）：未经实测的变体。
+ *
+ * Insiders / Cursor 两条写路径未经实测（代码注释自承 Cursor 只是候选落点），
+ * 却曾与默认落点平等呈现。默认 `code` 不在本项范围内——它是 P1-7 前已有的
+ * 默认落点，不动。判定只认这两个变体名，不按通道硬编码。
+ */
+function isUnverifiedVariant(variant: string): boolean {
+  return variant === "code-insiders" || variant === "cursor";
+}
+
 export default function Agents() {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -337,6 +365,13 @@ export default function Agents() {
   const [gatewayMode, setGatewayMode] = useState(true);
   const mode: DeliveryMode = gatewayMode ? "gateway" : "site";
 
+  // P1-7：只打印不写盘的预览模式（默认关）与落点变体选择（默认不选 =
+  // 后端默认落点）。变体只在后端给出的清单长度 > 1 时才出现下拉
+  // （目前只有 Cline 通道）；变体名一律来自后端 `targetVariants`，
+  // 界面不得硬编码变体清单。
+  const [previewOnly, setPreviewOnly] = useState(false);
+  const [variantOverride, setVariantOverride] = useState<string | null>(null);
+
   // 解绑（M8-S4 §5.4）。`alsoRevoke` **默认不勾**：默认路径纯本地、一个站点请求都不发。
   const [unbinding, setUnbinding] = useState(false);
   const [alsoRevoke, setAlsoRevoke] = useState(false);
@@ -352,18 +387,33 @@ export default function Agents() {
   });
 
   const plan = useQuery({
-    queryKey: ["plan", activeKey, channel, model, mode],
-    queryFn: () => deliveryPlan({ keyId: activeKey!, channel, model, mode }),
+    queryKey: ["plan", activeKey, channel, model, mode, previewOnly, variantOverride],
+    queryFn: () =>
+      deliveryPlan({
+        keyId: activeKey!,
+        channel,
+        model,
+        mode,
+        previewOnly: previewOnly ? true : undefined,
+        targetVariant: variantOverride ?? undefined,
+      }),
     enabled: activeKey !== null,
     retry: false,
   });
 
-  // 切换 key/通道/模型名/模式时，同意勾选必须重置（避免「上次勾过了」的错觉：预览已经变了）
+  // 切换 key/通道/模型名/模式/预览模式/变体时，同意勾选必须重置
+  // （避免「上次勾过了」的错觉：预览已经变了）
   useEffect(() => {
     setAgreeChecked(false);
     setNotice(null);
     setError(null);
-  }, [activeKey, channel, model, mode]);
+  }, [activeKey, channel, model, mode, previewOnly, variantOverride]);
+
+  // 切换通道时变体选择复位（变体只对 Cline 有意义，上一通道的变体
+  // 不得带到下一通道——带过去会在后端被直接拒绝，但复位更干净）。
+  useEffect(() => {
+    setVariantOverride(null);
+  }, [channel]);
 
   // P0-2 复审 P1-2：noChange 按全部写盘文件判定——入口无变化但另一文件有变化时，
   // 投递按钮不得被禁用；files 为空（旧 mock）时回退顶层预览，保持单文件行为。
@@ -374,8 +424,18 @@ export default function Agents() {
 
   const grantAndApply = useMutation({
     mutationFn: async () => {
-      await grantConsent({ keyId: activeKey!, channel });
-      return applyDelivery({ keyId: activeKey!, channel, model, mode });
+      await grantConsent({
+        keyId: activeKey!,
+        channel,
+        targetVariant: variantOverride ?? undefined,
+      });
+      return applyDelivery({
+        keyId: activeKey!,
+        channel,
+        model,
+        mode,
+        targetVariant: variantOverride ?? undefined,
+      });
     },
     onSuccess: async (outcome) => {
       setError(null);
@@ -403,7 +463,12 @@ export default function Agents() {
   });
 
   const revoke = useMutation({
-    mutationFn: () => revokeConsent({ keyId: activeKey!, channel }),
+    mutationFn: () =>
+      revokeConsent({
+        keyId: activeKey!,
+        channel,
+        targetVariant: variantOverride ?? undefined,
+      }),
     onSuccess: async () => {
       setNotice(t("agents.notice.revoked"));
       setRevoking(false);
@@ -529,6 +594,38 @@ export default function Agents() {
             </label>
           </div>
         </div>
+        {/*
+          P1-7：只打印不写盘的预览开关（默认关）。打开后预览查询走预览专用
+          入口，PlanView 只渲染横幅、不给投递按钮；关掉才恢复正常投递流程。
+          变体下拉只在后端清单长度 > 1 时出现（目前只有 Cline 通道），
+          选项与当前值一律来自后端 plan，不在界面里硬编码清单。
+        */}
+        <label className="checkline">
+          <input
+            type="checkbox"
+            checked={previewOnly}
+            onChange={(e) => setPreviewOnly(e.target.checked)}
+          />
+          <span>{t("agents.plan.previewOnlyToggle")}</span>
+        </label>
+        {plan.data && plan.data.targetVariants && plan.data.targetVariants.length > 1 ? (
+          <label className="checkline">
+            <span>{t("agents.plan.variantLabel")}</span>
+            <select
+              value={variantOverride ?? plan.data.targetVariant}
+              onChange={(e) => setVariantOverride(e.target.value)}
+            >
+              {plan.data.targetVariants.map((v) => (
+                <option key={v} value={v}>
+                  {/* 原生 <option> 放不下 badge 徽标，只能在文案后追加
+                      “未实测”后缀；计划视图里同一变体另有 badge-warn 徽标。 */}
+                  {variantLabel(v)}
+                  {isUnverifiedVariant(v) ? t("agents.plan.variant.unverifiedSuffix") : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
       </div>
 
       {agentsQuery.isError ? (
@@ -1532,8 +1629,12 @@ function PlanView({
           fields: plan.fields,
           preview: plan.preview,
           consent: plan.consent,
+          isFirstDelivery: plan.isFirstDelivery,
+          importedFields: plan.importedFields,
         },
       ];
+  // P1-7：预览模式下只展示、不给任何写入口（按钮禁用、撤销隐藏）。
+  const previewOnly = plan.previewOnly === true;
   const fileConsentLabel = (consent: string) => {
     if (consent === "granted") return t("agents.plan.consentGranted");
     if (consent === "revoked") return t("agents.plan.consentRevoked");
@@ -1546,6 +1647,12 @@ function PlanView({
           <ShieldCheck size={15} aria-hidden /> {t("agents.plan.title")}
         </h3>
       </div>
+
+      {previewOnly ? (
+        <p className="warnline" role="status">
+          <AlertTriangle size={14} aria-hidden /> {t("agents.plan.previewOnlyBanner")}
+        </p>
+      ) : null}
 
       <dl className="kv">
         <dt>{t("agents.plan.agent")}</dt>
@@ -1580,6 +1687,20 @@ function PlanView({
             {restartHintSourceLabel(plan.restartHintSource)}
           </span>
         </dd>
+        {/* P1-7 修复（复审 P1-1）：当前生效变体。只在多变体通道出现
+            （与下拉同条件）；Insiders / Cursor 未经实测，名后挂 P1-6
+            同款 badge-warn 徽标，不新增样式；默认 code 变体不挂。 */}
+        {plan.targetVariants && plan.targetVariants.length > 1 ? (
+          <>
+            <dt>{t("agents.plan.variantLabel")}</dt>
+            <dd>
+              {variantLabel(plan.targetVariant)}{" "}
+              {isUnverifiedVariant(plan.targetVariant) ? (
+                <span className="badge badge-warn">{t("agents.plan.variant.unverified")}</span>
+              ) : null}
+            </dd>
+          </>
+        ) : null}
       </dl>
 
       {plan.warnings.length > 0 ? (
@@ -1624,6 +1745,24 @@ function PlanView({
                 </span>
               ))}
             </dd>
+            {/*
+              P1-7：首次导入展示（只读预览，不是投递内容）。只在该文件
+              算首次且导入到了值时出现；导入值绝不自动成为投递内容，
+              用户想沿用旧值必须自己填成投递参数并确认后才写盘。
+            */}
+            {file.isFirstDelivery && file.importedFields && file.importedFields.length > 0 ? (
+              <>
+                <dt>{t("agents.plan.importedTitle")}</dt>
+                <dd>
+                  {file.importedFields.map((f) => (
+                    <span key={f.key} className="chip mono">
+                      {f.key} = {f.masked}
+                    </span>
+                  ))}
+                  <div className="muted">{t("agents.plan.importedHint")}</div>
+                </dd>
+              </>
+            ) : null}
           </dl>
           <h4>{t("agents.plan.diffTitle")}</h4>
           {/* 删除行的值侧掩掉（P2-5）：后端只对**已知的**密钥串做替换，旧站点密钥
@@ -1635,7 +1774,7 @@ function PlanView({
         </section>
       ))}
 
-      {noChange ? (
+      {previewOnly ? null : noChange ? (
         <p className="muted">{t("agents.plan.noChange")}</p>
       ) : (
         <label className="checkline">
@@ -1654,12 +1793,12 @@ function PlanView({
         <button
           type="button"
           className="btn btn-primary"
-          disabled={!agreeChecked || busy || noChange}
+          disabled={previewOnly || !agreeChecked || busy || noChange}
           onClick={onApply}
         >
           <Send size={14} aria-hidden /> {t("agents.btn.apply")}
         </button>
-        {plan.consent === "granted" ? (
+        {previewOnly ? null : plan.consent === "granted" ? (
           <button type="button" className="btn" onClick={onRevoke}>
             <RotateCcw size={14} aria-hidden /> {t("agents.btn.revoke")}
           </button>

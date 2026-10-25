@@ -2206,8 +2206,56 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         model: Option<&str>,
         source: delivery::DeliverySource<'_>,
     ) -> Result<DeliveryPlan> {
+        self.delivery_plan_in_with_variant(key_id, channel, model, source, None)
+    }
+
+    /// P1-7：带落点变体的投递预览。变体语义见
+    /// [`delivery::resolve_variant_target`]（名字选、白名单外拒绝）；
+    /// `None` = 默认落点，既有调用点行为一字不变。
+    pub fn delivery_plan_in_with_variant(
+        &self,
+        key_id: i64,
+        channel: DeliveryChannel,
+        model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
+        variant: Option<&str>,
+    ) -> Result<DeliveryPlan> {
+        self.build_delivery_plan(key_id, channel, model, source, variant, false)
+    }
+
+    /// P1-7：只打印不写盘的预览模式。**明确的预览入口**：产出的计划
+    /// 带 `preview_only = true`，全程不写盘、不记 journal、不写绑定——
+    /// 连既有 `delivery_plan` 会写的那条 Debug 事件日志都不写，
+    /// 因此「零副作用」可用库状态前后比对直接证明（见集成测试
+    /// `delivery_preview_import`：目标文件字节、绑定行、投递历史行、
+    /// 事件行四处前后一致）。预览不查同意（与既有预览同口径），
+    /// 但**绝不**因此绕过 apply 的同意门禁——同意仍在落盘入口硬查。
+    pub fn delivery_preview_in(
+        &self,
+        key_id: i64,
+        channel: DeliveryChannel,
+        model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
+        variant: Option<&str>,
+    ) -> Result<DeliveryPlan> {
+        self.build_delivery_plan(key_id, channel, model, source, variant, true)
+    }
+
+    /// `delivery_plan_in` / `delivery_preview_in` 的共享构造体。
+    /// `preview_only = true` 时跳过事件日志（零副作用的最后一处写操作）；
+    /// 其余步骤（取密钥、整单校验、同意状态、首次导入）两路逐字相同，
+    /// 预览看到的就是将来要写的东西，不存在「预览一套、落盘另一套」。
+    fn build_delivery_plan(
+        &self,
+        key_id: i64,
+        channel: DeliveryChannel,
+        model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
+        variant: Option<&str>,
+        preview_only: bool,
+    ) -> Result<DeliveryPlan> {
         let mode = source.mode();
-        let writer = self.prepare_delivery(key_id, channel, model, source)?;
+        let writer = self.prepare_delivery(key_id, channel, model, source, variant)?;
         let api_key = self.secret_for_source(key_id, source)?;
         let patch = writer.plan(&api_key)?;
         let target_path = writer.target_path();
@@ -2217,15 +2265,17 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let fields = writer.fields(&api_key);
         delivery::validate_plan_fields(channel, &fields, &field_options, &target_path)?;
         let consent = self.consent_state(channel, &target_path)?;
-        self.log(observability::event_with_payload(
-            Level::Debug,
-            "delivery",
-            format!("投递预览: {} → {}", channel.as_str(), target_path.display()),
-            serde_json::json!({
-                "consent_granted": consent.is_granted(),
-                "mode": mode.as_str(),
-            }),
-        ));
+        if !preview_only {
+            self.log(observability::event_with_payload(
+                Level::Debug,
+                "delivery",
+                format!("投递预览: {} → {}", channel.as_str(), target_path.display()),
+                serde_json::json!({
+                    "consent_granted": consent.is_granted(),
+                    "mode": mode.as_str(),
+                }),
+            ));
+        }
         // P2-5：掩掉 before 里可能仍在的旧站点密钥（改指网关时 `-` 行的旧密钥
         // 不一定是 `scrub` 认得的形态，不显式替换会明文带出去）。新密钥 + 该
         // target 上当前生效的旧密钥一起替换，`scrub` 兜底掩别的形态。
@@ -2240,6 +2290,24 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         } else {
             None
         };
+        // P1-7：首次投递判定与只读导入。判定口径是「该目标文件上
+        // 没有任何生效中的绑定」——同意不算投递（同意只写 consents 表，
+        // 不产生绑定），因此「授过同意但从未投递」仍算首次，导入照常做。
+        // 导入只读：读盘一次（不存在返回空串，不创建文件），导入值只进
+        // 本计划的 `imported_fields`，绝不进入 `fields` / `patch` / apply。
+        let (_, target_variant) = delivery::resolve_variant_target(channel, &self.home, variant)?;
+        let is_first_delivery = self
+            .store
+            .bindings_of_target(&target_path.display().to_string())?
+            .iter()
+            .all(|row| row.unbound_at.is_some());
+        let imported_fields = if is_first_delivery {
+            let expected = delivery::expected_fields(channel, &field_options);
+            let text = delivery::json_text::read_text_or_empty(&target_path)?;
+            delivery::import_existing_fields(channel, &expected, &text)
+        } else {
+            Vec::new()
+        };
         Ok(DeliveryPlan {
             agent_id: channel.agent_id().to_string(),
             channel,
@@ -2250,13 +2318,35 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             consent,
             target_path,
             dsh_credential_reference,
+            preview_only,
+            is_first_delivery,
+            imported_fields,
+            target_variant,
         })
     }
 
     /// 记录用户同意（幂等：重复同意刷新时间戳并解除撤销）。
     pub fn grant_consent(&self, key_id: i64, channel: DeliveryChannel) -> Result<()> {
-        let writer =
-            self.prepare_delivery(key_id, channel, None, delivery::DeliverySource::Site)?;
+        self.grant_consent_with_variant(key_id, channel, None)
+    }
+
+    /// P1-7：带落点变体的同意授予。同意按**变体目标路径**记——
+    /// 默认落点的同意不等于 Insiders / Cursor 变体的同意（`consents` 表
+    /// 按 `(agent_id, channel, target_path)` 存），变体投递查不到
+    /// 对应路径的同意时按缺同意拒绝，不拿默认路径的同意顶替。
+    pub fn grant_consent_with_variant(
+        &self,
+        key_id: i64,
+        channel: DeliveryChannel,
+        variant: Option<&str>,
+    ) -> Result<()> {
+        let writer = self.prepare_delivery(
+            key_id,
+            channel,
+            None,
+            delivery::DeliverySource::Site,
+            variant,
+        )?;
         let target = self.checked_target(channel, &writer.target_path())?;
         // 记录同意**不需要**读钥匙串：用户此刻同意的是「写哪些键」，不是「密钥是否存在」。
         let fields = writer.field_names();
@@ -2281,8 +2371,23 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
 
     /// 撤销同意。**不**回滚已写入的文件（回滚是独立动作）。
     pub fn revoke_consent(&self, key_id: i64, channel: DeliveryChannel) -> Result<()> {
-        let writer =
-            self.prepare_delivery(key_id, channel, None, delivery::DeliverySource::Site)?;
+        self.revoke_consent_with_variant(key_id, channel, None)
+    }
+
+    /// P1-7：带落点变体的同意撤销（与授予同口径：按变体目标路径记）。
+    pub fn revoke_consent_with_variant(
+        &self,
+        key_id: i64,
+        channel: DeliveryChannel,
+        variant: Option<&str>,
+    ) -> Result<()> {
+        let writer = self.prepare_delivery(
+            key_id,
+            channel,
+            None,
+            delivery::DeliverySource::Site,
+            variant,
+        )?;
         let target = self.checked_target(channel, &writer.target_path())?;
         self.store.revoke_consent(
             channel.agent_id(),
@@ -2384,13 +2489,27 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         model: Option<&str>,
         source: delivery::DeliverySource<'_>,
     ) -> Result<DeliveryOutcome> {
+        self.apply_delivery_in_with_variant(key_id, channel, model, source, None)
+    }
+
+    /// P1-7：带落点变体的落盘。写盘逻辑与 `apply_delivery_in` 逐字相同，
+    /// 只换写入器目标（变体路径经白名单解析 + `checked_target` 成员验算）；
+    /// 同意门禁、锁、校验、回读、记账一律不变。
+    pub fn apply_delivery_in_with_variant(
+        &self,
+        key_id: i64,
+        channel: DeliveryChannel,
+        model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
+        variant: Option<&str>,
+    ) -> Result<DeliveryOutcome> {
         // P1-2：记录投递模式（轮换按它走，不把网关模式改成站点模式）。
         let delivery_mode = match &source {
             delivery::DeliverySource::Gateway(_) => "gateway",
             delivery::DeliverySource::Site => "site",
         };
         // ① 同意（未同意时**不读钥匙串、不落盘**）
-        let writer = self.prepare_delivery(key_id, channel, model, source)?;
+        let writer = self.prepare_delivery(key_id, channel, model, source, variant)?;
         let target = self.checked_target(channel, &writer.target_path())?;
         if !self.consent_state(channel, &target)?.is_granted() {
             self.log(observability::event_with_payload(
@@ -2584,13 +2703,67 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         source: delivery::DeliverySource<'_>,
         preserve_auth: bool,
     ) -> Result<delivery::CodexDeliveryPlan> {
+        self.delivery_plan_codex_in_with_variant(key_id, model, source, preserve_auth, None)
+    }
+
+    /// P1-7：带落点变体的 Codex 双文件预览（Codex 两通道无变体，
+    /// 传非默认变体名时在单通道构造里即被拒绝，不静默忽略）。
+    pub fn delivery_plan_codex_in_with_variant(
+        &self,
+        key_id: i64,
+        model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
+        preserve_auth: bool,
+        variant: Option<&str>,
+    ) -> Result<delivery::CodexDeliveryPlan> {
+        self.build_codex_plan(key_id, model, source, preserve_auth, variant, false)
+    }
+
+    /// P1-7：Codex 双文件的只打印预览（两份单计划都走预览入口，
+    /// 各自 `preview_only = true`、各自零副作用）。
+    pub fn delivery_preview_codex_in(
+        &self,
+        key_id: i64,
+        model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
+        preserve_auth: bool,
+        variant: Option<&str>,
+    ) -> Result<delivery::CodexDeliveryPlan> {
+        self.build_codex_plan(key_id, model, source, preserve_auth, variant, true)
+    }
+
+    /// Codex 双文件预览的共享构造体（见 `build_delivery_plan` 的注释：
+    /// 预览与既有预览只差事件日志一处，其余逐字相同）。
+    fn build_codex_plan(
+        &self,
+        key_id: i64,
+        model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
+        preserve_auth: bool,
+        variant: Option<&str>,
+        preview_only: bool,
+    ) -> Result<delivery::CodexDeliveryPlan> {
         let mode = source.mode();
         let auth = if preserve_auth {
             None
         } else {
-            Some(self.delivery_plan_in(key_id, DeliveryChannel::CodexAuthJson, model, source)?)
+            Some(self.build_delivery_plan(
+                key_id,
+                DeliveryChannel::CodexAuthJson,
+                model,
+                source,
+                variant,
+                preview_only,
+            )?)
         };
-        let config = self.delivery_plan_in(key_id, DeliveryChannel::CodexConfig, model, source)?;
+        let config = self.build_delivery_plan(
+            key_id,
+            DeliveryChannel::CodexConfig,
+            model,
+            source,
+            variant,
+            preview_only,
+        )?;
         Ok(delivery::CodexDeliveryPlan {
             preserve_auth,
             mode,
@@ -2622,6 +2795,19 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         source: delivery::DeliverySource<'_>,
         preserve_auth: bool,
     ) -> Result<delivery::CodexDeliveryOutcome> {
+        self.apply_codex_in_with_variant(key_id, model, source, preserve_auth, None)
+    }
+
+    /// P1-7：带落点变体的 Codex 双文件落盘（写盘逻辑逐字不变，
+    /// 只换写入器目标的解析口径；Codex 通道无变体，非默认变体名即拒绝）。
+    pub fn apply_codex_in_with_variant(
+        &self,
+        key_id: i64,
+        model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
+        preserve_auth: bool,
+        variant: Option<&str>,
+    ) -> Result<delivery::CodexDeliveryOutcome> {
         let delivery_mode = match &source {
             delivery::DeliverySource::Gateway(_) => "gateway",
             delivery::DeliverySource::Site => "site",
@@ -2633,10 +2819,16 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let auth_writer = if preserve_auth {
             None
         } else {
-            Some(self.prepare_delivery(key_id, DeliveryChannel::CodexAuthJson, model, source)?)
+            Some(self.prepare_delivery(
+                key_id,
+                DeliveryChannel::CodexAuthJson,
+                model,
+                source,
+                variant,
+            )?)
         };
         let config_writer =
-            self.prepare_delivery(key_id, DeliveryChannel::CodexConfig, model, source)?;
+            self.prepare_delivery(key_id, DeliveryChannel::CodexConfig, model, source, variant)?;
         // 写顺序固定：auth → config（journal entry 顺序与之一致；
         // 回滚按逆序走，先还 config 再还 auth）。
         let mut to_write: Vec<(DeliveryChannel, PathBuf)> = Vec::new();
@@ -3747,23 +3939,27 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     fn rotation_precheck(&self, key_id: i64, channels: &[DeliveryChannel]) -> Vec<BlockedTarget> {
         let mut blocked = Vec::new();
         for channel in channels {
-            let writer =
-                match self.prepare_delivery(key_id, *channel, None, delivery::DeliverySource::Site)
-                {
-                    Ok(writer) => writer,
-                    Err(err) => {
-                        blocked.push(BlockedTarget {
-                            channel: channel.as_str().to_string(),
-                            target: self
-                                .home
-                                .join(channel.relative_target())
-                                .display()
-                                .to_string(),
-                            reason: crate::redact::scrub(&err.to_string()),
-                        });
-                        continue;
-                    }
-                };
+            let writer = match self.prepare_delivery(
+                key_id,
+                *channel,
+                None,
+                delivery::DeliverySource::Site,
+                None,
+            ) {
+                Ok(writer) => writer,
+                Err(err) => {
+                    blocked.push(BlockedTarget {
+                        channel: channel.as_str().to_string(),
+                        target: self
+                            .home
+                            .join(channel.relative_target())
+                            .display()
+                            .to_string(),
+                        reason: crate::redact::scrub(&err.to_string()),
+                    });
+                    continue;
+                }
+            };
             let target = writer.target_path();
             // P2-2 / DEBUG-REPORT-v3 §2-2：`plan()` 只验「文件写得进」，验不出「同意被撤销」
             // 和「目标是符号链接」——这两种在 `apply_delivery` 时才失败，而那时 `create_key`
@@ -6998,6 +7194,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         channel: DeliveryChannel,
         model: Option<&str>,
         source: delivery::DeliverySource<'_>,
+        variant: Option<&str>,
     ) -> Result<Box<dyn delivery::DeliveryWriter>> {
         // key_id 存在性先校验：不存在时连通道都不必解析
         let row = self
@@ -7012,6 +7209,26 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         // 在线拉取由命令层在调用投递前 `await warm_model_meta(...)` 完成（best-effort）；
         // 这里只读缓存，**一次网络都不发**（同步函数）。
         let meta = self.meta_for(model);
+        // P1-7：变体先验——任何通道都先过一次白名单变体名解析，
+        // 非默认变体名在这里就拒绝（不在后面静默回落默认）；
+        // Cline 通道再用解析出的变体路径构造写入器（其余通道的
+        // 解析结果恒为默认路径，走既有解析路径一字不变）。
+        let (variant_target, _) = delivery::resolve_variant_target(channel, &self.home, variant)?;
+        if channel == DeliveryChannel::Cline {
+            // 与 `resolve_for_source_with_meta` 的 base_url 口径逐字一致：
+            // 站点模式用站点 base_url，网关模式用端点自带的完整 base_url
+            // （已含 `/v1` 前缀，见 `resolve_for_gateway_with_meta`）。
+            let base_url = match source {
+                delivery::DeliverySource::Site => site.base_url.clone(),
+                delivery::DeliverySource::Gateway(endpoint) => endpoint.base_url.clone(),
+            };
+            return Ok(Box::new(delivery::cline::ClineWriter::with_path_and_model(
+                variant_target,
+                &base_url,
+                model,
+                meta,
+            )));
+        }
         delivery::resolve_for_source_with_meta(
             source,
             channel,
@@ -7208,20 +7425,29 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             .and_then(|state| state.last.lock().ok().and_then(|guard| guard.clone()))
     }
 
-    /// 目标路径白名单：既要落在 `home` 之内，也要与**该通道声明的相对路径**逐字相等。
+    /// 目标路径白名单：既要落在 `home` 之内，也要是该通道白名单内的路径
+    /// （P1-7：Cline 通道含三条编辑器变体路径，其余通道只有默认路径一条）。
     ///
     /// 只做 `starts_with(home)` 是不够的：任何落在 home 下的路径都会放行（复核 P2）。
     /// 期望路径由 [`DeliveryChannel::relative_target`] 提供（M6-S0 从本函数搬走）——
     /// 新增通道只需改 `delivery/mod.rs` 一处，本文件不再需要跟着改。
     fn checked_target(&self, channel: DeliveryChannel, target: &Path) -> Result<PathBuf> {
-        let expected = self.home.join(channel.relative_target());
-        if target != expected {
+        // P1-7：白名单按成员关系判定——Cline 通道含 Code / Insiders / Cursor
+        // 三条变体路径，其余通道只有默认路径一条；白名单外的任何路径
+        // （哪怕落在 home 内、哪怕是兄弟通道的路径）一律拒绝，不得静默接受。
+        let allowed = delivery::allowed_targets(channel, &self.home);
+        if !allowed.iter().any(|p| p.as_path() == target) {
+            let list = allowed
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("、");
             return Err(Error::Inject {
                 path: target.display().to_string(),
                 reason: format!(
-                    "投递目标与通道 {} 声明的路径不符（期望 {}），拒绝写入",
+                    "投递目标与通道 {} 声明的白名单路径不符（白名单：{}），拒绝写入",
                     channel.as_str(),
-                    expected.display()
+                    list
                 ),
             });
         }
