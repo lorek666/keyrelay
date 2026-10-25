@@ -127,8 +127,19 @@ fn config(route: Vec<Upstream>, keys: Vec<(&str, &str)>) -> GatewayConfig {
 }
 
 fn request(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    request_with_timeout(port, method, path, body, Duration::from_secs(15))
+}
+
+/// 同上，但客户端读超时可调：仅供 `m44_c4` 使用（见该用例注释）。
+fn request_with_timeout(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    read_timeout: Duration,
+) -> (u16, String) {
     let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(15))).ok();
+    s.set_read_timeout(Some(read_timeout)).ok();
     let body = body.unwrap_or("");
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -368,6 +379,17 @@ async fn m44_c3_read_timeout_is_not_replayed() {
 }
 
 /// C4：连接失败 ⇒ 重放；B 收到 1 次。
+///
+/// Windows 注意（CI 40225644513 实测 502）：Windows 的 Winsock 收到未监听端口的
+/// RST 后**不立即失败**，而是按 base 超时重发 SYN 直到最大重试（默认 3 次，见微软
+/// KB 175523；Unix 是首个 RST 即失败）。`config()` 默认的 300ms connect/read
+/// 超时会在 Winsock 真正报出拒绝之前先触发——其中 read 超时报的是非 connect
+/// 错误 ⇒ `classify_send_error` 判 Ambiguous ⇒ 不重放 ⇒ 502。Linux 上 RST 瞬到，
+/// 两维超时值从不触发，行为与断言都不变。
+///
+/// 修法（只动本用例的超时，不动分类与断言）：connect/read 各放宽到 30s，让
+/// Winsock 的 SYN 重试先走完、真正报拒（`is_connect`）后再分类、重放到 B；
+/// 客户端读超时同步放宽到 60s（Winsock 等待 + B 响应），避免客户端先于网关超时。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m44_c4_connection_failure_is_replayed() {
     let b = fake(vec!["200 OK"], 0);
@@ -379,9 +401,20 @@ async fn m44_c4_connection_failure_is_replayed() {
         vec![("r1", "sk-test-1"), ("r2", "sk-test-2")],
     );
     cfg.breaker = BreakerPolicy::default();
+    cfg.upstream_timeout = UpstreamTimeout {
+        connect: Duration::from_secs(30),
+        read: Duration::from_secs(30),
+    };
     let h = gateway::start(cfg).await.unwrap();
     assert_eq!(
-        request(port_of(&h), "POST", "/v1/chat/completions", Some(BODY)).0,
+        request_with_timeout(
+            port_of(&h),
+            "POST",
+            "/v1/chat/completions",
+            Some(BODY),
+            Duration::from_secs(60),
+        )
+        .0,
         200
     );
     assert_eq!(b.hits.load(Ordering::SeqCst), 1);

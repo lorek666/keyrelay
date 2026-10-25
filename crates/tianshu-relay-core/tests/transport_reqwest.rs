@@ -297,7 +297,24 @@ async fn real_stack_retries_429_with_retry_after() {
 /// TCP 直接 RST。用 mock 是证明不了的——mock 里的错误是我们自己造的形状。
 #[tokio::test]
 async fn refused_connection_is_classified_as_not_delivered() {
-    let transport = transport(Duration::from_secs(2));
+    // Windows 注意（CI 40225644513 实测 `Transport("请求超时 …")`，耗时约等于总超时
+    // 2s）：Windows 的 Winsock 收到未监听端口的 RST 后**不立即失败**，而是按 base
+    // 超时重发 SYN 直到最大重试（默认 3 次，见微软 KB 175523；Unix 是首个 RST 即
+    // 失败）。原用例的总超时 2s（且 connect 超时仍是默认 8s）会在 Winsock 真正报出
+    // 拒绝之前先触发总超时；而 `describe()` 按设计先判 `is_timeout` 再判
+    // `is_connect`（超时可能已送达，宁可保守），于是被拒误判为超时。
+    //
+    // 修法（只动本用例的超时，不动分类与断言）：总超时与 connect 超时**两维都**
+    // 给 30s——只放宽一维不够：任一先触发的定时器都会抢在 Winsock 报拒之前把
+    // 错误定性为超时。30s 足以覆盖 Winsock 的 SYN 重试全程（base 超时不翻倍，
+    // 即使按 3s 计也约 12s），Winsock 先报拒 ⇒ `is_connect` 且非超时 ⇒
+    // `NotDelivered`。Linux 上 RST 瞬到，两维取值不影响结果与耗时。
+    let transport = ReqwestTransport::new(TransportConfig {
+        timeout: Duration::from_secs(30),
+        connect_timeout: Duration::from_secs(30),
+        ..TransportConfig::default()
+    })
+    .expect("构造传输层");
     let err = transport
         .request(HttpRequest::new(
             Method::Post,

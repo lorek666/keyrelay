@@ -879,7 +879,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("临时目录");
         let bin_dir = dir.path().join(".local").join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
+        // Windows 下没有 sh：无后缀的 sh 脚本能被 find_bin 找到（非 Unix 的
+        // is_executable 只看 is_file），但 Command::new 跑不起来，CI 上表现为
+        // found=true、版本 None。生产 find_bin 在 Windows 上本来就先找 .exe/.cmd，
+        // 因此夹具用 .cmd；CreateProcess 会经 cmd.exe 执行它，输出同样是
+        // "cline 1.2.3"，版本解析不变。
+        #[cfg(windows)]
+        let script = bin_dir.join("cline.cmd");
+        #[cfg(not(windows))]
         let script = bin_dir.join("cline");
+        #[cfg(windows)]
+        std::fs::write(&script, "@echo cline 1.2.3\r\n").unwrap();
+        #[cfg(not(windows))]
         std::fs::write(&script, "#!/bin/sh\necho \"cline 1.2.3\"\n").unwrap();
         #[cfg(unix)]
         {
@@ -1091,11 +1102,10 @@ mod tests {
         let status = detect_one(spec, home);
         assert!(status.installed, "{status:?}");
         assert_eq!(status.version.as_deref(), Some("3.2.1"));
-        assert!(status
-            .source
-            .as_deref()
-            .unwrap()
-            .contains(".vscode/extensions"));
+        // source 是生产返回的 display() 路径：Windows 下分隔符是反斜杠，
+        // 断言前先归一化，否则 ".vscode/extensions" 在 Windows 上永远匹配不到。
+        let source = status.source.as_deref().unwrap().replace('\\', "/");
+        assert!(source.contains(".vscode/extensions"), "{status:?}");
     }
 
     #[cfg(target_os = "macos")]
