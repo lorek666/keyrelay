@@ -498,3 +498,152 @@ describe("M31-S1 Agent 工作台", () => {
     expect(plan.textContent).toContain("claude");
   });
 });
+
+describe("P1-7 首次导入 + 预览模式 + 落点变体", () => {
+  // 本 describe 只测 UI 接线（DTO 驱动渲染）：plan 由 mock 按入参回填，
+  // 后端变体白名单与只读导入的语义由核心层集成测试钉住，不在这里复测。
+  const fullPlan = (args: {
+    previewOnly?: boolean;
+    targetVariant?: string;
+    targetVariants?: string[];
+    importedFields?: { key: string; masked: string }[];
+    isFirstDelivery?: boolean;
+  }) => ({
+    agentId: "codex",
+    channel: "codex-auth-json",
+    targetPath: "/home/u/.codex/auth.json",
+    targetExists: true,
+    mode: "site",
+    fields: [{ key: "OPENAI_API_KEY", masked: "…9999" }],
+    endpointInChannel: false,
+    preview: '- "OPENAI_API_KEY": "…0000"\n+ "OPENAI_API_KEY": "…9999"\n',
+    consent: "missing",
+    consentGrantedAt: null,
+    consentRevokedAt: null,
+    warnings: [],
+    restartHint: "needed",
+    restartHintSource: "unverified",
+    restartHintAction: "codexSplit",
+    preserveAuth: false,
+    files: [
+      {
+        channel: "codex-auth-json",
+        targetPath: "/home/u/.codex/auth.json",
+        targetExists: true,
+        fields: [{ key: "OPENAI_API_KEY", masked: "…9999" }],
+        preview: '- "OPENAI_API_KEY": "…0000"\n+ "OPENAI_API_KEY": "…9999"\n',
+        consent: "missing",
+        consentGrantedAt: null,
+        consentRevokedAt: null,
+        isFirstDelivery: args.isFirstDelivery ?? false,
+        importedFields: args.importedFields ?? [],
+      },
+    ],
+    dshCredentialReference: null,
+    previewOnly: args.previewOnly ?? false,
+    isFirstDelivery: args.isFirstDelivery ?? false,
+    importedFields: args.importedFields ?? [],
+    targetVariant: args.targetVariant ?? "default",
+    targetVariants: args.targetVariants ?? ["default"],
+  });
+
+  const lastPlanArg = () =>
+    (deliveryPlan as unknown as { mock: { calls: unknown[][] } }).mock.calls.at(-1)![0] as Record<
+      string,
+      unknown
+    >;
+
+  const previewToggle = () =>
+    Array.from(document.querySelectorAll<HTMLInputElement>("input[type=checkbox]")).find((c) =>
+      c.closest("label")?.textContent?.includes(zhCN.agents.plan.previewOnlyToggle),
+    )!;
+
+  it("仅预览开关：plan 参数带 previewOnly，横幅出现、投递按钮消失", async () => {
+    vi.mocked(deliveryPlan).mockImplementation(async (args: {
+      previewOnly?: boolean;
+    }) => fullPlan({ previewOnly: args.previewOnly === true }) as never);
+    renderPage();
+    await waitFor(() => expect(keySelect("codex-auth-json")).not.toBeNull());
+    // 先选密钥，否则预览查询因 activeKey 为空而不启用（见测试⑩）。
+    fireEvent.change(keySelect("codex-auth-json"), { target: { value: "101" } });
+    fireEvent.click(row("codex-auth-json").querySelector(".agent-row-toggle")!);
+    await waitFor(() => expect(document.querySelector(".agent-row-plan")).not.toBeNull());
+
+    fireEvent.click(previewToggle());
+    await waitFor(() => expect(lastPlanArg()).toMatchObject({ previewOnly: true }));
+    await waitFor(() =>
+      expect(document.querySelector(".agent-row-plan")!.textContent).toContain(
+        zhCN.agents.plan.previewOnlyBanner,
+      ),
+    );
+    const planEl = document.querySelector(".agent-row-plan")!;
+    // 预览模式下投递按钮仍渲染、但被禁用（不是悄悄藏起来让用户以为没这功能）。
+    const applyBtn = Array.from(planEl.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes(zhCN.agents.btn.apply),
+    )!;
+    expect(applyBtn).not.toBeUndefined();
+    expect(applyBtn.disabled).toBe(true);
+    // 单变体通道不出现变体下拉（清单长度 1 时不渲染）。
+    expect(document.body.textContent).not.toContain(zhCN.agents.plan.variantLabel);
+  });
+
+  it("变体下拉与导入块都由 DTO 驱动：选变体进参数，导入值只展示不进投递栏", async () => {
+    vi.mocked(deliveryPlan).mockImplementation(async (args: {
+      targetVariant?: string;
+    }) =>
+      fullPlan({
+        targetVariant: args.targetVariant ?? "code",
+        targetVariants: ["code", "code-insiders", "cursor"],
+        isFirstDelivery: true,
+        importedFields: [{ key: "OPENAI_API_KEY", masked: "…1111" }],
+      }) as never,
+    );
+    renderPage();
+    await waitFor(() => expect(keySelect("codex-auth-json")).not.toBeNull());
+    // 先选密钥，否则预览查询因 activeKey 为空而不启用（见测试⑩）。
+    fireEvent.change(keySelect("codex-auth-json"), { target: { value: "101" } });
+    fireEvent.click(row("codex-auth-json").querySelector(".agent-row-toggle")!);
+    // .agent-row-plan 在加载态就已渲染，必须等到导入块出现才算 plan 数据已到
+    // （否则变体下拉还没渲染，查找会误报不存在）。
+    await waitFor(() =>
+      expect(document.querySelector(".agent-row-plan")!.textContent).toContain(
+        zhCN.agents.plan.importedTitle,
+      ),
+    );
+
+    const variantSelect = Array.from(document.querySelectorAll("select")).find((s) =>
+      Array.from(s.options).some((o) => o.value === "cursor"),
+    )!;
+    expect(variantSelect).not.toBeUndefined();
+    // P1-7 修复（复审 P1-1）：Insiders / Cursor 下拉选项名后必须带“未实测”
+    // 后缀，默认 code 变体不带（它是 P1-7 前已有的默认落点）。
+    const optionText = (v: string) =>
+      Array.from(variantSelect.options).find((o) => o.value === v)?.textContent ?? "";
+    expect(optionText("code-insiders")).toContain(zhCN.agents.plan.variant.unverifiedSuffix);
+    expect(optionText("cursor")).toContain(zhCN.agents.plan.variant.unverifiedSuffix);
+    expect(optionText("code")).not.toContain(zhCN.agents.plan.variant.unverifiedSuffix);
+    fireEvent.change(variantSelect, { target: { value: "cursor" } });
+    await waitFor(() => expect(lastPlanArg()).toMatchObject({ targetVariant: "cursor" }));
+    // 变体切换触发预览重取：等重取落定（导入块重现）后再断言，
+    // 否则读到的是加载态文本。
+    await waitFor(() =>
+      expect(document.querySelector(".agent-row-plan")!.textContent).toContain(
+        zhCN.agents.plan.importedTitle,
+      ),
+    );
+
+    const planEl = document.querySelector(".agent-row-plan")!;
+    expect(planEl.textContent).toContain(zhCN.agents.plan.importedTitle);
+    expect(planEl.textContent).toContain("…1111");
+    expect(planEl.textContent).toContain(zhCN.agents.plan.importedHint);
+    // 导入的旧值只出现在导入块，不会混进「将写入」栏的投递值（…9999 仍是新值）。
+    expect(planEl.textContent).toContain("…9999");
+    // P1-7 修复（复审 P1-1）：选 cursor 后计划视图里当前变体名后必须挂
+    // badge-warn“未实测”徽标（只断言徽标本身，不连带断言下拉后缀文本）。
+    expect(
+      Array.from(planEl.querySelectorAll("span.badge-warn")).some(
+        (s) => s.textContent === zhCN.agents.plan.variant.unverified,
+      ),
+    ).toBe(true);
+  });
+});

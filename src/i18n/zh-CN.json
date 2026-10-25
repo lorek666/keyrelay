@@ -615,7 +615,20 @@
       "agree": "我同意把上述密钥写入该 agent 的配置（写入前会备份，可回滚）",
       "agreeAll": "我已看过上面全部文件的差异，同意把上述密钥写入这些配置（写入前会备份，可回滚）",
       "fileTitle": "第 {index} 个文件（共 {total} 个）",
-      "generating": "生成预览…"
+      "generating": "生成预览…",
+      "previewOnlyToggle": "仅预览（不写盘、不记账）",
+      "previewOnlyBanner": "仅预览模式：下面是「将要写入」的内容，本次没有写盘、没有记账、没有写绑定。关掉「仅预览」后才能投递。",
+      "importedTitle": "现有配置（首次导入，只读）",
+      "importedHint": "这些是该文件里已有的值，仅供对照，不会自动写入；投递仍按「将写入」一栏走。",
+      "variantLabel": "落点变体",
+      "variant": {
+        "code": "VS Code（稳定版）",
+        "codeInsiders": "VS Code Insiders",
+        "cursor": "Cursor",
+        "default": "默认",
+        "unverified": "未实测",
+        "unverifiedSuffix": "（未实测）"
+      }
     },
     "restartHint": {
       "notNeeded": "改完即生效：该 agent 每次运行都会重新读这个文件。",

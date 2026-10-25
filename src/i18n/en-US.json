@@ -615,7 +615,20 @@
       "agree": "I consent to writing the above key into this agent's config (backup is taken before write; rollback is available)",
       "agreeAll": "I have reviewed the diffs of all files above and consent to writing the above key into these configs (backup is taken before write; rollback is available)",
       "fileTitle": "File {index} of {total}",
-      "generating": "Generating preview…"
+      "generating": "Generating preview…",
+      "previewOnlyToggle": "Preview only (writes nothing, records nothing)",
+      "previewOnlyBanner": "Preview-only mode: what follows is what would be written. Nothing was written to disk, no journal was recorded, no binding was created. Turn off preview-only to deliver.",
+      "importedTitle": "Existing config (first-delivery import, read-only)",
+      "importedHint": "These are the values already in the file, shown for reference only; delivery still writes the “will write” values.",
+      "variantLabel": "Target variant",
+      "variant": {
+        "code": "VS Code (stable)",
+        "codeInsiders": "VS Code Insiders",
+        "cursor": "Cursor",
+        "default": "Default",
+        "unverified": "Unverified",
+        "unverifiedSuffix": " (unverified)"
+      }
     },
     "restartHint": {
       "notNeeded": "Effective immediately: the agent re-reads this file on every run.",

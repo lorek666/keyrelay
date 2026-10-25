@@ -295,6 +295,20 @@ pub struct DeliveryPlanDto {
     /// 仅类型层接线：Agents 页渲染是后续项（BACKLOG B-280），在此之前
     /// 不得宣称预览已展示该结果。
     dsh_credential_reference: Option<tianshu_relay_core::delivery::dsh::DshReferenceCheck>,
+    /// P1-7：本计划是否由预览专用入口产出（零副作用模式）。
+    /// `true` 时前端必须渲染「仅预览，未写入」并禁用投递按钮。
+    preview_only: bool,
+    /// P1-7：该目标文件上是否没有任何生效中的绑定（首次投递判定）。
+    is_first_delivery: bool,
+    /// P1-7：首次投递时从现有文件只读导入的现有值（已掩码处理）；
+    /// 非首次为空。**不是**投递内容：写盘仍按 `fields` 走。
+    imported_fields: Vec<DeliveryFieldDto>,
+    /// P1-7：本次生效的落点变体名（Cline 为 `code` / `code-insiders` /
+    /// `cursor`，其余通道为 `default`）。
+    target_variant: String,
+    /// P1-7：该通道可选的落点变体名表（前端下拉直接用它渲染，
+    /// 不得在界面里硬编码变体清单——清单变了界面会跟着错）。
+    target_variants: Vec<String>,
 }
 
 /// 一单里某一个文件的预览（P0-2）。字段含义与顶层同名项一致，
@@ -312,6 +326,10 @@ pub struct DeliveryFilePlanDto {
     consent: String,
     consent_granted_at: Option<i64>,
     consent_revoked_at: Option<i64>,
+    /// P1-7：该文件的首次投递判定与只读导入（与顶层同口径，
+    /// 双文件时两文件各自判定、各自导入）。
+    is_first_delivery: bool,
+    imported_fields: Vec<DeliveryFieldDto>,
 }
 
 /// [`tianshu_relay_core::delivery::RestartHint`] 的线格式。
@@ -709,6 +727,17 @@ pub struct DeliveryArgs {
     /// - `Some(true)`：Codex 保留——只写 config.toml，auth.json 一个字节都不碰；
     ///   且**必须由调用方显式传入**，绝不能从「auth.json 已存在」推断。
     preserve_auth: Option<bool>,
+    /// P1-7：落点变体名（白名单名字，不是自由路径）。只对 Cline 通道有意义
+    /// （`"code"` / `"code-insiders"` / `"cursor"`）；其余通道只认
+    /// `None` / `"default"`，传编辑器变体名直接拒绝（不是静默回落默认）。
+    /// opencode 的 `.json` / `.jsonc` 选择由通道承载，不走这个字段。
+    target_variant: Option<String>,
+    /// P1-7：只打印不写盘的预览模式。只对 `delivery_plan` 有意义：
+    /// `true` 时走预览专用入口（计划带 `previewOnly: true`，全程不写盘、
+    /// 不记 journal、不写绑定、连事件日志都不写）。对 `apply_delivery` /
+    /// `grant_consent` / `revoke_consent` 传 `true` 直接拒绝——
+    /// 预览模式下任何写操作都不得发生，更不能静默降级成普通调用。
+    preview_only: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -921,6 +950,16 @@ fn file_plan_dto(plan: &tianshu_relay_core::delivery::DeliveryPlan) -> DeliveryF
         consent: consent.to_string(),
         consent_granted_at: granted_at,
         consent_revoked_at: revoked_at,
+        // P1-7：按文件透传首次判定与只读导入（双文件时 auth / config 各自算）。
+        is_first_delivery: plan.is_first_delivery,
+        imported_fields: plan
+            .imported_fields
+            .iter()
+            .map(|f| DeliveryFieldDto {
+                key: f.key.clone(),
+                masked: f.masked.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -966,6 +1005,23 @@ fn single_plan_dto(plan: tianshu_relay_core::delivery::DeliveryPlan) -> Delivery
         // P0-3：原样透传核心层结果——DSH 为 Some、其余通道为 None，
         // 不在这里把 None 换成空对象，也不在这里把 Some 丢掉。
         dsh_credential_reference: plan.dsh_credential_reference,
+        // P1-7：原样透传预览标志、首次判定、只读导入与生效变体；
+        // 变体清单由后端变体名表给（前端不得硬编码）。
+        preview_only: plan.preview_only,
+        is_first_delivery: plan.is_first_delivery,
+        imported_fields: plan
+            .imported_fields
+            .into_iter()
+            .map(|f| DeliveryFieldDto {
+                key: f.key,
+                masked: f.masked,
+            })
+            .collect(),
+        target_variant: plan.target_variant.to_string(),
+        target_variants: tianshu_relay_core::delivery::target_variant_names(channel)
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect(),
     }
 }
 
@@ -1067,6 +1123,10 @@ pub async fn delivery_plan(
     // M14-S7 §4.2：先把「内置表没覆盖的模型」的在线参数预热进缓存，再走同步的 plan。
     // best-effort：网络失败/超时只是没有参数行，预览照常出（失败不阻断投递）。
     let _ = state.service.warm_model_meta(args.model.as_deref()).await;
+    // P1-7：落点变体与预览模式随参数透传（变体名白名单外即拒绝，
+    // 见服务层；预览入口零副作用，见 `delivery_preview_in`）。
+    let variant = args.target_variant.as_deref();
+    let preview_only = args.preview_only == Some(true);
     // P0-2：两条 Codex 通道走双文件同单——没传 `preserve_auth` 即双文件
     // （`unwrap_or(false)`），显式 `true` 才保留。两条通道的入口等价：
     // 从 auth 卡片还是 config 卡片进来，单里都是同一组文件。
@@ -1076,9 +1136,28 @@ pub async fn delivery_plan(
             | tianshu_relay_core::delivery::DeliveryChannel::CodexConfig
     ) {
         let preserve_auth = args.preserve_auth.unwrap_or(false);
+        if preview_only {
+            return state
+                .service
+                .delivery_preview_codex_in(
+                    args.key_id,
+                    args.model.as_deref(),
+                    source,
+                    preserve_auth,
+                    variant,
+                )
+                .map(|plan| codex_plan_dto(channel, plan))
+                .map_err(|e| e.to_string());
+        }
         return state
             .service
-            .delivery_plan_codex_in(args.key_id, args.model.as_deref(), source, preserve_auth)
+            .delivery_plan_codex_in_with_variant(
+                args.key_id,
+                args.model.as_deref(),
+                source,
+                preserve_auth,
+                variant,
+            )
             .map(|plan| codex_plan_dto(channel, plan))
             .map_err(|e| e.to_string());
     }
@@ -1087,9 +1166,16 @@ pub async fn delivery_plan(
     if args.preserve_auth == Some(true) {
         return Err("preserve_auth 只对 Codex 双文件投递有意义，该通道不支持保留".to_string());
     }
+    if preview_only {
+        return state
+            .service
+            .delivery_preview_in(args.key_id, channel, args.model.as_deref(), source, variant)
+            .map(single_plan_dto)
+            .map_err(|e| e.to_string());
+    }
     state
         .service
-        .delivery_plan_in(args.key_id, channel, args.model.as_deref(), source)
+        .delivery_plan_in_with_variant(args.key_id, channel, args.model.as_deref(), source, variant)
         .map(single_plan_dto)
         .map_err(|e| e.to_string())
 }
@@ -1114,21 +1200,34 @@ fn delivery_warnings(target: &std::path::Path) -> Vec<String> {
     )]
 }
 
+/// P1-7：预览模式下的写入口守门——`preview_only = true` 时任何写操作
+/// （同意授予 / 撤销、落盘）都直接拒绝，不得静默降级成普通调用。
+fn reject_preview_write(args: &DeliveryArgs) -> Result<(), String> {
+    if args.preview_only == Some(true) {
+        return Err(
+            "预览模式下不得执行写操作（同意授予 / 撤销 / 落盘）：请关掉仅预览后再操作".to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn grant_consent(state: State<'_, AppState>, args: DeliveryArgs) -> Result<(), String> {
     let channel = parse_channel(&args.channel)?;
+    reject_preview_write(&args)?;
     state
         .service
-        .grant_consent(args.key_id, channel)
+        .grant_consent_with_variant(args.key_id, channel, args.target_variant.as_deref())
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn revoke_consent(state: State<'_, AppState>, args: DeliveryArgs) -> Result<(), String> {
     let channel = parse_channel(&args.channel)?;
+    reject_preview_write(&args)?;
     state
         .service
-        .revoke_consent(args.key_id, channel)
+        .revoke_consent_with_variant(args.key_id, channel, args.target_variant.as_deref())
         .map_err(|e| e.to_string())
 }
 
@@ -1199,6 +1298,9 @@ pub async fn apply_delivery(
     // M14-S7 §4.2：同 `delivery_plan`——直接投递（没先预览）时也要拿到在线参数。
     // 缓存已在预览时预热过，这里通常是一次纯读；best-effort，失败不阻断。
     let _ = state.service.warm_model_meta(args.model.as_deref()).await;
+    // P1-7：预览模式不得落盘（见 `reject_preview_write`）；变体随参数透传。
+    reject_preview_write(&args)?;
+    let variant = args.target_variant.as_deref();
     // P0-2：与 `delivery_plan` 同一条路由——Codex 通道走双文件同单，
     // 没传 `preserve_auth` 即双文件，显式 `true` 才保留；非 Codex 通道传
     // `true` 直接拒绝（不得静默忽略）。
@@ -1210,7 +1312,13 @@ pub async fn apply_delivery(
         let preserve_auth = args.preserve_auth.unwrap_or(false);
         return state
             .service
-            .apply_codex_in(args.key_id, args.model.as_deref(), source, preserve_auth)
+            .apply_codex_in_with_variant(
+                args.key_id,
+                args.model.as_deref(),
+                source,
+                preserve_auth,
+                variant,
+            )
             .map(|outcome| codex_outcome_dto(channel, outcome))
             .map_err(|e| e.to_string());
     }
@@ -1219,7 +1327,13 @@ pub async fn apply_delivery(
     }
     state
         .service
-        .apply_delivery_in(args.key_id, channel, args.model.as_deref(), source)
+        .apply_delivery_in_with_variant(
+            args.key_id,
+            channel,
+            args.model.as_deref(),
+            source,
+            variant,
+        )
         .map(single_outcome_dto)
         .map_err(|e| e.to_string())
 }
@@ -5522,6 +5636,13 @@ mod tests {
             // P0-2：本用例为单文件投递，非保留模式 ⇒ false + 空文件表。
             preserve_auth: false,
             files: vec![],
+            // P1-7：本用例为非预览、非首次的单文件投递 ⇒ 预览关、首次关、
+            // 导入空、变体取默认落点（与 P1-7 前的默认落点一致）。
+            preview_only: false,
+            is_first_delivery: false,
+            imported_fields: vec![],
+            target_variant: "default".into(),
+            target_variants: vec!["default".into()],
         };
         let value = to_value(&plan);
         assert_eq!(value["agentId"], "codex");
@@ -5553,6 +5674,16 @@ mod tests {
             Value::Null,
             "非 DSH 通道的引用校验必须为 null，不得是空对象"
         );
+        // P1-7：5 个新字段必须到 camelCase 线上名上（本测试的本意就是断言
+        // 线上字段名；只填默认值而不断言，新字段的序列化会继续缺席）。
+        assert_eq!(value["previewOnly"], false);
+        assert_eq!(value["isFirstDelivery"], false);
+        assert!(
+            value["importedFields"].as_array().unwrap().is_empty(),
+            "非首次投递的导入表必须为空"
+        );
+        assert_eq!(value["targetVariant"], "default");
+        assert_eq!(value["targetVariants"][0], "default");
         assert!(value.get("target_path").is_none(), "不得出现 snake_case");
 
         // M7-S5：**每个**通道都必须给出一个非空提示——新增通道时穷举 match 会编译失败，
