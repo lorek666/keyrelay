@@ -517,7 +517,9 @@
       },
       "unmappedError": "Channels for targets {targets} can't be identified; rotation would miss them. If you proceed and revoke the old key, they'd be stuck on it forever. Fix these targets first—this action is blocked.",
       "newNameLabel": "Name for the new key",
-      "stopCodex": "Rotation re-delivers the new key to Codex: any running Codex is stopped before writing (including terminal sessions), and it is not relaunched automatically afterwards."
+      "stopCodex": "Rotation re-delivers the new key to Codex: any running Codex is stopped before writing (including terminal sessions)—graceful quit first, forced kill if it is still running after the timeout; it is not relaunched automatically afterwards, restart it from the restart section or its launch command.",
+      "stopClaudeDesktop": "Rotation re-delivers the new key to Claude Desktop: any running Claude Desktop is stopped before writing (the desktop app only reads its config at startup, so writing while it runs may be overwritten on launch)—graceful quit first, forced kill if it is still running after the timeout; it is not relaunched automatically afterwards, restart it from the restart section.",
+      "cliNotStopped": "Rotation re-delivers to CLI-based channels too: they are not stopped before writing—if such a tool is running, it may write its old config back on exit and overwrite this rotation. Quit it before confirming, and relaunch it afterwards to verify."
     },
     "rotationResult": {
       "revokeRevoked": "Old key revoked on the site.",
