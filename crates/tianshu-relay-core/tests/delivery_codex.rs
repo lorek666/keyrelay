@@ -3,7 +3,9 @@
 //! 全部测试把 `home` 指向临时目录，绝不触碰用户真实的 `~/.codex`。
 
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tianshu_relay_core::delivery::{ConsentState, DeliveryChannel};
