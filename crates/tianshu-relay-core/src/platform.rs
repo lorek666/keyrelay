@@ -92,36 +92,49 @@ mod tests {
         move |name: &str| map.get(name).cloned()
     }
 
+    /// 覆盖值夹具：必须是宿主平台的绝对路径写法。B-14 校验只认
+    /// `Path::is_absolute`，硬编码 "/tmp/…" 在 Windows 上会被判为相对路径而
+    /// 拒绝（CI run 40225644513 的四例全是这个原因）。用系统临时目录派生：
+    // Unix 上是 /tmp/…，Windows 上是盘符绝对路径，两边都过校验。
+    fn fixture_home(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
     #[test]
     fn override_wins_on_every_platform() {
+        let portable = fixture_home("portable");
+        let portable = portable.to_string_lossy().into_owned();
         let get = env_of(&[
-            (HOME_OVERRIDE_ENV, "/tmp/portable"),
+            (HOME_OVERRIDE_ENV, portable.as_str()),
             ("HOME", "/home/me"),
             ("USERPROFILE", "C:\\Users\\me"),
         ]);
-        assert_eq!(home_dir_with(get).unwrap(), PathBuf::from("/tmp/portable"));
+        assert_eq!(home_dir_with(get).unwrap(), PathBuf::from(portable));
     }
 
     #[test]
     fn legacy_override_is_used_when_new_one_is_absent() {
         // M35-S1 §4.4：旧脚本/旧快捷方式只设 KEYRELAY_HOME 时仍要能启动。
+        let legacy = fixture_home("legacy-home");
+        let legacy = legacy.to_string_lossy().into_owned();
         let get = env_of(&[
-            (LEGACY_HOME_OVERRIDE_ENV, "/tmp/legacy-home"),
+            (LEGACY_HOME_OVERRIDE_ENV, legacy.as_str()),
             ("HOME", "/home/me"),
         ]);
-        assert_eq!(
-            home_dir_with(get).unwrap(),
-            PathBuf::from("/tmp/legacy-home")
-        );
+        assert_eq!(home_dir_with(get).unwrap(), PathBuf::from(legacy));
     }
 
     #[test]
     fn new_override_wins_over_legacy() {
+        let new = fixture_home("new-home");
+        let new = new.to_string_lossy().into_owned();
+        let legacy = fixture_home("legacy-home");
+        let legacy = legacy.to_string_lossy().into_owned();
         let get = env_of(&[
-            (HOME_OVERRIDE_ENV, "/tmp/new-home"),
-            (LEGACY_HOME_OVERRIDE_ENV, "/tmp/legacy-home"),
+            (HOME_OVERRIDE_ENV, new.as_str()),
+            (LEGACY_HOME_OVERRIDE_ENV, legacy.as_str()),
         ]);
-        assert_eq!(home_dir_with(get).unwrap(), PathBuf::from("/tmp/new-home"));
+        assert_eq!(home_dir_with(get).unwrap(), PathBuf::from(new));
     }
 
     #[test]
@@ -174,8 +187,11 @@ mod tests {
     #[test]
     fn override_is_trimmed() {
         // 复审 P2-2：`"  /tmp/padded  "` 以前会原样变成名字带空格的目录
-        let get = env_of(&[(HOME_OVERRIDE_ENV, "  /tmp/padded  ")]);
-        assert_eq!(home_dir_with(get).unwrap(), PathBuf::from("/tmp/padded"));
+        // （夹具路径同样改用宿主绝对路径，见 fixture_home 的说明）。
+        let padded = fixture_home("padded");
+        let padded_value = format!("  {}  ", padded.display());
+        let get = env_of(&[(HOME_OVERRIDE_ENV, padded_value.as_str())]);
+        assert_eq!(home_dir_with(get).unwrap(), padded);
     }
 
     #[test]

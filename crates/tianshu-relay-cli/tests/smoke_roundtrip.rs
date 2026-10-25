@@ -102,11 +102,18 @@ fn mock_ok(t: &Tmp, channel: DeliveryChannel) {
 }
 
 fn rollback(t: &Tmp, channel: DeliveryChannel, journal: &str) {
+    // 原先不给 --home、只靠子进程继承父进程 HOME：Unix 下碰巧能跑，
+    // Windows CI 默认无 HOME、CLI 又不回退 USERPROFILE，于是回滚在打开
+    // store 之前就以“无法确定 home” exit 2。显式传 --home <temp home>，
+    // 与 apply/mock 同款夹具、且回滚按 journal 里的绝对目标/备份路径还原，
+    // home 取值本身不改变还原语义。
     let out = Command::new(cli_bin())
         .args([
             "rollback-delivery",
             "--journal",
             journal,
+            "--home",
+            t.home.to_str().unwrap(),
             "--store",
             t.store.to_str().unwrap(),
         ])

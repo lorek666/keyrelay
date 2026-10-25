@@ -81,7 +81,10 @@ fn unknown_balance_sorts_between_healthy_and_exhausted_not_last() {
 fn no_unwrap_or_degradation_on_balance_in_the_builder() {
     // W2 的结构面：上面那条测的是行为，这条测的是**实现里没有那条降级路径**。
     // 行为断言会被「恰好没构造出触发条件的输入」骗过；这条不会。
-    let source = include_str!("../src/routing.rs");
+    // Windows 检出默认把 LF 转成 CRLF（仓库无 .gitattributes 定 eol），
+    // 此时源码里是 `\r\n}\r\n`，按 `\n}\n` 找函数结尾必然找不到。
+    // 先归一化换行符再扫描：只影响测试侧的扫描，不动生产代码与断言语义。
+    let source = include_str!("../src/routing.rs").replace("\r\n", "\n");
     let builder_start = source
         .find("pub fn build_route_table")
         .expect("有 build_route_table");

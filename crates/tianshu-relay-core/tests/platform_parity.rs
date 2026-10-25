@@ -43,7 +43,39 @@ fn relative(path: &Path) -> String {
     path.strip_prefix(src_dir())
         .unwrap_or(path)
         .to_string_lossy()
-        .to_string()
+        // Windows 上分隔符是 `\`，期望清单用 `/`：只在这里归一化分隔符，
+        // 不动生产清单收集逻辑（见 platform_specific_files_match_the_known_inventory）。
+        .replace('\\', "/")
+}
+
+/// 跨平台绝对路径夹具：`Path::is_absolute()` 是宿主语义，POSIX 形态在 Windows 上
+/// 会被判为相对（`validate_home` / `validate_exe` 先于一切校验，B-14 口径），
+/// 反之 `C:\...` 在 Unix 上也不是绝对路径；因此按编译目标分支选形态，
+/// 死分支在宿主上不参与判定，只保证「当前宿主上绝对」这一条。
+fn fixture_home() -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(r"C:\Users\me")
+    } else {
+        PathBuf::from("/home/me")
+    }
+}
+
+fn fixture_exe() -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(r"C:\Program Files\TianshuRelay\tianshu-relay.exe")
+    } else {
+        PathBuf::from("/Applications/TianshuRelay.app/Contents/MacOS/tianshu-relay")
+    }
+}
+
+/// 含 `"` 但在当前宿主上仍绝对的 exe：先过绝对路径校验，才能走到引号拒绝，
+/// 否则测到的会是绝对路径拒绝而非引号拒绝。
+fn fixture_quoted_exe() -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(r#"C:\a"b.exe"#)
+    } else {
+        PathBuf::from(r#"/usr/bin/a"b"#)
+    }
 }
 
 #[test]
@@ -244,14 +276,15 @@ fn autostart_windows_run_key_plan_is_well_formed() {
     use tianshu_relay_core::autostart::{plan_enable_on, AutostartTarget};
     use tianshu_relay_core::platform_env::{EnvPlan, RegHive, RUN_KEY};
 
-    // exe 用 POSIX 绝对路径：`Path::is_absolute()` 是宿主语义，macOS 上 `C:\...` 不判绝对
-    // （spec §13）；Windows 路径形态的 validate_exe 留 CI。本测验证 RegOp 四字段结构 +
-    // run_key_value 的「引号包裹 + --hidden」拼装（纯函数，与平台无关）。
+    // home / exe 用按目标分支的绝对路径夹具：POSIX 形态在 Windows CI 上会被
+    // validate_home / validate_exe 判为相对（CI run 40225644513 的失败根因）。
+    // 本测验证 RegOp 四字段结构 + run_key_value 的「引号包裹 + --hidden」拼装
+    // （纯函数，与平台无关）。
     let plan = plan_enable_on(
         AutostartTarget::WindowsRunKey,
-        Path::new("/home/me"),
+        &fixture_home(),
         "com.tianshu.relay",
-        Path::new("/Applications/TianshuRelay.app/Contents/MacOS/tianshu-relay"),
+        &fixture_exe(),
         true,
     )
     .expect("合法输入应产出计划");
@@ -282,7 +315,7 @@ fn autostart_windows_disable_clears_value() {
 
     let plan = plan_disable_on(
         AutostartTarget::WindowsRunKey,
-        Path::new("/home/me"),
+        &fixture_home(),
         "com.tianshu.relay",
     )
     .expect("合法输入应产出计划");
@@ -306,7 +339,7 @@ fn autostart_windows_state_is_unknown_by_design() {
     // 刻意如此：判不出来时保守报 Unknown，绝不把 Unknown 当 Enabled。
     let state = state_on(
         AutostartTarget::WindowsRunKey,
-        Path::new("/home/me"),
+        &fixture_home(),
         "com.tianshu.relay",
     )
     .expect("合法输入应产出状态");
@@ -319,11 +352,13 @@ fn autostart_windows_rejects_exe_with_quote() {
     use tianshu_relay_core::error::Error;
 
     // Windows 路径不允许 `"`，且它会让 Run 键的值提前闭合。
+    // home 已是宿主绝对路径、且 home 拒绝文案不含“双引号”，故下断言确实锚定
+    // quote 拒绝而非 home 拒绝（此前在 Windows CI 上测到的正是 home 拒绝）。
     let err = plan_enable_on(
         AutostartTarget::WindowsRunKey,
-        Path::new("/home/me"),
+        &fixture_home(),
         "com.tianshu.relay",
-        Path::new(r#"/usr/bin/a"b"#),
+        &fixture_quoted_exe(),
         true,
     )
     .unwrap_err();
@@ -339,9 +374,12 @@ fn autostart_windows_rejects_relative_exe() {
     use tianshu_relay_core::autostart::{plan_enable_on, AutostartTarget};
     use tianshu_relay_core::error::Error;
 
+    // 顺带收紧：此前在 Windows 上它只因 home 校验先失败而“碰巧”通过
+    // （home 拒绝文案同样含“绝对路径”）；home 改用宿主绝对夹具后，
+    // 本测才真正测到 exe 的相对拒绝。
     let err = plan_enable_on(
         AutostartTarget::WindowsRunKey,
-        Path::new("/home/me"),
+        &fixture_home(),
         "com.tianshu.relay",
         Path::new("relative/exe"),
         true,
