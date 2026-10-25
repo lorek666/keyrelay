@@ -505,6 +505,16 @@ async fn m44_c6_per_site_concurrency_cap() {
         rate_limit_per_sec: 0,
         rate_burst: 0, // M46-S3：机械补字段，行为不变
     };
+    // 本用例测的是并发上限，不是超时：共享 config() 的 300ms 读超时只比假上游
+    // 的 200ms 延迟多 100ms 裕量。CI 负载下首字节延迟一旦越过 300ms，读超时
+    // 即 Ambiguous——不重试下一个候选（直接 502）还要喂熔断，3 次即开闸，
+    // 剩下请求连上游都不碰就 503，最终 ok == 0（72602bc 的 macOS CI 实测）。
+    // 故本用例单独把上游超时放宽到 2s：200ms 延迟的 overlap 保证不动，
+    // 峰值 == 8 的判据也不动；5s 的单请求耗时上限仍在下面守着。
+    cfg.upstream_timeout = UpstreamTimeout {
+        connect: Duration::from_secs(2),
+        read: Duration::from_secs(2),
+    };
     let h = gateway::start(cfg).await.unwrap();
     let p = port_of(&h);
     let results = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -539,7 +549,11 @@ async fn m44_c6_per_site_concurrency_cap() {
     {
         let results = results.lock().unwrap();
         let ok = results.iter().filter(|(s, _, _)| *s == 200).count();
-        assert!(ok > 0, "至少要有成功的");
+        assert!(
+            ok > 0,
+            "至少要有成功的，实测各状态：{:?}",
+            results.iter().map(|(s, _, _)| s).collect::<Vec<_>>()
+        );
         // 被拒的必须是本地 429（不是上游 429）：body error.code 为 local_rate_limited。
         let local_429 = results
             .iter()
