@@ -1,0 +1,35 @@
+# 临时诊断：定位 Windows 上 commands 测试 exe 启动即死（0xc0000139）的缺失导出项。
+# 仅 workflow_dispatch 手动触发，不参与任何门禁；定位到根因后删除本文件。
+name: diag-commands
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build commands test exe without running
+        run: cargo test --no-run -p tianshu-relay --test commands
+      - name: Reproduce + dump imports
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem target/debug/deps/commands-*.exe | Select-Object -First 1 -ExpandProperty FullName
+          Write-Output "exe: $exe"
+          Write-Output "--- reproduce --list ---"
+          & $exe --list 2>&1 | Select-Object -First 5
+          Write-Output "exit: $LASTEXITCODE"
+          Write-Output "--- OS + toolchain ---"
+          (Get-CimInstance Win32_OperatingSystem).Caption
+          rustc --version; cargo --version
+          Write-Output "--- locate dumpbin ---"
+          $install = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem "$install\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1 -ExpandProperty FullName
+          Write-Output "dumpbin: $dumpbin"
+          Write-Output "--- DEPENDENTS ---"
+          & $dumpbin /DEPENDENTS $exe
+          Write-Output "--- IMPORTS (dll + symbol list) ---"
+          & $dumpbin /IMPORTS $exe
