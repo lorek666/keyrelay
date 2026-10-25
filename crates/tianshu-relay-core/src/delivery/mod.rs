@@ -1049,6 +1049,8 @@ pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
         | DeliveryChannel::DeepSeek
         | DeliveryChannel::Trae
         | DeliveryChannel::MiMoCode
+        // B-292：ClineDesktop 已下线，此取值已无投递语义，仅为穷举 match 保留，
+        // 不得据此向用户承诺任何生效方式（投递面已无该通道，见下线测试）。
         | DeliveryChannel::ClineDesktop
         | DeliveryChannel::DeepSeekHarness => RestartHint::Needed,
     }
@@ -1200,6 +1202,8 @@ pub fn restart_hint_detail(channel: DeliveryChannel) -> RestartHintDetail {
         | DeliveryChannel::DeepSeek
         | DeliveryChannel::Trae
         | DeliveryChannel::MiMoCode
+        // B-292：ClineDesktop 已下线，此分表行已无投递语义，仅为穷举 match 保留，
+        // 不得据此向用户承诺任何生效方式。
         | DeliveryChannel::ClineDesktop
         | DeliveryChannel::DeepSeekHarness => RestartHintDetail {
             hint: Hint::Needed,
@@ -1800,12 +1804,16 @@ pub fn resolve_for_binding_with_meta(
             meta,
         ))),
         DeliveryChannel::ClineDesktop => {
-            Ok(Box::new(cline_desktop::ClineDesktopWriter::with_model(
-                home,
-                base_url,
-                model_owned.as_deref(),
-                meta,
-            )))
+            // B-292 下线：不再提供文件直写。writer 本体留仓备复活（见
+            // cline_desktop.rs 文件头），但解析入口一律拒绝——站点与网关两路都经
+            // 本函数，故两路同禁。决策依据见 ADR-0006 §9：cc-switch 根本不把
+            // Cline 当可写文件目标、LoongPort 干脆不提供 Cline、magpie 即使标支持
+            // Cline 也只做最小单键编辑（与本 writer 整条目替换相反）、官方
+            // `cline auth` CLI 是唯一不依赖 schema 的路线。
+            return Err(Error::inject(
+                home.join(channel.relative_target()),
+                "暂不支持文件直写，请走 cline auth CLI",
+            ));
         }
         DeliveryChannel::DeepSeekHarness => Ok(Box::new(dsh::DshWriter::new(home, base_url))),
     }
@@ -2292,8 +2300,12 @@ mod tests {
     fn resolve_target_matches_relative_target_for_every_channel() {
         // **安全边界**：`service.rs::checked_target` 用 `home.join(relative_target())`
         // 逐字比对投递目标。写入器声明的路径只要差一个字节，投递就会被拒绝（fail-closed）。
+        // B-292：ClineDesktop 已下线，不再能解析出 writer，不进本测试。
         let home = Path::new("/tmp/nobody");
         for channel in DeliveryChannel::ALL {
+            if channel == DeliveryChannel::ClineDesktop {
+                continue;
+            }
             let writer = resolve_for(channel, home, "https://relay.example.com")
                 .unwrap_or_else(|e| panic!("{} 应可解析: {e}", channel.as_str()));
             assert_eq!(
@@ -2712,9 +2724,14 @@ mod tests {
     }
 
     #[test]
-    fn every_channel_resolves() {
+    // B-292：ClineDesktop 已下线后，“每条通道都可解析”不再成立——本测试改名，
+    // 只覆盖可投递通道；下线通道的拒绝行为由上文的下线断言钉住。
+    fn every_deliverable_channel_resolves() {
         let home = Path::new("/tmp/nobody");
         for channel in DeliveryChannel::ALL {
+            if channel == DeliveryChannel::ClineDesktop {
+                continue;
+            }
             let writer = resolve_for(channel, home, "https://relay.example.com")
                 .unwrap_or_else(|e| panic!("{} 应可解析: {e}", channel.as_str()));
             assert_eq!(writer.channel(), channel);
@@ -2825,8 +2842,25 @@ mod tests {
         };
 
         let home = tempfile::tempdir().expect("临时 home");
+        // B-292：ClineDesktop 已下线，不再能解析出 writer——它不进本守卫的计数，
+        // 而是在这里钉住下线错误本身（下线错误必须提到 cline auth CLI 去向）。
+        let delisted_err = match resolve_for(
+            DeliveryChannel::ClineDesktop,
+            home.path(),
+            "https://relay.example.com",
+        ) {
+            Ok(_) => panic!("ClineDesktop 应已下线，不应解析出 writer"),
+            Err(e) => e,
+        };
+        assert!(
+            delisted_err.to_string().contains("cline auth"),
+            "ClineDesktop 下线错误必须指明 cline auth CLI 去向：{delisted_err}"
+        );
         let mut checked = 0usize;
         for channel in DeliveryChannel::ALL {
+            if channel == DeliveryChannel::ClineDesktop {
+                continue;
+            }
             let writer = resolve_for(channel, home.path(), "https://relay.example.com")
                 .unwrap_or_else(|e| panic!("{} 应能解析出 writer: {e}", channel.as_str()));
             let fields = writer.fields("sk-probe-0123456789abcdef");
@@ -2842,7 +2876,12 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, DeliveryChannel::ALL.len(), "必须逐条通道都核过");
+        // B-292：ClineDesktop 已下线，不计入本守卫（它的下线错误已在上文钉住）。
+        assert_eq!(
+            checked,
+            DeliveryChannel::ALL.len() - 1,
+            "必须逐条可投递通道都核过"
+        );
         // canary：判据本身要能识别 endpoint 形状（否则整条守卫会恒绿）
         assert!(is_endpoint_key("OPENAI_BASE_URL"));
         assert!(!is_endpoint_key("OPENAI_API_KEY"));
@@ -2875,6 +2914,11 @@ mod tests {
         ];
         let mut checked = 0usize;
         for channel in DeliveryChannel::ALL {
+            // B-292：ClineDesktop 已下线，不再能解析出 writer——必填表里它的行
+            // 就此失去 writer 对照（行本身保留，plan 不可达），本矩阵不再核它。
+            if channel == DeliveryChannel::ClineDesktop {
+                continue;
+            }
             for (base_url, model, meta) in configs {
                 let writer = resolve_for_binding_with_meta(
                     channel,
@@ -2907,7 +2951,8 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, DeliveryChannel::ALL.len() * 4);
+        // B-292：ClineDesktop 已下线，不计入本矩阵（19 条 × 4 种构造输入）。
+        assert_eq!(checked, (DeliveryChannel::ALL.len() - 1) * 4);
         // opencode 限定键的 provider 段：点号 provider 与带点 provider（方括号形态）
         // 都要与 writer 的 qualified_field 逐字一致。
         for provider in ["my-relay", "a.b"] {

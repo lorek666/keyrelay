@@ -267,9 +267,26 @@ fn rollback_falls_back_to_the_previous_delivery() {
 }
 
 #[test]
-fn tracks_every_channel_independently() {
+fn tracks_every_deliverable_channel_independently() {
     let f = setup();
     for channel in DeliveryChannel::ALL {
+        // B-292：ClineDesktop 已下线，不再投递，跳过。
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
+        // P0-3 遗留夹具缺口（与本项无关，顺手补）：DSH 投递要求至少一个 profile
+        // 引用 KEYRELAY_API_KEY，否则 apply 在落盘前拒绝；本用例测的是漂移报告
+        // 而非引用校验，因此先给 DSH 备一个已引用的 profile（与其他 ALL 循环测试同款）。
+        if channel == DeliveryChannel::DeepSeekHarness {
+            let profile = f
+                .home
+                .join(".dsh")
+                .join("profiles")
+                .join("desktop")
+                .join("cordis.patch.yml");
+            fs::create_dir_all(profile.parent().unwrap()).expect("建 profile 目录");
+            fs::write(&profile, "apiKeyEnv: KEYRELAY_API_KEY\n").expect("写 profile");
+        }
         deliver(&f, channel);
     }
 
@@ -277,14 +294,19 @@ fn tracks_every_channel_independently() {
     // 期望值从 `ALL` 推导，而不是写死 3 或写死那三个字符串。
     // M6-S1 把 `ALL` 从 3 扩到 5 时，这个测试的两处硬编码会**同时**变红，
     // 而它要断言的其实是「每条通道各一条报告」这个关系，不是通道总数本身。
+    // B-292：ClineDesktop 已下线、无投递、无绑定，故无漂移报告——计数与集合均排除它。
     assert_eq!(
         reports.len(),
-        DeliveryChannel::ALL.len(),
-        "每条通道各一条报告"
+        DeliveryChannel::ALL.len() - 1,
+        "每条可投递通道各一条报告"
     );
     let mut channels: Vec<&str> = reports.iter().map(|r| r.channel.as_str()).collect();
     channels.sort_unstable();
-    let mut expected: Vec<&str> = DeliveryChannel::ALL.iter().map(|c| c.as_str()).collect();
+    let mut expected: Vec<&str> = DeliveryChannel::ALL
+        .iter()
+        .filter(|c| **c != DeliveryChannel::ClineDesktop)
+        .map(|c| c.as_str())
+        .collect();
     expected.sort_unstable();
     assert_eq!(channels, expected);
     assert!(reports.iter().all(|r| r.state == DriftState::Intact));

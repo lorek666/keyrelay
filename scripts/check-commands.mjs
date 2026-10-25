@@ -345,9 +345,18 @@ if (!ghostFiles.length && !missingFiles.length) {
 // ---------------------------------------------------------------- 5. 通道名对账（B-101）
 // 前端 `CHANNELS` 的 id 集合必须与后端 `DeliveryChannel::ALL` 的 `as_str()` 集合相同。
 // 少一个 ⇒ 用户选不到新通道；多一个 ⇒ 选到一个后端不认识的通道。
+//
+// B-292 下线例外：后端 `DeliveryChannel::ALL` 仍含 cline-desktop（枚举、检测探针、
+// 更新策略均保留），但投递面不再提供入口——前端两张表因此比后端少这一条，
+// 这是显式决策，不是分叉。改这里必须同步改 ADR-0006 §9 与 BACKLOG B-292。
+const DELISTED_CHANNELS = ["cline-desktop"];
+const DELISTED_AGENT_IDS = ["cline-desktop"];
 const rustChannels = parseRustChannels();
 const tsChannels = parseTsChannels();
-const onlyBackend = rustChannels.filter((c) => !tsChannels.includes(c));
+const deliverableChannels = rustChannels.filter(
+  (c) => !DELISTED_CHANNELS.includes(c),
+);
+const onlyBackend = deliverableChannels.filter((c) => !tsChannels.includes(c));
 const onlyFrontend = tsChannels.filter((c) => !rustChannels.includes(c));
 if (onlyBackend.length || onlyFrontend.length) {
   fail(
@@ -358,11 +367,14 @@ if (onlyBackend.length || onlyFrontend.length) {
       (onlyFrontend.length
         ? `  只有前端有: ${onlyFrontend.join(", ")}（后端不认识的通道，用户选到了也发不出去）\n`
         : "") +
-      `  后端清单来自 delivery/mod.rs 的 as_str()（${rustChannels.length} 条），` +
+      `  后端清单来自 delivery/mod.rs 的 as_str()（${rustChannels.length} 条，` +
+      `其中下线 ${DELISTED_CHANNELS.length} 条不在投递面），` +
       `前端清单来自 Agents.tsx 的 CHANNELS（${tsChannels.length} 条）`,
   );
 } else {
-  ok(`投递通道名两边一致（${rustChannels.length} 条）`);
+  ok(
+    `投递通道名两边一致（${tsChannels.length} 条可投递 + 下线 ${DELISTED_CHANNELS.length} 条）`,
+  );
 }
 
 // ------------------------------------------- 5b. AGENT_CHANNELS 对账（M8-S7 / B-116 P2-1）
@@ -372,9 +384,11 @@ const agentTable = parseTsAgentChannels();
 const rustChannelsForAgent = parseRustChannels();
 const rustAgentIds = parseRustAgentIds();
 
-// ① channel id 集合：AGENT_CHANNELS ∪ CHANNELS == 后端 as_str()
+// ① channel id 集合：AGENT_CHANNELS ∪ CHANNELS == 后端 as_str() − 下线通道（B-292）
 const agentOnly = agentTable.ids.filter((c) => !rustChannelsForAgent.includes(c));
-const missingFromAgent = rustChannelsForAgent.filter((c) => !agentTable.ids.includes(c));
+const missingFromAgent = rustChannelsForAgent
+  .filter((c) => !DELISTED_CHANNELS.includes(c))
+  .filter((c) => !agentTable.ids.includes(c));
 if (agentOnly.length || missingFromAgent.length) {
   fail(
     `AGENT_CHANNELS 与后端通道名不一致（M8-S7 / B-116）：\n` +
@@ -388,9 +402,11 @@ if (agentOnly.length || missingFromAgent.length) {
   );
 }
 
-// ② agent 键集合 == 后端 agent_id() 的臂
+// ② agent 键集合 == 后端 agent_id() 的臂 − 下线 agent（B-292）
 const agentKeyOnly = agentTable.keys.filter((a) => !rustAgentIds.includes(a));
-const agentIdMissing = rustAgentIds.filter((a) => !agentTable.keys.includes(a));
+const agentIdMissing = rustAgentIds
+  .filter((a) => !DELISTED_AGENT_IDS.includes(a))
+  .filter((a) => !agentTable.keys.includes(a));
 if (agentKeyOnly.length || agentIdMissing.length) {
   fail(
     `AGENT_CHANNELS 的 agent 键与后端 agent_id() 不一致：\n` +
@@ -506,8 +522,10 @@ const tsChannelPairs = parseTsChannelPairs();
 
 {
   const problems = [];
-  // ① 后端每一对，前端两张表都要有**同一对**
+  // ① 后端每一对，前端两张表都要有**同一对**（B-292 下线通道除外：投递面
+  // 不再提供入口，故前端两张表都没有它的一对，这是显式决策，不是缺失）。
   for (const { channel, agent } of rustPairs) {
+    if (DELISTED_CHANNELS.includes(channel)) continue;
     const inAgentTable = tsAgentMap.get(agent);
     if (inAgentTable !== channel) {
       problems.push(
@@ -544,7 +562,9 @@ const tsChannelPairs = parseTsChannelPairs();
         `  前端来自 api.ts 的 AGENT_CHANNELS 与 Agents.tsx 的 CHANNELS`,
     );
   } else {
-    ok(`通道 ↔ agent 配对两边一致（${rustPairs.length} 对）`);
+    ok(
+      `通道 ↔ agent 配对两边一致（${rustPairs.length - DELISTED_CHANNELS.length} 对可投递 + 下线 ${DELISTED_CHANNELS.length} 对）`,
+    );
   }
 }
 

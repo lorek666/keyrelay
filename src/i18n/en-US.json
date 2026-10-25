@@ -836,6 +836,9 @@
       "revoked": "Consent revoked. Written files won't auto-rollback—use the Change History page to restore.",
       "rolledBack": "Rolled back {journal}."
     },
+    "delivery": {
+      "clineDesktopDelisted": "Cline Desktop does not support direct file delivery; use the cline auth CLI instead"
+    },
     "workbench": {
       "title": "Supported agents ({count})",
       "hint": "One row per target. If it is installed, pick a key/model and expand the preview; if not, install it first, then re-detect.",

@@ -56,6 +56,9 @@ import { useTranslation, translate, getCurrentDict } from "../i18n";
  * 当前全部投递通道（M14-S1 删 Continue/Shell，新增 Claude Desktop/Grok/OpenClaw/Hermes/MCode/Pi；
  * M30-S2 把每个落点铺成独立卡片，不再用下拉框隐藏）。
  *
+ * B-292：Cline Desktop 已下线，不在本表——后端解析入口一律拒绝文件直写，
+ * 检测探针与更新策略仍在后端保留（见 agents.rs / agent_updates.rs），只是投递面不再提供入口。
+ *
  * 这里的 `label` 是**给人看的落点提示**；能力判断不在这里——投递能不能做、
  * 改完要不要重启，一律由后端给（`plan.restartHint`，P1-6 起连同动作
  * `plan.restartHintAction` 与来源标注 `plan.restartHintSource` 一起给），本文件不得按通道硬编码判断。
@@ -81,7 +84,6 @@ export const CHANNELS = [
   { id: "deepseek", label: "DeepSeek Reasonix（~/.reasonix/config.json）", agent: "deepseek" },
   { id: "trae", label: "Trae（~/.trae/config.json）", agent: "trae" },
   { id: "mimo-code", label: "MiMo Code（~/.mimocode/mimocode.json）", agent: "mimo-code" },
-  { id: "cline-desktop", label: "Cline Desktop（~/.cline/data/settings/providers.json）", agent: "cline-desktop" },
   { id: "dsh", label: "DeepSeek Harness（~/.dsh/.credentials.yaml）", agent: "dsh" },
 ];
 

@@ -106,7 +106,8 @@ fn restart_hint_detail_table_is_verbatim() {
     use RestartAction as Action;
     use RestartHint as Hint;
     use RestartHintSource as Source;
-    let table: [(DeliveryChannel, Hint, Source, Action); 20] = [
+    // B-292：ClineDesktop 已下线，不在本表，故表长 19（不是 20）。
+    let table: [(DeliveryChannel, Hint, Source, Action); 19] = [
         (
             DeliveryChannel::CodexAuthJson,
             Hint::Needed,
@@ -185,7 +186,9 @@ fn restart_hint_detail_table_is_verbatim() {
             Source::Unverified,
             Action::RestartAgent,
         ),
-        // Cline 两条按任务范围留给 P2-9：本项不动其动作，只钉住“仍为通用 + 未实测”。
+        // Cline 按任务范围留给 P2-9：本项不动其动作，只钉住“仍为通用 + 未实测”。
+        // ClineDesktop 不在本表：B-292 已下线，不再投递，故不再为它保留任何生效说法；
+        // 其 restart_hint / restart_hint_detail 取值仅为穷举 match 保留的死值。
         (
             DeliveryChannel::Cline,
             Hint::Needed,
@@ -217,19 +220,14 @@ fn restart_hint_detail_table_is_verbatim() {
             Action::RestartAgent,
         ),
         (
-            DeliveryChannel::ClineDesktop,
-            Hint::Needed,
-            Source::Unverified,
-            Action::RestartAgent,
-        ),
-        (
             DeliveryChannel::DeepSeekHarness,
             Hint::Needed,
             Source::Unverified,
             Action::RestartAgent,
         ),
     ];
-    assert_eq!(table.len(), DeliveryChannel::ALL.len());
+    // B-292：ClineDesktop 已下线，不在本表——表长 = 全部通道 − 1。
+    assert_eq!(table.len(), DeliveryChannel::ALL.len() - 1);
     for (channel, hint, source, action) in table {
         let detail = restart_hint_detail(channel);
         assert_eq!(detail.hint, hint, "{}: 取值", channel.as_str());

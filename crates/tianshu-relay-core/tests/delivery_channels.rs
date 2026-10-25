@@ -308,6 +308,10 @@ fn model_for(channel: DeliveryChannel) -> Option<&'static str> {
 fn all_channels_leave_no_plaintext_outside_their_target() {
     let f = setup();
     for channel in DeliveryChannel::ALL {
+        // B-292：ClineDesktop 已下线，不再投递，跳过。
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         f.service.grant_consent(f.key_id, channel).unwrap();
         // P0-3：DSH 投递要求至少一个 profile 引用 KEYRELAY_API_KEY，
         // 否则 apply 会在落盘前拒绝；本用例测的是“明文不外泄”而非引用
@@ -395,9 +399,26 @@ fn channel_whitelist_rejects_a_mismatched_target() {
 }
 
 #[test]
-fn plan_reports_missing_consent_for_all_channels() {
+fn plan_reports_missing_consent_for_deliverable_channels() {
     let f = setup();
+    // B-292：ClineDesktop 已下线，计划同样拒绝——先钉住下线错误本身。
+    let delisted_err = match f.service.delivery_plan_with_model(
+        f.key_id,
+        DeliveryChannel::ClineDesktop,
+        model_for(DeliveryChannel::ClineDesktop),
+    ) {
+        Ok(_) => panic!("ClineDesktop 应已下线，不应生成计划"),
+        Err(e) => e,
+    };
+    assert!(
+        delisted_err.to_string().contains("cline auth"),
+        "ClineDesktop 下线错误必须指明 cline auth CLI 去向：{delisted_err}"
+    );
     for channel in DeliveryChannel::ALL {
+        // B-292：ClineDesktop 已下线，不再投递，跳过。
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         let plan = f
             .service
             .delivery_plan_with_model(f.key_id, channel, model_for(channel))

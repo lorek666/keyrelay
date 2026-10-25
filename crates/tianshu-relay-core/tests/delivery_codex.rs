@@ -400,11 +400,28 @@ fn unknown_key_id_is_not_found() {
 }
 
 #[test]
-fn every_channel_produces_a_plan() {
+fn every_deliverable_channel_produces_a_plan() {
     // M2-S2 之后三条通道都实现了：逐个生成计划，确认目标路径落在 home 内、
     // 预览不含密钥、且都没同意时投递会被拒。
     let f = setup();
+    // B-292：ClineDesktop 已下线，计划同样拒绝——先钉住下线错误本身。
+    let delisted_err =
+        match f
+            .service
+            .delivery_plan_with_model(f.key_id, DeliveryChannel::ClineDesktop, None)
+        {
+            Ok(_) => panic!("ClineDesktop 应已下线，不应生成计划"),
+            Err(e) => e,
+        };
+    assert!(
+        delisted_err.to_string().contains("cline auth"),
+        "ClineDesktop 下线错误必须指明 cline auth CLI 去向：{delisted_err}"
+    );
     for channel in DeliveryChannel::ALL {
+        // B-292：ClineDesktop 已下线，不再投递，跳过。
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         // Continue 的条目必须有模型名（Continue 的 schema 必填），其余通道不需要
         let model = (channel == DeliveryChannel::OpenClaw).then_some("gpt-4o");
         let plan = f

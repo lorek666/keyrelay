@@ -77,6 +77,10 @@ fn fresh_installation_is_clean() {
 fn full_delivery_flow_stays_clean() {
     let f = setup();
     for channel in DeliveryChannel::ALL {
+        // B-292：ClineDesktop 已下线，不再投递，跳过。
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         // Continue 的条目必须有模型名（Continue 的 schema 必填），其余通道不需要
         let model = (channel == DeliveryChannel::OpenClaw).then_some("gpt-4o");
         // P0-3：DSH 投递要求至少一个 profile 引用 KEYRELAY_API_KEY，

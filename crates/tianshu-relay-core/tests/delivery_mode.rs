@@ -96,11 +96,30 @@ fn model_for(channel: DeliveryChannel) -> Option<&'static str> {
 }
 
 #[tokio::test]
-async fn every_channel_can_point_at_the_gateway() {
+async fn every_deliverable_channel_can_point_at_the_gateway() {
     let f = setup().await;
     let endpoint = gateway();
 
+    // B-292：ClineDesktop 已下线，网关计划同样拒绝——先钉住下线错误本身。
+    let delisted_err = match f.service.delivery_plan_in(
+        f.key_id,
+        DeliveryChannel::ClineDesktop,
+        model_for(DeliveryChannel::ClineDesktop),
+        DeliverySource::Gateway(&endpoint),
+    ) {
+        Ok(_) => panic!("ClineDesktop 应已下线，不应生成计划"),
+        Err(e) => e,
+    };
+    assert!(
+        delisted_err.to_string().contains("cline auth"),
+        "ClineDesktop 下线错误必须指明 cline auth CLI 去向：{delisted_err}"
+    );
     for channel in DeliveryChannel::ALL {
+        // B-292：ClineDesktop 已下线，不再投递，跳过。
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
+
         let plan = f
             .service
             .delivery_plan_in(
@@ -173,6 +192,10 @@ async fn gateway_mode_differs_from_site_mode_only_in_values() {
     let endpoint = gateway();
 
     for channel in DeliveryChannel::ALL {
+        // B-292：ClineDesktop 已下线，不再投递，跳过。
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         let site = f
             .service
             .delivery_plan_in(f.key_id, channel, model_for(channel), DeliverySource::Site)

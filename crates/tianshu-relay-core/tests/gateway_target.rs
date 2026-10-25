@@ -33,7 +33,43 @@ fn the_landing_point_is_byte_identical_to_the_site_mode() {
     // FR-5:158 的实现基础：**同一个文件、同一组键名**，只换两个值。
     // 落点不同的话「换站零改动」立刻变成「换站要改落点」。
     let home = Path::new("/home/u");
+    // B-292：ClineDesktop 已下线，站点与网关两路解析同样拒绝——先钉住下线错误本身。
+    for (label, r) in [
+        (
+            "站点模式",
+            resolve_for_binding(
+                DeliveryChannel::ClineDesktop,
+                home,
+                SITE_URL,
+                "tianshu-relay",
+                Some("gpt-5.6"),
+            ),
+        ),
+        (
+            "网关模式",
+            resolve_for_gateway(
+                DeliveryChannel::ClineDesktop,
+                home,
+                &gateway(),
+                "tianshu-relay",
+                Some("gpt-5.6"),
+            ),
+        ),
+    ] {
+        let err = match r {
+            Ok(_) => panic!("ClineDesktop 应已下线，{label}不应解析出 writer"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("cline auth"),
+            "ClineDesktop 下线错误必须指明 cline auth CLI 去向：{err}"
+        );
+    }
     for channel in DeliveryChannel::ALL {
+        // B-292：ClineDesktop 已下线，不再投递，跳过。
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         let site = resolve_for_binding(channel, home, SITE_URL, "tianshu-relay", Some("gpt-5.6"))
             .expect("站点模式应能解析");
         let via_gateway =
@@ -154,11 +190,15 @@ fn the_placeholder_key_is_not_a_secret_shape() {
 }
 
 #[test]
-fn the_placeholder_key_writes_through_every_channel() {
+fn the_placeholder_key_writes_through_every_deliverable_channel() {
     // §9-8 的实质：轮换在 `create_key` **之前**要用它把每个通道空跑一遍。
     // 这条证明「空跑」这件事在每个通道上都成立（写得进、不报错）。
     let dir = tempfile::tempdir().unwrap();
     for channel in DeliveryChannel::ALL {
+        // B-292：ClineDesktop 已下线，不再投递，跳过。
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         let writer = resolve_for_binding(
             channel,
             dir.path(),
