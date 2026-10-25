@@ -8,7 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tianshu_relay_core::delivery::{
-    detect_unmanaged_targets, restart_hint, DeliveryChannel, RestartHint,
+    detect_unmanaged_targets, restart_hint, restart_hint_detail, DeliveryChannel, RestartAction,
+    RestartHint, RestartHintSource,
 };
 
 fn tmp() -> tempfile::TempDir {
@@ -71,11 +72,16 @@ fn restart_hint_covers_every_channel() {
 
 #[test]
 fn restart_hint_table_is_verbatim() {
-    // M14-S1：ShellBlock 已删除，所有通道都标 Needed
+    // P1-6 生效分表：Claude Code 新会话即生效，其余 19 条仍标 Needed。
+    // （旧 M14-S1 “所有通道都标 Needed” 一说已作废。）
+    assert_eq!(
+        restart_hint(DeliveryChannel::ClaudeCodeSettings),
+        RestartHint::DependsOnNewSession,
+        "claude-code-settings 应为新会话即生效"
+    );
     assert_eq!(restart_hint(DeliveryChannel::Hermes), RestartHint::Needed);
     for channel in [
         DeliveryChannel::CodexAuthJson,
-        DeliveryChannel::ClaudeCodeSettings,
         DeliveryChannel::OpenCode,
         DeliveryChannel::GeminiCli,
         DeliveryChannel::OpenCodeJsonc,
@@ -90,18 +96,200 @@ fn restart_hint_table_is_verbatim() {
     }
 }
 
+/// P1-6：分表逐条钉住（取值 + 来源标注 + 动作），三者缺一不可。
+///
+/// 三分法对照：抄 cc-switch（未实测）4 条通道——Claude Code、Gemini、Grok、
+/// Claude Desktop；已实测 0 条；未实测 16 条通道（含 Codex 两条：其桌面按钮 /
+/// 终端手动 / daemon 三分法是本项目 P1-5 结论、不是 cc-switch 原话，故不标抄表）。
+#[test]
+fn restart_hint_detail_table_is_verbatim() {
+    use RestartAction as Action;
+    use RestartHint as Hint;
+    use RestartHintSource as Source;
+    let table: [(DeliveryChannel, Hint, Source, Action); 20] = [
+        (
+            DeliveryChannel::CodexAuthJson,
+            Hint::Needed,
+            Source::Unverified,
+            Action::CodexSplit,
+        ),
+        (
+            DeliveryChannel::CodexConfig,
+            Hint::Needed,
+            Source::Unverified,
+            Action::CodexSplit,
+        ),
+        (
+            DeliveryChannel::ClaudeCodeSettings,
+            Hint::DependsOnNewSession,
+            Source::CcSwitchUnverified,
+            Action::NewSession,
+        ),
+        (
+            DeliveryChannel::OpenCode,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::GeminiCli,
+            Hint::Needed,
+            Source::CcSwitchUnverified,
+            Action::RestartTerminalOrCli,
+        ),
+        (
+            DeliveryChannel::OpenCodeJsonc,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::ClaudeDesktop,
+            Hint::Needed,
+            Source::CcSwitchUnverified,
+            Action::RelaunchDesktopApp,
+        ),
+        (
+            DeliveryChannel::GrokBuild,
+            Hint::Needed,
+            Source::CcSwitchUnverified,
+            Action::RestartTerminalOrCli,
+        ),
+        (
+            DeliveryChannel::OpenClaw,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::Hermes,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::MCode,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::Pi,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::Cursor,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        // Cline 两条按任务范围留给 P2-9：本项不动其动作，只钉住“仍为通用 + 未实测”。
+        (
+            DeliveryChannel::Cline,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::QwenCode,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::DeepSeek,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::Trae,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::MiMoCode,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::ClineDesktop,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::DeepSeekHarness,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+    ];
+    assert_eq!(table.len(), DeliveryChannel::ALL.len());
+    for (channel, hint, source, action) in table {
+        let detail = restart_hint_detail(channel);
+        assert_eq!(detail.hint, hint, "{}: 取值", channel.as_str());
+        assert_eq!(detail.source, source, "{}: 来源标注", channel.as_str());
+        assert_eq!(detail.action, action, "{}: 动作", channel.as_str());
+        // 分表不得与取值函数自相矛盾。
+        assert_eq!(
+            detail.hint,
+            restart_hint(channel),
+            "{}: 分表取值必须等于 restart_hint",
+            channel.as_str()
+        );
+    }
+    // 诚实线：没有任何通道敢标“已实测”——先有真机证据再改这条断言。
+    assert!(
+        DeliveryChannel::ALL
+            .iter()
+            .all(|c| restart_hint_detail(*c).source != RestartHintSource::Verified),
+        "当前没有任何通道做过真机生效验证，不得出现 Verified"
+    );
+    // 线格式键集合（前端按这三个键取文案，改键名必须同步改 DTO/TS/i18n）。
+    assert_eq!(
+        RestartHintSource::CcSwitchUnverified.as_str(),
+        "ccSwitchUnverified"
+    );
+    assert_eq!(RestartHintSource::Verified.as_str(), "verified");
+    assert_eq!(RestartHintSource::Unverified.as_str(), "unverified");
+    assert_eq!(RestartAction::NewSession.as_str(), "newSession");
+    assert_eq!(
+        RestartAction::RestartTerminalOrCli.as_str(),
+        "restartTerminalOrCli"
+    );
+    assert_eq!(
+        RestartAction::RelaunchDesktopApp.as_str(),
+        "relaunchDesktopApp"
+    );
+    assert_eq!(RestartAction::CodexSplit.as_str(), "codexSplit");
+    assert_eq!(RestartAction::RestartAgent.as_str(), "restartAgent");
+}
+
 #[test]
 fn restart_hint_is_pure() {
     for channel in DeliveryChannel::ALL {
         let first = restart_hint(channel);
+        let first_detail = restart_hint_detail(channel);
         let saved = std::env::var("HOME").ok();
         std::env::set_var("HOME", "/tmp/tianshu-relay-not-this-home");
         let second = restart_hint(channel);
+        let second_detail = restart_hint_detail(channel);
         match saved {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
         assert_eq!(first, second, "{}: 纯函数不得依赖环境", channel.as_str());
+        assert_eq!(
+            first_detail,
+            second_detail,
+            "{}: 分表同样是纯函数，不得依赖环境",
+            channel.as_str()
+        );
     }
 }
 

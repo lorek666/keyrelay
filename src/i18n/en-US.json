@@ -621,7 +621,19 @@
       "notNeeded": "Effective immediately: the agent re-reads this file on every run.",
       "needed": "Requires restarting the agent to read the new config—it reads only on startup.",
       "dependsOnNewSession": "Only for new sessions: already-running windows still see the old config (e.g. shell rc files).",
-      "unknown": "Unknown restart policy: {hint}"
+      "unknown": "Unknown restart policy: {hint}",
+      "source": {
+        "ccSwitchUnverified": "Source: from the cc-switch effectiveness table, not verified on this machine.",
+        "unverified": "Source: not verified (conservative label from this project).",
+        "verified": "Source: verified on a real device."
+      },
+      "action": {
+        "newSession": "A new session picks it up; no process restart needed. A running session may not re-read it—open a new session to confirm when unsure.",
+        "restartTerminalOrCli": "Takes effect after restarting the terminal or the CLI.",
+        "relaunchDesktopApp": "Takes effect only after fully quitting and reopening the app (closing the window while it stays in the background does not count).",
+        "codexSplit": "Three separate places: relaunch the ChatGPT desktop app with the one-click restart button; a codex session in your terminal is not affected by the button and must be reopened manually; the app-server daemon needs separate verification—closing the terminal is not enough.",
+        "restartAgent": "Takes effect after restarting the agent."
+      }
     },
     "restart": {
       "title": "Restart {name}",
