@@ -751,6 +751,17 @@ export default function Keys() {
               </li>
             </ol>
             {/*
+              DEBUG-G6 P1-19：轮换没有单独的投递确认框，第②步重注入 Codex 时
+              同样走写盘前停 Codex 钩子（单通道与双文件同单两路），却曾全程不提。
+              只在重注入清单含 Codex 通道时才出现这句——其余轮换不走该钩子，
+              通用写一句会撒谎。channels 是通道 id（见 RotationPlan），不是显示名。
+            */}
+            {rotating.channels.some((c) => c === "codex-auth-json" || c === "codex-config") ? (
+              <p className="warnline" role="alert">
+                <AlertTriangle size={14} aria-hidden /> {t("keys.rotationDialog.stopCodex")}
+              </p>
+            ) : null}
+            {/*
               M20-S1 / B-166：分组继承要说在**动手之前**。
 
               旧 key 绑过分组时，新 key 必须继续待在同一个分组里，否则第三步回收旧 key

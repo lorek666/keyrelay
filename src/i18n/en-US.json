@@ -513,7 +513,8 @@
         "unavailable": "Couldn't check the group: {reason}"
       },
       "unmappedError": "Channels for targets {targets} can't be identified; rotation would miss them. If you proceed and revoke the old key, they'd be stuck on it forever. Fix these targets first—this action is blocked.",
-      "newNameLabel": "Name for the new key"
+      "newNameLabel": "Name for the new key",
+      "stopCodex": "Rotation re-delivers the new key to Codex: any running Codex is stopped before writing (including terminal sessions), and it is not relaunched automatically afterwards."
     },
     "rotationResult": {
       "revokeRevoked": "Old key revoked on the site.",
@@ -656,6 +657,16 @@
           "skipped": "Not probed: there is no model to verify, or the channel does not write a model.",
           "unresolved": "Not probed: the endpoint or key could not be resolved, so no probe was sent. Confirm the key and endpoint themselves first."
         }
+      },
+      "dshReference": {
+        "title": "DSH credential reference check",
+        "passed": "Passed: credential {name} is referenced by {count} profile(s).",
+        "unreferenced": "Not referenced: credential {name} is not referenced by any profile ({count} file(s) checked, none with apiKeyEnv: {name}).",
+        "noProfiles": "No profiles: no profile patch file was found (scanned directory: {dir}).",
+        "failClosed": "Before applying, the check runs again under the lock: an unreferenced credential is refused, so passing in preview does not guarantee passing at apply time (a profile edited in between is still blocked).",
+        "referencingLabel": "Profiles referencing this credential:",
+        "checkedLabel": "Profiles checked:",
+        "unreadableLabel": "Unreadable (not counted as references):"
       }
     },
     "restartHint": {
@@ -765,7 +776,8 @@
       "sourceMarketplace": "VS Code Marketplace",
       "sourceNone": "No public version source",
       "versionUnknown": "unknown",
-      "unknownState": "unknown"
+      "unknownState": "unknown",
+      "clineDesktopNote": "Cline Desktop: detection retained, delivery delisted—the backend still emits its update row, but it is not one of the 19 delivery channels above, and the summary counts exclude it."
     },
     "consents": {
       "title": "Recorded consents ({count})",
@@ -807,7 +819,8 @@
       "applyBodyNew": "(file doesn't exist; will create)",
       "applyAgreePre": "I understand this writes to the above file with ",
       "applyAgreeMid": " 0600 ",
-      "applyAgreePost": " permissions, and a backup is taken first."
+      "applyAgreePost": " permissions, and a backup is taken first.",
+      "stopCodex": "Before writing, any running Codex will be stopped first (including terminal codex sessions and the desktop app): graceful quit first, forced kill if it is still running after the timeout. Delivery itself will not relaunch it for you—restart it from the restart section or its launch command after writing."
     },
     "rollbackDialog": {
       "title": "Roll back this delivery",
@@ -1296,7 +1309,7 @@
       "loading": "Reading bindings…",
       "empty": "No delivered channels yet. Deliver one on the Agent Delivery page first.",
       "unmappedPre": "Can't identify channel (",
-      "unmappedPost": ")—this agent name is not in the known channel table (older version or hand-edited binding); checking it will also fail with a reason",
+      "unmappedPost": ")—this agent name is not in the known channel table (older version or hand-edited binding); after checking and previewing it, the row has no valid plan, so the apply button stays disabled and it cannot be re-pointed here",
       "mapped": "{channel} · {pathLabel}{path} · key #{keyId} · {site}",
       "recordedPathLabel": "recorded path: ",
       "actualPathLabel": "will actually write: ",
@@ -1316,9 +1329,14 @@
       "hint": "A single failure doesn't abort the rest (e.g. target file locked by another process). Successfully re-pointed ones aren't rolled back—the goal is \"as many as possible\", not \"all or nothing\".",
       "resultTitle": "Batch results",
       "unmappedFull": "Can't identify channel (possibly written under another home)",
-      "unmappedApplyDetail": "Can't identify channel (possibly written under another home); handle it manually on the Agent Delivery page",
+      "unmappedApplyDetail": "Cannot be re-pointed here: this agent name is not in the known channel table; handle the file manually",
       "appliedOk": "Re-pointed to gateway",
-      "unmappedStrong": "Can't identify channel"
+      "unmappedStrong": "Can't identify channel",
+      "delistedPre": "Delisted channel (",
+      "delistedPost": ")—Cline Desktop direct file writing is delisted and cannot be re-pointed here; use the cline auth CLI instead",
+      "delistedFull": "Cline Desktop direct file writing is delisted and cannot be re-pointed here; use the cline auth CLI",
+      "delistedApplyDetail": "Cline Desktop direct file writing is delisted and cannot be re-pointed here; use the cline auth CLI",
+      "delistedStrong": "Delisted channel"
     },
     "copyFail": "Copy failed ({error})—select the token text above manually.",
     "collectModelsLabel": "Collect site model catalog (for model-change notifications and multi-site routing)",

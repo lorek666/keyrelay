@@ -658,3 +658,162 @@ describe("P1-7 首次导入 + 预览模式 + 落点变体", () => {
     ).toBe(true);
   });
 });
+
+describe("DEBUG-G6 诚实性：停进程提示 + DSH 引用校验渲染", () => {
+  // 与 P1-7 的 fullPlan 同口径的最小完整计划：PlanView 读 files / modelValidation /
+  // dshCredentialReference，缺字段会按“旧二进制”静默跳段，测不到东西。
+  const g6Plan = (over: Record<string, unknown>) => ({
+    agentId: "dsh",
+    channel: "dsh",
+    targetPath: "/home/u/.dsh/.credentials.yaml",
+    targetExists: true,
+    mode: "site",
+    fields: [{ key: "KEYRELAY_API_KEY", masked: "…9999" }],
+    endpointInChannel: true,
+    preview: '- "KEYRELAY_API_KEY": "…0000"\n+ "KEYRELAY_API_KEY": "…9999"\n',
+    consent: "granted",
+    consentGrantedAt: null,
+    consentRevokedAt: null,
+    warnings: [],
+    restartHint: "needed",
+    restartHintSource: "unverified",
+    restartHintAction: "restartAgent",
+    preserveAuth: false,
+    files: [
+      {
+        channel: "dsh",
+        targetPath: "/home/u/.dsh/.credentials.yaml",
+        targetExists: true,
+        fields: [{ key: "KEYRELAY_API_KEY", masked: "…9999" }],
+        preview: '- "KEYRELAY_API_KEY": "…0000"\n+ "KEYRELAY_API_KEY": "…9999"\n',
+        consent: "granted",
+        consentGrantedAt: null,
+        consentRevokedAt: null,
+        isFirstDelivery: false,
+        importedFields: [],
+      },
+    ],
+    previewOnly: false,
+    isFirstDelivery: false,
+    importedFields: [],
+    targetVariant: "default",
+    targetVariants: ["default"],
+    modelValidation: {
+      model: null,
+      staticOutcome: "not_applicable",
+      staticCode: "no_model",
+      probeOutcome: "skipped",
+      probeCode: "skipped",
+      probeStatus: null,
+      blocksDelivery: false,
+    },
+    ...over,
+  });
+
+  const openPlan = async (channelId: string) => {
+    renderPage();
+    await waitFor(() => expect(keySelect(channelId)).not.toBeNull());
+    fireEvent.change(keySelect(channelId), { target: { value: "101" } });
+    fireEvent.click(row(channelId).querySelector(".agent-row-toggle")!);
+    // .agent-row-plan 在加载态就已存在（“生成预览…”），必须等 PlanView 真正
+    // 落定（标题“投递预览”出现）再断言，否则读到的是加载态文本。
+    await waitFor(() =>
+      expect(document.querySelector(".agent-row-plan")?.textContent).toContain(
+        zhCN.agents.plan.title,
+      ),
+    );
+    return document.querySelector(".agent-row-plan")!;
+  };
+
+  const agreeAndOpenConfirm = async (planEl: Element) => {
+    const consent = planEl.querySelector<HTMLInputElement>(".checkline input[type=checkbox]")!;
+    fireEvent.click(consent);
+    const applyBtn = Array.from(planEl.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes(zhCN.agents.btn.apply),
+    )!;
+    fireEvent.click(applyBtn);
+    await waitFor(() => expect(document.querySelector("dialog[open]")).not.toBeNull());
+    return document.querySelector("dialog[open]")!;
+  };
+
+  it("P1-19：Codex 确认框写出“先停掉正在跑的 Codex（含终端会话）”", async () => {
+    vi.mocked(deliveryPlan).mockImplementation(async () =>
+      g6Plan({ agentId: "codex", channel: "codex-auth-json", dshCredentialReference: null }) as never,
+    );
+    const planEl = await openPlan("codex-auth-json");
+    const dialog = await agreeAndOpenConfirm(planEl);
+    expect(dialog.textContent).toContain(zhCN.agents.confirmDialog.stopCodex);
+  });
+
+  it("P1-19：非 Codex 通道确认框不出现停 Codex 文案（钩子只对 Codex 生效）", async () => {
+    vi.mocked(deliveryPlan).mockImplementation(async () =>
+      g6Plan({ agentId: "claude-code", channel: "claude-code-settings", dshCredentialReference: null }) as never,
+    );
+    const planEl = await openPlan("claude-code-settings");
+    const dialog = await agreeAndOpenConfirm(planEl);
+    expect(dialog.textContent).not.toContain(zhCN.agents.confirmDialog.stopCodex);
+  });
+
+  it("P1-20：DSH 引用通过态渲染凭据名、引用文件与 fail-closed 说明", async () => {
+    vi.mocked(deliveryPlan).mockImplementation(async () =>
+      g6Plan({
+        dshCredentialReference: {
+          credentialName: "KEYRELAY_API_KEY",
+          profilesDir: "/home/u/.dsh/profiles",
+          checkedFiles: ["/home/u/.dsh/profiles/a.patch.yml", "/home/u/.dsh/profiles/b.patch.yml"],
+          referencingFiles: ["/home/u/.dsh/profiles/a.patch.yml"],
+          unreadableFiles: [],
+        },
+      }) as never,
+    );
+    const planEl = await openPlan("dsh");
+    expect(planEl.textContent).toContain(zhCN.agents.plan.dshReference.title);
+    expect(planEl.textContent).toContain("KEYRELAY_API_KEY");
+    expect(planEl.textContent).toContain("/home/u/.dsh/profiles/a.patch.yml");
+    expect(planEl.textContent).toContain(zhCN.agents.plan.dshReference.failClosed);
+  });
+
+  it("P1-20：DSH 有 profile 未引用态明确展示", async () => {
+    vi.mocked(deliveryPlan).mockImplementation(async () =>
+      g6Plan({
+        dshCredentialReference: {
+          credentialName: "KEYRELAY_API_KEY",
+          profilesDir: "/home/u/.dsh/profiles",
+          checkedFiles: ["/home/u/.dsh/profiles/a.patch.yml"],
+          referencingFiles: [],
+          unreadableFiles: [],
+        },
+      }) as never,
+    );
+    const planEl = await openPlan("dsh");
+    expect(planEl.textContent).toContain(
+      zhCN.agents.plan.dshReference.unreferenced.replaceAll("{name}", "KEYRELAY_API_KEY").replace("{count}", "1"),
+    );
+    expect(planEl.textContent).toContain(zhCN.agents.plan.dshReference.failClosed);
+  });
+
+  it("P1-20：DSH 无 profile 态明确展示扫描目录", async () => {
+    vi.mocked(deliveryPlan).mockImplementation(async () =>
+      g6Plan({
+        dshCredentialReference: {
+          credentialName: "KEYRELAY_API_KEY",
+          profilesDir: "/home/u/.dsh/profiles",
+          checkedFiles: [],
+          referencingFiles: [],
+          unreadableFiles: [],
+        },
+      }) as never,
+    );
+    const planEl = await openPlan("dsh");
+    expect(planEl.textContent).toContain("/home/u/.dsh/profiles");
+    expect(planEl.textContent).toContain(zhCN.agents.plan.dshReference.failClosed);
+  });
+
+  it("P1-20：dshCredentialReference 为 null 时不渲染引用段（不画假状态）", async () => {
+    vi.mocked(deliveryPlan).mockImplementation(async () =>
+      g6Plan({ dshCredentialReference: null }) as never,
+    );
+    const planEl = await openPlan("dsh");
+    expect(planEl.textContent).not.toContain(zhCN.agents.plan.dshReference.title);
+  });
+});

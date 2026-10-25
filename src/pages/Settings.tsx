@@ -218,8 +218,16 @@ function KeychainCard() {
       <p className="muted">
         {t("settings.keychain.bodyPre")}<strong>{t("settings.keychain.bodyStrong")}</strong>{t("settings.keychain.bodyPost")}
       </p>
+      {/*
+        DEBUG-G6 P1-21：`settings.keychain.localKeepPre` 在字典里不存在（回退
+        会把 key 本身打到界面上）。不往字典里补一个错键：本句的 Strong 本身
+        就是完整句首（“本地记录不会被删”），Pre 是从 keys 回收对话框
+        （keys.revokeDialog.localKeepPre = “本地记录”）照抄过来的残留——
+        直接复用那句 Pre 会拼出“本地记录本地记录不会被删”。故删掉悬空引用，
+        只留 Strong + Post，语义与字典现状一致。
+      */}
       <p className="muted">
-        {t("settings.keychain.localKeepPre")}<strong>{t("settings.keychain.localKeepStrong")}</strong>{t("settings.keychain.localKeepPost")}
+        <strong>{t("settings.keychain.localKeepStrong")}</strong>{t("settings.keychain.localKeepPost")}
       </p>
       <button
         type="button"
@@ -974,7 +982,8 @@ export default function SettingsPage() {
             </label>
             <p className="muted">{t("settings.gatewayAutoStart.hint")}</p>
             <label className="field">
-              <span>{t("settings.gatewayTokenGrace.label")}</span>
+              {/* DEBUG-G6 P1-21：真实键在 gatewayAutoStart 命名空间下，旧引用悬空。 */}
+              <span>{t("settings.gatewayAutoStart.gatewayTokenGrace.label")}</span>
               <input
                 type="number"
                 min={0}
@@ -991,7 +1000,7 @@ export default function SettingsPage() {
                 }}
               />
             </label>
-            <p className="muted">{t("settings.gatewayTokenGrace.hint")}</p>
+            <p className="muted">{t("settings.gatewayAutoStart.gatewayTokenGrace.hint")}</p>
           </div>
           <GatewayCard
             enabled={draft.gatewayEnabled}

@@ -348,8 +348,8 @@ export type DeliveryPlan = {
    * P0-3：DSH 通道的凭据引用校验结果；仅 DSH 通道为非 null，其余通道为 null。
    *
    * 语义与后端 `DeliveryPlanDto.dshCredentialReference` 一致。
-   * 仅类型层接线：Agents 页渲染是后续项（BACKLOG B-280），在此之前
-   * 不得宣称预览已展示该结果。
+   * DEBUG-G6 P1-20（B-280 已结）：Agents 页 PlanView 已渲染该结果（通过 /
+   * 未引用 / 无 profile 三态 + 锁内重校验的 fail-closed 说明），不再是仅类型层接线。
    */
   dshCredentialReference: DshReferenceCheck | null;
   /**
@@ -1443,6 +1443,18 @@ const AGENT_CHANNELS: Record<string, string> = {
  */
 export function channelOfBinding(agentId: string): string | null {
   return AGENT_CHANNELS[agentId] ?? null;
+}
+
+/**
+ * DEBUG-G6 P2-F1：`channelOfBinding` 返回 null 有两种完全不同的原因——
+ * “已下线”（cline-desktop：B-292 撤掉投递入口，检测与更新仍在后端保留）与
+ * “真正未知”（不在通道表里）。此前两者都走同一句“无法识别通道”，下线绑定
+ * 就被指去一个已无 Cline 入口的投递页，是死胡同。调用方需要区分时用本函数：
+ * 下线行明确指向 cline auth CLI（与下线错误 `agents.delivery.clineDesktopDelisted`
+ * 同口径），未知行才走通用未映射文案。`null` 本身的“不猜”语义不变。
+ */
+export function isDelistedBindingAgent(agentId: string): boolean {
+  return agentId === "cline-desktop";
 }
 
 export async function applyDelivery(

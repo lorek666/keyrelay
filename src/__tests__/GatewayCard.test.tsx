@@ -744,3 +744,63 @@ describe("合并回归（main ← feat-m46-ui）：老调用方不传 routingRul
     );
   });
 });
+
+describe("DEBUG-G6 P2-F1 批量改指：下线与未知行分流", () => {
+  const openBatch = async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(
+      status({
+        running: true,
+        phase: "running",
+        url: "http://127.0.0.1:8787",
+        site: "示例站",
+        tokenPersistent: true,
+      }),
+    );
+    vi.mocked(listChannelBindings).mockResolvedValue([
+      { bindingId: 1, agentId: "cline-desktop", keyId: 7, targetPath: "/home/u/.config/claude-desktop.json", siteId: 0 },
+      { bindingId: 2, agentId: "weird-old", keyId: 7, targetPath: "/home/u/.weird/config.json", siteId: 0 },
+      { bindingId: 3, agentId: "codex", keyId: 7, targetPath: "/home/u/.codex/auth.json", siteId: 0 },
+    ]);
+    renderCard();
+    await waitFor(() => expect(phaseLine()?.dataset.gatewayPhase).toBe("running"));
+    const batchBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes(zhCN.gateway.batch.btn),
+    )!;
+    fireEvent.click(batchBtn);
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("/home/u/.config/claude-desktop.json"),
+    );
+  };
+
+  const rowCheckbox = (path: string) => {
+    const label = Array.from(document.querySelectorAll("label")).find((l) =>
+      l.textContent?.includes(path),
+    )!;
+    return label.querySelector<HTMLInputElement>("input[type=checkbox]")!;
+  };
+
+  it("cline-desktop 行指向 cline auth CLI，未知行不再说“勾了也会失败”", async () => {
+    await openBatch();
+    expect(document.body.textContent).toContain("cline auth CLI");
+    expect(document.body.textContent).toContain(zhCN.gateway.batch.delistedPost);
+    expect(document.body.textContent).toContain(zhCN.gateway.batch.unmappedPost);
+    expect(document.body.textContent).not.toContain("勾了也会失败");
+  });
+
+  it("勾选未映射/下线行并预览后，执行按钮被禁用（不是“勾选后失败”）", async () => {
+    await openBatch();
+    fireEvent.click(rowCheckbox("/home/u/.config/claude-desktop.json"));
+    fireEvent.click(rowCheckbox("/home/u/.weird/config.json"));
+    const previewBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes(zhCN.gateway.batch.previewBtnIdle),
+    )!;
+    fireEvent.click(previewBtn);
+    await waitFor(() =>
+      expect(document.body.textContent).toContain(zhCN.gateway.batch.delistedFull),
+    );
+    const applyBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes(zhCN.gateway.batch.applyBtnIdle),
+    )!;
+    expect(applyBtn.disabled).toBe(true);
+  });
+});

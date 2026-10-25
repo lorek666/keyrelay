@@ -513,7 +513,8 @@
         "unavailable": "无法校验分组：{reason}"
       },
       "unmappedError": "{targets} 这些投递目标的通道无法识别，轮换会漏掉它们；若继续并回收旧密钥，它们会永久停在旧密钥上。请先处理这些目标再轮换——此操作已被禁止。",
-      "newNameLabel": "新密钥的名称"
+      "newNameLabel": "新密钥的名称",
+      "stopCodex": "轮换会把新密钥重新投递到 Codex：写盘前会先停掉正在跑的 Codex（含终端会话），写完不会自动拉起它。"
     },
     "rotationResult": {
       "revokeRevoked": "旧密钥已在站点侧回收。",
@@ -656,6 +657,16 @@
           "skipped": "未探针：没有可验证的模型或通道不写模型。",
           "unresolved": "未探针：端点或密钥解析失败，没能向端点发问。请先确认密钥与端点本身无误。"
         }
+      },
+      "dshReference": {
+        "title": "DSH 凭据引用校验",
+        "passed": "通过：凭据 {name} 已被 {count} 个 profile 引用。",
+        "unreferenced": "未引用：凭据 {name} 未被任何 profile 引用（已查 {count} 个文件，均无 apiKeyEnv: {name}）。",
+        "noProfiles": "无 profile：未找到任何 profile patch 文件（已扫描目录：{dir}）。",
+        "failClosed": "投递前会在锁内重新校验：未引用时拒绝写盘，预览时通过不代表投递时一定通过（期间改过 profile 也会拦）。",
+        "referencingLabel": "引用该凭据的 profile：",
+        "checkedLabel": "已查 profile：",
+        "unreadableLabel": "读失败（不算引用）："
       }
     },
     "restartHint": {
@@ -765,7 +776,8 @@
       "sourceMarketplace": "VS Code 扩展市场",
       "sourceNone": "无公开版本源",
       "versionUnknown": "未知",
-      "unknownState": "状态未知"
+      "unknownState": "状态未知",
+      "clineDesktopNote": "Cline Desktop：检测保留、投递已下线——后端仍产出它的更新行，但它不在上方 19 个投递通道内，汇总计数不含它。"
     },
     "consents": {
       "title": "已记录的同意（{count}）",
@@ -807,7 +819,8 @@
       "applyBodyNew": "（文件不存在，将新建）",
       "applyAgreePre": "我明白这会以",
       "applyAgreeMid": " 0600 ",
-      "applyAgreePost": "权限写入上述文件，且会先留一份备份。"
+      "applyAgreePost": "权限写入上述文件，且会先留一份备份。",
+      "stopCodex": "写入前会先停掉正在跑的 Codex（含终端 codex 会话与桌面应用）：先优雅退出，超时仍在跑则强制结束；投递本身不会替你重新拉起它，写完请用重启区或启动命令自行重开。"
     },
     "rollbackDialog": {
       "title": "回滚这次投递",
@@ -1296,7 +1309,7 @@
       "loading": "正在读绑定…",
       "empty": "还没有任何已投递的通道。先去「Agent 投递」页投递一条。",
       "unmappedPre": "无法识别通道（",
-      "unmappedPost": "）——这个 agent 名不在已知通道表里（更早版本或手工改过的绑定），勾了也会失败并说明原因",
+      "unmappedPost": "）——这个 agent 名不在已知通道表里（更早版本或手工改过的绑定）；勾选并预览后，该行无有效计划，执行按钮会被禁用，无法在此改指",
       "mapped": "{channel} · {pathLabel}{path} · key #{keyId} · {site}",
       "recordedPathLabel": "记录时的路径：",
       "actualPathLabel": "本次实际写入：",
@@ -1316,9 +1329,14 @@
       "hint": "某一条失败不会中断其它条（例如目标文件正被别的程序占用）。已经改成功的那几强不会回滚——要的是「尽量都改掉」，不是「要么全成要么全不成」。",
       "resultTitle": "批量结果",
       "unmappedFull": "无法识别通道（可能是另一个 home 下写的）",
-      "unmappedApplyDetail": "无法识别通道（可能是另一个 home 下写的），请到「Agent 投递」页手工处理",
+      "unmappedApplyDetail": "无法在此改指：该 agent 名不在已知通道表里，请手工处理该文件",
       "appliedOk": "已改指网关",
-      "unmappedStrong": "无法识别通道"
+      "unmappedStrong": "无法识别通道",
+      "delistedPre": "已下线通道（",
+      "delistedPost": "）——Cline Desktop 文件直写已下线，无法在此改指，请走 cline auth CLI 处理",
+      "delistedFull": "Cline Desktop 文件直写已下线，无法在此改指，请走 cline auth CLI",
+      "delistedApplyDetail": "Cline Desktop 文件直写已下线，无法在此改指，请走 cline auth CLI",
+      "delistedStrong": "已下线通道"
     },
     "copyFail": "复制失败（{error}）——请手动选中上面的令牌文本。",
     "collectModelsLabel": "采集站点模型目录（用于模型变化通知与跨站选路）",

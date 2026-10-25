@@ -290,8 +290,12 @@ export default function Agents() {
     () => new Map((updatesQuery.data ?? []).map((u) => [u.channel, u])),
     [updatesQuery.data],
   );
+  // DEBUG-G6 P1-18：汇总只计投递通道（CHANNELS）。后端仍产出 Cline Desktop
+  // 更新行（检测保留、投递已下线，见 agents.rs / agent_updates.rs），此前全量
+  // 计数会让用户看到“可更新 1”却在 19 行里找不到任何更新按钮。
   const updateCounts = useMemo(() => {
-    const rows = updatesQuery.data ?? [];
+    const known = new Set(CHANNELS.map((c) => c.id));
+    const rows = (updatesQuery.data ?? []).filter((u) => known.has(u.channel));
     return {
       available: rows.filter((u) => u.state === "available").length,
       upToDate: rows.filter((u) => u.state === "upToDate").length,
@@ -299,6 +303,12 @@ export default function Agents() {
       failed: rows.filter((u) => u.state === "error").length,
     };
   }, [updatesQuery.data]);
+  // 同上：后端更新行里有没有已下线通道（目前只有 cline-desktop）。有才标注——
+  // 没产出该行时不凭空提它，避免把“当前无此行”说成“一直有”。
+  const hasDelistedUpdateRow = useMemo(
+    () => (updatesQuery.data ?? []).some((u) => u.channel === "cline-desktop"),
+    [updatesQuery.data],
+  );
 
   /** 确认弹窗对应的通道（null = 未打开）。 */
   const [updateFor, setUpdateFor] = useState<string | null>(null);
@@ -685,6 +695,9 @@ export default function Agents() {
                 })}
           </p>
         )}
+        {hasDelistedUpdateRow ? (
+          <p className="muted">{t("agents.update.clineDesktopNote")}</p>
+        ) : null}
         {lastCheckedAt ? (
           <p className="muted">
             {t("agents.update.lastChecked", {
@@ -1087,6 +1100,17 @@ export default function Agents() {
             </li>
           ))}
         </ul>
+        {/*
+          DEBUG-G6 P1-19：停进程只对 Codex 两条通道发生（service.rs 的写盘前停
+          Codex 钩子，单通道与双文件两路同调；其余通道不走它），故只在 Codex
+          计划时才出现这句——对所有通道都写会撒谎。含终端会话：停的是进程名，
+          不是某个窗口，终端 codex 会话同样会被停掉，且投递不替用户拉起。
+        */}
+        {plan.data && (plan.data.channel === "codex-auth-json" || plan.data.channel === "codex-config") ? (
+          <p className="warnline" role="alert">
+            <AlertTriangle size={14} aria-hidden /> {t("agents.confirmDialog.stopCodex")}
+          </p>
+        ) : null}
         <label className="checkline">
           <input
             type="checkbox"
@@ -1404,8 +1428,10 @@ function UpdateAttempts({ outcome }: { outcome: AgentUpdateOutcome }) {
  * 不得复用「Codex CLI」之名；终端 codex 会话不受按钮影响，靠可复制命令自行重开。
  * 其余 CLI 类 agent 不给重启按钮，只给可复制的启动命令——
  * 应用绝不替用户拉终端进程（启动命令的 bin 名与后端 agents.rs 的探测 bin 同源）。
- * App / 扩展类通道（Cursor、Trae、Cline、Cline Desktop、DSH）既无重启按钮也无
- * 启动命令：本项不做它们，不给点了才报错的按钮。
+ * App / 扩展类通道（Cursor、Trae、Cline、DSH）既无重启按钮也无
+ * 启动命令：本项不做它们，不给点了才报错的按钮。Cline Desktop 不在此列——
+ * 它是 B-292 已下线的通道（检测保留、投递已下线），不是“本项不做”的在册通道，
+ * 不得把它与在册通道并列，否则会把下线说成未实现。
  *
  * daemon 清单项永远是「未验证」：后端结果的 daemon 状态恒为 unverified，这里只负责
  * 原样渲染，不得把它画成已通过。只杀窗口可能不生效的说明见 i18n 文案。
@@ -1756,6 +1782,61 @@ function PlanView({
               {t("agents.plan.modelValidation.blocked")}
             </p>
           ) : null}
+        </section>
+      ) : null}
+
+      {/*
+        DEBUG-G6 P1-20：DSH 凭据引用校验渲染（此前只有类型层接线，预览里零渲染）。
+        三态只认后端字段：referencingFiles 非空 = 通过；checkedFiles 为空 = 无 profile；
+        其余 = 有 profile 但未引用。null（非 DSH 通道或旧二进制）时整段不渲染，
+        与模型验证段缺失时同一口径，不画假状态。fail-closed 语义：预览只是预览，
+        apply 前后端在锁内重校验、未引用拒绝写盘。
+      */}
+      {plan.dshCredentialReference ? (
+        <section aria-label={t("agents.plan.dshReference.title")}>
+          <h4>{t("agents.plan.dshReference.title")}</h4>
+          {plan.dshCredentialReference.referencingFiles.length > 0 ? (
+            <p className="ok" role="status">
+              {t("agents.plan.dshReference.passed", {
+                name: plan.dshCredentialReference.credentialName,
+                count: plan.dshCredentialReference.referencingFiles.length,
+              })}
+            </p>
+          ) : plan.dshCredentialReference.checkedFiles.length === 0 ? (
+            <p className="warnline" role="alert">
+              <AlertTriangle size={14} aria-hidden />{" "}
+              {t("agents.plan.dshReference.noProfiles", {
+                dir: plan.dshCredentialReference.profilesDir,
+              })}
+            </p>
+          ) : (
+            <p className="warnline" role="alert">
+              <AlertTriangle size={14} aria-hidden />{" "}
+              {t("agents.plan.dshReference.unreferenced", {
+                name: plan.dshCredentialReference.credentialName,
+                count: plan.dshCredentialReference.checkedFiles.length,
+              })}
+            </p>
+          )}
+          {plan.dshCredentialReference.referencingFiles.length > 0 ? (
+            <p className="muted">
+              {t("agents.plan.dshReference.referencingLabel")}{" "}
+              <span className="mono">{plan.dshCredentialReference.referencingFiles.join("、")}</span>
+            </p>
+          ) : null}
+          {plan.dshCredentialReference.checkedFiles.length > 0 ? (
+            <p className="muted">
+              {t("agents.plan.dshReference.checkedLabel")}{" "}
+              <span className="mono">{plan.dshCredentialReference.checkedFiles.join("、")}</span>
+            </p>
+          ) : null}
+          {plan.dshCredentialReference.unreadableFiles.length > 0 ? (
+            <p className="muted">
+              {t("agents.plan.dshReference.unreadableLabel")}{" "}
+              <span className="mono">{plan.dshCredentialReference.unreadableFiles.join("、")}</span>
+            </p>
+          ) : null}
+          <p className="muted">{t("agents.plan.dshReference.failClosed")}</p>
         </section>
       ) : null}
 
