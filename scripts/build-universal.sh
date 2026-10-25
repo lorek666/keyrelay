@@ -78,7 +78,10 @@ if [ -z "$APP" ]; then
 fi
 
 # 测产物大小（PRD §5：≤30MB = 30720 KB，1024 进制）
-SIZE_KB=$(du -k "$APP" | cut -f1)
+# 注意：必须用 -s（汇总），裸 du -k 会逐子目录各出一行，SIZE_KB 成多行，
+# 后面的整数比较会报 integer expression expected、if 条件按假处理，
+# 导致超标也印 PASS（40b7c01 的 build-universal 就是这样假绿的）。
+SIZE_KB=$(du -sk "$APP" | cut -f1)
 echo "universal app: $APP"
 echo "size: ${SIZE_KB} KB（门槛 30720 KB）"
 
