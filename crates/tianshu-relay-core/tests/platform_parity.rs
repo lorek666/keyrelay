@@ -132,8 +132,14 @@ fn platform_specific_files_match_the_known_inventory() {
         // Windows 走 taskkill/tasklist、Linux 走 pkill//proc 扫描；argv 构造类函数显式收
         // 平台参数，macOS/Windows 分支在 Linux 上也有单测（未真机执行，见 restart.rs 模块文档）。
         "restart.rs".to_string(),
+        // DEBUG-G7 P2-K5（0600 落实）：`store/mod.rs` 的 tighten_db_files 与
+        // `vault/local.rs` 的 tighten_vault_files 在 unix 上把库文件权限只收紧
+        // 不放宽（`mode & 0o600`，含 -wal / -shm）；非 unix 分支均为继承 ACL 的
+        // 空实现。双端说明见 `docs/evidence/platform-parity.md` §1.6。
+        "store/mod.rs".to_string(),
         "vault/keychain.rs".to_string(),
         "vault/keyfile.rs".to_string(),
+        "vault/local.rs".to_string(),
     ];
 
     assert_eq!(
