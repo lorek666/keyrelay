@@ -295,7 +295,10 @@ export default function Agents() {
 
   // 投递模式（M8-S4 §6.2）：指向站点，还是指向本地网关。
   // 这是**投递参数**，不是新通道——通道集合不变，只换写进去的那两个值。
-  const [gatewayMode, setGatewayMode] = useState(false);
+  // P0-4：默认推荐网关模式（agent 文件只写本地端点 + 本地令牌），
+  // 站点直连降级为次选、不预选。只改 UI 默认与呈现：后端缺省仍是站点
+  // （见汇报），调用方不传 mode 时的行为不在本项改动范围内。
+  const [gatewayMode, setGatewayMode] = useState(true);
   const mode: DeliveryMode = gatewayMode ? "gateway" : "site";
 
   // 解绑（M8-S4 §5.4）。`alsoRevoke` **默认不勾**：默认路径纯本地、一个站点请求都不发。
@@ -459,14 +462,36 @@ export default function Agents() {
               ))}
             </select>
           </label>
-          <label className="checkline">
-            <input
-              type="checkbox"
-              checked={gatewayMode}
-              onChange={(e) => setGatewayMode(e.target.checked)}
-            />
-            <span>{t("agents.gatewayMode.label")}</span>
-          </label>
+        </div>
+        {/*
+          P0-4：投递方式改成双单选、网关在前且带「推荐」徽标，直连在后且带
+          「次选」徽标。只换呈现与默认选中：派生的 `mode`、预览查询键、
+          同意门禁、投递/回滚调用一字不动；直连仍可选，只是不再是默认值。
+        */}
+        <div className="delivery-mode" role="radiogroup" aria-label={t("agents.gatewayMode.modeLabel")}>
+          <span className="muted">{t("agents.gatewayMode.modeLabel")}</span>
+          <div className="radio-row">
+            <label className="radio">
+              <input
+                type="radio"
+                name="delivery-mode"
+                checked={gatewayMode}
+                onChange={() => setGatewayMode(true)}
+              />
+              <span>{t("agents.gatewayMode.label")}</span>
+              <span className="badge badge-ok">{t("agents.gatewayMode.recommended")}</span>
+            </label>
+            <label className="radio">
+              <input
+                type="radio"
+                name="delivery-mode"
+                checked={!gatewayMode}
+                onChange={() => setGatewayMode(false)}
+              />
+              <span>{t("agents.gatewayMode.siteLabel")}</span>
+              <span className="badge badge-muted">{t("agents.gatewayMode.secondary")}</span>
+            </label>
+          </div>
         </div>
       </div>
 

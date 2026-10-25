@@ -586,7 +586,11 @@
       "label": "Point at local gateway: writes the gateway URL (/v1) and a local token, not the site key. To switch sites you only restart the gateway, no agent-side change. Requires the gateway to be running.",
       "title": "Local gateway token (not the site key)",
       "siteKey": "Site key",
-      "unknownMode": "Unknown delivery mode: {mode}"
+      "unknownMode": "Unknown delivery mode: {mode}",
+      "modeLabel": "Delivery mode",
+      "recommended": "Recommended",
+      "siteLabel": "Direct to site: writes the site key and site URL; switching sites requires re-delivering each agent.",
+      "secondary": "Secondary"
     },
     "emptyKey": {
       "noSiteKey": "No local keys under this site; create one on the Keys page first.",
