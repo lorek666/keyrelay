@@ -272,6 +272,491 @@ pub fn channel_carries_endpoint(channel: DeliveryChannel) -> bool {
     )
 }
 
+// ==================================================== P0-1：每通道必填字段表 + 整单校验
+//
+// 为什么表是「通道 + 构造输入」的函数，而不是一张静态表：writer 的产出集随构造输入
+// 变化——base_url 为空时不写 endpoint 行、model 为空时不写 model 行、meta 缺失时不写
+// 模型参数行（见各 writer 的 `fields()`）。一张静态表要么把「只投密钥」的合法投递误杀，
+// 要么把「应写 endpoint 却没写」漏过去。于是：
+//
+// - 调用方（service）从**构造 writer 的同一批输入**（站点/网关 base_url 是否非空、
+//   model 是否非空、meta 缓存快照是否存在、opencode 的 provider_id）算出
+//   [`FieldSetOptions`]，再与 writer 实际产出的 `fields()` 逐项比对；
+// - 表本身是本文件里独立写出的另一份代码（引用各 writer 的 `FIELD_*` 常量，但**不调用**
+//   `writer.field_names()` / `writer.fields()`），writer 回归（改了 `fields()` 却漏了一行）
+//   会在这里被拦下；矩阵测试 `required_field_table_matches_writer_fields` 钉住「表 == writer
+//   产出」，两者任一 drift 都会红。
+//
+// 锚点是 `fields()`（预览/计划字段），不是 `field_names()`：cline / cline-desktop /
+// qwen-code / mimo-code 的 `field_names()`（同意记录用）带限定前缀（如 `providers.apiKey`、
+// `model.apiKey`），而 `fields()` 用叶键名（如 `apiKey`）——两处口径本就不同，
+// 表跟 `fields()` 走；统一 `field_names()` 口径不在本项范围。
+//
+// 「多出未知关键字段」的处理：**拒绝**（不是告警后放行）。理由：告警 + 报成功会让一次
+// 「写了不该写的东西」的投递被记成成功，而本项的语义就是整单全有或全无；拒绝与
+// `checked_target` / `inject` 的 fail-closed 口径一致。
+//
+// 表里**不含** writer 写盘时的脚手架键：cline-desktop 的 `provider` / `tokenSource` /
+// `updatedAt`、cline 的条目 `id` 是固定脚手架，不是本次投递的「关键字段」，
+// 故不在表里——它们变了不该让整单校验红，丢了也不影响「密钥 + 端点 + 模型是否齐全」
+// 的判断。opencode 的 meta 参数（`limit.context` / `limit.output`）同样不在 `fields()` 里，
+// 故也不在表里。
+
+/// plan/apply 校验用的「writer 构造输入」快照。
+///
+/// `provider_id` 只对 OpenCode / OpenCodeJsonc 有意义（限定键名里的 provider 段）；
+/// 其余通道忽略它。`has_meta` 只有在 `has_model` 同时为真时才产生参数行
+/// （各 writer 的 meta 参数都包在 `model` 分支里）。
+#[derive(Clone, Copy, Debug)]
+pub struct FieldSetOptions<'a> {
+    pub provider_id: &'a str,
+    pub has_endpoint: bool,
+    pub has_model: bool,
+    pub has_meta: bool,
+}
+
+impl<'a> FieldSetOptions<'a> {
+    pub fn new(provider_id: &'a str, has_endpoint: bool, has_model: bool, has_meta: bool) -> Self {
+        Self {
+            provider_id,
+            has_endpoint,
+            has_model,
+            has_meta,
+        }
+    }
+}
+
+/// opencode 的限定键名：`provider.<id>.options.<field>`。
+///
+/// 与 [`opencode::OpenCodeWriter::qualified_field`] 同规则的镜像（简单标识符走点号分段，
+/// 否则走方括号形态）：矩阵测试会把两者逐字钉住，任一侧改规则都会红。
+fn opencode_qualified_field(provider_id: &str, field: &str) -> String {
+    let simple = !provider_id.is_empty()
+        && provider_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if simple {
+        format!(
+            "{}.{}.{}.{}",
+            opencode::OpenCodeWriter::PROVIDER_KEY,
+            provider_id,
+            opencode::OpenCodeWriter::OPTIONS_KEY,
+            field
+        )
+    } else {
+        format!(
+            "{}[{}].{}.{}",
+            opencode::OpenCodeWriter::PROVIDER_KEY,
+            serde_json::to_string(provider_id).unwrap_or_else(|_| format!("\"{provider_id}\"")),
+            opencode::OpenCodeWriter::OPTIONS_KEY,
+            field
+        )
+    }
+}
+
+/// 该通道在给定构造输入下**必须**产出的字段键名表（顺序与 writer 的 `fields()` 一致）。
+///
+/// 逐通道摘要（`E` = 仅 `has_endpoint` 时有，`M` = 仅 `has_model` 时有，
+/// `P` = 仅 `has_model && has_meta` 时有）：
+/// - codex-auth-json：`auth_mode`、`OPENAI_API_KEY`（恒定两项；**不含**任何端点/模型键——
+///   api_key 不进 config，endpoint 在另一张表）。
+/// - codex-config：`model_provider`、`disable_response_storage`、`[M] model`、`name`、
+///   `[E] base_url`、`wire_api`（**不含** api_key——密钥只在 auth.json 里，这是两张表
+///   必须分开的理由；混成一张会把「密钥进了 config.toml」误判为正常）。
+/// - claude-code-settings：`ANTHROPIC_AUTH_TOKEN`、`[E] ANTHROPIC_BASE_URL`、
+///   `[M] ANTHROPIC_MODEL`。
+/// - opencode / opencode-jsonc（同一写入器）：`provider.<id>.options.apiKey`、
+///   `[E] provider.<id>.options.baseURL`、`[M] model`（meta 不进 `fields()`，故无参数行）。
+/// - gemini-cli：`GEMINI_API_KEY`、`[E] GOOGLE_GEMINI_BASE_URL`、`[M] GEMINI_MODEL`。
+/// - claude-desktop：`ANTHROPIC_AUTH_TOKEN`、`[E] ANTHROPIC_BASE_URL`（model 被忽略，
+///   故无论 `has_model` 都无 model 行）。
+/// - grok-build：`api_key`、`[E] base_url`、`[M] model`、`[P] context_window`
+///   （meta 只有 context_window，没有 max_tokens）。
+/// - openclaw：`api_key`、`[E] base_url`、`[M] model`、`[P] contextWindow`、`[P] maxTokens`。
+/// - hermes：`api_key`、`[E] base_url`、`[M] model`、`[P] context_length`
+///   （meta 只有 context_length）。
+/// - mcode：`api_key`、`[E] base_url`、`[M] model`、`[P] context_window`、`[P] max_tokens`。
+/// - pi / deepseek / trae：`api_key`、`[E] base_url`、`[M] model`、
+///   `[P] contextWindow`、`[P] maxTokens`。
+/// - cursor：`OPENAI_API_KEY`、`[E] OPENAI_BASE_URL`（model 被忽略）。
+/// - cline / qwen-code / mimo-code：`apiKey`、`[E] baseUrl`、`[M] model`、
+///   `[P] contextWindow`、`[P] maxTokens`（叶键名，见本节头部的口径说明）。
+/// - cline-desktop：`apiKey`、`[E] baseUrl`、`[M] modelId`（注意不是 `model`）、
+///   `[P] contextWindow`、`[P] maxTokens`。
+/// - dsh：恒定只有 `KEYRELAY_API_KEY`——**无端点字段**：`DshWriter` 收了 `base_url` 却不写
+///   （DSH 的 endpoint 在用户自配的 profile 文件里），`has_endpoint` / `has_model` /
+///   `has_meta` 对它一律无效；DSH 引用校验是 P0-3 的范围，本项不碰。
+pub fn expected_fields(channel: DeliveryChannel, opts: &FieldSetOptions<'_>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |key: String| out.push(key);
+    // 条件行：与各 writer `fields()` 里的 gating 逐字对应（base_url 非空 / model 非空 /
+    // model 非空且 meta 存在），不得凭空加减。
+    let endpoint = opts.has_endpoint;
+    let model = opts.has_model;
+    let params = opts.has_model && opts.has_meta;
+    match channel {
+        DeliveryChannel::CodexAuthJson => {
+            push(codex_auth::CodexAuthWriter::FIELD_AUTH_MODE.to_string());
+            push(codex_auth::CodexAuthWriter::FIELD_API_KEY.to_string());
+        }
+        DeliveryChannel::CodexConfig => {
+            push(codex_config::CodexConfigWriter::FIELD_MODEL_PROVIDER.to_string());
+            push(codex_config::CodexConfigWriter::FIELD_DISABLE_RESPONSE_STORAGE.to_string());
+            if model {
+                push(codex_config::CodexConfigWriter::FIELD_MODEL.to_string());
+            }
+            push(codex_config::CodexConfigWriter::FIELD_NAME.to_string());
+            if endpoint {
+                push(codex_config::CodexConfigWriter::FIELD_BASE_URL.to_string());
+            }
+            push(codex_config::CodexConfigWriter::FIELD_WIRE_API.to_string());
+        }
+        DeliveryChannel::ClaudeCodeSettings => {
+            push(claude_code::ClaudeCodeWriter::FIELD_TOKEN.to_string());
+            if endpoint {
+                push(claude_code::ClaudeCodeWriter::FIELD_BASE_URL.to_string());
+            }
+            if model {
+                push(claude_code::ClaudeCodeWriter::FIELD_MODEL.to_string());
+            }
+        }
+        DeliveryChannel::OpenCode | DeliveryChannel::OpenCodeJsonc => {
+            push(opencode_qualified_field(
+                opts.provider_id,
+                opencode::OpenCodeWriter::FIELD_API_KEY,
+            ));
+            if endpoint {
+                push(opencode_qualified_field(
+                    opts.provider_id,
+                    opencode::OpenCodeWriter::FIELD_BASE_URL,
+                ));
+            }
+            if model {
+                push(opencode::OpenCodeWriter::FIELD_MODEL.to_string());
+            }
+        }
+        DeliveryChannel::GeminiCli => {
+            push(gemini_cli::GeminiCliWriter::FIELD_API_KEY.to_string());
+            if endpoint {
+                push(gemini_cli::GeminiCliWriter::FIELD_BASE_URL.to_string());
+            }
+            if model {
+                push(gemini_cli::GeminiCliWriter::FIELD_MODEL.to_string());
+            }
+        }
+        DeliveryChannel::ClaudeDesktop => {
+            push(claude_desktop::ClaudeDesktopWriter::FIELD_TOKEN.to_string());
+            if endpoint {
+                push(claude_desktop::ClaudeDesktopWriter::FIELD_BASE_URL.to_string());
+            }
+        }
+        DeliveryChannel::GrokBuild => {
+            push(grok_build::GrokBuildWriter::FIELD_API_KEY.to_string());
+            if endpoint {
+                push(grok_build::GrokBuildWriter::FIELD_BASE_URL.to_string());
+            }
+            if model {
+                push(grok_build::GrokBuildWriter::FIELD_MODEL.to_string());
+                if params {
+                    push(grok_build::GrokBuildWriter::FIELD_CONTEXT_WINDOW.to_string());
+                }
+            }
+        }
+        DeliveryChannel::OpenClaw => {
+            push(openclaw::OpenClawWriter::FIELD_API_KEY.to_string());
+            if endpoint {
+                push(openclaw::OpenClawWriter::FIELD_BASE_URL.to_string());
+            }
+            if model {
+                push(openclaw::OpenClawWriter::FIELD_MODEL.to_string());
+                if params {
+                    push(openclaw::OpenClawWriter::FIELD_CONTEXT_WINDOW.to_string());
+                    push(openclaw::OpenClawWriter::FIELD_MAX_TOKENS.to_string());
+                }
+            }
+        }
+        DeliveryChannel::Hermes => {
+            push(hermes::HermesWriter::FIELD_API_KEY.to_string());
+            if endpoint {
+                push(hermes::HermesWriter::FIELD_BASE_URL.to_string());
+            }
+            if model {
+                push(hermes::HermesWriter::FIELD_MODEL.to_string());
+                if params {
+                    push(hermes::HermesWriter::FIELD_CONTEXT_LENGTH.to_string());
+                }
+            }
+        }
+        DeliveryChannel::MCode => {
+            push(mcode::MCodeWriter::FIELD_API_KEY.to_string());
+            if endpoint {
+                push(mcode::MCodeWriter::FIELD_BASE_URL.to_string());
+            }
+            if model {
+                push(mcode::MCodeWriter::FIELD_MODEL.to_string());
+                if params {
+                    push(mcode::MCodeWriter::FIELD_CONTEXT_WINDOW.to_string());
+                    push(mcode::MCodeWriter::FIELD_MAX_TOKENS.to_string());
+                }
+            }
+        }
+        DeliveryChannel::Pi => {
+            push(pi::PiWriter::FIELD_API_KEY.to_string());
+            if endpoint {
+                push(pi::PiWriter::FIELD_BASE_URL.to_string());
+            }
+            if model {
+                push(pi::PiWriter::FIELD_MODEL.to_string());
+                if params {
+                    push(pi::PiWriter::FIELD_CONTEXT_WINDOW.to_string());
+                    push(pi::PiWriter::FIELD_MAX_TOKENS.to_string());
+                }
+            }
+        }
+        DeliveryChannel::Cursor => {
+            push(cursor::CursorWriter::FIELD_API_KEY.to_string());
+            if endpoint {
+                push(cursor::CursorWriter::FIELD_BASE_URL.to_string());
+            }
+        }
+        DeliveryChannel::Cline => {
+            push(cline::ClineWriter::FIELD_API_KEY.to_string());
+            if endpoint {
+                push(cline::ClineWriter::FIELD_BASE_URL.to_string());
+            }
+            if model {
+                push(cline::ClineWriter::FIELD_MODEL.to_string());
+                if params {
+                    push(cline::ClineWriter::FIELD_CONTEXT_WINDOW.to_string());
+                    push(cline::ClineWriter::FIELD_MAX_TOKENS.to_string());
+                }
+            }
+        }
+        DeliveryChannel::QwenCode => {
+            push(qwen_code::QwenCodeWriter::FIELD_API_KEY.to_string());
+            if endpoint {
+                push(qwen_code::QwenCodeWriter::FIELD_BASE_URL.to_string());
+            }
+            if model {
+                push(qwen_code::QwenCodeWriter::FIELD_MODEL.to_string());
+                if params {
+                    push(qwen_code::QwenCodeWriter::FIELD_CONTEXT_WINDOW.to_string());
+                    push(qwen_code::QwenCodeWriter::FIELD_MAX_TOKENS.to_string());
+                }
+            }
+        }
+        DeliveryChannel::DeepSeek => {
+            push(deepseek::DeepSeekWriter::FIELD_API_KEY.to_string());
+            if endpoint {
+                push(deepseek::DeepSeekWriter::FIELD_BASE_URL.to_string());
+            }
+            if model {
+                push(deepseek::DeepSeekWriter::FIELD_MODEL.to_string());
+                if params {
+                    push(deepseek::DeepSeekWriter::FIELD_CONTEXT_WINDOW.to_string());
+                    push(deepseek::DeepSeekWriter::FIELD_MAX_TOKENS.to_string());
+                }
+            }
+        }
+        DeliveryChannel::Trae => {
+            push(trae::TraeWriter::FIELD_API_KEY.to_string());
+            if endpoint {
+                push(trae::TraeWriter::FIELD_BASE_URL.to_string());
+            }
+            if model {
+                push(trae::TraeWriter::FIELD_MODEL.to_string());
+                if params {
+                    push(trae::TraeWriter::FIELD_CONTEXT_WINDOW.to_string());
+                    push(trae::TraeWriter::FIELD_MAX_TOKENS.to_string());
+                }
+            }
+        }
+        DeliveryChannel::MiMoCode => {
+            push(mimo_code::MiMoCodeWriter::FIELD_API_KEY.to_string());
+            if endpoint {
+                push(mimo_code::MiMoCodeWriter::FIELD_BASE_URL.to_string());
+            }
+            if model {
+                push(mimo_code::MiMoCodeWriter::FIELD_MODEL.to_string());
+                if params {
+                    push(mimo_code::MiMoCodeWriter::FIELD_CONTEXT_WINDOW.to_string());
+                    push(mimo_code::MiMoCodeWriter::FIELD_MAX_TOKENS.to_string());
+                }
+            }
+        }
+        DeliveryChannel::ClineDesktop => {
+            push(cline_desktop::ClineDesktopWriter::FIELD_API_KEY.to_string());
+            if endpoint {
+                push(cline_desktop::ClineDesktopWriter::FIELD_BASE_URL.to_string());
+            }
+            if model {
+                push(cline_desktop::ClineDesktopWriter::FIELD_MODEL_ID.to_string());
+                if params {
+                    push(cline_desktop::ClineDesktopWriter::FIELD_CONTEXT_WINDOW.to_string());
+                    push(cline_desktop::ClineDesktopWriter::FIELD_MAX_TOKENS.to_string());
+                }
+            }
+        }
+        DeliveryChannel::DeepSeekHarness => {
+            // 只有密钥字段：base_url / model / meta 输入对它一律无效（见本节头部）。
+            push(dsh::DshWriter::FIELD_API_KEY.to_string());
+        }
+    }
+    out
+}
+
+/// plan 阶段整单校验：writer 实际产出的 `fields()` 键集必须与
+/// [`expected_fields`] **完全相等**（集合意义：顺序不同不算错，重复键算错）。
+///
+/// - 缺失 ⇒ 整单拒绝：不得只写一部分就报成功；
+/// - 多出必填表外的键 ⇒ 同样整单拒绝（本节头部说明了为什么选拒绝而不是告警）；
+/// - 重复键 ⇒ 整单拒绝（同一键出现两次，说明 writer 产出本身已坏）。
+///
+/// 错误用 `Error::Inject`：`Display` 自带目标路径，`reason` 里再逐字带上通道名、
+/// 缺失/多出/重复字段名与目标路径——调用方与界面都不需要再拼一次文案。
+/// 本函数**不落盘、不读盘**：plan 阶段拒绝时磁盘一个字节都不动。
+pub fn validate_plan_fields(
+    channel: DeliveryChannel,
+    fields: &[DeliveryField],
+    opts: &FieldSetOptions<'_>,
+    target: &Path,
+) -> Result<()> {
+    let expected = expected_fields(channel, opts);
+    let mut actual: Vec<&str> = fields.iter().map(|f| f.key.as_str()).collect();
+    actual.sort_unstable();
+    let mut duplicates: Vec<&str> = Vec::new();
+    for pair in actual.windows(2) {
+        if pair[0] == pair[1] && !duplicates.contains(&pair[0]) {
+            duplicates.push(pair[0]);
+        }
+    }
+    let mut expected_sorted: Vec<&str> = expected.iter().map(|k| k.as_str()).collect();
+    expected_sorted.sort_unstable();
+    let missing: Vec<&str> = expected_sorted
+        .iter()
+        .copied()
+        .filter(|k| !actual.contains(k))
+        .collect();
+    let unknown: Vec<&str> = actual
+        .iter()
+        .copied()
+        .filter(|k| !expected_sorted.contains(k))
+        .collect();
+    if missing.is_empty() && unknown.is_empty() && duplicates.is_empty() {
+        return Ok(());
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !missing.is_empty() {
+        parts.push(format!("缺失必填字段 [{}]", missing.join(", ")));
+    }
+    if !unknown.is_empty() {
+        parts.push(format!(
+            "多出必填表外字段 [{}]（未知关键字段按拒绝处理）",
+            unknown.join(", ")
+        ));
+    }
+    if !duplicates.is_empty() {
+        parts.push(format!("重复字段 [{}]", duplicates.join(", ")));
+    }
+    Err(Error::inject(
+        target,
+        format!(
+            "通道 {} 投递字段整单校验失败：{}；目标 {}；该单已拒绝，未写入任何内容",
+            channel.as_str(),
+            parts.join("；"),
+            target.display()
+        ),
+    ))
+}
+
+/// 限定键名的叶段：`provider.keyrelay.options.apiKey` → `apiKey`，
+/// `provider["a.b"].options.apiKey` → `apiKey`，裸键名原样返回。
+fn leaf_key(qualified: &str) -> &str {
+    qualified.rsplit('.').next().unwrap_or(qualified)
+}
+
+/// 文本里是否以「键」形态出现某叶键，分两种形态：
+/// - 行首键（TOML `api_key =`、YAML `api_key:`、.env `GEMINI_API_KEY=`、
+///   JSON5 `apiKey:`、pretty JSON `"apiKey":`）：行首（去前导空白、可选 `export `
+///   前缀、可选一个引号）是叶键，且紧跟 `"` / `:` / `=` / 空白；
+///   `export` 只认行首可选空白后的 `export` + 空白（与 gemini writer 的
+///   `match_assignment` 判定一致），行内其他位置的 `export` 不剥离，`exportKEY`
+///   （后无空白）也不剥离；
+/// - 紧凑 JSON 的行内键（`{"provider":{...,"apiKey":"..."}}` 整份只有一行，
+///   行首判定永远够不着）：行内出现 `"叶键"` 后跟可选空白再跟 `:`。
+/// 两种形态都用「叶键后紧跟分隔符」来防误撞：`model` 不会撞上 `model_provider`
+/// （后跟 `_`），也不会撞上 `"model_provider":`（后跟 `_` 而非引号）。
+fn text_contains_key(text: &str, leaf: &str) -> bool {
+    if text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        // 只认行首可选空白后的 `export` + 空白：`export ` 剥离后继续走叶键判定。
+        // 行内其他位置的 export（如 `FOO=export GEMINI_API_KEY=...` 的值部分）
+        // 不在行首，不会走到这里；`exportKEY` 后无空白，也不剥离。
+        let after_export = match trimmed.strip_prefix("export") {
+            Some(tail) if tail.starts_with(' ') || tail.starts_with('\t') => tail.trim_start(),
+            _ => trimmed,
+        };
+        let stripped = after_export.strip_prefix('"').unwrap_or(after_export);
+        stripped.starts_with(leaf)
+            && stripped[leaf.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| matches!(c, '"' | ':' | '=' | ' ' | '\t'))
+    }) {
+        return true;
+    }
+    let quoted = format!("\"{leaf}\"");
+    let mut rest = text;
+    while let Some(pos) = rest.find(&quoted) {
+        let after = &rest[pos + quoted.len()..];
+        if after.trim_start().starts_with(':') {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+/// apply 后回读比对：读回目标文件，确认必填表里每个字段的叶键都在文件中。
+///
+/// 只做**键存在性**比对，不做值比对——值相等已由 `inject` 的字节级回读保证
+/// （落盘内容必须与 `patch.after` 逐字节相等）；这里补的是「写完后文件又被改动」
+/// 以及「inject 回读语义未来变化」那一层。返回 `Err` 时调用方**必须**走失败补偿
+/// （回滚），不得只记一条日志就报成功。
+pub fn verify_applied_fields(
+    channel: DeliveryChannel,
+    expected: &[String],
+    target: &Path,
+) -> Result<()> {
+    let text = std::fs::read_to_string(target).map_err(|e| {
+        Error::inject(
+            target,
+            format!(
+                "通道 {} 投递后回读失败：{e}；目标 {}；该单视为投递失败",
+                channel.as_str(),
+                target.display()
+            ),
+        )
+    })?;
+    let missing: Vec<&str> = expected
+        .iter()
+        .map(|k| k.as_str())
+        .filter(|k| !text_contains_key(&text, leaf_key(k)))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::inject(
+        target,
+        format!(
+            "通道 {} 投递后回读比对失败：文件中缺失字段 [{}]；目标 {}；该单视为投递失败",
+            channel.as_str(),
+            missing.join(", "),
+            target.display()
+        ),
+    ))
+}
+
 /// 纯函数、无 IO。UI **必须**调用它取文案，不得在界面里硬编码判断——否则新增通道时又会漏一处。
 pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
     match channel {
@@ -1519,5 +2004,311 @@ mod tests {
         assert!(ConsentState::Granted { granted_at: 1 }.is_granted());
         assert!(!ConsentState::Missing.is_granted());
         assert!(!ConsentState::Revoked { revoked_at: 1 }.is_granted());
+    }
+
+    // ==================================================== P0-1：必填表测试
+
+    #[test]
+    fn required_field_table_matches_writer_fields() {
+        // 矩阵：20 通道 × 4 种构造输入（无端点无模型 / 有端点无模型 / 有端点有模型 /
+        // 有端点有模型有 meta）。表与 writer 的 `fields()` 必须逐字相等（含顺序）：
+        // 任一侧改了一行都会在这里红，而不是等到线上投递才被整单校验拦下。
+        let home = tempfile::tempdir().expect("临时 home");
+        let meta = Some(crate::model_meta::ModelMeta {
+            context_window: 128_000,
+            max_output_tokens: 4_096,
+        });
+        let configs: [(&str, Option<&str>, Option<crate::model_meta::ModelMeta>); 4] = [
+            ("", None, None),
+            ("https://relay.example.com", None, None),
+            ("https://relay.example.com", Some("gpt-4o"), None),
+            ("https://relay.example.com", Some("gpt-4o"), meta),
+        ];
+        let mut checked = 0usize;
+        for channel in DeliveryChannel::ALL {
+            for (base_url, model, meta) in configs {
+                let writer = resolve_for_binding_with_meta(
+                    channel,
+                    home.path(),
+                    base_url,
+                    "keyrelay",
+                    model,
+                    meta,
+                )
+                .unwrap_or_else(|e| panic!("{} 应能解析出 writer: {e}", channel.as_str()));
+                let opts = FieldSetOptions::new(
+                    "keyrelay",
+                    !base_url.is_empty(),
+                    model.is_some(),
+                    meta.is_some(),
+                );
+                let expected = expected_fields(channel, &opts);
+                let actual: Vec<String> = writer
+                    .fields("sk-probe-0123456789abcdef")
+                    .iter()
+                    .map(|f| f.key.clone())
+                    .collect();
+                assert_eq!(
+                    actual,
+                    expected,
+                    "{} 在 base_url={base_url:?} model={model:?} meta={} 时表与 writer 产出不一致",
+                    channel.as_str(),
+                    meta.is_some()
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, DeliveryChannel::ALL.len() * 4);
+        // opencode 限定键的 provider 段：点号 provider 与带点 provider（方括号形态）
+        // 都要与 writer 的 qualified_field 逐字一致。
+        for provider in ["my-relay", "a.b"] {
+            for channel in [DeliveryChannel::OpenCode, DeliveryChannel::OpenCodeJsonc] {
+                let writer = resolve_for_binding_with_meta(
+                    channel,
+                    home.path(),
+                    "https://relay.example.com",
+                    provider,
+                    None,
+                    None,
+                )
+                .unwrap();
+                let opts = FieldSetOptions::new(provider, true, false, false);
+                let actual: Vec<String> = writer
+                    .fields("sk-probe-0123456789abcdef")
+                    .iter()
+                    .map(|f| f.key.clone())
+                    .collect();
+                assert_eq!(
+                    actual,
+                    expected_fields(channel, &opts),
+                    "{} provider={provider:?} 的限定键名不一致",
+                    channel.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_two_tables_and_dsh_table_are_distinct() {
+        // Codex 两张表不得混成一张：auth.json 只有密钥（无端点），config.toml 只有
+        // 端点/模型（无密钥）。DSH 只有密钥字段，任何构造输入都不产生端点行。
+        let full = FieldSetOptions::new("keyrelay", true, true, true);
+        let auth = expected_fields(DeliveryChannel::CodexAuthJson, &full);
+        assert_eq!(auth, vec!["auth_mode", "OPENAI_API_KEY"]);
+        let config = expected_fields(DeliveryChannel::CodexConfig, &full);
+        assert!(
+            !config.iter().any(|k| k.contains("API_KEY")),
+            "config 表不得含密钥键: {config:?}"
+        );
+        assert!(config.contains(&"base_url".to_string()), "{config:?}");
+        assert!(config.contains(&"model".to_string()), "{config:?}");
+        assert!(
+            !auth.iter().any(|k| k.contains("base_url") || k == "model"),
+            "auth 表不得含端点/模型键: {auth:?}"
+        );
+        for opts in [
+            FieldSetOptions::new("keyrelay", false, false, false),
+            FieldSetOptions::new("keyrelay", true, true, true),
+        ] {
+            assert_eq!(
+                expected_fields(DeliveryChannel::DeepSeekHarness, &opts),
+                vec!["KEYRELAY_API_KEY"],
+                "DSH 表恒定只有密钥字段"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_plan_fields_rejects_missing_unknown_and_duplicate() {
+        let target = Path::new("/tmp/nobody/.codex/config.toml");
+        let opts = FieldSetOptions::new("keyrelay", true, true, false);
+        let expected = expected_fields(DeliveryChannel::CodexConfig, &opts);
+        // 缺失：拿掉 base_url 一行 ⇒ 错误必须带通道名、缺失字段名、目标路径。
+        let mut missing_fields: Vec<DeliveryField> = expected
+            .iter()
+            .filter(|k| k.as_str() != "base_url")
+            .map(|k| literal_field(k.clone(), "x"))
+            .collect();
+        let err =
+            validate_plan_fields(DeliveryChannel::CodexConfig, &missing_fields, &opts, target)
+                .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("codex-config"), "{text}");
+        assert!(text.contains("base_url"), "{text}");
+        assert!(text.contains(".codex/config.toml"), "{text}");
+        // 多出未知字段 ⇒ 同样拒绝（不是告警放行）。
+        missing_fields.push(literal_field("surprise_key", "x"));
+        let err =
+            validate_plan_fields(DeliveryChannel::CodexConfig, &missing_fields, &opts, target)
+                .unwrap_err();
+        assert!(err.to_string().contains("surprise_key"), "{err}");
+        // 重复键 ⇒ 拒绝。
+        let mut dup_fields: Vec<DeliveryField> = expected
+            .iter()
+            .map(|k| literal_field(k.clone(), "x"))
+            .collect();
+        dup_fields.push(literal_field("name", "y"));
+        let err = validate_plan_fields(DeliveryChannel::CodexConfig, &dup_fields, &opts, target)
+            .unwrap_err();
+        assert!(err.to_string().contains("name"), "{err}");
+        // 全量一致 ⇒ 放行。
+        let ok_fields: Vec<DeliveryField> = expected
+            .iter()
+            .map(|k| literal_field(k.clone(), "x"))
+            .collect();
+        assert!(
+            validate_plan_fields(DeliveryChannel::CodexConfig, &ok_fields, &opts, target).is_ok()
+        );
+    }
+
+    #[test]
+    fn verify_applied_fields_checks_leaf_keys() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        // JSON：引号键；`model` 不得误撞 `model_provider`。
+        let json_path = dir.path().join("a.json");
+        std::fs::write(
+            &json_path,
+            "{\n  \"model_provider\": \"custom\",\n  \"name\": \"x\"\n}\n",
+        )
+        .unwrap();
+        assert!(verify_applied_fields(
+            DeliveryChannel::CodexConfig,
+            &["model".to_string()],
+            &json_path
+        )
+        .is_err());
+        assert!(verify_applied_fields(
+            DeliveryChannel::CodexConfig,
+            &["model_provider".to_string(), "name".to_string()],
+            &json_path
+        )
+        .is_ok());
+        // 紧凑 JSON：整份只有一行，键在行中而非行首（回归：单行预置文件曾让回读误报缺失）。
+        let compact_path = dir.path().join("d.json");
+        std::fs::write(
+            &compact_path,
+            "{\"provider\":{\"keyrelay\":{\"options\":{\"baseURL\":\"https://keep.example.com\",\"apiKey\":\"sk-x\"}}}}",
+        )
+        .unwrap();
+        assert!(verify_applied_fields(
+            DeliveryChannel::OpenCode,
+            &[
+                "provider.keyrelay.options.apiKey".to_string(),
+                "provider.keyrelay.options.baseURL".to_string()
+            ],
+            &compact_path
+        )
+        .is_ok());
+        assert!(verify_applied_fields(
+            DeliveryChannel::OpenCode,
+            &["provider.keyrelay.options.model".to_string()],
+            &compact_path
+        )
+        .is_err());
+        // TOML / YAML / .env 三种裸键渲染。
+        let toml_path = dir.path().join("b.toml");
+        std::fs::write(
+            &toml_path,
+            "[models.custom]\napi_key = \"sk-x\"\nbase_url = \"https://x\"\n",
+        )
+        .unwrap();
+        assert!(verify_applied_fields(
+            DeliveryChannel::GrokBuild,
+            &["api_key".to_string(), "base_url".to_string()],
+            &toml_path
+        )
+        .is_ok());
+        let env_path = dir.path().join("c.env");
+        std::fs::write(
+            &env_path,
+            "GEMINI_API_KEY=sk-x\nGOOGLE_GEMINI_BASE_URL=https://x\n",
+        )
+        .unwrap();
+        assert!(verify_applied_fields(
+            DeliveryChannel::GeminiCli,
+            &[
+                "GEMINI_API_KEY".to_string(),
+                "GOOGLE_GEMINI_BASE_URL".to_string()
+            ],
+            &env_path
+        )
+        .is_ok());
+        // export 前缀形态（回归 P1-1：gemini writer 保留 `  export KEY=...`，回读
+        // 曾把这类行判为缺失，导致 plan 能过、apply 必回滚）。
+        // 端到端：writer 对 export 风格旧文件 plan 后仍保留 export 前缀，
+        // 且对 plan 产物回读通过。
+        let export_path = dir.path().join("export.env");
+        std::fs::write(
+            &export_path,
+            "  export GEMINI_API_KEY=<redacted>\n  export GOOGLE_GEMINI_BASE_URL=https://old.example.com\n",
+        )
+        .unwrap();
+        let writer =
+            gemini_cli::GeminiCliWriter::with_path(&export_path, "https://relay.example.com");
+        let patch = writer.plan("sk-new").unwrap();
+        assert!(
+            patch.after.contains("  export GEMINI_API_KEY="),
+            "writer 应保留 export 前缀与缩进:\n{}",
+            patch.after
+        );
+        assert!(
+            patch.after.contains("  export GOOGLE_GEMINI_BASE_URL="),
+            "writer 应保留 export 前缀与缩进:\n{}",
+            patch.after
+        );
+        std::fs::write(&export_path, &patch.after).unwrap();
+        assert!(verify_applied_fields(
+            DeliveryChannel::GeminiCli,
+            &[
+                "GEMINI_API_KEY".to_string(),
+                "GOOGLE_GEMINI_BASE_URL".to_string()
+            ],
+            &export_path
+        )
+        .is_ok());
+        // 剥离只认行首 `export `：`exportKEY`（后无空白）与行内 export 均不得放行。
+        let bad_export_path = dir.path().join("bad-export.env");
+        std::fs::write(
+            &bad_export_path,
+            "exportGEMINI_API_KEY=<redacted>\n  export GOOGLE_GEMINI_BASE_URL=https://old.example.com\n",
+        )
+        .unwrap();
+        // 注：第二行是合法 export 行故放行 base_url；第一行不是合法 export 行，
+        // 故 GEMINI_API_KEY 必须判缺失。
+        assert!(verify_applied_fields(
+            DeliveryChannel::GeminiCli,
+            &["GEMINI_API_KEY".to_string()],
+            &bad_export_path
+        )
+        .is_err());
+        assert!(verify_applied_fields(
+            DeliveryChannel::GeminiCli,
+            &["GOOGLE_GEMINI_BASE_URL".to_string()],
+            &bad_export_path
+        )
+        .is_ok());
+        let inline_export_path = dir.path().join("inline-export.env");
+        std::fs::write(
+            &inline_export_path,
+            "FOO=export GEMINI_API_KEY=<redacted>\n  export GOOGLE_GEMINI_BASE_URL=https://old.example.com\n",
+        )
+        .unwrap();
+        assert!(verify_applied_fields(
+            DeliveryChannel::GeminiCli,
+            &["GEMINI_API_KEY".to_string()],
+            &inline_export_path
+        )
+        .is_err());
+        // 缺失字段的错误同样带通道名、字段名、目标路径。
+        let err = verify_applied_fields(
+            DeliveryChannel::GeminiCli,
+            &["GEMINI_API_KEY".to_string(), "GEMINI_MODEL".to_string()],
+            &env_path,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("gemini-cli"), "{text}");
+        assert!(text.contains("GEMINI_MODEL"), "{text}");
+        assert!(text.contains("c.env"), "{text}");
     }
 }
