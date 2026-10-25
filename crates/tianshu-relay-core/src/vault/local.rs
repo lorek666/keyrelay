@@ -40,6 +40,35 @@ pub struct LocalVault {
     device_bound: bool,
 }
 
+/// DEBUG-G7 P2-K5：Unix 上把 vault.db（及 WAL 附属文件，若存在）权限只收紧
+/// 不放宽（`mode & 0o600`）。best-effort：任一 chmod 失败都不阻断打开。
+#[cfg(unix)]
+fn tighten_vault_files(db_path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut candidates = vec![db_path.to_path_buf()];
+    if let Some(name) = db_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+    {
+        candidates.push(db_path.with_file_name(format!("{name}-wal")));
+        candidates.push(db_path.with_file_name(format!("{name}-shm")));
+    }
+    for candidate in candidates {
+        if let Ok(meta) = std::fs::metadata(&candidate) {
+            let cur = meta.permissions().mode() & 0o777;
+            let tight = cur & 0o600;
+            if tight != cur {
+                let _ =
+                    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(tight));
+            }
+        }
+    }
+}
+
+/// 非 Unix 平台无 POSIX 权限位：空实现，继承目录 ACL（与 store/mod.rs 同模式）。
+#[cfg(not(unix))]
+fn tighten_vault_files(_db_path: &Path) {}
+
 impl LocalVault {
     /// 生产入口：`~/.tianshu-relay/vault.db` + `~/.tianshu-relay/vault.key`。
     pub fn open(db_path: &Path, key_path: &Path) -> Result<Self> {
@@ -89,30 +118,9 @@ impl LocalVault {
         // DEBUG-G7 P2-K5：与 Store::open 同口径——Unix 上把 vault.db 权限只收紧
         // 不放宽（`mode & 0o600`，含 -wal / -shm 若存在）；best-effort。
         // 注意：vault.db 本身是密文，收紧是纵深防御，不是唯一防线。
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut candidates = vec![db_path.to_path_buf()];
-            if let Some(name) = db_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-            {
-                candidates.push(db_path.with_file_name(format!("{name}-wal")));
-                candidates.push(db_path.with_file_name(format!("{name}-shm")));
-            }
-            for candidate in candidates {
-                if let Ok(meta) = std::fs::metadata(&candidate) {
-                    let cur = meta.permissions().mode() & 0o777;
-                    let tight = cur & 0o600;
-                    if tight != cur {
-                        let _ = std::fs::set_permissions(
-                            &candidate,
-                            std::fs::Permissions::from_mode(tight),
-                        );
-                    }
-                }
-            }
-        }
+        // 非 Unix 分支是空实现（无 POSIX 权限位，继承目录 ACL），与 store/mod.rs
+        // 的 tighten_db_files 同模式，让 platform_parity 的成对守护能看见。
+        tighten_vault_files(db_path);
         conn.busy_timeout(BUSY_TIMEOUT)
             .map_err(|e| Error::Vault(format!("设置忙等超时失败: {e}")))?;
         // WAL 与主库同口径；内存库/只读介质上失败不该阻止使用，退化为默认日志模式即可。
