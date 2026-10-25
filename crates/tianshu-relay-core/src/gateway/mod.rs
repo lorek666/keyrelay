@@ -2502,8 +2502,25 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
             order.push(c.upstream);
         }
     }
+    // DELIVERY-P2-10：命中路由规则时，备用顺序按规则 `siteIds` 数组顺序重排。
+    // 只动首选之后的尾巴：首选仍是加权轮转 / EWMA / 探针定出的那一个（探针优先
+    // 的恢复语义不动）；未命中规则（`allowed` 为 `None`）时不重排，行为与今天相同。
+    // 这里不增删候选——规则过滤已把候选集限定在规则内，优先级只改尝试顺序，
+    // 不把用户没配过的站点拉进来；未列出的站点排在已列出之后、保持原顺序
+    // （见 `reorder_failover_tail`）。把优先级提升为主用选择（首选也按规则顺序）
+    // 是拆分项，不在本步悄悄做（会改 M46-S7 的轮转语义，见 spec 的拆分清单）。
+    if let Some(priority) = allowed {
+        if order.len() > 1 {
+            let rest = order.split_off(1);
+            order.extend(crate::routing::reorder_failover_tail(rest, priority));
+        }
+    }
 
     let mut last_error: Option<String> = None;
+    // DELIVERY-P2-10：本次请求实际发出去的尝试序列（站点 id + 结果标签），
+    // 只用于全失败尾巴的透明度。本地保护跳过的候选没发出去，不列入；
+    // 只含站点 id，不含 key_ref / 密钥 / 响应正文。
+    let mut attempted: Vec<(i64, String)> = Vec::new();
     // M46-S4：重试预算。cap = 0 ⇒ 走全部候选（今天行为）；>0 则每请求最多
     // 尝试 cap 个候选。attempts_made 只计实际发出去的上游尝试（见循环内递增点）：
     // 本地保护拒绝的候选不计（它没产生可返回的真实错误），探针被实际发出去时
@@ -2616,6 +2633,8 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
             Ok(response) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let status = response.status().as_u16();
+                // DELIVERY-P2-10：一次真实发送即记一次尝试（含随后被重放的 429）。
+                attempted.push((upstream.site_id, format!("HTTP {status}")));
                 observe(
                     &state,
                     upstream.site_id,
@@ -2701,6 +2720,16 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                     .record_attempt(upstream.site_id, 502, latency_ms);
                 let replayable = failure.is_replayable();
                 let message = failure.message().to_string();
+                // DELIVERY-P2-10：传输层尝试同样记入序列（只记结果类别，不记原文，
+                // 原文仍只走既有的 last_error / 失败事件）。
+                attempted.push((
+                    upstream.site_id,
+                    if replayable {
+                        "连接失败".to_string()
+                    } else {
+                        "传输层失败".to_string()
+                    },
+                ));
                 // 传输层失败没有 HTTP 状态码：按 502 记（与 legacy 路径的错误码一致）。
                 // 文案必须说清**为什么**这次能/不能重放——这是计费决策的现场记录（P2-13）。
                 let reason = if replayable {
@@ -2806,11 +2835,27 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         report_failure_without_breaker(&state, upstream.site_id, status, &event_model, reason);
     }
 
+    // DELIVERY-P2-10：全失败时把实际尝试过的档位列出来（只含站点 id 与结果标签）。
+    // attempted 为空时文案与改动前逐字相同（例如候选全被本地保护跳过时走的是
+    // 上面的 local_rate_limited 尾巴，到不了这里；order 为空时同样无后缀）。
+    let attempted_text = if attempted.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = attempted
+            .iter()
+            .map(|(site_id, outcome)| format!("{site_id}（{outcome}）"))
+            .collect();
+        format!("；已尝试站点：{}", list.join("、"))
+    };
+    let message = match last_error {
+        Some(reason) => format!("{reason}{attempted_text}"),
+        None => format!("所有候选上游都失败了{attempted_text}"),
+    };
     local_error(
         StatusCode::BAD_GATEWAY,
         GatewayErrorKind::Api,
         "all_upstreams_failed",
-        last_error.unwrap_or_else(|| "所有候选上游都失败了".to_string()),
+        message,
     )
 }
 

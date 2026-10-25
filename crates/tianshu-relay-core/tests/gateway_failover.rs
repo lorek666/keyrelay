@@ -18,16 +18,19 @@ use std::thread;
 use std::time::Duration;
 
 use tianshu_relay_core::gateway::{
-    generate_token, start, GatewayConfig, GatewayFailure, GatewayHandle, UpstreamTimeout,
+    generate_token, sha256_hex, start, GatewayConfig, GatewayFailure, GatewayHandle,
+    GatewayTokenEntry, UpstreamTimeout,
 };
-use tianshu_relay_core::routing::{BreakerPolicy, RouteTable, Upstream};
+use tianshu_relay_core::routing::{BreakerPolicy, RouteTable, RoutingRule, Upstream};
 use zeroize::Zeroizing;
 
 const MODEL: &str = "gpt-5.6";
 const KEY_A: &str = "sk-upstream-A-0123456789abcdef";
 const KEY_B: &str = "sk-upstream-B-0123456789abcdef";
+const KEY_C: &str = "sk-upstream-C-0123456789abcdef";
 const REF_A: &str = "kr/key/1/secret";
 const REF_B: &str = "kr/key/2/secret";
+const REF_C: &str = "kr/key/3/secret";
 
 // ============================================================ 脚手架
 
@@ -1669,4 +1672,348 @@ async fn non_success_body_holds_the_site_lease_until_read() {
     assert!(body3.contains("site1"), "{body3}");
 
     handle.shutdown_and_wait().await;
+}
+
+// ============================================================ DELIVERY-P2-10：优先级备用顺序
+//
+// 语义（见 spec）：命中路由规则时，备用尝试顺序按规则 `siteIds` 数组顺序；
+// 首选仍由加权轮转定出（本文件用 lb_top_n=1 + 倍率拉开派生顺序，使首选确定为 1 号站）。
+// 触发切换的仍是既有可重放类（429 / 连接层失败）；401 / 5xx / 读超时不切换，
+// 优先级不得推翻这些口径——下面每条否定用例都钉住一条。
+//
+// 假上游与既有用例同款（本地 TcpListener，不联网、不用真实密钥与真实站点）。
+
+const PRIORITY_TOKEN: &str = "kr-gw-p10-labeled-token-0123456789abcdef";
+
+fn seed_priority_token(handle: &GatewayHandle) {
+    handle.set_tokens(vec![GatewayTokenEntry {
+        id: 1,
+        token_hash: sha256_hex(PRIORITY_TOKEN),
+        label: "codex".to_string(),
+        grace_until: None,
+    }]);
+}
+
+/// P2-10 专用构造点：既有 `start_routed_full` 的 `routing_rules` 恒为空、`lb_top_n` 恒为 1、
+/// `max_attempts` 恒为 0，改它会牵动全文件调用点；这里单独立一份，只给本节用例用。
+/// 派生顺序由倍率拉开：1 号站 0.1、2 号站 0.5、3 号站 1.0 ⇒ 派生顺序恒为 [1, 2, 3]，
+/// lb_top_n=1 ⇒ 首选恒为 1 号站；规则顺序 [3, 2, 1] 与派生顺序完全相反，
+/// 于是「备用先打谁」一眼可辨。
+async fn start_priority_routed(
+    ups: Vec<Upstream>,
+    rules: Vec<RoutingRule>,
+    max_attempts: usize,
+    timeout: UpstreamTimeout,
+    breaker: BreakerPolicy,
+) -> GatewayHandle {
+    let mut map = std::collections::HashMap::new();
+    map.insert(REF_A.to_string(), Zeroizing::new(KEY_A.to_string()));
+    map.insert(REF_B.to_string(), Zeroizing::new(KEY_B.to_string()));
+    map.insert(REF_C.to_string(), Zeroizing::new(KEY_C.to_string()));
+    start(GatewayConfig {
+        port: 0,
+        token: generate_token(),
+        key_id: None,
+        site_id: 0,
+        base_url: String::new(),
+        api_key: Zeroizing::new(String::new()),
+        site_display_name: "优先级备用".to_string(),
+        route: RouteTable::new(ups),
+        breaker,
+        keys_by_ref: map,
+        upstream_timeout: timeout,
+        revoked_refs: None,
+        on_observation: None,
+        on_usage: None,
+        budget_check: None,
+        on_budget_breach: None,
+        routing_rules: rules,
+        upstream_proxy: None,
+        legacy_key_ref: None,
+        max_request_bytes: tianshu_relay_core::gateway::DEFAULT_MAX_REQUEST_BYTES,
+        lb_top_n: 1,
+        max_attempts,
+        guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
+        runtime: None,
+        on_failure: None,
+    })
+    .await
+    .expect("网关应能启动")
+}
+
+fn priority_rule() -> Vec<RoutingRule> {
+    vec![RoutingRule {
+        agent_label: "codex".to_string(),
+        site_ids: vec![3, 2, 1],
+    }]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn priority_rule_orders_backup_attempts_after_a_429() {
+    // 派生备用顺序是 [2, 3]，规则备用顺序是 [3, 2]：1 号站 429 之后必须先打 3 号站。
+    let a = spawn_upstream_always(1, REF_A, "429 Too Many Requests");
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let c = spawn_upstream_always(3, REF_C, "200 OK");
+    let handle = start_priority_routed(
+        vec![a.upstream(0.1), b.upstream(0.5), c.upstream(1.0)],
+        priority_rule(),
+        0,
+        UpstreamTimeout::default(),
+        long_cooldown(),
+    )
+    .await;
+    seed_priority_token(&handle);
+
+    let (status, body) = post(&handle, PRIORITY_TOKEN, &chat_body()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(status, 200, "备用应当接住: {body}");
+    assert!(
+        body.contains("site3"),
+        "备用首选应是规则第一位的 3 号站: {body}"
+    );
+    assert_eq!(a.request_count(), 1, "首选 1 号站应被试过一次");
+    assert_eq!(c.request_count(), 1, "规则备用第一位 3 号站应被试过一次");
+    assert_eq!(b.request_count(), 0, "派生顺序的下一位 2 号站不该被抢先");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn priority_chain_continues_in_priority_order() {
+    // 1 号站 429 → 3 号站 429 → 2 号站 200：整条链都按规则顺序走。
+    let a = spawn_upstream_always(1, REF_A, "429 Too Many Requests");
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let c = spawn_upstream_always(3, REF_C, "429 Too Many Requests");
+    let handle = start_priority_routed(
+        vec![a.upstream(0.1), b.upstream(0.5), c.upstream(1.0)],
+        priority_rule(),
+        0,
+        UpstreamTimeout::default(),
+        long_cooldown(),
+    )
+    .await;
+    seed_priority_token(&handle);
+
+    let (status, body) = post(&handle, PRIORITY_TOKEN, &chat_body()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(status, 200, "链尾应当接住: {body}");
+    assert!(body.contains("site2"), "链尾应是 2 号站: {body}");
+    assert_eq!(a.request_count(), 1);
+    assert_eq!(c.request_count(), 1);
+    assert_eq!(b.request_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn priority_does_not_apply_without_a_matching_rule() {
+    // 对照：不播种带 label 的令牌 ⇒ legacy 路径恒不命中规则，备用顺序仍是派生顺序 [2, 3]。
+    let a = spawn_upstream_always(1, REF_A, "429 Too Many Requests");
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let c = spawn_upstream_always(3, REF_C, "200 OK");
+    let handle = start_priority_routed(
+        vec![a.upstream(0.1), b.upstream(0.5), c.upstream(1.0)],
+        priority_rule(),
+        0,
+        UpstreamTimeout::default(),
+        long_cooldown(),
+    )
+    .await;
+    let legacy = handle.token.clone();
+
+    let (status, body) = post(&handle, &legacy, &chat_body()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(status, 200, "备用应当接住: {body}");
+    assert!(
+        body.contains("site2"),
+        "未命中规则时备用应是派生下一位 2 号站: {body}"
+    );
+    assert_eq!(a.request_count(), 1);
+    assert_eq!(b.request_count(), 1);
+    assert_eq!(c.request_count(), 0, "规则顺序在未命中时不得生效");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn priority_never_overrides_a_401() {
+    // 401 是凭证问题：优先级再高也不得拿别的站点的密钥去试（既有红线，本项不碰）。
+    let a = spawn_upstream_always(1, REF_A, "401 Unauthorized");
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let c = spawn_upstream_always(3, REF_C, "200 OK");
+    let handle = start_priority_routed(
+        vec![a.upstream(0.1), b.upstream(0.5), c.upstream(1.0)],
+        priority_rule(),
+        0,
+        UpstreamTimeout::default(),
+        long_cooldown(),
+    )
+    .await;
+    seed_priority_token(&handle);
+
+    let (status, _) = post(&handle, PRIORITY_TOKEN, &chat_body()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(status, 401, "401 必须原样返回");
+    assert_eq!(a.request_count(), 1);
+    assert_eq!(
+        c.request_count(),
+        0,
+        "401 时规则第一位 3 号站一次都不该被请求"
+    );
+    assert_eq!(b.request_count(), 0, "401 时 2 号站也不该被请求");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn priority_stops_at_max_attempts() {
+    // 预算：max_attempts=2 ⇒ 链 1→3→2 只走到 3，2 号站不被试，返回第二条 429。
+    let a = spawn_upstream_always(1, REF_A, "429 Too Many Requests");
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let c = spawn_upstream_always(3, REF_C, "429 Too Many Requests");
+    let handle = start_priority_routed(
+        vec![a.upstream(0.1), b.upstream(0.5), c.upstream(1.0)],
+        priority_rule(),
+        2,
+        UpstreamTimeout::default(),
+        long_cooldown(),
+    )
+    .await;
+    seed_priority_token(&handle);
+
+    let (status, body) = post(&handle, PRIORITY_TOKEN, &chat_body()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(status, 429, "预算耗尽时应返回最后一条真实 429: {body}");
+    assert_eq!(a.request_count(), 1);
+    assert_eq!(c.request_count(), 1);
+    assert_eq!(b.request_count(), 0, "预算耗尽后不得再试下一个备用");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_failed_error_lists_attempted_sites() {
+    // 全部连接失败 ⇒ 502 尾巴必须列出实际尝试过的站点，且不带任何密钥材料。
+    let handle = start_priority_routed(
+        vec![dead_upstream(1, REF_A, 0.1), dead_upstream(2, REF_B, 1.0)],
+        priority_rule(),
+        0,
+        UpstreamTimeout::default(),
+        long_cooldown(),
+    )
+    .await;
+    seed_priority_token(&handle);
+
+    let (status, body) = post(&handle, PRIORITY_TOKEN, &chat_body()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(status, 502, "两个候选都连不上 ⇒ 502: {body}");
+    assert!(
+        body.contains("已尝试站点：1（连接失败）、2（连接失败）"),
+        "全失败错误必须按实际尝试顺序列出档位: {body}"
+    );
+    assert!(!body.contains(KEY_A) && !body.contains(KEY_B), "{body}");
+    assert!(
+        !body.contains("kr/key"),
+        "错误里不得出现密钥引用原文: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_500_is_not_replayed_even_with_a_priority_rule() {
+    // P2-13 红线（本项不推翻）：5xx 单请求内不重放——规则再优先也不得让 503 去试备用。
+    // 5xx 的可用性由熔断承接（见下一条跨请求用例），不在本请求内发生。
+    let a = spawn_upstream_always(1, REF_A, "503 Service Unavailable");
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let c = spawn_upstream_always(3, REF_C, "200 OK");
+    let handle = start_priority_routed(
+        vec![a.upstream(0.1), b.upstream(0.5), c.upstream(1.0)],
+        priority_rule(),
+        0,
+        UpstreamTimeout::default(),
+        long_cooldown(),
+    )
+    .await;
+    seed_priority_token(&handle);
+
+    let (status, body) = post(&handle, PRIORITY_TOKEN, &chat_body()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(status, 503, "503 必须原样返回: {body}");
+    assert!(
+        body.contains("site1"),
+        "返回的应是首选 1 号站的响应: {body}"
+    );
+    assert_eq!(a.request_count(), 1);
+    assert_eq!(
+        c.request_count(),
+        0,
+        "503 时规则第一位 3 号站一次都不该被请求"
+    );
+    assert_eq!(b.request_count(), 0, "503 时 2 号站也不该被请求");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn breaker_skips_the_failed_primary_on_the_next_request() {
+    // 5xx 的跨请求承接：阈值 1 ⇒ 第一次 503 即熔断 1 号站；第二次请求跳过它，
+    // 由剩余候选承接。这里如实钉住一个边界：第二次的首选仍是派生顺序的 2 号站，
+    // 而不是规则第一位的 3 号站——本项的优先级只排备用顺序，不改首选；
+    // 把优先级提升为主用选择是拆分项（见 spec），不得由本用例假装已实现。
+    let a = spawn_upstream_always(1, REF_A, "503 Service Unavailable");
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let c = spawn_upstream_always(3, REF_C, "200 OK");
+    let handle = start_priority_routed(
+        vec![a.upstream(0.1), b.upstream(0.5), c.upstream(1.0)],
+        priority_rule(),
+        0,
+        UpstreamTimeout::default(),
+        BreakerPolicy {
+            threshold: 1,
+            cooldown: Duration::from_secs(3600),
+        },
+    )
+    .await;
+    seed_priority_token(&handle);
+
+    let (first, _) = post(&handle, PRIORITY_TOKEN, &chat_body()).await;
+    assert_eq!(first, 503, "第一次应如实返回 503");
+    let (second, body) = post(&handle, PRIORITY_TOKEN, &chat_body()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(second, 200, "第二次应由备用承接: {body}");
+    assert!(
+        body.contains("site2"),
+        "第二次首选仍是派生顺序的 2 号站: {body}"
+    );
+    assert_eq!(a.request_count(), 1, "熔断后不该再打 1 号站");
+    assert_eq!(b.request_count(), 1);
+    assert_eq!(c.request_count(), 0, "第二次首选成功，3 号站无需被试");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_timeout_is_not_replayed_even_with_a_priority_rule() {
+    // 读超时（已送达、可能已计费）同样不切换：停滞的 1 号站超时后直接 502，
+    // 规则第一位的 3 号站一次都不该被请求。超时分两类：连接阶段超时属可重放类
+    // （与连接拒绝同类，见 classify），读超时属不可重放类——本用例钉住后者。
+    let stalled = spawn_stalled_upstream(1, REF_A);
+    let b = spawn_upstream_always(2, REF_B, "200 OK");
+    let c = spawn_upstream_always(3, REF_C, "200 OK");
+    let handle = start_priority_routed(
+        vec![stalled.upstream(0.1), b.upstream(0.5), c.upstream(1.0)],
+        priority_rule(),
+        0,
+        UpstreamTimeout {
+            connect: Duration::from_millis(500),
+            read: Duration::from_millis(200),
+        },
+        long_cooldown(),
+    )
+    .await;
+    seed_priority_token(&handle);
+
+    let (status, _) = post(&handle, PRIORITY_TOKEN, &chat_body()).await;
+    handle.shutdown_and_wait().await;
+
+    assert_eq!(status, 502, "读超时按 502 如实返回");
+    assert_eq!(
+        c.request_count(),
+        0,
+        "读超时时规则第一位 3 号站一次都不该被请求"
+    );
+    assert_eq!(b.request_count(), 0, "读超时时 2 号站也不该被请求");
 }
