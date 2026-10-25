@@ -255,7 +255,9 @@ if (missing.length) {
 
 const srcFiles = walk(join(root, "src"));
 const offenders = srcFiles
-  .filter((file) => relative(root, file) !== "src/lib/api.ts")
+  // Windows 下 relative() 给出反斜杠路径（src\lib\api.ts），与正斜杠的白名单
+  // 字面不等，api.ts 自身会被误判为违规——比较前统一归一化分隔符。
+  .filter((file) => relative(root, file).replaceAll("\\", "/") !== "src/lib/api.ts")
   // 先去掉注释再查（M16-S6b）：裸子串检查会把「注释里提到 @tauri-apps/api」也算成违规，
   // 而注释不会 import 任何东西——那是一条**假红**，会训练大家不敢在文档里写包名。
   // 去注释只会减少假红，不会放过真实违规（真 import 在代码里，不在注释里）。
