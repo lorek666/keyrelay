@@ -385,7 +385,7 @@ fn opencode_qualified_field(provider_id: &str, field: &str) -> String {
 ///   `[P] contextWindow`、`[P] maxTokens`。
 /// - dsh：恒定只有 `KEYRELAY_API_KEY`——**无端点字段**：`DshWriter` 收了 `base_url` 却不写
 ///   （DSH 的 endpoint 在用户自配的 profile 文件里），`has_endpoint` / `has_model` /
-///   `has_meta` 对它一律无效；DSH 引用校验是 P0-3 的范围，本项不碰。
+///   `has_meta` 对它一律无效；DSH 引用校验见 `dsh.rs` 的 P0-3 节（本项已实现）。
 pub fn expected_fields(channel: DeliveryChannel, opts: &FieldSetOptions<'_>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |key: String| out.push(key);
@@ -964,6 +964,21 @@ pub struct DeliveryPlan {
     /// 已脱敏的 diff 预览
     pub preview: String,
     pub consent: ConsentState,
+    // ==================================================== P0-3：DSH 凭据引用校验
+    //
+    // 仅 DSH 通道为 `Some`，其余通道一律为 `None`——DSH 是唯一“凭据文件
+    // 与 provider 配置分离”的通道（凭据在 `.credentials.yaml`，引用在
+    // profile patch 文件里，见 `dsh.rs` 的 P0-3 节）。
+    //
+    // 预览与落盘的 enforcement 分层（有意如此，不是漏网）：
+    // - 预览（plan）**不因未引用而直接报错**：预览的职责是把“未引用及
+    //   去向”展示给用户看——plan 一报错，预览结构体本身就不存在了，
+    //   “展示结果”无从谈起；
+    // - 落盘（apply）在 P0-1 字段校验之后、写盘之前硬拒绝（见服务层
+    //   `apply_delivery_in`），未引用时一个字节都不写。
+    // 两处调的是同一个 `dsh::check_credential_reference`，不是两条旁路。
+    /// DSH 通道的凭据引用校验结果；非 DSH 通道为 `None`。
+    pub dsh_credential_reference: Option<dsh::DshReferenceCheck>,
 }
 
 impl std::fmt::Debug for DeliveryPlan {
@@ -977,6 +992,7 @@ impl std::fmt::Debug for DeliveryPlan {
             .field("fields", &self.fields)
             .field("preview_len", &self.preview.len())
             .field("consent", &self.consent)
+            .field("dsh_credential_reference", &self.dsh_credential_reference)
             .finish()
     }
 }

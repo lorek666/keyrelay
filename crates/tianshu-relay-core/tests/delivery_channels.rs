@@ -309,6 +309,20 @@ fn all_channels_leave_no_plaintext_outside_their_target() {
     let f = setup();
     for channel in DeliveryChannel::ALL {
         f.service.grant_consent(f.key_id, channel).unwrap();
+        // P0-3：DSH 投递要求至少一个 profile 引用 KEYRELAY_API_KEY，
+        // 否则 apply 会在落盘前拒绝；本用例测的是“明文不外泄”而非引用
+        // 校验本身，因此先给 DSH 备一个已引用的 profile，让该通道能走完
+        // apply（引用校验自身的正反用例在 delivery_dsh_reference.rs）。
+        if channel == DeliveryChannel::DeepSeekHarness {
+            let profile = f
+                .home
+                .join(".dsh")
+                .join("profiles")
+                .join("desktop")
+                .join("cordis.patch.yml");
+            fs::create_dir_all(profile.parent().unwrap()).expect("建 profile 目录");
+            fs::write(&profile, "apiKeyEnv: KEYRELAY_API_KEY\n").expect("写 profile");
+        }
         let plan = f
             .service
             .delivery_plan_with_model(f.key_id, channel, model_for(channel))

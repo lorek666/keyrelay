@@ -280,6 +280,13 @@ pub struct DeliveryPlanDto {
     /// 入口是 auth 时单里没有 auth，只能取 config）；**新界面必须读 `files`
     /// 才算看到整单**，只看顶层会漏掉另一半文件。
     files: Vec<DeliveryFilePlanDto>,
+    /// P0-3：DSH 通道的凭据引用校验结果；仅 DSH 为 `Some`，其余通道为 `None`。
+    ///
+    /// 语义与核心层 `DeliveryPlan.dsh_credential_reference` 一字不差：
+    /// 非 DSH 通道序列化为 `null`，不得在映射层把 `None` 写成空对象。
+    /// 仅类型层接线：Agents 页渲染是后续项（BACKLOG B-280），在此之前
+    /// 不得宣称预览已展示该结果。
+    dsh_credential_reference: Option<tianshu_relay_core::delivery::dsh::DshReferenceCheck>,
 }
 
 /// 一单里某一个文件的预览（P0-2）。字段含义与顶层同名项一致，
@@ -916,6 +923,9 @@ fn single_plan_dto(plan: tianshu_relay_core::delivery::DeliveryPlan) -> Delivery
         endpoint_in_channel: tianshu_relay_core::delivery::channel_carries_endpoint(channel),
         preserve_auth: false,
         files: vec![file],
+        // P0-3：原样透传核心层结果——DSH 为 Some、其余通道为 None，
+        // 不在这里把 None 换成空对象，也不在这里把 Some 丢掉。
+        dsh_credential_reference: plan.dsh_credential_reference,
     }
 }
 
@@ -5327,6 +5337,11 @@ mod tests {
             endpoint_in_channel: tianshu_relay_core::delivery::channel_carries_endpoint(
                 tianshu_relay_core::delivery::DeliveryChannel::CodexAuthJson,
             ),
+            // P0-3：Codex 不是 DSH，引用校验恒为 None ⇒ 线上为 null，不得是空对象。
+            dsh_credential_reference: None,
+            // P0-2：本用例为单文件投递，非保留模式 ⇒ false + 空文件表。
+            preserve_auth: false,
+            files: vec![],
         };
         let value = to_value(&plan);
         assert_eq!(value["agentId"], "codex");
@@ -5344,6 +5359,11 @@ mod tests {
         assert_eq!(
             value["endpointInChannel"], false,
             "codex-auth-json 的 auth.json 里没有 endpoint"
+        );
+        assert_eq!(
+            value["dshCredentialReference"],
+            Value::Null,
+            "非 DSH 通道的引用校验必须为 null，不得是空对象"
         );
         assert!(value.get("target_path").is_none(), "不得出现 snake_case");
 
@@ -5363,6 +5383,9 @@ mod tests {
             target_path: "/home/u/.codex/auth.json".into(),
             journal_id: "j1-0".into(),
             backup_path: Some("/home/u/.tianshu-relay/backups/j1-0/0-auth.json".into()),
+            // P0-2：本用例为单文件投递，非保留模式 ⇒ false + 空文件表。
+            preserve_auth: false,
+            files: vec![],
         };
         let value = to_value(&outcome);
         assert_eq!(value["journalId"], "j1-0");

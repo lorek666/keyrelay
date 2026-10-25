@@ -2232,6 +2232,14 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let mut secrets: Vec<String> = vec![api_key.to_string()];
         secrets.extend(self.previous_secrets_for_target(&target_path, key_id));
         let secret_refs: Vec<&str> = secrets.iter().map(|s| s.as_str()).collect();
+        // P0-3：DSH 通道的引用校验结果随预览一起展示（已引用 / 未引用及
+        // 去向），而不是只在 apply 时才报错。预览本身不因未引用而失败——
+        // 硬拒绝在 apply 落盘前（见 `apply_delivery_in`）；非 DSH 通道为 None。
+        let dsh_credential_reference = if channel == DeliveryChannel::DeepSeekHarness {
+            Some(delivery::dsh::check_credential_reference(&self.home))
+        } else {
+            None
+        };
         Ok(DeliveryPlan {
             agent_id: channel.agent_id().to_string(),
             channel,
@@ -2241,6 +2249,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             preview: delivery::diff_preview(&patch.before, &patch.after, &secret_refs),
             consent,
             target_path,
+            dsh_credential_reference,
         })
     }
 
@@ -2393,6 +2402,25 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let field_options = self.delivery_field_options(key_id, model, &source)?;
         let expected = delivery::expected_fields(channel, &field_options);
         delivery::validate_plan_fields(channel, &writer.fields(&api_key), &field_options, &target)?;
+
+        // P0-3：DSH 凭据引用校验——与 P0-1 同链路（plan/apply 共用
+        // `dsh::check_credential_reference`，只读 profile 文件，绝不改写
+        // 它们）。未引用（含无任何 profile 文件）时整单拒绝，落盘前返回，
+        // 因此 ⑤ 的写盘、记账、回读都不会发生；凭据文件一个字节都不动。
+        // 注意：这里在锁内、写盘前重新校验，不复用 plan 时的结果——plan
+        // 与 apply 之间用户可能改过 profile，复用旧结果会放行一次半注入。
+        if channel == DeliveryChannel::DeepSeekHarness {
+            let check = delivery::dsh::check_credential_reference(&self.home);
+            if !check.is_referenced() {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "delivery",
+                    "投递被拒绝：DSH 凭据未被任何 profile 引用",
+                    serde_json::json!({ "channel": channel.as_str() }),
+                ));
+                return Err(delivery::dsh::unreferenced_error(&check, &target));
+            }
+        }
 
         // ⑤ 写入（加锁已在上面完成；预检 → 备份 → 原子写 → 回读校验 → 失败补偿在 apply 内部）
         let journal = match inject::apply_holding_lock(
