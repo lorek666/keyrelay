@@ -59,8 +59,18 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 # tauri build 会自动跑 beforeBuildCommand（pnpm build）
 pnpm tauri build --target universal-apple-darwin
 
-# 定位产物
-APP_DIR="src-tauri/target/universal-apple-darwin/release/bundle/macos"
+# 定位产物：src-tauri 是 workspace 成员时 cargo 把产物放在工作区根 target/ 下，
+# 只有独立 crate 时才在 src-tauri/target/ 下；先查工作区根，再回落到旧路径。
+APP_DIR=""
+for candidate in "target/universal-apple-darwin/release/bundle/macos" "src-tauri/target/universal-apple-darwin/release/bundle/macos"; do
+  if [ -d "$candidate" ]; then
+    APP_DIR="$candidate"
+    break
+  fi
+done
+if [ -z "$APP_DIR" ]; then
+  APP_DIR="target/universal-apple-darwin/release/bundle/macos"
+fi
 APP=$(find "$APP_DIR" -maxdepth 1 -name "*.app" 2>/dev/null | head -n1 || true)
 if [ -z "$APP" ]; then
   echo "找不到 universal .app 产物（在 $APP_DIR 下）" >&2
