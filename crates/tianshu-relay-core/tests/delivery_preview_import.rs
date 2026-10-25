@@ -80,7 +80,7 @@ async fn setup() -> Fixture {
     }
 }
 
-fn write(home: &Path, rel: &str, content: &str) -> PathBuf {
+fn write(home: &Path, rel: impl AsRef<Path>, content: &str) -> PathBuf {
     let path = home.join(rel);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, content).unwrap();
@@ -286,9 +286,12 @@ async fn preview_after_delivery_writes_nothing_and_imports_nothing() {
 #[tokio::test]
 async fn cline_import_reads_only_the_keyrelay_entry() {
     let f = setup().await;
+    // 夹具必须写到通道实际解析的落点（cline::relative_config_path() 随平台变化：
+    // Linux 是 .config/Code/...，macOS 是 Library/Application Support/Code/...），
+    // 写死 Linux 路径在 macOS runner 上会读到空文件、import 返回 []。
     write(
         &f.home,
-        ".config/Code/User/globalStorage/saoudrizwan.claude-dev/settings.json",
+        DeliveryChannel::Cline.relative_target(),
         r#"{"providers": [
           {"id": "other", "apiKey": "sk-other-2222", "baseUrl": "https://other.example.com"},
           {"id": "keyrelay", "apiKey": "sk-mine-3333", "baseUrl": "https://old.example.com"}
@@ -341,7 +344,10 @@ async fn gemini_env_import_reads_export_prefixed_lines() {
 #[tokio::test]
 async fn variant_paths_are_reachable_and_out_of_allowlist_is_rejected() {
     let f = setup().await;
-    // Cline 三变体各归其位（Linux 布局）。
+    // Cline 三变体各归其位。平台前缀随 OS 变化（Linux .config、macOS
+    // Library/Application Support、Windows AppData/Roaming），断言只钉
+    // 「变体目录名 + 固定尾巴」这一平台无关部分；完整前缀由
+    // relative_target() / allowed_targets() 覆盖。
     let code = f
         .service
         .delivery_preview_in(
@@ -355,7 +361,7 @@ async fn variant_paths_are_reachable_and_out_of_allowlist_is_rejected() {
     assert_eq!(code.target_variant, "code");
     assert!(code
         .target_path
-        .ends_with(".config/Code/User/globalStorage/saoudrizwan.claude-dev/settings.json"));
+        .ends_with("Code/User/globalStorage/saoudrizwan.claude-dev/settings.json"));
     let insiders = f
         .service
         .delivery_preview_in(
@@ -367,9 +373,9 @@ async fn variant_paths_are_reachable_and_out_of_allowlist_is_rejected() {
         )
         .unwrap();
     assert_eq!(insiders.target_variant, "code-insiders");
-    assert!(insiders.target_path.ends_with(
-        ".config/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings.json"
-    ));
+    assert!(insiders
+        .target_path
+        .ends_with("Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings.json"));
     let cursor = f
         .service
         .delivery_preview_in(
@@ -383,7 +389,7 @@ async fn variant_paths_are_reachable_and_out_of_allowlist_is_rejected() {
     assert_eq!(cursor.target_variant, "cursor");
     assert!(cursor
         .target_path
-        .ends_with(".config/Cursor/User/globalStorage/saoudrizwan.claude-dev/settings.json"));
+        .ends_with("Cursor/User/globalStorage/saoudrizwan.claude-dev/settings.json"));
 
     // 越界一律拒绝：未知名、路径形态、给非变体通道传变体名。
     for (channel, variant) in [

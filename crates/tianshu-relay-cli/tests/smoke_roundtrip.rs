@@ -124,7 +124,25 @@ fn rollback(t: &Tmp, channel: DeliveryChannel, journal: &str) {
 #[test]
 fn smoke_roundtrip_target_absent_then_rollback_removes() {
     for channel in DeliveryChannel::ALL {
+        // B-292：ClineDesktop 已下线（文件直写已拒，走 cline auth CLI），
+        // smoke 投递不再适用；下线通道的拒绝行为由 core 的下线断言钉住。
+        // （与 delivery/mod.rs 里 every_deliverable_channel_resolves 同款处理。）
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         let t = tmp();
+        // P0-3 DSH 引用校验：dsh 投递要求至少一个 profile patch 文件引用
+        // KEYRELAY_API_KEY，否则 fail-closed 拒绝；与 list_and_mock 同款，
+        // 按 spec 例预建一个引用了该凭据的 profile。
+        if channel == DeliveryChannel::DeepSeekHarness {
+            let profile = t.home.join(".dsh").join("profiles").join("desktop");
+            fs::create_dir_all(&profile).unwrap();
+            fs::write(
+                profile.join("cordis.patch.yml"),
+                "provider:\n  apiKeyEnv: KEYRELAY_API_KEY\n",
+            )
+            .unwrap();
+        }
         let target = t.home.join(channel.relative_target());
 
         // 形态一：目标不存在 ⇒ apply 创建 → mock ok → rollback 删除
@@ -146,7 +164,21 @@ fn smoke_roundtrip_target_present_then_rollback_byte_identical() {
     let original = b"{\n  \"user_comment\": \"keep my own bytes\"\n}\n".to_vec();
 
     for channel in DeliveryChannel::ALL {
+        // B-292：同上，ClineDesktop 已下线，跳过 smoke 投递。
+        if channel == DeliveryChannel::ClineDesktop {
+            continue;
+        }
         let t = tmp();
+        // P0-3 DSH 引用校验：同上，预建引用 profile 夹具。
+        if channel == DeliveryChannel::DeepSeekHarness {
+            let profile = t.home.join(".dsh").join("profiles").join("desktop");
+            fs::create_dir_all(&profile).unwrap();
+            fs::write(
+                profile.join("cordis.patch.yml"),
+                "provider:\n  apiKeyEnv: KEYRELAY_API_KEY\n",
+            )
+            .unwrap();
+        }
         let target = t.home.join(channel.relative_target());
         // 预置原内容（ASCII，字节比对基准）
         fs::create_dir_all(target.parent().unwrap()).expect("parent");

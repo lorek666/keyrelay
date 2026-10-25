@@ -347,8 +347,11 @@ fn detect_site_returns_fingerprint_shape_against_fake_site() {
 
 // ================================================================ 密钥投递（M1-S3）
 
-/// 全新内存状态下没有密钥记录 → 投递相关命令都应报**业务错误**，
+/// 全新内存状态下没有密钥记录 → 投递相关命令应报**业务错误**，
 /// 而不是「命令未注册 / 未授权」这类装配问题。
+/// 例外是 `revoke_consent`：按 DEBUG-G7 P2-D7 的有意设计，撤销**不**校验
+/// key 存在性（键已删、站已删时同意行仍应能撤），未知 key 下也成功返回
+/// （幂等、无同意行可删），因此它单独断言成功，不进报错循环。
 #[test]
 fn delivery_commands_report_business_errors_on_unknown_key() {
     for (cmd, args) in [
@@ -361,10 +364,6 @@ fn delivery_commands_report_business_errors_on_unknown_key() {
             json!({"args": {"keyId": 999, "channel": "codex-auth-json"}}),
         ),
         (
-            "revoke_consent",
-            json!({"args": {"keyId": 999, "channel": "codex-auth-json"}}),
-        ),
-        (
             "apply_delivery",
             json!({"args": {"keyId": 999, "channel": "codex-auth-json"}}),
         ),
@@ -374,6 +373,14 @@ fn delivery_commands_report_business_errors_on_unknown_key() {
         let text = err.as_str().unwrap_or_default();
         assert!(text.contains("999"), "{cmd} 的错误应说明是哪个 key: {text}");
     }
+
+    // revoke_consent：未知 key 下仍成功（P2-D7 幂等语义），不是测试缺口。
+    let value = invoke_impl(
+        "revoke_consent",
+        json!({"args": {"keyId": 999, "channel": "codex-auth-json"}}),
+    )
+    .expect("revoke_consent 对未知 key 应幂等成功");
+    assert_not_acl_rejection("revoke_consent", &value);
 }
 
 #[test]
@@ -1448,15 +1455,19 @@ fn the_frontend_channel_list_matches_the_backend_channels_exactly() {
     }
     frontend.sort();
 
+    // B-292：ClineDesktop 已下线（文件直写已拒，走 cline auth CLI），前端已摘卡，
+    // 因此比对口径是**可投递通道集合**（ALL 减下线通道），不是 ALL 本身；
+    // 与 core 的 every_deliverable_channel_resolves 同款处理。
     let mut backend: Vec<String> = tianshu_relay_core::delivery::DeliveryChannel::ALL
         .iter()
+        .filter(|channel| **channel != tianshu_relay_core::delivery::DeliveryChannel::ClineDesktop)
         .map(|channel| channel.as_str().to_string())
         .collect();
     backend.sort();
 
     assert_eq!(
         frontend, backend,
-        "前端 CHANNELS 的 id 集合与后端 DeliveryChannel::ALL 的 as_str() 集合不一致。\n\
+        "前端 CHANNELS 的 id 集合与后端可投递通道集合不一致。\n\
          后端是权威：新增/删除通道时请同步 src/pages/Agents.tsx 的 CHANNELS。"
     );
 }
