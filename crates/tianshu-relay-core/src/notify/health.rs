@@ -67,6 +67,12 @@ impl KeyHealthVerdict {
 /// - `Transport`：只有 `map_http_error` 的 5xx 字面量（`"站点服务异常（{s}）"`）
 ///   ⇒ `UpstreamFault`；其余（400、形态异常、未预期状态码）⇒ `Unknown`。
 ///   字面量锚点由用例钉住：5xx mock 必须得 `UpstreamFault`，字面量一变用例即红。
+/// - DEBUG-G7 补齐 P3-K2（取“保留字面量 + 锚定测试 + 文档说明”分支，不得硬编
+///   字段）：`Transport` 变体只带一个 `String`，没有状态码字段可依；把状态码
+///   塞进 `Error` 枚举是跨变体的结构改动，不属 P3。字面量的唯一生产者是
+///   `site::map_http_error` 的 5xx 分支，消费侧锚定测试直接调生产者断言
+///   （见 `classify_probe_result_anchors_to_map_http_error_literal`），生产者
+///   改字面量即红——不是靠两处各写一遍字面量碰巧一致。
 /// - 其余变体（`NotFound` 等）⇒ `Unknown`。
 pub fn classify_probe_result(result: &Result<Vec<String>>) -> KeyHealthVerdict {
     match result {
@@ -199,6 +205,24 @@ mod tests {
         );
         assert_eq!(
             classify_probe_result(&Err(Error::NotFound("资源不存在".into()))),
+            KeyHealthVerdict::Unknown
+        );
+    }
+
+    #[test]
+    fn classify_probe_result_anchors_to_map_http_error_literal() {
+        // DEBUG-G7 补齐 P3-K2：生产者—消费者锚定。分类器认的不是“任意以
+        // 该前缀开头的字符串”，而是 `map_http_error` 5xx 分支的唯一产物：
+        // 生产者改字面量（或改 5xx 归属）时，本用例即红；400 分支产物
+        // 必须仍是 Unknown（不得把“所有 Transport”都算成站点故障）。
+        let err_503 = crate::site::map_http_error(503, b"", None);
+        assert_eq!(
+            classify_probe_result(&Err(err_503)),
+            KeyHealthVerdict::UpstreamFault
+        );
+        let err_400 = crate::site::map_http_error(400, b"", None);
+        assert_eq!(
+            classify_probe_result(&Err(err_400)),
             KeyHealthVerdict::Unknown
         );
     }

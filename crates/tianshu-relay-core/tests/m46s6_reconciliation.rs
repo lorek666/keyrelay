@@ -631,3 +631,103 @@ fn reconciliation_unpriced_usage_gets_explicit_row_not_silently_skipped() {
     );
     let _ = dir;
 }
+
+#[test]
+fn site_bills_excludes_future_days() {
+    // DEBUG-G7 补齐 P3-K3：site_bills 窗口有上界——未来日账单行不得出现
+    // （此前只有下界，未来行会以 bill_only 混进对账）。
+    let (dir, store, site) = store_with_site();
+    let today = local_today(&dir);
+    bill(
+        &store,
+        site,
+        &today,
+        Some(10.0),
+        Some("USD"),
+        "newapi-log-self",
+    );
+    bill(
+        &store,
+        site,
+        "2999-01-01",
+        Some(10.0),
+        Some("USD"),
+        "newapi-log-self",
+    );
+    let rows = store.site_bills(90).expect("读账单");
+    assert!(rows.iter().any(|r| r.day == today), "当日行应在窗口内");
+    assert!(
+        rows.iter().all(|r| r.day != "2999-01-01"),
+        "未来日行不得进入窗口，实测 {:?}",
+        rows.iter().map(|r| r.day.clone()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn reconciliation_rows_carry_import_partial_flag() {
+    // DEBUG-G7 补齐 P3-K3：对账行带站级导入覆盖信号——最近一次导入
+    // partial 的站，其账单行与网关行都挂 import_partial=true；无记录的站
+    // 为 false（不是“覆盖完整”，只是“没导入过/取完了”，见字段语义）。
+    let (dir, store, site_partial) = store_with_site();
+    let site_clean = store
+        .upsert_site("newapi", "https://clean.example.com", "干净站")
+        .expect("写干净站");
+    setup_usd_price(&store);
+    let t = now();
+    let today = local_today(&dir);
+    // partial 站：当日账单（bill-only 侧）+ 当日网关用量（另一天无账单侧
+    // 为 gateway-only——为避免两天混淆，用量写当日、账单写昨日）。
+    let (start, _) = store.local_day_bounds(&today).expect("当日窗口");
+    let yesterday = local_date_of(&dir, start - 3600);
+    bill(
+        &store,
+        site_partial,
+        &yesterday,
+        Some(5.0),
+        Some("USD"),
+        "newapi-log-self",
+    );
+    gateway_cost(&store, site_partial, 5_000_000, t);
+    bill(
+        &store,
+        site_clean,
+        &today,
+        Some(5.0),
+        Some("USD"),
+        "newapi-log-self",
+    );
+    store
+        .record_site_bill_import(site_partial, true, 10, 3)
+        .expect("记覆盖");
+    store
+        .record_site_bill_import(site_clean, false, 10, 3)
+        .expect("记覆盖");
+    let rows = reconcile_bills(&store, None, 30).expect("对账全部");
+    let partial_rows: Vec<_> = rows.iter().filter(|r| r.site_id == site_partial).collect();
+    assert!(!partial_rows.is_empty(), "partial 站应有行");
+    assert!(
+        partial_rows.iter().all(|r| r.import_partial),
+        "partial 站的全部行都应挂旗，实测 {:?}",
+        partial_rows
+            .iter()
+            .map(|r| (r.day.clone(), r.kind))
+            .collect::<Vec<_>>()
+    );
+    let clean_rows: Vec<_> = rows.iter().filter(|r| r.site_id == site_clean).collect();
+    assert!(!clean_rows.is_empty(), "干净站应有行");
+    assert!(
+        clean_rows.iter().all(|r| !r.import_partial),
+        "取完的站不得挂旗"
+    );
+    // 最新一次为准：partial 站再记一次取完，旗应翻回 false。
+    store
+        .record_site_bill_import(site_partial, false, 10, 30)
+        .expect("记覆盖");
+    let rows = reconcile_bills(&store, None, 30).expect("对账全部");
+    assert!(
+        rows.iter()
+            .filter(|r| r.site_id == site_partial)
+            .all(|r| !r.import_partial),
+        "最新一次取完后，旧 partial 旗不得残留"
+    );
+}

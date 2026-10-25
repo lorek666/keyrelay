@@ -881,9 +881,16 @@ pub fn spawn_maintenance_tasks<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
                             summary.unknown
                         );
                         // 喂入运行中网关的 Breaker（同步操作，不跨 await 持锁）。
+                        // DEBUG-G7 补齐 P3-K4：喂不喂必须在摘要里可见——网关未运行
+                        // 时本轮结论只记事件、不喂熔断，且熔断是网关内存态、重启
+                        // 后归零：死 key 在重启后会重新接流，至多 3 次失败才再次
+                        // Open。两分支都打印，不得只打印“已喂”分支、让未喂分支
+                        // 在日志里看起来像已喂。
+                        let mut fed = false;
                         if let Ok(guard) = state.gateway.lock() {
                             if let Some(running) = guard.as_ref() {
                                 if running.handle.alive() {
+                                    fed = true;
                                     for outcome in &summary.outcomes {
                                         running.handle.record_probe_outcome(
                                             outcome.site_id,
@@ -894,6 +901,13 @@ pub fn spawn_maintenance_tasks<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
                                     }
                                 }
                             }
+                        }
+                        if fed {
+                            eprintln!(
+                                "[tianshu-relay] 密钥健康巡检: 本轮结论已喂入运行中网关的熔断"
+                            );
+                        } else {
+                            eprintln!("[tianshu-relay] 密钥健康巡检: 网关未运行，本轮结论未喂熔断（只记事件）；网关重启后熔断归零，死 key 将重新接流直至再次 Open");
                         }
                     }
                 }

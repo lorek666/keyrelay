@@ -62,6 +62,12 @@ pub enum Error {
     ///
     /// **边界（实测）**：`is_connect()` **不**覆盖「连接挂起直到 `connect_timeout`」，
     /// 那类失败在 reqwest 里表现为 `is_timeout()` ⇒ 仍落在 `Transport`（不可重放）。
+    ///
+    /// DEBUG-G7 补齐小残留（K3 口径同步）：「连接失败可重放」只指本变体——
+    /// 即 `is_connect()` 已证明请求未送达的情形；挂起超时、读超时等“可能已
+    /// 送达”失败一律不在本变体里，不得把两处口径混读成“一切连接层失败都
+    /// 可重放”。网关侧 `classify_send_error` 与站点侧 `RetryingTransport`
+    /// 与本判据同源（同一个 `is_connect()`），三处不得各自发明“连接失败”。
     #[error("连接未建立（请求未送达）: {0}")]
     NotDelivered(String),
 

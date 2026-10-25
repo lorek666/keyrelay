@@ -61,8 +61,12 @@ impl Injector for CodexInjector {
         let mut doc: DocumentMut = if before.trim().is_empty() {
             DocumentMut::new()
         } else {
-            before.parse().map_err(|e| {
-                Error::inject(&self.config_path, format!("TOML 解析失败，拒绝改写: {e}"))
+            before.parse().map_err(|_| {
+                // DEBUG-G7 补齐 P2-K4（新 canary 用例抓到的真回显）：toml_edit
+                // 的解析错误自带出错行原文，旧文件里若有密钥残值会被原样带进
+                // 错误串；故此处只给固定文案，不插值解析器详情（行列号随详情
+                // 一起丢掉——旧文件本就拒绝改写，用户凭路径自行打开文件定位）。
+                Error::inject(&self.config_path, "TOML 解析失败，拒绝改写")
             })?
         };
 
@@ -154,6 +158,28 @@ wire_api = "chat"
         assert!(after.contains("env_key = \"KEYRELAY_KEYRELAY_KEY\""));
         // 密钥绝不进入受管文件
         assert!(!after.contains("sk-should-never-be-written"));
+    }
+
+    #[test]
+    fn plan_and_errors_never_echo_the_key() {
+        // DEBUG-G7 补齐 P2-K4：inject/codex.rs 是 Codex 双单写盘本体
+        // （config.toml 本身不含密钥），此前只有 preservation 用例顺带断言
+        // 不含密钥；专属 canary 用例钉住两条：① 正常 plan 的 after 不含传入
+        // 的 canary；② 畸形旧文件（含旧 canary）导致 plan 失败时，错误串不含
+        // 新旧任一 canary。本用例初版即红：toml_edit 解析错误自带出错行原文
+        // （旧 canary 被回显），故 plan 的解析失败已改成固定文案（见上）。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let injector = CodexInjector::new(&path);
+        let mut b = binding();
+        b.api_key = "CANARY-KEY-4k2m".to_string();
+        let patches = injector.plan(&b).unwrap();
+        assert!(!patches[0].after.contains("CANARY-KEY-4k2m"));
+        std::fs::write(&path, "model = [CANARY-FILE-9x7z\n").unwrap();
+        let err = injector.plan(&b).unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains("CANARY-KEY-4k2m"), "{text}");
+        assert!(!text.contains("CANARY-FILE-9x7z"), "{text}");
     }
 
     #[test]

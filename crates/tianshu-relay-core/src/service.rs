@@ -387,6 +387,28 @@ pub struct KeyHealthSummary {
     pub outcomes: Vec<KeyHealthOutcome>,
 }
 
+/// DEBUG-G7 补齐 P3-K5：巡检模型键集合 = 库里目录 ∪ 本轮返回（去重保序）。
+///
+/// 口径说明（报告原文即此行为，属有意偏保守而非待修缺口）：已下架模型
+/// （在库目录里、本轮未返回）仍会被喂失败结论——多喂一次计数，但该模型的
+/// 熔断键本就仍在库目录口径里（路由仍可能选中它），不喂反而会让它的熔断
+/// 键静默过期；真正 pruning 目录是目录采集的职责，巡检不写库、不发布快照，
+/// 故不得在这里把已下架模型摘掉。纯函数，单测钉住并集、去重与保序。
+/// DEBUG-G7 补齐 P3-K4 也见本摘要的壳层用法：结论喂不喂熔断由壳层循环按
+/// “网关是否在运行”决定（服务层没有熔断句柄），网关未运行时本轮结论只记
+/// 事件不喂熔断、且熔断是网关内存态、重启后归零——壳层循环在摘要打印处
+/// 明示该分支（见 `src-tauri/src/lib.rs` 的巡检循环），不得把摘要读成
+/// “结论已喂熔断”。
+fn patrol_model_keys(stored: &[String], fetched: &[String]) -> Vec<String> {
+    let mut models: Vec<String> = stored.to_vec();
+    for name in fetched {
+        if !models.iter().any(|kept| kept == name) {
+            models.push(name.clone());
+        }
+    }
+    models
+}
+
 /// 一趟巡检里**同时在途**的站点数上限（M46-S1）。
 ///
 /// 与 `MODEL_CATALOG_CONCURRENCY` 同值（2）但独立常量：巡检与目录采集是两条
@@ -1127,6 +1149,11 @@ pub struct BillReconciliationRow {
     pub flagged: bool,
     pub kind: BillReconciliationKind,
     pub source: Option<String>,
+    /// DEBUG-G7 补齐 P3-K3：该站最近一次账单导入是否 partial（只取了最近
+    /// N 页）。站级信号、非天级结论：为 true 时，本行之外的缺失天数可能
+    /// 是导入截断而非真无账单；为 false 时只表示“最近一次取完了或没导入
+    /// 过”（无记录的站同样为 false，调用方不得把 false 读成“覆盖完整”)。
+    pub import_partial: bool,
 }
 
 /// 6 位舍入（与成本口径同位数；与 SQLite `ROUND` 同为半值远离零），
@@ -1172,6 +1199,9 @@ pub fn reconcile_bills(
     let days = crate::store::clamp_usage_days(days);
     let bills = store.site_bills(days)?;
     let usage_days = store.gateway_usage_days(site_id, days)?;
+    // DEBUG-G7 补齐 P3-K3：对账行带站级导入覆盖信号（一次查询取全站，
+    // 不逐行查库）。任一查询失败 ⇒ Err（与本函数“不返回半份数据”同口径）。
+    let import_partials = store.site_bill_import_partials()?;
     let billed_days: std::collections::HashSet<(i64, String)> = bills
         .iter()
         .filter(|b| site_id.is_none_or(|s| s == b.site_id))
@@ -1215,6 +1245,7 @@ pub fn reconcile_bills(
             flagged,
             kind,
             source: Some(bill.source.clone()),
+            import_partial: import_partials.get(&bill.site_id).copied().unwrap_or(false),
         });
     }
     for (site, day) in &usage_days {
@@ -1240,6 +1271,7 @@ pub fn reconcile_bills(
                 flagged: true,
                 kind: BillReconciliationKind::GatewayUnpriced,
                 source: None,
+                import_partial: import_partials.get(site).copied().unwrap_or(false),
             });
             continue;
         }
@@ -1254,6 +1286,7 @@ pub fn reconcile_bills(
             flagged: diff.abs() > threshold,
             kind: BillReconciliationKind::GatewayOnly,
             source: None,
+            import_partial: import_partials.get(site).copied().unwrap_or(false),
         });
     }
     // 输出顺序是契约：day 倒序、site_id 升序、source 升序。
@@ -2742,9 +2775,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 | DeliveryChannel::ClaudeDesktop
         ) {
             Some(self.restart_write_op.lock().map_err(|_| {
-                Error::Store(
-                    "桌面通道写锁中毒：上一任写盘中异常，拒绝写入以免交错".into(),
-                )
+                Error::Store("桌面通道写锁中毒：上一任写盘中异常，拒绝写入以免交错".into())
             })?)
         } else {
             None
@@ -6769,6 +6800,25 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 "newapi-log-self",
             )?;
         }
+        // DEBUG-G7 补齐 P3-K3：记导入覆盖（对账侧据此判断缺失天是截断还是
+        // 真无账单）。best-effort：覆盖行写失败只记 Warn 事件、不翻转导入
+        // 结果（账单行已落库，报失败会诱导用户重导）。
+        if let Err(err) = self.store.record_site_bill_import(
+            site_id,
+            outcome.partial,
+            outcome.pages,
+            outcome.imported,
+        ) {
+            self.log(observability::event_with_payload(
+                Level::Warn,
+                "site",
+                "站点账单导入覆盖未记上（对账将看不到本次截断信号）",
+                serde_json::json!({
+                    "site_id": site_id,
+                    "error": crate::redact::scrub(&err.to_string()),
+                }),
+            ));
+        }
         self.log(observability::event_with_payload(
             Level::Info,
             "site",
@@ -7032,15 +7082,10 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     "verdict": verdict.as_str(),
                 }),
             ));
-            // 模型键集合 = 库里目录 ∪ 本轮返回（去重保序）；本轮清单**不落库**。
-            let mut models = self.store.site_models(job.site_id).unwrap_or_default();
-            if let Some(fetched) = fetched {
-                for name in fetched {
-                    if !models.iter().any(|kept| kept == &name) {
-                        models.push(name);
-                    }
-                }
-            }
+            // 模型键集合 = 库里目录 ∪ 本轮返回（去重保序，见 `patrol_model_keys`）；
+            // 本轮清单**不落库**。
+            let stored = self.store.site_models(job.site_id).unwrap_or_default();
+            let models = patrol_model_keys(&stored, fetched.as_deref().unwrap_or(&[]));
             summary.outcomes.push(KeyHealthOutcome {
                 site_id: job.site_id,
                 key_id: job.key_id,
@@ -8294,6 +8339,89 @@ mod tests {
             // 的语义用上面三条已经覆盖；这里只确认通道枚举完整
             assert!(plan.is_err() || plan.is_ok());
         }
+    }
+
+    /// DEBUG-G7 补齐 P2-C9（B-282）：服务层写锁的持有面——桌面通道 apply
+    /// 在锁被占时阻塞、非桌面通道不受影响；轮换直调的正是这两条 apply
+    /// 函数，故锁面覆盖轮换。key_id 用不存在的 999：无锁时两路都应立刻
+    /// 因准备失败返回（不是阻塞在别处），有锁时桌面两路必须等锁释放。
+    #[test]
+    fn restart_write_lock_serializes_desktop_applies_only() {
+        let service = service_with_blocking();
+        let (tx, rx) = std::sync::mpsc::channel::<&str>();
+        let write_op = service.restart_write_op();
+        let guard = write_op.lock().unwrap();
+        std::thread::scope(|scope| {
+            let service_ref = &service;
+            let tx1 = tx.clone();
+            scope.spawn(move || {
+                let _ = service_ref.apply_delivery_in_with_variant(
+                    999,
+                    DeliveryChannel::ClaudeDesktop,
+                    None,
+                    delivery::DeliverySource::Site,
+                    None,
+                );
+                let _ = tx1.send("delivery-desktop");
+            });
+            let tx2 = tx.clone();
+            scope.spawn(move || {
+                let _ = service_ref.apply_codex_in_with_variant(
+                    999,
+                    None,
+                    delivery::DeliverySource::Site,
+                    false,
+                    None,
+                );
+                let _ = tx2.send("codex");
+            });
+            // 非桌面通道：锁被占时也应立刻返回（不持锁）。
+            assert!(service_ref
+                .apply_delivery_in_with_variant(
+                    999,
+                    DeliveryChannel::ClaudeCodeSettings,
+                    None,
+                    delivery::DeliverySource::Site,
+                    None,
+                )
+                .is_err());
+            // 桌面两路在 300ms 内不得完成（它们应卡在写锁上）。
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "桌面 apply 在写锁被占时应阻塞，不得立刻返回"
+            );
+            drop(guard);
+            // 锁释放后两路都应完成（准备失败是预期结果，关键是“完成了”）。
+            let mut done = vec![
+                rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(),
+                rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(),
+            ];
+            done.sort();
+            assert_eq!(done, vec!["codex", "delivery-desktop"]);
+        });
+    }
+
+    /// DEBUG-G7 补齐 P3-K5：巡检模型键集合口径钉子——库里目录 ∪ 本轮返回，
+    /// 去重保序；已下架模型（只在库目录里）保留在集合里（偏保守，见
+    /// `patrol_model_keys` 的口径说明），不得被“只取本轮返回”悄悄摘掉。
+    #[test]
+    fn patrol_model_keys_is_union_dedup_order_preserving() {
+        let stored = vec!["a".to_string(), "b".to_string()];
+        let fetched = vec!["b".to_string(), "c".to_string()];
+        assert_eq!(
+            patrol_model_keys(&stored, &fetched),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        // 本轮空 ⇒ 只有库目录（含已下架模型）；库目录空 ⇒ 只有本轮返回。
+        assert_eq!(
+            patrol_model_keys(&stored, &[]),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            patrol_model_keys(&[], &fetched),
+            vec!["b".to_string(), "c".to_string()]
+        );
     }
 
     /// 只用来构造一个 service（不需要可用的传输层）。

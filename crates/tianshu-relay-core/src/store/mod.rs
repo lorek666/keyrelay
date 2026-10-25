@@ -295,6 +295,18 @@ CREATE TABLE IF NOT EXISTS site_bills(
   UNIQUE(site_id, day, source)
 );
 CREATE INDEX IF NOT EXISTS idx_site_bills_site_day ON site_bills(site_id, day DESC);
+-- DEBUG-G7 补齐 P3-K3：账单导入覆盖（一次导入 = 一行；只记覆盖元数据，
+-- 不含账单金额/日志正文）。对账行据此判断“缺失天是真无账单还是导入未取完”。
+-- 追加式日志（无 UNIQUE 约束）：同秒多次导入各记一行，最新一行以
+-- (fetched_at, rowid) 最大者为准。
+CREATE TABLE IF NOT EXISTS site_bill_imports(
+  site_id       INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  fetched_at    INTEGER NOT NULL,
+  partial       INTEGER NOT NULL,
+  pages         INTEGER NOT NULL,
+  imported_days INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_site_bill_imports_site ON site_bill_imports(site_id, fetched_at DESC);
 -- M46-S5：站点 / key 硬预算（一行 = 一个预算）。
 -- key_id 为空 = 该站全部 key 合计；有值 = 该 key 单独的预算。
 -- period 只认 'day' | 'month'（写路径 validate，不靠 CHECK 约束兜底）。
@@ -3005,18 +3017,30 @@ impl Store {
     }
 
     /// 站点账单（近 `days` 天，按日倒序）。
+    ///
+    /// DEBUG-G7 补齐 P3-K3：窗口有上界——只取 `day <= 本地今天`。此前只有
+    /// `day >= cutoff` 下界，未来日账单行（脏数据/时区错位）会以 `bill_only`
+    /// 出现在对账里（噪声，非错误）。上界只对数字日期形（`YYYY-MM-DD`）
+    /// 生效：非法日期形仍放行，由调用方原有校验 fail-loud（对账的
+    /// `local_day_bounds` 会对其报错），不得借上界把非法行静默吞掉——
+    /// 否则 `reconciliation_illegal_bill_day_errors` 类的显性报错会退化
+    /// 成静默缺失。
     pub fn site_bills(&self, days: i64) -> Result<Vec<SiteBillRow>> {
         let days = clamp_usage_days(days);
         let conn = self.lock()?;
         let cutoff = local_day_ago(&conn, days - 1)?;
+        let today = local_day_ago(&conn, 0)?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, site_id, day, amount, currency, requests, source, fetched_at
-                 FROM site_bills WHERE day >= ?1 ORDER BY day DESC, site_id ASC",
+                 FROM site_bills
+                 WHERE day >= ?1
+                   AND (day <= ?2 OR day NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]')
+                 ORDER BY day DESC, site_id ASC",
             )
             .map_err(|e| Error::Store(format!("prepare site bills: {e}")))?;
         let rows = stmt
-            .query_map(params![cutoff], |row| {
+            .query_map(params![cutoff, today], |row| {
                 Ok(SiteBillRow {
                     id: row.get(0)?,
                     site_id: row.get(1)?,
@@ -3031,6 +3055,58 @@ impl Store {
             .map_err(|e| Error::Store(format!("query site bills: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Store(format!("collect site bills: {e}")))
+    }
+
+    /// DEBUG-G7 补齐 P3-K3：记一次账单导入的覆盖。调用方是导入成功路径；
+    /// 本行写失败不得翻转导入结果（账单行已落库，报失败会诱导重导），
+    /// 调用方须按 best-effort 处理（记 Warn 事件、继续返回成功）。
+    pub fn record_site_bill_import(
+        &self,
+        site_id: i64,
+        partial: bool,
+        pages: usize,
+        imported_days: usize,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO site_bill_imports(site_id, fetched_at, partial, pages, imported_days)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                site_id,
+                now_secs(),
+                partial as i64,
+                pages as i64,
+                imported_days as i64
+            ],
+        )
+        .map_err(|e| Error::Store(format!("写入账单导入覆盖失败: {e}")))?;
+        Ok(())
+    }
+
+    /// DEBUG-G7 补齐 P3-K3：每站最近一次导入的 partial 旗（批量版，供对账
+    /// 一次取全站）。无记录的站不在 map 里（调用方按 false 计，但语义是
+    /// “没导入过”，不是“导入取完了”——卡片横幅只对 map 里 partial=true
+    /// 的站出现，不得把“没导入过”也标成截断）。
+    pub fn site_bill_import_partials(&self) -> Result<std::collections::HashMap<i64, bool>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT site_id, partial FROM site_bill_imports
+                 ORDER BY site_id ASC, fetched_at ASC, rowid ASC",
+            )
+            .map_err(|e| Error::Store(format!("prepare site bill imports: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0))
+            })
+            .map_err(|e| Error::Store(format!("query site bill imports: {e}")))?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (site_id, partial) =
+                row.map_err(|e| Error::Store(format!("collect site bill imports: {e}")))?;
+            out.insert(site_id, partial);
+        }
+        Ok(out)
     }
 
     /// M34-S1：近 `days` 天余额快照，按（本地日, 站点）聚合，每天取**最后一条**。

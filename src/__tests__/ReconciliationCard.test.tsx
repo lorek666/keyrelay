@@ -118,4 +118,40 @@ describe("ReconciliationCard（M46-UI B-251）", () => {
     expect(screen.getByText("用量不可定价（无 USD 价）")).toBeInTheDocument();
     expect(screen.getByText("不可比行")).toBeInTheDocument();
   });
+
+  it("DEBUG-G7 补齐 P3-K6：小额仅网关行单独立组，不受仅看超阈值筛选隐藏", async () => {
+    vi.mocked(billReconciliation).mockResolvedValue([
+      {
+        siteId: 1, day: "2026-10-24", gatewayUsd: 10, billUsd: 10, diffUsd: 0,
+        flagged: false, kind: "matched", source: "newapi-log-self",
+      },
+      {
+        siteId: 1, day: "2026-10-20", gatewayUsd: 0.5, billUsd: 0, diffUsd: 0.5,
+        flagged: false, kind: "gateway_only", source: null,
+      },
+    ] as never);
+    render(<ReconciliationCard />, { wrapper });
+    await screen.findByText("2026-10-20");
+    expect(screen.getByText("仅网关行（站点无账单）")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("仅看超阈值"));
+    await waitFor(() => {
+      expect(screen.queryByText("2026-10-24")).toBeNull();
+    });
+    // 小额仅网关行 flagged=false，旧版会被该筛选隐藏；单独立组后仍可见。
+    expect(screen.getByText("2026-10-20")).toBeInTheDocument();
+    const row = screen.getByText("2026-10-20").closest("tr") as HTMLElement;
+    expect(within(row).queryByText("超阈值")).toBeNull();
+  });
+
+  it("DEBUG-G7 补齐 P3-K3：导入 partial 的站出截断横幅", async () => {
+    vi.mocked(billReconciliation).mockResolvedValue([
+      {
+        siteId: 1, day: "2026-10-24", gatewayUsd: 10, billUsd: 10, diffUsd: 0,
+        flagged: false, kind: "matched", source: "newapi-log-self", importPartial: true,
+      },
+    ] as never);
+    render(<ReconciliationCard />, { wrapper });
+    await screen.findByText("2026-10-24");
+    expect(screen.getByText(/最近一次账单导入未取完/)).toBeInTheDocument();
+  });
 });

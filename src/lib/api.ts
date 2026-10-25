@@ -1885,6 +1885,7 @@ export type BillReconciliation = {
   flagged: boolean;
   kind: "matched" | "gateway_only" | "bill_only" | "gateway_unpriced";
   source: string | null;
+  importPartial?: boolean;
 };
 
 export async function billReconciliation(

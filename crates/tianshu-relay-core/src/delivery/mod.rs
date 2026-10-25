@@ -3292,16 +3292,19 @@ mod tests {
 
     #[test]
     fn required_field_table_matches_writer_fields() {
-        // 矩阵：20 通道 × 4 种构造输入（无端点无模型 / 有端点无模型 / 有端点有模型 /
-        // 有端点有模型有 meta）。表与 writer 的 `fields()` 必须逐字相等（含顺序）：
+        // 矩阵：19 条可投递通道 × 5 种构造输入（无端点无模型 / 纯空白端点无模型 /
+        // 有端点无模型 / 有端点有模型 / 有端点有模型有 meta）。表与 writer 的 `fields()` 必须逐字相等（含顺序）：
         // 任一侧改了一行都会在这里红，而不是等到线上投递才被整单校验拦下。
+        // DEBUG-G7 补齐小残留：纯空白端点一格——助手口径须与 writer 的 trim 门禁
+        // 一致（空白 = 无端点），否则矩阵会把“writer 已 trim、表未 trim”的分叉漏过去。
         let home = tempfile::tempdir().expect("临时 home");
         let meta = Some(crate::model_meta::ModelMeta {
             context_window: 128_000,
             max_output_tokens: 4_096,
         });
-        let configs: [(&str, Option<&str>, Option<crate::model_meta::ModelMeta>); 4] = [
+        let configs: [(&str, Option<&str>, Option<crate::model_meta::ModelMeta>); 5] = [
             ("", None, None),
+            ("   ", None, None),
             ("https://relay.example.com", None, None),
             ("https://relay.example.com", Some("gpt-4o"), None),
             ("https://relay.example.com", Some("gpt-4o"), meta),
@@ -3325,7 +3328,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{} 应能解析出 writer: {e}", channel.as_str()));
                 let opts = FieldSetOptions::new(
                     "keyrelay",
-                    !base_url.is_empty(),
+                    !base_url.trim().is_empty(),
                     model.is_some(),
                     meta.is_some(),
                 );
@@ -3345,8 +3348,8 @@ mod tests {
                 checked += 1;
             }
         }
-        // B-292：ClineDesktop 已下线，不计入本矩阵（19 条 × 4 种构造输入）。
-        assert_eq!(checked, (DeliveryChannel::ALL.len() - 1) * 4);
+        // B-292：ClineDesktop 已下线，不计入本矩阵（19 条 × 5 种构造输入）。
+        assert_eq!(checked, (DeliveryChannel::ALL.len() - 1) * 5);
         // opencode 限定键的 provider 段：点号 provider 与带点 provider（方括号形态）
         // 都要与 writer 的 qualified_field 逐字一致。
         for provider in ["my-relay", "a.b"] {
