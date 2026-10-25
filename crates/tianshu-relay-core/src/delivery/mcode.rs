@@ -73,7 +73,7 @@ impl DeliveryWriter for MCodeWriter {
 
     fn field_names(&self) -> Vec<String> {
         let mut names = vec![Self::FIELD_API_KEY.to_string()];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             names.push(Self::FIELD_BASE_URL.to_string());
         }
         if self.model.is_some() {
@@ -88,7 +88,7 @@ impl DeliveryWriter for MCodeWriter {
 
     fn fields(&self, api_key: &str) -> Vec<DeliveryField> {
         let mut fields = vec![masked_field(Self::FIELD_API_KEY, api_key)];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
         if let Some(m) = &self.model {
@@ -136,7 +136,15 @@ fn build_after(
     let block = build_block(api_key, base_url, model, meta);
 
     if let Some(begin_pos) = before.find(BLOCK_BEGIN) {
-        if let Some(end_pos) = before[begin_pos..].find(BLOCK_END) {
+        // DEBUG-G7 P2-D2：孤 BEGIN（有 BEGIN 无 END）时拒绝，不得静默追加第二块——
+        // 旧块与新块并存时 agent 读哪块不可预期，追加等于把“哪块生效”交给运气。
+        let Some(end_pos) = before[begin_pos..].find(BLOCK_END) else {
+            return Err(Error::inject(
+                path,
+                "标记块只有起始标记、没有结束标记，拒绝写入：请先手工修复该文件里的 keyrelay 标记块（补结束标记或删掉残块）再重新投递",
+            ));
+        };
+        {
             let absolute_end = begin_pos + end_pos + BLOCK_END.len();
             let after_end = if before[absolute_end..].starts_with('\n') {
                 absolute_end + 1
@@ -172,7 +180,7 @@ fn build_block(
     block.push_str("api_key: ");
     block.push_str(api_key);
     block.push('\n');
-    if !base_url.is_empty() {
+    if !base_url.trim().is_empty() {
         block.push_str("base_url: ");
         block.push_str(base_url);
         block.push('\n');
@@ -259,6 +267,16 @@ agent:
         assert!(!patch.after.contains("sk-old"));
         assert!(patch.after.contains("model:"));
         assert_eq!(patch.after.matches(BLOCK_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn rejects_orphan_begin_block() {
+        // DEBUG-G7 P2-D2：孤 BEGIN（无 END）不得静默追加第二块，必须拒绝。
+        let dir = tmp();
+        let before = format!("model:\n  default: x\n{}\napi_key: sk-old\n", BLOCK_BEGIN);
+        std::fs::write(writer_in(dir.path(), BASE).path(), &before).unwrap();
+        let err = writer_in(dir.path(), BASE).plan(SECRET).unwrap_err();
+        assert!(err.to_string().contains("没有结束标记"), "{err}");
     }
 
     #[test]

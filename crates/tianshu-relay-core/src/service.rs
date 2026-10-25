@@ -921,6 +921,21 @@ pub struct TianshuRelayService<T: HttpTransport + Clone + 'static> {
     /// 用户点「立即刷新」三者重叠时，在途峰值会翻倍（实测 8）。用 async-aware 的
     /// `tokio::sync::Mutex` 串行化（不得用 `std::sync::Mutex` 跨 `.await`）。
     refresh_lock: tokio::sync::Mutex<()>,
+    /// DEBUG-G7 补齐 P2-C9（B-282）：桌面通道“停 → 写盘”与重启的服务层互斥锁。
+    ///
+    /// 为什么必须在服务层（而不只留命令层 `restart_op`）：轮换直调服务层
+    /// `apply_*_with_variant`，根本不经过 Tauri `apply_delivery` 命令，命令层
+    /// 锁对它完全透明——重启可在轮换的停写后、写盘前把应用拉起来，写盘随即
+    /// 被启动覆盖。服务层锁由两条写盘路径（单通道与 Codex 双单，限桌面通道）
+    /// 与壳层重启命令共同持有，停 → 写窗口至此对重启互斥。
+    ///
+    /// 为什么是 `std::sync::Mutex` 而不是 `tokio` 锁：两条写盘路径是同步函数，
+    /// 不能 `.await`；锁只在同步段内持有（写盘路径全程同步、重启在
+    /// `spawn_blocking` 里取锁），绝不跨 `.await`，故无 `await_holding_lock`
+    /// 问题。锁序（防死锁）：命令层锁（Tauri `restart_op` / 轮换的 `gateway_op`）
+    /// 永远在外、服务层锁在内；没有任何路径持服务层锁再去取命令层锁。
+    /// `Arc` 包裹是为壳层重启命令克隆同一把锁（服务本体不包 `Arc`）。
+    restart_write_op: Arc<std::sync::Mutex<()>>,
 }
 
 /// 缓冲里的一条：**失败发生的时刻** + 失败本身。
@@ -1290,10 +1305,17 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             captcha_phases: Mutex::new(HashMap::new()),
             webview_creds: Mutex::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
+            restart_write_op: Arc::new(std::sync::Mutex::new(())),
         };
         // M13-S1：启动时从钥匙串恢复持久化 session，重启免登。best-effort，不阻断启动。
         svc.restore_sessions();
         svc
+    }
+
+    /// DEBUG-G7 补齐 P2-C9：克隆服务层写锁句柄，供壳层重启命令持有同一把锁。
+    /// （服务本体不包 `Arc`，壳层只能经此方法拿到句柄；句柄本身不含任何状态。）
+    pub fn restart_write_op(&self) -> Arc<std::sync::Mutex<()>> {
+        Arc::clone(&self.restart_write_op)
     }
 
     /// 从钥匙串恢复所有站点的持久化 session 到内存缓存（M13-S1）。
@@ -2556,20 +2578,22 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     }
 
     /// P1-7：带落点变体的同意撤销（与授予同口径：按变体目标路径记）。
+    ///
+    /// DEBUG-G7 P2-D7：撤销**不**经过 `prepare_delivery`。旧路径先解析投递写入器，
+    /// 下线通道（如 Cline Desktop）解析即报错，导致历史同意永远撤不掉；撤销本就
+    /// 只删同意行，不写文件、不读密钥、不依赖站点与密钥记录仍存在——目标只经
+    /// `resolve_variant_target`（变体名白名单）+ `checked_target`（路径白名单）
+    /// 两道白名单验算，`key_id` 在此路径下有意不做存在性校验（键已删、站已删时
+    /// 同意行仍应能撤）。
     pub fn revoke_consent_with_variant(
         &self,
         key_id: i64,
         channel: DeliveryChannel,
         variant: Option<&str>,
     ) -> Result<()> {
-        let writer = self.prepare_delivery(
-            key_id,
-            channel,
-            None,
-            delivery::DeliverySource::Site,
-            variant,
-        )?;
-        let target = self.checked_target(channel, &writer.target_path())?;
+        let _ = key_id;
+        let (variant_target, _) = delivery::resolve_variant_target(channel, &self.home, variant)?;
+        let target = self.checked_target(channel, &variant_target)?;
         self.store.revoke_consent(
             channel.agent_id(),
             channel.as_str(),
@@ -2635,21 +2659,43 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     ///   ⇒ 返回 Err，写盘、记账、回读一律不发生（锁随 guard 析构释放，同意不受影响）。
     /// - 只停、不拉起：CLI 会话与桌面应用的重开由用户在前端点重启按钮（或按可复制命令）
     ///   完成；投递本身绝不替用户拉起任何进程。
-    /// - 只对 Codex 通道调用：其余通道（包括 Claude Desktop）不在此拦截——Claude Desktop
-    ///   的重开只走前端重启按钮，不在投递时自动停它。
-    /// - 残留窗口（诚实说明）：停 → 探查 → 写盘不是原子的，Codex 若在这之间自己重起并
+    /// - 只对桌面端通道调用（Codex 两条 + Claude Desktop）：二者都是“只在启动时读配置”
+    ///   的桌面应用，不停就可能被启动时覆盖。DEBUG-G7 P2-D5：此前只拦 Codex，
+    ///   Claude Desktop 同为 RestartTarget 且走同一 stop_for_write 机器，现一并拦截。
+    /// - CLI 通道**不**自动停：停 CLI 进程可能中断用户正在跑的任务/终端会话，且本应用
+    ///   绝不替用户拉终端进程；CLI 类的出路是前端的可复制启动命令（Agents.tsx
+    ///   RestartSection），不在投递时动进程。
+    /// - DEBUG-G7 补齐 P2-D5（二选一取后者：文档声明 + 界面提示，不做后端探查）：
+    ///   CLI 类**不在停进程保证内**——进程名无法可靠归属到通道（同名进程可能是
+    ///   用户的其它任务；CLI 可经别名/包装脚本启动，进程名与通道无一一对应），
+    ///   “探查到运行中 ⇒ 警告 + 确认后继续”的后端路径在不可靠探查上立不住，
+    ///   误杀/误报都会伤用户任务；故不补探查，改由投递确认框对非桌面通道
+    ///   常驻提示（`agents.confirmDialog.cliNotStopped`）+ 本声明兜底。诚实缺口：
+    ///   轮换路径没有确认框，CLI 警示在轮换侧仍未披露——属 B-283 轮换披露评估
+    ///   的未闭部分，不得读成“CLI 侧已全覆盖”。
+    /// - 残留窗口（诚实说明）：停 → 探查 → 写盘不是原子的，目标若在这之间自己重起并
     ///   写回，仍可能覆盖；事后漂移检测（既有）会报出来，本项不宣称已消除该窗口。
-    fn ensure_codex_stopped_before_write(&self) -> Result<()> {
-        let outcome = crate::restart::stop_for_write(crate::restart::RestartTarget::Codex)?;
+    fn ensure_stopped_before_write(
+        &self,
+        target: crate::restart::RestartTarget,
+        channel_label: &str,
+    ) -> Result<()> {
+        let outcome = crate::restart::stop_for_write(target)?;
+        // restart.rs 的 spec_name 未公开：这里按目标枚举直接给显示名（只有两个
+        // RestartTarget，新增目标时编译器会提醒补分支——match 非穷尽即报错）。
+        let display = match target {
+            crate::restart::RestartTarget::Codex => "Codex",
+            crate::restart::RestartTarget::ClaudeDesktop => "Claude Desktop",
+        };
         if outcome.was_running {
             self.log(observability::event_with_payload(
                 Level::Info,
                 "delivery",
                 format!(
-                    "写盘前已停止 Codex（强制杀：{}），开始写入 Codex 配置",
+                    "写盘前已停止 {display}（强制杀：{}），开始写入 {channel_label} 配置",
                     outcome.force_killed
                 ),
-                serde_json::json!({ "channel": "codex" }),
+                serde_json::json!({ "channel": channel_label }),
             ));
         }
         Ok(())
@@ -2661,8 +2707,8 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 网关模式只换「`base_url` 与 `api_key` 取哪一对值」，其余一个字节都不改。
     /// 这很关键——同意、备份、回读校验、失败补偿这些安全动作**不因为模式而放松**。
     ///
-    /// P1-5 补充一步（只对 Codex 通道）：写盘前先停 Codex 并探查写进程，见
-    /// [`TianshuRelayService::ensure_codex_stopped_before_write`]。
+    /// P1-5 补充一步（桌面端通道：Codex 两条 + Claude Desktop）：写盘前先停目标应用
+    ///   并探查写进程，见 [`TianshuRelayService::ensure_stopped_before_write`]。
     pub fn apply_delivery_in(
         &self,
         key_id: i64,
@@ -2684,6 +2730,25 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         source: delivery::DeliverySource<'_>,
         variant: Option<&str>,
     ) -> Result<DeliveryOutcome> {
+        // DEBUG-G7 补齐 P2-C9（B-282）：桌面通道在整个 apply 期间持服务层写锁
+        // （guard 活到函数返回，全部提前返回分支同样受约束）。轮换直调本函数
+        // 时同样持锁，重启命令持同一把锁——停 → 写窗口至此对重启互斥。
+        // 非桌面通道不停进程，不持锁。锁中毒 ⇒ fail-closed 拒绝写入：
+        // 上一任持有者在写盘中 panic，文件状态已不可信，不得赌着继续写。
+        let _write_op = if matches!(
+            channel,
+            DeliveryChannel::CodexAuthJson
+                | DeliveryChannel::CodexConfig
+                | DeliveryChannel::ClaudeDesktop
+        ) {
+            Some(self.restart_write_op.lock().map_err(|_| {
+                Error::Store(
+                    "桌面通道写锁中毒：上一任写盘中异常，拒绝写入以免交错".into(),
+                )
+            })?)
+        } else {
+            None
+        };
         // P1-2：记录投递模式（轮换按它走，不把网关模式改成站点模式）。
         let delivery_mode = match &source {
             delivery::DeliverySource::Gateway(_) => "gateway",
@@ -2754,13 +2819,19 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             }
         }
 
-        // P1-5：写 Codex 配置前先停 Codex 并探查写进程（只对两条 Codex 通道）。
-        // 位置在锁内、写盘前：停不下来 ⇒ Err，⑤ 的写盘、记账、回读一律不发生。
+        // P1-5 + DEBUG-G7 P2-D5：写桌面应用配置前先停该应用并探查写进程（Codex 两条
+        // + Claude Desktop）。位置在锁内、写盘前：停不下来 ⇒ Err，⑤ 的写盘、记账、
+        // 回读一律不发生。CLI 通道不自动停（见 ensure_stopped_before_write 文档）。
         if matches!(
             channel,
             DeliveryChannel::CodexAuthJson | DeliveryChannel::CodexConfig
         ) {
-            self.ensure_codex_stopped_before_write()?;
+            self.ensure_stopped_before_write(crate::restart::RestartTarget::Codex, "codex")?;
+        } else if channel == DeliveryChannel::ClaudeDesktop {
+            self.ensure_stopped_before_write(
+                crate::restart::RestartTarget::ClaudeDesktop,
+                "claude-desktop",
+            )?;
         }
 
         // ⑤ 写入（加锁已在上面完成；预检 → 备份 → 原子写 → 回读校验 → 失败补偿在 apply 内部）
@@ -3009,6 +3080,12 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         preserve_auth: bool,
         variant: Option<&str>,
     ) -> Result<delivery::CodexDeliveryOutcome> {
+        // DEBUG-G7 补齐 P2-C9（B-282）：Codex 双单恒为桌面通道，整个 apply
+        // 期间持服务层写锁（与单通道同款，见 `apply_delivery_in_with_variant`；
+        // 双单不调单通道函数，故两处各持一次、不嵌套）。锁中毒 ⇒ fail-closed。
+        let _write_op = self.restart_write_op.lock().map_err(|_| {
+            Error::Store("桌面通道写锁中毒：上一任写盘中异常，拒绝写入以免交错".into())
+        })?;
         let delivery_mode = match &source {
             delivery::DeliverySource::Gateway(_) => "gateway",
             delivery::DeliverySource::Site => "site",
@@ -3125,7 +3202,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         // P1-5：写 Codex 配置前先停 Codex 并探查写进程（双文件同单只拦一次，位置在
         // 锁内、两文件补丁都已校验过、真正写盘之前）。停不下来 ⇒ Err，⑥ 的写盘、
         // 记账、回读一律不发生；auth 与 config 两个文件都不动。
-        self.ensure_codex_stopped_before_write()?;
+        self.ensure_stopped_before_write(crate::restart::RestartTarget::Codex, "codex")?;
 
         // ⑥ 写入：一次调用写全部补丁 ⇒ 一个 journal id（预检 → 备份 → 原子写 →
         //    回读校验 → 失败补偿都在 apply 内部，与单通道同一条代码）。
@@ -6223,9 +6300,10 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         // ① 解析成功 + 站表可读 ⇒ 剥离不存在站点（逐条 Warn 事件），有效规则进 config；
         // ② 站表读失败 ⇒ 规则原样进 config（未知 id 在请求层自然匹配不到候选，无害），
         //    只写一条 Warn；绝不因此让网关起不来；
-        // ③ 解析失败（仅手改库等旁路可达，正常写路径已被 validate 拦）⇒ fail-open：
-        //    规则置空 + 一条 Warn 事件（payload 只写原因摘要，不回显规则全文），
-        //    网关照常启动、全局加权。
+        // ③ 解析失败（仅手改库等旁路可达，正常写路径已被 validate 拦）⇒ DEBUG-G7
+        //    P2-G3 fail-closed：记一条 Warn 后**返回 Err，网关不起**。旧 fail-open
+        //    （规则置空 + 全局加权启动）会静默解除全部 agent 站点隔离——解析失败
+        //    时“起不来、让用户去设置页修规则再重启”比“带病启动”安全。
         config.routing_rules = match crate::routing::parse_routing_rules(&settings.routing_rules) {
             Ok(rules) => match self.store.list_sites() {
                 Ok(rows) => {
@@ -6261,10 +6339,12 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 self.log(observability::event_with_payload(
                     Level::Warn,
                     "gateway",
-                    "路由规则解析失败，已按全局加权放行（请在设置页修正规则后重启网关）",
+                    "路由规则解析失败，网关拒绝启动（请在设置页修正规则后重启网关）",
                     serde_json::json!({ "reason": reason }),
                 ));
-                Vec::new()
+                return Err(Error::InvalidInput(format!(
+                    "路由规则解析失败，网关拒绝启动：{reason}；请在设置页修正规则后重试"
+                )));
             }
         };
         Ok(config)
@@ -6275,8 +6355,12 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 为什么 budget_check 也要先 drain 再判定（P0-1 修法 b）：网关运行中用量只进
     /// 内存缓冲，判定只读库内表时永远看不到本轮用量；先 drain 再走既有
     /// `budget_breach_for`，已花 = 库内 + 缓冲之和，且计价仍是同一条 SQL，不另起
-    /// 一套缓冲计价口径（USD 价行、CNY 排除、逐行 6 位舍入都不动）。写失败静默
-    /// 跳过（与既有 drain 同口径）；缓冲锁中毒时只报已丢计数后返回。
+    /// 一套缓冲计价口径（USD 价行、CNY 排除、逐行 6 位舍入都不动）。缓冲锁中毒时
+    /// 只报已丢计数后返回。
+    ///
+    /// DEBUG-G7 P2-K1：落库写失败**不再静默跳过**——本轮写失败条数与缓冲满丢弃条数
+    /// 各记一条 Warn 事件（同一 `warn` 出口），对账/预算侧据此可见丢数。缓冲上限
+    /// 策略本身不变（≥1024 丢最旧 512、计数）。
     fn drain_gateway_usage_buffer(
         store: &crate::store::Store,
         buffer: &std::sync::Mutex<Vec<crate::gateway::GatewayUsage>>,
@@ -6301,13 +6385,26 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             }
         };
         let dropped_this_round = dropped.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let mut write_failed = 0u64;
         for usage in &drained {
-            let _ = store.insert_gateway_usage(usage);
+            if store.insert_gateway_usage(usage).is_err() {
+                write_failed += 1;
+            }
             // M43-S1：归因到的令牌记一次 last_used_at（每分钟最多一次；失败静默）。
             if let Some(token_id) = usage.token_id {
                 let now = unix_now_secs();
                 let _ = store.touch_gateway_token_throttled(token_id, now);
             }
+        }
+        if write_failed > 0 {
+            warn(observability::event_with_payload(
+                Level::Warn,
+                "gateway",
+                format!(
+                    "本轮 {write_failed} 条网关用量记录落库失败（未入库，预算与对账将低估该部分）"
+                ),
+                serde_json::json!({ "write_failed": write_failed }),
+            ));
         }
         if dropped_this_round > 0 {
             warn(observability::event_with_payload(
@@ -7697,7 +7794,19 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             // （已含 `/v1` 前缀，见 `resolve_for_gateway_with_meta`）。
             let base_url = match source {
                 delivery::DeliverySource::Site => site.base_url.clone(),
-                delivery::DeliverySource::Gateway(endpoint) => endpoint.base_url.clone(),
+                delivery::DeliverySource::Gateway(endpoint) => {
+                    // DEBUG-G7 P2-C9（B-289）：网关源空地址拒绝写出——此前 Cline
+                    // 分支绕过 `resolve_for_gateway_with_meta` 的空地址检查，网关
+                    // 地址为空时静默写出一条无端点条目。只拦网关源：站点模式
+                    // “key only”（空 base_url）是既有语义（D4 已把空白判为空端点，
+                    // 但站点模式的无端点写入本身仍被允许），不在此改动。
+                    if endpoint.base_url.trim().is_empty() {
+                        return Err(Error::InvalidInput(
+                            "Cline 网关模式端点地址为空，拒绝写出无端点条目".to_string(),
+                        ));
+                    }
+                    endpoint.base_url.clone()
+                }
             };
             return Ok(Box::new(delivery::cline::ClineWriter::with_path_and_model(
                 variant_target,
@@ -7721,7 +7830,13 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 而不是从 writer 的产出反推（反推会把「writer 漏写」也算成「本来就不写」）。
     ///
     /// 口径与 writer 的 gating 逐字对应：endpoint 看 base_url 是否**非空**
-    /// （不 trim——writer 的 gating 就是 `!base_url.is_empty()`）；
+    /// （DEBUG-G7 P2-D4：trim 后判定——writer 的 gating 已统一为
+    /// `!base_url.trim().is_empty()`，空白串即视为无端点，不再当有效端点写盘；
+    /// 网关路径此前已 trim 校验，口径不变）；
+    ///
+    /// DEBUG-G7 P2-D8：服务层投递一律用默认 provider 名（`DEFAULT_PROVIDER_ID`）——
+    /// 见 `delivery::resolve_for_binding` 文档：自定义 provider 的调用方必须自传匹配
+    /// 的 `FieldSetOptions`，否则整单校验误杀；服务层不走自定义路，行为不变。
     /// model 看 trim 后是否非空（`resolve_for_binding_with_meta` 会 trim 并过滤空串）；
     /// meta 看 `meta_for` 的缓存快照（与 `prepare_delivery` 同一个来源）。
     /// 服务层投递一律用默认 provider 名，因此这里固定传默认 provider；
@@ -7739,9 +7854,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     .get_key(key_id)?
                     .ok_or_else(|| Error::NotFound(format!("密钥记录 #{key_id} 不存在")))?;
                 let site = self.site(row.site_id)?;
-                !site.base_url.is_empty()
+                !site.base_url.trim().is_empty()
             }
-            delivery::DeliverySource::Gateway(endpoint) => !endpoint.base_url.is_empty(),
+            delivery::DeliverySource::Gateway(endpoint) => !endpoint.base_url.trim().is_empty(),
         };
         Ok(delivery::FieldSetOptions::new(
             delivery::opencode::OpenCodeWriter::DEFAULT_PROVIDER_ID,
@@ -8198,6 +8313,162 @@ mod tests {
             backup_dir: home.join(".tianshu-relay").join("backups"),
             home,
         }
+    }
+
+    /// DEBUG-G7 P2-D7：下线通道的历史同意必须能撤销——撤销不再经过
+    /// prepare_delivery，因此即使密钥记录已不存在、通道已下线，撤销仍成功。
+    #[test]
+    fn revoke_consent_for_delisted_channel_without_delivery_resolution() {
+        let service = service_with_blocking();
+        let channel = DeliveryChannel::ClineDesktop;
+        let (target, _) =
+            delivery::resolve_variant_target(channel, &service.home, None).unwrap();
+        service
+            .store
+            .grant_consent(
+                channel.agent_id(),
+                channel.as_str(),
+                &target.display().to_string(),
+                &[],
+            )
+            .unwrap();
+        // key_id 999 根本不存在：旧路径会在 prepare_delivery 里先报 NotFound，
+        // 下线通道还会先报下线错误；新路径两者都不经过，必须成功。
+        service
+            .revoke_consent_with_variant(999, channel, None)
+            .unwrap();
+        let rows = service.list_consents().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].revoked_at.is_some(), "{rows:?}");
+    }
+
+    /// DEBUG-G7 P2-C9（B-289）：Cline 分支网关源空地址必须拒绝，不得静默
+    /// 写出无端点条目；对照组：站点源空 base_url 仍按既有“key only”语义
+    /// 构造（本项只拦网关源，不改站点模式）。
+    #[test]
+    fn cline_gateway_source_with_empty_endpoint_is_rejected() {
+        let service = service_with_blocking();
+        let site_id = service
+            .store
+            .upsert_site("test", "https://relay.example.com", "测试站")
+            .unwrap();
+        let key_id = service
+            .store
+            .insert_key(site_id, "k", &crate::vault::secret_ref("key", 1, "secret"), None, None)
+            .unwrap();
+        let empty_endpoint = delivery::GatewayEndpoint {
+            base_url: "   ".to_string(),
+            token: "test-token".to_string(),
+        };
+        let err = match service.prepare_delivery(
+            key_id,
+            DeliveryChannel::Cline,
+            None,
+            delivery::DeliverySource::Gateway(&empty_endpoint),
+            None,
+        ) {
+            Ok(_) => panic!("网关源空地址应被拒绝"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("无端点"), "{err}");
+        // 对照：站点源（站点 base_url 为空）仍构造成功——既有语义不动。
+        let blank_site_id = service.store.upsert_site("test", "", "空地址站").unwrap();
+        let blank_key_id = service
+            .store
+            .insert_key(blank_site_id, "k2", &crate::vault::secret_ref("key", 2, "secret"), None, None)
+            .unwrap();
+        service
+            .prepare_delivery(
+                blank_key_id,
+                DeliveryChannel::Cline,
+                None,
+                delivery::DeliverySource::Site,
+                None,
+            )
+            .expect("站点源空 base_url 仍按既有语义构造");
+    }
+
+    /// DEBUG-G7 P2-K1：drain 时缓冲满丢弃条数必须以 Warn 事件可见；写失败分支
+    /// 由下一个用例（FK 违规）确定性覆盖。
+    #[test]
+    fn drain_gateway_usage_buffer_warns_on_dropped_count() {
+        let store = Store::open_in_memory().expect("内存库");
+        // gateway_usage_log.site_id 有 FK 引用 sites 表（内存库 FK 开启）：
+        // 先建站点行，否则 insert 会因 FK 失败——那正好是写失败 Warn 的触发条件，
+        // 但本用例要测的是丢弃 Warn，落库必须成功。
+        let site_id = store
+            .upsert_site("test", "https://relay.example.com", "测试站")
+            .unwrap();
+        let buffer = std::sync::Mutex::new(vec![
+            crate::gateway::GatewayUsage {
+                at: unix_now_secs(),
+                site_id,
+                key_id: None,
+                model: "m".to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                total_tokens: 3,
+                status: 200,
+                latency_ms: 10,
+                attempts: 1,
+                stream: false,
+                token_id: None,
+                agent_label: String::new(),
+            },
+        ]);
+        let dropped = std::sync::atomic::AtomicU64::new(3);
+        let mut warns: Vec<Event> = Vec::new();
+        TianshuRelayService::<MockTransport>::drain_gateway_usage_buffer(
+            &store,
+            &buffer,
+            &dropped,
+            |e| warns.push(e),
+        );
+        assert!(buffer.lock().unwrap().is_empty(), "drain 后缓冲应空");
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].message.contains("丢弃 3 条"), "{}", warns[0].message);
+        assert!(warns[0].payload.as_deref().unwrap_or("").contains("\"dropped\":3"));
+        // 落库的行确实进了库（不是只记了 Warn 就丢）。
+        assert_eq!(store.recent_gateway_usage(24).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn drain_gateway_usage_buffer_warns_on_write_failure() {
+        // DEBUG-G7 P2-K1：写失败分支的确定性覆盖——用量行指向不存在的站点，
+        // FK 约束让 insert 失败，drain 必须记一条 write_failed Warn（不静默）。
+        let store = Store::open_in_memory().expect("内存库");
+        let buffer = std::sync::Mutex::new(vec![crate::gateway::GatewayUsage {
+            at: unix_now_secs(),
+            site_id: 999_001,
+            key_id: None,
+            model: "m".to_string(),
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+            status: 200,
+            latency_ms: 10,
+            attempts: 1,
+            stream: false,
+            token_id: None,
+            agent_label: String::new(),
+        }]);
+        let dropped = std::sync::atomic::AtomicU64::new(0);
+        let mut warns: Vec<Event> = Vec::new();
+        TianshuRelayService::<MockTransport>::drain_gateway_usage_buffer(
+            &store,
+            &buffer,
+            &dropped,
+            |e| warns.push(e),
+        );
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].message.contains("落库失败"), "{}", warns[0].message);
+        assert!(warns[0]
+            .payload
+            .as_deref()
+            .unwrap_or("")
+            .contains("\"write_failed\":1"));
+        assert!(store.recent_gateway_usage(24).unwrap().is_empty());
     }
 
     #[tokio::test]

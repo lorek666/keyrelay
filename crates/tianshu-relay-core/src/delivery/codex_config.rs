@@ -106,7 +106,7 @@ impl DeliveryWriter for CodexConfigWriter {
         }
         // 段内键：name / base_url / wire_api 在 fields() 写，这里也列。
         names.push(Self::FIELD_NAME.to_string());
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             names.push(Self::FIELD_BASE_URL.to_string());
         }
         names.push(Self::FIELD_WIRE_API.to_string());
@@ -123,7 +123,7 @@ impl DeliveryWriter for CodexConfigWriter {
             fields.push(literal_field(Self::FIELD_MODEL, m));
         }
         fields.push(literal_field(Self::FIELD_NAME, Self::PROVIDER_NAME));
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
         fields.push(literal_field(Self::FIELD_WIRE_API, Self::WIRE_API));
@@ -305,6 +305,23 @@ mod tests {
             .filter(|m| !m.is_empty())
             .map(str::to_string);
         w
+    }
+
+    #[test]
+    fn errors_never_echo_the_key() {
+        // DEBUG-G7 P2-K4：codex-config 文件本身不含密钥（只写端点与模型），
+        // 故 claude_code 式“畸形文件 + 真 canary”在此无密钥可回显；适用覆盖是
+        // 钉住空端点拒绝的固定文案——错误串不得插值任何调用方传入值。
+        let dir = tmp();
+        let err = writer_in(dir.path(), "")
+            .plan("CANARY-KEY-4k2m")
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains("CANARY-KEY-4k2m"), "{text}");
+        assert!(
+            text.contains("base_url 为空，拒绝写入 codex config"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -390,6 +390,10 @@ export default function Agents() {
   const [previewOnly, setPreviewOnly] = useState(false);
   const [variantOverride, setVariantOverride] = useState<string | null>(null);
 
+  // DEBUG-G7 P2-C6：Codex 保留官方登录（只写 config，不动 auth.json）。
+  // 只对 Codex 双文件单有意义；切通道时复位（与变体同理，不得带到下一通道）。
+  const [preserveAuth, setPreserveAuth] = useState(false);
+
   // 解绑（M8-S4 §5.4）。`alsoRevoke` **默认不勾**：默认路径纯本地、一个站点请求都不发。
   const [unbinding, setUnbinding] = useState(false);
   const [alsoRevoke, setAlsoRevoke] = useState(false);
@@ -405,7 +409,7 @@ export default function Agents() {
   });
 
   const plan = useQuery({
-    queryKey: ["plan", activeKey, channel, model, mode, previewOnly, variantOverride],
+    queryKey: ["plan", activeKey, channel, model, mode, previewOnly, variantOverride, preserveAuth],
     queryFn: () =>
       deliveryPlan({
         keyId: activeKey!,
@@ -414,23 +418,26 @@ export default function Agents() {
         mode,
         previewOnly: previewOnly ? true : undefined,
         targetVariant: variantOverride ?? undefined,
+        preserveAuth:
+          channel === "codex-auth-json" || channel === "codex-config" ? preserveAuth : undefined,
       }),
     enabled: activeKey !== null,
     retry: false,
   });
 
-  // 切换 key/通道/模型名/模式/预览模式/变体时，同意勾选必须重置
+  // 切换 key/通道/模型名/模式/预览模式/变体/保留开关时，同意勾选必须重置
   // （避免「上次勾过了」的错觉：预览已经变了）
   useEffect(() => {
     setAgreeChecked(false);
     setNotice(null);
     setError(null);
-  }, [activeKey, channel, model, mode, previewOnly, variantOverride]);
+  }, [activeKey, channel, model, mode, previewOnly, variantOverride, preserveAuth]);
 
-  // 切换通道时变体选择复位（变体只对 Cline 有意义，上一通道的变体
-  // 不得带到下一通道——带过去会在后端被直接拒绝，但复位更干净）。
+  // 切换通道时变体选择与保留开关复位（变体只对 Cline 有意义、保留只对 Codex
+  // 有意义，上一通道的选项不得带到下一通道——带过去会在后端被直接拒绝，但复位更干净）。
   useEffect(() => {
     setVariantOverride(null);
+    setPreserveAuth(false);
   }, [channel]);
 
   // P0-2 复审 P1-2：noChange 按全部写盘文件判定——入口无变化但另一文件有变化时，
@@ -442,17 +449,30 @@ export default function Agents() {
 
   const grantAndApply = useMutation({
     mutationFn: async () => {
-      await grantConsent({
-        keyId: activeKey!,
-        channel,
-        targetVariant: variantOverride ?? undefined,
-      });
+      // DEBUG-G7 P2-D6：一键授双文件——Codex 双文件单此前要分两次同意，首试
+      // 必败（第二文件的同意还没给）；现在一次用户动作里把两文件的同意都授了，
+      // 再调 apply。fail-closed 不变：双文件 apply 仍要求两份同意齐全，缺一即拒。
+      // preserveAuth=true 时只写 config：只授 config 那份，不授不会写的文件。
+      const isCodex = channel === "codex-auth-json" || channel === "codex-config";
+      const grantChannels = isCodex
+        ? preserveAuth
+          ? ["codex-config"]
+          : ["codex-auth-json", "codex-config"]
+        : [channel];
+      for (const grantChannel of grantChannels) {
+        await grantConsent({
+          keyId: activeKey!,
+          channel: grantChannel,
+          targetVariant: variantOverride ?? undefined,
+        });
+      }
       return applyDelivery({
         keyId: activeKey!,
         channel,
         model,
         mode,
         targetVariant: variantOverride ?? undefined,
+        preserveAuth: isCodex ? preserveAuth : undefined,
       });
     },
     onSuccess: async (outcome) => {
@@ -460,14 +480,18 @@ export default function Agents() {
       setLastOutcome(outcome);
       // 生效策略必须跟着结果一起说：用户最容易在这里以为「已经生效了」
       const hint = plan.data ? restartHintLabel(plan.data.restartHint) : "";
+      // DEBUG-G7 P2-C10：成功提示补动作与来源（与计划视图口径一致）——
+      // 只有 hint 标签时用户不知道“到底要动什么、这话从哪来”。
+      const action = plan.data ? restartHintActionLabel(plan.data.restartHintAction) : "";
+      const source = plan.data ? restartHintSourceLabel(plan.data.restartHintSource) : "";
       // P0-2 复审 P1-2：成功提示列出全部写盘路径（双文件时两条，单文件时沿用旧文案）。
       const writtenPaths = outcome.files?.length
         ? outcome.files.map((f) => f.targetPath)
         : [outcome.targetPath];
       setNotice(
         writtenPaths.length > 1
-          ? t("agents.notice.deliveredFiles", { paths: writtenPaths.join(", "), journal: outcome.journalId, hint })
-          : t("agents.notice.delivered", { path: outcome.targetPath, journal: outcome.journalId, hint }),
+          ? t("agents.notice.deliveredFiles", { paths: writtenPaths.join(", "), journal: outcome.journalId, hint, action, source })
+          : t("agents.notice.delivered", { path: outcome.targetPath, journal: outcome.journalId, hint, action, source }),
       );
       setConfirming(false);
       await qc.invalidateQueries({ queryKey: ["plan", activeKey, channel] });
@@ -1111,6 +1135,41 @@ export default function Agents() {
             <AlertTriangle size={14} aria-hidden /> {t("agents.confirmDialog.stopCodex")}
           </p>
         ) : null}
+        {/*
+          DEBUG-G7 P2-D5：Claude Desktop 与 Codex 同为“启动时读配置”的桌面应用，
+          写盘前同样会先停它——确认框里与 Codex 提示平行出现，只在 Claude Desktop
+          计划时出现。其余通道（CLI 类）不自动停进程，故不出现此类提示。
+        */}
+        {plan.data && plan.data.channel === "claude-desktop" ? (
+          <p className="warnline" role="alert">
+            <AlertTriangle size={14} aria-hidden /> {t("agents.confirmDialog.stopClaudeDesktop")}
+          </p>
+        ) : null}
+        {/*
+          DEBUG-G7 补齐 P2-D5：CLI 类通道不在停进程保证内（后端不探查、不自动停，
+          进程名无法可靠归属），故确认框对非桌面通道常驻这句——否则用户会默认
+          “所有通道写盘前都会先停进程”。桌面两通道（Codex / Claude Desktop）
+          走上面的停进程提示，不重复出现这句。
+        */}
+        {plan.data && plan.data.channel !== "codex-auth-json" && plan.data.channel !== "codex-config" && plan.data.channel !== "claude-desktop" ? (
+          <p className="warnline" role="alert">
+            <AlertTriangle size={14} aria-hidden /> {t("agents.confirmDialog.cliNotStopped")}
+          </p>
+        ) : null}
+        {/*
+          DEBUG-G7 P2-C6：Codex 保留官方登录——只在 Codex 通道出现；勾选后计划
+          重新查询（只写 config，不动 auth.json），apply 只授 config 那份同意。
+        */}
+        {plan.data && (plan.data.channel === "codex-auth-json" || plan.data.channel === "codex-config") ? (
+          <label className="checkline">
+            <input
+              type="checkbox"
+              checked={preserveAuth}
+              onChange={(e) => setPreserveAuth(e.target.checked)}
+            />
+            <span>{t("agents.confirmDialog.preserveAuth")}</span>
+          </label>
+        ) : null}
         <label className="checkline">
           <input
             type="checkbox"
@@ -1705,8 +1764,8 @@ function PlanView({
         </dd>
         {/* 生效策略：文案从 `restartHint` 取值派生，**不按通道硬编码**。
             认不出的取值原样显示（不静默留空——那会让用户以为「不需要重启」）。
-            顶层只此一份：DTO 的 files[] 条目暂无 per-file restart_hint（复审 P2-3，
-            已登记 BACKLOG，不在这里顺手改 DTO）。
+            顶层只此一份；各文件的 per-file restart_hint（DEBUG-G7 P2-C6 新增）
+            在下方文件段里各自渲染，不再只有顶层才有。
             P1-6：同一行补动作与来源标注——动作说“到底要动什么”，来源标注说
             “这话从哪来、有没有实测”；已实测徽标只在后端给 verified 时出现。 */}
         <dt>{t("agents.plan.restart")}</dt>
@@ -1836,6 +1895,15 @@ function PlanView({
               <span className="mono">{plan.dshCredentialReference.unreadableFiles.join("、")}</span>
             </p>
           ) : null}
+          {/* DEBUG-G7 P2-C4：读失败的目录单独列出——它不是“无 profile”，
+              旧后端不返回该字段时按空处理，整段不渲染。 */}
+          {(plan.dshCredentialReference.unreadableDirs ?? []).length > 0 ? (
+            <p className="warnline" role="alert">
+              <AlertTriangle size={14} aria-hidden />{" "}
+              {t("agents.plan.dshReference.unreadableDirsLabel")}{" "}
+              <span className="mono">{(plan.dshCredentialReference.unreadableDirs ?? []).join("、")}</span>
+            </p>
+          ) : null}
           <p className="muted">{t("agents.plan.dshReference.failClosed")}</p>
         </section>
       ) : null}
@@ -1861,6 +1929,20 @@ function PlanView({
                 </span>
               ))}
             </dd>
+            {/* DEBUG-G7 P2-C6：per-file 提示——该文件自己的 warnings（旧后端
+                不返回时不渲染，不画假状态；顶层 warnings 仍在上方单独渲染）。 */}
+            {(file.warnings ?? []).length > 0 ? (
+              <>
+                <dt>{t("agents.plan.fileWarningsTitle")}</dt>
+                <dd>
+                  {(file.warnings ?? []).map((w) => (
+                    <p key={w} className="warnline">
+                      <AlertTriangle size={14} aria-hidden /> {w}
+                    </p>
+                  ))}
+                </dd>
+              </>
+            ) : null}
             {/*
               P1-7：首次导入展示（只读预览，不是投递内容）。只在该文件
               算首次且导入到了值时出现；导入值绝不自动成为投递内容，

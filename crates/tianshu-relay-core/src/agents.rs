@@ -381,6 +381,59 @@ pub fn detect_agents(home: &Path) -> Vec<AgentStatus> {
     })
 }
 
+/// DEBUG-G7 P2-C3：Cline CLI 探针（B-291 应用内路径之 ① PATH 检测）。
+///
+/// 只做检测，不写盘、不调 `cline auth`：直写代码不在本组范围（ADR-0006 §9
+/// 的下线裁定不变），本探针 + 可复制命令是给下线通道留的应用内路径。
+/// 复用 `find_bin` 的加宽搜索（home bin + Homebrew + 系统目录 + `PATH`），
+/// 因此“没找到”必须与“确实未安装”区分开写进 `note`——GUI 进程 PATH 假阴性
+/// （C2 ③）下，前者只是“本应用的搜索范围里没见到”。
+/// 版本用 `run_version`（5s 超时，stdout 优先、stderr 兜底）；拿不到版本时
+/// `version` 为 `None`，文案写“版本未确认”，不得编造版本号。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClineCliProbe {
+    pub found: bool,
+    pub path: Option<String>,
+    pub version: Option<String>,
+    pub note: String,
+}
+
+pub fn probe_cline_cli(home: &Path) -> ClineCliProbe {
+    let Some(path) = find_bin("cline", home) else {
+        return ClineCliProbe {
+            found: false,
+            path: None,
+            version: None,
+            note: "在应用的搜索范围（家目录 bin、Homebrew、系统目录、PATH）里没找到 cline CLI；这不等于确实未安装——经 Finder/Dock 启动的应用 PATH 较窄，终端里能跑的 cline 也可能在这里查不到。请按下方命令在终端确认，或装好 CLI 后点“重新检测”。".to_string(),
+        };
+    };
+    let path_display = path.display().to_string();
+    match run_version(&path, &["--version"]) {
+        VersionRun::Ok(version) => ClineCliProbe {
+            found: true,
+            path: Some(path_display),
+            version: version.clone(),
+            note: match version {
+                Some(_) => "已找到 cline CLI。".to_string(),
+                None => "已找到 cline CLI，但版本未确认（--version 未返回可解析的版本号）。".to_string(),
+            },
+        },
+        VersionRun::TimedOut => ClineCliProbe {
+            found: true,
+            path: Some(path_display),
+            version: None,
+            note: "已找到 cline CLI，但版本探测超时（5 秒），版本未确认；可点“重新检测”再试一次。".to_string(),
+        },
+        VersionRun::Failed(reason) => ClineCliProbe {
+            found: true,
+            path: Some(path_display),
+            version: None,
+            note: format!("已找到 cline CLI，但版本命令执行失败（{reason}），版本未确认。"),
+        },
+    }
+}
+
 /// 探测单个 agent。
 pub fn detect_one(spec: &AgentSpec, home: &Path) -> AgentStatus {
     match spec.probe {
@@ -815,6 +868,39 @@ fn read_package_version(package_json: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_cline_cli_finds_fake_bin_and_reports_not_found_without_claiming_uninstalled() {
+        // DEBUG-G7 P2-C3：家目录 bin 里有可执行 cline 时 found=true 且版本可解析；
+        // 空家目录时 found=false，且 note 必须写清“搜索范围里没找到 ≠ 确实未安装”。
+        let dir = tempfile::tempdir().expect("临时目录");
+        let bin_dir = dir.path().join(".local").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let script = bin_dir.join("cline");
+        std::fs::write(&script, "#!/bin/sh\necho \"cline 1.2.3\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let found = probe_cline_cli(dir.path());
+        assert!(found.found);
+        assert_eq!(found.version.as_deref(), Some("1.2.3"));
+        assert_eq!(found.path.as_deref(), Some(script.display().to_string().as_str()));
+
+        // 注：本断言假设运行环境的 PATH 与系统目录里没有 cline（CI/VM 成立）；
+        // 若机器上装有 cline，find_bin 会在系统目录/PATH 里找到它，found 即为真。
+        let empty = tempfile::tempdir().expect("临时目录");
+        let missing = probe_cline_cli(empty.path());
+        assert!(!missing.found);
+        assert!(missing.path.is_none());
+        assert!(missing.version.is_none());
+        assert!(
+            missing.note.contains("不等于确实未安装"),
+            "{}",
+            missing.note
+        );
+    }
 
     #[test]
     fn specs_cover_exactly_the_delivery_channels_in_order() {

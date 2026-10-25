@@ -260,6 +260,11 @@ export type DshReferenceCheck = {
   checkedFiles: string[];
   referencingFiles: string[];
   unreadableFiles: string[];
+  /**
+   * DEBUG-G7 P2-C4：扫描时读失败的目录（不是“无 profile”）。可选：旧后端
+   * 不返回时按空处理，不得把“没返回”读成“没有读失败”。
+   */
+  unreadableDirs?: string[];
 };
 
 /**
@@ -389,6 +394,16 @@ export type DeliveryFilePlan = {
   /** P1-7：该文件的首次投递判定与只读导入（与顶层同口径）。 */
   isFirstDelivery: boolean;
   importedFields: DeliveryField[];
+  /**
+   * DEBUG-G7 P2-C6：per-file 提示（与顶层同源，按该文件通道/路径算）。
+   * 全部可选：旧后端不返回时，前端仍渲染顶层视图，不画假状态。
+   */
+  warnings?: string[];
+  restartHint?: string;
+  restartHintSource?: string;
+  restartHintAction?: string;
+  endpointInChannel?: boolean;
+  agentId?: string;
 };
 
 /** 投递模式（M8-S4 §6.2）。缺省 = `"site"`：既有调用点的行为一字不变。 */
@@ -1318,8 +1333,10 @@ export function isClineDesktopDelistedError(err: unknown): boolean {
   return err instanceof Error && err.message.includes("暂不支持文件直写");  // i18n:skip
 }
 
-/** 下线错误 → 本地化文案；不是下线错误时返回 null（调用方原样透传）。 */
-function localizeDelistedError(err: unknown): string | null {
+/** 下线错误 → 本地化文案；不是下线错误时返回 null（调用方原样透传）。
+ * DEBUG-G7 P2-F2：导出以便前端测试钉住映射——`deliveryPlan` 与 `applyDelivery`
+ * 的 catch 块共用本函数，一处改措辞两路同失效，故映射本身必须有单测。 */
+export function localizeDelistedError(err: unknown): string | null {
   if (!isClineDesktopDelistedError(err)) return null;
   return translate(getCurrentDict(), "agents.delivery.clineDesktopDelisted");
 }
@@ -2505,6 +2522,31 @@ export type AgentStatus = {
   installUrl: string | null;
 };
 
+export type ClineCliProbe = {
+  found: boolean;
+  path: string | null;
+  version: string | null;
+  note: string;
+};
+
+/**
+ * Cline CLI 探针（DEBUG-G7 P2-C3，命令 `cline_cli_probe`，只读）。
+ *
+ * 浏览器预览无 Tauri：返回“搜索范围里没找到”的 mock（不谎称已安装）。
+ * “没找到”不等于“未安装”，见后端 `probe_cline_cli` 的 note。
+ */
+export async function clineCliProbe(): Promise<ClineCliProbe> {
+  if (!hasTauri) {
+    return mock({
+      found: false,
+      path: null,
+      version: null,
+      note: "浏览器预览无真实检测：在应用的搜索范围里没找到 cline CLI；这不等于确实未安装。", // i18n:skip
+    });
+  }
+  return invokeCommand<ClineCliProbe>("cline_cli_probe");
+}
+
 export async function detectAgents(): Promise<AgentStatus[]> {
   if (!hasTauri) {
     const missing = (channel: string): AgentStatus => ({
@@ -2518,8 +2560,9 @@ export async function detectAgents(): Promise<AgentStatus[]> {
       ],
       installUrl: "https://example.com/install",
     });
-    // 与真实后端一样返回全部 20 条：只给 5 条会让其余行落到「状态未知」，
-    // 浏览器预览里就看不到完整的工作台。
+    // 与真实后端检测清单的区别：后端 detect_agents 返回 20 条检测规格（含已下线
+    // 的 cline-desktop 检测保留），浏览器 mock 只按可投递的 19 条 AGENT_CHANNELS
+    // 出——只给 5 条会让其余行落到「状态未知」，浏览器预览里就看不到完整的工作台。
     const installedMock: Record<string, AgentStatus> = {
       "codex-auth-json": {
         channel: "codex-auth-json",
@@ -2658,7 +2701,7 @@ export type AgentUpdateOutcome = {
  */
 export async function checkAgentUpdates(): Promise<AgentUpdateStatus[]> {
   if (!hasTauri) {
-    // 浏览器预览：与 spec §4.3 的 mock 口径一致 —— 20 条、顺序同后端（= AGENT_CHANNELS 的值序）。
+    // 浏览器预览：与 spec §4.3 的 mock 口径一致 —— 19 条、顺序同后端（= AGENT_CHANNELS 的值序）。
     // codex 两个通道可更新、claude 可更新、dsh 已最新、grok 不支持检查、其余未安装。
     const notInstalled = (channel: string): AgentUpdateStatus => ({
       channel,

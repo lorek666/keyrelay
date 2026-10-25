@@ -207,7 +207,7 @@ impl OpenCodeWriter {
                 Self::FIELD_API_KEY.to_string(),
                 Value::String(api_key.to_string()),
             );
-            if self.base_url.is_empty() {
+            if self.base_url.trim().is_empty() {
                 // base_url 为空表示「只投递密钥」：不动用户已有的 baseURL。
             } else {
                 options.insert(
@@ -222,6 +222,15 @@ impl OpenCodeWriter {
         }
 
         // M14-S7：写入模型参数到 provider.<id>.models.<id>.limit.{context,output}
+        //
+        // DEBUG-G7 P2-D3（B-273，显性标注、不改键）：第二 `<id>` 用的是
+        // `provider_id` 而非模型名，且该键不在 `fields()`、也不在必填表里——
+        // writer 回归删掉它时整单校验仍放行（见 `delivery/mod.rs` 的表注释）。
+        // opencode 官方 schema 未在本机核实：schema 要求模型 id 还是 provider 名、
+        // `limit.*` 是不是合法键，均未定论；**在核实前不得凭猜测改键**（改错键
+        // 等于把参数写到一个 OpenCode 不读的位置，比脱钩更糟）。本注释 + 下面的
+        // `limit_keys_are_written_but_outside_field_table` 用例共同钉住当前行为：
+        // 键照写、表照旧不含它；schema 核实后另立项决定归属。
         if let Some(meta) = self.meta {
             let providers = object_entry(&mut root, Self::PROVIDER_KEY, &self.path)?;
             let provider = object_entry(providers, &self.provider_id, &self.path)?;
@@ -253,7 +262,7 @@ impl DeliveryWriter for OpenCodeWriter {
 
     fn field_names(&self) -> Vec<String> {
         let mut names = vec![self.qualified_field(Self::FIELD_API_KEY)];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             names.push(self.qualified_field(Self::FIELD_BASE_URL));
         }
         if self.model.is_some() {
@@ -267,7 +276,7 @@ impl DeliveryWriter for OpenCodeWriter {
             self.qualified_field(Self::FIELD_API_KEY),
             api_key,
         )];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             fields.push(literal_field(
                 self.qualified_field(Self::FIELD_BASE_URL),
                 &self.base_url,
@@ -343,6 +352,41 @@ mod tests {
 
     fn parsed(text: &str) -> Value {
         serde_json::from_str(text).expect("应是合法 JSON")
+    }
+
+    #[test]
+    fn limit_keys_are_written_but_outside_field_table() {
+        // DEBUG-G7 P2-D3：钉住当前行为——limit.* 照写（第二 <id> 为 provider_id），
+        // 但 fields() 与整单校验的必填表仍不含 limit 键；schema 核实前不改键。
+        let dir = tmp();
+        let meta = crate::model_meta::ModelMeta {
+            context_window: 200_000,
+            max_output_tokens: 32_000,
+        };
+        let writer = OpenCodeWriter::with_path_and_meta(
+            dir.path().join("opencode.json"),
+            DeliveryChannel::OpenCode,
+            PROVIDER,
+            BASE,
+            Some(MODEL),
+            Some(meta),
+        );
+        let patch = writer.plan(SECRET).unwrap();
+        let after = parsed(&patch.after);
+        assert_eq!(after["provider"][PROVIDER]["models"][PROVIDER]["limit"]["context"], 200_000);
+        assert_eq!(after["provider"][PROVIDER]["models"][PROVIDER]["limit"]["output"], 32_000);
+        let names = writer_in(dir.path(), BASE, Some(MODEL)).field_names();
+        assert!(!names.iter().any(|n| n.contains("limit")), "{names:?}");
+        // 整单校验仍放行（limit 键既不在必填表、也不在 fields 里，不触发误杀/缺失）。
+        let fields = writer.fields(SECRET);
+        let opts = crate::delivery::FieldSetOptions::new(PROVIDER, true, true, true);
+        crate::delivery::validate_plan_fields(
+            DeliveryChannel::OpenCode,
+            &fields,
+            &opts,
+            writer.target_path().as_path(),
+        )
+        .unwrap();
     }
 
     #[test]

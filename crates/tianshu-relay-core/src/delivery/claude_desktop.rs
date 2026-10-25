@@ -56,7 +56,7 @@ impl DeliveryWriter for ClaudeDesktopWriter {
 
     fn field_names(&self) -> Vec<String> {
         let mut names = vec![Self::FIELD_TOKEN.to_string()];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             names.push(Self::FIELD_BASE_URL.to_string());
         }
         names
@@ -64,7 +64,7 @@ impl DeliveryWriter for ClaudeDesktopWriter {
 
     fn fields(&self, api_key: &str) -> Vec<DeliveryField> {
         let mut fields = vec![masked_field(Self::FIELD_TOKEN, api_key)];
-        if !self.base_url.is_empty() {
+        if !self.base_url.trim().is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
         }
         fields
@@ -121,7 +121,7 @@ fn build_after(before: &str, api_key: &str, base_url: &str, path: &Path) -> Resu
             ClaudeDesktopWriter::FIELD_TOKEN.to_string(),
             Value::String(api_key.to_string()),
         );
-        if !base_url.is_empty() {
+        if !base_url.trim().is_empty() {
             env.insert(
                 ClaudeDesktopWriter::FIELD_BASE_URL.to_string(),
                 Value::String(base_url.to_string()),

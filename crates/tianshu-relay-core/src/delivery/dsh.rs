@@ -128,6 +128,8 @@ pub struct DshReferenceCheck {
     pub referencing_files: Vec<PathBuf>,
     /// 存在但读失败的文件（不算引用；拒绝文案里点名）。
     pub unreadable_files: Vec<PathBuf>,
+    /// 扫描时读失败的目录（不算“无 profile”；拒绝文案里点名，见 P2-C4）。
+    pub unreadable_dirs: Vec<PathBuf>,
 }
 
 impl DshReferenceCheck {
@@ -150,20 +152,55 @@ pub fn profiles_dir(home: &Path) -> PathBuf {
 
 /// 递归收集 `profiles_dir` 下的全部 `*.patch.yml`（已排序）。
 ///
-/// 目录不存在、不可读时返回空（不报错）：调用方用 `checked_files.is_empty()`
-/// 区分“无 profile”与“有 profile 未引用”，读失败的单文件则在
-/// `check_credential_reference_in` 里另记一笔，不在这里吞掉。
-fn profile_patch_files(profiles_dir: &Path) -> Vec<PathBuf> {
+/// DEBUG-G7 P2-C4（B-278 / B-279）：此前 `read_dir` 失败 `continue` 静默吞掉、
+/// `path.is_dir()` 跟随 symlink、无 visited 集、无深度上限。本实现：
+/// - 目录读失败记入 `unreadable_dirs`（调用方在文案里点名，不再把“目录不可读”
+///   误写成“无 profile，请先建 profile”）；
+/// - 嵌套的 symlink 条目（目录或文件）一律不跟随：`DirEntry::file_type` 不解析
+///   链接，symlink 环因此无法让遍历不终止；
+/// - 规范路径 visited 集 + 深度上限（`MAX_SCAN_DEPTH`）：同一目录经不同路径
+///   到达只扫一次，超深嵌套直接截断。
+/// - 「任一引用即通过」的判定语义不变（见 `check_credential_reference_in`）。
+const MAX_SCAN_DEPTH: usize = 8;
+
+fn profile_patch_files(profiles_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut out: Vec<PathBuf> = Vec::new();
-    let mut stack: Vec<PathBuf> = vec![profiles_dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+    let mut unreadable_dirs: Vec<PathBuf> = Vec::new();
+    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(profiles_dir.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        // 根目录本身按调用方给定的路径走（不要求它先规范化）；嵌套目录用规范路径去重。
+        if depth > 0 {
+            let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            if !visited.insert(canonical) {
+                continue;
+            }
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
+            if !unreadable_dirs.contains(&dir) {
+                unreadable_dirs.push(dir.clone());
+            }
             continue;
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                if !unreadable_dirs.contains(&dir) {
+                    unreadable_dirs.push(dir.clone());
+                }
+                continue;
+            };
+            // 不跟随 symlink：file_type 不解析链接，链接到目录的条目也不会被当成目录入栈。
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
+            if file_type.is_dir() {
+                if depth < MAX_SCAN_DEPTH {
+                    stack.push((path, depth + 1));
+                }
             } else if path
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy().ends_with(".patch.yml"))
@@ -173,7 +210,8 @@ fn profile_patch_files(profiles_dir: &Path) -> Vec<PathBuf> {
         }
     }
     out.sort();
-    out
+    unreadable_dirs.sort();
+    (out, unreadable_dirs)
 }
 
 /// 一行文本是否以 `apiKeyEnv: <凭据名>` 的形态引用该凭据。
@@ -220,7 +258,7 @@ pub fn check_credential_reference(home: &Path) -> DshReferenceCheck {
 
 /// 对给定的 profiles 目录做校验（`DshWriter::reference_check` 与测试的入口）。
 pub fn check_credential_reference_in(profiles_dir: &Path) -> DshReferenceCheck {
-    let checked_files = profile_patch_files(profiles_dir);
+    let (checked_files, unreadable_dirs) = profile_patch_files(profiles_dir);
     let mut referencing_files: Vec<PathBuf> = Vec::new();
     let mut unreadable_files: Vec<PathBuf> = Vec::new();
     for path in &checked_files {
@@ -242,6 +280,7 @@ pub fn check_credential_reference_in(profiles_dir: &Path) -> DshReferenceCheck {
         checked_files,
         referencing_files,
         unreadable_files,
+        unreadable_dirs,
     }
 }
 
@@ -265,6 +304,17 @@ pub fn unreferenced_error(check: &DshReferenceCheck, target: &Path) -> Error {
             check.credential_name,
             check.profiles_dir.join("desktop").join("cordis.patch.yml").display()
         ));
+        if !check.unreadable_dirs.is_empty() {
+            let dirs = check
+                .unreadable_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("、");
+            reason.push_str(&format!(
+                "；注意：以下目录扫描时读失败（不是“无 profile”）：{dirs}，请先修权限再重投"
+            ));
+        }
     } else {
         let files = check
             .checked_files
@@ -296,6 +346,30 @@ pub fn unreferenced_error(check: &DshReferenceCheck, target: &Path) -> Error {
     Error::inject(target, reason)
 }
 
+/// `refs_body`（`refs:` 行之后的部分）里 `refs:` 段本身的字节长度。
+///
+/// DEBUG-G7 P2-D1：段边界 = 之后第一个**顶格**（行首无空白）的非空行——YAML 顶层
+/// 键（`records:` / `version:` / 其它段）都在顶格，`refs:` 段内的条目一律缩进。
+/// 旧实现把 `refs:` 行之后整个文件剩余部分都当成段体，段不在末尾时追加会落到
+/// 后续段里（回读只搜叶键仍放行，错写静默成立）。本函数让追加/替换严格发生在
+/// 段内：段外内容原样保留在追加点之后。
+fn refs_segment_len(refs_body: &str) -> usize {
+    let mut offset = 0usize;
+    for chunk in refs_body.split_inclusive('\n') {
+        let line = chunk.strip_suffix('\n').unwrap_or(chunk);
+        let trimmed = line.trim();
+        if !trimmed.is_empty()
+            && !line.starts_with(' ')
+            && !line.starts_with('\t')
+            && !trimmed.starts_with('#')
+        {
+            break;
+        }
+        offset += chunk.len();
+    }
+    offset
+}
+
 fn build_after(before: &str, api_key: &str, path: &Path) -> Result<String> {
     if api_key.trim().is_empty() {
         return Err(Error::inject(path, "密钥为空，拒绝写入"));
@@ -313,42 +387,57 @@ fn build_after(before: &str, api_key: &str, path: &Path) -> Result<String> {
             .map(|p| p + 1)
             .unwrap_or(after_header.len());
         let refs_body = &after_header[newline_after_header..];
+        // 段内部分与段外部分（后续段）分开：一切操作只动段内。
+        let segment_len = refs_segment_len(refs_body);
+        let (refs_segment, refs_rest) = refs_body.split_at(segment_len);
 
-        // 在 refs_body 里找 KEYRELAY_API_KEY 行
-        if let Some(key_pos) = find_ref_line(refs_body, KEY_NAME) {
-            // 替换这一行
-            let line_end = refs_body[key_pos..]
+        // 在段内找 KEYRELAY_API_KEY 行
+        if let Some(key_pos) = find_ref_line(refs_segment, KEY_NAME) {
+            // 替换这一行（段内偏移，段外原样）
+            let line_end = refs_segment[key_pos..]
                 .find('\n')
                 .map(|p| key_pos + p)
-                .unwrap_or(refs_body.len());
-            let before_key = &refs_body[..key_pos];
-            let after_key = &refs_body[line_end..];
+                .unwrap_or(refs_segment.len());
+            let before_key = &refs_segment[..key_pos];
+            let after_key = &refs_segment[line_end..];
             let mut result = String::with_capacity(
                 before_refs.len()
                     + newline_after_header
-                    + before_key.len()
+                    + refs_segment.len()
                     + target_line.len()
-                    + after_key.len(),
+                    + refs_rest.len(),
             );
             result.push_str(before_refs);
             result.push_str(&after_header[..newline_after_header]);
             result.push_str(before_key);
             result.push_str(&target_line);
+            // 段内被替换行若是段末行且无尾换行、段外还有后续段：补一个换行，
+            // 否则目标行会与下一段头粘连成一行。
+            if after_key.is_empty() && !refs_rest.is_empty() {
+                result.push('\n');
+            }
             result.push_str(after_key);
+            result.push_str(refs_rest);
             Ok(result)
         } else {
-            // 在 refs 段末尾追加
+            // 在 refs 段末尾追加（即段外内容之前，不是文件末尾）
             let mut result = String::with_capacity(
-                before_refs.len() + newline_after_header + refs_body.len() + target_line.len() + 1,
+                before_refs.len()
+                    + newline_after_header
+                    + refs_segment.len()
+                    + target_line.len()
+                    + 1
+                    + refs_rest.len(),
             );
             result.push_str(before_refs);
             result.push_str(&after_header[..newline_after_header]);
-            result.push_str(refs_body);
-            if !refs_body.is_empty() && !refs_body.ends_with('\n') {
+            result.push_str(refs_segment);
+            if !refs_segment.is_empty() && !refs_segment.ends_with('\n') {
                 result.push('\n');
             }
             result.push_str(&target_line);
             result.push('\n');
+            result.push_str(refs_rest);
             Ok(result)
         }
     } else {
@@ -454,6 +543,65 @@ mod tests {
     }
 
     #[test]
+    fn refs_not_last_appends_inside_refs_section() {
+        // DEBUG-G7 P2-D1：refs 不在末尾时，追加必须落在 refs 段内、后续段之前，
+        // 不能落到文件末尾（后续段里）。
+        let dir = tmp();
+        let before = "version: 1\nrefs:\n  TIANSHU_API_KEY: sk-other\nrecords:\n  some-key:\n    kind: grant\n";
+        std::fs::write(writer_in(dir.path()).path(), before).unwrap();
+        let patch = writer_in(dir.path()).plan(SECRET).unwrap();
+        let refs_pos = patch.after.find("refs:").unwrap();
+        let key_pos = patch.after.find("KEYRELAY_API_KEY:").unwrap();
+        let records_pos = patch.after.find("records:").unwrap();
+        assert!(refs_pos < key_pos && key_pos < records_pos, "{}", patch.after);
+        assert!(patch.after.contains("  some-key:\n    kind: grant\n"), "{}", patch.after);
+    }
+
+    #[test]
+    fn refs_not_last_does_not_replace_later_section_key() {
+        // 后续段里若有同名行，替换/追加都只动 refs 段：段外同名行原样保留，
+        // 且 refs 段里应新出现一行（不是把段外那行当成已存在）。
+        let dir = tmp();
+        let before = "version: 1\nrefs:\n  TIANSHU_API_KEY: sk-other\nother:\n  KEYRELAY_API_KEY: sk-elsewhere\n";
+        std::fs::write(writer_in(dir.path()).path(), before).unwrap();
+        let patch = writer_in(dir.path()).plan(SECRET).unwrap();
+        assert!(patch.after.contains("KEYRELAY_API_KEY: sk-elsewhere"), "{}", patch.after);
+        assert_eq!(patch.after.matches("KEYRELAY_API_KEY:").count(), 2, "{}", patch.after);
+        let refs_pos = patch.after.find("refs:").unwrap();
+        let other_pos = patch.after.find("other:").unwrap();
+        let new_key_pos = patch.after.find(&format!("KEYRELAY_API_KEY: {SECRET}")).unwrap();
+        assert!(refs_pos < new_key_pos && new_key_pos < other_pos, "{}", patch.after);
+    }
+
+    #[test]
+    fn scan_skips_symlink_loop_and_terminates() {
+        // DEBUG-G7 P2-C4：profiles 下有指向父目录的 symlink 时遍历必须终止，
+        // 且仍能找到真实 patch 文件（不跟随 symlink）。
+        let dir = tmp();
+        let profiles = dir.path().join("profiles");
+        let real = profiles.join("desktop");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("cordis.patch.yml"), "apiKeyEnv: KEYRELAY_API_KEY\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&profiles, profiles.join("loop")).unwrap();
+        let check = check_credential_reference_in(&profiles);
+        assert!(check.is_referenced());
+        assert_eq!(check.checked_files.len(), 1);
+    }
+
+    #[test]
+    fn scan_records_unreadable_root_dir_instead_of_claiming_no_profiles() {
+        // DEBUG-G7 P2-C4：根目录本身读失败时记入 unreadable_dirs，文案不得
+        // 只说“无 profile”（那会误导用户去建 profile 而非修权限）。
+        let dir = tmp();
+        let missing = dir.path().join("no-such-profiles");
+        let check = check_credential_reference_in(&missing);
+        assert!(check.has_no_profiles());
+        assert_eq!(check.unreadable_dirs, vec![missing.clone()]);
+        let err = unreferenced_error(&check, writer_in(dir.path()).path()).to_string();
+        assert!(err.contains("读失败"), "{err}");
+    }
+    #[test]
     fn replaces_existing_key() {
         let dir = tmp();
         let before = "version: 1\nrefs:\n  KEYRELAY_API_KEY: sk-old\n  TIANSHU_API_KEY: sk-keep\n";
@@ -494,9 +642,20 @@ mod tests {
 
     #[test]
     fn errors_never_echo_the_key() {
+        // DEBUG-G7 P3-K1：旧测试是空洞的——`plan("")` 后断言错误串不含从未传入
+        // 的字面量，什么都拦不住。DSH 的 build_after 没有解析步骤：唯一接收密钥
+        // 的错误路径就是空密钥检查（只判空、不插值）。本用例改为钉住该错误串的
+        // 固定形态：空白密钥（含空格）报错时错误串必须逐字等于固定文案 + 路径，
+        // 不得把传入的密钥值拼进去。claude_code 式“畸形旧文件 + 真 canary”在此
+        // 不适用——DSH 写盘是行级操作，畸形旧文件不会产生带密钥的解析错误。
         let dir = tmp();
-        let err = writer_in(dir.path()).plan("").unwrap_err();
-        assert!(!err.to_string().contains("SECRET"), "{err}");
+        let path = writer_in(dir.path()).path().to_path_buf();
+        let err = writer_in(dir.path()).plan("   ").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("写入失败 {}: 密钥为空，拒绝写入", path.display()),
+            "{err}"
+        );
     }
 
     // ---- P0-3：凭据引用校验 ----

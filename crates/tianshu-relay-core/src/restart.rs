@@ -18,10 +18,16 @@
 //! 其余 CLI 类 agent 不走本命令拉终端进程——前端只给可复制的启动命令，由用户自己在终端跑
 //! （[`RestartSpec::manual_launch_command`]；Codex 为 `codex`，Claude Desktop 没有 CLI 命令）。
 //!
-//! 写前停 Codex（[`stop_for_write`]）：投递写盘路径在写 Codex 配置前调它——先停、再探查，
-//! 探查到仍在写的进程就拒绝写入，绝不在疑似写入进行时写盘。注意它**只停、不拉起**，
-//! 拉起永远是用户在前端点了重启按钮之后的事。探查是 fail-closed 的：探查工具本身失败
-//! （读不到进程表）也按「仍在跑」处理，宁可拒绝一次写入，也不赌。
+//! DEBUG-G7 补齐 P2-D5：CLI 类**不在停进程保证内**（不只“不走重启命令”）：
+//! 进程名无法可靠归属到通道，误停会中断用户任务，故投递写盘前也不探查、
+//! 不警告拦截；唯一处置是投递确认框对非桌面通道的常驻提示。轮换路径无
+//! 确认框，该提示在轮换侧缺位，见 B-283。
+//!
+//! 写前停桌面应用（[`stop_for_write`]）：投递写盘路径在写 Codex / Claude Desktop
+//! 配置前调它——先停、再探查，探查到仍在写的进程就拒绝写入，绝不在疑似写入进行时
+//! 写盘。注意它**只停、不拉起**，拉起永远是用户在前端点了重启按钮之后的事。探查是
+//! fail-closed 的：探查工具本身失败（读不到进程表）也按「仍在跑」处理，宁可拒绝一次
+//! 写入，也不赌。
 //!
 //! app-server daemon 是**独立验证项**，不是本命令的返回值里能打勾的一项：外部资料称
 //! CLI 0.157 起共享 app-server 在内存里留旧配置，只杀窗口可能不生效。本模块的每次结果
@@ -286,6 +292,12 @@ fn writer_force_kill_commands(
 /// macOS 按 bundle id 拉起；Windows 用 `start`（首个空串是窗口标题占位，不是参数）；
 /// Linux 按名从 PATH 执行。拉起失败（程序没装 / 注册表没登记）会以 spawn 错误返回，
 /// 调用方必须把它报成失败，不得把「叫了拉起」当成「已拉起」。
+///
+/// DEBUG-G7 P2-C9（B-284）显性标注：**本函数三平台拉起路径均无真机验证**——
+/// VM 证据只证明 Linux 上应用不存在时以清晰“拉起失败”告终（明确错误而非静默
+/// 成功），不证明任何一台真实机器上拉起了应用。Linux 上 ChatGPT 桌面应用本身
+/// 是否存在亦存疑。调用方/前端不得把本命令呈现为“已验证可拉起”；Linux 上该
+/// 按钮应隐藏或注明平台范围（见 BACKLOG B-284，后续小步：真机验证两平台路径）。
 pub fn launch_command(platform: RestartPlatform, spec: &RestartSpec) -> (String, Vec<String>) {
     match platform {
         RestartPlatform::MacOs => (
@@ -769,6 +781,17 @@ mod tests {
 
     fn claude() -> RestartSpec {
         spec(RestartTarget::ClaudeDesktop)
+    }
+
+    #[test]
+    fn stop_for_write_accepts_claude_desktop_target_when_absent() {
+        // DEBUG-G7 P2-D5：Claude Desktop 与 Codex 同为 RestartTarget，走同一
+        // stop_for_write 机器；本机无该应用时应直接放行（was_running=false），
+        // 而不是因目标不支持而报错。真机上应用在跑时停进程的路径不在本机覆盖。
+        let outcome = stop_for_write(RestartTarget::ClaudeDesktop).unwrap();
+        assert!(!outcome.was_running);
+        assert!(outcome.stopped);
+        assert!(!outcome.force_killed);
     }
 
     #[test]

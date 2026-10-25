@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cline-cli-probe"
+description = "Enables the cline_cli_probe command without any pre-configured scope."
+commands.allow = ["cline_cli_probe"]
+
+[[permission]]
+identifier = "deny-cline-cli-probe"
+description = "Denies the cline_cli_probe command without any pre-configured scope."
+commands.deny = ["cline_cli_probe"]
