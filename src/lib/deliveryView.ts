@@ -34,6 +34,82 @@ export function shouldWarnEndpointOutOfScope(
 }
 
 /**
+ * P2-8：模型验证 code → i18n 键后缀（纯函数，不碰 React、不碰网络）。
+ *
+ * 为什么要这一层而不是在页面里拼 `t("agents.plan.modelValidation.probe." + code)`：
+ * 动态拼键在字典缺键时会静默回落成键名本身，用户看到一串英文键——
+ * 而这里把「未知 code → 通用文案」钉死：后端将来新增 code 时页面先显示
+ * 通用说明，不会把键名当文案，更不会把未知状态误当成通过。
+ * 后端 code 集合见 `src/lib/api.ts` 的 `ModelValidation` 注释。
+ */
+export function modelValidationStaticKey(code: string | undefined): string {
+  switch (code) {
+    case "no_model":
+      return "agents.plan.modelValidation.static.noModel";
+    case "channel_no_model":
+      return "agents.plan.modelValidation.static.channelNoModel";
+    case "malformed":
+      return "agents.plan.modelValidation.static.malformed";
+    case "unchecked":
+      return "agents.plan.modelValidation.static.unchecked";
+    default:
+      return "agents.plan.modelValidation.static.unchecked";
+  }
+}
+
+export function modelValidationProbeKey(code: string | undefined): string {
+  switch (code) {
+    case "passed":
+      return "agents.plan.modelValidation.probe.passed";
+    // P2-8 复审 P1：网关专属 code 必须显式映射，不得落入 default（unresolved）
+    // ——default 文案是「没能向端点发问」，与「问过本地网关目录、只是口径有限」
+    // 是两回事；且网关警告 code 绝不能被误读为硬拦（见 modelValidationBlocks）。
+    case "passed_gateway_catalog":
+      return "agents.plan.modelValidation.probe.passedGatewayCatalog";
+    case "unauthorized":
+      return "agents.plan.modelValidation.probe.unauthorized";
+    case "forbidden":
+      return "agents.plan.modelValidation.probe.forbidden";
+    case "not_in_catalog":
+      return "agents.plan.modelValidation.probe.notInCatalog";
+    case "not_in_gateway_catalog":
+      return "agents.plan.modelValidation.probe.notInGatewayCatalog";
+    case "empty_catalog":
+      return "agents.plan.modelValidation.probe.emptyCatalog";
+    case "bad_response":
+      return "agents.plan.modelValidation.probe.badResponse";
+    case "unexpected_status":
+      return "agents.plan.modelValidation.probe.unexpectedStatus";
+    case "unreachable":
+      return "agents.plan.modelValidation.probe.unreachable";
+    case "timeout":
+      return "agents.plan.modelValidation.probe.timeout";
+    case "unresolved":
+      return "agents.plan.modelValidation.probe.unresolved";
+    case "skipped":
+      return "agents.plan.modelValidation.probe.skipped";
+    default:
+      return "agents.plan.modelValidation.probe.unresolved";
+  }
+}
+
+/**
+ * P2-8：验证结果是否硬拦投递。判据**只来自后端字段** `blocksDelivery`
+ * （与 apply 后端门禁同源的结论），前端不得按 outcome/code 自己再算一遍——
+ * 两套算法会分叉（例如将来新增硬拦 code 时页面还按旧表放行）。
+ * 因此网关专属警告 code（`not_in_gateway_catalog`）在这里不需要、也不得
+ * 再单独列分支：后端已把它定为 `blocksDelivery: false`，本函数原样放行；
+ * 若将来有人按 code 重算硬拦表，新 code 落入「未知 ⇒ 不拦/拦」的任一默认
+ * 都会错——判据只认后端字段这一条，就是防这个分叉。
+ * 字段缺失（旧二进制）⇒ 不拦：宁可不拦，也不给一条可能错的拦截。
+ */
+export function modelValidationBlocks(
+  modelValidation: { blocksDelivery?: boolean } | null | undefined,
+): boolean {
+  return modelValidation?.blocksDelivery === true;
+}
+
+/**
  * 把 diff 预览里**删除行**的值侧掩掉。
  *
  * 为什么需要：`diff_preview` 只对**已知的**密钥串做替换，再走文本层 `scrub`

@@ -262,6 +262,30 @@ export type DshReferenceCheck = {
   unreadableFiles: string[];
 };
 
+/**
+ * P2-8：投递前模型验证（后端 `ModelValidationDto` 的线上形态）。
+ *
+ * 取值全部是后端给的稳定 code，前端只按 code 取文案，不得按文案反推状态：
+ * - `staticOutcome`：`"fail"` / `"not_applicable"` / `"unchecked"`；
+ * - `staticCode`：`no_model` / `channel_no_model` / `malformed` / `unchecked`；
+ * - `probeOutcome`：`"passed"` / `"failed"` / `"warning"` / `"skipped"`；
+ * - `probeCode`：`passed` / `passed_gateway_catalog`（网关模式通过，仅本地网关
+ *   目录口径，不代表逐站核对）/ `unauthorized` / `forbidden` / `not_in_catalog`
+ *   （站点模式硬拦）/ `not_in_gateway_catalog`（网关模式警告，不拦）/
+ *   `empty_catalog` / `bad_response` / `unexpected_status` / `unreachable` /
+ *   `timeout` / `skipped` / `unresolved`；
+ * - `blocksDelivery`：任一层硬拦即 true——plan 只展示，apply 由后端再探一次后拒绝。
+ */
+export type ModelValidation = {
+  model: string | null;
+  staticOutcome: string;
+  staticCode: string;
+  probeOutcome: string;
+  probeCode: string;
+  probeStatus: number | null;
+  blocksDelivery: boolean;
+};
+
 export type DeliveryPlan = {
   agentId: string;
   channel: string;
@@ -344,6 +368,11 @@ export type DeliveryPlan = {
   targetVariant: string;
   /** P1-7：该通道可选的落点变体名表（下拉直接用它渲染，不得硬编码）。 */
   targetVariants: string[];
+  /**
+   * P2-8：投递前模型验证（静态配对 + `/v1/models` 探针）。计划阶段产出，
+   * Agents 页在计划视图里展示；旧二进制缺失时页面按「未验证」处理，不禁用投递。
+   */
+  modelValidation: ModelValidation;
 };
 
 /** 一单里某一个文件的预览（P0-2）。字段含义与 DeliveryPlan 的同名项一致。 */
@@ -936,6 +965,16 @@ const MOCK_PLAN: DeliveryPlan = {
   importedFields: [],
   targetVariant: "default",
   targetVariants: ["default"],
+  // P2-8：mock 无模型输入 ⇒ 静态不适用、探针跳过、不拦。
+  modelValidation: {
+    model: null,
+    staticOutcome: "not_applicable",
+    staticCode: "no_model",
+    probeOutcome: "skipped",
+    probeCode: "skipped",
+    probeStatus: null,
+    blocksDelivery: false,
+  },
 };
 
 const MOCK_EVENTS: EventRow[] = [

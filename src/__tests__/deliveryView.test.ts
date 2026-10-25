@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { maskRemovedValues, shouldWarnEndpointOutOfScope } from "../lib/deliveryView";
+import {
+  maskRemovedValues,
+  modelValidationBlocks,
+  modelValidationProbeKey,
+  modelValidationStaticKey,
+  shouldWarnEndpointOutOfScope,
+} from "../lib/deliveryView";
 import * as deliveryView from "../lib/deliveryView";
 
 const PH = "…（旧值已隐去）";
@@ -67,5 +73,84 @@ describe("maskRemovedValues（P2-5 前端半）", () => {
     const preview = '- "A": "1"\n+ "A": "2"\n- B=3\n';
     const once = maskRemovedValues(preview, PH);
     expect(maskRemovedValues(once, PH)).toBe(once);
+  });
+});
+
+describe("modelValidation key mapping（P2-8 前端半：code → i18n 键）", () => {
+  it("静态层：全部已知 code 都有键，未知 code 回落通用文案（不把键名当文案）", () => {
+    expect(modelValidationStaticKey("no_model")).toBe(
+      "agents.plan.modelValidation.static.noModel",
+    );
+    expect(modelValidationStaticKey("channel_no_model")).toBe(
+      "agents.plan.modelValidation.static.channelNoModel",
+    );
+    expect(modelValidationStaticKey("malformed")).toBe(
+      "agents.plan.modelValidation.static.malformed",
+    );
+    expect(modelValidationStaticKey("unchecked")).toBe(
+      "agents.plan.modelValidation.static.unchecked",
+    );
+    expect(modelValidationStaticKey("future-code")).toBe(
+      "agents.plan.modelValidation.static.unchecked",
+    );
+    expect(modelValidationStaticKey(undefined)).toBe(
+      "agents.plan.modelValidation.static.unchecked",
+    );
+  });
+
+  it("探针层：全部已知 code 都有键，401 与模型不在目录各有自己的键", () => {
+    expect(modelValidationProbeKey("passed")).toBe(
+      "agents.plan.modelValidation.probe.passed",
+    );
+    expect(modelValidationProbeKey("unauthorized")).toBe(
+      "agents.plan.modelValidation.probe.unauthorized",
+    );
+    expect(modelValidationProbeKey("not_in_catalog")).toBe(
+      "agents.plan.modelValidation.probe.notInCatalog",
+    );
+    expect(modelValidationProbeKey("timeout")).toBe(
+      "agents.plan.modelValidation.probe.timeout",
+    );
+    expect(modelValidationProbeKey("unreachable")).toBe(
+      "agents.plan.modelValidation.probe.unreachable",
+    );
+    expect(modelValidationProbeKey("skipped")).toBe(
+      "agents.plan.modelValidation.probe.skipped",
+    );
+    expect(modelValidationProbeKey("future-code")).toBe(
+      "agents.plan.modelValidation.probe.unresolved",
+    );
+  });
+
+  it("网关专属 code（P2-8 复审 P1）显式映射，不落入 default 的 unresolved", () => {
+    // not_in_gateway_catalog 是警告：文案必须写清聚合/透传口径，不能被
+    // default 成「没能向端点发问」；passed_gateway_catalog 同理，文案限定
+    // 为本地网关目录口径，不代表逐站核对。
+    expect(modelValidationProbeKey("not_in_gateway_catalog")).toBe(
+      "agents.plan.modelValidation.probe.notInGatewayCatalog",
+    );
+    expect(modelValidationProbeKey("passed_gateway_catalog")).toBe(
+      "agents.plan.modelValidation.probe.passedGatewayCatalog",
+    );
+  });
+});
+
+describe("modelValidationBlocks（P2-8 前端半：硬拦判据只来自后端字段）", () => {
+  it("后端说拦 ⇒ 拦；后端说不拦 ⇒ 不拦", () => {
+    expect(modelValidationBlocks({ blocksDelivery: true })).toBe(true);
+    expect(modelValidationBlocks({ blocksDelivery: false })).toBe(false);
+  });
+
+  it("网关警告 code 不另算硬拦：判据只认后端 blocksDelivery 字段", () => {
+    // modelValidationBlocks 不收 code 参数：后端把 not_in_gateway_catalog
+    // 定为 blocksDelivery: false，前端原样放行；若将来有人按 code 重算
+    // 硬拦表，新 code 的默认分支（拦/放行）都会错，所以这里钉住「只认字段」。
+    expect(modelValidationBlocks({ blocksDelivery: false })).toBe(false);
+  });
+
+  it("字段缺失（旧二进制）⇒ 不拦：宁可不拦，也不给一条可能错的拦截", () => {
+    expect(modelValidationBlocks(null)).toBe(false);
+    expect(modelValidationBlocks(undefined)).toBe(false);
+    expect(modelValidationBlocks({})).toBe(false);
   });
 });

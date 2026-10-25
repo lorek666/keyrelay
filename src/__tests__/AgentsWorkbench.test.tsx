@@ -545,6 +545,17 @@ describe("P1-7 首次导入 + 预览模式 + 落点变体", () => {
     importedFields: args.importedFields ?? [],
     targetVariant: args.targetVariant ?? "default",
     targetVariants: args.targetVariants ?? ["default"],
+    // P2-8：工作台 mock 默认无模型输入 ⇒ 静态不适用、探针跳过、不拦；
+    // PlanView 的验证段按此渲染，不影响既有用例的按钮状态。
+    modelValidation: {
+      model: null,
+      staticOutcome: "not_applicable",
+      staticCode: "no_model",
+      probeOutcome: "skipped",
+      probeCode: "skipped",
+      probeStatus: null,
+      blocksDelivery: false,
+    },
   });
 
   const lastPlanArg = () =>

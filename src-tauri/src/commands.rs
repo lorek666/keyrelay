@@ -309,6 +309,10 @@ pub struct DeliveryPlanDto {
     /// P1-7：该通道可选的落点变体名表（前端下拉直接用它渲染，
     /// 不得在界面里硬编码变体清单——清单变了界面会跟着错）。
     target_variants: Vec<String>,
+    /// P2-8：投递前模型验证（静态配对 + `/v1/models` 探针），计划阶段产出、
+    /// 前端在计划视图里展示。只读验证结果，不含密钥；硬拦项由
+    /// `blocks_delivery` 统一表示（plan 只展示，apply 再探一次并执行硬拦）。
+    model_validation: ModelValidationDto,
 }
 
 /// 一单里某一个文件的预览（P0-2）。字段含义与顶层同名项一致，
@@ -930,6 +934,65 @@ fn consent_parts(consent: &ConsentState) -> (&'static str, Option<i64>, Option<i
     }
 }
 
+/// P2-8：投递前模型验证的线上形态（camelCase，与核心层
+/// `delivery::model_check::ModelValidation` 一一对应）。
+///
+/// 字段含义（前端按 code 取中英成对文案，不得按文案反推状态）：
+/// - `model`：trim 后的模型名；无模型时为 null；
+/// - `static_outcome`：`"fail"`（格式无效，硬拦）/ `"not_applicable"`（无模型
+///   或通道不写模型）/ `"unchecked"`（格式合格、仓库无依据判定厂商配对）；
+/// - `static_code`：静态层原因键（`no_model` / `channel_no_model` /
+///   `malformed` / `unchecked`）；
+/// - `probe_outcome`：`"passed"` / `"failed"`（硬拦）/ `"warning"`（不拦）/
+///   `"skipped"`（未探针）；
+/// - `probe_code`：探针原因键（`passed` / `unauthorized` / `forbidden` /
+///   `not_in_catalog` / `empty_catalog` / `bad_response` / `unexpected_status` /
+///   `unreachable` / `timeout` / `skipped` / `unresolved`）；
+/// - `probe_status`：探针 HTTP 状态码（仅状态码，绝不带响应正文）；
+/// - `blocks_delivery`：任一层硬拦即 true；plan 只展示它，apply 据此拒绝写盘。
+/// 本结构**不含密钥**（探针密钥只进请求头，见核心层）。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelValidationDto {
+    model: Option<String>,
+    static_outcome: String,
+    static_code: String,
+    probe_outcome: String,
+    probe_code: String,
+    probe_status: Option<u16>,
+    blocks_delivery: bool,
+}
+
+fn model_validation_dto(
+    v: tianshu_relay_core::delivery::model_check::ModelValidation,
+) -> ModelValidationDto {
+    ModelValidationDto {
+        model: v.model,
+        static_outcome: v.static_check.outcome.to_string(),
+        static_code: v.static_check.code.to_string(),
+        probe_outcome: v.probe.outcome.to_string(),
+        probe_code: v.probe.code.to_string(),
+        probe_status: v.probe.status,
+        blocks_delivery: v.blocks_delivery,
+    }
+}
+
+/// P2-8：apply 硬拦时的错误文案（与前端 `agents.plan.modelValidation` 的
+/// 中文文案同义；401 不得只报裸 401，必须译成「密钥与端点不匹配或旧登录残留」）。
+fn model_block_message(v: &tianshu_relay_core::delivery::model_check::ModelValidation) -> String {
+    if v.static_check.outcome == "fail" {
+        return "模型验证未通过：模型名格式无效（不能含空白字符、不能是 URL 形态、provider 前缀后必须有模型名），已阻止投递；请修正模型名后再试"
+            .to_string();
+    }
+    match v.probe.code {
+        "unauthorized" => "模型验证未通过：探针返回 401——密钥与端点不匹配，或本地残留了旧登录的密钥，已阻止投递；请确认这把密钥属于该端点对应的站点，或重新登录换取新密钥后再投递"
+            .to_string(),
+        "not_in_catalog" => "模型验证未通过：目标模型不在端点 /v1/models 目录中，已阻止投递；请检查模型名是否写错，或确认该端点是否提供此模型"
+            .to_string(),
+        _ => "模型验证未通过，已阻止投递；请先在投递预览里查看验证结果".to_string(),
+    }
+}
+
 /// 一份单通道计划 → 一单里某文件的 DTO（借用版：顶层与 `files` 共用同一份
 /// 计划时，先用它从借用建 `files`，再移动原计划建顶层）。
 fn file_plan_dto(plan: &tianshu_relay_core::delivery::DeliveryPlan) -> DeliveryFilePlanDto {
@@ -964,7 +1027,10 @@ fn file_plan_dto(plan: &tianshu_relay_core::delivery::DeliveryPlan) -> DeliveryF
 }
 
 /// 单通道计划 → 完整 DTO（顶层 = 该计划本身，`files` = 只有它一条）。
-fn single_plan_dto(plan: tianshu_relay_core::delivery::DeliveryPlan) -> DeliveryPlanDto {
+fn single_plan_dto(
+    plan: tianshu_relay_core::delivery::DeliveryPlan,
+    model_validation: ModelValidationDto,
+) -> DeliveryPlanDto {
     let file = file_plan_dto(&plan);
     let (consent, granted_at, revoked_at) = consent_parts(&plan.consent);
     // BACKLOG B-76：有些 agent 会优先读**另一个扩展名**的同名文件
@@ -1022,6 +1088,7 @@ fn single_plan_dto(plan: tianshu_relay_core::delivery::DeliveryPlan) -> Delivery
             .into_iter()
             .map(|v| v.to_string())
             .collect(),
+        model_validation,
     }
 }
 
@@ -1035,6 +1102,7 @@ fn single_plan_dto(plan: tianshu_relay_core::delivery::DeliveryPlan) -> Delivery
 fn codex_plan_dto(
     entry: tianshu_relay_core::delivery::DeliveryChannel,
     plan: tianshu_relay_core::delivery::CodexDeliveryPlan,
+    model_validation: ModelValidationDto,
 ) -> DeliveryPlanDto {
     let mut files: Vec<DeliveryFilePlanDto> = Vec::new();
     if let Some(auth) = &plan.auth {
@@ -1045,7 +1113,7 @@ fn codex_plan_dto(
         (Some(auth), tianshu_relay_core::delivery::DeliveryChannel::CodexAuthJson) => auth.clone(),
         _ => plan.config.clone(),
     };
-    let mut dto = single_plan_dto(top);
+    let mut dto = single_plan_dto(top, model_validation);
     dto.preserve_auth = plan.preserve_auth;
     dto.files = files;
     dto
@@ -1123,6 +1191,16 @@ pub async fn delivery_plan(
     // M14-S7 §4.2：先把「内置表没覆盖的模型」的在线参数预热进缓存，再走同步的 plan。
     // best-effort：网络失败/超时只是没有参数行，预览照常出（失败不阻断投递）。
     let _ = state.service.warm_model_meta(args.model.as_deref()).await;
+    // P2-8：投递前模型验证（静态配对 + 真实 /v1/models 探针），在计划阶段跑、
+    // 写盘前可见。验证本身不使计划失败：结果随计划返回前端展示，硬拦项
+    // （`blocks_delivery`）由前端禁用投递按钮、并由 apply 再探一次后执行；
+    // 探针是只读 GET，计划查询每次刷新会发一次（去重由前端查询键控制）。
+    let model_validation = model_validation_dto(
+        state
+            .service
+            .validate_delivery_model(args.key_id, channel, args.model.as_deref(), source)
+            .await,
+    );
     // P1-7：落点变体与预览模式随参数透传（变体名白名单外即拒绝，
     // 见服务层；预览入口零副作用，见 `delivery_preview_in`）。
     let variant = args.target_variant.as_deref();
@@ -1146,7 +1224,7 @@ pub async fn delivery_plan(
                     preserve_auth,
                     variant,
                 )
-                .map(|plan| codex_plan_dto(channel, plan))
+                .map(|plan| codex_plan_dto(channel, plan, model_validation.clone()))
                 .map_err(|e| e.to_string());
         }
         return state
@@ -1158,7 +1236,7 @@ pub async fn delivery_plan(
                 preserve_auth,
                 variant,
             )
-            .map(|plan| codex_plan_dto(channel, plan))
+            .map(|plan| codex_plan_dto(channel, plan, model_validation))
             .map_err(|e| e.to_string());
     }
     // 非 Codex 通道没有「保留 auth」这个概念：传 `true` 必须拒绝，
@@ -1170,13 +1248,13 @@ pub async fn delivery_plan(
         return state
             .service
             .delivery_preview_in(args.key_id, channel, args.model.as_deref(), source, variant)
-            .map(single_plan_dto)
+            .map(|plan| single_plan_dto(plan, model_validation))
             .map_err(|e| e.to_string());
     }
     state
         .service
         .delivery_plan_in_with_variant(args.key_id, channel, args.model.as_deref(), source, variant)
-        .map(single_plan_dto)
+        .map(|plan| single_plan_dto(plan, model_validation))
         .map_err(|e| e.to_string())
 }
 
@@ -1300,6 +1378,18 @@ pub async fn apply_delivery(
     let _ = state.service.warm_model_meta(args.model.as_deref()).await;
     // P1-7：预览模式不得落盘（见 `reject_preview_write`）；变体随参数透传。
     reject_preview_write(&args)?;
+    // P2-8：apply 前复核——plan 里看到的验证可能已过期（模型/端点换过），
+    // 且直接投递根本没走过 plan；硬拦项（静态格式无效、探针 401、站点模式
+    // 下模型不在非空目录）在这里再探一次并拒绝写盘，警告项不拦——网关模式
+    // 下模型不在本地网关目录只是警告（见 `validate_delivery_model` 分流），
+    // 与 plan 同走该函数，一处改即两处生效。验证本身不写盘。
+    let validation = state
+        .service
+        .validate_delivery_model(args.key_id, channel, args.model.as_deref(), source)
+        .await;
+    if validation.blocks_delivery {
+        return Err(model_block_message(&validation));
+    }
     let variant = args.target_variant.as_deref();
     // P0-2：与 `delivery_plan` 同一条路由——Codex 通道走双文件同单，
     // 没传 `preserve_auth` 即双文件，显式 `true` 才保留；非 Codex 通道传
@@ -5643,6 +5733,17 @@ mod tests {
             imported_fields: vec![],
             target_variant: "default".into(),
             target_variants: vec!["default".into()],
+            // P2-8：本用例无模型输入 ⇒ 静态不适用、探针跳过、不拦；线上字段
+            // 名须为 modelValidation，且序列化里不得出现任何密钥材料。
+            model_validation: ModelValidationDto {
+                model: None,
+                static_outcome: "not_applicable".into(),
+                static_code: "no_model".into(),
+                probe_outcome: "skipped".into(),
+                probe_code: "skipped".into(),
+                probe_status: None,
+                blocks_delivery: false,
+            },
         };
         let value = to_value(&plan);
         assert_eq!(value["agentId"], "codex");
@@ -5684,6 +5785,13 @@ mod tests {
         );
         assert_eq!(value["targetVariant"], "default");
         assert_eq!(value["targetVariants"][0], "default");
+        // P2-8：验证结果必须到 camelCase 线上名上，且不含密钥材料。
+        assert_eq!(value["modelValidation"]["staticOutcome"], "not_applicable");
+        assert_eq!(value["modelValidation"]["staticCode"], "no_model");
+        assert_eq!(value["modelValidation"]["probeOutcome"], "skipped");
+        assert_eq!(value["modelValidation"]["probeCode"], "skipped");
+        assert_eq!(value["modelValidation"]["probeStatus"], Value::Null);
+        assert_eq!(value["modelValidation"]["blocksDelivery"], false);
         assert!(value.get("target_path").is_none(), "不得出现 snake_case");
 
         // M7-S5：**每个**通道都必须给出一个非空提示——新增通道时穷举 match 会编译失败，
