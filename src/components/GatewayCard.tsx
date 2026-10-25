@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Copy, Play, RefreshCw, Square } from "lucide-react";
 import {
   channelOfBinding,
+  isDelistedBindingAgent,
   deliveryPlan,
   gatewayRotateToken,
   gatewayStart,
@@ -532,11 +533,12 @@ export default function GatewayCard({
    *
    * key 是绑定行 id ⇒ 这是 O(n) 查找。批量面板一次最多十几条，不值得建 Map。
    */
-  function planOf(key: string): { channel: string | null; targetPath: string } {
+  function planOf(key: string): { channel: string | null; targetPath: string; delisted: boolean } {
     const found = batchCandidates.find((c) => c.key === key);
     return {
       channel: found?.channel ?? null,
       targetPath: found?.binding.targetPath ?? "",
+      delisted: found?.delisted ?? false,
     };
   }
 
@@ -582,20 +584,27 @@ export default function GatewayCard({
   /** 一条 binding ⇒ 界面上的那一行（猜不出通道的也列出来，标「无法识别」）。 */
   const batchCandidates = (batchBindings.data ?? []).map((binding: ChannelBinding) => {
     const channel = channelOfBinding(binding.agentId);
+    // DEBUG-G6 P2-F1：channel 为 null 时还要分“已下线”与“真正未知”——
+    // 下线行（cline-desktop）指向 cline auth CLI，未知行才走通用未映射文案。
+    const delisted = channel === null && isDelistedBindingAgent(binding.agentId);
     // key 用**绑定行 id**（M8-S7 P2-4）：`bindings` 没有 UNIQUE 约束，同一文件上可能
     // 有多条未解绑的行（换 key 后重投就会这样）。用 `${channel}::${targetPath}` 会让
     // 那两行共用一个复选框（勾一个等于勾两个）并报 React 重复 key。
-    return { binding, channel, key: String(binding.bindingId) };
+    return { binding, channel, delisted, key: String(binding.bindingId) };
   });
 
   /** 逐条预览（硬约束 1）：把勾选的每条都问一次后端，diff 显示给人看后才让执行。 */
   const batchPreview = useMutation({
     mutationFn: async () => {
       const out: Record<string, DeliveryPlan | string> = {};
-      for (const { binding, channel, key } of batchCandidates) {
+      for (const { binding, channel, delisted, key } of batchCandidates) {
         if (!batchPicked[key]) continue;
         if (channel === null) {
-          out[key] = t("gateway.batch.unmappedFull");
+          // 字符串预览会禁用执行按钮（见下方 apply 按钮判据），下线行与未知行
+          // 在此分流：下线行给 cline auth CLI 去向，不再笼统说“无法识别”。
+          out[key] = delisted
+            ? t("gateway.batch.delistedFull")
+            : t("gateway.batch.unmappedFull");
           continue;
         }
         try {
@@ -618,13 +627,15 @@ export default function GatewayCard({
   const batchApply = useMutation({
     mutationFn: async () => {
       const results: { label: string; ok: boolean; detail: string }[] = [];
-      for (const { binding, channel, key } of batchCandidates) {
+      for (const { binding, channel, delisted, key } of batchCandidates) {
         if (!batchPicked[key]) continue;
         if (channel === null) {
           results.push({
             label: binding.targetPath,
             ok: false,
-            detail: t("gateway.batch.unmappedApplyDetail"),
+            detail: delisted
+              ? t("gateway.batch.delistedApplyDetail")
+              : t("gateway.batch.unmappedApplyDetail"),
           });
           continue;
         }
@@ -1114,7 +1125,7 @@ export default function GatewayCard({
           {batchCandidates.length === 0 && !batchBindings.isLoading ? (
             <p className="muted">{t("gateway.batch.empty")}</p>
           ) : null}
-          {batchCandidates.map(({ binding, channel, key }) => {
+          {batchCandidates.map(({ binding, channel, delisted, key }) => {
             const site = (sites.data ?? []).find((s) => s.id === binding.siteId);
             return (
               <label className="checkline" key={key}>
@@ -1134,7 +1145,11 @@ export default function GatewayCard({
                   }}
                 />
                 <span>
-                  {channel === null ? (
+                  {channel === null && delisted ? (
+                    <>
+                      {t("gateway.batch.delistedPre")}{binding.targetPath}{t("gateway.batch.delistedPost")}
+                    </>
+                  ) : channel === null ? (
                     <>
                       {t("gateway.batch.unmappedPre")}{binding.targetPath}{t("gateway.batch.unmappedPost")}
                     </>
@@ -1162,7 +1177,7 @@ export default function GatewayCard({
               <h4>{t("gateway.batch.previewTitle")}</h4>
               {Object.entries(batchPreviews).map(([key, plan]) => (
                 <div key={key}>
-                  <strong>{planOf(key).channel ?? t("gateway.batch.unmappedStrong")}</strong>{" "}
+                  <strong>{planOf(key).channel ?? (planOf(key).delisted ? t("gateway.batch.delistedStrong") : t("gateway.batch.unmappedStrong"))}</strong>{" "}
                   {/* 这里是**本次实际写入**的路径（来自后端计划），与上面那一行的
                       「记录时的路径」可能不同（P3-13）：绑定是当年另一个 TIANSHU_RELAY_HOME
                       下写的时，两个路径就不一样。两个都标出来，用户才知道写的是哪个文件。 */}

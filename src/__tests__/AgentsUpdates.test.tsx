@@ -148,7 +148,7 @@ vi.mock("../lib/api", async (importOriginal) => {
   };
 });
 
-import { updateAgent } from "../lib/api";
+import { checkAgentUpdates, updateAgent } from "../lib/api";
 
 const rows = () => Array.from(document.querySelectorAll<HTMLElement>("[data-agent-channel]"));
 const row = (id: string) => document.querySelector<HTMLElement>(`[data-agent-channel="${id}"]`)!;
@@ -214,6 +214,55 @@ describe("M34-S1 Agent 更新", () => {
     // 未安装：没有徽标/按钮
     expect(row("gemini-cli").getAttribute("data-agent-update-state")).toBe("notInstalled");
     expect(row("gemini-cli").querySelector(".agent-update-badge")).toBeNull();
+  });
+
+  it("DEBUG-G6 P1-18：汇总计数按投递通道过滤，Cline Desktop 更新行不计入且标注下线", async () => {
+    // 后端仍产出 cline-desktop 更新行（检测保留），但 19 个投递通道里没有它：
+    // 汇总“可更新”必须仍是 3（codex / claude / dsh），而不是被它抬成 4；
+    // 且汇总卡要出现“检测保留、投递已下线”标注，行上绝无它的更新按钮。
+    const notInstalledUpdate = (channel: string) => ({
+      channel,
+      installed: false,
+      currentVersion: null,
+      latestVersion: null,
+      state: "notInstalled",
+      source: "none",
+      autoUpdate: false,
+      command: null,
+      manualUrl: null,
+      message: null,
+    });
+    const available = (channel: string, current: string, latest: string, autoUpdate: boolean) => ({
+      channel,
+      installed: true,
+      currentVersion: current,
+      latestVersion: latest,
+      state: "available",
+      source: "npm",
+      autoUpdate,
+      command: autoUpdate ? "codex update" : null,
+      manualUrl: "https://example.test/install",
+      message: autoUpdate ? null : "该通道需手动更新",
+    });
+    vi.mocked(checkAgentUpdates).mockImplementationOnce(async () => [
+      ...CHANNELS.map((c) => {
+        if (c.id === "codex-auth-json") return available(c.id, "0.162.1", "0.163.0", true);
+        if (c.id === "claude-code-settings") return available(c.id, "2.1.296", "2.1.306", true);
+        if (c.id === "dsh") return available(c.id, "0.2.1-rc.2", "0.2.2", false);
+        if (c.id === "opencode")
+          return { ...available(c.id, "1.4.0", "1.4.0", true), state: "upToDate", command: null };
+        if (c.id === "grok-build")
+          return { ...notInstalledUpdate(c.id), state: "unsupported", manualUrl: "https://example.test/grok" };
+        return notInstalledUpdate(c.id);
+      }),
+      available("cline-desktop", "1.0.0", "1.1.0", true),
+    ] as never);
+    renderPage();
+    await waitForUpdates();
+    const summary = document.querySelector(".agent-updates-summary")!;
+    expect(summary.textContent).toContain("可更新 3");
+    expect(document.body.textContent).toContain(zhCN.agents.update.clineDesktopNote);
+    expect(document.querySelector('[data-agent-channel="cline-desktop"]')).toBeNull();
   });
 
   it("② 弹窗展示版本与命令；未勾选同意时确认禁用；勾选后调用 updateAgent(channel)", async () => {

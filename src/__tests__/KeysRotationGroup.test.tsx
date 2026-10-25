@@ -234,3 +234,21 @@ describe("M22-S1 轮换分组按需在线校验", () => {
     ).toBeDefined();
   });
 });
+
+describe("DEBUG-G6 P1-19 轮换停进程提示", () => {
+  it("重注入清单含 Codex ⇒ 轮换对话框写出写盘前停 Codex", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue({ ...plan(null), channels: ["codex-auth-json"] });
+    renderKeys();
+    await openRotationDialog();
+    expect(screen.getByText(zhCN.keys.rotationDialog.stopCodex)).toBeDefined();
+  });
+
+  it("重注入清单不含 Codex ⇒ 不出现停 Codex 文案", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue({ ...plan(null), channels: ["claude-code-settings"] });
+    renderKeys();
+    await openRotationDialog();
+    expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.stopCodex);
+  });
+});
