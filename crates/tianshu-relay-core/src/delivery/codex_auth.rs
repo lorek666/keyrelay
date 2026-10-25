@@ -136,9 +136,7 @@ mod tests {
             "{\"api_key\": \"CANARY-FILE-9x7z",
         )
         .unwrap();
-        let err = writer_in(dir.path())
-            .plan("CANARY-KEY-4k2m")
-            .unwrap_err();
+        let err = writer_in(dir.path()).plan("CANARY-KEY-4k2m").unwrap_err();
         assert!(!err.to_string().contains("CANARY-KEY-4k2m"), "{err}");
         assert!(!err.to_string().contains("CANARY-FILE-9x7z"), "{err}");
     }

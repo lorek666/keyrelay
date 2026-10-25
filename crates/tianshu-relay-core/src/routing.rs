@@ -1565,12 +1565,9 @@ mod tests {
     fn available_models_for_sites_restricts_to_allowed_sites() {
         // DEBUG-G7 P2-G4：过滤版只算允许站点；别名可服务性也只看允许站点
         // （指向规则外站点的别名不得列出；规则内站点服务的别名照常列出）。
-        let route = RouteTable::new(vec![
-            upstream_of(1, &["a", "b"]),
-            upstream_of(2, &["c"]),
-        ])
-        .with_alias("fast", "c")
-        .with_alias("slow", "a");
+        let route = RouteTable::new(vec![upstream_of(1, &["a", "b"]), upstream_of(2, &["c"])])
+            .with_alias("fast", "c")
+            .with_alias("slow", "a");
         assert_eq!(
             route.available_models_for_sites(Some(&[1])),
             vec!["a", "b", "slow"],

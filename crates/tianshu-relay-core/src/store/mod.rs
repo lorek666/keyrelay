@@ -957,7 +957,8 @@ fn tighten_db_files(path: &Path) {
             let cur = meta.permissions().mode() & 0o777;
             let tight = cur & 0o600;
             if tight != cur {
-                let _ = std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(tight));
+                let _ =
+                    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(tight));
             }
         }
     }

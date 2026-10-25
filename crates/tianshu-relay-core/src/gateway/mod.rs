@@ -5110,7 +5110,10 @@ mod tests {
         capture.feed(b"data: {\"choices\":[]}\n\n");
         capture.feed(b"data: [DONE]\n\n");
         capture.flush();
-        assert!(log.lock().unwrap().is_empty(), "标记不是用量行，不得进用量 sink");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "标记不是用量行，不得进用量 sink"
+        );
         let failures = failures.lock().unwrap();
         assert_eq!(failures.len(), 1);
         assert!(

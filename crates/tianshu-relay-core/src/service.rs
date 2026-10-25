@@ -8449,8 +8449,7 @@ mod tests {
     fn revoke_consent_for_delisted_channel_without_delivery_resolution() {
         let service = service_with_blocking();
         let channel = DeliveryChannel::ClineDesktop;
-        let (target, _) =
-            delivery::resolve_variant_target(channel, &service.home, None).unwrap();
+        let (target, _) = delivery::resolve_variant_target(channel, &service.home, None).unwrap();
         service
             .store
             .grant_consent(
@@ -8482,7 +8481,13 @@ mod tests {
             .unwrap();
         let key_id = service
             .store
-            .insert_key(site_id, "k", &crate::vault::secret_ref("key", 1, "secret"), None, None)
+            .insert_key(
+                site_id,
+                "k",
+                &crate::vault::secret_ref("key", 1, "secret"),
+                None,
+                None,
+            )
             .unwrap();
         let empty_endpoint = delivery::GatewayEndpoint {
             base_url: "   ".to_string(),
@@ -8503,7 +8508,13 @@ mod tests {
         let blank_site_id = service.store.upsert_site("test", "", "空地址站").unwrap();
         let blank_key_id = service
             .store
-            .insert_key(blank_site_id, "k2", &crate::vault::secret_ref("key", 2, "secret"), None, None)
+            .insert_key(
+                blank_site_id,
+                "k2",
+                &crate::vault::secret_ref("key", 2, "secret"),
+                None,
+                None,
+            )
             .unwrap();
         service
             .prepare_delivery(
@@ -8514,6 +8525,40 @@ mod tests {
                 None,
             )
             .expect("站点源空 base_url 仍按既有语义构造");
+    }
+
+    /// DEBUG-G7 P2-G3（复审建议补测）：路由规则解析失败时 `gateway_config`
+    /// 必须 fail-closed（返回 Err、网关不起），不得静默置空规则后全局加权启动。
+    /// 非法规则经 `store.set_setting` 直接写库（绕过 `update_settings` 的
+    /// validate），模拟手改库等旁路可达的路径；正常写路径仍由 validate 拦。
+    /// 纯测试：不改生产行为；若有人把 Err 分支改回 fail-open，本用例变红。
+    #[test]
+    fn gateway_config_rejects_malformed_routing_rules_fail_closed() {
+        let service = service_with_blocking();
+        let site_id = service
+            .store
+            .upsert_site("test", "https://relay.example.com", "测试站")
+            .unwrap();
+        let secret_ref = crate::vault::secret_ref("key", 1, "secret");
+        let key_id = service
+            .store
+            .insert_key(site_id, "k", &secret_ref, None, None)
+            .unwrap();
+        service.vault.put(&secret_ref, "sk-test").unwrap();
+        // 对照：规则为空时装配成功，证明下面的 Err 确由非法规则触发、不是装配本身失败。
+        service
+            .gateway_config(site_id, key_id, 18765)
+            .expect("规则为空时网关装配应成功");
+        // 旁路写库：非法规则（siteIds 为空，解析器必拒）。
+        let bad = r#"[{"agentLabel": "codex", "siteIds": []}]"#;
+        service.store.set_setting("routing_rules", bad).unwrap();
+        let err = service.gateway_config(site_id, key_id, 18765).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("路由规则解析失败，网关拒绝启动"), "{msg}");
+        assert!(
+            !msg.contains(bad),
+            "错误串只含原因摘要，不得回显规则全文：{msg}"
+        );
     }
 
     /// DEBUG-G7 P2-K1：drain 时缓冲满丢弃条数必须以 Warn 事件可见；写失败分支
@@ -8527,23 +8572,21 @@ mod tests {
         let site_id = store
             .upsert_site("test", "https://relay.example.com", "测试站")
             .unwrap();
-        let buffer = std::sync::Mutex::new(vec![
-            crate::gateway::GatewayUsage {
-                at: unix_now_secs(),
-                site_id,
-                key_id: None,
-                model: "m".to_string(),
-                prompt_tokens: 1,
-                completion_tokens: 2,
-                total_tokens: 3,
-                status: 200,
-                latency_ms: 10,
-                attempts: 1,
-                stream: false,
-                token_id: None,
-                agent_label: String::new(),
-            },
-        ]);
+        let buffer = std::sync::Mutex::new(vec![crate::gateway::GatewayUsage {
+            at: unix_now_secs(),
+            site_id,
+            key_id: None,
+            model: "m".to_string(),
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+            status: 200,
+            latency_ms: 10,
+            attempts: 1,
+            stream: false,
+            token_id: None,
+            agent_label: String::new(),
+        }]);
         let dropped = std::sync::atomic::AtomicU64::new(3);
         let mut warns: Vec<Event> = Vec::new();
         TianshuRelayService::<MockTransport>::drain_gateway_usage_buffer(
@@ -8555,8 +8598,16 @@ mod tests {
         assert!(buffer.lock().unwrap().is_empty(), "drain 后缓冲应空");
         assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(warns.len(), 1, "{warns:?}");
-        assert!(warns[0].message.contains("丢弃 3 条"), "{}", warns[0].message);
-        assert!(warns[0].payload.as_deref().unwrap_or("").contains("\"dropped\":3"));
+        assert!(
+            warns[0].message.contains("丢弃 3 条"),
+            "{}",
+            warns[0].message
+        );
+        assert!(warns[0]
+            .payload
+            .as_deref()
+            .unwrap_or("")
+            .contains("\"dropped\":3"));
         // 落库的行确实进了库（不是只记了 Warn 就丢）。
         assert_eq!(store.recent_gateway_usage(24).unwrap().len(), 1);
     }
@@ -8590,7 +8641,11 @@ mod tests {
             |e| warns.push(e),
         );
         assert_eq!(warns.len(), 1, "{warns:?}");
-        assert!(warns[0].message.contains("落库失败"), "{}", warns[0].message);
+        assert!(
+            warns[0].message.contains("落库失败"),
+            "{}",
+            warns[0].message
+        );
         assert!(warns[0]
             .payload
             .as_deref()
