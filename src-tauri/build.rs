@@ -36,6 +36,9 @@ fn main() {
 "#,
         )
         .expect("写 v6 清单失败");
+        // 注意：MANIFESTINPUT 必须与 /MANIFEST:EMBED 联用，否则链接器报
+        // LNK1220（测试目标的链接调用默认不带 /MANIFEST:EMBED，实测）。
+        println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
         println!(
             "cargo:rustc-link-arg-tests=/MANIFESTINPUT:{}",
             manifest_path.display()
