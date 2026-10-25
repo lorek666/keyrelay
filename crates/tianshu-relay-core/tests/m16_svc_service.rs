@@ -1074,6 +1074,127 @@ async fn revoke_key_reports_local_status_not_updated_when_the_keys_update_fails(
     );
 }
 
+#[tokio::test]
+async fn revoke_key_deletes_vault_entry_but_keeps_db_row() {
+    // DEBUG-G5 P1-10：回收 = 站点删 + 本地状态 revoked + 保险库条目单删；
+    // DB 行必须保留（绑定与漂移追溯靠 keys.id），只分离明文材料。
+    let f = fixture(vec![
+        login_response(&jwt_with_exp(9_999_999_999)),
+        HttpResponse::new(204, Vec::new()),
+    ]);
+    f.service
+        .login(f.site_id, Credentials::new("me@example.com", "pw-12345678"))
+        .await
+        .expect("登录");
+    let reference = secret_ref("key", 1, "secret");
+    assert!(
+        f.service.vault_has_for_test(&reference).expect("查钥匙串"),
+        "回收前保险库条目应在"
+    );
+    let report = f.service.revoke_key(f.site_id, "1").await.expect("回收");
+    assert!(report.revoked, "站点侧必须确认删除: {report:?}");
+    assert!(
+        report.local_status_updated,
+        "本地状态应写上 revoked: {report:?}"
+    );
+    assert!(report.vault_deleted, "保险库条目必须单删: {report:?}");
+    assert!(
+        !f.service.vault_has_for_test(&reference).expect("查钥匙串"),
+        "回收后保险库条目必须不在"
+    );
+    let row = f
+        .service
+        .store()
+        .get_key(f.key_id)
+        .expect("读 key 行")
+        .expect("DB 行必须保留，不得删行");
+    assert_eq!(row.status, "revoked", "行保留、状态改 revoked: {row:?}");
+}
+
+#[tokio::test]
+async fn revoke_key_vault_delete_failure_is_visible_not_fatal() {
+    // DEBUG-G5 P1-10：保险库删除失败不得把不可逆的站点侧成功报成失败，
+    // 但必须留痕：vault_deleted=false + note 点名保险库 + 整体仍 Ok。
+    struct DeleteFailingVault {
+        inner: MemoryVault,
+    }
+    impl Vault for DeleteFailingVault {
+        fn backend_name(&self) -> &'static str {
+            "memory"
+        }
+        fn probe(&self) -> tianshu_relay_core::error::Result<()> {
+            Ok(())
+        }
+        fn put(&self, key: &str, secret: &str) -> tianshu_relay_core::error::Result<()> {
+            self.inner.put(key, secret)
+        }
+        fn get(&self, key: &str) -> tianshu_relay_core::error::Result<Option<String>> {
+            self.inner.get(key)
+        }
+        fn delete(&self, _key: &str) -> tianshu_relay_core::error::Result<()> {
+            Err(tianshu_relay_core::error::Error::Vault(
+                "删失败（探针注入）".to_string(),
+            ))
+        }
+    }
+    let dir = tempfile::tempdir().expect("临时目录");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let db_path = dir.path().join("tianshu-relay.db");
+    let store = Store::open(&db_path).expect("文件库");
+    let site_id = store
+        .upsert_site("sub2api", "https://sub.example.com", "探针站")
+        .expect("站点");
+    let reference = secret_ref("key", 1, "secret");
+    store
+        .insert_key_with_group(
+            site_id,
+            "m16/daily",
+            &reference,
+            Some("1"),
+            Some("vip"),
+            None,
+        )
+        .expect("密钥行");
+    let vault = std::sync::Arc::new(DeleteFailingVault {
+        inner: MemoryVault::new(),
+    });
+    vault.put(&reference, "<redacted>").expect("钥匙串");
+    let service = TianshuRelayService::new(
+        store,
+        MockTransport::new(vec![
+            login_response(&jwt_with_exp(9_999_999_999)),
+            HttpResponse::new(204, Vec::new()),
+        ]),
+        ServiceConfig {
+            vault,
+            home: home.clone(),
+            backup_dir: dir.path().join("backups"),
+        },
+    );
+    service
+        .login(site_id, Credentials::new("me@example.com", "pw-12345678"))
+        .await
+        .expect("登录");
+    let report = service
+        .revoke_key(site_id, "1")
+        .await
+        .expect("保险库删失败时整体仍应 Ok（站点侧已删不可逆）");
+    assert!(report.revoked, "站点侧必须确认删除: {report:?}");
+    assert!(
+        !report.vault_deleted,
+        "删除失败必须如实报 false: {report:?}"
+    );
+    assert!(
+        report
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("保险库"),
+        "note 必须点名保险库残留，不得静默: {report:?}"
+    );
+}
+
 // ============================================================ B-179
 
 /// `NotifyConfig.timeout = 0` 触发 webhook 零超时守卫（`Error::Store`）⇒

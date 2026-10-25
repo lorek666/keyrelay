@@ -78,7 +78,8 @@
       "kindValues": {
         "matched": "双方都有",
         "gateway_only": "仅网关",
-        "bill_only": "仅账单"
+        "bill_only": "仅账单",
+        "gateway_unpriced": "用量不可定价（无 USD 价）"
       },
       "flaggedYes": "超阈值",
       "incomparableTitle": "不可比行",

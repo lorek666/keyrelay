@@ -85,16 +85,28 @@ async fn probe_outcome_opens_and_closes_gateway_candidate() {
     assert_eq!(breaker_of(&handle, 1), "closed");
     assert_eq!(breaker_of(&handle, 2), "closed");
 
-    // 2 轮失败仍 Closed（阈值 3），第 3 轮才 Open；另一站不受影响。
-    handle.record_probe_outcome(1, &models, KeyHealthVerdict::DeadKey, now);
-    handle.record_probe_outcome(1, &models, KeyHealthVerdict::DeadKey, now);
+    // 2 轮故障仍 Closed（阈值 3），第 3 轮才 Open；另一站不受影响。
+    // 触发源是站点级故障：DEBUG-G5 P1-8 起 DeadKey 不再喂熔断（单 key 事实
+    // 不得株连全站），此处改用 UpstreamFault，阈值语义本身未放宽。
+    handle.record_probe_outcome(1, &models, KeyHealthVerdict::UpstreamFault, now);
+    handle.record_probe_outcome(1, &models, KeyHealthVerdict::UpstreamFault, now);
     assert_eq!(breaker_of(&handle, 1), "closed");
-    handle.record_probe_outcome(1, &models, KeyHealthVerdict::DeadKey, now);
+    handle.record_probe_outcome(1, &models, KeyHealthVerdict::UpstreamFault, now);
     assert_eq!(breaker_of(&handle, 1), "open");
     assert_eq!(breaker_of(&handle, 2), "closed");
 
     // 成功一轮 ⇒ 立即回 Closed（正证据复活）。
     handle.record_probe_outcome(1, &models, KeyHealthVerdict::Healthy, now);
+    assert_eq!(breaker_of(&handle, 1), "closed");
+
+    // DEBUG-G5 P1-8：死 key / 额度空连续 3 轮也不得打开本站候选（其它 key 不被跳过）。
+    handle.record_probe_outcome(1, &models, KeyHealthVerdict::DeadKey, now);
+    handle.record_probe_outcome(1, &models, KeyHealthVerdict::DeadKey, now);
+    handle.record_probe_outcome(1, &models, KeyHealthVerdict::DeadKey, now);
+    assert_eq!(breaker_of(&handle, 1), "closed");
+    handle.record_probe_outcome(1, &models, KeyHealthVerdict::QuotaExhausted, now);
+    handle.record_probe_outcome(1, &models, KeyHealthVerdict::QuotaExhausted, now);
+    handle.record_probe_outcome(1, &models, KeyHealthVerdict::QuotaExhausted, now);
     assert_eq!(breaker_of(&handle, 1), "closed");
 
     handle.shutdown();

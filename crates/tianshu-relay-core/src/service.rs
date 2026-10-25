@@ -650,6 +650,12 @@ pub struct RevokeReport {
     pub revoked: bool,
     /// 本地 `keys.status` 是否写上 `revoked`。
     pub local_status_updated: bool,
+    /// DEBUG-G5 P1-10：本轮是否成功删掉了该 key 的**保险库条目**（明文材料）。
+    /// `true` = 删掉了；`false` = 没删（无本地行可定位条目，或删除失败，见 note）。
+    /// 与 `local_status_updated` 互相独立：DB 行**刻意保留**（绑定与漂移追溯
+    /// 靠 `keys.id` 存活，删行会经 `ON DELETE CASCADE` 一起带走），只分离
+    /// 「明文材料也保留」的那部分——保险库条目单删，行不动。
+    pub vault_deleted: bool,
     pub note: Option<String>,
 }
 
@@ -1063,12 +1069,17 @@ pub fn budget_breach_for(
 /// M46-S6：对账行种类——**存在分区**，不是金额结论（见 spec §4.2）：
 /// `matched` = 账单行存在且网关成本 > 0；`gateway_only` = 网关成本 > 0 且
 /// 该 (site, day) 无任何账单行；`bill_only` = 账单行存在且网关成本为 0 或无行；
+/// `gateway_unpriced` = 该 (site, day) **有用量行但无账单行、且网关成本算不出
+/// USD**（DEBUG-G5 P1-9：无价模型 / CNY 价模型的用量行在 USD 口径下 INNER
+/// JOIN 不命中，成本恒为 0——旧实现在此直接 `continue`，把「用量不可定价
+/// 且账单缺失」静默成「当天无用量」，与真正的两边都空无法区分）；
 /// 两边都空 ⇒ 不出任何行。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BillReconciliationKind {
     Matched,
     GatewayOnly,
     BillOnly,
+    GatewayUnpriced,
 }
 
 impl BillReconciliationKind {
@@ -1077,6 +1088,7 @@ impl BillReconciliationKind {
             BillReconciliationKind::Matched => "matched",
             BillReconciliationKind::GatewayOnly => "gateway_only",
             BillReconciliationKind::BillOnly => "bill_only",
+            BillReconciliationKind::GatewayUnpriced => "gateway_unpriced",
         }
     }
 }
@@ -1086,6 +1098,10 @@ impl BillReconciliationKind {
 /// 缺失侧在算术上按 0 计（gateway-only 行 `bill_usd = 0.0`、
 /// bill-only 行 `gateway_usd = 0.0`）。`flagged` 可比时 = 超阈值，
 /// 不可比时恒为 true（需人工看）。
+/// DEBUG-G5 P1-9 的 `gateway_unpriced` 行是例外中的例外：`gateway_usd = 0.0`
+/// 在此**不是**「网关花了 0 美元」，而是「用量行没有可 JOIN 的 USD 价、
+/// 成本算不出来」——kind 本身就是区分信号；`bill_usd = Some(0.0)`（无账单，
+/// 缺失侧按 0）、`diff_usd = None`（网关侧未知，无法比较）、`flagged = true`。
 #[derive(Clone, Debug, PartialEq)]
 pub struct BillReconciliationRow {
     pub site_id: i64,
@@ -1192,7 +1208,25 @@ pub fn reconcile_bills(
         }
         let gateway_usd = reconciliation_gateway_cost(store, &mut cost_cache, *site, day)?;
         if gateway_usd <= 0.0 {
-            continue; // 网关成本 0 且无账单 ⇒ 两边都空，无可对项。
+            // DEBUG-G5 P1-9：到这里的 (site, day) 一定在 `usage_days` 里——即
+            // 当天**有用网关用量行**，只是 USD 成本算出来是 0（无价模型 /
+            // CNY 价模型在 USD 口径下 JOIN 不命中）。旧实现直接 `continue`，
+            // 把它与「当天根本无用量」混成同一种「无行」，用户无法区分。
+            // 现出显性行：kind = gateway_unpriced，gateway_usd 记 0.0 但语义
+            // 是「不可定价」而非「花了 0」（见行结构注释），diff 不可比 = None，
+            // flagged = true（需人工看：补价或补账单）。「两边都空」的天根本
+            // 不在 `usage_days` 里，仍不出行——区分点就立在这里。
+            rows.push(BillReconciliationRow {
+                site_id: *site,
+                day: day.clone(),
+                gateway_usd: 0.0,
+                bill_usd: Some(0.0),
+                diff_usd: None,
+                flagged: true,
+                kind: BillReconciliationKind::GatewayUnpriced,
+                source: None,
+            });
+            continue;
         }
         let diff = round6_usd(gateway_usd);
         let threshold = (0.05 * gateway_usd).max(1.0);
@@ -4713,10 +4747,13 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             // 而那把 key 在本地仍是 active，`sync_site_keys` 之前会被当成可用。
             Ok(report) => {
                 let local_ok = report.local_status_updated;
-                let message = if local_ok {
+                let vault_ok = report.vault_deleted;
+                let message = if local_ok && vault_ok {
                     "轮换完成: 新密钥已全量注入，旧密钥已回收".to_string()
-                } else {
+                } else if !local_ok {
                     "轮换完成: 新密钥已全量注入，旧密钥站点侧已删除，但本地状态未写成 revoked（对账交给 sync_site_keys）".to_string()
+                } else {
+                    "轮换完成: 新密钥已全量注入，旧密钥站点侧已删除，但保险库条目未删除".to_string()
                 };
                 self.log(observability::event_with_payload(
                     Level::Info,
@@ -4728,6 +4765,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                         "new_key_id": new_key.id,
                         "reinjected": &reinjected,
                         "local_status_updated": local_ok,
+                        "vault_deleted": vault_ok,
                     }),
                 ));
                 Ok(RotationRun {
@@ -4737,10 +4775,12 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     // 本地那一行**刻意不删**：`bindings.key_id` 是 `ON DELETE CASCADE`，
                     // 删行会连带丢掉旧 key 的绑定与漂移追溯；对账交给 `sync_site_keys`。
                     stopped_at: None,
-                    stop_reason: if local_ok {
+                    stop_reason: if local_ok && vault_ok {
                         None
-                    } else {
+                    } else if !local_ok {
                         Some("旧密钥站点侧已删除，但本地状态未写成 revoked".to_string())
+                    } else {
+                        Some("旧密钥站点侧已删除，但保险库条目未删除".to_string())
                     },
                 })
             }
@@ -5563,13 +5603,17 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 //
                 // 代价是记账确实没写上，所以这里**必须留痕**：Warn 级事件带上原因（脱敏后），
                 // 用户能在事件面板看到；下一次 `sync_site_keys` 对账也会把它标出来。
+                let mut vault_deleted = false;
                 if let Some(key_id) = key_id {
                     // M8-S1 §3.5-5：让**正在运行**的网关也立刻停止使用这把 key。
                     // `ensure_not_revoked` 只拦新启动；运行中的网关只看这个集合。
+                    // DEBUG-G5 P1-10：同时记下 secret_ref，供下面单删保险库条目。
+                    let mut secret_ref: Option<String> = None;
                     if let Ok(Some(row)) = self.store.get_key(key_id) {
                         if let Ok(mut set) = self.revoked_refs.lock() {
-                            set.insert(row.secret_ref);
+                            set.insert(row.secret_ref.clone());
                         }
+                        secret_ref = Some(row.secret_ref);
                     }
                     match self
                         .store
@@ -5591,6 +5635,36 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                             ));
                         }
                     }
+                    // DEBUG-G5 P1-10：单删该 key 的保险库条目（明文材料），DB 行
+                    // 保留（上文 `set_key_status` 只改状态，不删行）。删除与状态
+                    // 写回互相独立：任一失败都不让另一次、更不让整次回收失败
+                    // （站点侧已删不可逆，同上文「本地记账失败不让命令失败」的
+                    // 口径）；删除失败必须留痕：Warn 事件 + note 追加，调用方与
+                    // 界面能看到「站点已删、本地保险库条目还在」，而不是静默残留。
+                    // `vault.delete` 幂等：条目本来就没了也算成功。
+                    if let Some(reference) = secret_ref {
+                        match self.vault.delete(&reference) {
+                            Ok(()) => vault_deleted = true,
+                            Err(err) => {
+                                let reason = crate::redact::scrub(&err.to_string());
+                                let suffix = format!("保险库条目未删除：{reason}");
+                                note = Some(match note {
+                                    Some(prev) => format!("{prev}；{suffix}"),
+                                    None => format!("站点侧已回收，但{suffix}"),
+                                });
+                                self.log(observability::event_with_payload(
+                                    Level::Warn,
+                                    "key",
+                                    "站点侧已回收，但保险库条目未删除",
+                                    serde_json::json!({
+                                        "site_id": site_id,
+                                        "key_id": key_id,
+                                        "reason": reason,
+                                    }),
+                                ));
+                            }
+                        }
+                    }
                 }
                 // payload 只记 id 与状态：这里经手的是「哪一把」，不是「那一把的值」。
                 self.log(observability::event_with_payload(
@@ -5602,6 +5676,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                         "key_id": key_id,
                         "status": crate::store::KEY_STATUS_REVOKED,
                         "local_status_updated": local_status_updated,
+                        "vault_deleted": vault_deleted,
                     }),
                 ));
                 Ok(RevokeReport {
@@ -5609,6 +5684,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     remote_id: Some(remote_id.to_string()),
                     revoked: true,
                     local_status_updated,
+                    vault_deleted,
                     note,
                 })
             }
@@ -5672,6 +5748,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                         remote_id: Some(remote_id),
                         revoked: false,
                         local_status_updated: false,
+                        vault_deleted: false,
                         note: Some(crate::redact::scrub(&err.to_string())),
                     }),
                 }

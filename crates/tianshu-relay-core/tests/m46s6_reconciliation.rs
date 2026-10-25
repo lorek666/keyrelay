@@ -601,3 +601,33 @@ fn reconciliation_illegal_bill_day_errors() {
         "非法 day 应整条报错，不静默跳行"
     );
 }
+
+#[test]
+fn reconciliation_unpriced_usage_gets_explicit_row_not_silently_skipped() {
+    // DEBUG-G5 P1-9：有用量、无账单、无 USD 价 ⇒ 出 gateway_unpriced 显性行，
+    // 而不是旧实现的静默 continue；当天无用量的空站仍不出行，两者可区分。
+    let (dir, store, site_a) = store_with_site();
+    let site_empty = store
+        .upsert_site("newapi", "https://empty.example.com", "空站")
+        .expect("写空站");
+    // 只有 CNY 价：USD 口径 JOIN 不命中，网关成本恒为 0，但用量行真实存在。
+    price(&store, "cny-model", 2.0, 4.0, "CNY", now() - 40 * 86_400);
+    store
+        .insert_gateway_usage(&usage(now(), site_a, None, "cny-model", 1_000_000, 0))
+        .expect("写 CNY 用量");
+    let rows = reconcile_bills(&store, None, 30).expect("对账全部");
+    assert_eq!(rows.len(), 1, "只应有 unpriced 这一行，空站不出行");
+    let row = &rows[0];
+    assert_eq!(row.site_id, site_a);
+    assert_eq!(row.kind, BillReconciliationKind::GatewayUnpriced);
+    assert_eq!(row.gateway_usd, 0.0, "0 在此表示不可定价，不是花了 0");
+    assert_eq!(row.bill_usd, Some(0.0), "无账单，缺失侧按 0 计");
+    assert_eq!(row.diff_usd, None, "网关侧未知，无法比较");
+    assert!(row.flagged, "不可比行恒 flagged，需人工看");
+    assert_eq!(row.source, None, "无账单行无来源");
+    assert!(
+        rows.iter().all(|r| r.site_id != site_empty),
+        "当天无用量的空站必须不出行，否则与 unpriced 无法区分"
+    );
+    let _ = dir;
+}

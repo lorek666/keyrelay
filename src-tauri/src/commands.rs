@@ -2169,7 +2169,7 @@ pub fn site_bills(
         .map_err(|e| e.to_string())
 }
 
-/// M46-S6：一行账单对账结果（kind 为 "matched" | "gateway_only" | "bill_only"；
+/// M46-S6：一行账单对账结果（kind 为 "matched" | "gateway_only" | "bill_only" | "gateway_unpriced"；
 /// bill_usd / diff_usd 为空只表示不可比——currency 非 USD、或为空、或 amount 为空；
 /// 缺失侧按 0 计：gateway-only 行 bill_usd = 0.0、bill-only 行 gateway_usd = 0.0）。
 #[derive(Serialize, Clone, Debug)]
@@ -4020,6 +4020,7 @@ pub struct RevokeReportDto {
     remote_id: Option<String>,
     revoked: bool,
     local_status_updated: bool,
+    vault_deleted: bool,
     note: Option<String>,
 }
 
@@ -4030,6 +4031,7 @@ impl From<tianshu_relay_core::service::RevokeReport> for RevokeReportDto {
             remote_id: report.remote_id,
             revoked: report.revoked,
             local_status_updated: report.local_status_updated,
+            vault_deleted: report.vault_deleted,
             note: report.note,
         }
     }
