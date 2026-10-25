@@ -609,6 +609,8 @@
       "removedValueMasked": "…（旧值已隐去）",
       "noChange": "配置已是最新，无需改动。",
       "agree": "我同意把上述密钥写入该 agent 的配置（写入前会备份，可回滚）",
+      "agreeAll": "我已看过上面全部文件的差异，同意把上述密钥写入这些配置（写入前会备份，可回滚）",
+      "fileTitle": "第 {index} 个文件（共 {total} 个）",
       "generating": "生成预览…"
     },
     "restartHint": {
@@ -743,6 +745,7 @@
     },
     "notice": {
       "delivered": "已投递到 {path}（变更 {journal}）。{hint}",
+      "deliveredFiles": "已投递到 {paths}（变更 {journal}）。{hint}",
       "revoked": "已撤销同意。已写入的文件不会被自动回滚——如需还原请用「变更历史」页。",
       "rolledBack": "已回滚 {journal}。"
     },

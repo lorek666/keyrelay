@@ -990,6 +990,81 @@ pub struct DeliveryOutcome {
     pub backup_path: Option<PathBuf>,
 }
 
+// ==================================================== P0-2：Codex 双文件同单
+//
+// 背景：Codex 真调通上游必须同时写 `~/.codex/auth.json`（密钥）与
+// `~/.codex/config.toml`（端点 / provider / 模型）。此前它们是两次独立投递，
+// 中间存在「密钥换了、端点没换」的半注入窗口（旧密钥 + 新端点、或新密钥 +
+// 旧端点都会拿 401，而两次投递又各自报成功）。
+//
+// 本节只定**形状**（两个文件各自的计划 / 结果怎么拼成一单），同单的执行语义
+// （共享 journal、双锁、双校验、双记账、失败整体回滚）在服务层
+// `apply_codex_in` 里实现，见那里的注释。
+
+/// Codex 双文件投递的预览：两文件各自一份 [`DeliveryPlan`]，拼成一单。
+///
+/// - `auth` 为 `Some` ⇔ 双文件模式：预览必须同时展示两文件的内容与字段，
+///   只看其中一份就确认，等于没看到另一半；
+/// - `auth` 为 `None` ⇔ 保留模式（见 `preserve_auth`）：auth.json 不在单里，
+///   预览里也没有它——不是「auth 没变化」，而是「auth 根本不写」。
+/// - 两份计划的 `fields` 各自走 P0-1 的必填表校验：auth 表不得含端点 / 模型键，
+///   config 表不得含任何 API_KEY 键；两张表分开校验，混成一张会把
+///   「密钥进了 config.toml」误判为正常。
+#[derive(Clone, PartialEq, Eq)]
+pub struct CodexDeliveryPlan {
+    /// `true` = 保留模式：只写 config.toml，auth.json 一个字节都不碰。
+    /// `false` = 双文件模式：两文件同单写。
+    ///
+    /// **默认值与显式性**：服务层入口收的是 `bool`，没有「缺省」这个第三态——
+    /// 调用方必须传 `true` 或 `false`，不存在「没传就按保留算」的路径；
+    /// 命令层把「没传」翻译成 `false`（双文件），见命令层 `DeliveryArgs` 的注释。
+    /// 「auth.json 已存在」**绝不**被推断为保留：已存在只说明用户以前投递过，
+    /// 不能说明这次他想保留官方登录。
+    pub preserve_auth: bool,
+    pub mode: DeliveryMode,
+    pub auth: Option<DeliveryPlan>,
+    pub config: DeliveryPlan,
+}
+
+impl std::fmt::Debug for CodexDeliveryPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexDeliveryPlan")
+            .field("preserve_auth", &self.preserve_auth)
+            .field("mode", &self.mode)
+            .field("auth", &self.auth)
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+/// Codex 双文件投递的结果：**不含任何密钥材料**，可直接序列化给前端。
+///
+/// ## 记账语义（本单唯一正确的读法）
+///
+/// - **journal 共享一个 id**：双文件是一次 `inject::apply_holding_lock` 调用，
+///   产出一个 `Journal { id, entries: [auth, config] }`。`record_journal`
+///   据此写两行（`id = "<journal>:<target_path>"`，按目标路径区分），
+///   回滚时 `journal_entries(journal_id)` 一次取回两条，按逆序还原——
+///   滚一单就是滚两文件，不存在「只滚一半」的入口。
+/// - **绑定各记一条**：`bindings` 表按 `(agent_id, target_path)` 区分落点，
+///   因此双文件记**两行**，`agent_id` 各取通道自己的值（`codex` /
+///   `codex-config`）、`journal_id` 填**同一个**共享 id。漂移按行取
+///   `journal_id || ':' || target_path` 的哈希，各文件独立判定，互不干扰。
+/// - **保留模式只记 config 一行**：auth.json 没写，就没有它的绑定行；
+///   绝不能为一个没动过的文件记一条「已投递」的绑定——那会让漂移报告
+///   把用户官方登录态的后续变化算成我们的漂移。
+/// - 回滚一单后，两条绑定行的 journal 状态同时变 `rolled_back`，
+///   漂移报告里两文件同时退出（`mark_journal_rolled_back` 按 journal id 前缀匹配）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexDeliveryOutcome {
+    /// 与 `auth` / `config` 各自的 `journal_id` 是**同一个值**（共享 journal）。
+    pub journal_id: String,
+    pub preserve_auth: bool,
+    /// 双文件模式为 `Some`，保留模式为 `None`（auth 没写，就没有结果行）。
+    pub auth: Option<DeliveryOutcome>,
+    pub config: DeliveryOutcome,
+}
+
 /// 通道实现。
 pub trait DeliveryWriter: Send + Sync {
     fn channel(&self) -> DeliveryChannel;
@@ -1506,6 +1581,44 @@ pub(crate) fn jsonc_hazard(text: &str) -> Option<JsoncHazard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P0-2：双文件各自的回读比对——缺一个必填叶键即失败，服务层据此回滚整单。
+    /// 服务层无法在不挂钩子的情况下确定性制造「写完后文件又被改动」，
+    /// 因此回读函数本身的语义由这条单元测试钉住，整单回滚路径由集成测试
+    /// （记账失败回滚两文件、写盘失败补偿）覆盖同一条回滚代码。
+    #[test]
+    fn verify_applied_fields_checks_each_codex_file_separately() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let opts = FieldSetOptions::new("keyrelay", true, true, false);
+
+        // auth：缺 OPENAI_API_KEY 即失败。
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(&auth_path, "{\n  \"auth_mode\": \"apikey\"\n}").unwrap();
+        let auth_expected = expected_fields(DeliveryChannel::CodexAuthJson, &opts);
+        let err = verify_applied_fields(DeliveryChannel::CodexAuthJson, &auth_expected, &auth_path)
+            .unwrap_err();
+        assert!(err.to_string().contains("OPENAI_API_KEY"), "{err}");
+
+        // config：缺 base_url 即失败；齐全则通过。
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "model_provider = \"custom\"\nmodel = \"m\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\n",
+        )
+        .unwrap();
+        let config_expected = expected_fields(DeliveryChannel::CodexConfig, &opts);
+        let err =
+            verify_applied_fields(DeliveryChannel::CodexConfig, &config_expected, &config_path)
+                .unwrap_err();
+        assert!(err.to_string().contains("base_url"), "{err}");
+        std::fs::write(
+            &config_path,
+            "model_provider = \"custom\"\nmodel = \"m\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"https://relay.example.com\"\nwire_api = \"responses\"\n",
+        )
+        .unwrap();
+        verify_applied_fields(DeliveryChannel::CodexConfig, &config_expected, &config_path)
+            .unwrap();
+    }
 
     #[test]
     fn channel_strings_are_exact() {

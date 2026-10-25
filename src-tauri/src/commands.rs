@@ -270,6 +270,33 @@ pub struct DeliveryPlanDto {
     /// 这里是**穷举 match**（没有 `_` 分支）：新增一条通道时它会编译失败，
     /// 而不是悄悄给出一个空提示。
     restart_hint: &'static str,
+    /// P0-2：Codex 保留模式（只写 config，auth.json 不动）时为 true；其余一律 false。
+    preserve_auth: bool,
+    /// P0-2：本次投递实际覆盖的全部文件。单通道 = 1 条；Codex 双文件 = 2 条
+    /// （auth + config，写顺序）；Codex 保留 = 1 条（config）。
+    ///
+    /// 顶层字段（`target_path` / `fields` / `preview` / `consent`）是历史形态，
+    /// 只描述「入口文件」（入口文件在单里就取它，否则取 config——保留模式下
+    /// 入口是 auth 时单里没有 auth，只能取 config）；**新界面必须读 `files`
+    /// 才算看到整单**，只看顶层会漏掉另一半文件。
+    files: Vec<DeliveryFilePlanDto>,
+}
+
+/// 一单里某一个文件的预览（P0-2）。字段含义与顶层同名项一致，
+/// 只是作用域收窄到这一个文件；`consent` 同样按文件各自的同意记录取。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryFilePlanDto {
+    channel: String,
+    target_path: String,
+    target_exists: bool,
+    fields: Vec<DeliveryFieldDto>,
+    /// **已脱敏**的 diff 预览（只含这一个文件的变化行）
+    preview: String,
+    /// `"missing"` | `"granted"` | `"revoked"`
+    consent: String,
+    consent_granted_at: Option<i64>,
+    consent_revoked_at: Option<i64>,
 }
 
 /// [`tianshu_relay_core::delivery::RestartHint`] 的线格式。
@@ -325,6 +352,23 @@ pub struct DeliveryOutcomeDto {
     channel: String,
     target_path: String,
     journal_id: String,
+    backup_path: Option<String>,
+    /// P0-2：Codex 保留模式时为 true；其余一律 false。
+    preserve_auth: bool,
+    /// P0-2：本次投递实际写了的全部文件（单通道 = 1 条；Codex 双文件 = 2 条，
+    /// 写顺序；Codex 保留 = 1 条 config）。`journal_id` 在各条之间**共享**
+    /// （同一单、同一 journal），`backup_path` 各取各文件的备份。
+    /// 顶层 `target_path` / `backup_path` 只描述入口文件（入口文件没写时取
+    /// config——保留模式下入口是 auth 时单里没有 auth），新界面必须读 `files`。
+    files: Vec<DeliveryFileOutcomeDto>,
+}
+
+/// 一单里某一个文件的投递结果（P0-2）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryFileOutcomeDto {
+    channel: String,
+    target_path: String,
     backup_path: Option<String>,
 }
 
@@ -615,6 +659,15 @@ pub struct DeliveryArgs {
     /// 缺省 = 站点模式 ⇒ **既有调用点的行为一字不变**。认不出的取值直接拒绝，
     /// 不静默回退（回退会把「指向网关」的请求当成站点投递）。
     mode: Option<String>,
+    /// P0-2：Codex 保留选项。**只对两条 Codex 通道有意义**，其余通道传 `true`
+    /// 会被直接拒绝（不是静默忽略——忽略会让调用方以为「已保留」而实际没保留）。
+    ///
+    /// - `None`（没传）：Codex 通道走**双文件**（auth + config 同单）；
+    ///   非 Codex 通道走既有单通道行为。**没传 ≠ 保留**。
+    /// - `Some(false)`：Codex 双文件（与没传同义，但显式写出来便于调用方自证）。
+    /// - `Some(true)`：Codex 保留——只写 config.toml，auth.json 一个字节都不碰；
+    ///   且**必须由调用方显式传入**，绝不能从「auth.json 已存在」推断。
+    preserve_auth: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -798,6 +851,150 @@ fn parse_channel(raw: &str) -> Result<tianshu_relay_core::delivery::DeliveryChan
     tianshu_relay_core::delivery::DeliveryChannel::parse(raw).map_err(|e| e.to_string())
 }
 
+/// 同意状态 → DTO 三元组（与既有 `delivery_plan` 的映射逐字一致）。
+fn consent_parts(consent: &ConsentState) -> (&'static str, Option<i64>, Option<i64>) {
+    match consent {
+        ConsentState::Missing => ("missing", None, None),
+        ConsentState::Granted { granted_at } => ("granted", Some(*granted_at), None),
+        ConsentState::Revoked { revoked_at } => ("revoked", None, Some(*revoked_at)),
+    }
+}
+
+/// 一份单通道计划 → 一单里某文件的 DTO（借用版：顶层与 `files` 共用同一份
+/// 计划时，先用它从借用建 `files`，再移动原计划建顶层）。
+fn file_plan_dto(plan: &tianshu_relay_core::delivery::DeliveryPlan) -> DeliveryFilePlanDto {
+    let (consent, granted_at, revoked_at) = consent_parts(&plan.consent);
+    DeliveryFilePlanDto {
+        channel: plan.channel.as_str().to_string(),
+        target_path: plan.target_path.display().to_string(),
+        target_exists: plan.target_exists,
+        fields: plan
+            .fields
+            .iter()
+            .map(|f| DeliveryFieldDto {
+                key: f.key.clone(),
+                masked: f.masked.clone(),
+            })
+            .collect(),
+        preview: plan.preview.clone(),
+        consent: consent.to_string(),
+        consent_granted_at: granted_at,
+        consent_revoked_at: revoked_at,
+    }
+}
+
+/// 单通道计划 → 完整 DTO（顶层 = 该计划本身，`files` = 只有它一条）。
+fn single_plan_dto(plan: tianshu_relay_core::delivery::DeliveryPlan) -> DeliveryPlanDto {
+    let file = file_plan_dto(&plan);
+    let (consent, granted_at, revoked_at) = consent_parts(&plan.consent);
+    // BACKLOG B-76：有些 agent 会优先读**另一个扩展名**的同名文件
+    // （本机实测 `~/.config/opencode/` 下 `.json` 与 `.jsonc` 并存）。
+    // 写进 A 而 agent 读 B 时投递会**静默不生效**——用户看到「已投递成功」，
+    // agent 却拿不到 key，且没有任何报错。这里只提示，不阻断。
+    let warnings = delivery_warnings(&plan.target_path);
+    let channel = plan.channel;
+    DeliveryPlanDto {
+        agent_id: plan.agent_id,
+        channel: channel.as_str().to_string(),
+        target_path: plan.target_path.display().to_string(),
+        target_exists: plan.target_exists,
+        mode: plan.mode.as_str().to_string(),
+        fields: plan
+            .fields
+            .into_iter()
+            .map(|f| DeliveryFieldDto {
+                key: f.key,
+                masked: f.masked,
+            })
+            .collect(),
+        preview: plan.preview,
+        consent: consent.to_string(),
+        consent_granted_at: granted_at,
+        consent_revoked_at: revoked_at,
+        warnings,
+        restart_hint: restart_hint_str(tianshu_relay_core::delivery::restart_hint(channel)),
+        endpoint_in_channel: tianshu_relay_core::delivery::channel_carries_endpoint(channel),
+        preserve_auth: false,
+        files: vec![file],
+    }
+}
+
+/// Codex 双文件计划 → 完整 DTO。
+///
+/// 顶层取「入口文件」的那份计划（入口文件在单里就取它，否则取 config——
+///
+/// 保留模式下入口是 auth 时单里没有 auth）；`files` 按写顺序列出全部文件。
+/// 顶层的 `warnings` / `restart_hint` / `endpoint_in_channel` 同样按顶层
+/// 那份计划的文件算，与单通道口径一致。
+fn codex_plan_dto(
+    entry: tianshu_relay_core::delivery::DeliveryChannel,
+    plan: tianshu_relay_core::delivery::CodexDeliveryPlan,
+) -> DeliveryPlanDto {
+    let mut files: Vec<DeliveryFilePlanDto> = Vec::new();
+    if let Some(auth) = &plan.auth {
+        files.push(file_plan_dto(auth));
+    }
+    files.push(file_plan_dto(&plan.config));
+    let top = match (&plan.auth, entry) {
+        (Some(auth), tianshu_relay_core::delivery::DeliveryChannel::CodexAuthJson) => auth.clone(),
+        _ => plan.config.clone(),
+    };
+    let mut dto = single_plan_dto(top);
+    dto.preserve_auth = plan.preserve_auth;
+    dto.files = files;
+    dto
+}
+
+/// 一份单通道结果 → 一单里某文件的 DTO（借用版）。
+fn file_outcome_dto(
+    outcome: &tianshu_relay_core::delivery::DeliveryOutcome,
+) -> DeliveryFileOutcomeDto {
+    DeliveryFileOutcomeDto {
+        channel: outcome.channel.as_str().to_string(),
+        target_path: outcome.target_path.display().to_string(),
+        backup_path: outcome
+            .backup_path
+            .as_ref()
+            .map(|p| p.display().to_string()),
+    }
+}
+
+/// 单通道结果 → 完整 DTO（顶层 = 该结果本身，`files` = 只有它一条）。
+fn single_outcome_dto(
+    outcome: tianshu_relay_core::delivery::DeliveryOutcome,
+) -> DeliveryOutcomeDto {
+    let file = file_outcome_dto(&outcome);
+    DeliveryOutcomeDto {
+        channel: outcome.channel.as_str().to_string(),
+        target_path: outcome.target_path.display().to_string(),
+        journal_id: outcome.journal_id,
+        backup_path: outcome.backup_path.map(|p| p.display().to_string()),
+        preserve_auth: false,
+        files: vec![file],
+    }
+}
+
+/// Codex 双文件结果 → 完整 DTO（顶层取入口文件那份结果，否则取 config；
+/// `files` 按写顺序列出全部文件；各条的 `journal_id` 相同，见服务层注释）。
+fn codex_outcome_dto(
+    entry: tianshu_relay_core::delivery::DeliveryChannel,
+    outcome: tianshu_relay_core::delivery::CodexDeliveryOutcome,
+) -> DeliveryOutcomeDto {
+    let mut files: Vec<DeliveryFileOutcomeDto> = Vec::new();
+    if let Some(auth) = &outcome.auth {
+        files.push(file_outcome_dto(auth));
+    }
+    files.push(file_outcome_dto(&outcome.config));
+    let top = match (&outcome.auth, entry) {
+        (Some(auth), tianshu_relay_core::delivery::DeliveryChannel::CodexAuthJson) => auth.clone(),
+        _ => outcome.config.clone(),
+    };
+    let mut dto = single_outcome_dto(top);
+    dto.preserve_auth = outcome.preserve_auth;
+    dto.files = files;
+    dto
+}
+
 #[tauri::command]
 pub async fn delivery_plan(
     state: State<'_, AppState>,
@@ -820,47 +1017,30 @@ pub async fn delivery_plan(
     // M14-S7 §4.2：先把「内置表没覆盖的模型」的在线参数预热进缓存，再走同步的 plan。
     // best-effort：网络失败/超时只是没有参数行，预览照常出（失败不阻断投递）。
     let _ = state.service.warm_model_meta(args.model.as_deref()).await;
+    // P0-2：两条 Codex 通道走双文件同单——没传 `preserve_auth` 即双文件
+    // （`unwrap_or(false)`），显式 `true` 才保留。两条通道的入口等价：
+    // 从 auth 卡片还是 config 卡片进来，单里都是同一组文件。
+    if matches!(
+        channel,
+        tianshu_relay_core::delivery::DeliveryChannel::CodexAuthJson
+            | tianshu_relay_core::delivery::DeliveryChannel::CodexConfig
+    ) {
+        let preserve_auth = args.preserve_auth.unwrap_or(false);
+        return state
+            .service
+            .delivery_plan_codex_in(args.key_id, args.model.as_deref(), source, preserve_auth)
+            .map(|plan| codex_plan_dto(channel, plan))
+            .map_err(|e| e.to_string());
+    }
+    // 非 Codex 通道没有「保留 auth」这个概念：传 `true` 必须拒绝，
+    // 不能静默忽略——忽略会让调用方以为「已保留」而实际没保留。
+    if args.preserve_auth == Some(true) {
+        return Err("preserve_auth 只对 Codex 双文件投递有意义，该通道不支持保留".to_string());
+    }
     state
         .service
         .delivery_plan_in(args.key_id, channel, args.model.as_deref(), source)
-        .map(|plan| {
-            let (consent, granted_at, revoked_at) = match plan.consent {
-                ConsentState::Missing => ("missing", None, None),
-                ConsentState::Granted { granted_at } => ("granted", Some(granted_at), None),
-                ConsentState::Revoked { revoked_at } => ("revoked", None, Some(revoked_at)),
-            };
-            // BACKLOG B-76：有些 agent 会优先读**另一个扩展名**的同名文件
-            // （本机实测 `~/.config/opencode/` 下 `.json` 与 `.jsonc` 并存）。
-            // 写进 A 而 agent 读 B 时投递会**静默不生效**——用户看到「已投递成功」，
-            // agent 却拿不到 key，且没有任何报错。这里只提示，不阻断。
-            let warnings = delivery_warnings(&plan.target_path);
-            DeliveryPlanDto {
-                agent_id: plan.agent_id,
-                channel: plan.channel.as_str().to_string(),
-                target_path: plan.target_path.display().to_string(),
-                target_exists: plan.target_exists,
-                mode: plan.mode.as_str().to_string(),
-                fields: plan
-                    .fields
-                    .into_iter()
-                    .map(|f| DeliveryFieldDto {
-                        key: f.key,
-                        masked: f.masked,
-                    })
-                    .collect(),
-                preview: plan.preview,
-                consent: consent.to_string(),
-                consent_granted_at: granted_at,
-                consent_revoked_at: revoked_at,
-                warnings,
-                restart_hint: restart_hint_str(tianshu_relay_core::delivery::restart_hint(
-                    plan.channel,
-                )),
-                endpoint_in_channel: tianshu_relay_core::delivery::channel_carries_endpoint(
-                    plan.channel,
-                ),
-            }
-        })
+        .map(single_plan_dto)
         .map_err(|e| e.to_string())
 }
 
@@ -969,15 +1149,28 @@ pub async fn apply_delivery(
     // M14-S7 §4.2：同 `delivery_plan`——直接投递（没先预览）时也要拿到在线参数。
     // 缓存已在预览时预热过，这里通常是一次纯读；best-effort，失败不阻断。
     let _ = state.service.warm_model_meta(args.model.as_deref()).await;
+    // P0-2：与 `delivery_plan` 同一条路由——Codex 通道走双文件同单，
+    // 没传 `preserve_auth` 即双文件，显式 `true` 才保留；非 Codex 通道传
+    // `true` 直接拒绝（不得静默忽略）。
+    if matches!(
+        channel,
+        tianshu_relay_core::delivery::DeliveryChannel::CodexAuthJson
+            | tianshu_relay_core::delivery::DeliveryChannel::CodexConfig
+    ) {
+        let preserve_auth = args.preserve_auth.unwrap_or(false);
+        return state
+            .service
+            .apply_codex_in(args.key_id, args.model.as_deref(), source, preserve_auth)
+            .map(|outcome| codex_outcome_dto(channel, outcome))
+            .map_err(|e| e.to_string());
+    }
+    if args.preserve_auth == Some(true) {
+        return Err("preserve_auth 只对 Codex 双文件投递有意义，该通道不支持保留".to_string());
+    }
     state
         .service
         .apply_delivery_in(args.key_id, channel, args.model.as_deref(), source)
-        .map(|outcome| DeliveryOutcomeDto {
-            channel: outcome.channel.as_str().to_string(),
-            target_path: outcome.target_path.display().to_string(),
-            journal_id: outcome.journal_id,
-            backup_path: outcome.backup_path.map(|p| p.display().to_string()),
-        })
+        .map(single_outcome_dto)
         .map_err(|e| e.to_string())
 }
 

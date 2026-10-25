@@ -326,7 +326,12 @@ export default function Agents() {
     setError(null);
   }, [activeKey, channel, model, mode]);
 
-  const noChange = plan.data?.preview.trim() === "(无变化)";  // i18n:skip
+  // P0-2 复审 P1-2：noChange 按全部写盘文件判定——入口无变化但另一文件有变化时，
+  // 投递按钮不得被禁用；files 为空（旧 mock）时回退顶层预览，保持单文件行为。
+  const noChange =
+    plan.data?.files?.length
+      ? plan.data.files.every((f) => f.preview.trim() === "(无变化)") // i18n:skip
+      : plan.data?.preview.trim() === "(无变化)"; // i18n:skip
 
   const grantAndApply = useMutation({
     mutationFn: async () => {
@@ -338,7 +343,15 @@ export default function Agents() {
       setLastOutcome(outcome);
       // 生效策略必须跟着结果一起说：用户最容易在这里以为「已经生效了」
       const hint = plan.data ? restartHintLabel(plan.data.restartHint) : "";
-      setNotice(t("agents.notice.delivered", { path: outcome.targetPath, journal: outcome.journalId, hint }));
+      // P0-2 复审 P1-2：成功提示列出全部写盘路径（双文件时两条，单文件时沿用旧文案）。
+      const writtenPaths = outcome.files?.length
+        ? outcome.files.map((f) => f.targetPath)
+        : [outcome.targetPath];
+      setNotice(
+        writtenPaths.length > 1
+          ? t("agents.notice.deliveredFiles", { paths: writtenPaths.join(", "), journal: outcome.journalId, hint })
+          : t("agents.notice.delivered", { path: outcome.targetPath, journal: outcome.journalId, hint }),
+      );
       setConfirming(false);
       await qc.invalidateQueries({ queryKey: ["plan", activeKey, channel] });
       await qc.invalidateQueries({ queryKey: ["consents"] });
@@ -402,13 +415,6 @@ export default function Agents() {
       setUnbinding(false);
     },
   });
-
-  const consentLabel = useMemo(() => {
-    const state = plan.data?.consent;
-    if (state === "granted") return t("agents.plan.consentGranted");
-    if (state === "revoked") return t("agents.plan.consentRevoked");
-    return t("agents.plan.consentMissing");
-  }, [plan.data?.consent, t]);
 
   return (
     <section className="page">
@@ -709,7 +715,6 @@ export default function Agents() {
                     ) : plan.data ? (
                       <PlanView
                         plan={plan.data}
-                        consentLabel={consentLabel}
                         noChange={!!noChange}
                         agreeChecked={agreeChecked}
                         onAgreeChange={setAgreeChecked}
@@ -898,10 +903,21 @@ export default function Agents() {
         onCancel={() => setConfirming(false)}
         onConfirm={() => grantAndApply.mutate()}
       >
-        <p>
-          {t("agents.confirmDialog.applyBodyPre")}<span className="mono">{plan.data?.targetPath}</span>
-          {plan.data?.targetExists ? t("agents.confirmDialog.applyBodyExists") : t("agents.confirmDialog.applyBodyNew")}
-        </p>
+        {/* P0-2 复审 P1-2：确认弹窗同样列出全部写盘文件，不只入口文件。 */}
+        <p>{t("agents.confirmDialog.applyBodyPre")}</p>
+        <ul className="list">
+          {(plan.data?.files?.length
+            ? plan.data.files
+            : plan.data
+              ? [{ targetPath: plan.data.targetPath, targetExists: plan.data.targetExists }]
+              : []
+          ).map((f) => (
+            <li key={f.targetPath}>
+              <span className="mono">{f.targetPath}</span>{" "}
+              {f.targetExists ? t("agents.confirmDialog.applyBodyExists") : t("agents.confirmDialog.applyBodyNew")}
+            </li>
+          ))}
+        </ul>
         <label className="checkline">
           <input
             type="checkbox"
@@ -1213,7 +1229,6 @@ function UpdateAttempts({ outcome }: { outcome: AgentUpdateOutcome }) {
 
 function PlanView({
   plan,
-  consentLabel,
   noChange,
   agreeChecked,
   onAgreeChange,
@@ -1222,7 +1237,6 @@ function PlanView({
   onRevoke,
 }: {
   plan: DeliveryPlan;
-  consentLabel: string;
   noChange: boolean;
   agreeChecked: boolean;
   onAgreeChange: (v: boolean) => void;
@@ -1231,24 +1245,37 @@ function PlanView({
   onRevoke: () => void;
 }) {
   const { t } = useTranslation();
+  // P0-2 复审 P1-2：确认区按 `plan.files` 渲染——份数由后端给（双文件 2 份、
+  // 保留模式 1 份、单通道 1 份），不得写死「永远两份」；files 为空（旧 mock）
+  // 时用顶层字段拼一份，保持单文件行为。顶层字段只作回退，不再是确认依据。
+  const files = plan.files?.length
+    ? plan.files
+    : [
+        {
+          channel: plan.channel,
+          targetPath: plan.targetPath,
+          targetExists: plan.targetExists,
+          fields: plan.fields,
+          preview: plan.preview,
+          consent: plan.consent,
+        },
+      ];
+  const fileConsentLabel = (consent: string) => {
+    if (consent === "granted") return t("agents.plan.consentGranted");
+    if (consent === "revoked") return t("agents.plan.consentRevoked");
+    return t("agents.plan.consentMissing");
+  };
   return (
     <div className="card">
       <div className="row row-between">
         <h3>
           <ShieldCheck size={15} aria-hidden /> {t("agents.plan.title")}
         </h3>
-        <span className={`badge badge-${plan.consent === "granted" ? "ok" : "warn"}`}>
-          {consentLabel}
-        </span>
       </div>
 
       <dl className="kv">
         <dt>{t("agents.plan.agent")}</dt>
         <dd className="mono">{plan.agentId}</dd>
-        <dt>{t("agents.plan.target")}</dt>
-        <dd className="mono ellipsis" title={plan.targetPath}>
-          {plan.targetPath} {plan.targetExists ? t("agents.plan.targetExists") : t("agents.plan.targetNew")}
-        </dd>
         {/* 模式必须显式说出来（M8-S4 §6.6）：两种模式的字段名一模一样
             （`apiKey` / `apiBase`），不说用户分不清写进去的是站点密钥还是本地令牌。 */}
         <dt>{t("agents.plan.writeWhat")}</dt>
@@ -1261,16 +1288,10 @@ function PlanView({
             <span className="badge badge-warn">{t("agents.gatewayMode.unknownMode", { mode: plan.mode })}</span>
           )}
         </dd>
-        <dt>{t("agents.plan.willWrite")}</dt>
-        <dd>
-          {plan.fields.map((f) => (
-            <span key={f.key} className="chip mono">
-              {f.key} = {f.masked}
-            </span>
-          ))}
-        </dd>
         {/* 生效策略：文案从 `restartHint` 取值派生，**不按通道硬编码**。
-            认不出的取值原样显示（不静默留空——那会让用户以为「不需要重启」）。 */}
+            认不出的取值原样显示（不静默留空——那会让用户以为「不需要重启」）。
+            顶层只此一份：DTO 的 files[] 条目暂无 per-file restart_hint（复审 P2-3，
+            已登记 BACKLOG，不在这里顺手改 DTO）。 */}
         <dt>{t("agents.plan.restart")}</dt>
         <dd>{restartHintLabel(plan.restartHint)}</dd>
       </dl>
@@ -1296,13 +1317,37 @@ function PlanView({
         </p>
       ) : null}
 
-      <h4>{t("agents.plan.diffTitle")}</h4>
-      {/* 删除行的值侧掩掉（P2-5）：后端只对**已知的**密钥串做替换，旧站点密钥
-          形态未必落在 scrub 认得的集合里；渲染层先保证不把旧值显示出来。
-          `+` 行逐字节保留——那是「将要写进去什么」，掩掉等于掩盖改动。 */}
-      <pre className="diff">
-        {maskRemovedValues(plan.preview, t("agents.plan.removedValueMasked"))}
-      </pre>
+      {files.map((file, index) => (
+        <section key={file.targetPath}>
+          <div className="row row-between">
+            <h4>{t("agents.plan.fileTitle", { index: index + 1, total: files.length })}</h4>
+            <span className={`badge badge-${file.consent === "granted" ? "ok" : "warn"}`}>
+              {fileConsentLabel(file.consent)}
+            </span>
+          </div>
+          <dl className="kv">
+            <dt>{t("agents.plan.target")}</dt>
+            <dd className="mono ellipsis" title={file.targetPath}>
+              {file.targetPath} {file.targetExists ? t("agents.plan.targetExists") : t("agents.plan.targetNew")}
+            </dd>
+            <dt>{t("agents.plan.willWrite")}</dt>
+            <dd>
+              {file.fields.map((f) => (
+                <span key={f.key} className="chip mono">
+                  {f.key} = {f.masked}
+                </span>
+              ))}
+            </dd>
+          </dl>
+          <h4>{t("agents.plan.diffTitle")}</h4>
+          {/* 删除行的值侧掩掉（P2-5）：后端只对**已知的**密钥串做替换，旧站点密钥
+              形态未必落在 scrub 认得的集合里；渲染层先保证不把旧值显示出来。
+              `+` 行逐字节保留——那是「将要写进去什么」，掩掉等于掩盖改动。 */}
+          <pre className="diff">
+            {maskRemovedValues(file.preview, t("agents.plan.removedValueMasked"))}
+          </pre>
+        </section>
+      ))}
 
       {noChange ? (
         <p className="muted">{t("agents.plan.noChange")}</p>
@@ -1313,7 +1358,9 @@ function PlanView({
             checked={agreeChecked}
             onChange={(e) => onAgreeChange(e.target.checked)}
           />
-          <span>{t("agents.plan.agree")}</span>
+          {/* 同意门禁语义：勾选 = 看过本次全部写盘文件的差异。双文件时用 agreeAll，
+              单文件时沿用旧文案——门禁本身仍是同一个 agreeChecked，不另设复选框。 */}
+          <span>{files.length > 1 ? t("agents.plan.agreeAll") : t("agents.plan.agree")}</span>
         </label>
       )}
 
