@@ -621,7 +621,19 @@
       "notNeeded": "改完即生效：该 agent 每次运行都会重新读这个文件。",
       "needed": "需要重启该 agent 才能读到新配置——它只在启动时读一次。",
       "dependsOnNewSession": "只对新开的会话生效：已经在跑的窗口读到的还是旧配置（例如 shell rc 文件）。",
-      "unknown": "未知的生效策略：{hint}"
+      "unknown": "未知的生效策略：{hint}",
+      "source": {
+        "ccSwitchUnverified": "来源：引自 cc-switch 生效表，未在本机实测。",
+        "unverified": "来源：未实测（本项目保守标注）。",
+        "verified": "来源：已在真机上实测。"
+      },
+      "action": {
+        "newSession": "新开会话即生效，无需重启进程；已在跑的会话不一定重读，拿不准时请新开会话确认。",
+        "restartTerminalOrCli": "重启终端或 CLI 后生效。",
+        "relaunchDesktopApp": "完全退出应用后再重开才生效（仅关窗口、应用仍驻留后台不算）。",
+        "codexSplit": "分三处：ChatGPT 桌面应用重开走一键重启按钮；终端里的 codex 会话不受按钮影响，需手动重开；app-server daemon 需另行验证，只关终端不够。",
+        "restartAgent": "重启该 agent 后生效。"
+      }
     },
     "restart": {
       "title": "重启 {name}",

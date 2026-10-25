@@ -758,16 +758,21 @@ pub fn verify_applied_fields(
 }
 
 /// 纯函数、无 IO。UI **必须**调用它取文案，不得在界面里硬编码判断——否则新增通道时又会漏一处。
+///
+/// P1-6 生效分表：不再一刀切 Needed。
+/// - Claude Code：新会话即生效（无需重启进程）→ `DependsOnNewSession`。注意不是
+///   `NotNeeded`：`NotNeeded` 的语义是「每次运行都重读」，而 cc-switch FAQ 说的是
+///   provider 热切，且本项未在真机上验证运行中会话是否重读 env；`NotNeeded` 仍被
+///   `restart_hint_does_not_use_not_needed_yet` 禁止，未经实测不得标。
+/// - 其余 19 条：仍为 `Needed`（启动时读配置）。其中 Codex / Gemini / Grok /
+///   Claude Desktop 的具体动作见 `restart_hint_detail`；其余通道只有通用说法。
+/// 保守方向（M7-S3 spec §8）不变：多提示一次重启无害；反过来（说「改完即生效」
+/// 而其实没生效）会让用户以为投递失败。
 pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
     match channel {
-        // rc 文件在 **shell 启动时** source：不是「重启某个 agent」能解决的，
-        // 而是「**新开的终端**才生效」——改的是会话环境，不是某个进程的配置。
-        // 其余六条都是「进程启动时读配置」：已在跑的会话不会自动重读。
-        // 保守方向（M7-S3 spec §8）：多提示一次重启无害；反过来（说「改完即生效」而其实没生效）
-        // 会让用户以为投递失败。
+        DeliveryChannel::ClaudeCodeSettings => RestartHint::DependsOnNewSession,
         DeliveryChannel::CodexAuthJson
         | DeliveryChannel::CodexConfig
-        | DeliveryChannel::ClaudeCodeSettings
         | DeliveryChannel::OpenCode
         | DeliveryChannel::GeminiCli
         | DeliveryChannel::OpenCodeJsonc
@@ -816,6 +821,131 @@ pub enum RestartHint {
     Needed,
     /// 无法一概而论（例如 shell rc：只对新开的终端生效）
     DependsOnNewSession,
+}
+
+/// `restart_hint` 的来源标注（P1-6 诚实线）。
+///
+/// 三分法，逐条钉在 `restart_hint_detail` 里；前端必须把标注原样呈现给用户，
+/// 未实测项不得写成定论：
+/// - `CcSwitchUnverified`：说法引自 cc-switch 生效表（公开 FAQ “Do I need to
+///   restart the terminal after switching providers?”），但**未在本机真机上实测**。
+/// - `Verified`：已在真机上实测生效。**当前没有任何通道取它**（与 `NotNeeded`
+///   的冻结逻辑同理：先有实测证据再标，集成测试钉住“Verified 集合为空”）。
+/// - `Unverified`：未引自任何外部生效表、亦未实测的本项目保守标注。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartHintSource {
+    CcSwitchUnverified,
+    Verified,
+    Unverified,
+}
+
+impl RestartHintSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestartHintSource::CcSwitchUnverified => "ccSwitchUnverified",
+            RestartHintSource::Verified => "verified",
+            RestartHintSource::Unverified => "unverified",
+        }
+    }
+}
+
+/// 生效动作（P1-6）：`RestartHint` 只说“要不要重启”，这里补“到底要动什么”。
+/// 前端按 action 取 i18n 文案，**不得**按通道硬编码——与 `restart_hint` 同款约束。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartAction {
+    /// 新会话即生效，无需重启进程（Claude Code，cc-switch 热切说法）。
+    NewSession,
+    /// 重启终端或 CLI 后生效（Gemini、Grok，cc-switch 原话）。
+    RestartTerminalOrCli,
+    /// 完全退出应用后再重开（Claude Desktop，cc-switch 原话 fully quit）。
+    RelaunchDesktopApp,
+    /// Codex 三分法（必须与 P1-5 事实一致，不得写成“按钮一按全生效”）：
+    /// 桌面应用重开走一键重启按钮；终端会话不受按钮影响、需手动重开；
+    /// app-server daemon 需另行验证，只关终端不够。
+    CodexSplit,
+    /// 其余通道的通用说法：重启该 agent（未细化、未实测）。
+    RestartAgent,
+}
+
+impl RestartAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestartAction::NewSession => "newSession",
+            RestartAction::RestartTerminalOrCli => "restartTerminalOrCli",
+            RestartAction::RelaunchDesktopApp => "relaunchDesktopApp",
+            RestartAction::CodexSplit => "codexSplit",
+            RestartAction::RestartAgent => "restartAgent",
+        }
+    }
+}
+
+/// 一条通道的完整生效分表项：取值 + 来源标注 + 动作。纯函数、无 IO。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestartHintDetail {
+    pub hint: RestartHint,
+    pub source: RestartHintSource,
+    pub action: RestartAction,
+}
+
+/// 纯函数、无 IO。`hint` 恒等于 `restart_hint(channel)`（集成测试钉住一致性），
+/// 本函数只补来源与动作；不得改投递逻辑、不得改 `restart_hint` 的取值。
+pub fn restart_hint_detail(channel: DeliveryChannel) -> RestartHintDetail {
+    use RestartAction as Action;
+    use RestartHint as Hint;
+    use RestartHintSource as Source;
+    match channel {
+        // cc-switch FAQ 原话：Claude Code 支持 provider 热切、无需重启。
+        // 落到本项目枚举是 DependsOnNewSession（新会话即生效），不是 NotNeeded
+        // （见 restart_hint 注释：运行中会话是否重读 env 未实测）。
+        DeliveryChannel::ClaudeCodeSettings => RestartHintDetail {
+            hint: Hint::DependsOnNewSession,
+            source: Source::CcSwitchUnverified,
+            action: Action::NewSession,
+        },
+        // Codex 不标 cc-switch：cc-switch 只说“重启终端或 CLI”，而这里的
+        // 桌面按钮 / 终端手动 / daemon 三分法是本项目 P1-5 的结论（按钮实际重启
+        // 的是 ChatGPT 桌面应用），整体未做真机生效验证，故标 Unverified。
+        DeliveryChannel::CodexAuthJson | DeliveryChannel::CodexConfig => RestartHintDetail {
+            hint: Hint::Needed,
+            source: Source::Unverified,
+            action: Action::CodexSplit,
+        },
+        // cc-switch FAQ 原话：restart your terminal or the CLI tool。
+        DeliveryChannel::GeminiCli | DeliveryChannel::GrokBuild => RestartHintDetail {
+            hint: Hint::Needed,
+            source: Source::CcSwitchUnverified,
+            action: Action::RestartTerminalOrCli,
+        },
+        // cc-switch FAQ 原话：fully quit and reopen Claude Desktop。
+        DeliveryChannel::ClaudeDesktop => RestartHintDetail {
+            hint: Hint::Needed,
+            source: Source::CcSwitchUnverified,
+            action: Action::RelaunchDesktopApp,
+        },
+        // 其余 14 条：P1-6 不细化，穷举列出（新增通道时这里编译失败，不得静默
+        // 落入通用说法）。OpenCode / OpenClaw / Hermes / Pi / MCode 在 cc-switch
+        // FAQ 里是“共存模式（在工具内选模型）”，但 KeyRelay 是换 key 不是并存
+        // 添加，该说法不能直接转成“无需重启”，故不抄表、仍保守标注。
+        // Cline / ClineDesktop 按任务范围留给 P2-9，本项不动其动作。
+        DeliveryChannel::OpenCode
+        | DeliveryChannel::OpenCodeJsonc
+        | DeliveryChannel::OpenClaw
+        | DeliveryChannel::Hermes
+        | DeliveryChannel::MCode
+        | DeliveryChannel::Pi
+        | DeliveryChannel::Cursor
+        | DeliveryChannel::Cline
+        | DeliveryChannel::QwenCode
+        | DeliveryChannel::DeepSeek
+        | DeliveryChannel::Trae
+        | DeliveryChannel::MiMoCode
+        | DeliveryChannel::ClineDesktop
+        | DeliveryChannel::DeepSeekHarness => RestartHintDetail {
+            hint: Hint::Needed,
+            source: Source::Unverified,
+            action: Action::RestartAgent,
+        },
+    }
 }
 
 /// 一个「已知但本版本**不托管**」的落点（M7-S3 / 章程 R-7）。
@@ -1857,8 +1987,18 @@ mod tests {
 
     #[test]
     fn restart_hint_table_is_verbatim() {
-        // M14-S1：所有通道都按「需要重启」保守标注（DependsOnNewSession 已随 ShellBlock 删除）
+        // P1-6 生效分表：Claude Code 新会话即生效（DependsOnNewSession），其余 19 条
+        // 仍按「需要重启」保守标注（DependsOnNewSession 已随 ShellBlock 删除一说作废，
+        // 现为 Claude Code 的热切取值；逐条对照见 delivery_restart_hint 集成测试）。
+        assert_eq!(
+            restart_hint(DeliveryChannel::ClaudeCodeSettings),
+            RestartHint::DependsOnNewSession,
+            "claude-code-settings 应按「新会话即生效、无需重启进程」标注"
+        );
         for channel in DeliveryChannel::ALL {
+            if channel == DeliveryChannel::ClaudeCodeSettings {
+                continue;
+            }
             assert_eq!(
                 restart_hint(channel),
                 RestartHint::Needed,

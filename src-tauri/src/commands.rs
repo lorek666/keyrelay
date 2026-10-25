@@ -270,6 +270,14 @@ pub struct DeliveryPlanDto {
     /// 这里是**穷举 match**（没有 `_` 分支）：新增一条通道时它会编译失败，
     /// 而不是悄悄给出一个空提示。
     restart_hint: &'static str,
+    /// P1-6：`restart_hint` 的来源标注（三分法：抄 cc-switch 未实测 / 已实测 /
+    /// 未实测）。取值只能来自 `delivery::restart_hint_detail(channel)`，与
+    /// `restart_hint` 同源；界面必须把标注呈现给用户，未实测不得写成定论。
+    restart_hint_source: &'static str,
+    /// P1-6：生效动作（新会话 / 重启终端或 CLI / 完全退出重开 / Codex 三分法 /
+    /// 通用重启）。取值同样只能来自 `restart_hint_detail`，界面按动作取文案，
+    /// 不得按通道硬编码。
+    restart_hint_action: &'static str,
     /// P0-2：Codex 保留模式（只写 config，auth.json 不动）时为 true；其余一律 false。
     preserve_auth: bool,
     /// P0-2：本次投递实际覆盖的全部文件。单通道 = 1 条；Codex 双文件 = 2 条
@@ -317,6 +325,32 @@ fn restart_hint_str(hint: tianshu_relay_core::delivery::RestartHint) -> &'static
         RestartHint::NotNeeded => "notNeeded",
         RestartHint::Needed => "needed",
         RestartHint::DependsOnNewSession => "dependsOnNewSession",
+    }
+}
+
+/// [`tianshu_relay_core::delivery::RestartHintSource`] 的线格式（P1-6）。
+/// 取值集合与前端 `RestartHintSource` 联合类型一致（`restart_hint_str` 那对
+/// 由 check-commands 逐字对账；这两对未进对账表，但改动时必须同步改 TS）。
+fn restart_hint_source_str(
+    source: tianshu_relay_core::delivery::RestartHintSource,
+) -> &'static str {
+    use tianshu_relay_core::delivery::RestartHintSource;
+    match source {
+        RestartHintSource::CcSwitchUnverified => "ccSwitchUnverified",
+        RestartHintSource::Verified => "verified",
+        RestartHintSource::Unverified => "unverified",
+    }
+}
+
+/// [`tianshu_relay_core::delivery::RestartAction`] 的线格式（P1-6）。
+fn restart_hint_action_str(action: tianshu_relay_core::delivery::RestartAction) -> &'static str {
+    use tianshu_relay_core::delivery::RestartAction;
+    match action {
+        RestartAction::NewSession => "newSession",
+        RestartAction::RestartTerminalOrCli => "restartTerminalOrCli",
+        RestartAction::RelaunchDesktopApp => "relaunchDesktopApp",
+        RestartAction::CodexSplit => "codexSplit",
+        RestartAction::RestartAgent => "restartAgent",
     }
 }
 
@@ -900,6 +934,10 @@ fn single_plan_dto(plan: tianshu_relay_core::delivery::DeliveryPlan) -> Delivery
     // agent 却拿不到 key，且没有任何报错。这里只提示，不阻断。
     let warnings = delivery_warnings(&plan.target_path);
     let channel = plan.channel;
+    // P1-6：生效三件套同源取自 restart_hint_detail——取值与旧 restart_hint 一致
+    // （分表测试钉住），来源与动作随同一条通道走，Codex 双文件入口同样经此
+    // （codex_plan_dto 复用 single_plan_dto，auth/config 两条都是 CodexSplit）。
+    let hint_detail = tianshu_relay_core::delivery::restart_hint_detail(channel);
     DeliveryPlanDto {
         agent_id: plan.agent_id,
         channel: channel.as_str().to_string(),
@@ -919,7 +957,9 @@ fn single_plan_dto(plan: tianshu_relay_core::delivery::DeliveryPlan) -> Delivery
         consent_granted_at: granted_at,
         consent_revoked_at: revoked_at,
         warnings,
-        restart_hint: restart_hint_str(tianshu_relay_core::delivery::restart_hint(channel)),
+        restart_hint: restart_hint_str(hint_detail.hint),
+        restart_hint_source: restart_hint_source_str(hint_detail.source),
+        restart_hint_action: restart_hint_action_str(hint_detail.action),
         endpoint_in_channel: tianshu_relay_core::delivery::channel_carries_endpoint(channel),
         preserve_auth: false,
         files: vec![file],
@@ -5455,9 +5495,23 @@ mod tests {
             warnings: vec!["同目录下还有 auth.jsonc。".into()],
             // M7-S5：生效策略（PRD FR-4:137）。这里取真实值而不是字面量——
             // 若 `restart_hint` 表变了，这条断言跟着变，不会变成一份假的留档。
+            // P1-6：来源与动作同源取自 restart_hint_detail（Codex 不标抄表：
+            // 其三分法是 P1-5 结论，整体未实测 ⇒ unverified + codexSplit）。
             restart_hint: restart_hint_str(tianshu_relay_core::delivery::restart_hint(
                 tianshu_relay_core::delivery::DeliveryChannel::CodexAuthJson,
             )),
+            restart_hint_source: restart_hint_source_str(
+                tianshu_relay_core::delivery::restart_hint_detail(
+                    tianshu_relay_core::delivery::DeliveryChannel::CodexAuthJson,
+                )
+                .source,
+            ),
+            restart_hint_action: restart_hint_action_str(
+                tianshu_relay_core::delivery::restart_hint_detail(
+                    tianshu_relay_core::delivery::DeliveryChannel::CodexAuthJson,
+                )
+                .action,
+            ),
             // M16-S6a / P2-3：Codex 的 `auth.json` 里**没有** endpoint（改指网关时只换令牌不换地址）。
             // 取真实值而不是字面量——事实表变了这条会跟着变。
             endpoint_in_channel: tianshu_relay_core::delivery::channel_carries_endpoint(
@@ -5480,6 +5534,14 @@ mod tests {
         assert_eq!(value["consentGrantedAt"], Value::Null);
         assert_eq!(value["warnings"][0], "同目录下还有 auth.jsonc。");
         assert_eq!(value["restartHint"], "needed", "codex 的配置进程启动时才读");
+        assert_eq!(
+            value["restartHintSource"], "unverified",
+            "codex 三分法是 P1-5 结论、整体未实测，不得标成抄表或已实测"
+        );
+        assert_eq!(
+            value["restartHintAction"], "codexSplit",
+            "codex 必须呈现桌面按钮 / 终端手动 / daemon 三分法，不得写成按钮一按全生效"
+        );
         // M16-S6a / P2-3：Codex 的落点文件里没有 endpoint ⇒ 线上字段必须是 `false`
         // （界面据此提示「改指网关后还要去改 config.toml 里的地址」）。
         assert_eq!(
@@ -5495,11 +5557,24 @@ mod tests {
 
         // M7-S5：**每个**通道都必须给出一个非空提示——新增通道时穷举 match 会编译失败，
         // 而不是悄悄给一个空串（界面会因此显示「无需重启」这种最危险的假话）。
+        // P1-6：来源与动作同样逐通道非空（空来源会被前端默认成未实测，但这里先
+        // 钉住“后端必须给”，缺失是后端 bug、不是前端回落的借口）。
         for channel in tianshu_relay_core::delivery::DeliveryChannel::ALL {
             let hint = restart_hint_str(tianshu_relay_core::delivery::restart_hint(channel));
             assert!(
                 !hint.is_empty(),
                 "{} 的 restartHint 不得为空",
+                channel.as_str()
+            );
+            let detail = tianshu_relay_core::delivery::restart_hint_detail(channel);
+            assert!(
+                !restart_hint_source_str(detail.source).is_empty(),
+                "{} 的 restartHintSource 不得为空",
+                channel.as_str()
+            );
+            assert!(
+                !restart_hint_action_str(detail.action).is_empty(),
+                "{} 的 restartHintAction 不得为空",
                 channel.as_str()
             );
         }

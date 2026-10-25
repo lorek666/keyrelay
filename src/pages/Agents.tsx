@@ -51,7 +51,8 @@ import { useTranslation, translate, getCurrentDict } from "../i18n";
  * M30-S2 把每个落点铺成独立卡片，不再用下拉框隐藏）。
  *
  * 这里的 `label` 是**给人看的落点提示**；能力判断不在这里——投递能不能做、
- * 改完要不要重启，一律由后端给（`plan.restartHint`），本文件不得按通道硬编码判断。
+ * 改完要不要重启，一律由后端给（`plan.restartHint`，P1-6 起连同动作
+ * `plan.restartHintAction` 与来源标注 `plan.restartHintSource` 一起给），本文件不得按通道硬编码判断。
  *
  * M14-S2：`label` 含文件路径（技术描述），中英同形，暂不抽——i18n:skip
  */
@@ -94,6 +95,38 @@ function restartHintLabel(hint: RestartHint): string {
   if (hint === "notNeeded") return translate(getCurrentDict(), "agents.restartHint.notNeeded");
   if (hint === "needed") return translate(getCurrentDict(), "agents.restartHint.needed");
   return translate(getCurrentDict(), "agents.restartHint.dependsOnNewSession");
+}
+
+/**
+ * P1-6：生效动作文案。从后端给的 `restartHintAction` 取值派生，不按通道硬编码。
+ * 缺失/未知一律回落通用“重启该 agent”，绝不静默留空（留空会被读成“无需重启”）。
+ */
+function restartHintActionLabel(action: string | undefined): string {
+  switch (action) {
+    case "newSession":
+      return translate(getCurrentDict(), "agents.restartHint.action.newSession");
+    case "restartTerminalOrCli":
+      return translate(getCurrentDict(), "agents.restartHint.action.restartTerminalOrCli");
+    case "relaunchDesktopApp":
+      return translate(getCurrentDict(), "agents.restartHint.action.relaunchDesktopApp");
+    case "codexSplit":
+      return translate(getCurrentDict(), "agents.restartHint.action.codexSplit");
+    default:
+      return translate(getCurrentDict(), "agents.restartHint.action.restartAgent");
+  }
+}
+
+/**
+ * P1-6：来源标注文案。从后端给的 `restartHintSource` 取值派生，不按通道硬编码。
+ * 缺失/未知一律按“未实测”呈现——绝不默认已实测；只有后端明确给 `verified`
+ * 时才呈现已实测（当前没有任何通道取它）。
+ */
+function restartHintSourceLabel(source: string | undefined): string {
+  if (source === "ccSwitchUnverified")
+    return translate(getCurrentDict(), "agents.restartHint.source.ccSwitchUnverified");
+  if (source === "verified")
+    return translate(getCurrentDict(), "agents.restartHint.source.verified");
+  return translate(getCurrentDict(), "agents.restartHint.source.unverified");
 }
 
 export default function Agents() {
@@ -1532,9 +1565,21 @@ function PlanView({
         {/* 生效策略：文案从 `restartHint` 取值派生，**不按通道硬编码**。
             认不出的取值原样显示（不静默留空——那会让用户以为「不需要重启」）。
             顶层只此一份：DTO 的 files[] 条目暂无 per-file restart_hint（复审 P2-3，
-            已登记 BACKLOG，不在这里顺手改 DTO）。 */}
+            已登记 BACKLOG，不在这里顺手改 DTO）。
+            P1-6：同一行补动作与来源标注——动作说“到底要动什么”，来源标注说
+            “这话从哪来、有没有实测”；已实测徽标只在后端给 verified 时出现。 */}
         <dt>{t("agents.plan.restart")}</dt>
-        <dd>{restartHintLabel(plan.restartHint)}</dd>
+        <dd>
+          {restartHintLabel(plan.restartHint)}
+          <div className="muted">{restartHintActionLabel(plan.restartHintAction)}</div>
+          <span
+            className={
+              plan.restartHintSource === "verified" ? "badge badge-ok" : "badge badge-warn"
+            }
+          >
+            {restartHintSourceLabel(plan.restartHintSource)}
+          </span>
+        </dd>
       </dl>
 
       {plan.warnings.length > 0 ? (

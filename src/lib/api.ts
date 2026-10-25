@@ -226,6 +226,29 @@ export type ConsentState = "missing" | "granted" | "revoked";
 export type RestartHint = "notNeeded" | "needed" | "dependsOnNewSession";
 
 /**
+ * P1-6：生效说法的来源标注（后端 `delivery::RestartHintSource` 的线格式）。
+ *
+ * 三分法：`"ccSwitchUnverified"` 引自 cc-switch 生效表但未实测；
+ * `"verified"` 已在真机上实测（当前没有任何通道取它）；`"unverified"` 未引自
+ * 外部表、亦未实测的本项目保守标注。界面必须把标注呈现给用户。
+ */
+export type RestartHintSource = "ccSwitchUnverified" | "verified" | "unverified";
+
+/**
+ * P1-6：生效动作（后端 `delivery::RestartAction` 的线格式）。
+ *
+ * `"newSession"` 新会话即生效；`"restartTerminalOrCli"` 重启终端或 CLI；
+ * `"relaunchDesktopApp"` 完全退出重开；`"codexSplit"` Codex 三分法（桌面按钮 /
+ * 终端手动 / daemon 另行验证）；`"restartAgent"` 通用重启该 agent。
+ */
+export type RestartHintAction =
+  | "newSession"
+  | "restartTerminalOrCli"
+  | "relaunchDesktopApp"
+  | "codexSplit"
+  | "restartAgent";
+
+/**
  * P0-3：DSH 通道的凭据引用校验结果（后端 `DshReferenceCheck` 的 camelCase 线格式）。
  *
  * 路径均为字符串；不含任何密钥材料。仅 DSH 通道的 plan 带非 null 值，
@@ -274,6 +297,16 @@ export type DeliveryPlan = {
   warnings: string[];
   /** 生效策略。文案由这个取值派生，**不得**在页面里按通道判断。 */
   restartHint: RestartHint;
+  /**
+   * P1-6：生效说法的来源标注。文案由这个取值派生，**不得**在页面里按通道判断；
+   * 缺失/未知时页面一律按未实测呈现，绝不默认已实测。
+   */
+  restartHintSource: RestartHintSource;
+  /**
+   * P1-6：生效动作。文案由这个取值派生，**不得**在页面里按通道判断；
+   * 缺失/未知时页面回落通用“重启该 agent”。
+   */
+  restartHintAction: RestartHintAction;
   /**
    * P0-2：Codex 保留模式（只写 config，auth.json 不动）时为 true；其余一律 false。
    *
@@ -845,6 +878,9 @@ const MOCK_PLAN: DeliveryPlan = {
   warnings: [],
   // codex 只在进程启动时读 auth.json（M7-S3 的 `restart_hint` 表）
   restartHint: "needed",
+  // P1-6：Codex 三分法是 P1-5 结论、整体未实测（见核心层 restart_hint_detail）。
+  restartHintSource: "unverified",
+  restartHintAction: "codexSplit",
   preserveAuth: false,
   files: [
     {
