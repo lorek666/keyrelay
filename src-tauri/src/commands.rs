@@ -981,7 +981,7 @@ fn consent_parts(consent: &ConsentState) -> (&'static str, Option<i64>, Option<i
 ///   `unreachable` / `timeout` / `skipped` / `unresolved`）；
 /// - `probe_status`：探针 HTTP 状态码（仅状态码，绝不带响应正文）；
 /// - `blocks_delivery`：任一层硬拦即 true；plan 只展示它，apply 据此拒绝写盘。
-/// 本结构**不含密钥**（探针密钥只进请求头，见核心层）。
+///   本结构**不含密钥**（探针密钥只进请求头，见核心层）。
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelValidationDto {

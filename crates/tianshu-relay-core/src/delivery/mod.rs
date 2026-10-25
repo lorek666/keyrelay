@@ -686,8 +686,8 @@ fn leaf_key(qualified: &str) -> &str {
 ///   （后无空白）也不剥离；
 /// - 紧凑 JSON 的行内键（`{"provider":{...,"apiKey":"..."}}` 整份只有一行，
 ///   行首判定永远够不着）：行内出现 `"叶键"` 后跟可选空白再跟 `:`。
-/// 两种形态都用「叶键后紧跟分隔符」来防误撞：`model` 不会撞上 `model_provider`
-/// （后跟 `_`），也不会撞上 `"model_provider":`（后跟 `_` 而非引号）。
+///   两种形态都用「叶键后紧跟分隔符」来防误撞：`model` 不会撞上 `model_provider`
+///   （后跟 `_`），也不会撞上 `"model_provider":`（后跟 `_` 而非引号）。
 fn text_contains_key(text: &str, leaf: &str) -> bool {
     if text.lines().any(|line| {
         let trimmed = line.trim_start();
@@ -820,15 +820,15 @@ fn json_walk<'a>(
 ///   GrokBuild 全字段只认 `[models.custom]` 段内；
 /// - 标记块通道（Hermes / MCode）：只认 keyrelay 块内，块缺失即缺失；
 /// - DSH：只认 `refs:` 段内，段缺失即缺失。
-/// 返回 `None` = 该通道无位置感知口径，走旧的全文件叶键搜寻。
-/// 目前只有 GeminiCli 走这条回退：它的 `.env` 没有 provider 段或
-/// 嵌套结构，每行就是一个赋值，行首键判定本身就是归属判定，
-/// 且键名带 `GEMINI_` / `GOOGLE_GEMINI_` 通道专属前缀，不存在
-/// 别家 provider 用同一叶键顶替的形态——这不是「弱检查声明」，
-/// 而是该文件格式下叶键即归属。不得把这条回退扩到多 provider 通道。
-/// JSON 通道解析失败时返回 `Some(false)` 而非回退：写盘器只产
-/// 严格 JSON（OpenClaw 标记形态除外），解析失败说明文件已被外部
-/// 改成写盘器产不出的形态，fail-closed，不以全文件搜寻放行。
+///   返回 `None` = 该通道无位置感知口径，走旧的全文件叶键搜寻。
+///   目前只有 GeminiCli 走这条回退：它的 `.env` 没有 provider 段或
+///   嵌套结构，每行就是一个赋值，行首键判定本身就是归属判定，
+///   且键名带 `GEMINI_` / `GOOGLE_GEMINI_` 通道专属前缀，不存在
+///   别家 provider 用同一叶键顶替的形态——这不是「弱检查声明」，
+///   而是该文件格式下叶键即归属。不得把这条回退扩到多 provider 通道。
+///   JSON 通道解析失败时返回 `Some(false)` 而非回退：写盘器只产
+///   严格 JSON（OpenClaw 标记形态除外），解析失败说明文件已被外部
+///   改成写盘器产不出的形态，fail-closed，不以全文件搜寻放行。
 fn scoped_verify_present(channel: DeliveryChannel, qualified: &str, text: &str) -> Option<bool> {
     let leaf = leaf_key(qualified);
     match channel {
@@ -1170,7 +1170,7 @@ fn collect_json_values(
 ///   ClineDesktop：`providers.keyrelay.settings`；
 /// - 根写盘通道（Cursor / DeepSeek / Trae / CodexAuthJson）：只认根级
 ///   标量，不认嵌套对象里的同名键（写盘器只写根级）。
-/// 归属子树缺失时返回空序列（宁缺不猜），不回退全文档。
+///   归属子树缺失时返回空序列（宁缺不猜），不回退全文档。
 fn scoped_json_values(
     channel: DeliveryChannel,
     parsed: &serde_json::Value,
@@ -1411,8 +1411,8 @@ pub fn import_existing_fields(
 ///   `restart_hint_does_not_use_not_needed_yet` 禁止，未经实测不得标。
 /// - 其余 19 条：仍为 `Needed`（启动时读配置）。其中 Codex / Gemini / Grok /
 ///   Claude Desktop 的具体动作见 `restart_hint_detail`；其余通道只有通用说法。
-/// 保守方向（M7-S3 spec §8）不变：多提示一次重启无害；反过来（说「改完即生效」
-/// 而其实没生效）会让用户以为投递失败。
+///   保守方向（M7-S3 spec §8）不变：多提示一次重启无害；反过来（说「改完即生效」
+///   而其实没生效）会让用户以为投递失败。
 pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
     match channel {
         DeliveryChannel::ClaudeCodeSettings => RestartHint::DependsOnNewSession,
@@ -1725,8 +1725,8 @@ fn cline_variant_relative_target(os: HostOs, editor: &str) -> PathBuf {
 ///
 /// - 非 Cline 通道：只有 `relative_target()` 一条；
 /// - Cline 通道：默认 Code + Insiders + Cursor 三条。
-/// 服务层 `checked_target` 按**成员关系**判定，不再是单路径相等——
-/// 白名单外的任何路径（哪怕落在 `home` 内）一律拒绝。
+///   服务层 `checked_target` 按**成员关系**判定，不再是单路径相等——
+///   白名单外的任何路径（哪怕落在 `home` 内）一律拒绝。
 pub fn allowed_targets(channel: DeliveryChannel, home: &Path) -> Vec<PathBuf> {
     match channel {
         DeliveryChannel::Cline => {
@@ -2203,10 +2203,10 @@ pub fn resolve_for_binding_with_meta(
             // Cline 当可写文件目标、LoongPort 干脆不提供 Cline、magpie 即使标支持
             // Cline 也只做最小单键编辑（与本 writer 整条目替换相反）、官方
             // `cline auth` CLI 是唯一不依赖 schema 的路线。
-            return Err(Error::inject(
+            Err(Error::inject(
                 home.join(channel.relative_target()),
                 "暂不支持文件直写，请走 cline auth CLI",
-            ));
+            ))
         }
         DeliveryChannel::DeepSeekHarness => Ok(Box::new(dsh::DshWriter::new(home, base_url))),
     }

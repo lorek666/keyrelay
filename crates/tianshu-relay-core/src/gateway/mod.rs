@@ -734,13 +734,13 @@ impl Default for UpstreamTimeout {
 /// 掐断，分站值就成了「半优先」（M46-S4 spec §4.2 原论证）；分维要么要求两维
 /// 齐填、要么引入逐维回退，都会扩大 P1-4 刚落地的存储面（第二列 + 第二 setter
 /// + 第二透传字段）；(2) 下游 `UpstreamTimeout` 本身已是两维结构，分维是
-/// 将来可加的纯加法，不必在本波次预支。
-/// 取舍与推荐取值（管理员必读）：单值同时是「连接挂起的上界」与「无字节期
-/// 的上界」。合法非流式推理 TTFB 观测最大 100.7s、重尾 >120s——给慢推理站
-/// 配低于 240s 的分站值会直接杀合法慢请求；配高值则连接挂起要等满该值才
-/// 失败。因此**默认（未填 ⇒ 全局 connect 5s / read 240s）是已标定的那对值**；
-/// 分站值只给「已知很快」的站配快速失败（如 30s），或给「已知很慢」的站配
-/// 不低于 240s 的值；不要用一个 5s 级的小值去「顺带掐连接」——那会连读一起掐。
+///   将来可加的纯加法，不必在本波次预支。
+///   取舍与推荐取值（管理员必读）：单值同时是「连接挂起的上界」与「无字节期
+///   的上界」。合法非流式推理 TTFB 观测最大 100.7s、重尾 >120s——给慢推理站
+///   配低于 240s 的分站值会直接杀合法慢请求；配高值则连接挂起要等满该值才
+///   失败。因此**默认（未填 ⇒ 全局 connect 5s / read 240s）是已标定的那对值**；
+///   分站值只给「已知很快」的站配快速失败（如 30s），或给「已知很慢」的站配
+///   不低于 240s 的值；不要用一个 5s 级的小值去「顺带掐连接」——那会连读一起掐。
 ///
 /// `Some(0)` ≡ 未填：0 毫秒的超时永远不可能成功，把它当成配置值会直接 brick 掉
 /// 该站点；且与本仓库「0 = 关/不限」的惯例一致。
@@ -3407,10 +3407,10 @@ async fn maybe_translate_response(
 /// - **客户端断开** ⇒ `tx.send` 失败 ⇒ 任务退出（不泄漏、不继续跑）；
 /// - **usage 只记一次**（`include_usage` 的末帧）。
 #[allow(clippy::too_many_arguments)]
-/// 流式 usage 末帧口径（B-224 长尾）：与 [`UsageCapture`] 的 last-wins 一致——
-/// 泵在整个流里只记**最后一次**见到的 usage，任务结束时（正常、错误、客户端断开）
-/// 恰好发一行；无 usage 则不发。`Drop` 保证各返回点都不漏发、不多发；
-/// `at` 取任务结束时刻（与 `GatewayUsage.at`「流结束或被客户端断开的那一刻」一致）。
+///   流式 usage 末帧口径（B-224 长尾）：与 [`UsageCapture`] 的 last-wins 一致——
+///   泵在整个流里只记**最后一次**见到的 usage，任务结束时（正常、错误、客户端断开）
+///   恰好发一行；无 usage 则不发。`Drop` 保证各返回点都不漏发、不多发；
+///   `at` 取任务结束时刻（与 `GatewayUsage.at`「流结束或被客户端断开的那一刻」一致）。
 struct StreamUsageFlush {
     sink: Option<std::sync::Arc<dyn Fn(GatewayUsage) + Send + Sync>>,
     /// DEBUG-G7 P2-G5/K2：与 UsageCapture 同口径的“可能已计费”标记出口。
@@ -3461,6 +3461,10 @@ impl Drop for StreamUsageFlush {
     }
 }
 
+// clippy::too_many_arguments：内部 helper，8 个参数均为流式翻译必需的不同上下文
+// （state/proto/上游响应/站点 id/用量模型/meta/身份/租约），无自然分组；
+// 改签名纯为凑数、无行为收益，故针对性 allow（唯一调用点在 3315 行）。
+#[allow(clippy::too_many_arguments)]
 fn streaming_translate_response(
     state: &AppState,
     proto: translate::Protocol,

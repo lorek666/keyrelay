@@ -129,7 +129,7 @@ impl RouteTable {
     /// 但规则的存在意义就是隔离，名字也不应漏）。
     pub fn available_models_for_sites(&self, allowed: Option<&[i64]>) -> Vec<String> {
         let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let in_scope = |site_id: i64| allowed.map_or(true, |list| list.contains(&site_id));
+        let in_scope = |site_id: i64| allowed.is_none_or(|list| list.contains(&site_id));
         for upstream in &self.upstreams {
             if in_scope(upstream.site_id) {
                 out.extend(upstream.models.iter().cloned());

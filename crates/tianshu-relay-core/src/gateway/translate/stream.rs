@@ -138,9 +138,11 @@ impl ChatDelta {
     /// 从 Chat 的 `data:` JSON 解析；`[DONE]` ⇒ `None`（由调用方处理结束）。
     pub fn from_json(data: &str) -> Option<Self> {
         let v: Value = serde_json::from_str(data).ok()?;
-        let mut d = ChatDelta::default();
-        d.id = v.get("id").and_then(|x| x.as_str()).map(str::to_string);
-        d.model = v.get("model").and_then(|x| x.as_str()).map(str::to_string);
+        let mut d = ChatDelta {
+            id: v.get("id").and_then(|x| x.as_str()).map(str::to_string),
+            model: v.get("model").and_then(|x| x.as_str()).map(str::to_string),
+            ..Default::default()
+        };
         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
             d.usage = Some((
                 u.get("prompt_tokens").and_then(|x| x.as_i64()).unwrap_or(0),

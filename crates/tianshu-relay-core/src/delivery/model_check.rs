@@ -12,10 +12,10 @@
 //!      是**正常用法**；按「通道厂商 = 模型厂商」硬拦会把这种合法投递拦掉；
 //!    - 站点行只有 `kind`（网关类型，如 newapi）与 `base_url`，不声明它提供哪些模型；
 //!      OpenCode 的 provider 名恒为 `keyrelay`（中转 provider，不是上游厂商）。
-//!    因此静态层**不判定厂商配对**：格式合格的模型一律记 `unchecked`
-//!    （不是通过、不是失败——是「无依据，不作判定」，以探针为准）；只拦两种
-//!    格式上不可能是模型 id 的输入（空白/控制字符、URL 形态、provider 前缀后无模型名）。
-//!    没有模型、或通道根本不写模型字段时记 `not_applicable`，不拦也不警告。
+//!      因此静态层**不判定厂商配对**：格式合格的模型一律记 `unchecked`
+//!      （不是通过、不是失败——是「无依据，不作判定」，以探针为准）；只拦两种
+//!      格式上不可能是模型 id 的输入（空白/控制字符、URL 形态、provider 前缀后无模型名）。
+//!      没有模型、或通道根本不写模型字段时记 `not_applicable`，不拦也不警告。
 //!
 //! 2. **真实 `/v1/models` 探针**（[`probe_models`]，只读）：
 //!    用待投递的端点 + 密钥发一次 `GET /v1/models`，验证端点可达、密钥有效、
@@ -758,9 +758,11 @@ mod tests {
     }
 
     fn stub_transport() -> crate::site::transport_reqwest::ReqwestTransport {
-        let mut config = crate::site::transport_reqwest::TransportConfig::default();
-        config.timeout = Duration::from_secs(5);
-        config.proxy = None;
+        let config = crate::site::transport_reqwest::TransportConfig {
+            timeout: Duration::from_secs(5),
+            proxy: None,
+            ..Default::default()
+        };
         crate::site::transport_reqwest::ReqwestTransport::new(config).expect("桩传输层可构造")
     }
 

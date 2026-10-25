@@ -13,7 +13,7 @@
 //!    默认文件保持不存在。
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::json;
@@ -80,7 +80,7 @@ async fn setup() -> Fixture {
     }
 }
 
-fn write(home: &PathBuf, rel: &str, content: &str) -> PathBuf {
+fn write(home: &Path, rel: &str, content: &str) -> PathBuf {
     let path = home.join(rel);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, content).unwrap();
