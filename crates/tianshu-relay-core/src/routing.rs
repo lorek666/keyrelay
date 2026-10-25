@@ -457,6 +457,41 @@ pub fn filter_upstreams_by_sites<'a>(
         .collect()
 }
 
+/// DELIVERY-P2-10：按用户配置的优先级排备用顺序（纯函数）。
+///
+/// `rest` 是「首选之后」的候选：首选已由加权轮转 / EWMA / 探针定出，本函数不动它，
+/// 只排它之后的备用尝试顺序。`priority` 是用户配置的站点顺序——当前唯一来源是
+/// 命中 agent 的路由规则 `siteIds` 数组顺序（网关 handler 在过滤后调用本函数；
+/// 未命中规则时 handler 根本不调用，顺序与今天相同）。
+///
+/// 排序：`priority` 里出现过的站点按其在数组里的下标升序；未出现的站点排在已出现
+/// 之后，且彼此保持输入顺序；同站多 key（同一 `site_id` 的多个候选）同 rank，
+/// 彼此顺序不变（站内 key 轮换顺序不被打乱）。
+///
+/// 只重排、不增删：`priority` 里有但候选里没有的站点不会凭空出现；候选里有但
+/// `priority` 里没有的站点不会被丢弃（只排后面）。于是「切换不得去用户没配过的档位」
+/// 在本层由调用方（规则过滤）与本函数共同保证：过滤限定集合，本函数限定顺序。
+/// 注意与 [`filter_upstreams_by_sites`] 的分工：过滤保持输入顺序（不按规则重排），
+/// 优先级只在网关的尝试顺序层生效，不改变候选集本身。
+pub fn reorder_failover_tail<'a>(rest: Vec<&'a Upstream>, priority: &[i64]) -> Vec<&'a Upstream> {
+    if priority.is_empty() || rest.len() < 2 {
+        return rest;
+    }
+    let mut keyed: Vec<(usize, usize, &'a Upstream)> = rest
+        .into_iter()
+        .enumerate()
+        .map(|(index, upstream)| {
+            let rank = priority
+                .iter()
+                .position(|id| *id == upstream.site_id)
+                .unwrap_or(usize::MAX);
+            (rank, index, upstream)
+        })
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    keyed.into_iter().map(|(_, _, upstream)| upstream).collect()
+}
+
 /// 余额健康度档位：0 = 有余额，1 = 未知（`None` 或 `NaN`），2 = 已耗尽。
 ///
 /// `NaN` 归入「未知」而不是「已耗尽」：`NaN` 表示**算不出来**，不是「没钱了」。
@@ -1520,5 +1555,95 @@ mod tests {
         );
         let kept = filter_upstreams_by_sites(all, Some(&[]));
         assert!(kept.is_empty(), "空 allowlist ⇒ 空候选");
+    }
+
+    #[test]
+    fn reorder_failover_tail_puts_listed_sites_first_in_list_order() {
+        let a = up(1, Some(1.0), Some(10.0), None);
+        let b = up(2, Some(1.0), Some(10.0), None);
+        let c = up(3, Some(1.0), Some(10.0), None);
+        let got = reorder_failover_tail(vec![&a, &b, &c], &[3, 2, 1]);
+        assert_eq!(
+            got.iter().map(|u| u.site_id).collect::<Vec<_>>(),
+            vec![3, 2, 1],
+            "已列出的站点按规则数组顺序排在前面"
+        );
+    }
+
+    #[test]
+    fn reorder_failover_tail_keeps_unlisted_sites_after_in_input_order() {
+        let a = up(1, Some(1.0), Some(10.0), None);
+        let b = up(2, Some(1.0), Some(10.0), None);
+        let c = up(3, Some(1.0), Some(10.0), None);
+        let d = up(4, Some(1.0), Some(10.0), None);
+        let got = reorder_failover_tail(vec![&a, &b, &c, &d], &[3]);
+        assert_eq!(
+            got.iter().map(|u| u.site_id).collect::<Vec<_>>(),
+            vec![3, 1, 2, 4],
+            "未列出的站点不丢弃，只排在已列出之后、保持原顺序"
+        );
+    }
+
+    #[test]
+    fn reorder_failover_tail_creates_nothing_for_unknown_priority_ids() {
+        let a = up(1, Some(1.0), Some(10.0), None);
+        let b = up(2, Some(1.0), Some(10.0), None);
+        let got = reorder_failover_tail(vec![&a, &b], &[99, 2]);
+        assert_eq!(
+            got.iter().map(|u| u.site_id).collect::<Vec<_>>(),
+            vec![2, 1],
+            "规则里有但候选里没有的站点不得凭空出现"
+        );
+        assert_eq!(got.len(), 2, "只重排，不增删");
+    }
+
+    #[test]
+    fn reorder_failover_tail_is_identity_without_priority() {
+        let a = up(1, Some(1.0), Some(10.0), None);
+        let b = up(2, Some(1.0), Some(10.0), None);
+        let got = reorder_failover_tail(vec![&b, &a], &[]);
+        assert_eq!(
+            got.iter().map(|u| u.site_id).collect::<Vec<_>>(),
+            vec![2, 1],
+            "空优先级 ⇒ 原样返回"
+        );
+    }
+
+    #[test]
+    fn reorder_failover_tail_keeps_same_site_keys_in_relative_order() {
+        // 同站多 key：用不同 base_url 区分两个同一 site_id 的候选。
+        let first_key = Upstream {
+            site_id: 2,
+            key_id: Some(1),
+            base_url: "http://key1.example.com".to_string(),
+            key_ref: "kr/key/2/a".to_string(),
+            models: vec!["gpt-5.6".to_string()],
+            rate: Some(1.0),
+            balance_usd: Some(10.0),
+            latency_ms: None,
+            timeout_ms: None,
+        };
+        let second_key = Upstream {
+            site_id: 2,
+            key_id: Some(2),
+            base_url: "http://key2.example.com".to_string(),
+            key_ref: "kr/key/2/b".to_string(),
+            models: vec!["gpt-5.6".to_string()],
+            rate: Some(1.0),
+            balance_usd: Some(10.0),
+            latency_ms: None,
+            timeout_ms: None,
+        };
+        let other = up(1, Some(1.0), Some(10.0), None);
+        let got = reorder_failover_tail(vec![&first_key, &other, &second_key], &[2, 1]);
+        assert_eq!(
+            got.iter().map(|u| u.base_url.as_str()).collect::<Vec<_>>(),
+            vec![
+                "http://key1.example.com",
+                "http://key2.example.com",
+                "http://site1.example.com"
+            ],
+            "同 rank 的同站 key 彼此顺序不变（站内轮换不被打乱）"
+        );
     }
 }
