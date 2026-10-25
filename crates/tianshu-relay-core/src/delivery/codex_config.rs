@@ -227,6 +227,49 @@ fn strip_top_keys_and_section(text: &str) -> String {
     out
 }
 
+/// 读出现盘 config.toml 顶层的 `model`（DEBUG P1-12 的轮换保留用）。
+///
+/// 只认**第一个 `[section]` 之前**的 `model = "..."` 行：段内的 `model` 是该
+/// provider 自己的，不属于顶层。引号内为空、行不存在、文件不存在（调用方把
+/// 读失败当 `None` 处理）时都返回 `None`——轮换此时退回旧行为（`model=None`），
+/// 而不是猜一个模型写进去。
+pub fn top_model_from_text(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            break;
+        }
+        if !is_top_key(trimmed, CodexConfigWriter::FIELD_MODEL) {
+            continue;
+        }
+        let value = trimmed[CodexConfigWriter::FIELD_MODEL.len()..]
+            .trim_start()
+            .strip_prefix('=')
+            .map(str::trim)?;
+        let quoted = value
+            .strip_prefix('"')
+            .and_then(|rest| rest.split('"').next())
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|rest| rest.split('\'').next())
+            });
+        return match quoted {
+            Some(inner) if !inner.trim().is_empty() => Some(inner.to_string()),
+            Some(_) => None,
+            None => {
+                let bare = value.split([' ', '\t', '#']).next().unwrap_or("");
+                if bare.is_empty() {
+                    None
+                } else {
+                    Some(bare.to_string())
+                }
+            }
+        };
+    }
+    None
+}
+
 /// 判断某行是否是「顶部全局键 `KEY = ...`」。
 /// 不靠 `config.toml` 解析器，靠前缀字面量匹配（与 grok-build 同源）。
 fn is_top_key(line: &str, key: &str) -> bool {
@@ -342,6 +385,21 @@ wire_api = "responses"
         std::fs::write(w.path(), &first.after).unwrap();
         let second = w.plan(SECRET).unwrap();
         assert_eq!(second.after, first.after);
+    }
+
+    #[test]
+    fn top_model_reads_only_the_top_level_line() {
+        assert_eq!(
+            top_model_from_text("model = \"gpt-5\"\n\n[model_providers.custom]\n"),
+            Some("gpt-5".to_string())
+        );
+        // 段内 model 不是顶层：第一个段出现即停，段内行不认。
+        assert_eq!(
+            top_model_from_text("[model_providers.openai]\nmodel = \"gpt-4\"\n"),
+            None
+        );
+        assert_eq!(top_model_from_text("model_provider = \"custom\"\n"), None);
+        assert_eq!(top_model_from_text(""), None);
     }
 
     #[test]
