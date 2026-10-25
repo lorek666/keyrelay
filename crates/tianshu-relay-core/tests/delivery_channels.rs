@@ -62,6 +62,10 @@ fn setup() -> Fixture {
     }
 }
 
+/// Unix 权限位读取：Windows 没有 Unix mode 位，生产侧的权限收紧
+/// （inject/mod.rs 的 resolve_mode / clamp_secret_mode）本身就是 cfg(unix)，
+/// 非 Unix 路径写文件时直接忽略 mode——因此 mode 断言只在 Unix 上有意义。
+#[cfg(unix)]
 fn mode_of(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     fs::metadata(path).expect("stat").permissions().mode() & 0o777
@@ -97,7 +101,12 @@ fn round_trip(f: &Fixture, channel: DeliveryChannel, preexisting: Option<(&Path,
         channel.as_str()
     );
     // 含密钥的文件不允许比 0600 更宽；预置文件是 0644 时会被**收紧**成 0600
+    // （收紧本身只在 Unix 上成立，见 mode_of 的注释；Windows 没有 mode 位，
+    // 投递成功 + 文件落盘即是该平台下可验证的全部）。
+    #[cfg(unix)]
     assert_eq!(mode_of(&target), 0o600, "{} 必须是 0600", channel.as_str());
+    #[cfg(not(unix))]
+    assert!(target.exists(), "{} 投递后目标文件应存在", channel.as_str());
 
     // 幂等：再投一次内容不变
     f.service

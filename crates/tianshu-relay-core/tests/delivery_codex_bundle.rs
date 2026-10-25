@@ -247,7 +247,11 @@ fn dual_requires_both_consents_and_writes_nothing_without_either() {
     assert!(!f.config_target.exists());
 }
 
+/// Unix 专属：符号链接写盘保护的前提是能建出符号链接；Windows 上
+/// 建链接需要特权且 std::os::unix 不存在，本测试只在 Unix 上编译运行；
+/// 非链接的写盘失败路径由本文件其他测试覆盖。
 #[test]
+#[cfg(unix)]
 fn config_symlink_failure_rolls_auth_back_then_recovery_succeeds() {
     // 反向验证：临时破坏第二文件（config）的写盘——auth 已写，必须被补偿回滚；
     // 恢复后重投成功，证明失败不是「环境坏了」。
@@ -294,7 +298,9 @@ fn config_symlink_failure_rolls_auth_back_then_recovery_succeeds() {
     assert!(fs::read_to_string(&f.config_target).unwrap().contains(BASE));
 }
 
+/// Unix 专属：理由同 config_symlink_failure_rolls_auth_back_then_recovery_succeeds。
 #[test]
+#[cfg(unix)]
 fn auth_symlink_failure_leaves_config_untouched() {
     // 第一文件（auth）写盘失败时，第二文件（config）根本不应被写。
     let f = setup();

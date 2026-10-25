@@ -121,7 +121,12 @@ fn round_trip(f: &Fixture, channel: DeliveryChannel, preexisting: &str) {
         "{} 的目标文件应含密钥:\n{written}",
         channel.as_str()
     );
+    // 0600 断言只在 Unix 上成立（见 mode_of 的注释）；Windows 没有
+    // mode 位，投递成功 + 文件落盘即是该平台下可验证的全部。
+    #[cfg(unix)]
     assert_eq!(mode_of(&target), 0o600, "{} 必须是 0600", channel.as_str());
+    #[cfg(not(unix))]
+    assert!(target.exists(), "{} 投递后目标文件应存在", channel.as_str());
 
     // 幂等：再投一次内容不变
     f.service
@@ -713,7 +718,12 @@ fn comment_with_a_lone_quote_does_not_block_gemini_delivery() {
         "注释与无关变量逐字保留；受管键**原地**替换，base_url 因文件中原本没有而追加"
     );
     assert!(!written.contains("sk-old"), "旧密钥必须被替换掉");
+    // 0600 断言只在 Unix 上成立（见 mode_of 的注释）；Windows 没有
+    // mode 位，投递成功 + 文件落盘即是该平台下可验证的全部。
+    #[cfg(unix)]
     assert_eq!(mode_of(&target), 0o600);
+    #[cfg(not(unix))]
+    assert!(target.exists(), "投递后目标文件应存在");
 }
 
 #[test]
