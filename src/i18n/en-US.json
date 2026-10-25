@@ -78,7 +78,8 @@
       "kindValues": {
         "matched": "Both sides",
         "gateway_only": "Gateway only",
-        "bill_only": "Bill only"
+        "bill_only": "Bill only",
+        "gateway_unpriced": "Usage unpriced (no USD price)"
       },
       "flaggedYes": "Over threshold",
       "incomparableTitle": "Incomparable rows",

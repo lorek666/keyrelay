@@ -105,4 +105,17 @@ describe("ReconciliationCard（M46-UI B-251）", () => {
     render(<ReconciliationCard />, { wrapper });
     expect(await screen.findByText("该窗口内没有对账行。")).toBeInTheDocument();
   });
+
+  it("DEBUG-G5 P1-9：不可定价行在不可比组里以新 kind 文案可见", async () => {
+    vi.mocked(billReconciliation).mockResolvedValue([
+      {
+        siteId: 1, day: "2026-10-21", gatewayUsd: 0, billUsd: 0, diffUsd: null,
+        flagged: true, kind: "gateway_unpriced", source: null,
+      },
+    ] as never);
+    render(<ReconciliationCard />, { wrapper });
+    expect(await screen.findByText("2026-10-21")).toBeInTheDocument();
+    expect(screen.getByText("用量不可定价（无 USD 价）")).toBeInTheDocument();
+    expect(screen.getByText("不可比行")).toBeInTheDocument();
+  });
 });

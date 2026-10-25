@@ -1675,6 +1675,92 @@ async fn budget_blocks_all_candidates_with_local_rate_limited() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_check_is_per_attempt_not_per_request() {
+    // DEBUG-G5 P1-7：检查点在每次尝试之前，不在请求开始时。
+    // 判定条件与「首站已被打过」挂钩：请求开始时 1 号站还没被打，2 号站
+    // 若在请求开始时预查会放行；逐次尝试时，1 号站 429 失败切换之后再查
+    // 2 号站，超标已发生，必须拦住。旧预算法下本用例会由 2 号站 200 成功，
+    // 新行为下 2 号站 0 次、3 号站 429 收尾（429 可重放，末候选原样返回）。
+    let a = spawn_upstream(1, &["429 Too Many Requests"], Duration::ZERO);
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let c = spawn_upstream(3, &["429 Too Many Requests"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    let first_hits = Arc::clone(&a.seen);
+    let breaches: Breaches = Arc::new(Mutex::new(Vec::new()));
+    let sink_clone = Arc::clone(&breaches);
+    cfg.budget_check = Some(Arc::new(move |site_id, _key_id| {
+        if site_id == 2 && first_hits.load(Ordering::SeqCst) >= 1 {
+            Some(BudgetBreach {
+                site_id,
+                key_id: None,
+                period: BudgetPeriod::Day,
+                spent_usd: 10.0,
+                limit_usd: 5.0,
+            })
+        } else {
+            None
+        }
+    }));
+    cfg.on_budget_breach = Some(Arc::new(move |breach| {
+        if let Ok(mut log) = sink_clone.lock() {
+            log.push(breach);
+        }
+    }));
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(
+        status, 429,
+        "2 号站中途超标被拦、3 号站 429 时应为 429: {body}"
+    );
+    assert!(
+        body.contains("site3"),
+        "末候选 3 号站的 429 应原样返回: {body}"
+    );
+    assert_eq!(a.count(), 1, "1 号站应被打 1 次（429 失败切换）");
+    assert_eq!(b.count(), 0, "2 号站中途超标后必须没被打到");
+    assert_eq!(c.count(), 1, "3 号站应被打 1 次兜底");
+    assert_eq!(
+        breaches.lock().unwrap().len(),
+        1,
+        "2 号站 breach 应回调一次"
+    );
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_check_is_lazy_for_untried_candidates() {
+    // DEBUG-G5 P1-7 的另一面：首候选一次成功时，未被尝试的候选根本不查。
+    // 旧预算法会在请求开始时把三个候选各查一次；逐次尝试只查真正走到
+    // 的那一个。判定次数与实际尝试对齐，也是「检查时点后移」的直接证据。
+    let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
+    let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);
+    let c = spawn_upstream(3, &["200 OK"], Duration::ZERO);
+    let (mut cfg, _) = three_site_config(&a, &b, &c, no_guard(), open_breaker());
+    let checked: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+    let checked_clone = Arc::clone(&checked);
+    cfg.budget_check = Some(Arc::new(move |site_id, _key_id| {
+        if let Ok(mut log) = checked_clone.lock() {
+            log.push(site_id);
+        }
+        None
+    }));
+    let handle = start(cfg).await.expect("网关应能启动");
+    let token = handle.token.clone();
+
+    let (status, body) = post(&handle, &token).await;
+    assert_eq!(status, 200, "首候选成功时应为 200: {body}");
+    assert_eq!(a.count(), 1, "1 号站应被打 1 次");
+    assert_eq!(
+        checked.lock().unwrap().clone(),
+        vec![1],
+        "只应查首候选，未尝试的 2/3 号站不得被预查"
+    );
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn budget_blocks_only_the_over_budget_candidate() {
     let a = spawn_upstream(1, &["200 OK"], Duration::ZERO);
     let b = spawn_upstream(2, &["200 OK"], Duration::ZERO);

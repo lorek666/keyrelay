@@ -655,6 +655,8 @@ export type RevokeReport = {
   revoked: boolean;
   /** 本地 `keys.status` 是否写上 */
   localStatusUpdated: boolean;
+  /** 该 key 的保险库条目是否已删（DB 行保留，只删明文材料） */
+  vaultDeleted: boolean;
   note?: string | null;
 };
 
@@ -1852,7 +1854,7 @@ export type BillReconciliation = {
   billUsd: number | null;
   diffUsd: number | null;
   flagged: boolean;
-  kind: "matched" | "gateway_only" | "bill_only";
+  kind: "matched" | "gateway_only" | "bill_only" | "gateway_unpriced";
   source: string | null;
 };
 
@@ -2347,6 +2349,7 @@ export async function revokeKey(
       remoteId,
       revoked: true,
       localStatusUpdated: true,
+      vaultDeleted: true,
       note: null,
     });
   }
@@ -2375,6 +2378,7 @@ export async function unbindAgent(
               remoteId: "mock-remote-1",
               revoked: true,
               localStatusUpdated: true,
+              vaultDeleted: true,
               note: null,
             },
           ]

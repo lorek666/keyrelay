@@ -110,6 +110,10 @@ CREATE TABLE IF NOT EXISTS journals(
   before_sha256 TEXT,
   after_sha256 TEXT,
   backup_path TEXT,
+  -- DEBUG-G5 P1-10：投递前目标文件的原始权限位（Unix）。备份文件被强制成
+  -- 0600 后，回滚还原原始权限只能靠它；老库靠 migrate() 的 add_column_if_missing
+  -- 补列，老行留 NULL（回滚时回落到备份模板行为，即 0600 方向收紧，不放宽）。
+  before_mode INTEGER,
   status TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events(
@@ -1047,6 +1051,9 @@ impl Store {
         // **必须先判存在**：不判的话第二次打开会因 `duplicate column name` 直接失败——
         // 而 `migrate()` 是每次打开都跑的。
         add_column_if_missing(&conn, "bindings", "unbound_at", "INTEGER")?;
+        // DEBUG-G5 P1-10：journals.before_mode（投递前目标文件原始权限位）。
+        // 老行留 NULL：回滚时回落到备份模板行为（0600 方向收紧，不放宽）。
+        add_column_if_missing(&conn, "journals", "before_mode", "INTEGER")?;
         // P1-2：投递模式（轮换按它走）。老库默认 "site"（既有行为）。
         add_column_if_missing(
             &conn,
@@ -1710,7 +1717,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT target_path, backup_path, before_sha256, after_sha256
+                "SELECT target_path, backup_path, before_sha256, after_sha256, before_mode
                  FROM journals WHERE instr(id, ?1 || ':') = 1 ORDER BY rowid",
             )
             .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
@@ -1723,6 +1730,7 @@ impl Store {
                         .map(std::path::PathBuf::from),
                     before_sha256: row.get(2)?,
                     after_sha256: row.get(3)?,
+                    before_mode: row.get::<_, Option<i64>>(4)?.map(|m| m as u32),
                 })
             })
             .map_err(|e| Error::Store(format!("查询变更记录失败: {e}")))?;
@@ -1766,8 +1774,8 @@ impl Store {
         for entry in &journal.entries {
             conn.execute(
                 "INSERT OR REPLACE INTO journals
-                 (id, ts, op, target_path, before_sha256, after_sha256, backup_path, status)
-                 VALUES (?1, ?2, 'inject', ?3, ?4, ?5, ?6, 'applied')",
+                 (id, ts, op, target_path, before_sha256, after_sha256, backup_path, before_mode, status)
+                 VALUES (?1, ?2, 'inject', ?3, ?4, ?5, ?6, ?7, 'applied')",
                 params![
                     format!("{}:{}", journal.id, entry.path.display()),
                     now_secs(),
@@ -1775,6 +1783,7 @@ impl Store {
                     entry.before_sha256,
                     entry.after_sha256,
                     entry.backup.as_ref().map(|p| p.display().to_string()),
+                    entry.before_mode.map(|m| m as i64),
                 ],
             )
             .map_err(|e| Error::Store(format!("写入变更记录失败: {e}")))?;
@@ -4203,6 +4212,7 @@ mod tests {
                 backup: Some(PathBuf::from("/tmp/backups/0-config.toml")),
                 before_sha256: Some("aa".into()),
                 after_sha256: "bb".into(),
+                before_mode: Some(0o644),
             }],
         };
         store.record_journal(&journal).unwrap();

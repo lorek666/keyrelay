@@ -78,12 +78,17 @@ impl std::fmt::Debug for Patch {
 }
 
 /// 回滚凭据。`backup` 为 `None` 表示该文件在应用前不存在（回滚时应删除）。
+/// `before_mode`（Unix）= 应用前目标文件的权限位：备份文件自 DEBUG-G5 P1-10
+/// 起被强制成 0600 后，不能再拿备份文件当回滚的权限模板（否则一个 0644
+/// 的原文件回滚后会被收紧成 0600）；回滚时按本字段还原原始位，`None`（例如
+/// 从老库 journals 行重建、或非 Unix）时回落到既有模板行为。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalEntry {
     pub path: PathBuf,
     pub backup: Option<PathBuf>,
     pub before_sha256: Option<String>,
     pub after_sha256: String,
+    pub before_mode: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -300,7 +305,51 @@ pub fn default_lock_dir() -> PathBuf {
     std::env::temp_dir().join("tianshu-relay-locks")
 }
 
-/// 应用补丁：加锁 → 预检 → 备份 → 原子写 + 回读校验 → 记账。
+/// 注入备份的保留期（DEBUG-G5 P1-10）：每次成功 apply 后，把 `backup_dir` 下
+/// 超过此时限的 journal 目录删掉——备份里是含旧密钥明文的完整旧配置，不能
+/// 无限期留存。代价是过期 journal 的回滚随之失效（备份文件已不在，回滚会
+/// 报「读取备份失败」），这是「过期」的本意，不是 bug：回滚窗口 = 保留期。
+/// 只删名字以 `j` 开头的子目录（journal id 形如 `j<纳秒>-<序号>`），不碰
+/// 其它文件、不递归、不跟随符号链接；删不掉的单目录静默跳过（不因此让
+/// 本次 apply 失败——过期清理是善后，不是本次写入的前提）。
+pub const BACKUP_RETENTION: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// 删掉 `backup_dir` 下超过 `retention` 的 journal 目录，返回删掉的个数。
+/// mtime 取不到的目录不删（无法证明它已过期，宁可留着）。
+pub fn prune_expired_backups(backup_dir: &Path, retention: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(backup_dir) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // 只删真实目录：符号链接指向目录时 file_type().is_dir() 为 false，
+        // 不跟随，避免删到用户别处的数据。
+        if !file_type.is_dir() {
+            continue;
+        }
+        if !entry.file_name().to_string_lossy().starts_with('j') {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let expired = now
+            .duration_since(mtime)
+            .map(|age| age > retention)
+            .unwrap_or(false);
+        if expired && std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
 ///
 /// 三处保证：
 /// 1. **先加锁**：所有目标文件在预检之前就取到排他锁（进程内 + 跨进程），
@@ -398,10 +447,30 @@ pub(crate) fn apply_holding_lock(
     let journal_backup_dir = backup_dir.join(&journal_id);
     fs::create_dir_all(&journal_backup_dir)
         .map_err(|e| Error::inject(&journal_backup_dir, format!("创建备份目录失败: {e}")))?;
+    // DEBUG-G5 P1-10：备份目录本身先收紧到 0700（纵深防御：即使单个备份
+    // 文件的权限被旁路改宽，同机其它用户也进不来目录）；失败即报错——备份
+    // 目录还没写任何文件，此时失败不丢数据。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&journal_backup_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| Error::inject(&journal_backup_dir, format!("收紧备份目录失败: {e}")))?;
+    }
 
     let mut entries: Vec<JournalEntry> = Vec::with_capacity(patches.len());
     for (index, (patch, current)) in patches.iter().zip(current_contents).enumerate() {
         let existed = !current.is_empty() || patch.path.exists();
+        // 应用前目标文件的原始权限位（Unix）：回滚时按它还原，见 JournalEntry
+        // 的 before_mode 注释——备份文件被强制 0600 后不能再当权限模板。
+        #[cfg(unix)]
+        let before_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            fs::metadata(&patch.path)
+                .ok()
+                .map(|meta| meta.permissions().mode() & 0o7777)
+        };
+        #[cfg(not(unix))]
+        let before_mode = None;
         let backup = if existed {
             let file_name = patch
                 .path
@@ -411,6 +480,23 @@ pub(crate) fn apply_holding_lock(
             let backup_path = journal_backup_dir.join(format!("{index}-{file_name}"));
             fs::copy(&patch.path, &backup_path)
                 .map_err(|e| Error::inject(&backup_path, format!("备份失败: {e}")))?;
+            // DEBUG-G5 P1-10：备份文件强制 0600，不再继承源文件权限。
+            // `fs::copy` 会把源权限（例如 0644）带过来，而备份里是含旧密钥
+            // 明文的完整旧配置——0644 下同机其它用户可直接读。chmod 失败时
+            // 删掉刚拷的备份再报错：目标文件此时还没动，不留一份宽权限的
+            // 明文副本在磁盘上。
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) = fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o600))
+                {
+                    let _ = fs::remove_file(&backup_path);
+                    return Err(Error::inject(
+                        &backup_path,
+                        format!("收紧备份权限失败: {e}"),
+                    ));
+                }
+            }
             Some(backup_path)
         } else {
             None
@@ -422,6 +508,7 @@ pub(crate) fn apply_holding_lock(
                 backup,
                 before_sha256: existed.then(|| sha256_hex(current.as_bytes())),
                 after_sha256,
+                before_mode,
             }),
             Err(err) => {
                 // 2) 补偿：把当前文件（若已被改写）与之前所有已写入的文件还原，
@@ -437,6 +524,7 @@ pub(crate) fn apply_holding_lock(
                         before_sha256: existed.then(|| sha256_hex(current.as_bytes())),
                         // 用磁盘现状计算，保证补偿回滚的校验必然通过
                         after_sha256: sha256_hex(disk_now.as_bytes()),
+                        before_mode,
                     });
                 }
                 return match rollback(&Journal {
@@ -453,6 +541,9 @@ pub(crate) fn apply_holding_lock(
         }
     }
 
+    // 成功后顺带清过期备份（DEBUG-G5 P1-10，尽力而为）：本轮刚建的 journal
+    // 远未过期，不会被误删；清理失败不影响本次 apply 的成功回报。
+    let _ = prune_expired_backups(backup_dir, BACKUP_RETENTION);
     Ok(Journal {
         id: journal_id,
         entries,
@@ -504,6 +595,17 @@ fn restore_entry(entry: &JournalEntry) -> Result<()> {
             let contents = String::from_utf8(bytes)
                 .map_err(|_| Error::inject(backup, "备份不是合法 UTF-8"))?;
             write_atomic(&entry.path, &contents, None, Some(backup))?;
+            // DEBUG-G5 P1-10：备份文件已被强制成 0600，`write_atomic` 的模板
+            // 优先规则会把 0600 带到目标上——回滚语义是「还原到投递之前」，
+            // 包括原始权限位，故按 entry.before_mode 再钉一次（方向是还原，
+            // 不是放宽：0600 的原文件仍是 0600，0644 的原文件回到 0644）。
+            // before_mode 为 None（老库重建行）时跳过，保留模板行为。
+            #[cfg(unix)]
+            if let Some(mode) = entry.before_mode {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&entry.path, fs::Permissions::from_mode(mode))
+                    .map_err(|e| Error::inject(&entry.path, format!("还原权限失败: {e}")))?;
+            }
         }
         None => {
             if entry.path.exists() {
@@ -1136,5 +1238,77 @@ mod tests {
         assert_ne!(a, b, "两次写入不得用同一个临时名");
         assert!(a.to_string_lossy().ends_with(".tmp"));
         assert!(a.to_string_lossy().contains("auth.json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_is_forced_0600_and_rollback_restores_original_mode() {
+        // DEBUG-G5 P1-10：源文件 0644 时备份文件不得继承 0644（含旧密钥明文
+        // 的完整旧配置），必须强制 0600；journal 目录 0700；回滚时内容与
+        // 原始权限位（0644）都要回来——备份文件本身不再是权限模板。
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        fs::write(&target, "old-secret").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let journal = apply(
+            &[Patch::new(&target, "old-secret", "new-secret")],
+            &dir.path().join("backups"),
+        )
+        .unwrap();
+        let backup = journal.entries[0].backup.clone().expect("应有备份");
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "备份文件必须强制 0600，不得继承源文件 0644"
+        );
+        let journal_dir = backup.parent().unwrap();
+        assert_eq!(
+            fs::metadata(journal_dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "备份目录必须 0700"
+        );
+        assert_eq!(journal.entries[0].before_mode, Some(0o644));
+
+        rollback(&journal).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old-secret");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "回滚必须还原原始权限位，而不是备份的 0600"
+        );
+    }
+
+    #[test]
+    fn prune_expired_backups_only_touches_old_journal_dirs() {
+        // DEBUG-G5 P1-10：只删 j* 真实目录中超过保留期的；非 j* 目录、
+        // 普通文件、未过期目录一律不动。
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backups");
+        let old_journal = backup_dir.join("j1000-0");
+        let fresh_journal = backup_dir.join("j2000-0");
+        let other_dir = backup_dir.join("exports");
+        fs::create_dir_all(&old_journal).unwrap();
+        fs::create_dir_all(&fresh_journal).unwrap();
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(backup_dir.join("notes.txt"), "keep").unwrap();
+
+        // 保留期 0：全部 j* 目录都已过期（mtime 早于 now）。
+        let removed = prune_expired_backups(&backup_dir, std::time::Duration::from_secs(0));
+        assert_eq!(removed, 2, "两个 j* 目录都应被删");
+        assert!(!old_journal.exists());
+        assert!(!fresh_journal.exists());
+        assert!(other_dir.exists(), "非 j* 目录不得动");
+        assert!(backup_dir.join("notes.txt").exists(), "普通文件不得动");
+
+        // 保留期极大：新建的 j* 目录未过期，保留。
+        let kept = backup_dir.join("j3000-0");
+        fs::create_dir_all(&kept).unwrap();
+        let removed =
+            prune_expired_backups(&backup_dir, std::time::Duration::from_secs(365 * 24 * 3600));
+        assert_eq!(removed, 0, "未过期目录不得删");
+        assert!(kept.exists());
     }
 }

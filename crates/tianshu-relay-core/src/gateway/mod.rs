@@ -2491,21 +2491,20 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     let ewma = state.metrics.ewma_latency_map();
     let sendable = reorder_by_effective_latency(sendable, &|site_id| ewma.get(&site_id).copied());
 
-    // M46-S5：请求级预算拦截表。sendable 里去重后的 (site_id, key_id) 对各查一次
-    // budget_check，命中即记入映射（循环内按它跳过候选）。
+    // DEBUG-G5 P1-7：预算检查**不在请求开始时预算**，改在循环内每次尝试前现查。
+    // 旧预算法在请求开始时把全部候选各查一次：一次长请求（多次失败切换）或
+    // 并发请求在途期间发生的超标，直到下一次请求开始才可见；用量入账又滞后
+    // 于 drain，超支窗口 = 整段请求时长 + drain 间隔，理论上无界。
+    // 现查把窗口收窄到「本次尝试之前」：service 侧闭包判定前先 drain 用量缓冲
+    // （P0-1 修法 b），因此上一条已完成请求的用量在下一次尝试前已可见，超支
+    // 被本轮尝试的拦截 + breach 回调立刻暴露，而不是等到请求结束。
+    // 刻意**不做并发预留**：请求发出前 token 数未知，任何预留额都是凭空估计——
+    // 估高了会误拦合法请求、估低了等于没拦，都会改动 USD 计费语义；真预留需
+    // 要「先估价后结算」的两阶段计费，不在本项的最小改动内。残留窗口仍在：
+    // 同时在途、都已通过检查的请求仍可一起超支，上界 = 在途请求数 × 单请求
+    // 成本（不再是 drain 间隔 × 全量并发），超支事实由下一条检查的 breach
+    // 事件（含 spent_usd / limit_usd）如实报出。
     // 不在 eligible 阶段过滤：eligible 为空走的是熔断 503 尾巴，预算拦光不得报成熔断。
-    let mut budget_blocked: std::collections::HashMap<(i64, Option<i64>), BudgetBreach> =
-        std::collections::HashMap::new();
-    if let Some(check) = &state.config.budget_check {
-        for c in &sendable {
-            let pair = (c.upstream.site_id, c.upstream.key_id);
-            if let std::collections::hash_map::Entry::Vacant(entry) = budget_blocked.entry(pair) {
-                if let Some(breach) = check(pair.0, pair.1) {
-                    entry.insert(breach);
-                }
-            }
-        }
-    }
     // 同一请求内同一 breach 的回调去重集合（循环内首次遇到时才回调）。
     let mut budget_breach_fired: std::collections::HashSet<(i64, Option<i64>, BudgetPeriod)> =
         std::collections::HashSet::new();
@@ -2598,7 +2597,15 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         // 不 record_failover（预算是策略拦停，不是失败切换）、不喂熔断、不写
         // GatewayFailure；continue 发生在 attempts_made 递增之前，故不占 M46-S4
         // 重试预算。回调只在同一请求内首次遇到该 breach 时发一次。
-        if let Some(breach) = budget_blocked.get(&(upstream.site_id, upstream.key_id)) {
+        // DEBUG-G5 P1-7：检查点在**本次尝试之前**现查（不是请求开始时的预算表）：
+        // 前一候选失败切换期间、或其它并发请求完成并入账后发生的超标，本次尝试
+        // 前就能拦住；未被尝试的候选根本不查（懒查），判定次数与实际尝试对齐。
+        if let Some(breach) = state
+            .config
+            .budget_check
+            .as_ref()
+            .and_then(|check| check(upstream.site_id, upstream.key_id))
+        {
             state
                 .local_rejects
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
