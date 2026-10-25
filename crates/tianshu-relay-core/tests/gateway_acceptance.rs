@@ -523,28 +523,32 @@ async fn m44_c6_per_site_concurrency_cap() {
     for j in joins {
         j.join().unwrap();
     }
-    let results = results.lock().unwrap();
-    let ok = results.iter().filter(|(s, _, _)| *s == 200).count();
-    assert!(ok > 0, "至少要有成功的");
-    // 被拒的必须是本地 429（不是上游 429）：body error.code 为 local_rate_limited。
-    let local_429 = results
-        .iter()
-        .filter(|(s, text, _)| *s == 429 && text.contains(r#""code":"local_rate_limited""#))
-        .count();
-    assert!(
-        local_429 > 0,
-        "32 并发、双站各 8 上限 ⇒ 必然有请求在双站都满时被本地拒掉（429 local_rate_limited），实测各状态：{:?}",
-        results.iter().map(|(s, _, _)| s).collect::<Vec<_>>()
-    );
-    let max_latency = results
-        .iter()
-        .map(|(_, _, elapsed)| *elapsed)
-        .max()
-        .expect("至少一条请求");
-    assert!(
-        max_latency < Duration::from_secs(5),
-        "无请求耗时可超过 5s，实测最慢 {max_latency:?}"
-    );
+    // 锁只在断言段持有：先在块内读完 results 做断言、块结束即放锁，
+    // 再 await 关停（clippy::await_holding_lock；join 已全部回收，块内无并发写）。
+    {
+        let results = results.lock().unwrap();
+        let ok = results.iter().filter(|(s, _, _)| *s == 200).count();
+        assert!(ok > 0, "至少要有成功的");
+        // 被拒的必须是本地 429（不是上游 429）：body error.code 为 local_rate_limited。
+        let local_429 = results
+            .iter()
+            .filter(|(s, text, _)| *s == 429 && text.contains(r#""code":"local_rate_limited""#))
+            .count();
+        assert!(
+            local_429 > 0,
+            "32 并发、双站各 8 上限 ⇒ 必然有请求在双站都满时被本地拒掉（429 local_rate_limited），实测各状态：{:?}",
+            results.iter().map(|(s, _, _)| s).collect::<Vec<_>>()
+        );
+        let max_latency = results
+            .iter()
+            .map(|(_, _, elapsed)| *elapsed)
+            .max()
+            .expect("至少一条请求");
+        assert!(
+            max_latency < Duration::from_secs(5),
+            "无请求耗时可超过 5s，实测最慢 {max_latency:?}"
+        );
+    }
     assert_eq!(
         a.current.load(Ordering::SeqCst),
         0,

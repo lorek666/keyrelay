@@ -4293,10 +4293,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 轮换时某通道用的模型：只有 Codex 两通道透传现盘模型（auth 写入器本身
     /// 不写模型，透传无害；config 靠它保留），其余通道一律 `None`——它们在
     /// `None` 时只插不删，透传反而会把模型写进本来没有模型的通道。
-    fn rotation_model_for<'a>(
-        channel: DeliveryChannel,
-        codex_model: &'a Option<String>,
-    ) -> Option<&'a str> {
+    fn rotation_model_for(channel: DeliveryChannel, codex_model: &Option<String>) -> Option<&str> {
         match channel {
             DeliveryChannel::CodexAuthJson | DeliveryChannel::CodexConfig => codex_model.as_deref(),
             _ => None,

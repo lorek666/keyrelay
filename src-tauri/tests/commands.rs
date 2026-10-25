@@ -2763,7 +2763,7 @@ fn m41s2_rotation_keeps_exactly_one_unrevoked_default_row() {
     let (site, key_id) = seed_gateway_site(&webview);
     let port = free_port();
     enable_gateway(&webview, port);
-    let started = invoke_on(
+    let _started = invoke_on(
         &webview,
         "gateway_start",
         json!({"args": {"siteId": site, "keyId": key_id}}),
@@ -2836,7 +2836,7 @@ fn m41s2_three_rotations_never_revoke_the_default_row() {
     let (site, key_id) = seed_gateway_site(&webview);
     let port = free_port();
     enable_gateway(&webview, port);
-    let started = invoke_on(
+    let _started = invoke_on(
         &webview,
         "gateway_start",
         json!({"args": {"siteId": site, "keyId": key_id}}),
@@ -2850,7 +2850,7 @@ fn m41s2_three_rotations_never_revoke_the_default_row() {
         .expect("读默认行")
         .expect("默认行");
     set_grace(&webview, 60);
-    let mut current = started["token"].as_str().expect("令牌").to_string();
+    let mut current: String;
     for _ in 0..3 {
         let rotated =
             invoke_on(&webview, "gateway_rotate_token", json!({"args": null})).expect("轮换");
