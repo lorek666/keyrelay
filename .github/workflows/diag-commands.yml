@@ -1,7 +1,4 @@
-# 临时诊断 round 2：验证 commands 测试 exe 的 0xc0000139 是否因缺 Common-Controls v6 清单。
-# 理论：exe 从 comctl32 导入 TaskDialogIndirect/SetWindowSubclass/DefSubclassProc（均为 v6 专属），
-# 但 cargo test 产物没有像 Tauri 应用二进制那样嵌入 v6 清单，于是加载器绑到 comctl32 v5，导入解析失败。
-# 验证方法：给 exe 副本嵌入一份标准 v6 清单后跑 --list，若能列出测试即证实。
+# 临时诊断 round 3：验证 build.rs 的 v6 清单是否真进了 CI 编出的测试 exe，并跑通 commands 目标。
 # 仅 workflow_dispatch 手动触发，不参与任何门禁；定位到根因后删除本文件。
 name: diag-commands
 
@@ -17,29 +14,21 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Build commands test exe without running
         run: cargo test --no-run -p tianshu-relay --test commands
-      - name: Manifest experiment
+      - name: Check embedded manifest + list + run target
         shell: pwsh
         run: |
           $exe = Get-ChildItem target/debug/deps/commands-*.exe | Select-Object -First 1 -ExpandProperty FullName
           Write-Output "exe: $exe"
           $mt = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\mt.exe" | Select-Object -First 1 -ExpandProperty FullName
-          Write-Output "mt: $mt"
-          Write-Output "--- original manifest (expect failure if none embedded) ---"
-          & $mt -inputresource:"$exe;#1" -out:orig.xml 2>&1 | Select-Object -First 3
-          if (Test-Path orig.xml) { Get-Content orig.xml -Raw | Select-Object -First 1 }
-          @'
-          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-          <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-            <dependency>
-              <dependentAssembly>
-                <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
-              </dependentAssembly>
-            </dependency>
-          </assembly>
-          '@ | Out-File -Encoding utf8 v6.manifest
-          $exe2 = "$exe.v6.exe"
-          Copy-Item $exe $exe2
-          & $mt -manifest v6.manifest -outputresource:"$exe2;#1" 2>&1 | Select-Object -First 3
-          Write-Output "--- run manifest-embedded copy --list ---"
-          & $exe2 --list 2>&1 | Select-Object -First 8
-          Write-Output "exit: $LASTEXITCODE"
+          Write-Output "--- embedded manifest (expect Common-Controls 6.0.0.0) ---"
+          & $mt -inputresource:"$exe;#1" -out:embedded.xml 2>&1 | Select-Object -First 2
+          if (Test-Path embedded.xml) { Get-Content embedded.xml -Raw }
+          Write-Output "--- --list (first 5) ---"
+          & $exe --list 2>&1 | Select-Object -First 5
+          Write-Output "list exit: $LASTEXITCODE"
+      - name: Run commands test target
+        shell: pwsh
+        run: |
+          cargo test -p tianshu-relay --test commands 2>&1 | Tee-Object -FilePath commands-out.txt | Select-Object -Last 5
+          Write-Output "--- FAILED lines ---"
+          Select-String -Path commands-out.txt -Pattern 'FAILED|panicked|test result' | Select-Object -ExpandProperty Line | Select-Object -First 30
