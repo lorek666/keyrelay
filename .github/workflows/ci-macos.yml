@@ -45,7 +45,7 @@ jobs:
       - run: node scripts/check-clean-gate.mjs
 
       # 六门禁（macOS 侧）
-      - run: cargo fmt --check --workspace
+      - run: cargo fmt --check --all
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --no-fail-fast
       - run: pnpm build
