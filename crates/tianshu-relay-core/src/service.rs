@@ -1418,6 +1418,103 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             .and_then(|m| self.meta_cache.lookup_cached(m))
     }
 
+    /// P2-8：投递前模型验证（静态配对 + 真实 `/v1/models` 探针）。
+    ///
+    /// 触发点是**计划/校验阶段**（命令层在 `delivery_plan` 里、建计划之前调，
+    /// `apply_delivery` 里、写盘之前再调一次）：验证本身**不写盘、不记账、
+    /// 不写绑定、不进持久化表**，结果只随本次调用返回。
+    ///
+    /// 行为分层（理由见 `delivery::model_check` 模块文档）：
+    /// - 静态层先行：无模型 / 通道不写模型 ⇒ 探针跳过（`skipped`），不拦；
+    ///   格式无效 ⇒ 直接硬拦，不再发探针（写进去必错，没必要再问端点）；
+    /// - 端点与密钥取自**本次投递的同一来源**（站点模式取站点 base_url 与站点
+    ///   密钥，网关模式取网关端点 base_url 与本地令牌），与写盘用的值同源，
+    ///   探针验的就是「将要写进去的那一对」；
+    /// - 端点/密钥解析失败（key 不存在、已回收等）⇒ 探针跳过（`unresolved`），
+    ///   不拦：计划/落盘本身会在原有路径上按既有规则报错，验证不得抢先
+    ///   制造第二种错误口径，更不得把「没问到」说成「密钥错」；
+    /// - 探针走通用传输层（与站点请求同一条、代理配置一致），总预算
+    ///   [`delivery::model_check::MODEL_PROBE_TIMEOUT`]；返回结构不含密钥，
+    ///   本函数也不记任何日志（密钥只在探针请求头里出现一次，用完即清零）。
+    /// - 按来源分流（P2-8 复审 P1）：`probe_models` 本身只认「被探端点亲口给的
+    ///   目录」，站点模式直打上游，该口径成立，`not_in_catalog` 保持硬拦；
+    ///   网关模式探针打的是本地网关 `GET /v1/models`，该路径只在路由非空且
+    ///   聚合目录非空时返回本地聚合，否则透传给首选上游（且采集默认关闭，
+    ///   默认走的恰恰是透传分支），聚合对未知目录（通配）上游也是盲的——
+    ///   网关目录里没有该模型**不是**「目标站点没有该模型」的肯定性证据，
+    ///   故网关模式的 `not_in_catalog` 降级为警告，code 换成网关专属的
+    ///   `not_in_gateway_catalog`（前端文案注明聚合/透传口径）；同理网关模式
+    ///   的通过也只说明本地网关目录里有该模型，code 换成
+    ///   `passed_gateway_catalog`，文案限定口径、不代表逐站核对。网关模式的
+    ///   401 保持硬拦（本地令牌无效则经网关推理同样失败，与目录口径无关）。
+    ///   plan 与 apply 都调本函数，一处分流即两处生效。
+    pub async fn validate_delivery_model(
+        &self,
+        key_id: i64,
+        channel: delivery::DeliveryChannel,
+        model: Option<&str>,
+        source: delivery::DeliverySource<'_>,
+    ) -> delivery::model_check::ModelValidation {
+        let static_check = delivery::model_check::check_static(channel, model);
+        if static_check.outcome == "not_applicable" {
+            return delivery::model_check::ModelValidation::skipped(static_check, "skipped");
+        }
+        // 能到这里，模型必为 trim 后非空（静态层已排除空串）。
+        let model_name = model.map(str::trim).filter(|m| !m.is_empty()).unwrap_or("");
+        let endpoint = match source {
+            delivery::DeliverySource::Site => self
+                .store
+                .get_key(key_id)
+                .ok()
+                .flatten()
+                .and_then(|row| self.site(row.site_id).ok())
+                .map(|site| site.base_url),
+            delivery::DeliverySource::Gateway(endpoint) => Some(endpoint.base_url.clone()),
+        };
+        let api_key = self.secret_for_source(key_id, source).ok();
+        let (Some(base_url), Some(api_key)) = (endpoint, api_key) else {
+            // unresolved：探针没做成，但用户填了的模型名仍带回去，前端展示
+            // 「未验证」时能对上号（skipped 默认 model 为空是「无模型」口径，
+            // 这里是有模型但问不到端点，不能混为一谈）。
+            let mut v = delivery::model_check::ModelValidation::skipped(static_check, "unresolved");
+            v.model = Some(model_name.to_string());
+            return v;
+        };
+        let probe = delivery::model_check::probe_models(
+            &self.transport,
+            &base_url,
+            &api_key,
+            model_name,
+            delivery::model_check::MODEL_PROBE_TIMEOUT,
+        )
+        .await;
+        // 网关模式分流（见本函数文档）：只翻这两个 code，其余（401 硬拦、
+        // 403/空目录/不可达/超时等警告）原样通过，不得因来源改判。
+        let probe = match source {
+            delivery::DeliverySource::Gateway(_) => match probe.code {
+                "not_in_catalog" => delivery::model_check::ProbeCheck {
+                    outcome: "warning",
+                    code: "not_in_gateway_catalog",
+                    status: probe.status,
+                    blocks_delivery: false,
+                },
+                "passed" => delivery::model_check::ProbeCheck {
+                    outcome: "passed",
+                    code: "passed_gateway_catalog",
+                    status: probe.status,
+                    blocks_delivery: false,
+                },
+                _ => probe,
+            },
+            delivery::DeliverySource::Site => probe,
+        };
+        delivery::model_check::ModelValidation::with_probe(
+            model_name.to_string(),
+            static_check,
+            probe,
+        )
+    }
+
     /// 钥匙串后端标识（诊断用；`"memory"` 出现在生产装配里即为缺陷）。
     pub fn vault_backend(&self) -> &'static str {
         self.vault.backend_name()
@@ -8265,6 +8362,101 @@ mod tests {
             .insert_key(site.id, "probe-key", &reference, Some("remote-1"), None)
             .expect("insert_key");
         (service, key_id, mock, sleeper)
+    }
+
+    // ---------- P2-8 复审 P1：validate_delivery_model 按来源分流 ----------
+    // plan 与 apply 同走该函数，这里直接测函数即覆盖两处；探针层
+    // `probe_models` 本身不分来源（站点口径出码），分流只发生在本层。
+
+    fn catalog_probe_response(ids: &[&str]) -> HttpResponse {
+        HttpResponse::json(
+            200,
+            json!({ "data": ids.iter().map(|id| json!({ "id": id })).collect::<Vec<_>>() }),
+        )
+        .expect("构造目录响应")
+    }
+
+    #[tokio::test]
+    async fn validate_model_site_not_in_catalog_blocks() {
+        let (service, key_id) =
+            probe_service(vec![catalog_probe_response(&["some-other-model"])]).await;
+        let v = service
+            .validate_delivery_model(
+                key_id,
+                DeliveryChannel::OpenCode,
+                Some("gpt-4o"),
+                delivery::DeliverySource::Site,
+            )
+            .await;
+        assert_eq!(v.probe.outcome, "failed");
+        assert_eq!(v.probe.code, "not_in_catalog");
+        assert!(v.blocks_delivery);
+    }
+
+    #[tokio::test]
+    async fn validate_model_gateway_not_in_catalog_is_warning() {
+        let (service, key_id) =
+            probe_service(vec![catalog_probe_response(&["some-other-model"])]).await;
+        let endpoint = delivery::GatewayEndpoint {
+            base_url: "http://127.0.0.1:8080/v1".to_string(),
+            token: "<redacted>".to_string(),
+        };
+        let v = service
+            .validate_delivery_model(
+                key_id,
+                DeliveryChannel::OpenCode,
+                Some("gpt-4o"),
+                delivery::DeliverySource::Gateway(&endpoint),
+            )
+            .await;
+        assert_eq!(v.probe.outcome, "warning");
+        assert_eq!(v.probe.code, "not_in_gateway_catalog");
+        assert!(!v.blocks_delivery);
+    }
+
+    #[tokio::test]
+    async fn validate_model_gateway_unauthorized_still_blocks() {
+        let (service, key_id) =
+            probe_service(vec![
+                HttpResponse::json(401, json!({ "error": "bad key" })).expect("构造 401 响应")
+            ])
+            .await;
+        let endpoint = delivery::GatewayEndpoint {
+            base_url: "http://127.0.0.1:8080/v1".to_string(),
+            token: "<redacted>".to_string(),
+        };
+        let v = service
+            .validate_delivery_model(
+                key_id,
+                DeliveryChannel::OpenCode,
+                Some("gpt-4o"),
+                delivery::DeliverySource::Gateway(&endpoint),
+            )
+            .await;
+        assert_eq!(v.probe.outcome, "failed");
+        assert_eq!(v.probe.code, "unauthorized");
+        assert!(v.blocks_delivery);
+    }
+
+    #[tokio::test]
+    async fn validate_model_gateway_passed_is_scoped_to_local_catalog() {
+        let (service, key_id) = probe_service(vec![catalog_probe_response(&["gpt-4o"])]).await;
+        let endpoint = delivery::GatewayEndpoint {
+            base_url: "http://127.0.0.1:8080/v1".to_string(),
+            token: "<redacted>".to_string(),
+        };
+        let v = service
+            .validate_delivery_model(
+                key_id,
+                DeliveryChannel::OpenCode,
+                Some("gpt-4o"),
+                delivery::DeliverySource::Gateway(&endpoint),
+            )
+            .await;
+        assert_eq!(v.probe.outcome, "passed");
+        // 口径限定：不是站点模式的裸 `passed`，前端文案据此注明本地网关目录。
+        assert_eq!(v.probe.code, "passed_gateway_catalog");
+        assert!(!v.blocks_delivery);
     }
 
     /// M46-S1 巡检测试装配：1 站 + 1 把假密钥（内存 vault），巡检间隔已开（300 秒）。

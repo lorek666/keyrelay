@@ -628,6 +628,33 @@
         "default": "Default",
         "unverified": "Unverified",
         "unverifiedSuffix": " (unverified)"
+      },
+      "modelValidation": {
+        "title": "Model validation (pre-delivery probe)",
+        "staticLabel": "Static pairing",
+        "probeLabel": "Endpoint probe",
+        "blocked": "Validation failed, delivery is blocked. Follow the guidance below, then try again; the backend will check once more at delivery time.",
+        "static": {
+          "noModel": "No model entered: this delivery only writes the key and endpoint, so there is no pairing to check.",
+          "channelNoModel": "This channel does not write a model field: the model input will not land on disk, so there is no pairing to check.",
+          "malformed": "Invalid model name: it must not contain whitespace, must not look like a URL, and a provider prefix must be followed by a model name.",
+          "unchecked": "No basis to judge: the repo has no provider-to-model mapping table, and relay endpoints translate model names, so family names alone never block. The probe below is authoritative."
+        },
+        "probe": {
+          "passed": "Passed: the endpoint is reachable, the key is valid, and the target model is in the endpoint catalog.",
+          "passedGatewayCatalog": "Passed (local gateway catalog scope): the endpoint is reachable, the key is valid, and the target model is in the local gateway catalog — that catalog is an aggregate (or, when collection is empty, the passthrough first-upstream catalog), not a per-upstream check, so it does not prove every upstream serves this model.",
+          "unauthorized": "Failed (delivery blocked): the probe got 401 — the key does not match this endpoint, or a stale login key is left locally. Confirm the key belongs to this endpoint's site, or log in again for a fresh key, then retry.",
+          "forbidden": "Warning: the endpoint refused the catalog query (403), but catalog permission may be separate from inference permission, so this does not prove inference will fail. Confirm the key has catalog access on the endpoint, or deliver and check with a real agent run.",
+          "notInCatalog": "Failed (delivery blocked): the target model is not in the endpoint's /v1/models catalog. Check the model name for typos, or confirm the endpoint actually serves this model.",
+          "notInGatewayCatalog": "Warning: the target model is not in the local gateway catalog — that catalog is an aggregate (or, when collection is empty, the passthrough first-upstream catalog), not a per-upstream check, so it does not prove the upstream lacks this model. Delivery is not blocked. Confirm the model name, then decide whether to deliver.",
+          "emptyCatalog": "Warning: the endpoint returned an empty catalog, which does not prove the model is absent (some relays do not publish a full catalog). Confirm the model name, then decide whether to deliver.",
+          "badResponse": "Warning: the endpoint did not return an OpenAI catalog shape (missing data array), so the model cannot be checked. Confirm the endpoint address is an OpenAI-compatible /v1/models.",
+          "unexpectedStatus": "Warning: the probe got an unexpected status ({status}). 404 usually means a wrong endpoint path, 429 means rate-limited (retry later), 5xx means an endpoint-side problem. Check the endpoint address for the status, then retry.",
+          "unreachable": "Warning: the probe could not reach the endpoint (network unreachable). Check the endpoint address, proxy settings, and network, then retry; if you are sure they are right, you may deliver first and check with a real agent run.",
+          "timeout": "Warning: the endpoint did not answer within the 10s probe budget. Check whether the endpoint is slow or the network is congested, then retry; if you are sure, you may deliver first.",
+          "skipped": "Not probed: there is no model to verify, or the channel does not write a model.",
+          "unresolved": "Not probed: the endpoint or key could not be resolved, so no probe was sent. Confirm the key and endpoint themselves first."
+        }
       }
     },
     "restartHint": {

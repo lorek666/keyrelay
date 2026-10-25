@@ -39,7 +39,13 @@ import {
   type AgentUpdateStatus,
 } from "../lib/api";
 import { rollbackAftermath, rollbackAftermathTitle } from "../lib/rollback";
-import { maskRemovedValues, shouldWarnEndpointOutOfScope } from "../lib/deliveryView";
+import {
+  maskRemovedValues,
+  modelValidationBlocks,
+  modelValidationProbeKey,
+  modelValidationStaticKey,
+  shouldWarnEndpointOutOfScope,
+} from "../lib/deliveryView";
 import ConfirmDialog from "../components/ConfirmDialog";
 import AgentIcon from "../components/AgentIcon";
 import ModelPicker from "../components/ModelPicker";
@@ -1724,6 +1730,33 @@ function PlanView({
         </p>
       ) : null}
 
+      {/* P2-8：投递前模型验证（静态配对 + /v1/models 探针），计划阶段产出。
+          判据与硬拦结论只来自后端字段（`modelValidation`），页面不按
+          outcome/code 自己算拦不拦（见 deliveryView.modelValidationBlocks）；
+          字段缺失（旧二进制）时整段不渲染、不禁用投递。
+          探针只读：这里展示的是「投递前问过端点」的结果，不是记账。 */}
+      {plan.modelValidation ? (
+        <section aria-label={t("agents.plan.modelValidation.title")}>
+          <h4>{t("agents.plan.modelValidation.title")}</h4>
+          <dl className="kv">
+            <dt>{t("agents.plan.modelValidation.staticLabel")}</dt>
+            <dd>{t(modelValidationStaticKey(plan.modelValidation.staticCode))}</dd>
+            <dt>{t("agents.plan.modelValidation.probeLabel")}</dt>
+            <dd>
+              {t(modelValidationProbeKey(plan.modelValidation.probeCode), {
+                status: plan.modelValidation.probeStatus ?? "",
+              })}
+            </dd>
+          </dl>
+          {modelValidationBlocks(plan.modelValidation) ? (
+            <p className="warnline" role="alert">
+              <AlertTriangle size={14} aria-hidden />{" "}
+              {t("agents.plan.modelValidation.blocked")}
+            </p>
+          ) : null}
+        </section>
+      ) : null}
+
       {files.map((file, index) => (
         <section key={file.targetPath}>
           <div className="row row-between">
@@ -1793,7 +1826,15 @@ function PlanView({
         <button
           type="button"
           className="btn btn-primary"
-          disabled={previewOnly || !agreeChecked || busy || noChange}
+          // P2-8：验证硬拦时禁用投递（与 previewOnly / noChange 同列门禁）；
+          // 后端 apply 还会再探一次并拒绝写盘，前端禁用只是第一层。
+          disabled={
+            previewOnly ||
+            !agreeChecked ||
+            busy ||
+            noChange ||
+            modelValidationBlocks(plan.modelValidation)
+          }
           onClick={onApply}
         >
           <Send size={14} aria-hidden /> {t("agents.btn.apply")}

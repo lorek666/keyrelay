@@ -23,6 +23,7 @@ pub mod hermes;
 pub mod json_text;
 pub mod mcode;
 pub mod mimo_code;
+pub mod model_check;
 pub mod openclaw;
 pub mod opencode;
 pub mod pi;
