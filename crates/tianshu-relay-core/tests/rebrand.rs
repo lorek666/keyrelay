@@ -174,6 +174,10 @@ fn symlinks_are_skipped_and_reported() {
     let (_, report) = resolve_app_home(h.path());
 
     assert_eq!(report.status, RebrandStatus::Migrated, "{report:?}");
+    // 符号链接断言只在 Unix 上成立：Windows 下本测试没有建出链接，
+    // 也就没有“被跳过并上报”的警告；迁移本身与“链接目标不被复制”
+    // 由上下两条跨平台断言覆盖。
+    #[cfg(unix)]
     assert!(
         report.warnings.iter().any(|w| w.contains("link.txt")),
         "必须记录被跳过的符号链接: {:?}",

@@ -106,6 +106,10 @@ fn setup() -> Fixture {
     }
 }
 
+/// Unix 权限位读取：Windows 没有 Unix mode 位，生产侧的权限收紧
+/// （inject/mod.rs 的 resolve_mode / clamp_secret_mode）本身就是 cfg(unix)，
+/// 非 Unix 路径写文件时直接忽略 mode——因此 mode 断言只在 Unix 上有意义。
+#[cfg(unix)]
 fn mode_of(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     fs::metadata(path).expect("stat").permissions().mode() & 0o777
@@ -217,11 +221,13 @@ fn delivery_writes_key_with_0600_and_preserves_other_keys() {
         "{\n  \"auth_mode\": \"apikey\",\n  \"tokens\": {\n    \"id_token\": \"keep-me\"\n  }\n}",
     )
     .unwrap();
-    fs::set_permissions(
-        &f.target,
-        std::os::unix::fs::PermissionsExt::from_mode(0o600),
-    )
-    .unwrap();
+    // 0600 预置只在 Unix 上有意义（Windows 无 mode 位）；Windows 下预置文件
+    // 用默认权限，投递成功 + 内容断言仍覆盖本测试的跨平台意图。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&f.target, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     f.service
         .grant_consent(f.key_id, DeliveryChannel::CodexAuthJson)
@@ -240,7 +246,12 @@ fn delivery_writes_key_with_0600_and_preserves_other_keys() {
     assert_eq!(parsed["OPENAI_API_KEY"], SECRET);
     assert_eq!(parsed["auth_mode"], "apikey");
     assert_eq!(parsed["tokens"]["id_token"], "keep-me", "无关键必须保留");
+    // 0600 断言只在 Unix 上成立（见 mode_of 的注释）；Windows 没有
+    // mode 位，投递成功 + 文件落盘即是该平台下可验证的全部。
+    #[cfg(unix)]
     assert_eq!(mode_of(&f.target), 0o600, "含密钥的文件必须是 0600");
+    #[cfg(not(unix))]
+    assert!(f.target.exists(), "投递后目标文件应存在");
 
     // 结果对象不得携带密钥
     assert!(!format!("{outcome:?}").contains(SECRET));
@@ -256,7 +267,12 @@ fn fresh_file_is_created_with_0600() {
         .apply_delivery(f.key_id, DeliveryChannel::CodexAuthJson)
         .unwrap();
 
+    // 0600 断言只在 Unix 上成立（见 mode_of 的注释）；Windows 没有
+    // mode 位，投递成功 + 文件落盘即是该平台下可验证的全部。
+    #[cfg(unix)]
     assert_eq!(mode_of(&f.target), 0o600, "新建的 auth.json 必须是 0600");
+    #[cfg(not(unix))]
+    assert!(f.target.exists(), "投递后目标文件应存在");
     let parsed: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&f.target).unwrap()).unwrap();
     assert_eq!(parsed["OPENAI_API_KEY"], SECRET);
@@ -342,11 +358,13 @@ fn rollback_restores_bytes_and_mode() {
     fs::create_dir_all(f.target.parent().unwrap()).unwrap();
     let before = "{\n  \"auth_mode\": \"apikey\"\n}";
     fs::write(&f.target, before).unwrap();
-    fs::set_permissions(
-        &f.target,
-        std::os::unix::fs::PermissionsExt::from_mode(0o600),
-    )
-    .unwrap();
+    // 0600 预置只在 Unix 上有意义（Windows 无 mode 位）；Windows 下回滚的
+    // 字节级还原断言仍覆盖本测试的跨平台意图，权限位断言见下方的 Unix 分支。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&f.target, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     f.service
         .grant_consent(f.key_id, DeliveryChannel::CodexAuthJson)
@@ -363,7 +381,12 @@ fn rollback_restores_bytes_and_mode() {
         before,
         "必须字节级还原"
     );
+    // 0600 断言只在 Unix 上成立（见 mode_of 的注释）；Windows 没有
+    // mode 位，字节级还原即是该平台下可验证的全部。
+    #[cfg(unix)]
     assert_eq!(mode_of(&f.target), 0o600, "回滚后权限位必须保持");
+    #[cfg(not(unix))]
+    assert!(f.target.exists(), "回滚后目标文件应存在");
 }
 
 #[test]
