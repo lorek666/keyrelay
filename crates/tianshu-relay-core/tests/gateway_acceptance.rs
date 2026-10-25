@@ -793,3 +793,55 @@ async fn failed_attempt_counts_requests_exactly_once() {
     assert!(per_site.last_error.is_some(), "失败原因仍要记");
     h.shutdown_and_wait().await;
 }
+
+// ---------------------------------------------------------------- DEBUG P1-3
+
+/// DEBUG P1-3：走别名的请求，用量行模型名必须是改写后的真实名（不是别名）。
+/// 别名 `gpt4` → 真实 `gpt-4o-real`：上游收到的 body 已改写、用量行也必须
+/// 是真实名，否则价格 JOIN（按真实名）命中不了价格行、预算 spent 记 0。
+/// 未命中别名时两者恒等（既有 D1 用例覆盖，不在此重复）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_p1_3_alias_usage_uses_the_rewritten_real_model() {
+    let a = fake_with_body(
+        vec!["200 OK"],
+        0,
+        r#"{"id":"x","usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}"#,
+    );
+    let seen: Arc<Mutex<Vec<tianshu_relay_core::gateway::GatewayUsage>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let mut cfg = config(
+        vec![upstream(1, a.port, "r1", vec!["gpt-4o-real"], 1.0)],
+        vec![("r1", "sk-test-1")],
+    );
+    cfg.route = cfg.route.with_alias("gpt4", "gpt-4o-real");
+    cfg.on_usage = Some(Arc::new(
+        move |u: tianshu_relay_core::gateway::GatewayUsage| {
+            sink.lock().unwrap().push(u);
+        },
+    ));
+    let h = gateway::start(cfg).await.unwrap();
+    let alias_body = r#"{"model":"gpt4","messages":[]}"#;
+    let (status, _) = request(
+        port_of(&h),
+        "POST",
+        "/v1/chat/completions",
+        Some(alias_body),
+    );
+    assert_eq!(status, 200, "别名请求应经改写后成功");
+    // 上游收到的 body 已改写成真实名（出站改写本身无问题，问题只在用量口径）。
+    let upstream_seen = a.seen.lock().unwrap().clone();
+    assert_eq!(upstream_seen.len(), 1, "上游应恰好收到一次请求");
+    assert!(
+        upstream_seen[0].contains(r#""model":"gpt-4o-real""#),
+        "上游应收到改写后的真实名: {}",
+        upstream_seen[0]
+    );
+    let log = seen.lock().unwrap().clone();
+    assert_eq!(log.len(), 1, "一条请求一条 usage");
+    assert_eq!(
+        log[0].model, "gpt-4o-real",
+        "用量行模型名必须是真实名（修前记别名 gpt4，价格 JOIN 命中不了）"
+    );
+    h.shutdown_and_wait().await;
+}

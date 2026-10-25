@@ -57,7 +57,10 @@ CREATE TABLE IF NOT EXISTS sites(
   display_name TEXT NOT NULL DEFAULT '',
   fingerprint_json TEXT,
   health TEXT NOT NULL DEFAULT 'unknown',
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  -- DEBUG P1-4：分站超时（毫秒），NULL = 未填 ⇒ 生产路由回退全局超时。
+  -- 老库由 migrate() 的 add_column_if_missing 补列（与 keys.status 同一条纪律）。
+  timeout_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS accounts(
   id INTEGER PRIMARY KEY,
@@ -401,6 +404,10 @@ pub struct SiteRow {
     pub base_url: String,
     pub display_name: String,
     pub health: String,
+    /// DEBUG P1-4：分站超时（毫秒）。`None` = 未填 ⇒ 回退全局超时；
+    /// 生产构造层（`build_gateway_route`）把 `<= 0` 也归为未填
+    /// （与 `effective_upstream_timeout` 的 `Some(0)` 口径一致）。
+    pub timeout_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1143,6 +1150,11 @@ impl Store {
             "cost_reported",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        // DEBUG P1-4：分站超时列。老行留 NULL = **未填**（不回填任何数值：
+        // 回填一个猜出来的毫秒数会悄悄改全局超时的生效值；NULL 回退全局，
+        // 行为与修前逐字相同）。版本号不 bump：本列迁移是幂等的
+        // add_column_if_missing，与 delivery_mode 等列同口径。
+        add_column_if_missing(&conn, "sites", "timeout_ms", "INTEGER")?;
 
         // 版本号仍然只在升级时写，保留它作为「将来需要非幂等迁移」的锚点。
         if version < SCHEMA_VERSION {
@@ -1183,7 +1195,7 @@ impl Store {
     pub fn list_sites(&self) -> Result<Vec<SiteRow>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare("SELECT id, kind, base_url, display_name, health FROM sites ORDER BY id")
+            .prepare("SELECT id, kind, base_url, display_name, health, timeout_ms FROM sites ORDER BY id")
             .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
         let rows = stmt
             .query_map([], |row| {
@@ -1193,6 +1205,7 @@ impl Store {
                     base_url: row.get(2)?,
                     display_name: row.get(3)?,
                     health: row.get(4)?,
+                    timeout_ms: row.get(5)?,
                 })
             })
             .map_err(|e| Error::Store(format!("查询站点失败: {e}")))?;
@@ -1255,7 +1268,7 @@ impl Store {
     pub fn get_site(&self, id: i64) -> Result<Option<SiteRow>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare("SELECT id, kind, base_url, display_name, health FROM sites WHERE id = ?1")
+            .prepare("SELECT id, kind, base_url, display_name, health, timeout_ms FROM sites WHERE id = ?1")
             .map_err(|e| Error::Store(format!("准备查询失败: {e}")))?;
         let mut rows = stmt
             .query_map(params![id], |row| {
@@ -1265,6 +1278,7 @@ impl Store {
                     base_url: row.get(2)?,
                     display_name: row.get(3)?,
                     health: row.get(4)?,
+                    timeout_ms: row.get(5)?,
                 })
             })
             .map_err(|e| Error::Store(format!("查询站点失败: {e}")))?;
@@ -2092,6 +2106,26 @@ impl Store {
                 params![site_id, health],
             )
             .map_err(|e| Error::Store(format!("更新站点状态失败: {e}")))?;
+        if affected == 0 {
+            return Err(Error::Store(format!("站点不存在: {site_id}")));
+        }
+        Ok(())
+    }
+
+    /// DEBUG P1-4：写站点的分站超时（毫秒）。`None` = 清除（回退全局超时）；
+    /// `Some(0)` 也按未填处理（读侧/网关解析侧均视 0 为未填，见
+    /// `effective_upstream_timeout`）。站点不存在时与 `set_site_health` 同口径报错，
+    /// 不静默成功。本方法是将来站点编辑 IPC/DTO 的直接落点——本波次只接通
+    /// 存储 + 生产路由构造，IPC/DTO/UI 仍待后续（见 M46-S4 spec §4.4 的残留说明）。
+    pub fn set_site_timeout_ms(&self, site_id: i64, timeout_ms: Option<u64>) -> Result<()> {
+        let conn = self.lock()?;
+        let value: Option<i64> = timeout_ms.filter(|ms| *ms > 0).map(|ms| ms as i64);
+        let affected = conn
+            .execute(
+                "UPDATE sites SET timeout_ms = ?2 WHERE id = ?1",
+                params![site_id, value],
+            )
+            .map_err(|e| Error::Store(format!("更新站点超时失败: {e}")))?;
         if affected == 0 {
             return Err(Error::Store(format!("站点不存在: {site_id}")));
         }
