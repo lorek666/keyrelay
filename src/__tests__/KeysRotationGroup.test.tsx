@@ -252,3 +252,92 @@ describe("DEBUG-G6 P1-19 轮换停进程提示", () => {
     expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.stopCodex);
   });
 });
+
+describe("DEBUG 收尾 B-283 轮换侧与投递确认框同款披露", () => {
+  it("重注入清单含 Claude Desktop ⇒ 出现停 Claude Desktop 文案，不出现停 Codex 文案", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue({ ...plan(null), channels: ["claude-desktop"] });
+    renderKeys();
+    await openRotationDialog();
+    expect(screen.getByText(zhCN.keys.rotationDialog.stopClaudeDesktop)).toBeDefined();
+    expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.stopCodex);
+  });
+
+  it("重注入清单只有 CLI 通道 ⇒ 出现 CLI 不停进程警告，不出现两条停进程文案", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue({ ...plan(null), channels: ["claude-code-settings"] });
+    renderKeys();
+    await openRotationDialog();
+    expect(screen.getByText(zhCN.keys.rotationDialog.cliNotStopped)).toBeDefined();
+    expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.stopCodex);
+    expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.stopClaudeDesktop);
+  });
+
+  it("混合清单（Codex + CLI）⇒ 两句都出现", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue({
+      ...plan(null),
+      channels: ["codex-auth-json", "claude-code-settings"],
+    });
+    renderKeys();
+    await openRotationDialog();
+    expect(screen.getByText(zhCN.keys.rotationDialog.stopCodex)).toBeDefined();
+    expect(screen.getByText(zhCN.keys.rotationDialog.cliNotStopped)).toBeDefined();
+  });
+
+  it("混合清单（Codex + Claude Desktop，无 CLI）⇒ 两条停进程文案都出现，不出现 CLI 警告", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue({
+      ...plan(null),
+      channels: ["codex-config", "claude-desktop"],
+    });
+    renderKeys();
+    await openRotationDialog();
+    expect(screen.getByText(zhCN.keys.rotationDialog.stopCodex)).toBeDefined();
+    expect(screen.getByText(zhCN.keys.rotationDialog.stopClaudeDesktop)).toBeDefined();
+    expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.cliNotStopped);
+  });
+
+  it("清单为空（第②步是空操作）⇒ 三句全不出现", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue({ ...plan(null), channels: [] });
+    renderKeys();
+    await openRotationDialog();
+    expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.stopCodex);
+    expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.stopClaudeDesktop);
+    expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.cliNotStopped);
+  });
+
+  it("Cline 变体串不等于桌面 id ⇒ 落入 CLI 一侧，只出现 CLI 警告", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue({ ...plan(null), channels: ["cline (code-insiders)"] });
+    renderKeys();
+    await openRotationDialog();
+    expect(screen.getByText(zhCN.keys.rotationDialog.cliNotStopped)).toBeDefined();
+    expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.stopCodex);
+    expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.stopClaudeDesktop);
+  });
+
+  it("单 codex-config ⇒ 只出现停 Codex 文案", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue({ ...plan(null), channels: ["codex-config"] });
+    renderKeys();
+    await openRotationDialog();
+    expect(screen.getByText(zhCN.keys.rotationDialog.stopCodex)).toBeDefined();
+    expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.stopClaudeDesktop);
+    expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.cliNotStopped);
+  });
+
+  it("混合清单（Claude Desktop + CLI，无 Codex）⇒ 停 Claude Desktop + CLI 警告，不出现停 Codex", async () => {
+    vi.mocked(rotationDue).mockResolvedValue(DUE);
+    vi.mocked(rotationPlan).mockResolvedValue({
+      ...plan(null),
+      channels: ["claude-desktop", "claude-code-settings"],
+    });
+    renderKeys();
+    await openRotationDialog();
+    expect(screen.getByText(zhCN.keys.rotationDialog.stopClaudeDesktop)).toBeDefined();
+    expect(screen.getByText(zhCN.keys.rotationDialog.cliNotStopped)).toBeDefined();
+    expect(document.body.textContent).not.toContain(zhCN.keys.rotationDialog.stopCodex);
+  });
+});

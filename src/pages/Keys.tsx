@@ -762,6 +762,28 @@ export default function Keys() {
               </p>
             ) : null}
             {/*
+              DEBUG 收尾 B-283：轮换侧与投递确认框同款披露，缺的两面在此补齐。
+              轮换重注入走同一条写盘前停进程钩子（service.rs：Codex 两条 +
+              Claude Desktop），故 Claude Desktop 目标也要有停进程提示；其余
+              CLI 类通道后端不自动停（进程名无法可靠归属），故常驻 CLI 警告
+              （与投递确认框 cliNotStopped 同款逻辑：桌面两通道不重复出这句）。
+              门控按通道 id 判定（Cline 变体如 "cline (code-insiders)" 不等于
+              桌面 id，自然落入 CLI 一侧）。channels 为空 = 当前没有绑定、
+              第②步是空操作、不写盘，故三句全不出现。
+            */}
+            {rotating.channels.some((c) => c === "claude-desktop") ? (
+              <p className="warnline" role="alert">
+                <AlertTriangle size={14} aria-hidden /> {t("keys.rotationDialog.stopClaudeDesktop")}
+              </p>
+            ) : null}
+            {rotating.channels.some(
+              (c) => c !== "codex-auth-json" && c !== "codex-config" && c !== "claude-desktop",
+            ) ? (
+              <p className="warnline" role="alert">
+                <AlertTriangle size={14} aria-hidden /> {t("keys.rotationDialog.cliNotStopped")}
+              </p>
+            ) : null}
+            {/*
               M20-S1 / B-166：分组继承要说在**动手之前**。
 
               旧 key 绑过分组时，新 key 必须继续待在同一个分组里，否则第三步回收旧 key
