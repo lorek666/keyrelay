@@ -1,6 +1,6 @@
 # 天枢 Relay 用户手册
 
-> 适用版本：v0.2.0（下载见 [Releases](https://github.com/lorek666/keyrelay/releases/latest)）
+> 适用版本：v0.2.1（下载见 [Releases](https://github.com/lorek666/keyrelay/releases/latest)）
 >
 > 本手册讲“怎么用”。一句话了解产品请看 [README.md](README.md)。
 

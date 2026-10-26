@@ -5,7 +5,7 @@
 你手里有两三个中转站账号，本机又装了好几个 AI 编程 agent——每次换站、换 key 都要逐个改配置文件，改错一个就是静默 401，额度用完才发现没钱。天枢 Relay 就是把这套手工活收进一个桌面 App：站点侧取 key、管 key、看余额，agent 侧一键注入、随时回滚。
 
 - **下载最新版**：[Releases](https://github.com/lorek666/keyrelay/releases/latest)（macOS universal dmg / Windows x64-setup.exe）
-- **当前版本**：v0.2.0
+- **当前版本**：v0.2.1
 - **适用人群**：手里 2–6 个中转站账号、本机 3–8 个 agent 的重度 AI 编码用户；以及给团队成员发 key 的自建站站长。
 
 ## 它解决什么
