@@ -85,6 +85,9 @@ jobs:
       # Universal Binary：Tauri 的 universal-apple-darwin target 内部用 lipo 合并双架构。
       # 脚本断言产物 ≤30MB（PRD §5），>30MB 退出 1 → job 红。
       - run: bash scripts/build-universal.sh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - uses: actions/upload-artifact@v4
         with:

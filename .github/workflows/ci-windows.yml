@@ -59,6 +59,9 @@ jobs:
 
       # NSIS 打包（B-56）
       - run: pnpm tauri build --target x86_64-pc-windows-msvc
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       # 条件签名（B-55）：secrets 未配置时跳过，不阻塞
       - name: sign-nsis
