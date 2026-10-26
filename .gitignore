@@ -30,3 +30,14 @@ src-tauri/gen/schemas/
 
 # 编排工具（OMC）的本地状态：与产品无关，且会随会话变化（M7 收口时出现）
 .omc/
+
+# 密钥与证书（绝不进仓库）
+*.pem
+*.key
+id_rsa*
+credentials*
+*.p12
+*.pfx
+
+# 文档已全部移至内部文档库（keyrelay-docs 私有库），公开库不留 docs/
+docs/

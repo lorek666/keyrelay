@@ -2,7 +2,7 @@ name: ci-windows
 
 # M14-S5：Windows 运行级对等 CI。本机（macOS）跑不了，本 workflow 在 windows-latest 上
 # 首次给「Windows 编译 / 测试 / 打包 / 签名」一条可执行路径。对应 BACKLOG B-56 / B-66。
-# 语法校验见 docs/evidence/m14s5-windows-ci.md。
+# 语法校验见内部文档库 docs/evidence/m14s5-windows-ci.md。
 
 on:
   push:
@@ -59,6 +59,9 @@ jobs:
 
       # NSIS 打包（B-56）
       - run: pnpm tauri build --target x86_64-pc-windows-msvc
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       # 条件签名（B-55）：secrets 未配置时跳过，不阻塞
       - name: sign-nsis

@@ -14,8 +14,10 @@ name: release
 # 发版规矩：
 #   - 标签只从 CI 全绿的 main 上切；发版前先把 tauri.conf.json 的 version
 #     升到与标签一致的版本（manifest 里的版本号取自应用配置，不是标签名）。
-#   - 首个 Release 务必核对 latest.json 的平台键：macOS 走 universal 产物，
-#     须确认 updater 能认到对应平台条目，否则再拆双架构构建。
+#   - macOS 走分架构产物（2026-10-26 起替代 universal）：aarch64 与 x86_64
+#     各自出 dmg + app.tar.gz + sig；下个 Release 务必核对 latest.json 里
+#     darwin-aarch64 与 darwin-x86_64 两条目齐全且签名非空（tauri-action
+#     生成 latest.json 时会合并已有的平台条目）。
 # 注意（私钥丢失时的先有鸡后有蛋）：
 #   已装机的旧客户端只认旧 pubkey；换新密钥对后，旧客户端收不到新版提示，
 #   须靠一次手动安装（去 Release 页下载）才能让新 pubkey 生效。
@@ -59,6 +61,8 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # 分架构（2026-10-26 起替代 universal）：两步顺序跑，避免并行写 latest.json 竞态；
+      # 第二步生成 latest.json 时会合并已有的平台条目，故最终 JSON 含双架构。
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -69,7 +73,26 @@ jobs:
           releaseName: "天枢 Relay ${{ github.event.inputs.tag || github.ref_name }}"
           releaseDraft: false
           prerelease: false
-          args: --target universal-apple-darwin
+          # updater JSON（latest.json）显式开启（v0 默认已是 true，留作明确意图）。
+          includeUpdaterJson: true
+          # 产品名含中文时 action 的新旧名字对不上（上传存的名字丢了中文前缀、JSON 侧按原名查），
+          # 导致签名永远匹配不到、latest.json 被跳过；用纯 ASCII 固定模式统一两边名字。
+          assetNamePattern: 'Relay_[version]_[arch][setup][ext]'
+          args: --target aarch64-apple-darwin
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: "天枢 Relay ${{ github.event.inputs.tag || github.ref_name }}"
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          assetNamePattern: 'Relay_[version]_[arch][setup][ext]'
+          args: --target x86_64-apple-darwin
 
   release-windows:
     runs-on: windows-latest
@@ -106,4 +129,9 @@ jobs:
           releaseName: "天枢 Relay ${{ github.event.inputs.tag || github.ref_name }}"
           releaseDraft: false
           prerelease: false
+          # updater JSON（latest.json）显式开启（v0 默认已是 true，留作明确意图）。
+          includeUpdaterJson: true
+          # 产品名含中文时 action 的新旧名字对不上（上传存的名字丢了中文前缀、JSON 侧按原名查），
+          # 导致签名永远匹配不到、latest.json 被跳过；用纯 ASCII 固定模式统一两边名字。
+          assetNamePattern: 'Relay_[version]_[arch][setup][ext]'
           args: --target x86_64-pc-windows-msvc

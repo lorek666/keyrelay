@@ -10,7 +10,7 @@
 //   2  环境不具备（非交互 tty / 无 tauri-driver / 无 GUI）——≠失败
 //   3  脚本自身错误（参数非法 / --check 自检失败 / 未捕获异常）
 //
-// 见 docs/specs/M14-S6-GUI走查.md。
+// 见 内部文档库 docs/specs/M14-S6-GUI-walkthrough.md。
 
 import { writeFileSync } from "node:fs";
 import { runWalkthrough, checkSelf } from "./gui-walkthrough-lib.mjs";
