@@ -12,7 +12,7 @@
  *   2. 该段里出现三个键：`复审者` / `是否参与本步实现` / `门禁数字来源`；
  *   3. `是否参与本步实现` 的值必须含「否」——写「是」等于自认不独立，直接红。
  *
- * **纳入范围**：波次号 ≥ 24 的 `*-复审.md`（M24 起）。
+ * **纳入范围**：波次号 ≥ 24 的 `*-review.md`（M24 起）。
  * 历史（M0–M23）的复审记录**不纳入**，原因是它们写在新模板之前、且当年的事实多数已查不到；
  * 为了不制造「填空式回填」，这里按**波次号**豁免而不是维护一张会腐烂的白名单。
  * 豁免不是静默的：运行时逐条列出文件名（B-182：任何排除都必须可点名）。
@@ -27,8 +27,8 @@ import { join } from "node:path";
 /** 从 M24 起要求独立性声明。 */
 const FIRST_GUARDED_WAVE = 24;
 const REVIEWS_DIR = "docs/reviews";
-/** 只断言「复审记录」本体；`-复审闭环.md` 是复审者的追加说明，不重复要求 §0。 */
-const REVIEW_FILE = /^(M(\d+)-S\d+[ab]?.*)-复审\.md$/;
+/** 只断言「复审记录」本体；`-review-closure.md` 是复审者的追加说明，不重复要求 §0。 */
+const REVIEW_FILE = /^(M(\d+)-S\d+[ab]?.*)-review\.md$/;
 // 三键是「独立性」的最小集；④（复审期作者只读）是 §6.2 的**唯一书面承载物**，
 // 不守护它 ⇒ 一份记录可以声称「作者只读：是」也可以漏写，守护都绿 ⇒ §6.2 形同虚设。
 // 所以这里把 ④ 也纳入；它的值必须含「是」或「否」（写「是」不红——只读是合规的，
@@ -70,7 +70,7 @@ function main() {
 
   if (reviewFiles.length === 0) {
     // 解析器坏了（或目录换了）时**不许静默通过** —— 恒绿的守护等于没有守护。
-    fail(`${REVIEWS_DIR} 里一份 *-复审.md 都没解析到：守护不可能在「零输入」下成立。`);
+    fail(`${REVIEWS_DIR} 里一份 *-review.md 都没解析到：守护不可能在「零输入」下成立。`);
     return 1;
   }
 
@@ -83,7 +83,7 @@ function main() {
   }
 
   console.log(
-    `=== 复审独立性守护（M${FIRST_GUARDED_WAVE} 起）=== 解析到 ${reviewFiles.length} 份 *-复审.md`,
+    `=== 复审独立性守护（M${FIRST_GUARDED_WAVE} 起）=== 解析到 ${reviewFiles.length} 份 *-review.md`,
   );
   console.log(`  纳入断言 ${guarded.length} 份；豁免 ${legacy.length} 份（M0–M${FIRST_GUARDED_WAVE - 1}）`);
 

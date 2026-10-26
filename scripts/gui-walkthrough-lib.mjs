@@ -3,7 +3,7 @@
 // 本机非交互 tty / 无 tauri-driver / 无 GUI → checkEnvironment skip → exitCode 2（环境不具备，≠失败）。
 // --check 模式只验脚本自身，不起 driver、不开窗口。
 // 红线：报告不含 cookie 字节/密钥/PAT（captcha evidence 只记 cookie count，不记内容）。
-// 见 内部文档库 docs/specs/M14-S6-GUI走查.md。
+// 见 内部文档库 docs/specs/M14-S6-GUI-walkthrough.md。
 
 import { execFileSync } from "node:child_process";
 

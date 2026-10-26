@@ -5,7 +5,7 @@
 // 为什么不是 tauri-driver：tauri-driver 官方不支持 macOS（WKWebView 没有 WebDriver 后端），
 // 本机也从未安装。
 //
-// **AppleScript 能证到什么、证不到什么**（详见 内部文档库 docs/specs/M16-S7-GUI真机走查.md）：
+// **AppleScript 能证到什么、证不到什么**（详见 内部文档库 docs/specs/M16-S7-GUI-real-device-walkthrough.md）：
 //   能证：窗口存在 / 标题 / 尺寸 / 进程存活
 //   证不到：WebView 内部的 JS 状态、invoke 往返的字节、DOM 结构
 // 并且本机**采不到该窗口的像素**（窗口存在 ≠ 能采到它的像素）——见 spec §4 的坑清单。
