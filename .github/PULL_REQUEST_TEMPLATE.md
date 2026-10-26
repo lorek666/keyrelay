@@ -15,5 +15,5 @@
 
 - [ ] CI 两门禁通过（`gate-macos`、`gate-windows`）
 - [ ] 没有提交真实密钥、token、证书或账号信息；日志与截图已脱敏
-- [ ] 按 `docs/PROCESS.md` 同步了 spec / 复审记录（如适用）
+- [ ] 按 spec 先行流程同步了 spec / 复审记录（如适用）
 - [ ] 用户可见行为变化已同步文档

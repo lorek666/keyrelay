@@ -96,7 +96,7 @@
 | OpenCode | `.json` 与 `.jsonc` 是两个落点，预览里自选其一，产品不猜优先级 |
 | Gemini CLI、Grok、OpenClaw、Hermes、MCode、Pi | |
 | Cursor、Cline、Qwen Code、DeepSeek、Trae、MiMoCode、DeepSeek Harness | |
-| Cline 桌面版 | ⚠️ 暂不支持文件直写，请走 `cline auth` CLI（见 `docs/ADR/0006` 相关说明） |
+| Cline 桌面版 | ⚠️ 暂不支持文件直写，请走 `cline auth` CLI |
 
 每个 agent 的生效策略不同（有的新会话即生效，有的需重启），注入前界面会标注。
 
@@ -113,7 +113,7 @@
 
 ## 安全模型
 
-- **密钥只进本地加密保险库**：`vault.db` 存 AES-256-GCM 密文，`vault.key` 存设备绑定的数据密钥；元数据库只存引用，`Store::insert_key` 会拒绝明文。威胁模型与残余风险见 `docs/ADR/0003-本地加密保险库.md`。
+- **密钥只进本地加密保险库**：`vault.db` 存 AES-256-GCM 密文，`vault.key` 存设备绑定的数据密钥；元数据库只存引用，`Store::insert_key` 会拒绝明文。
 - **日志零明文**：任何日志、通知、错误信息先过脱敏（`sk-…`、`nap-…`、PAT、`Authorization` 头一律打码），脱敏在写日志前完成。
 - **写操作可审计、可回滚**：原子写（临时文件 + rename）+ 写前备份 + 变更 journal；回滚后文件与注入前字节一致。
 - **受管字段隔离**：只改受管字段；配置文件里的其他内容、格式与注释原样保留；重名冲突先报冲突让用户确认。
@@ -191,20 +191,16 @@ crates/tianshu-relay-cli/      # 命令行（冒烟 / 迁移等运维入口）
 src-tauri/                # Tauri 2 桌面壳：命令与平台胶水
 src/                      # React 18 + Vite 前端
 scripts/                  # 门禁与守护脚本（gate / check-*）
-docs/PROCESS.md           # 工程流程（先写 spec，再实现，再独立复审）
-docs/ADR/                 # 架构决策
-docs/updater-setup.md     # 自动更新配置指南
+USER-MANUAL.md            # 用户使用手册
 ```
 
 ### 贡献流程
 
-工程流程见 `docs/PROCESS.md`：**每一步先写 spec，再实现，再独立复审**。PR 前请读 [CONTRIBUTING.md](CONTRIBUTING.md)，并确认 CI 两门禁（`gate-macos`、`gate-windows`）通过。
+工程流程：**每一步先写 spec，再实现，再独立复审**。PR 前请读 [CONTRIBUTING.md](CONTRIBUTING.md)，并确认 CI 两门禁（`gate-macos`、`gate-windows`）通过。
 
 ## 相关文档
 
-- 产品需求：[PRD-天枢Relay.md](PRD-天枢Relay.md)
-- 工程流程：[docs/PROCESS.md](docs/PROCESS.md)
-- 架构决策：[docs/ADR/](docs/ADR/)
+- 用户手册：[USER-MANUAL.md](USER-MANUAL.md)
 - 安全政策：[SECURITY.md](SECURITY.md)
 - 行为准则：[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 
