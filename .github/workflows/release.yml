@@ -69,6 +69,9 @@ jobs:
           releaseName: "天枢 Relay ${{ github.event.inputs.tag || github.ref_name }}"
           releaseDraft: false
           prerelease: false
+          # 必须显式开启：updater JSON（latest.json）默认不生成不上传
+          #（缺了它客户端更新端点 404，v0.2.0 首发即因此缺 latest.json）。
+          includeUpdaterJson: true
           args: --target universal-apple-darwin
 
   release-windows:
@@ -106,4 +109,7 @@ jobs:
           releaseName: "天枢 Relay ${{ github.event.inputs.tag || github.ref_name }}"
           releaseDraft: false
           prerelease: false
+          # 必须显式开启：updater JSON（latest.json）默认不生成不上传
+          #（缺了它客户端更新端点 404，v0.2.0 首发即因此缺 latest.json）。
+          includeUpdaterJson: true
           args: --target x86_64-pc-windows-msvc
