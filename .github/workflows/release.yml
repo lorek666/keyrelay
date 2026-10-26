@@ -69,9 +69,11 @@ jobs:
           releaseName: "天枢 Relay ${{ github.event.inputs.tag || github.ref_name }}"
           releaseDraft: false
           prerelease: false
-          # 必须显式开启：updater JSON（latest.json）默认不生成不上传
-          #（缺了它客户端更新端点 404，v0.2.0 首发即因此缺 latest.json）。
+          # updater JSON（latest.json）显式开启（v0 默认已是 true，留作明确意图）。
           includeUpdaterJson: true
+          # 产品名含中文时 action 的新旧名字对不上（上传存的名字丢了中文前缀、JSON 侧按原名查），
+          # 导致签名永远匹配不到、latest.json 被跳过；用纯 ASCII 固定模式统一两边名字。
+          assetNamePattern: 'Relay_[version]_[arch][setup][ext]'
           args: --target universal-apple-darwin
 
   release-windows:
@@ -109,7 +111,9 @@ jobs:
           releaseName: "天枢 Relay ${{ github.event.inputs.tag || github.ref_name }}"
           releaseDraft: false
           prerelease: false
-          # 必须显式开启：updater JSON（latest.json）默认不生成不上传
-          #（缺了它客户端更新端点 404，v0.2.0 首发即因此缺 latest.json）。
+          # updater JSON（latest.json）显式开启（v0 默认已是 true，留作明确意图）。
           includeUpdaterJson: true
+          # 产品名含中文时 action 的新旧名字对不上（上传存的名字丢了中文前缀、JSON 侧按原名查），
+          # 导致签名永远匹配不到、latest.json 被跳过；用纯 ASCII 固定模式统一两边名字。
+          assetNamePattern: 'Relay_[version]_[arch][setup][ext]'
           args: --target x86_64-pc-windows-msvc
