@@ -1,7 +1,8 @@
 name: ci-macos
 
-# M14-S5：macOS 六门禁 CI + Universal Binary 构建占位。
-# build-universal job 产出 aarch64+x86_64 合并的 .app/.dmg 并断言 ≤30MB（PRD §5）。
+# M14-S5：macOS 六门禁 CI + 分架构构建。
+# build-macos job（矩阵：aarch64/x86_64）每架构单独出 .app/.dmg 并各自断言 ≤30MB（PRD §5）；
+# 2026-10-26 起替代 Universal（通用包 50 MiB 天生超标）。
 
 on:
   push:
@@ -56,10 +57,14 @@ jobs:
       # 红了也看不出是哪一条守护。本地 `pnpm test` 已含它，这一步是冗余的保险。
       - run: node scripts/check-charter-steps.mjs
 
-  build-universal:
+  # 分架构 macOS 构建：每架构单独出 .app/.dmg，各自断言 ≤30MB（PRD §5）。
+  build-macos:
     needs: gate-macos
     runs-on: macos-latest
     timeout-minutes: 60
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
     steps:
       - uses: actions/checkout@v4
 
@@ -74,25 +79,27 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: macos-universal-${{ hashFiles('Cargo.lock') }}
+          key: macos-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
 
       - run: pnpm install --frozen-lockfile
 
-      # Universal Binary：Tauri 的 universal-apple-darwin target 内部用 lipo 合并双架构。
-      # 脚本断言产物 ≤30MB（PRD §5），>30MB 退出 1 → job 红。
-      - run: bash scripts/build-universal.sh
+      # 分架构构建 + 体积断言（脚本内含 ≤30MB 检查，>30MB 退出 1 → job 红）。
+      # 签名密钥沿用 5e1a986f 的做法：updater 公钥已配置时 tauri build 缺私钥会失败。
+      - run: bash scripts/build-macos.sh ${{ matrix.target }}
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tianshu-relay-macos-universal
+          name: tianshu-relay-macos-${{ matrix.target }}
           path: |
-            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
-            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            target/${{ matrix.target }}/release/bundle/macos/*.app
+            target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
           if-no-files-found: warn

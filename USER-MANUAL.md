@@ -20,7 +20,7 @@
 
 从 [Releases](https://github.com/lorek666/keyrelay/releases/latest) 下载最新版：
 
-- **macOS**：universal dmg（arm64 + x86_64），要求 macOS 12+
+- **macOS**：按芯片下载对应 dmg（Apple Silicon：`*_aarch64.dmg`；Intel：`*_x64.dmg`），要求 macOS 12+
 - **Windows**：x64-setup.exe，要求 Windows 10/11
 
 装好后打开即用，不需要注册账号、不需要服务端：所有数据默认只在本机。后续更新由应用内更新通道推送，设置里可开关自动更新；界面语言可在设置中切换中文 / English。
