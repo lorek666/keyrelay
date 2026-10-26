@@ -21,7 +21,7 @@
  * 退出码：0 = 全部合规；1 = 有缺失 / 自认不独立 / 解析到 0 份（解析器坏了不许静默通过）；2 = 脚本自身错误。
  */
 
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** 从 M24 起要求独立性声明。 */
@@ -54,6 +54,11 @@ function sectionZero(text) {
 }
 
 function main() {
+  // 公开库布局：docs/ 已移至内部文档库，reviews 与 specs 都不存在 ⇒ 跳过（缺一半时仍报错，见下）。
+  if (!existsSync(REVIEWS_DIR) && !existsSync("docs/specs")) {
+    console.log("跳过复审独立性守护：本仓库无 docs/reviews（流程文档在内部文档库）。");
+    return 0;
+  }
   let entries;
   try {
     entries = readdirSync(REVIEWS_DIR, { withFileTypes: true });

@@ -39,7 +39,7 @@
  *         2 = 脚本自身错误（目录缺失 / 找不到章程 / 解析出 0 个 step）。
  */
 
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -90,6 +90,12 @@ function charterMilestone(fileName) {
 }
 
 // ---------------------------------------------------------------- 1. 读目录与定位章程
+
+// 公开库布局：docs/ 已移至内部文档库，specs 与 reviews 都不存在 ⇒ 跳过（与 pre-commit 的跳过逻辑一致；缺一半时仍报错，见下）。
+if (!existsSync(SPECS_DIR) && !existsSync(REVIEWS_DIR)) {
+  console.log("跳过章程守护：本仓库无 docs/specs 与 docs/reviews（流程文档在内部文档库）。");
+  process.exit(0);
+}
 
 let specFiles;
 let reviewFiles;
