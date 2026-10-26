@@ -38,3 +38,11 @@ id_rsa*
 credentials*
 *.p12
 *.pfx
+
+# 过程留档已移至内部文档库（keyrelay-docs 私有库），勿提交到公开库
+docs/specs/
+docs/reviews/
+docs/evidence/
+docs/BACKLOG.md
+docs/DEBUG-*.md
+docs/*收口*.md

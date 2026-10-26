@@ -191,11 +191,9 @@ crates/tianshu-relay-cli/      # 命令行（冒烟 / 迁移等运维入口）
 src-tauri/                # Tauri 2 桌面壳：命令与平台胶水
 src/                      # React 18 + Vite 前端
 scripts/                  # 门禁与守护脚本（gate / check-*）
-docs/specs/               # 每步 spec（先写）
-docs/reviews/             # 每步复审记录（后写）
-docs/evidence/            # 每步门禁与验证证据
+docs/PROCESS.md           # 工程流程（先写 spec，再实现，再独立复审）
 docs/ADR/                 # 架构决策
-docs/BACKLOG.md           # 范围外问题登记
+docs/updater-setup.md     # 自动更新配置指南
 ```
 
 ### 贡献流程
@@ -207,7 +205,6 @@ docs/BACKLOG.md           # 范围外问题登记
 - 产品需求：[PRD-天枢Relay.md](PRD-天枢Relay.md)
 - 工程流程：[docs/PROCESS.md](docs/PROCESS.md)
 - 架构决策：[docs/ADR/](docs/ADR/)
-- 范围外问题登记：[docs/BACKLOG.md](docs/BACKLOG.md)
 - 安全政策：[SECURITY.md](SECURITY.md)
 - 行为准则：[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 

@@ -19,7 +19,7 @@ cargo fmt --check
 ## PR 检查清单
 
 - [ ] CI 两门禁通过（`gate-macos`、`gate-windows`，分支保护强制要求）
-- [ ] 有 spec 或复审记录的改动已同步到 `docs/specs/` / `docs/reviews/`（按 `docs/PROCESS.md`）
+- [ ] 有 spec 或复审记录的改动已按 `docs/PROCESS.md` 同步留存（内部文档库）
 - [ ] **没有提交任何真实密钥、token、证书或账号信息**；日志、截图、测试固件先脱敏
 - [ ] 改动了用户可见行为的，同步更新了 README 或相关文档
 
