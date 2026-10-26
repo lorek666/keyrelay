@@ -54,3 +54,20 @@ cargo check -p tianshu-relay        # 桌面壳类型检查（需先 pnpm build 
 2. 任何日志/通知/错误信息先过 `tianshu_relay_core::redact::scrub`。
 3. 受管配置文件里只出现 base_url / provider / env 变量名；写密钥进 agent 配置必须先有用户显式同意。
 4. 配置写入必须原子、先备份、可字节级回滚；外部改动时拒绝覆盖。
+
+## 安装
+
+从 [Releases](https://github.com/lorek666/keyrelay/releases/latest) 下载最新版：
+
+- macOS：universal dmg（arm64 + x86_64）
+- Windows：x64-setup.exe
+
+装好后打开即用；后续更新由应用内更新通道推送。
+
+## 贡献
+
+见 [CONTRIBUTING.md](CONTRIBUTING.md)。改动流程遵循 `docs/PROCESS.md`（先写 spec，再实现，再独立复审）。
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。
