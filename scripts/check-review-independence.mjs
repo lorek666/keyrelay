@@ -3,7 +3,7 @@
  * 复审记录的**独立性声明**守护（M24-S3 / B-181③④）。
  *
  * 为什么需要它：B-181 的 ③（门禁取数与复审解耦）与 ④（复审期作者只读）此前只是
- * `docs/PROCESS.md` 里的散文 + 聊天里的约定。散文没有承载物：一份复审记录里
+ * `内部文档库 docs/PROCESS.md` 里的散文 + 聊天里的约定。散文没有承载物：一份复审记录里
  * **看不出**「复审者是谁、跑没跑门禁、作者当时能不能写文件」——
  * 于是「复审发生了」与「复审被跳过了」在文件层面**不可区分**（B-182 的教训）。
  *
@@ -136,7 +136,7 @@ function main() {
     fail(`复审独立性声明不合规（${problems.length} 份）：`);
     for (const problem of problems) console.error(`    - ${problem}`);
     console.error("");
-    console.error("模板见 docs/specs/REVIEW-TEMPLATE.md §2；约束见 docs/PROCESS.md §6。");
+    console.error("模板见 内部文档库 docs/specs/REVIEW-TEMPLATE.md §2；约束见 内部文档库 docs/PROCESS.md §6。");
     return 1;
   }
 

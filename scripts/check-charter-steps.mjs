@@ -4,7 +4,7 @@
  *
  * 背景：`M16-S0` 章程 §1.1 把 B-125 指派给 **M16-S8**，而 S8 是唯一没落 spec 的步骤；
  * 波次收口时也没人对着「章程列了 S1…S8」逐个数。结果代码在 `919d3b9` 就交付了（含守护脚本），
- * `docs/specs/M16-S8-*` 与 `docs/reviews/M16-S8-*` 直到 2026-10-18 才补（spec 明确标为
+ * `内部文档库 docs/specs/M16-S8-*` 与 `内部文档库 docs/reviews/M16-S8-*` 直到 2026-10-18 才补（spec 明确标为
  * 「追认定稿」）。本脚本把这条收口检查固化成守护：**章程点名的每个本波 step，都必须同时有
  * spec 与复审两份文件**。
  *
@@ -97,13 +97,13 @@ try {
   specFiles = listMarkdown(SPECS_DIR);
   reviewFiles = listMarkdown(REVIEWS_DIR);
 } catch (e) {
-  die(`读不到 docs/specs 或 docs/reviews（${e.message}）——需要在仓库根跑本脚本`);
+  die(`读不到 docs/specs 或 docs/reviews（本仓库已无 docs/，流程文档在内部文档库）（${e.message}）——需要在仓库根跑本脚本`);
 }
 
 /**
  * 章程 = `docs/specs/` 下**文件名含「章程」**的 `.md`。
  *
- * 为什么不 grep 全仓：`docs/**` 里有几百处「章程」二字，绝大多数是别的文件**引用**章程
+ * 为什么不 grep 全仓：`内部文档库 docs/**` 里有几百处「章程」二字，绝大多数是别的文件**引用**章程
  * （spec 的「上游」行、复审记录的「章程依据」）。把引用方也当章程，等于把实现记录当章程，
  * 断言面会被稀释到没有意义。文件名含「章程」是本仓库既有的命名事实（M5-S0 / M6-S0 /
  * M7-S0 / M8-S0 / M9-S7 / M16-S0 六份）。
@@ -136,9 +136,9 @@ const nonAssignment = [];
  * 1. `转出给别的波次` —— 「留待 **M5-S7（下一波）**」「后续 M9-S8 / M9-S9 波次」
  *    （把工作推给将来，那一步的产物归将来的波次负责）。
  * 2. `引用别处的现成产物` —— M6-S0 章程 §3 写「M6-S7 审计 | `channel-forge` |
- *    `docs/reviews/M6-S7-PRD覆盖度审计.md`」，产物路径已经直接给出，且不是 `<step>-复审` 前缀。
+ *    `内部文档库 docs/reviews/M6-S7-PRD覆盖度审计.md`」，产物路径已经直接给出，且不是 `<step>-复审` 前缀。
  * 3. `指认一次已完成的实测轮次` —— M9-S7 章程 §4 写「（M9-S6 §7）」，指的是
- *    `docs/evidence/m9s6-real-site-response-shapes.md`（一份既有的探测记录，不是新的 step 包）。
+ *    `内部文档库 docs/evidence/m9s6-real-site-response-shapes.md`（一份既有的探测记录，不是新的 step 包）。
  *
  * **为什么豁免而不是报红**：B-169 的诉求是「章程列出的 step 必须有 spec+复审」，
  * 这三类都是**章程自己说清了这一步不由本波次出产物**——照报红就是假红，
@@ -154,7 +154,7 @@ const WAIVER_PATTERNS = [
   /后续\s*M\d+-S\d+/,
   /下一波/,
   /按严重度分批/,
-  // ②③ 引用了现成产物路径（docs/reviews|specs|evidence/<lowercase-token>.md）
+  // ②③ 引用了现成产物路径（内部文档库 docs/reviews|specs|evidence/<lowercase-token>.md）
   // **`-` 必须在字符类外写成字面量**：`M\d+[Ss]\d+` 漏了连字符，实测对 `M6-S7` 恒 false
   // （`/[Mm]\d+[Ss]\d+/.test("M6-S7")` → false），整条豁免会静默失效。
   /docs\/(reviews|specs|evidence)\/[Mm]\d+-[Ss]\d+/,
@@ -170,8 +170,8 @@ const WAIVER_PATTERNS = [
  *
  * 1. **变更记录表**（`| v1.5 | 2026-10-12 | …M6-S7… |`）：记录的是「哪一版章程改了什么」，
  *    里面的 token 是**被提及的既存 step**，不是本波派的工。M6-S7 由此假红
- *    （它的产物 `docs/reviews/M6-S7-PRD覆盖度审计.md` 就在，只是名字不叫 `-复审`）。
- * 2. **散文提及**（「见 M9-S6 §7」「`docs/M8-收口记录.md:6`」）：上下文引用。
+ *    （它的产物 `内部文档库 docs/reviews/M6-S7-PRD覆盖度审计.md` 就在，只是名字不叫 `-复审`）。
+ * 2. **散文提及**（「见 M9-S6 §7」「`内部文档库 docs/M8-收口记录.md:6`」）：上下文引用。
  * 3. **写域表 / 冻结接口表 / 裁决表**（`| \`routing.rs\` | **M8-S1** | … |`、
  *    `| 1 | DEBUG §2.1 | … | M8-S1 | … |`）：它们确实与派工有关，但同一 step 的派工
  *    在派工表（首格是 step token、或含「收了/转」的行）里已经断言过，不重复断言。
@@ -220,7 +220,7 @@ function isAssignmentRow(raw, token) {
 
 /**
  * 章程**自身**不需要 spec 之外的复审文件：`M5-S0-加固波次章程.md` 这类文件名本身就是
- * `docs/specs/<step>-*.md`，它既是章程也是该 step 的 spec；而「复审本章程」没有意义
+ * `内部文档库 docs/specs/<step>-*.md`，它既是章程也是该 step 的 spec；而「复审本章程」没有意义
  * （M5-S0 / M6-S0 / M7-S0 / M8-S0 / M9-S7 五份都如此）。
  *
  * 判据在下面的主循环里：**章程文件名自己的 token** 出现在该文件的第 1 行（标题行）。
@@ -336,11 +336,11 @@ const specOf = indexByStep(specFiles);
 const reviewOf = indexByStep(reviewFiles);
 
 /**
- * `docs/specs/<step>-*.md` 里**内嵌独立复审记录**的 step。
+ * `内部文档库 docs/specs/<step>-*.md` 里**内嵌独立复审记录**的 step。
  *
  * 为什么要有这一层：M8 波次的约定是「复审记录在各包 spec 的『独立复审记录』节」
- * （`docs/M8-收口记录.md:6`），M8-S5B / M8-S6 / M8-S7 三份 spec 确实各有一节
- * `## N. 独立复审记录（<复审者名>，<日期>）`。只认 `docs/reviews/<step>-*` 就会把这三份
+ * （`内部文档库 docs/M8-收口记录.md:6`），M8-S5B / M8-S6 / M8-S7 三份 spec 确实各有一节
+ * `## N. 独立复审记录（<复审者名>，<日期>）`。只认 `内部文档库 docs/reviews/<step>-*` 就会把这三份
  * 判成「缺复审」——**假红**。
  *
  * 判据（保守）：spec 正文里出现形如
@@ -438,10 +438,10 @@ if (missingSpec.length === 0 && missingReview.length === 0) {
     "\n章程 step 产物齐全性检查未通过。",
   );
   console.error(
-    "处置：缺 spec ⇒ 该 step 按 docs/PROCESS.md §2 补 spec（先写）再动代码；",
+    "处置：缺 spec ⇒ 该 step 按 内部文档库 docs/PROCESS.md §2 补 spec（先写）再动代码；",
   );
   console.error(
-    "　　　缺复审 ⇒ 由未参与实现的复审者补 docs/reviews/<step>-复审.md。",
+    "　　　缺复审 ⇒ 由未参与实现的复审者补 内部文档库 docs/reviews/<step>-复审.md。",
   );
   console.error(
     "　　　若某一条是**章程自述不需要产物**（如「留待下一波」），改章程的措辞或销账，",

@@ -13,7 +13,7 @@
 #   4  脚本自身错误（找不到 installer）
 #
 # 本脚本不本机真签（本机是 macOS，无 Windows 证书）；真签在 ci-windows.yml 的 sign-nsis
-# step 上跑（secrets.SIGNING_CERT 配置后）。见 docs/specs/M14-S5-Windows-CI.md §4.3。
+# step 上跑（secrets.SIGNING_CERT 配置后）。见 内部文档库 docs/specs/M14-S5-Windows-CI.md §4.3。
 
 param(
     [string]$Installer = ""

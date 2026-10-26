@@ -14,7 +14,7 @@
  * 既避开了陈旧产物，也让「这次的门禁数字」与「上次」互不污染。
  *
  * **它不做入库**：所有 merge 都发生在临时 worktree 的 **detached HEAD** 上，
- * 不移动任何分支、不碰 `main`。合并入库由 Lead 决定（见 docs/specs/M16-S9-集成与门禁环境.md）。
+ * 不移动任何分支、不碰 `main`。合并入库由 Lead 决定（见 内部文档库 docs/specs/M16-S9-集成与门禁环境.md）。
  *
  * 退出码：0 = 全部 merge 成功且五门禁全绿；1 = 用法/环境错误；2 = merge 冲突；
  *         3 = 有门禁红了（打印汇总表后退出）；4 = **共享 node_modules 被污染**。
@@ -22,7 +22,7 @@
  * 依赖：node（无第三方依赖）。**前端门禁不调用 `pnpm` 本体**——临时 worktree 的
  * `node_modules` 是软链，pnpm 的依赖检查会把临时目录当成项目根、**改写主工作区
  * `node_modules` 的顶层链接**，而那些链接随后指向被清理的临时目录 ⇒ 全队前端工具链全断
- * （M16-S9 真实事故，见 docs/evidence/m16s9-integration-gate.md §7）。所以这里直接调
+ * （M16-S9 真实事故，见 内部文档库 docs/evidence/m16s9-integration-gate.md §7）。所以这里直接调
  * `node_modules/.bin/*`，并在跑前/跑后各做一次「共享 node_modules 是否被改动」的自检。
  */
 

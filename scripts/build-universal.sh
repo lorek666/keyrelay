@@ -12,7 +12,7 @@
 #
 # 用 Tauri 的 universal-apple-darwin target（内部 lipo 合并 aarch64 + x86_64），
 # 等价于 spec §4.3 的「分别 build + lipo」，但更可靠（不手工替换 .app 内的二进制）。
-# 见 docs/specs/M14-S5-Windows-CI.md §4.3。
+# 见 内部文档库 docs/specs/M14-S5-Windows-CI.md §4.3。
 
 set -euo pipefail
 

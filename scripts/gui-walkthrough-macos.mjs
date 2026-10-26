@@ -5,7 +5,7 @@
 // 为什么不是 tauri-driver：tauri-driver 官方不支持 macOS（WKWebView 没有 WebDriver 后端），
 // 本机也从未安装。
 //
-// **AppleScript 能证到什么、证不到什么**（详见 docs/specs/M16-S7-GUI真机走查.md）：
+// **AppleScript 能证到什么、证不到什么**（详见 内部文档库 docs/specs/M16-S7-GUI真机走查.md）：
 //   能证：窗口存在 / 标题 / 尺寸 / 进程存活
 //   证不到：WebView 内部的 JS 状态、invoke 往返的字节、DOM 结构
 // 并且本机**采不到该窗口的像素**（窗口存在 ≠ 能采到它的像素）——见 spec §4 的坑清单。
@@ -16,7 +16,7 @@
 // 只烧 0.06s CPU 都是这一现象的副作用，不是宿主能力的边界）。**修法**：用 `--app <天枢 Relay.app>`
 // 走 `open -n` 让 LaunchServices 在用户 GUI 会话里启动新实例，env（含 `TIANSHU_RELAY_HOME`）从父
 // shell 正常传播。`--app` 模式 3 次重复：`ui_ready_at` 全部落库（623 / 687 / 881 ms；证据
-// `docs/evidence/m16s7-gui.md §16.2`）。`--binary` 模式在当前 Aqua-attached shell 下也能落库
+// `内部文档库 docs/evidence/m16s7-gui.md §16.2`）。`--binary` 模式在当前 Aqua-attached shell 下也能落库
 // （533 / 546 ms；§16.2 反向证据，证明 M16-S7 零命中是当时 shell 上下文的产物）。**`--binary`
 // 模式保留**作为对比口径（与 M16-S7 同形）。
 //
