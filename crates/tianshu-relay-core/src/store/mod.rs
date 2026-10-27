@@ -1075,7 +1075,7 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<()> {
-        let conn = self.lock()?;
+        let mut conn = self.lock()?;
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| Error::Store(format!("读取 schema 版本失败: {e}")))?;
@@ -1218,14 +1218,32 @@ impl Store {
         // M3 复审（11 → 12）：NewAPI 历史行把 `remain_quota` 写进了 `quota_limit`；
         // 新语义要求 `quota_limit = used + remaining`。只在升级时做一次加法，
         // 避免每次打开重复累加。Sub2API 的 `quota` 本来就是总额，不动。
+        //
+        // 用**事务 + schema_meta 标记**而不是只看 `user_version`：两个进程同时首次
+        // 升级时可能都读到 v11；先抢占标记的那一个执行加法，另一个看到标记直接跳过，
+        // 不会把总额重复相加。
         if version < 12 {
-            conn.execute(
-                "UPDATE keys SET quota_limit = quota_used + quota_limit \
-                 WHERE quota_used IS NOT NULL AND quota_limit IS NOT NULL \
-                   AND site_id IN (SELECT id FROM sites WHERE kind IN ('newapi', 'new-api'))",
-                [],
-            )
-            .map_err(|e| Error::Store(format!("迁移 NewAPI 额度总额失败: {e}")))?;
+            let tx = conn
+                .transaction()
+                .map_err(|e| Error::Store(format!("begin NewAPI 额度迁移: {e}")))?;
+            let claimed = tx
+                .execute(
+                    "INSERT OR IGNORE INTO schema_meta(key, value) \
+                     VALUES ('newapi_quota_limit_total_v12', 'done')",
+                    [],
+                )
+                .map_err(|e| Error::Store(format!("标记 NewAPI 额度迁移失败: {e}")))?;
+            if claimed == 1 {
+                tx.execute(
+                    "UPDATE keys SET quota_limit = quota_used + quota_limit \
+                     WHERE quota_used IS NOT NULL AND quota_limit IS NOT NULL \
+                       AND site_id IN (SELECT id FROM sites WHERE kind IN ('newapi', 'new-api'))",
+                    [],
+                )
+                .map_err(|e| Error::Store(format!("迁移 NewAPI 额度总额失败: {e}")))?;
+            }
+            tx.commit()
+                .map_err(|e| Error::Store(format!("提交 NewAPI 额度迁移失败: {e}")))?;
         }
 
         // 版本号仍然只在升级时写，保留它作为「将来需要非幂等迁移」的锚点。
@@ -4071,11 +4089,17 @@ mod tests {
             store
                 .update_key_usage(sub2api_key, Some(2.5), Some(10.0), Some("USD"))
                 .unwrap();
-            store
-                .lock()
-                .unwrap()
-                .pragma_update(None, "user_version", 11)
+            {
+                let conn = store.lock().unwrap();
+                // 这个测试库由当前代码创建时已写入 v12 标记；模拟真正的 v11 库时
+                // 必须把标记一起回退，否则迁移正确地跳过。
+                conn.execute(
+                    "DELETE FROM schema_meta WHERE key = 'newapi_quota_limit_total_v12'",
+                    [],
+                )
                 .unwrap();
+                conn.pragma_update(None, "user_version", 11).unwrap();
+            }
             (newapi_key, sub2api_key)
         };
 
