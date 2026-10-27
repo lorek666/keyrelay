@@ -103,19 +103,23 @@ fn window_cost_agrees_with_budget_spent() {
         .insert_key(site, "k1", "kr/key/1/secret", None, None)
         .expect("写 key");
     let base = now() - 40 * 86_400;
-    let t = now();
-    // 价格版本更替：旧价 2.0（40 天前生效）、新价 10.0（1 小时前生效）。
-    price(&store, "usd-model", 2.0, 4.0, "USD", base);
-    price(&store, "usd-model", 10.0, 4.0, "USD", t - 3600);
-    // 旧价时段行：1M prompt × 2.0 = 2.0；新价时段行：1M prompt × 10.0 = 10.0。
-    store
-        .insert_gateway_usage(&usage(t - 7200, site, Some(key), "usd-model", 1_000_000, 0))
-        .expect("写旧价用量");
-    store
-        .insert_gateway_usage(&usage(t, site, Some(key), "usd-model", 1_000_000, 0))
-        .expect("写新价用量");
+    // 用「本地当天起点」而不是 `now()-2h` 造两个价格时段：后者在凌晨 0–2 点
+    // 会把旧价行落到前一天，日窗口只剩 10.0 而稳定失败（跨午夜时间依赖）。
     let today = local_today(&dir);
     let (start, end) = store.local_day_bounds(&today).expect("当日窗口");
+    let old_at = start + 10;
+    let new_price_at = start + 20;
+    let new_at = start + 30;
+    // 价格版本更替：旧价 2.0（40 天前生效）、新价 10.0（当天第二秒生效）。
+    price(&store, "usd-model", 2.0, 4.0, "USD", base);
+    price(&store, "usd-model", 10.0, 4.0, "USD", new_price_at);
+    // 旧价时段行：1M prompt × 2.0 = 2.0；新价时段行：1M prompt × 10.0 = 10.0。
+    store
+        .insert_gateway_usage(&usage(old_at, site, Some(key), "usd-model", 1_000_000, 0))
+        .expect("写旧价用量");
+    store
+        .insert_gateway_usage(&usage(new_at, site, Some(key), "usd-model", 1_000_000, 0))
+        .expect("写新价用量");
     assert_eq!(
         store
             .gateway_cost_usd_in_window(site, None, start, end)
