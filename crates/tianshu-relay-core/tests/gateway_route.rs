@@ -207,17 +207,17 @@ fn preferred_uses_the_same_key_without_model_filter() {
     assert!(table.candidates("not-registered").is_empty());
 }
 
-// ============================================================ should_failover
+// ============================================================ should_failover（熔断语义，不是重放许可）
 
 #[test]
-fn should_failover_boundary_table() {
-    // 该切的
+fn breaker_failure_boundary_table_does_not_imply_replay() {
+    // 记录失败 ≠ 在本次请求里换站。5xx 走下一请求的熔断恢复，不重放当前请求。
     for status in [429u16, 500, 502, 503, 504, 599] {
-        assert!(should_failover(status), "{status} 应当切换");
+        assert!(should_failover(status), "{status} 应当记录上游失败");
     }
-    // **不该切的**：401/403 是凭证问题，切换会把「密钥无效」误报成「上游故障」
+    // 401/403 是凭证问题：既不喂熔断，也不拿其他站点的密钥重试。
     for status in [200u16, 301, 302, 400, 401, 403, 404, 405, 409, 418, 422] {
-        assert!(!should_failover(status), "{status} 不该切换");
+        assert!(!should_failover(status), "{status} 不该记录上游失败");
     }
     // 边界：499 不是 5xx，500 是
     assert!(!should_failover(499));
