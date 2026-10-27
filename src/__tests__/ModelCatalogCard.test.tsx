@@ -137,6 +137,16 @@ describe("模型名单卡（M47-S2）", () => {
     expect(screen.getByText(/2026-10-27T00:00:00Z/)).toBeTruthy();
   });
 
+  it("支持按模型名 / 厂商筛选，并显示匹配条数", async () => {
+    renderCard();
+    await screen.findByText("GLM-5.3-Flash");
+    const filter = screen.getByRole("searchbox", { name: "筛选模型名 / 厂商" });
+    fireEvent.change(filter, { target: { value: "plain" } });
+    expect(screen.getByText("Plain Model")).toBeTruthy();
+    expect(screen.queryByText("GLM-5.3-Flash")).toBeNull();
+    expect(screen.getByText("显示 1 / 2 条")).toBeTruthy();
+  });
+
   it("③ 带入上下文/输出/思考档位；无价显示「未定价」", async () => {
     renderCard();
     await screen.findByText("GLM-5.3-Flash");

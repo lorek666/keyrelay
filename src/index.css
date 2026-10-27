@@ -264,6 +264,9 @@ p.warn[role="status"] { background: var(--warn-soft); border-color: transparent;
 .empty { padding: 28px 16px; border: 1px dashed var(--line-strong); border-radius: 10px; color: var(--muted); text-align: center; }
 
 /* 表格、列表与详情 */
+.catalog-filter { margin: 12px 0; }
+.catalog-filter .input { min-width: 260px; }
+
 .table-wrap { width: 100%; min-width: 0; max-width: 100%; overflow: auto; border: 1px solid var(--line); border-radius: 9px; }
 .card, .hm-card, .card > *, .hm-card > * { min-width: 0; }
 .table { width: 100%; border-collapse: collapse; font-size: 12px; }

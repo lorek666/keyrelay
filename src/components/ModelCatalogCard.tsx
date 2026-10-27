@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CloudDownload, RotateCcw, Save } from "lucide-react";
+import { CloudDownload, RotateCcw, Save, Search } from "lucide-react";
 import {
   catalogSetOverride,
   catalogStatus,
@@ -30,6 +30,7 @@ export default function ModelCatalogCard() {
   const [notice, setNotice] = useState<string | null>(null);
   const [autoSync, setAutoSync] = useState(true);
   const [url, setUrl] = useState("");
+  const [filter, setFilter] = useState("");
 
   useEffect(() => {
     if (!settings.data) return;
@@ -89,6 +90,16 @@ export default function ModelCatalogCard() {
   });
 
   const models = useMemo(() => status.data?.models ?? [], [status.data]);
+  const visibleModels = useMemo(() => {
+    const query = filter.trim().toLowerCase();
+    if (!query) return models;
+    return models.filter((model) =>
+      [model.displayName, model.id, model.vendor]
+        .join("\n")
+        .toLowerCase()
+        .includes(query),
+    );
+  }, [filter, models]);
   const source = status.data?.source;
 
   return (
@@ -171,6 +182,34 @@ export default function ModelCatalogCard() {
       ) : null}
 
       {models.length > 0 ? (
+        <div className="row row-between catalog-filter">
+          <label className="field-inline">
+            <Search size={14} aria-hidden />
+            <input
+              className="input"
+              type="search"
+              value={filter}
+              placeholder={t("catalog.filterPlaceholder")}
+              aria-label={t("catalog.filterPlaceholder")}
+              onChange={(e) => setFilter(e.target.value)}
+            />
+          </label>
+          {filter.trim() ? (
+            <span className="muted">
+              {t("catalog.filterCount", {
+                shown: visibleModels.length,
+                total: models.length,
+              })}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+
+      {models.length > 0 && visibleModels.length === 0 ? (
+        <p className="muted empty">{t("catalog.filterEmpty")}</p>
+      ) : null}
+
+      {visibleModels.length > 0 ? (
         <div
           className="table-wrap"
           role="region"
@@ -190,7 +229,7 @@ export default function ModelCatalogCard() {
               </tr>
             </thead>
             <tbody>
-              {models.map((model) => (
+              {visibleModels.map((model) => (
                 <CatalogRow
                   // key 带上「有效值指纹」：同步换了一份名单之后同一行的编辑器要重建，
                   // 否则输入框里留着旧名单的值，用户下一次保存会把旧值钉回覆盖里。

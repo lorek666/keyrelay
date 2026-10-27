@@ -1,9 +1,1687 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-10-27T00:00:00Z",
+  "generatedAt": "2026-10-27T06:45:00Z",
   "minAppVersion": "0.2.1",
-  "notes": "价格留空 = 未知（成本估算按「无价」处理，绝不按 0 计）；思考档位只在**核对过官方能力**后才写，没核对就留空（= 未知，投递不写该参数、网关丢弃该字段），不猜。",
+  "notes": "价格留空 = 未知（成本估算按「无价」处理，绝不按 0 计）；思考档位只在核对过官方能力后才写，没核对就留空（= 未知，投递不写该参数、网关丢弃该字段），不猜。2026-10-27 扩充：新增条目只收录已核对的窗口 / 最大输出 / 原生协议；价格和思考能力未经逐项核对，不填。",
   "models": [
+    {
+      "id": "gpt-6.1-sol",
+      "displayName": "GPT-6.1 Sol",
+      "aliases": [
+        "gpt-6-1-sol"
+      ],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-6.1-terra",
+      "displayName": "GPT-6.1 Terra",
+      "aliases": [
+        "gpt-6-1-terra"
+      ],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-6-astra",
+      "displayName": "GPT-6 Astra",
+      "aliases": [
+        "gpt-6.0-astra"
+      ],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-6-sol",
+      "displayName": "GPT-6 Sol",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-6-luna",
+      "displayName": "GPT-6 Luna",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-5.6",
+      "displayName": "GPT-5.6",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "displayName": "GPT-5.6 Sol",
+      "aliases": [
+        "gpt-5-6-sol"
+      ],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "displayName": "GPT-5.6 Terra",
+      "aliases": [
+        "gpt-5-6-terra"
+      ],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "displayName": "GPT-5.6 Luna",
+      "aliases": [
+        "gpt-5-6-luna"
+      ],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-5.5",
+      "displayName": "GPT-5.5",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-5.5-pro",
+      "displayName": "GPT-5.5 Pro",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-5.4",
+      "displayName": "GPT-5.4",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "displayName": "GPT-5.4 mini",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-5.4-nano",
+      "displayName": "GPT-5.4 nano",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-5.4-pro",
+      "displayName": "GPT-5.4 Pro",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-5.3-codex",
+      "displayName": "GPT-5.3 Codex",
+      "aliases": [
+        "gpt-5-3-codex"
+      ],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-4.1",
+      "displayName": "GPT-4.1",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 32768
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-4.1-mini",
+      "displayName": "GPT-4.1 mini",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 32768
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-4.1-nano",
+      "displayName": "GPT-4.1 nano",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 32768
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "o3-pro",
+      "displayName": "o3-pro",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 100000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "o4-mini",
+      "displayName": "o4-mini",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 272000,
+        "maxOutputTokens": 100000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-oss-120b",
+      "displayName": "gpt-oss-120b",
+      "aliases": [
+        "openai/gpt-oss-120b"
+      ],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 131072,
+        "maxOutputTokens": 32768
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-oss-20b",
+      "displayName": "gpt-oss-20b",
+      "aliases": [
+        "openai/gpt-oss-20b"
+      ],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 131072,
+        "maxOutputTokens": 32768
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-fable-5-1",
+      "displayName": "Claude Fable 5.1",
+      "aliases": [
+        "claude-fable-5.1"
+      ],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-opus-5-5",
+      "displayName": "Claude Opus 5.5",
+      "aliases": [
+        "claude-opus-5.5"
+      ],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "displayName": "Claude Sonnet 5.5",
+      "aliases": [
+        "claude-sonnet-5.5"
+      ],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "displayName": "Claude Haiku 5.5",
+      "aliases": [
+        "claude-haiku-5.5"
+      ],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-opus-5",
+      "displayName": "Claude Opus 5",
+      "aliases": [],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-sonnet-5",
+      "displayName": "Claude Sonnet 5",
+      "aliases": [],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-fable-5",
+      "displayName": "Claude Fable 5",
+      "aliases": [],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-opus-4-8",
+      "displayName": "Claude Opus 4.8",
+      "aliases": [
+        "claude-opus-4.8"
+      ],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "displayName": "Claude Sonnet 4.6",
+      "aliases": [
+        "claude-sonnet-4.6"
+      ],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-opus-4-5",
+      "displayName": "Claude Opus 4.5",
+      "aliases": [
+        "claude-opus-4.5",
+        "claude-opus-4-5-20251101"
+      ],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 64000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-sonnet-4-5",
+      "displayName": "Claude Sonnet 4.5",
+      "aliases": [
+        "claude-sonnet-4.5",
+        "claude-sonnet-4-5-20250929"
+      ],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 64000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "displayName": "Claude Haiku 4.5",
+      "aliases": [
+        "claude-haiku-4.5",
+        "claude-haiku-4-5-20251001"
+      ],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 64000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemini-4-argon",
+      "displayName": "Gemini 4 Argon",
+      "aliases": [],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "gemini",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 32768
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "displayName": "Gemini 3.8 Flash",
+      "aliases": [
+        "gemini-3-8-flash"
+      ],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "gemini",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemini-3.7-flash",
+      "displayName": "Gemini 3.7 Flash",
+      "aliases": [
+        "gemini-3-7-flash"
+      ],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "gemini",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemini-3.5-flash",
+      "displayName": "Gemini 3.5 Flash",
+      "aliases": [],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "gemini",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemini-3.5-flash-lite",
+      "displayName": "Gemini 3.5 Flash-Lite",
+      "aliases": [],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "gemini",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemini-3.1-pro",
+      "displayName": "Gemini 3.1 Pro",
+      "aliases": [
+        "gemini-3.1-pro-preview",
+        "gemini-3-1-pro"
+      ],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "gemini",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemini-3.1-flash-lite",
+      "displayName": "Gemini 3.1 Flash-Lite",
+      "aliases": [],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "gemini",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemini-2.5-pro",
+      "displayName": "Gemini 2.5 Pro",
+      "aliases": [],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "gemini",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemini-2.5-flash",
+      "displayName": "Gemini 2.5 Flash",
+      "aliases": [],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "gemini",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemma-4-31b-it",
+      "displayName": "Gemma 4 31B IT",
+      "aliases": [],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 262144,
+        "maxOutputTokens": 32768
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemma-4-26b-a4b-it",
+      "displayName": "Gemma 4 26B A4B IT",
+      "aliases": [],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 262144,
+        "maxOutputTokens": 32768
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "grok-4.7",
+      "displayName": "Grok 4.7",
+      "aliases": [],
+      "vendor": "xai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 500000,
+        "maxOutputTokens": 500000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "grok-4.6",
+      "displayName": "Grok 4.6",
+      "aliases": [],
+      "vendor": "xai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 500000,
+        "maxOutputTokens": 500000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "grok-4.5",
+      "displayName": "Grok 4.5",
+      "aliases": [],
+      "vendor": "xai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 500000,
+        "maxOutputTokens": 500000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "grok-4.20-reasoning",
+      "displayName": "Grok 4.20 (Reasoning)",
+      "aliases": [
+        "grok-4.20"
+      ],
+      "vendor": "xai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 30000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "grok-4.20-non-reasoning",
+      "displayName": "Grok 4.20 (Non-Reasoning)",
+      "aliases": [],
+      "vendor": "xai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 30000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "displayName": "DeepSeek V4 Pro",
+      "aliases": [],
+      "vendor": "deepseek",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 393216
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "deepseek-flash",
+      "displayName": "DeepSeek V4.1 Flash",
+      "aliases": [
+        "deepseek-v4-flash",
+        "deepseek-v4.1-flash",
+        "deepseek-v4-flash-vision-exp"
+      ],
+      "vendor": "deepseek",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 393216
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "deepseek-v3.2",
+      "displayName": "DeepSeek V3.2",
+      "aliases": [],
+      "vendor": "deepseek",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 163840,
+        "maxOutputTokens": 81920
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "qwen3.8-max",
+      "displayName": "Qwen3.8 Max",
+      "aliases": [],
+      "vendor": "alibaba",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "qwen3.8-flash",
+      "displayName": "Qwen3.8 Flash",
+      "aliases": [],
+      "vendor": "alibaba",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "qwen3.7-max",
+      "displayName": "Qwen3.7 Max",
+      "aliases": [],
+      "vendor": "alibaba",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "qwen3.6-plus",
+      "displayName": "Qwen3.6 Plus",
+      "aliases": [],
+      "vendor": "alibaba",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "qwen3-max",
+      "displayName": "Qwen3 Max",
+      "aliases": [],
+      "vendor": "alibaba",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 262144,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "qwen3-coder-plus",
+      "displayName": "Qwen3 Coder Plus",
+      "aliases": [],
+      "vendor": "alibaba",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "qwen3-coder-flash",
+      "displayName": "Qwen3 Coder Flash",
+      "aliases": [],
+      "vendor": "alibaba",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "glm-5.3",
+      "displayName": "GLM-5.3",
+      "aliases": [
+        "glm-5-3"
+      ],
+      "vendor": "zhipu",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "glm-5.3-flash",
+      "displayName": "GLM-5.3-Flash",
+      "aliases": [
+        "glm-5-3-flash"
+      ],
+      "vendor": "zhipu",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "glm-5.3-flashx",
+      "displayName": "GLM-5.3-FlashX",
+      "aliases": [
+        "glm-5-3-flashx"
+      ],
+      "vendor": "zhipu",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "glm-5.2",
+      "displayName": "GLM-5.2",
+      "aliases": [
+        "glm-5-2"
+      ],
+      "vendor": "zhipu",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "glm-5",
+      "displayName": "GLM-5",
+      "aliases": [],
+      "vendor": "zhipu",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 204800,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "glm-4.7",
+      "displayName": "GLM-4.7",
+      "aliases": [],
+      "vendor": "zhipu",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 204800,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "kimi-k3.1-pro",
+      "displayName": "Kimi K3.1 Pro",
+      "aliases": [
+        "kimi-k3-1-pro"
+      ],
+      "vendor": "moonshot",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 1048576
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "kimi-k3",
+      "displayName": "Kimi K3",
+      "aliases": [],
+      "vendor": "moonshot",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 1048576
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "kimi-k2.7-code",
+      "displayName": "Kimi K2.7 Code",
+      "aliases": [],
+      "vendor": "moonshot",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 262144,
+        "maxOutputTokens": 262144
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "kimi-k2.6",
+      "displayName": "Kimi K2.6",
+      "aliases": [],
+      "vendor": "moonshot",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 262144,
+        "maxOutputTokens": 262144
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "minimax-m3.1-flash",
+      "displayName": "MiniMax-M3.1-Flash",
+      "aliases": [
+        "minimax-m3-1-flash"
+      ],
+      "vendor": "minimax",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 524288
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "minimax-m3",
+      "displayName": "MiniMax-M3",
+      "aliases": [],
+      "vendor": "minimax",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 524288
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "minimax-m2.7",
+      "displayName": "MiniMax-M2.7",
+      "aliases": [],
+      "vendor": "minimax",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 204800,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "mistral-large-4",
+      "displayName": "Mistral Large 4",
+      "aliases": [],
+      "vendor": "mistral",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 262144
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "mistral-medium-3.5",
+      "displayName": "Mistral Medium 3.5",
+      "aliases": [
+        "mistral-medium-latest",
+        "mistral-medium-2604"
+      ],
+      "vendor": "mistral",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 262144,
+        "maxOutputTokens": 262144
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "devstral-2",
+      "displayName": "Devstral 2",
+      "aliases": [
+        "devstral-latest",
+        "devstral-2512"
+      ],
+      "vendor": "mistral",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 262144,
+        "maxOutputTokens": 262144
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "muse-spark-1.3",
+      "displayName": "Muse Spark 1.3",
+      "aliases": [],
+      "vendor": "meta",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "muse-wonder-1.0",
+      "displayName": "Muse Wonder",
+      "aliases": [],
+      "vendor": "meta",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "llama-4-maverick",
+      "displayName": "Llama 4 Maverick",
+      "aliases": [
+        "meta.llama4-maverick-17b-instruct-v1:0"
+      ],
+      "vendor": "meta",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 8192
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "llama-4-scout",
+      "displayName": "Llama 4 Scout",
+      "aliases": [
+        "meta.llama4-scout-17b-instruct-v1:0"
+      ],
+      "vendor": "meta",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 10000000,
+        "maxOutputTokens": 8192
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "command-a-plus",
+      "displayName": "Command A Plus",
+      "aliases": [
+        "command-a-plus-05-2026"
+      ],
+      "vendor": "cohere",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 128000,
+        "maxOutputTokens": 64000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "command-a-reasoning",
+      "displayName": "Command A Reasoning",
+      "aliases": [
+        "command-a-reasoning-08-2025"
+      ],
+      "vendor": "cohere",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 256000,
+        "maxOutputTokens": 32000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "sonar-pro",
+      "displayName": "Sonar Pro",
+      "aliases": [],
+      "vendor": "perplexity",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 8192
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "sonar-reasoning-pro",
+      "displayName": "Sonar Reasoning Pro",
+      "aliases": [],
+      "vendor": "perplexity",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 128000,
+        "maxOutputTokens": 4096
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "nova-2-lite",
+      "displayName": "Amazon Nova 2 Lite",
+      "aliases": [
+        "amazon.nova-2-lite-v1:0"
+      ],
+      "vendor": "amazon",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 65535
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "nova-pro",
+      "displayName": "Amazon Nova Pro",
+      "aliases": [
+        "amazon.nova-pro-v1:0"
+      ],
+      "vendor": "amazon",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 300000,
+        "maxOutputTokens": 10000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "mimo-v2.6-pro",
+      "displayName": "MiMo-V2.6-Pro",
+      "aliases": [],
+      "vendor": "xiaomi",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "mimo-v2.6-flash",
+      "displayName": "MiMo-V2.6-Flash",
+      "aliases": [],
+      "vendor": "xiaomi",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "step-5-preview",
+      "displayName": "Step 5 Preview",
+      "aliases": [],
+      "vendor": "stepfun",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "step-3.7-flash",
+      "displayName": "Step 3.7 Flash",
+      "aliases": [],
+      "vendor": "stepfun",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 256000,
+        "maxOutputTokens": 256000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "doubao-seed-2.1-pro",
+      "displayName": "Doubao Seed 2.1 Pro",
+      "aliases": [
+        "doubao-seed-2-1-pro-260628"
+      ],
+      "vendor": "bytedance",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 256000,
+        "maxOutputTokens": 256000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "doubao-seed-2.1-turbo",
+      "displayName": "Doubao Seed 2.1 Turbo",
+      "aliases": [
+        "doubao-seed-2-1-turbo-260628"
+      ],
+      "vendor": "bytedance",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 256000,
+        "maxOutputTokens": 256000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "doubao-seed-2.0-code",
+      "displayName": "Doubao Seed 2.0 Code",
+      "aliases": [
+        "doubao-seed-2-0-code-preview-260215"
+      ],
+      "vendor": "bytedance",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 262144,
+        "maxOutputTokens": 131072
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "hunyuan-4-preview",
+      "displayName": "Hunyuan 4 Preview",
+      "aliases": [
+        "hy4-preview"
+      ],
+      "vendor": "tencent",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1024000,
+        "maxOutputTokens": 64000
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "hunyuan-2.0-thinking",
+      "displayName": "Hunyuan 2.0 Think",
+      "aliases": [],
+      "vendor": "tencent",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 131072,
+        "maxOutputTokens": 16384
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "nemotron-3-ultra",
+      "displayName": "NVIDIA Nemotron 3 Ultra 550B A55B",
+      "aliases": [
+        "nvidia/nemotron-3-ultra-550b-a55b"
+      ],
+      "vendor": "nvidia",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "nemotron-3.5-lightning",
+      "displayName": "NVIDIA Nemotron 3.5 Lightning 30B A3B",
+      "aliases": [
+        "nvidia/nemotron-3.5-lightning-30b-a3b"
+      ],
+      "vendor": "nvidia",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 262144,
+        "maxOutputTokens": 262144
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "longcat-2.5-preview",
+      "displayName": "LongCat-2.5-Preview",
+      "aliases": [],
+      "vendor": "longcat",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 262144
+      },
+      "prices": [],
+      "deprecated": false
+    },
     {
       "id": "gpt-4o",
       "displayName": "gpt-4o",

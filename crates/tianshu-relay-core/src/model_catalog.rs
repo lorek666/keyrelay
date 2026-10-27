@@ -47,7 +47,7 @@ pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 pub const CATALOG_URL: &str =
     "https://raw.githubusercontent.com/lorek666/keyrelay/main/catalog/models.json";
 
-/// 名单文件大小上限。34 条 ≈ 17KB，2MB 足够容纳上千条，同时挡住「拉回来一个网页」。
+/// 名单文件大小上限。133 条 ≈ 51KB，2MB 足够容纳上千条，同时挡住「拉回来一个网页」。
 pub const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 
 /// 编译进二进制的名单（离线兜底；也保证首次启动就有数据）。
@@ -961,7 +961,7 @@ impl CatalogStore {
             return Err(message);
         }
         // 「解析出来一条就算成功」是危险的：远端文件被截断/改坏时往往仍是合法 JSON，
-        // 只是只剩几条——照单接收等于把 34 条名单悄悄缩成 1 条，投递立刻退化到
+        // 只是只剩几条——照单接收等于把内置名单悄悄缩成 1 条，投递立刻退化到
         // 「只写模型名」。这里加两道闸，宁可报错继续用旧缓存：
         //   ① 坏条目比好条目还多 ⇒ 这份文件本身有问题，不是个别条目的问题；
         //   ② 条目数掉到现有的一半以下 ⇒ 不足以替换，先让人看一眼。
@@ -1567,10 +1567,25 @@ mod tests {
     fn bundled_catalog_is_parseable_and_has_entries() {
         let (catalog, stats) = Catalog::parse(BUNDLED_CATALOG).expect("内置名单必须可解析");
         assert!(
-            catalog.models.len() >= 30,
+            catalog.models.len() >= 100,
             "内置名单条数: {}",
             catalog.models.len()
         );
+        for id in [
+            "gpt-6.1-sol",
+            "claude-opus-5-5",
+            "gemini-4-argon",
+            "deepseek-v4-pro",
+            "qwen3.8-max",
+            "glm-5.3",
+            "kimi-k3.1-pro",
+            "minimax-m3.1-flash",
+        ] {
+            assert!(
+                catalog.resolve(id).is_some(),
+                "内置名单必须覆盖当前模型: {id}"
+            );
+        }
         assert_eq!(stats.skipped, 0, "内置名单不该有坏条目");
         assert_eq!(catalog.schema_version, CATALOG_SCHEMA_VERSION);
     }
@@ -1582,7 +1597,7 @@ mod tests {
         use crate::site::transport::{HttpResponse, MockTransport};
         let dir = tempfile::tempdir().unwrap();
         let store = CatalogStore::open(dir.path());
-        // 1 条合规 + 3 条不合规：语法合法、解析只有 1 条——照单接收会把 34 条名单缩成 1 条。
+        // 1 条合规 + 3 条不合规：语法合法、解析只有 1 条——照单接收会把内置名单缩成 1 条。
         let body = r#"{"schemaVersion":1,"generatedAt":"2026-10-01T00:00:00Z","models":[
             {"id":"only-one","protocol":{"upstream":"openai_chat"},"limits":{"contextWindow":8000,"maxOutputTokens":1000}},
             {"id":"bad-1","limits":{"contextWindow":0,"maxOutputTokens":1}},

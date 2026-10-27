@@ -6,6 +6,14 @@
 协议字段描述模型原生能力；本地网关负责把客户端协议转换为 OpenAI Chat，不会把 Responses
 客户端配置盲目改写成名单中的另一种协议。
 
+当前（2026-10-27）收录 **20 家厂商的 133 个模型**，覆盖 OpenAI、Anthropic、Google、xAI、
+DeepSeek、Qwen、GLM、Kimi、MiniMax、Mistral、Meta、Cohere、Perplexity、Amazon Nova、
+豆包、混元、MiMo、StepFun、Nemotron 与 LongCat。窗口 / 最大输出与原生协议按 models.dev 的
+公开元数据整理，并对主流模型与各厂商文档做了交叉核对；没有逐项核实的价格与思考能力保持未知，不猜。
+
+OpenAI GPT 系列的窗口统一按中转站常见的 **272K** 封顶（模型文档的 API 窗口更大）；
+这是投递保守值，不是模型原生上限。
+
 ## 名字怎么匹配（先看这个）
 
 客户端把用户填的模型名规范化后再查表：
@@ -24,7 +32,7 @@ claude-3-5-sonnet-20241022 → claude-3-5-sonnet（逐段剥尾）
 ```jsonc
 {
   "schemaVersion": 1,              // 客户端只认 <= 自己支持的版本；更高整份忽略
-  "generatedAt": "2026-10-27T00:00:00Z",   // 也是「价格生效时间」的兜底
+  "generatedAt": "2026-10-27T06:45:00Z",   // 也是「价格生效时间」的兜底
   "minAppVersion": "0.2.1",        // 提示用，不强制
   "notes": "……",
   "models": [
