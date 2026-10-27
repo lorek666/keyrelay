@@ -184,6 +184,7 @@ fn config(
         lb_top_n: top_n,
         max_attempts: 0,
         session_affinity: false,
+        upstream_protocol: tianshu_relay_core::gateway::session::UpstreamProtocol::OpenAiChat,
         key_quotas: std::collections::HashMap::new(),
         guard_policy: SiteGuardPolicy {
             max_concurrency: 0,

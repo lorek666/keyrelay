@@ -119,6 +119,7 @@ fn routed_config(
         lb_top_n: 1,
         max_attempts: 0,
         session_affinity: false,
+        upstream_protocol: tianshu_relay_core::gateway::session::UpstreamProtocol::OpenAiChat,
         key_quotas: std::collections::HashMap::new(),
         guard_policy: SiteGuardPolicy::default(),
         runtime: None,

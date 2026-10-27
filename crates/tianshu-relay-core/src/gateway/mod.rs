@@ -201,11 +201,36 @@ fn decoded_path_has_no_traversal(bytes: &[u8]) -> bool {
 /// OpenAI 兼容的非流式响应：`{ "usage": { "prompt_tokens": 100, ... } }`。
 /// 缺失或类型不对 → `None`。
 fn extract_usage_from_json(body: &[u8]) -> Option<(i64, i64, i64)> {
+    merge_usage_from_json(body, None)
+}
+
+/// M4：Anthropic 原生流会在 `message_start.message.usage` 给输入用量、
+/// 在 `message_delta.usage` 只给最终输出用量；用前值补齐缺失的一半，
+/// 不把缺失字段猜成 0。OpenAI Chat 的完整 usage 仍按 last-wins 覆盖。
+fn merge_usage_from_json(
+    body: &[u8],
+    previous: Option<(i64, i64, i64)>,
+) -> Option<(i64, i64, i64)> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let usage = value.get("usage")?;
-    let prompt = usage.get("prompt_tokens").and_then(|v| v.as_i64())?;
-    let completion = usage.get("completion_tokens").and_then(|v| v.as_i64())?;
-    let total = usage.get("total_tokens").and_then(|v| v.as_i64())?;
+    let usage = value.get("usage").or_else(|| {
+        value
+            .get("message")
+            .and_then(|message| message.get("usage"))
+    })?;
+    let prompt = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(|v| v.as_i64())
+        .or_else(|| previous.map(|old| old.0))?;
+    let completion = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(|v| v.as_i64())
+        .or_else(|| previous.map(|old| old.1))?;
+    let total = usage
+        .get("total_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(prompt.saturating_add(completion));
     Some((prompt, completion, total))
 }
 
@@ -369,8 +394,8 @@ impl UsageCapture {
                 self.done = true;
                 continue;
             }
-            if let Some(usage) = extract_usage_from_json(rest.as_bytes()) {
-                // 后出现的覆盖前面的：OpenAI 兼容的 usage 在最后一个事件里。
+            if let Some(usage) = merge_usage_from_json(rest.as_bytes(), self.last_usage) {
+                // OpenAI 的完整 usage 后出现者覆盖；Anthropic 的部分事件用 previous 补齐。
                 self.last_usage = Some(usage);
             }
         }
@@ -612,6 +637,8 @@ pub struct GatewayConfig {
     pub session_affinity: bool,
     /// M3：逐 key 额度快照（不含密钥；只用于软排序与解释）。
     pub key_quotas: HashMap<i64, KeyQuotaSnapshot>,
+    /// M4：显式上游协议；默认 OpenAI Chat。首版只支持原生 Anthropic。
+    pub upstream_protocol: UpstreamProtocol,
     /// M39-S3 §4.2：每站并发/限速策略。
     pub guard_policy: SiteGuardPolicy,
     /// `key_ref` → 明文。**仅进程内**；`Debug` 不打印（见下方手写 `Debug`）。
@@ -1034,6 +1061,7 @@ impl GatewayConfig {
             max_attempts: 0,
             session_affinity: false,
             key_quotas: HashMap::new(),
+            upstream_protocol: UpstreamProtocol::OpenAiChat,
             guard_policy: SiteGuardPolicy::default(),
             keys_by_ref: HashMap::new(),
             catalog: None,
@@ -2591,6 +2619,7 @@ fn remember_session_pin(
     identity: &Option<SessionIdentity>,
     upstream: &Upstream,
     model: &str,
+    protocol: UpstreamProtocol,
     generation: u64,
     success: bool,
 ) {
@@ -2601,13 +2630,9 @@ fn remember_session_pin(
         return;
     };
     // 调用方传的是已解析别名的 usage_model；这里不再二次读运行时快照。
-    let Some(pin) = SessionPin::new(
-        upstream.site_id,
-        upstream.key_id,
-        model,
-        UpstreamProtocol::OpenAiChat,
-    )
-    .map(|pin| pin.at_generation(generation)) else {
+    let Some(pin) = SessionPin::new(upstream.site_id, upstream.key_id, model, protocol)
+        .map(|pin| pin.at_generation(generation))
+    else {
         return;
     };
     state.sessions.pin(identity, pin, Instant::now());
@@ -2728,116 +2753,136 @@ async fn proxy_inner(
         )
     });
 
-    // Chat **零翻译**（不进本分支，body 逐字节不动）；其余三种先解析成 IR，
-    // 再序列化成 OpenAI Chat body。**解析失败发生在发请求之前** ⇒ 不可能产生上游计费（ADR D5）。
+    // M4：显式上游协议只接受同协议入站。首版只实现 Anthropic Messages；
+    // 默认 Chat 继续走既有翻译路径，行为逐字不变。
+    let inbound_protocol = translate::detect(&method, &path, &inbound);
     let mut translate_stream = false;
-    let (body, translate_proto) = match translate::detect(&method, &path, &inbound) {
-        Some(proto)
-            if matches!(
-                proto,
-                translate::Protocol::OpenAiResponses
-                    | translate::Protocol::AnthropicMessages
-                    | translate::Protocol::GeminiGenerateContent
-            ) =>
-        {
-            match translate::parse_request(proto, &body) {
-                Ok(mut req) => {
-                    // Gemini 的模型名在**路径**里，不在 body（spec §4.3）。
-                    if req.model.is_empty() {
-                        if let Some(model) = gemini_model_from_path(&path) {
-                            req.model = model;
+    let (body, translate_proto) = if state.config.upstream_protocol != UpstreamProtocol::OpenAiChat
+        && !(method == axum::http::Method::GET && path == "/v1/models")
+    {
+        let expected = match state.config.upstream_protocol {
+            UpstreamProtocol::AnthropicMessages => Some(translate::Protocol::AnthropicMessages),
+            _ => None,
+        };
+        if expected != inbound_protocol {
+            return local_error(
+                StatusCode::BAD_REQUEST,
+                GatewayErrorKind::InvalidRequest,
+                "upstream_protocol_mismatch",
+                "该网关配置为原生上游协议，只接受对应协议的入站请求",
+            );
+        }
+        // 同协议直通：请求体逐字节保留，响应和 SSE 也由 into_upstream_response 透传。
+        (body, None)
+    } else {
+        match inbound_protocol {
+            Some(proto)
+                if matches!(
+                    proto,
+                    translate::Protocol::OpenAiResponses
+                        | translate::Protocol::AnthropicMessages
+                        | translate::Protocol::GeminiGenerateContent
+                ) =>
+            {
+                match translate::parse_request(proto, &body) {
+                    Ok(mut req) => {
+                        // Gemini 的模型名在**路径**里，不在 body（spec §4.3）。
+                        if req.model.is_empty() {
+                            if let Some(model) = gemini_model_from_path(&path) {
+                                req.model = model;
+                            }
                         }
-                    }
-                    if req.model.is_empty() {
-                        return local_error(
+                        if req.model.is_empty() {
+                            return local_error(
                             StatusCode::BAD_REQUEST,
                             GatewayErrorKind::InvalidRequest,
                             "invalid_request",
                             "无法确定模型名：Gemini 需要 /v1beta/models/<model>:generateContent",
                         );
-                    }
-                    // P1-1（复审）：**先**把流式意图写回 IR，再序列化——
-                    // 否则 `to_upstream_json()` 读的还是 `req.stream`（false），
-                    // 上游收到的是非流式请求，整个流式路径形同虚设。
-                    req.stream = req.stream || gemini_stream;
-                    translate_stream = req.stream;
-                    let mut upstream = req.to_upstream_json();
-                    // M47-S2：`thinking` 的落点。
-                    //
-                    // ADR-0005 的上游固定是 OpenAI Chat，没有 `thinking` 这个概念；
-                    // 名单说这个模型支持思考 ⇒ 折算成 `reasoning_effort`；
-                    // 不支持 / 不在名单 ⇒ 丢掉这个字段（并留一行 stderr）。
-                    //
-                    // **为什么不再 400**：一个可选字段把整次请求打死，用户看到的是
-                    // 「换个客户端就用不了」，而不是「这个模型不支持思考」。丢弃是
-                    // 有代价的（思考被静默降级），所以名单里 `thinking.supported`
-                    // 是显式事实，界面上也标出来了。
-                    match proto {
-                        translate::Protocol::AnthropicMessages => {
-                            if let Some(level) =
-                                thinking_effort_for(&state.config, &req.model, &body)
-                            {
-                                if level.is_empty() {
-                                    return local_error(
+                        }
+                        // P1-1（复审）：**先**把流式意图写回 IR，再序列化——
+                        // 否则 `to_upstream_json()` 读的还是 `req.stream`（false），
+                        // 上游收到的是非流式请求，整个流式路径形同虚设。
+                        req.stream = req.stream || gemini_stream;
+                        translate_stream = req.stream;
+                        let mut upstream = req.to_upstream_json();
+                        // M47-S2：`thinking` 的落点。
+                        //
+                        // ADR-0005 的上游固定是 OpenAI Chat，没有 `thinking` 这个概念；
+                        // 名单说这个模型支持思考 ⇒ 折算成 `reasoning_effort`；
+                        // 不支持 / 不在名单 ⇒ 丢掉这个字段（并留一行 stderr）。
+                        //
+                        // **为什么不再 400**：一个可选字段把整次请求打死，用户看到的是
+                        // 「换个客户端就用不了」，而不是「这个模型不支持思考」。丢弃是
+                        // 有代价的（思考被静默降级），所以名单里 `thinking.supported`
+                        // 是显式事实，界面上也标出来了。
+                        match proto {
+                            translate::Protocol::AnthropicMessages => {
+                                if let Some(level) =
+                                    thinking_effort_for(&state.config, &req.model, &body)
+                                {
+                                    if level.is_empty() {
+                                        return local_error(
                                         StatusCode::BAD_REQUEST,
                                         GatewayErrorKind::InvalidRequest,
                                         "invalid_request",
                                         "thinking 必须明确 type=enabled，且 budget_tokens 不得低于名单最低档",
                                     );
-                                }
-                                upstream["reasoning_effort"] = serde_json::json!(level);
-                            }
-                        }
-                        translate::Protocol::OpenAiResponses => {
-                            if let Some(level) = req.reasoning_effort {
-                                match state
-                                    .config
-                                    .catalog
-                                    .as_ref()
-                                    .and_then(|catalog| catalog.resolve(&req.model))
-                                {
-                                    Some(entry)
-                                        if entry
-                                            .thinking
-                                            .is_some_and(|spec| spec.accepts(level)) => {}
-                                    Some(entry) if entry.thinking_unsupported => {
-                                        // 用户已明确关闭，不再转发思考参数。
-                                        upstream
-                                            .as_object_mut()
-                                            .map(|body| body.remove("reasoning_effort"));
                                     }
-                                    Some(entry) => {
-                                        if let Some(spec) = entry.thinking {
-                                            // 保留用户选档，只在名单明确声明的能力边界内封顶；
-                                            // 未声明（unknown）不猜、也不强制改成名单默认档。
-                                            let capped = level.min(spec.max_level);
-                                            if capped != level {
-                                                eprintln!("[tianshu-relay] 网关将 reasoning 档位从 {} 降为名单上限 {}", level.as_str(), capped.as_str());
-                                            }
-                                            upstream["reasoning_effort"] =
-                                                serde_json::json!(capped.as_str());
+                                    upstream["reasoning_effort"] = serde_json::json!(level);
+                                }
+                            }
+                            translate::Protocol::OpenAiResponses => {
+                                if let Some(level) = req.reasoning_effort {
+                                    match state
+                                        .config
+                                        .catalog
+                                        .as_ref()
+                                        .and_then(|catalog| catalog.resolve(&req.model))
+                                    {
+                                        Some(entry)
+                                            if entry
+                                                .thinking
+                                                .is_some_and(|spec| spec.accepts(level)) => {}
+                                        Some(entry) if entry.thinking_unsupported => {
+                                            // 用户已明确关闭，不再转发思考参数。
+                                            upstream
+                                                .as_object_mut()
+                                                .map(|body| body.remove("reasoning_effort"));
                                         }
+                                        Some(entry) => {
+                                            if let Some(spec) = entry.thinking {
+                                                // 保留用户选档，只在名单明确声明的能力边界内封顶；
+                                                // 未声明（unknown）不猜、也不强制改成名单默认档。
+                                                let capped = level.min(spec.max_level);
+                                                if capped != level {
+                                                    eprintln!("[tianshu-relay] 网关将 reasoning 档位从 {} 降为名单上限 {}", level.as_str(), capped.as_str());
+                                                }
+                                                upstream["reasoning_effort"] =
+                                                    serde_json::json!(capped.as_str());
+                                            }
+                                        }
+                                        None => {}
                                     }
-                                    None => {}
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
+                        let json = upstream.to_string();
+                        (bytes::Bytes::from(json), Some(proto))
                     }
-                    let json = upstream.to_string();
-                    (bytes::Bytes::from(json), Some(proto))
-                }
-                Err(e) => {
-                    return local_error(
-                        StatusCode::BAD_REQUEST,
-                        GatewayErrorKind::InvalidRequest,
-                        e.code,
-                        e.message,
-                    );
+                    Err(e) => {
+                        return local_error(
+                            StatusCode::BAD_REQUEST,
+                            GatewayErrorKind::InvalidRequest,
+                            e.code,
+                            e.message,
+                        );
+                    }
                 }
             }
+            _ => (body, None),
         }
-        _ => (body, None),
     };
 
     // M39-S1：**每请求只取一次**路由视图（克隆一次 `Arc<GatewaySnapshot>` 就放锁）。
@@ -3175,7 +3220,7 @@ async fn proxy_inner(
         .as_ref()
         .and_then(|identity| state.sessions.lookup(identity, now))
         .and_then(|pin| {
-            if pin.upstream_protocol != UpstreamProtocol::OpenAiChat {
+            if pin.upstream_protocol != state.config.upstream_protocol {
                 return None;
             }
             sendable
@@ -3527,6 +3572,7 @@ async fn proxy_inner(
                     &session_identity,
                     upstream,
                     &usage_model,
+                    state.config.upstream_protocol,
                     view.generation(),
                     response.status().is_success(),
                 );
@@ -5624,6 +5670,24 @@ mod tests {
     fn extract_usage_from_json_finds_usage() {
         let body = br#"{"id":"chatcmpl-1","usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}"#;
         assert_eq!(extract_usage_from_json(body), Some((100, 50, 150)));
+    }
+
+    #[test]
+    fn extract_usage_from_json_accepts_anthropic_native_usage() {
+        let body = br#"{"type":"message","usage":{"input_tokens":9,"output_tokens":2}}"#;
+        assert_eq!(extract_usage_from_json(body), Some((9, 2, 11)));
+        let nested = br#"{"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}"#;
+        assert_eq!(extract_usage_from_json(nested), Some((12, 1, 13)));
+        let delta = br#"{"type":"message_delta","usage":{"output_tokens":7}}"#;
+        assert_eq!(
+            merge_usage_from_json(delta, Some((12, 1, 13))),
+            Some((12, 7, 19))
+        );
+        assert_eq!(
+            merge_usage_from_json(delta, None),
+            None,
+            "missing input token must remain unknown"
+        );
     }
 
     #[test]

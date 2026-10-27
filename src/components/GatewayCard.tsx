@@ -52,6 +52,9 @@ type Props = {
   /** M2：显式会话粘性灰度开关；缺省 = 关闭（兼容旧调用点）。 */
   sessionAffinity?: boolean;
   onSessionAffinityChange?: (enabled: boolean) => void;
+  /** M4：显式上游协议；缺省 = openai_chat（兼容旧调用点）。 */
+  upstreamProtocol?: "openai_chat" | "anthropic_messages";
+  onUpstreamProtocolChange?: (protocol: "openai_chat" | "anthropic_messages") => void;
   /** 密钥健康巡检间隔（秒，M46-UI B-237）：0 = 关，非 0 时 60..=86400。 */
   keyHealthIntervalSecs: number;
   /** 按 agent 路由规则 JSON（M46-S7）：空 = 无规则，走全局加权。 */
@@ -504,6 +507,8 @@ export default function GatewayCard({
   maxAttempts,
   sessionAffinity = false,
   onSessionAffinityChange,
+  upstreamProtocol = "openai_chat",
+  onUpstreamProtocolChange,
   keyHealthIntervalSecs,
   routingRules,
   onToggle,
@@ -1329,6 +1334,25 @@ export default function GatewayCard({
         <span>{t("gateway.sessionAffinityLabel")}</span>
       </label>
       <p className="muted">{t("gateway.sessionAffinityHint")}</p>
+
+      <label className="field">
+        <span>{t("gateway.upstreamProtocolLabel")}</span>
+        <select
+          className="input"
+          value={upstreamProtocol}
+          onChange={(e) =>
+            onUpstreamProtocolChange?.(
+              e.target.value as "openai_chat" | "anthropic_messages",
+            )
+          }
+        >
+          <option value="openai_chat">{t("gateway.upstreamProtocolChat")}</option>
+          <option value="anthropic_messages">
+            {t("gateway.upstreamProtocolAnthropic")}
+          </option>
+        </select>
+      </label>
+      <p className="muted">{t("gateway.upstreamProtocolHint")}</p>
 
       {/*
         M46-UI B-255：按 agent 路由规则改为结构化编辑器（agent 下拉取令牌

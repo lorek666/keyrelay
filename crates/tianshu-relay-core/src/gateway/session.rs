@@ -34,12 +34,22 @@ pub enum UpstreamProtocol {
 }
 
 impl UpstreamProtocol {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::OpenAiChat => "openai_chat",
             Self::OpenAiResponses => "openai_responses",
             Self::AnthropicMessages => "anthropic_messages",
             Self::GeminiGenerateContent => "gemini_generate_content",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "openai_chat" => Some(Self::OpenAiChat),
+            "openai_responses" => Some(Self::OpenAiResponses),
+            "anthropic_messages" => Some(Self::AnthropicMessages),
+            "gemini_generate_content" => Some(Self::GeminiGenerateContent),
+            _ => None,
         }
     }
 }

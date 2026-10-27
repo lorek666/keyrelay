@@ -118,6 +118,7 @@
 - 兼容端点：`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`、`GET /v1/models`（含 SSE 流式透传）。
 - agent 只用本地签发的 `local-` token（可撤销）；真实站点 key 留在保险库。
 - 路由：站点/模型路由表；上游 429 或确认未送达的连接失败可按优先级切换。5xx 原样返回、不在本次请求内换站重放，但会记录失败并参与熔断，冷却后探活回归。
+- 上游协议：默认 OpenAI Chat；可在设置中显式选择 Anthropic Messages 同协议直通（实验）。不自动猜测站点协议，协议不匹配会在发送前拒绝。
 - 成本控制：硬预算（v1 按 USD 计）、重试预算、分站点超时、分 agent 路由规则。
 - 请求日志默认只记元数据，不记正文。
 

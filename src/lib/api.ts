@@ -512,6 +512,8 @@ export type Settings = {
   gatewayMaxAttempts: number;
   /** M2：显式会话粘性开关；默认关，只有明确会话 id 时生效。 */
   gatewaySessionAffinity: boolean;
+  /** M4：显式上游协议；默认 openai_chat，首版额外支持 anthropic_messages。 */
+  gatewayUpstreamProtocol: "openai_chat" | "anthropic_messages";
   /** M46-S7：按 agent 路由规则 JSON（空 = 无规则）；保存后下次启动网关生效。 */
   routingRules: string;
   /** M46-S1：密钥健康巡检间隔秒（默认 0 = 关；非 0 时 60..=86400）。 */
@@ -2267,6 +2269,7 @@ export const MOCK_SETTINGS: Settings = {
   gatewayPerSiteBurst: 0,
   gatewayMaxAttempts: 0,
   gatewaySessionAffinity: false,
+  gatewayUpstreamProtocol: "openai_chat",
   routingRules: "",
   gatewayKeyHealthIntervalSecs: 0,
   theme: "system",

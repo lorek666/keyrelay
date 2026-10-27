@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tianshu_relay_core::gateway::{
-    GatewayConfig, GatewayHandle, GatewayTokenEntry, UpstreamTimeout,
+    session::UpstreamProtocol, GatewayConfig, GatewayHandle, GatewayTokenEntry, UpstreamTimeout,
 };
 use tianshu_relay_core::routing::{BreakerPolicy, RouteTable, SiteGuardPolicy, Upstream};
 use zeroize::Zeroizing;
@@ -17,6 +17,7 @@ const TOKEN: &str = "kr-gw-trace-test";
 struct FakeUpstream {
     port: u16,
     hits: Arc<AtomicUsize>,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 fn upstream(status: &'static str, body: &'static str) -> FakeUpstream {
@@ -24,12 +25,18 @@ fn upstream(status: &'static str, body: &'static str) -> FakeUpstream {
     let port = listener.local_addr().unwrap().port();
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&hits);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_for_thread = Arc::clone(&seen);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             counter.fetch_add(1, Ordering::SeqCst);
             let mut buffer = [0; 8192];
-            let _ = stream.read(&mut buffer);
+            let n = stream.read(&mut buffer).unwrap_or(0);
+            seen_for_thread
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buffer[..n]).to_string());
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -37,7 +44,7 @@ fn upstream(status: &'static str, body: &'static str) -> FakeUpstream {
             let _ = stream.write_all(response.as_bytes());
         }
     });
-    FakeUpstream { port, hits }
+    FakeUpstream { port, hits, seen }
 }
 
 fn candidate(site_id: i64, upstream: &FakeUpstream, rate: f64) -> Upstream {
@@ -59,6 +66,14 @@ async fn start(upstreams: Vec<Upstream>) -> GatewayHandle {
 }
 
 async fn start_with_affinity(upstreams: Vec<Upstream>, session_affinity: bool) -> GatewayHandle {
+    start_with_options(upstreams, session_affinity, UpstreamProtocol::OpenAiChat).await
+}
+
+async fn start_with_options(
+    upstreams: Vec<Upstream>,
+    session_affinity: bool,
+    upstream_protocol: UpstreamProtocol,
+) -> GatewayHandle {
     let mut keys = std::collections::HashMap::new();
     for upstream in &upstreams {
         keys.insert(
@@ -89,6 +104,7 @@ async fn start_with_affinity(upstreams: Vec<Upstream>, session_affinity: bool) -
         lb_top_n: 3,
         max_attempts: 0,
         session_affinity,
+        upstream_protocol,
         key_quotas: std::collections::HashMap::new(),
         guard_policy: SiteGuardPolicy::default(),
         runtime: None,
@@ -302,5 +318,67 @@ async fn malformed_session_identity_is_ignored_without_affinity() {
     );
     assert_eq!(a.hits.load(Ordering::SeqCst), 1);
     assert_eq!(b.hits.load(Ordering::SeqCst), 1, "非法身份不建立 pin");
+    handle.shutdown_and_wait().await;
+}
+
+fn request_native_anthropic(port: u16, body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let request = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TOKEN}\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).unwrap();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let status = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, text)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_anthropic_upstream_preserves_native_request_and_response() {
+    let response = r#"{"id":"msg_1","type":"message","content":[],"usage":{"input_tokens":9,"output_tokens":2}}"#;
+    let a = upstream("200 OK", response);
+    let mut candidate = candidate(1, &a, 1.0);
+    candidate.models = vec!["claude-native".into()];
+    let handle =
+        start_with_options(vec![candidate], false, UpstreamProtocol::AnthropicMessages).await;
+    let (status, body) = request_native_anthropic(
+        handle.addr.port(),
+        r#"{"model":"claude-native","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+    );
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("input_tokens"),
+        "原生响应不得被 Chat 翻译: {body}"
+    );
+    let seen = a.seen.lock().unwrap().join("\n");
+    assert!(
+        seen.contains("POST /v1/messages HTTP/1.1"),
+        "路径必须保持原生: {seen}"
+    );
+    assert!(seen.contains("anthropic-version: 2023-06-01"));
+    assert!(
+        seen.contains("\"max_tokens\":16"),
+        "原生 body 必须保留: {seen}"
+    );
+    assert!(!seen.contains("chat/completions"));
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_upstream_rejects_chat_before_sending() {
+    let a = upstream("200 OK", "{}");
+    let handle = start_with_options(
+        vec![candidate(1, &a, 1.0)],
+        false,
+        UpstreamProtocol::AnthropicMessages,
+    )
+    .await;
+    assert_eq!(
+        request(handle.addr.port(), r#"{"model":"gpt-trace","messages":[]}"#),
+        400
+    );
+    assert_eq!(a.hits.load(Ordering::SeqCst), 0, "协议不匹配不得发往上游");
     handle.shutdown_and_wait().await;
 }
