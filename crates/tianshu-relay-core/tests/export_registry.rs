@@ -53,6 +53,7 @@ fn setup() -> Fixture {
             vault,
             home,
             backup_dir,
+            data_dir: None,
         },
     );
 

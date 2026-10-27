@@ -205,6 +205,32 @@ async fn responses_e2e_on_the_legacy_path() {
     h.shutdown_and_wait().await;
 }
 
+#[tokio::test]
+async fn responses_reasoning_reaches_chat_as_reasoning_effort() {
+    let up = spawn_upstream("200 OK", &chat_response_text("好"));
+    let h = start_legacy(&up).await;
+    let token = h.token.clone();
+    let url = format!("http://{}", h.addr);
+    let body = json!({
+        "model": "o3",
+        "reasoning": {"effort": "high"},
+        "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "问" }] }]
+    })
+    .to_string();
+    let (status, resp) =
+        tokio::task::spawn_blocking(move || http_post(&url, &token, "/v1/responses", &body))
+            .await
+            .unwrap();
+    assert_eq!(
+        status, 200,
+        "Codex 自己写出的 reasoning 不能在本地 400: {resp}"
+    );
+    let sent = up.last_body();
+    assert_eq!(sent["reasoning_effort"], "high");
+    assert!(sent.get("reasoning").is_none());
+    h.shutdown_and_wait().await;
+}
+
 // ---------------------------------------------------------------- 2 Anthropic（路由）
 
 #[tokio::test]
@@ -352,7 +378,7 @@ async fn parse_failure_and_stream_never_touch_the_upstream() {
     assert!(resp.contains("reasoning"), "必须点名: {resp}");
 
     // ② 另一个不支持字段（流式已由 M42-S2b 支持，不再是拒绝理由）
-    let body = json!({ "model": "m", "max_tokens": 1, "messages": [], "thinking": {} }).to_string();
+    let body = json!({ "model": "m", "max_tokens": 1, "messages": [], "top_k": 5 }).to_string();
     let (status, resp) = tokio::task::spawn_blocking({
         let (url, token) = (url.clone(), token.clone());
         move || http_post(&url, &token, "/v1/messages", &body)
@@ -360,7 +386,7 @@ async fn parse_failure_and_stream_never_touch_the_upstream() {
     .await
     .unwrap();
     assert_eq!(status, 400, "{resp}");
-    assert!(resp.contains("thinking"), "必须点名: {resp}");
+    assert!(resp.contains("top_k"), "必须点名: {resp}");
 
     assert_eq!(
         up.count(),

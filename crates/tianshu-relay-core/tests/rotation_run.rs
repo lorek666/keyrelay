@@ -58,6 +58,7 @@ async fn setup(remote_id: Option<&str>) -> Fixture {
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 

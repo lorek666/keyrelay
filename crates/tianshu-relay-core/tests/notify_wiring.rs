@@ -73,6 +73,7 @@ fn setup() -> Fixture {
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     )
     .with_notify(silent_notify());

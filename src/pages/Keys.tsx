@@ -91,7 +91,7 @@ export default function Keys() {
    */
   const [rotationSuggesting, setRotationSuggesting] = useState(false);
   const [rotationResult, setRotationResult] = useState<RotationRun | null>(null);
-  // 回收站点侧密钥（B-82）：先出二次确认，确认里还要**明确勾选**才会带 `confirm=true`
+  // 删除站点侧密钥（B-82）：先出二次确认，确认里还要**明确勾选**才会带 `confirm=true`
   const [revoking, setRevoking] = useState<StoredKeyRow | null>(null);
   const [revokeAgreed, setRevokeAgreed] = useState(false);
 
@@ -182,9 +182,18 @@ export default function Keys() {
 
   // 主表用**本地已存密钥**（投递需要它的本地 id）；站点侧列表只作对照
   const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
+  /**
+   * 可见的本地密钥（M47-S1）。
+   *
+   * 界面上的「删除」现在是**物理删行**：删掉的那一行不会留在库里，也就不会再回到
+   * 任何列表里。这里再排除一次 `status === "revoked"` 是给**旧版本留下的历史行**兜底
+   * ——那些行没被删掉，但语义上等同「已删除」，同样不该出现在资产里。用户的原话是
+   * 「删除后的密钥不用再显示」，所以这里连计数都不留：列表里彻底看不到它们。
+   */
+  const liveKeys = (keys.data ?? []).filter((k) => k.status !== "revoked");
   // 主表跟随所选站点（M9-S4 / D）：此前站点下拉只管「新建 / 对齐 / 对照」，主表却列全部站点，
   // 表里又没有站点列——同名规范（`app-id/agent-id/日期`）下根本分不出哪把是哪个站的。
-  const siteKeys = (keys.data ?? []).filter((k) => k.siteId === activeSite);
+  const siteKeys = liveKeys.filter((k) => k.siteId === activeSite);
   const remote = useQuery({
     queryKey: ["remote-keys", activeSite],
     queryFn: () => listKeys(activeSite!),
@@ -198,12 +207,12 @@ export default function Keys() {
     mutationFn: () => revokeKey(revoking!.siteId, revoking!.remoteId!, true),
     onSuccess: async (report) => {
       setError(null);
-      // B-100：站点侧删掉了（不可逆）与本地记账写上了是**两件事**。本地状态没写上时
+      // B-100：站点侧删掉了（不可逆）与本地行删掉了是**两件事**。本地删行失败时
       // 整体仍然是成功——把不可逆的成功报成失败会让用户去重试一次注定失败的删除，
-      // 所以这里说的是「已回收，但本地状态没记上」。
+      // 所以这里说的是「已删除，但本地记录没删掉」。
       setNotice(
         t("keys.notice.revokedPre", { name: revoking?.name ?? "" }) +
-          (report.localStatusUpdated ? "" : t("keys.notice.revokedLocalFail")) +
+          (report.localRowDeleted ? "" : t("keys.notice.revokedLocalFail")) +
           (report.note ? t("keys.notice.revokedNote", { note: report.note }) : ""),
       );
       setRevokeAgreed(false);
@@ -440,7 +449,7 @@ export default function Keys() {
                     <td>{due.name}</td>
                     <td className="mono">{formatTs(due.dueAt)}</td>
                     <td>
-                      {/* 轮换是「建 / 读 / 回收」三连，缺一不可（M7-S2 §3.3） */}
+                      {/* 轮换是「建 / 读 / 删除」三连，缺一不可（M7-S2 §3.3） */}
                       <CapButton
                         allowed={rotationAllowed(capsFor(due.siteId))}
                         reason={capReason(
@@ -519,9 +528,13 @@ export default function Keys() {
         {keys.data?.length === 0 ? (
           <p className="muted empty">{t("keys.emptyStates.noKeys")}</p>
         ) : null}
-        {/* 两种空不能混成一句：「本地一把都没有」与「这个站下没有」处理方式不同 */}
-        {keys.data?.length && siteKeys.length === 0 ? (
-          <p className="muted empty">{t("keys.emptyStates.noSiteKeys", { count: keys.data.length })}</p>
+        {/* 三种空不能混成一句（M47-S1 加了第三种）：「本地一把都没有」/「本地只剩已删除的行」/
+            「这个站下没有」处理方式完全不同，合并会把用户引到错误的下一步。 */}
+        {keys.data && keys.data.length > 0 && liveKeys.length === 0 ? (
+          <p className="muted empty">{t("keys.emptyStates.allDeleted")}</p>
+        ) : null}
+        {liveKeys.length && siteKeys.length === 0 ? (
+          <p className="muted empty">{t("keys.emptyStates.noSiteKeys", { count: liveKeys.length })}</p>
         ) : null}
 
         {siteKeys.length ? (
@@ -554,8 +567,8 @@ export default function Keys() {
                     <td className="mono">{key.group ?? "—"}</td>
                     {groupRateCell(key.group)}
                     <td>
-                      {/* `revoked`（我回收的·本地）与 `disabled`（站点禁的）**必须能分开**：
-                          恢复方式不同，混成一个词会让用户不知道去哪处理（M7-S4）。 */}
+                      {/* `revoked`（我删掉的·本地·只剩旧版本历史行）与 `disabled`（站点禁的）
+                          **必须能分开**：恢复方式不同，混成一个词会让用户不知道去哪处理（M7-S4）。 */}
                       <span
                         className={`badge badge-${statusTone(key.status)}`}
                         title={statusHint(key.status)}
@@ -889,7 +902,8 @@ export default function Keys() {
       </ConfirmDialog>
 
       {/*
-        回收站点侧密钥（B-82）。破坏性且**不可逆**：站点上那把 key 真的没了。
+        删除站点侧密钥（B-82）。破坏性且**不可逆**：站点上那把 key 真的没了，
+        本地这一行也会被删掉（M47-S1）。
         所以 `confirm=true` 只能来自这里的**明确勾选**——默认 false，不勾就点不动
         （后端也会拒绝 `confirm=false`，两处都不给「无参数即执行」的形态）。
       */}
@@ -1000,7 +1014,9 @@ function rotationStepLabel(step: string): string {
 /**
  * 状态文案。**两套词表必须能区分**（M7-S4 / 冻结契约 7）：
  *
- * - `"revoked"` 是**本地**状态：用户在本产品里把它在站点侧回收了（`store::KEY_STATUS_REVOKED`）；
+ * - `"revoked"` 是**本地**状态：用户在本产品里把它在站点上删掉了（`store::KEY_STATUS_REVOKED`）。
+ *   M47-S1 起「删除」是物理删行，所以新数据里这个值不会再出现；它只剩一种来源——
+ *   **旧版本留下的历史行**（那些行也会被列表过滤掉）；
  * - `"disabled"` 是**站点**状态：站点自己把它禁用了。
  *
  * 用同一个词显示这两件事，用户就不知道该去哪里恢复——一个是「我干的、不可逆」，
@@ -1038,12 +1054,12 @@ function statusTone(status: string): string {
   if (status === "enabled") return "ok";
   if (status === "disabled") return "warn";
   if (status === "exhausted") return "danger";
-  // 已回收 = 站点侧真的没了，不能看着像「未知」那样无害
+  // 已删除 = 站点侧真的没了，不能看着像「未知」那样无害
   if (status === "revoked") return "danger";
   return "muted";
 }
 
-/** 轮换的三连门槛：建 / 读 / 回收**缺一不可**（M7-S2 §3.3）。 */
+/** 轮换的三连门槛：建 / 读 / 删除**缺一不可**（M7-S2 §3.3）。 */
 function rotationAllowed(caps: SiteRow["capabilities"] | undefined): boolean {
   if (!caps) return false;
   return caps.createKey && caps.revealKey && caps.revokeKey;
@@ -1069,9 +1085,9 @@ function capReason(
 }
 
 /**
- * 单把密钥能不能回收。三个条件各自有各自的**原因文案**——灰显必须说明原因，
+ * 单把密钥能不能删除。三个条件各自有各自的**原因文案**——灰显必须说明原因，
  * 否则用户只会觉得按钮坏了（`capabilities.revokeKey` 是站点类型问题，
- * 缺 `remoteId` / 已回收是这把 key 自己的状态问题，处理方式完全不同）。
+ * 缺 `remoteId` / 已删除是这把 key 自己的状态问题，处理方式完全不同）。
  */
 function revokeGate(
   site: SiteRow | undefined,

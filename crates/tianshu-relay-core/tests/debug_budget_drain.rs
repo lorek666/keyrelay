@@ -57,6 +57,7 @@ fn fixture(limit_usd: f64) -> Fixture {
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     Fixture {

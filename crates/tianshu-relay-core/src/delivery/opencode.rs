@@ -362,6 +362,10 @@ mod tests {
         let meta = crate::model_meta::ModelMeta {
             context_window: 200_000,
             max_output_tokens: 32_000,
+            thinking: None,
+            thinking_unsupported: false,
+            protocol: crate::model_catalog::UpstreamProtocol::OpenAiChat,
+            anthropic_compatible: false,
         };
         let writer = OpenCodeWriter::with_path_and_meta(
             dir.path().join("opencode.json"),

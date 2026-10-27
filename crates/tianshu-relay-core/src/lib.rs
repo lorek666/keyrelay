@@ -14,6 +14,7 @@ pub mod error;
 pub mod export;
 pub mod gateway;
 pub mod inject;
+pub mod model_catalog;
 pub mod model_meta;
 pub mod naming;
 pub mod notify;

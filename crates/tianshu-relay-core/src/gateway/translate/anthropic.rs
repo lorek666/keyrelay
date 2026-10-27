@@ -17,6 +17,10 @@ const ALLOWED: &[&str] = &[
     "tool_choice",
     "stream",
     "metadata",
+    // M47-S2：`thinking` 现在**放行**——是否真的生效由网关按内置模型名单决定
+    // （名单说支持 ⇒ 折算成上游 Chat 的 `reasoning_effort`，否则丢弃）。
+    // 这里仍保留「点名拒绝未知字段」的纪律：只有这个字段被显式加进白名单。
+    "thinking",
 ];
 
 pub fn parse_request(v: &Value) -> Result<ChatRequest, TranslateError> {
@@ -204,6 +208,7 @@ pub fn parse_request(v: &Value) -> Result<ChatRequest, TranslateError> {
             })
             .unwrap_or_default(),
         tools,
+        reasoning_effort: None,
         stream: false,
     })
 }

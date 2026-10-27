@@ -67,7 +67,7 @@ export default function BudgetsCard() {
       ? t("usage.budgets.keyAll")
       : (storedKeys.data?.find((k) => k.id === id)?.name ?? `Key ${id}`);
   const keysForSite = (storedKeys.data ?? []).filter(
-    (k) => siteId === "" || k.siteId === Number(siteId),
+    (k) => (siteId === "" || k.siteId === Number(siteId)) && k.status !== "revoked",
   );
 
   return (

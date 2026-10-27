@@ -99,6 +99,7 @@ fn routed_config(
         );
     }
     GatewayConfig {
+        catalog: None,
         port: 0,
         max_request_bytes: 16 * 1024 * 1024,
         token: token.to_string(),

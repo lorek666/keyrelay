@@ -46,6 +46,7 @@ fn setup() -> Fixture {
             vault,
             home,
             backup_dir: backup_dir.clone(),
+            data_dir: None,
         },
     );
 
@@ -355,6 +356,7 @@ fn export_strips_embedded_credentials_from_the_site_url() {
             vault: Arc::new(MemoryVault::new()),
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 

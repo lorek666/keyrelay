@@ -36,7 +36,7 @@ fn v3_database_gets_alias_table_and_keeps_rows() {
     let store = Store::open(&path).expect("open v3");
     // M39-S1：schema 6 → 7（新增 site_model_catalog / site_model_sync）；
     // M40-S1：7 → 8（gateway_usage_log 六列）；M43-S1：8 → 9（gateway_tokens + usage token 归因）；M43-S2：9 → 10（model_prices / site_bills）。
-    assert_eq!(store.schema_version().unwrap(), 10, "迁移到 v10");
+    assert_eq!(store.schema_version().unwrap(), 11, "迁移到当前 v11");
     // 老数据零丢失
     let sites = store.list_sites().expect("list_sites");
     assert_eq!(sites.len(), 1, "老数据零丢失");
@@ -50,7 +50,7 @@ fn v3_database_gets_alias_table_and_keeps_rows() {
     // 二次 open 幂等：不报 duplicate / 不丢数据
     drop(store);
     let again = Store::open(&path).expect("二次 open");
-    assert_eq!(again.schema_version().unwrap(), 10, "M43-S2：v10");
+    assert_eq!(again.schema_version().unwrap(), 11, "当前版本 v11");
     assert_eq!(again.list_sites().unwrap().len(), 1);
 }
 

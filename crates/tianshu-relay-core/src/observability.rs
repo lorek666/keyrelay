@@ -31,8 +31,14 @@ use crate::redact::scrub_event_message;
 /// 两条处置（加白名单 / 改成 `"app"`）里选**加白名单**：通知是「本产品主动发出去的东西」，
 /// 与「应用做了什么」是两类事实；归一成 `"app"` 会**丢掉**这个区分，而白名单的用途正是
 /// 枚举已知来源。代价是数组长度 8 → 9，行为对既有事件零影响（`"app"` 仍在白名单里）。
-pub const SOURCES: [&str; 9] = [
+pub const SOURCES: [&str; 10] = [
     "app", "site", "key", "delivery", "vault", "store", "gateway", "probe", "notify",
+    // M47-S2：内置模型名单的同步（失败时留痕）。
+    //
+    // 不加白名单会被 `normalize_source` 归一成 `"app"`——实测踩过一次：代码里写
+    // `"catalog"`，事件表里却是 `app`，按来源筛「名单为什么没更新」筛不到。
+    // 与 `notify` / `probe` 两条历史教训同源，处置也一致：加白名单。
+    "catalog",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

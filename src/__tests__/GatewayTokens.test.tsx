@@ -95,7 +95,7 @@ function renderCard() {
 }
 
 const section = () =>
-  screen.getByText(zhCN.gateway.tokens.title).closest(".card") as HTMLElement;
+  document.querySelector(".gateway-tokens-panel") as HTMLElement;
 
 beforeEach(() => {
   vi.clearAllMocks();

@@ -58,6 +58,7 @@ fn setup_with_base(base_url: &str) -> Fixture {
             vault,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 

@@ -147,7 +147,7 @@ fn unbinding_does_not_touch_the_key_status() {
     assert_ne!(
         status.as_deref(),
         Some(KEY_STATUS_REVOKED),
-        "解绑不得把 key 标成已回收（那是另一个动作，且不可逆）"
+        "解绑不得把 key 标成已删除（那是另一个动作，且不可逆）"
     );
 }
 
@@ -201,8 +201,8 @@ fn opening_a_v2_database_adds_the_unbound_column_without_losing_data() {
 
     assert_eq!(
         store.schema_version().unwrap(),
-        10,
-        "版本号升到 10（M39-S1 是 7，M40-S1 是 8，M43-S1 是 9，M43-S2 新增 model_prices/site_bills）"
+        11,
+        "版本号升到 11（M47-S2 新增价格来源，旧库经各版本迁移）"
     );
     let rows = store.bindings_of_agent("codex").unwrap();
     assert_eq!(rows.len(), 1, "老数据必须还在");
@@ -224,7 +224,7 @@ fn reopening_a_migrated_database_is_idempotent() {
 
     for round in 1..=3 {
         let store = Store::open(&path).unwrap_or_else(|e| panic!("第 {round} 次打开失败: {e}"));
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
     }
 }
 

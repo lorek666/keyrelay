@@ -34,6 +34,28 @@
     "delivery": "Delivery",
     "settings": "Settings"
   },
+  "shell": {
+    "tagline": "Local AI workspace",
+    "navigation": "Main navigation",
+    "workspace": "Workspace",
+    "localWorkspace": "Local workspace",
+    "localOnly": "Your data stays on this device",
+    "gatewaySettings": "Open gateway settings",
+    "gatewayPhase": {
+      "running": "Running",
+      "stopped": "Stopped",
+      "crashed": "Crashed"
+    },
+    "pages": {
+      "cockpit": "A clear view of your sites, keys, agents, and runtime.",
+      "traffic": "Explore gateway requests, token trends, and site distribution.",
+      "cost": "Manage budgets, cost estimates, and site billing.",
+      "health": "Resolve site issues, probe keys, and review configuration drift.",
+      "assets": "Manage relay sites, sessions, and API keys in one place.",
+      "delivery": "Deliver connections to agents with a safe way to roll back.",
+      "settings": "Configure gateway, network, notifications, and local data."
+    }
+  },
   "usage": {
     "cost": {
       "title": "Cost (estimated)",
@@ -105,7 +127,7 @@
       "title": "Site bills (self-reported)",
       "note": "**All** traffic on the site side (including direct agents). A different scope from the estimate above — they must not be subtracted. Import is read-only.",
       "site": "Site",
-        "siteLabel": "Bill site",
+      "siteLabel": "Bill site",
       "sitePlaceholder": "Pick a site",
       "currency": "Site currency",
       "currencyAuto": "Auto (as reported)",
@@ -324,7 +346,54 @@
     }
   },
   "cockpit": {
-    "live": "LIVE"
+    "live": "LIVE",
+    "heroEyebrow": "YOUR LOCAL AI CONTROL CENTER",
+    "heroTitle": "Every connection, clearly under control.",
+    "heroBody": "Sites, keys, and agents working together, with every important signal within reach.",
+    "localData": "Local data, securely managed",
+    "gatewayIdle": "Not started · loopback only",
+    "manageGateway": "Manage gateway",
+    "summary": "Runtime overview",
+    "healthySites": "{count} healthy sessions",
+    "keyStorage": "Managed in the local vault",
+    "agentAccess": "Authorized agent channels",
+    "recentEvents": "Last 20 events",
+    "externalChanges": "Changes needing review",
+    "attentionTitle": "Needs attention",
+    "attentionBody": "Signals that can affect connections and delivery, in one place.",
+    "allClear": "Everything looks healthy",
+    "allClearBody": "No sign-in, configuration, or alert items need your attention right now.",
+    "loginNeeded": "This site's session has expired. Sign in again to reconnect.",
+    "viewAssets": "Open assets",
+    "reviewDelivery": "Review delivery",
+    "viewHealth": "View health details",
+    "allHealth": "View all health signals",
+    "driftHelp": "About configuration drift and rollback",
+    "activityTitle": "Activity overview",
+    "activityBody": "Only requests through your local gateway are counted.",
+    "viewTraffic": "View traffic analytics",
+    "noActivity": "No gateway activity yet. Make a request and your usage will appear here.",
+    "quickActions": "Quick actions",
+    "quickAssets": "Manage sites & keys",
+    "quickAssetsBody": "Connect sites, check balances and groups",
+    "quickDelivery": "Configure agents",
+    "quickDeliveryBody": "Preview changes and deliver safely",
+    "quickSettings": "Tune your workspace",
+    "quickSettingsBody": "Gateway, notifications, and preferences",
+    "systemDetails": "Runtime & data details",
+    "getStarted": "GET STARTED",
+    "onboardingTitle": "Make your first connection in three steps",
+    "onboardingBody": "From site to agent, Tianshu Relay guides you through the whole flow.",
+    "steps": {
+      "assets": "Connect a site",
+      "delivery": "Deliver to an agent",
+      "settings": "Enable the gateway"
+    },
+    "stepBodies": {
+      "assets": "Sign in and choose or create an API key",
+      "delivery": "Preview the diff with backup and rollback",
+      "settings": "Manage multiple sites through one connection"
+    }
   },
   "sites": {
     "title": "Add a new site",
@@ -419,7 +488,7 @@
       "sync": "Sync site keys",
       "syncing": "Syncing site keys…",
       "rotate": "Rotate…",
-      "revoke": "Revoke"
+      "revoke": "Delete"
     },
     "sync": {
       "hintPre": "Fetches the plaintext of existing site-side keys into the local vault. Plaintext ",
@@ -429,9 +498,9 @@
       "unreadable": " / site gave no plaintext for {count} keys ({list}), these can only be deleted and recreated"
     },
     "rotation": {
-      "warnPre": "{count} keys have reached the rotation window. Rotation is a three-step \"create → reinject-all → revoke-old\", ",
+      "warnPre": "{count} keys have reached the rotation window. Rotation is a three-step \"create → reinject-all → delete-old\", ",
       "warnStrong": "if any step fails it stops immediately",
-      "warnPost": ", never leaving a state of \"old key revoked but new key not injected\".",
+      "warnPost": ", never leaving a state of \"old key deleted but new key not injected\".",
       "hint": "\"Rotate…\" first shows a preview (which delivery targets are affected); it only acts after confirmation."
     },
     "table": {
@@ -456,11 +525,11 @@
       "enabled": "Enabled",
       "disabled": "Site-disabled",
       "exhausted": "Exhausted",
-      "revoked": "Revoked",
+      "revoked": "Deleted",
       "unknown": "Unknown"
     },
     "statusHint": {
-      "revoked": "Local state: you revoked it on the site (irreversible). Local record kept for tracing and drift tracking.",
+      "revoked": "Local state: you deleted it on the site (irreversible). Rows like this can only come from older versions—deleting now removes the record outright and the list no longer shows it.",
       "disabled": "Site state: the site disabled this token—unrelated to this product.",
       "other": "Raw status from site: {status}"
     },
@@ -474,7 +543,8 @@
       "loadingKeys": "Loading…",
       "keysError": "Read failed: {error}",
       "noKeys": "No local keys yet. Click \"New key\"—on success the key goes straight into the local encrypted vault.",
-      "noSiteKeys": "No local keys under this site ({count} under other sites, switch above to see them)."
+      "noSiteKeys": "No local keys under this site ({count} under other sites, switch above to see them).",
+      "allDeleted": "Every remaining local key has been deleted—deleted keys are no longer shown. Click \"New key\" if you need one."
     },
     "footnote": "Key plaintext lives only in the local encrypted vault; the backend never returns plaintext to the UI. Delivery uses the \"Local id\" above.",
     "createDialog": {
@@ -503,7 +573,7 @@
       "step1": "Create a new key on the site (plaintext goes straight to the local encrypted vault)",
       "step2All": "Re-deliver the new key to all delivery targets (none bound now, this step is a no-op)",
       "step2Some": "Re-deliver the new key to {count} targets: {channels}",
-      "step3Revoke": "Revoke the old key on the site (remote id {id})—irreversible",
+      "step3Revoke": "Delete the old key on the site (remote id {id})—irreversible, and the local record is removed too",
       "step3Skip": "Old key has no site-side id; this step is skipped (not a failure)",
       "groupInherit": "The new key will stay in the old key's group \"{group}\"; if that group no longer exists on the site, rotation is refused before anything is created (no unusable key is left behind).",
       "groupCheck": {
@@ -511,21 +581,21 @@
         "checking": "Checking…",
         "matched": "Group \"{group}\" still exists on the site; rotation will bind to it.",
         "renamed": "The group was renamed on the site: \"{oldName}\" → \"{newName}\". Rotation will bind to the renamed group.",
-        "missing": "Group \"{group}\" no longer exists on the site. Rotation will be refused before anything is created; the old key will not be revoked.",
-        "missingNoId": "Group \"{group}\" was not found on the site. This local record has no site-side group id, so matching is by name only—a site-side rename is indistinguishable. Rotation will be refused before anything is created; the old key will not be revoked.",
+        "missing": "Group \"{group}\" no longer exists on the site. Rotation will be refused before anything is created; the old key will not be deleted.",
+        "missingNoId": "Group \"{group}\" was not found on the site. This local record has no site-side group id, so matching is by name only—a site-side rename is indistinguishable. Rotation will be refused before anything is created; the old key will not be deleted.",
         "unavailable": "Couldn't check the group: {reason}"
       },
-      "unmappedError": "Channels for targets {targets} can't be identified; rotation would miss them. If you proceed and revoke the old key, they'd be stuck on it forever. Fix these targets first—this action is blocked.",
+      "unmappedError": "Channels for targets {targets} can't be identified; rotation would miss them. If you proceed and delete the old key, they'd be stuck on it forever. Fix these targets first—this action is blocked.",
       "newNameLabel": "Name for the new key",
       "stopCodex": "Rotation re-delivers the new key to Codex: any running Codex is stopped before writing (including terminal sessions)—graceful quit first, forced kill if it is still running after the timeout; it is not relaunched automatically afterwards, restart it from the restart section or its launch command.",
       "stopClaudeDesktop": "Rotation re-delivers the new key to Claude Desktop: any running Claude Desktop is stopped before writing (the desktop app only reads its config at startup, so writing while it runs may be overwritten on launch)—graceful quit first, forced kill if it is still running after the timeout; it is not relaunched automatically afterwards, restart it from the restart section.",
       "cliNotStopped": "Rotation re-delivers to CLI-based channels too: they are not stopped before writing—if such a tool is running, it may write its old config back on exit and overwrite this rotation. Quit it before confirming, and relaunch it afterwards to verify."
     },
     "rotationResult": {
-      "revokeRevoked": "Old key revoked on the site.",
-      "revokeSkipped": "Old key has no site-side id; revoke skipped—check manually on the site whether it needs deletion.",
-      "revokeFailed": "Old key revoke failed: {reason}. It's still valid; retry or delete it manually on the site.",
-      "revokeNotAttempted": "Old key not revoked (stopped on a prior failed step). It's still valid and usable.",
+      "revokeRevoked": "Old key deleted on the site (local record removed too).",
+      "revokeSkipped": "Old key has no site-side id; delete skipped—check manually on the site whether it needs deletion.",
+      "revokeFailed": "Old key deletion failed: {reason}. It's still valid; retry or delete it manually on the site.",
+      "revokeNotAttempted": "Old key not deleted (stopped on a prior failed step). It's still valid and usable.",
       "completedPre": "Rotation completed: new key {masked} delivered to ",
       "completedNoTargets": "0 targets (none bound originally).",
       "completedTargets": "{targets}.",
@@ -539,38 +609,38 @@
     },
     "rotationStep": {
       "create_new": "Create new key",
-      "revoke_old": "Revoke old key",
+      "revoke_old": "Delete old key",
       "reinject_all": "Reinject all"
     },
     "revokeDialog": {
-      "title": "Revoke key on site",
-      "confirming": "Revoking…",
-      "confirm": "Confirm revoke",
-      "bodyPre": "Will revoke \"{name}\" on the site (remote id ",
+      "title": "Delete key on site",
+      "confirming": "Deleting…",
+      "confirm": "Confirm delete",
+      "bodyPre": "Will delete \"{name}\" on the site (remote id ",
       "bodyMid": "). This key ",
       "bodyStrong": "fails immediately",
       "bodyPost": " on the site; anyone still using it will be rejected.",
       "localKeepPre": "The local record ",
-      "localKeepStrong": "is not",
-      "localKeepPost": " deleted—it's marked \"revoked\" and kept, since `bindings` and drift tracing depend on it. Old values already written to agent configs need to be re-delivered to overwrite.",
-      "agree": "I confirm revoking this key on the site and understand it's irreversible (site-side unrecoverable)"
+      "localKeepStrong": "is also",
+      "localKeepPost": " deleted: this key disappears from every list, and its delivery bindings, per-key usage samples and probe history go with it (only a named audit event remains). Old values already written to agent configs need to be re-delivered to overwrite.",
+      "agree": "I confirm deleting this key: site-side it's unrecoverable, and the local record plus its bindings are deleted too"
     },
     "capReason": {
       "unsupportedCreate": "This site type doesn't support creating keys on the site",
       "noSite": "Add a site first (or the site list hasn't loaded)",
-      "rotationMissing": "Rotation needs create / read / revoke all three; this type is missing one",
+      "rotationMissing": "Rotation needs create / read / delete all three; this type is missing one",
       "noListEndpoint": "This site type has no key-list endpoint",
       "noReveal": "Site doesn't expose plaintext read-back",
       "siteNotFound": "Can't find the site record for this key",
-      "unsupportedRevoke": "This site type doesn't support revocation",
+      "unsupportedRevoke": "This site type doesn't support deletion",
       "noRemoteId": "This key has no site-side id; the site can't locate it",
-      "alreadyRevoked": "Already revoked on the site (local record kept)"
+      "alreadyRevoked": "Already deleted on the site (such rows only come from older versions and are no longer listed)"
     },
     "siteSelect": "Site",
     "notice": {
       "created": "Created {name} ({masked}); key stored in the local encrypted vault",
-      "revokedPre": "Revoked \"{name}\" on the site. Local record is marked \"revoked\" and kept—the site-side key is gone; this is irreversible.",
-      "revokedLocalFail": "Note: local status wasn't written (see below); the next reconciliation will retry.",
+      "revokedPre": "Deleted \"{name}\": the site-side key is gone and the local record was removed, so it won't show up in any list again. This is irreversible.",
+      "revokedLocalFail": " Local cleanup was incomplete: the site key is deleted, but a hidden, disabled local record remains so it can be cleaned up later (see below).",
       "revokedNote": "\n{note}"
     }
   },
@@ -582,7 +652,7 @@
       "model": "Model",
       "modelPlaceholder": "e.g. gpt-4o",
       "keyPlaceholder": "(pick one)",
-      "revokedHidden": "{count} revoked key(s) hidden (they are gone on the site and must not be delivered again)",
+      "revokedHidden": "{count} deleted key(s) hidden (they are gone on the site and must not be delivered again)",
       "modelLoading": "Loading models…",
       "modelFetchFailed": "Could not load the model list; you can type one manually, or retry after signing in",
       "modelRetry": "Retry",
@@ -612,7 +682,7 @@
       "writeWhat": "Writing",
       "willWrite": "Will write",
       "restart": "Takes effect",
-      "endpointOutOfScope": "Note: this channel does **not** write an endpoint — it only writes the token. The agent will still send requests to the site, but it holds the local gateway token, so the site will reject them (401). To route this agent through the gateway, change its own endpoint config (e.g. base_url in Codex's ~/.codex/config.toml).",
+      "endpointOutOfScope": "Note: this channel does not write an endpoint — it only writes the token. The agent will still send requests to the site, but it holds the local gateway token, so the site will reject them (401). To route this agent through the gateway, change its own endpoint config (e.g. base_url in Codex's ~/.codex/config.toml).",
       "consentGranted": "Granted",
       "consentRevoked": "Revoked",
       "consentMissing": "Not granted",
@@ -673,7 +743,7 @@
         "referencingLabel": "Profiles referencing this credential:",
         "checkedLabel": "Profiles checked:",
         "unreadableLabel": "Unreadable (not counted as references):",
-      "unreadableDirsLabel": "Directories that failed to scan (not “no profiles”; fix permissions and re-deliver):"
+        "unreadableDirsLabel": "Directories that failed to scan (not “no profiles”; fix permissions and re-deliver):"
       }
     },
     "restartHint": {
@@ -729,7 +799,8 @@
       "apply": "Deliver",
       "revoke": "Revoke consent",
       "rollback": "Roll back this delivery",
-      "unbind": "Unbind {agent}"
+      "unbind": "Unbind {agent}",
+      "applying": "Delivering…"
     },
     "lastDelivery": {
       "title": "Last delivery",
@@ -811,9 +882,9 @@
       "unbound": "Unbound {count} bindings this time.",
       "noneUnbound": "No new bindings unbound this time.",
       "alreadyUnbound": "Another {count} were already unbound.",
-      "revokedOk": "Revoked",
-      "revokedFail": "Revoke failed",
-      "localFail": "Deleted on the site (irreversible), but local status wasn't written.",
+      "revokedOk": "Deleted",
+      "revokedFail": "Delete failed",
+      "localFail": "Deleted on the site (irreversible), but the local record wasn't deleted.",
       "siteLine": "Site #{siteId} · {remoteId}",
       "localOnly": "(no site-side id locally)"
     },
@@ -850,9 +921,10 @@
       "bodyPre": "Unbind only removes the Tianshu Relay↔agent-config binding; it ",
       "bodyStrong": "does not",
       "bodyPost": " touch the site-side key. Written file content stays as-is; you can still roll back that delivery on the Change History page.",
-      "alsoRevokePre": "Also revoke the site-side key (",
+      "alsoRevokePre": "Also delete the site-side key (",
       "alsoRevokeStrong": "irreversible",
-      "alsoRevokePost": ": deleted on the site, programs using it elsewhere fail immediately)"
+      "alsoRevokePost": ": deleted on the site, programs using it elsewhere fail immediately)",
+      "revokeDataWarning": "Deleting also removes the local key record, delivery bindings, per-key usage samples, probe history and key-level budget. Re-deliver to overwrite old values already written to agent configs."
     },
     "notice": {
       "delivered": "Delivered to {path} (change {journal}). {hint} Action: {action}; source: {source}.",
@@ -861,12 +933,18 @@
       "rolledBack": "Rolled back {journal}."
     },
     "delivery": {
-      "clineDesktopDelisted": "Cline Desktop does not support direct file delivery; use the cline auth CLI instead"
+      "clineDesktopDelisted": "Cline Desktop does not support direct file writes; use the cline auth CLI"
     },
     "workbench": {
       "title": "Supported agents ({count})",
       "hint": "One row per target. If it is installed, pick a key/model and expand the preview; if not, install it first, then re-detect.",
-      "detectFailed": "Detection failed: {error}"
+      "detectFailed": "Detection failed: {error}",
+      "searchLabel": "Search agents",
+      "searchPlaceholder": "Search name or channel…",
+      "installedOnly": "Installed only",
+      "resultCount": "Showing {shown} of {total} targets",
+      "empty": "No matching agents. Clear the search or turn off the installed-only filter.",
+      "clearFilters": "Clear filters"
     },
     "row": {
       "detecting": "Detecting…",
@@ -888,6 +966,19 @@
       "url": "Install page",
       "close": "Close",
       "empty": "The backend returned no install command; follow that agent's official docs."
+    },
+    "workflow": {
+      "label": "Delivery progress",
+      "configure": "Choose site and agent",
+      "review": "Review and confirm",
+      "result": "Result and rollback"
+    },
+    "secondary": {
+      "updatesTitle": "Agent updates",
+      "updatesHint": "Check versions and install updates without changing your delivery configuration.",
+      "accessTitle": "Consent & bindings",
+      "accessHint": "Review recorded consent and read-only targets, or unbind a configuration.",
+      "resultTitle": "Latest delivery result"
     }
   },
   "history": {
@@ -937,7 +1028,91 @@
     },
     "notice": "Rolled back {target} (change {journal})."
   },
+  "catalog": {
+    "title": "Built-in model catalog",
+    "body": "The catalog carries each model's context window, max output, protocol, price and thinking tiers. Delivering a model auto-fills these—no manual entry. It syncs once a day from the public repo and keeps the old copy when a sync fails.",
+    "source": {
+      "remote": "From GitHub",
+      "bundled": "Bundled",
+      "empty": "No catalog"
+    },
+    "summary": "{entries} models · {overrides} overridden locally",
+    "generatedAt": "Generated {at}",
+    "syncNow": "Sync now",
+    "syncing": "Syncing…",
+    "syncDone": "Synced: {accepted} models ({skipped} invalid skipped).",
+    "syncUnchanged": "Remote catalog unchanged.",
+    "statusFailed": "Could not read the catalog status: {error}",
+    "lastError": "Last catalog sync problem: {error}",
+    "autoSync": "Sync automatically from GitHub (daily)",
+    "urlLabel": "Catalog URL",
+    "urlHint": "Empty = built-in default (catalog/models.json on the public repo's main branch). Only http(s) is accepted.",
+    "saveSettings": "Save sync settings",
+    "settingsSaved": "Sync settings saved.",
+    "settingsNotApplied": "The catalog URL was not accepted; sync was not started.",
+    "saveBeforeSync": "Save the changed catalog sync settings before syncing now.",
+    "empty": "The catalog is empty. Click \"Sync now\", or check network and URL.",
+    "footnote": "The catalog is metadata only: available models are still whatever the site offers. Unknown prices never count as zero cost.",
+    "overridden": "Local override",
+    "overrideSaved": "Local override saved.",
+    "overrideCleared": "Restored the catalog value.",
+    "priceUnknown": "Unpriced",
+    "thinkingUpTo": "Up to {level}",
+    "thinkingNone": "Explicitly unsupported",
+    "thinkingUnknown": "Not declared (no automatic tier)",
+    "table": {
+      "name": "Model",
+      "protocol": "Protocol",
+      "context": "Context",
+      "output": "Max output",
+      "price": "In/out (per 1M)",
+      "thinking": "Thinking",
+      "actions": "Local override"
+    },
+    "override": {
+      "edit": "Override…",
+      "save": "Save override",
+      "clear": "Restore catalog",
+      "hint": "Leave a box empty to keep that field as-is (grey text is the value in effect). Use \"Reset to catalog\" to drop the whole override.",
+      "level": "Thinking tier",
+      "levelKeep": "Keep",
+      "priceIn": "Input price",
+      "priceOut": "Output price",
+      "errPositive": "{field}: must be a positive integer",
+      "errPricePair": "Price: fill in both input and output",
+      "errPriceNegative": "Price must be greater than zero; restore the catalog to leave it unpriced",
+      "errWindow": "Max output cannot exceed the context window",
+      "errRange": "{field}: exceeds the maximum of 4294967295"
+    },
+    "level": {
+      "off": "Off",
+      "low": "Low",
+      "medium": "Medium",
+      "high": "High",
+      "xhigh": "Extra high"
+    },
+    "protocol": {
+      "openai_chat": "OpenAI Chat",
+      "openai_responses": "OpenAI Responses",
+      "anthropic_messages": "Anthropic Messages",
+      "gemini": "Gemini"
+    },
+    "syncFailed": "Sync failed: {error}"
+  },
   "settings": {
+    "sections": {
+      "navigation": "Settings sections",
+      "general": "General",
+      "generalBody": "Appearance, window behavior, and update preferences.",
+      "sync": "Sync & notifications",
+      "syncBody": "Automatic refresh, balance alerts, key rotation, and system notifications.",
+      "gateway": "Gateway & routing",
+      "gatewayBody": "Local gateway, model discovery, upstream protection, and agent routing.",
+      "data": "Data & security",
+      "dataBody": "Model aliases, backups, exports, diagnostics, and vault maintenance.",
+      "ui": "Appearance & network",
+      "uiBody": "Theme, language, and system proxy."
+    },
     "prices": {
       "title": "Model prices",
       "body": "Prices are **per 1M tokens** and only drive the cost estimate (never routing). Without a price, cost shows as unknown.",
@@ -983,7 +1158,8 @@
       "retryFailed": "Some items were still not migrated; check the reason and retry.",
       "loadFailed": "Failed to read migration status: {error}"
     },
-    "intro": "All settings are stored locally in the database; nothing is uploaded.",
+    "intro": "Settings are stored in the local database. Automatic catalog sync downloads metadata only; it never uploads settings or keys.",
+    "loadFailed": "Could not read settings: {error}",
     "loading": "Loading…",
     "autorefresh": {
       "title": "Auto refresh",
@@ -1040,7 +1216,7 @@
     },
     "rotation": {
       "title": "Key rotation",
-      "body": "Reminds you to rotate before expiry. Rotation is a three-step op: create new key → reinject all → revoke old; if any step fails it stops, never leaving \"old key revoked but new key not injected\".",
+      "body": "Reminds you to rotate before expiry. Rotation is a three-step op: create new key → reinject all → delete old; if any step fails it stops, never leaving \"old key deleted but new key not injected\".",
       "maxAge": "Rotation period (days; 0 = off)",
       "warnBefore": "Warn before (days)",
       "error": "Warn-before days can't exceed the rotation period."
@@ -1072,6 +1248,7 @@
     },
     "updateTitle": "App updates",
     "save": {
+      "discard": "Discard changes",
       "btn": "Save",
       "dirty": "Unsaved changes",
       "ok": "Saved. Refresh-interval changes take effect on next launch.",
@@ -1245,7 +1422,7 @@
     "allowLabel": "Allow starting the local gateway (off by default; this toggle only allows it—starting still needs the button below)",
     "portLabel": "Port (1024–65535)",
     "multiSiteLabel": "Cross-site routing (multiple upstreams)",
-    "multiSiteHint": "When on, the gateway routes by **model name** across sites: aliases apply, candidates are ordered by balance health → rate → latency, and exhausted or repeatedly failing upstreams are removed and probed back after a cooldown. When off, the gateway uses only the single site chosen at start (same as before). **Off by default**—make sure every site has a usable key before enabling it.",
+    "multiSiteHint": "When on, the gateway routes by model name across sites: aliases apply, candidates are ordered by balance health → rate → latency, and exhausted or repeatedly failing upstreams are removed and probed back after a cooldown. When off, the gateway uses only the single site chosen at start (same as before). Off by default—make sure every site has a usable key before enabling it.",
     "portDirtyHint": "Port changes need saving first and take effect on next gateway start.",
     "status": {
       "running": "Running",
@@ -1286,7 +1463,7 @@
       "listenAddrs": "Listening on"
     },
     "maxRequestLabel": "Request body limit (MiB, 1–64)",
-    "maxRequestHint": "Limits the **request body** only (1–64 MiB). The response body cap is a fixed 64 MiB constant and is unrelated; changes apply the next time the gateway starts.",
+    "maxRequestHint": "Limits the request body only (1–64 MiB). The response body cap is a fixed 64 MiB constant and is unrelated; changes apply the next time the gateway starts.",
     "perSiteBurstLabel": "Per-site rate-limit burst (0–10000, 0=off)",
     "perSiteBurstHint": "Only takes effect when the per-site per-second limit is greater than 0: the token bucket capacity becomes per-second limit + burst, so the first burst of requests is no longer killed by mistake; refill per second is still the per-second limit, so the long-term rate is unchanged. Applies the next time the gateway starts.",
     "perSiteConcurrencyLabel": "Per-site concurrency cap (1–128)",
@@ -1360,12 +1537,25 @@
       "clineProbeVersionUnknown": "unknown",
       "clineProbeNotFound": "No cline CLI found in the app's search scope."
     },
+    "statusFailed": "Could not read gateway status: {error}",
+    "statusUnknown": "Status unknown",
     "copyFail": "Copy failed ({error})—select the token text above manually.",
     "collectModelsLabel": "Collect site model catalog (for model-change notifications and multi-site routing)",
     "collectModelsHint": "Independent switch: collection still runs when multi-site routing is off (for model-change notifications); the gateway just doesn't use the catalog.",
     "modelsIntervalLabel": "Collection interval (seconds, 30–86400)",
     "modelsIntervalHint": "Minimum interval between two collections of the same site; out-of-range input is clamped to 30–86400 on blur.",
-    "modelsIntervalClamped": "Input was out of range and has been clamped to 30–86400."
+    "modelsIntervalClamped": "Input was out of range and has been clamped to 30–86400.",
+    "sections": {
+      "advanced": "Advanced settings",
+      "advancedHint": "Port, routing, request limits and model collection. Save and restart when indicated.",
+      "routing": "Routing & upstreams",
+      "request": "Requests & site protection",
+      "models": "Model catalog",
+      "metrics": "Runtime metrics",
+      "metricsHint": "Inspect traffic, candidates and latency.",
+      "tokens": "Agent tokens",
+      "tokensHint": "Create, authorize and revoke independent tokens."
+    }
   },
   "confirm": {
     "cancel": "Cancel",
@@ -1375,7 +1565,7 @@
     "aftermath": {
       "title": "Three things to know after a rollback (it restores the file, not the binding):",
       "drift": "Overview keeps listing this target as \"needs attention\", and every Overview open logs another \"external change\" alert—the file no longer matches Tianshu Relay's last delivered content. This is expected; do not re-deliver because of it (that would undo the rollback).",
-      "rotation": "Rotating this key rewrites the file; it also stays a candidate when batch re-pointing to the gateway. If this rollback restored the file to a **different** key from an earlier delivery: later rotating or revoking that earlier key will not rewrite this file—come back and deliver a still-valid key, or the agent stays on a revoked key.",
+      "rotation": "Rotating this key rewrites the file; it also stays a candidate when batch re-pointing to the gateway. If this rollback restored the file to a **different** key from an earlier delivery: later rotating or deleting that earlier key will not rewrite this file—come back and deliver a still-valid key, or the agent stays on a deleted key.",
       "unbind": "To stop Tianshu Relay from managing it, unbind {agent} on the Agent Delivery page."
     }
   },
@@ -1388,5 +1578,12 @@
       "site": "Site",
       "balance": "Balance"
     }
+  },
+  "delivery": {
+    "navigation": "Delivery workspace",
+    "configure": "Configure delivery",
+    "configureHint": "Choose a site, key and agent, then review the preview before confirming the write.",
+    "history": "History & rollback",
+    "historyHint": "Review delivery records and confirm the target and backup before restoring."
   }
 }

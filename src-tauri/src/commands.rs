@@ -514,6 +514,11 @@ pub struct SettingsDto {
     proxy_mode: String,
     telemetry_enabled: bool,
     auto_update_enabled: bool,
+    // ---- M47-S2：内置模型名单 ----
+    /// 是否跟随 GitHub 每天同步一次（camelCase `catalogAutoSync`）。
+    catalog_auto_sync: bool,
+    /// 名单地址；空 = 用内置默认地址（camelCase `catalogUrl`）。
+    catalog_url: String,
     // ---- M6-S5：FR-3 通知 ----
     /// M16-S9：通知**总开关**（默认关）。关着时服务层不装通知状态。
     notify_enabled: bool,
@@ -2064,6 +2069,207 @@ pub fn model_price_delete(state: State<'_, AppState>, id: i64) -> Result<bool, S
         .map_err(|e| e.to_string())
 }
 
+// ============================================ M47-S2：内置模型名单
+
+/// 思考能力（名单给的能力面，不是用户当前选择）。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogThinkingDto {
+    /// `"thinking"`（预算形态）或 `"reasoning_effort"`（枚举形态）。
+    param: String,
+    max_level: String,
+    default_level: String,
+    budget_low: u32,
+    budget_medium: u32,
+    budget_high: u32,
+    budget_xhigh: u32,
+}
+
+/// 一条价格。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogPriceDto {
+    currency: String,
+    input_per_mtok: f64,
+    output_per_mtok: f64,
+    cache_read_per_mtok: Option<f64>,
+}
+
+/// 名单里的一条模型（合并本机覆盖后的**生效值**）。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogModelDto {
+    id: String,
+    display_name: String,
+    vendor: String,
+    /// `"openai_chat"` / `"openai_responses"` / `"anthropic_messages"` / `"gemini"`
+    protocol: String,
+    anthropic_compatible: bool,
+    context_window: u32,
+    max_output_tokens: u32,
+    thinking: Option<CatalogThinkingDto>,
+    thinking_unsupported: bool,
+    prices: Vec<CatalogPriceDto>,
+    deprecated: bool,
+    /// 该条是否被本机覆盖改过（界面据此显示「本机覆盖」+ 恢复入口）。
+    overridden: bool,
+}
+
+/// 名单状态 + 全部条目（一次调用给界面渲染整张表）。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogStatusDto {
+    /// `"remote"` / `"bundled"` / `"empty"`
+    source: String,
+    schema_version: u32,
+    generated_at: String,
+    entries: usize,
+    overrides: usize,
+    last_success_at: i64,
+    last_error: Option<String>,
+    url: String,
+    auto_sync: bool,
+    models: Vec<CatalogModelDto>,
+}
+
+/// 一次同步的回报。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSyncDto {
+    bytes: usize,
+    accepted: usize,
+    skipped: usize,
+    generated_at: String,
+    unchanged: bool,
+    status: CatalogStatusDto,
+}
+
+/// 本机覆盖的入参（缺省字段 = 不改）。
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogOverrideInputDto {
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
+    thinking_level: Option<String>,
+    thinking_supported: Option<bool>,
+    price_input_per_mtok: Option<f64>,
+    price_output_per_mtok: Option<f64>,
+    price_currency: Option<String>,
+}
+
+impl CatalogOverrideInputDto {
+    fn into_patch(self) -> Result<tianshu_relay_core::model_catalog::ModelOverride, String> {
+        let thinking_level = match self.thinking_level.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(raw) => Some(
+                tianshu_relay_core::model_catalog::ThinkingLevel::parse(raw)
+                    .ok_or_else(|| format!("思考档位非法: {raw}"))?,
+            ),
+        };
+        Ok(tianshu_relay_core::model_catalog::ModelOverride {
+            context_window: self.context_window,
+            max_output_tokens: self.max_output_tokens,
+            thinking_level,
+            thinking_supported: self.thinking_supported,
+            price_input_per_mtok: self.price_input_per_mtok,
+            price_output_per_mtok: self.price_output_per_mtok,
+            price_currency: self.price_currency,
+        })
+    }
+}
+
+fn catalog_status_dto(state: &AppState) -> CatalogStatusDto {
+    let status = state.service.catalog_status();
+    let settings = state.service.settings().ok();
+    let models = state
+        .service
+        .catalog_entries()
+        .into_iter()
+        .map(|m| CatalogModelDto {
+            overridden: state.service.catalog().override_for(&m.id).is_some(),
+            id: m.id,
+            display_name: m.display_name,
+            vendor: m.vendor,
+            protocol: m.protocol.as_str().to_string(),
+            anthropic_compatible: m.anthropic_compatible,
+            context_window: m.context_window,
+            max_output_tokens: m.max_output_tokens,
+            thinking: m.thinking.map(|spec| CatalogThinkingDto {
+                param: spec.param.as_str().to_string(),
+                max_level: spec.max_level.as_str().to_string(),
+                default_level: spec.default_level.as_str().to_string(),
+                budget_low: spec.budget_low,
+                budget_medium: spec.budget_medium,
+                budget_high: spec.budget_high,
+                budget_xhigh: spec.budget_xhigh,
+            }),
+            thinking_unsupported: m.thinking_unsupported,
+            prices: m
+                .prices
+                .into_iter()
+                .map(|p| CatalogPriceDto {
+                    currency: p.currency,
+                    input_per_mtok: p.input_per_mtok,
+                    output_per_mtok: p.output_per_mtok,
+                    cache_read_per_mtok: p.cache_read_per_mtok,
+                })
+                .collect(),
+            deprecated: m.deprecated,
+        })
+        .collect();
+    CatalogStatusDto {
+        source: status.source.to_string(),
+        schema_version: status.schema_version,
+        generated_at: status.generated_at,
+        entries: status.entries,
+        overrides: status.overrides,
+        last_success_at: status.last_success_at,
+        last_error: status.last_error,
+        url: settings
+            .as_ref()
+            .map(|s| s.catalog_url.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| tianshu_relay_core::model_catalog::CATALOG_URL.to_string()),
+        auto_sync: settings.map(|s| s.catalog_auto_sync).unwrap_or(true),
+        models,
+    }
+}
+
+/// 名单现状 + 全部条目（只读，不联网）。
+#[tauri::command]
+pub fn catalog_status(state: State<'_, AppState>) -> Result<CatalogStatusDto, String> {
+    Ok(catalog_status_dto(&state))
+}
+
+/// 从 GitHub 拉一次名单（失败保留旧缓存，错误原样给界面）。
+#[tauri::command]
+pub async fn catalog_sync(state: State<'_, AppState>) -> Result<CatalogSyncDto, String> {
+    let report = state.service.sync_model_catalog().await?;
+    Ok(CatalogSyncDto {
+        bytes: report.bytes,
+        accepted: report.accepted,
+        skipped: report.skipped,
+        generated_at: report.generated_at,
+        unchanged: report.unchanged,
+        status: catalog_status_dto(&state),
+    })
+}
+
+/// 写 / 撤销一条本机覆盖（`patch = null` 即撤销）。
+#[tauri::command]
+pub fn catalog_set_override(
+    state: State<'_, AppState>,
+    model_id: String,
+    patch: Option<CatalogOverrideInputDto>,
+) -> Result<CatalogStatusDto, String> {
+    let patch = patch.map(|input| input.into_patch()).transpose()?;
+    state
+        .service
+        .set_catalog_override(&model_id, patch)
+        .map_err(|e| e.to_string())?;
+    Ok(catalog_status_dto(&state))
+}
+
 // ============================================ M46-S5：站点 / key 硬预算
 //
 // 校验全部在 store::budget_create（validate 先行）；命令层只做 DTO 映射与
@@ -2319,6 +2525,8 @@ fn settings_from_dto(dto: &SettingsDto) -> tianshu_relay_core::settings::Setting
         proxy_mode: dto.proxy_mode.clone(),
         telemetry_enabled: dto.telemetry_enabled,
         auto_update_enabled: dto.auto_update_enabled,
+        catalog_auto_sync: dto.catalog_auto_sync,
+        catalog_url: dto.catalog_url.clone(),
         notify_enabled: dto.notify_enabled,
         notify_system_enabled: dto.notify_system_enabled,
         notify_webhook_url: dto.notify_webhook_url.clone(),
@@ -2359,6 +2567,8 @@ fn settings_to_dto(settings: &tianshu_relay_core::settings::Settings) -> Setting
         proxy_mode: settings.proxy_mode.clone(),
         telemetry_enabled: settings.telemetry_enabled,
         auto_update_enabled: settings.auto_update_enabled,
+        catalog_auto_sync: settings.catalog_auto_sync,
+        catalog_url: settings.catalog_url.clone(),
         notify_enabled: settings.notify_enabled,
         notify_system_enabled: settings.notify_system_enabled,
         notify_webhook_url: settings.notify_webhook_url.clone(),
@@ -2750,7 +2960,8 @@ enum GatewayTransition {
     Restart,
 }
 
-/// 判据是**白名单**：只有端口 / 多站 / 代理模式 / 代理地址的变化才重启。
+/// 判据是**白名单**：只有端口 / 多站 / 代理 / 运行时限流、请求上限与路由规则才重启。
+/// 名单覆盖走共享快照，无需重启；catalogUrl/autoSync 只控制同步，也不重启网关。
 ///
 /// 新增设置字段默认不触发重启，除非显式加进这里（复审要点）。
 fn gateway_transition(
@@ -2777,6 +2988,13 @@ fn gateway_transition(
         || prev.gateway_multi_site != next.gateway_multi_site
         || prev.proxy_mode != next.proxy_mode
         || prev.proxy_url != next.proxy_url
+        || prev.gateway_max_request_mib != next.gateway_max_request_mib
+        || prev.gateway_key_health_interval_secs != next.gateway_key_health_interval_secs
+        || prev.gateway_per_site_concurrency != next.gateway_per_site_concurrency
+        || prev.gateway_per_site_rate_limit != next.gateway_per_site_rate_limit
+        || prev.gateway_per_site_burst != next.gateway_per_site_burst
+        || prev.gateway_max_attempts != next.gateway_max_attempts
+        || prev.routing_rules != next.routing_rules
     {
         GatewayTransition::Restart
     } else {
@@ -4009,12 +4227,15 @@ pub fn suggest_key_name(agent_id: String, year: i32, month: u32, day: u32) -> Op
     )
 }
 
-/// 回收站点上的某把令牌（B-82 的独立路径）。
+/// 删除站点上的某把令牌（B-82 的独立路径）。
 ///
-/// **不是**「删除本地记录」：本地行会被标成 `revoked` 并保留——`bindings` 与漂移追溯
-/// 靠 `keys.id` 存活，删行会一起带走（M7-S4 spec §6.1 有实测）。
+/// **两件事一起做**（M47-S1）：站点侧 DELETE，然后**物理删掉**本地 `keys` 行——
+/// 用户要求「删除后的密钥不要再显示」，所以本地不再留「已回收」墓碑行。
+/// 代价是 `ON DELETE CASCADE` 会带走该 key 的绑定 / 用量采样 / 检测历史，
+/// 逐条清单见 `tianshu_relay_core::store::Store::delete_key`；最小溯源由一条
+/// `events` 事件承担（带 id、名字、站点、远端 id）。
 ///
-/// `confirm` 必须是 `true`。回收是不可逆的站点侧动作，**不提供「无参数即执行」的形态**：
+/// `confirm` 必须是 `true`。删除是不可逆的站点侧动作，**不提供「无参数即执行」的形态**：
 /// 误触的代价是用户正在用的 key 在站点上消失。
 #[tauri::command]
 pub async fn revoke_key(
@@ -4024,7 +4245,7 @@ pub async fn revoke_key(
     confirm: bool,
 ) -> Result<RevokeReportDto, String> {
     if !confirm {
-        return Err("回收站点侧密钥需要二次确认".to_string());
+        return Err("删除站点侧密钥需要二次确认".to_string());
     }
     state
         .service
@@ -4052,7 +4273,7 @@ pub async fn unbind_agent(
 ) -> Result<UnbindOutcomeDto, String> {
     if also_revoke && !confirm {
         return Err(
-            "「同时回收站点侧的密钥」不可逆，需要二次确认；若只想解除本机绑定，请取消勾选。"
+            "「同时删除站点侧的密钥」不可逆，需要二次确认；若只想解除本机绑定，请取消勾选。"
                 .to_string(),
         );
     }
@@ -4098,18 +4319,18 @@ pub struct KeychainPurgeDto {
     first_error: Option<String>,
 }
 
-/// 一次**回收**（站点侧删除）的回报（B-100 / M8-S4 §7）。
+/// 一次**删除**（站点侧删除 + 本地删行）的回报（B-100 / M8-S4 §7）。
 ///
-/// 两个布尔值必须分开给界面：`revoked = true` + `localStatusUpdated = false` 是
-/// 「站点侧已经删了（不可逆），但本地记账没写上」——**整体仍然是成功**，
-/// 界面要说的是「已回收，但本地状态没记上」，而不是「回收失败」。
+/// 两个布尔值必须分开给界面：`revoked = true` + `localRowDeleted = false` 是
+/// 「站点侧已经删了（不可逆），但本地记录没删掉」——**整体仍然是成功**，
+/// 界面要说的是「已删除，但本地记录没删掉」，而不是「删除失败」。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RevokeReportDto {
     site_id: i64,
     remote_id: Option<String>,
     revoked: bool,
-    local_status_updated: bool,
+    local_row_deleted: bool,
     vault_deleted: bool,
     note: Option<String>,
 }
@@ -4120,7 +4341,7 @@ impl From<tianshu_relay_core::service::RevokeReport> for RevokeReportDto {
             site_id: report.site_id,
             remote_id: report.remote_id,
             revoked: report.revoked,
-            local_status_updated: report.local_status_updated,
+            local_row_deleted: report.local_row_deleted,
             vault_deleted: report.vault_deleted,
             note: report.note,
         }
@@ -4130,7 +4351,7 @@ impl From<tianshu_relay_core::service::RevokeReport> for RevokeReportDto {
 /// 一次解绑的结果（M8-S4 §5.4 第 4 条：**四种文案**都要能说出来）。
 ///
 /// `unbound` / `alreadyUnbound` / `revoked` 三者互相独立：
-/// 「这次新解开了 2 条」「本来就是解绑状态」「回收成功 1 把、失败 1 把」可以同时成立。
+/// 「这次新解开了 2 条」「本来就是解绑状态」「删除成功 1 把、失败 1 把」可以同时成立。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UnbindOutcomeDto {
@@ -6536,6 +6757,51 @@ mod m41s1_tests {
         assert_eq!(
             gateway_transition(&enabled, &proxy_url, true),
             GatewayTransition::Restart
+        );
+        for changed in [
+            Settings {
+                gateway_max_request_mib: 32,
+                ..enabled.clone()
+            },
+            Settings {
+                gateway_per_site_burst: 8,
+                ..enabled.clone()
+            },
+            Settings {
+                gateway_per_site_concurrency: 2,
+                ..enabled.clone()
+            },
+            Settings {
+                gateway_per_site_rate_limit: 5,
+                ..enabled.clone()
+            },
+            Settings {
+                gateway_max_attempts: 3,
+                ..enabled.clone()
+            },
+            Settings {
+                gateway_key_health_interval_secs: 60,
+                ..enabled.clone()
+            },
+            Settings {
+                routing_rules: "[]".into(),
+                ..enabled.clone()
+            },
+        ] {
+            assert_eq!(
+                gateway_transition(&enabled, &changed, true),
+                GatewayTransition::Restart
+            );
+        }
+        let catalog = Settings {
+            catalog_url: "https://example.com/catalog.json".into(),
+            catalog_auto_sync: false,
+            ..enabled.clone()
+        };
+        assert_eq!(
+            gateway_transition(&enabled, &catalog, true),
+            GatewayTransition::None,
+            "名单共享快照/同步设置不需要重启"
         );
         // 9) 白名单外字段 ⇒ None（主题 / 语言 / 自动启动 / last_*）
         let theme = Settings {

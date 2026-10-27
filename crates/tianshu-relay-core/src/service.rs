@@ -39,6 +39,11 @@ pub struct ServiceConfig {
     pub vault: Arc<dyn Vault>,
     pub home: PathBuf,
     pub backup_dir: PathBuf,
+    /// 本次运行实际使用的数据目录（可能因迁移失败回退旧目录）。
+    ///
+    /// 与 `backup_dir` 分开保存，而不是由 `home` 反推：名单缓存、覆盖和备份必须跟随
+    /// 同一个实际数据目录。缺省时从 backup_dir 的父目录推导，兼容旧测试/CLI 装配。
+    pub data_dir: Option<PathBuf>,
 }
 
 impl ServiceConfig {
@@ -69,6 +74,7 @@ impl ServiceConfig {
         Self {
             vault,
             backup_dir: home.join(".tianshu-relay").join("backups"),
+            data_dir: None,
             home,
         }
     }
@@ -89,9 +95,11 @@ impl ServiceConfig {
         home: impl Into<PathBuf>,
         data_dir: impl Into<PathBuf>,
     ) -> Self {
+        let data_dir = data_dir.into();
         Self {
             vault,
-            backup_dir: data_dir.into().join("backups"),
+            backup_dir: data_dir.join("backups"),
+            data_dir: Some(data_dir),
             home: home.into(),
         }
     }
@@ -114,14 +122,14 @@ impl ServiceConfig {
         Self::with_vault_at(vault, home, data_dir)
     }
 
-    /// 测试装配：内存钥匙串 + 显式临时目录。
-    pub fn in_memory(home: impl Into<PathBuf>) -> Self {
-        let home = home.into();
-        Self {
-            vault: Arc::new(crate::vault::MemoryVault::new()),
-            backup_dir: home.join(".tianshu-relay").join("backups"),
-            home,
-        }
+    /// 测试装配：内存钥匙串 + 显式数据目录（与生产 with_vault_at 同一目录语义）。
+    pub fn in_memory(data_dir: impl Into<PathBuf>) -> Self {
+        let data_dir = data_dir.into();
+        Self::with_vault_at(
+            Arc::new(crate::vault::MemoryVault::new()),
+            data_dir.clone(),
+            data_dir,
+        )
     }
 }
 
@@ -168,14 +176,15 @@ fn error_kind(err: &Error) -> &'static str {
     }
 }
 
-/// 已回收（`keys.status = revoked`）的 key 不得再被使用：投递、网关、轮换都在这里拒绝。
+/// 已删除的 key（`keys.status = revoked`，**只可能是旧版本留下的行**）不得再被使用：
+/// 投递、网关、轮换都在这里拒绝。
 ///
 /// 站点上已经没有它了：投递出去 agent 只会收到 401；对它轮换会先在站点上**新建**一把，
 /// 再去 DELETE 一个不存在的 id。用 `NotFound`（「远端资源不存在」）——这正是事实。
 fn ensure_not_revoked(row: &crate::store::KeyRow) -> Result<()> {
     if row.status == crate::store::KEY_STATUS_REVOKED {
         return Err(Error::NotFound(format!(
-            "密钥 #{} 已回收，站点上已经没有它了；不能再投递、启动网关或轮换，需要的话请新建一把",
+            "密钥 #{} 已在站点上删除，站点上已经没有它了；不能再投递、启动网关或轮换，需要的话请新建一把",
             row.id
         )));
     }
@@ -247,6 +256,18 @@ fn session_is_expired(session: &Session, now: i64) -> bool {
 /// **调用时机是硬要求**：必须在 `self.session(site_id)?` **之前**。
 /// 没有令牌管理端点的站点通常也没有会话，先要会话会先报「未登录」，
 /// 把用户引向一个根本不存在的登录流程——这正是 `custom-openai-compatible` 会踩的坑。
+/// 生效的名单地址：空串（设置默认值）⇒ 内置默认地址。
+///
+/// 单独抽出来是为了能被单测钉住：这个「空串折算」在 DTO 与同步两条路径上都要成立，
+/// 漏一处就会出现「界面显示地址、同步却拿到空串」的分叉（实测过一次）。
+pub(crate) fn effective_catalog_url(settings: Option<&Settings>) -> String {
+    settings
+        .map(|s| s.catalog_url.trim())
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::model_catalog::CATALOG_URL.to_string())
+}
+
 fn capability_gate(kind: crate::site::SiteKind, supported: bool, action: &str) -> Result<()> {
     if supported {
         return Ok(());
@@ -651,10 +672,10 @@ struct BlockedTarget {
     reason: String,
 }
 
-/// 一次**回收**（站点侧删除）的回报（B-100）。
+/// 一次**删除**（站点侧删除 + 本地删行）的回报（B-100）。
 ///
-/// 为什么要把「站点侧删掉了」与「本地状态写上了」分开报：这两个是**两个不同的世界**，
-/// 且第一个不可逆。合成一个 bool 会让「站点侧已删、本地记账失败」只能二选一，
+/// 为什么要把「站点侧删掉了」与「本地行删掉了」分开报：这两个是**两个不同的世界**，
+/// 且第一个不可逆。合成一个 bool 会让「站点侧已删、本地删行失败」只能二选一，
 /// 而两种选择都错——报成功则账不平，报失败则用户会去重试一次注定失败的删除（§7）。
 ///
 /// # 为什么叫 `RevokeReport` 而不是 spec §4.2 写的 `RevokeOutcome`
@@ -670,13 +691,12 @@ pub struct RevokeReport {
     pub remote_id: Option<String>,
     /// 站点侧**确认删除**（适配器 `revoke_key` 返回 `Ok`）。
     pub revoked: bool,
-    /// 本地 `keys.status` 是否写上 `revoked`。
-    pub local_status_updated: bool,
+    /// 本站地 `keys` 行是否**已经删掉**（M47-S1：界面上的「删除」是物理删行）。
+    /// `true` = 本地行没了（含「本来就不在」的幂等情形）；`false` = 删行失败，见 note。
+    pub local_row_deleted: bool,
     /// DEBUG-G5 P1-10：本轮是否成功删掉了该 key 的**保险库条目**（明文材料）。
     /// `true` = 删掉了；`false` = 没删（无本地行可定位条目，或删除失败，见 note）。
-    /// 与 `local_status_updated` 互相独立：DB 行**刻意保留**（绑定与漂移追溯
-    /// 靠 `keys.id` 存活，删行会经 `ON DELETE CASCADE` 一起带走），只分离
-    /// 「明文材料也保留」的那部分——保险库条目单删，行不动。
+    /// 与 `local_row_deleted` 互相独立：删明文与删行是两次独立的写，任一失败都要如实报出。
     pub vault_deleted: bool,
     pub note: Option<String>,
 }
@@ -846,6 +866,12 @@ pub struct TianshuRelayService<T: HttpTransport + Clone + 'static> {
     /// 投递路径是同步的（不能 `.await`），所以「异步预热 → 同步读快照」两步走：
     /// `warm_model_meta` 填这份缓存，`meta_for` 在 `prepare_delivery` 里读。
     meta_cache: crate::model_meta::OnlineMetaCache,
+    /// M47-S2：内置模型名单（窗口 / 输出 / 价格 / 协议 / 思考档位）。
+    ///
+    /// **优先级高于 `meta_cache`**：名单是我们自己维护、可随 GitHub 更新的权威数据；
+    /// models.dev 只在名单没覆盖时兜底。投递路径只读它的内存快照（永不联网），
+    /// 拉取走 [`Self::sync_model_catalog`]。
+    catalog: std::sync::Arc<crate::model_catalog::CatalogStore>,
     /// M46-S5：`Arc` 包裹是预算接线的最小改动——`gateway_config` 要给网关一个
     /// `'static` 的 `budget_check` 闭包，闭包必须自持 store；按值持有派生不出
     /// `'static` 引用。调用点零改动（`Arc` 的 Deref 让 `self.store.foo()` 照常编译）。
@@ -1301,6 +1327,13 @@ pub fn reconcile_bills(
 
 impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     pub fn new(store: Store, transport: T, config: ServiceConfig) -> Self {
+        let catalog_dir = config.data_dir.clone().unwrap_or_else(|| {
+            config
+                .backup_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| config.home.join(crate::rebrand::APP_DIR_NAME))
+        });
         let svc = Self {
             registry: SiteRegistry::new(transport.clone()),
             transport,
@@ -1315,6 +1348,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             meta_transport: None,
             // 默认空缓存：冷缓存 ⇒ 同步读拿不到在线参数（不联网），语义与「没查到」一致。
             meta_cache: crate::model_meta::OnlineMetaCache::new(),
+            // M47-S2：名单从应用数据目录读（磁盘缓存 + 本机覆盖），编译期那份兜底已内嵌。
+            // 这里**只读文件、不联网**：拉取由 `sync_model_catalog` 显式触发。
+            catalog: std::sync::Arc::new(crate::model_catalog::CatalogStore::open(&catalog_dir)),
             // M46-S5：包一层 Arc（见 store 字段注释）；调用点靠 Deref 不动。
             store: std::sync::Arc::new(store),
             sessions: SessionCache::new(),
@@ -1518,6 +1554,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             // 没注入在线传输层 ⇒ 不做在线补全。测试装配走这条路径：一次网络都不发。
             return None;
         };
+        if let Some(meta) = self.catalog.meta_for(model) {
+            return Some(meta);
+        }
         let resolved = self.meta_cache.lookup_online(transport, model).await;
         if resolved.is_none() {
             // 只记模型名与结果，不记任何密钥/响应正文。Debug 级：这是增强路径，
@@ -1532,12 +1571,199 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         resolved
     }
 
-    /// 同步读模型元数据：内置表 → 已缓存的 models.dev 结果。**不联网**。
+    /// 同步读模型元数据：**名单** → 内置表 → 已缓存的 models.dev 结果。**不联网**。
+    ///
+    /// 名单排第一的理由（M47-S2）：它是我们自己维护、可随 GitHub 更新的权威数据，
+    /// 带价格/协议/思考档位；models.dev 只补「名单没覆盖的长尾模型」的窗口与输出。
     fn meta_for(&self, model: Option<&str>) -> Option<crate::model_meta::ModelMeta> {
-        model
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .and_then(|m| self.meta_cache.lookup_cached(m))
+        let model = model.map(str::trim).filter(|m| !m.is_empty())?;
+        if let Some(meta) = self.catalog.meta_for(model) {
+            return Some(meta);
+        }
+        self.meta_cache.lookup_cached(model)
+    }
+
+    /// M47-S2：名单里的一条（含本机覆盖后的值）。界面用它显示「自动带入」的参数。
+    pub fn model_spec(&self, model: &str) -> Option<crate::model_catalog::CatalogModel> {
+        self.catalog.resolve(model)
+    }
+
+    /// M47-S2：名单存储（命令层读写覆盖、网关读「这个模型支不支持思考」都用它）。
+    pub fn catalog(&self) -> &crate::model_catalog::CatalogStore {
+        &self.catalog
+    }
+
+    /// 写 / 撤销本机覆盖，并把当前生效的名单价补进成本估算的价格表。
+    /// 以新版本追加，不删除历史价；撤销后按同样的规则恢复当前名单价。
+    pub fn set_catalog_override(
+        &self,
+        model_id: &str,
+        patch: Option<crate::model_catalog::ModelOverride>,
+    ) -> Result<()> {
+        match patch {
+            Some(patch) => self.catalog.set_override(model_id, patch)?,
+            None => self.catalog.clear_override(model_id)?,
+        }
+        let entry = self
+            .catalog
+            .resolve(model_id)
+            .ok_or_else(|| Error::InvalidInput("模型不在名单中".to_string()))?;
+        let mut names = vec![entry.id.clone()];
+        names.extend(entry.aliases.iter().cloned());
+        self.store.catalog_price_delete_for(&names)?;
+        self.import_catalog_prices_for(model_id, Some(unix_now_secs()))?;
+        Ok(())
+    }
+
+    /// M47-S2：名单快照（给界面表格）。
+    pub fn catalog_entries(&self) -> Vec<crate::model_catalog::CatalogModel> {
+        self.catalog.entries()
+    }
+
+    /// M47-S2：名单状态（来源 / 条数 / 上次同步 / 上次错误）。
+    pub fn catalog_status(&self) -> crate::model_catalog::CatalogStatus {
+        self.catalog.status(unix_now_secs())
+    }
+
+    /// M47-S2：从 GitHub 拉一次名单，并把名单里的价格补进 `model_prices`。
+    ///
+    /// # 为什么价格是「补」不是「覆盖」
+    ///
+    /// 用户手输的价格永远优先：这里**只为完全没有价格行**的模型插入默认价。
+    /// 这样既不用给 `model_prices` 加 `source` 列、也不用改用量聚合里那段 SQL
+    /// （它按 model + 生效时间取最新版本），代价只是「用户删掉所有价格后，
+    /// 下一次同步会把名单价补回来」——这是可接受的（并在文档里写明）。
+    pub async fn sync_model_catalog(
+        &self,
+    ) -> std::result::Result<crate::model_catalog::CatalogSyncReport, String> {
+        let Some(transport) = self.meta_transport.as_deref() else {
+            return Err("没有可用的网络传输层（该装配未注入），无法同步模型名单".to_string());
+        };
+        // 空串 = 「用内置默认地址」：`Settings` 的默认值就是空，这里必须折算成
+        // `CATALOG_URL`，否则同步会拿着一个空 URL 去发请求（实测报「URL 非法」）。
+        let settings = self.settings().map_err(|err| {
+            format!(
+                "读取设置失败，未发起名单同步: {}",
+                crate::redact::scrub(&err.to_string())
+            )
+        })?;
+        let url = effective_catalog_url(Some(&settings));
+        let report = match self.catalog.sync(transport, &url, unix_now_secs()).await {
+            Ok(report) => report,
+            Err(err) => {
+                // 失败必须留痕（用户能在事件面板看到「名单为什么没更新」），
+                // 但**不影响投递**：旧缓存 / 内置名单照旧生效。
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "catalog",
+                    "模型名单同步失败（沿用上一份名单）",
+                    serde_json::json!({
+                        "error": err.clone(),
+                        "entries_after": self.catalog_status().entries,
+                    }),
+                ));
+                return Err(err);
+            }
+        };
+        let imported = match self.import_catalog_prices() {
+            Ok(imported) => imported,
+            Err(err) => {
+                let message = format!("名单已更新，但价格写入失败: {err}");
+                self.catalog.record_sync_failure(&message);
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "catalog",
+                    "模型名单价格写入失败",
+                    serde_json::json!({ "error": message }),
+                ));
+                return Err(message);
+            }
+        };
+        self.log(observability::event_with_payload(
+            Level::Info,
+            "catalog",
+            "模型名单已同步",
+            serde_json::json!({
+                "bytes": report.bytes,
+                "accepted": report.accepted,
+                "skipped": report.skipped,
+                "unchanged": report.unchanged,
+                "prices_imported": imported,
+            }),
+        ));
+        Ok(report)
+    }
+
+    /// 名单同步只补「从未有过价格」的模型，避免覆盖用户手输价。
+    /// 本机覆盖是明确的用户动作，走 `import_catalog_prices_for`，追加当前生效版本。
+    /// `generatedAt` 是没有条目级 `effectiveFrom` 时的生效时间，不能拿同步时刻冒充。
+    fn import_catalog_prices(&self) -> Result<usize> {
+        let existing = self.store.model_price_list()?;
+        let known: std::collections::HashSet<String> = existing
+            .iter()
+            .map(|row| row.model.trim().to_ascii_lowercase())
+            .collect();
+        self.import_catalog_prices_where(None, None, &known)
+    }
+
+    fn import_catalog_prices_for(&self, model_id: &str, now: Option<i64>) -> Result<usize> {
+        self.import_catalog_prices_where(Some(model_id), now, &std::collections::HashSet::new())
+    }
+
+    fn import_catalog_prices_where(
+        &self,
+        model_id: Option<&str>,
+        now: Option<i64>,
+        skip_names: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let mut inserted = 0usize;
+        for entry in self.catalog_entries() {
+            if model_id.is_some_and(|id| {
+                crate::model_catalog::normalize_key(&entry.id)
+                    != crate::model_catalog::normalize_key(id)
+            }) {
+                continue;
+            }
+            let Some(price) = entry
+                .prices
+                .iter()
+                .find(|p| p.currency == "USD" && p.input_per_mtok > 0.0 && p.output_per_mtok > 0.0)
+                .or_else(|| {
+                    entry
+                        .prices
+                        .iter()
+                        .find(|p| p.input_per_mtok > 0.0 && p.output_per_mtok > 0.0)
+                })
+            else {
+                continue;
+            };
+            let from = if price.effective_from > 0 {
+                price.effective_from
+            } else if let Some(now) = now {
+                now
+            } else {
+                self.catalog_status().generated_at_ts.max(1)
+            };
+            let mut names = vec![entry.id.clone()];
+            names.extend(entry.aliases.iter().cloned());
+            names.sort();
+            names.dedup();
+            for name in names {
+                let key = name.trim().to_ascii_lowercase();
+                if key.is_empty() || skip_names.contains(&key) {
+                    continue;
+                }
+                self.store.catalog_price_upsert(
+                    &name,
+                    price.input_per_mtok,
+                    price.output_per_mtok,
+                    &price.currency,
+                    from,
+                )?;
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
     }
 
     /// P2-8：投递前模型验证（静态配对 + 真实 `/v1/models` 探针）。
@@ -4846,17 +5072,17 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         };
         match self.revoke_key(plan.site_id, &remote_id).await {
             // `Ok(report)` 里带的是 B-100 的回报；轮换这条路径只关心「站点侧确认删除了」
-            // （`Ok` 即已删除，本地状态写失败也仍是 `Ok`——理由见 `revoke_key` 的注释）。
-            // P3-2 / DEBUG-REPORT-v3 §3-2：不丢弃 `local_status_updated`——站点侧已删
-            // 但本地没写成 revoked 时，不能报纯「已回收」，否则用户以为本地也清了，
+            // （`Ok` 即已删除，本地删行失败也仍是 `Ok`——理由见 `revoke_key` 的注释）。
+            // P3-2 / DEBUG-REPORT-v3 §3-2：不丢弃 `local_row_deleted`——站点侧已删
+            // 但本地行没删掉时，不能报纯「已删除」，否则用户以为本地也清了，
             // 而那把 key 在本地仍是 active，`sync_site_keys` 之前会被当成可用。
             Ok(report) => {
-                let local_ok = report.local_status_updated;
+                let local_ok = report.local_row_deleted;
                 let vault_ok = report.vault_deleted;
                 let message = if local_ok && vault_ok {
-                    "轮换完成: 新密钥已全量注入，旧密钥已回收".to_string()
+                    "轮换完成: 新密钥已全量注入，旧密钥已删除".to_string()
                 } else if !local_ok {
-                    "轮换完成: 新密钥已全量注入，旧密钥站点侧已删除，但本地状态未写成 revoked（对账交给 sync_site_keys）".to_string()
+                    "轮换完成: 新密钥已全量注入，旧密钥站点侧已删除，但本地记录未删除".to_string()
                 } else {
                     "轮换完成: 新密钥已全量注入，旧密钥站点侧已删除，但保险库条目未删除".to_string()
                 };
@@ -4869,7 +5095,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                         "old_key_id": key_id,
                         "new_key_id": new_key.id,
                         "reinjected": &reinjected,
-                        "local_status_updated": local_ok,
+                        "local_row_deleted": local_ok,
                         "vault_deleted": vault_ok,
                     }),
                 ));
@@ -4877,13 +5103,14 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     new_key,
                     reinjected,
                     revoke: RevokeOutcome::Revoked,
-                    // 本地那一行**刻意不删**：`bindings.key_id` 是 `ON DELETE CASCADE`，
-                    // 删行会连带丢掉旧 key 的绑定与漂移追溯；对账交给 `sync_site_keys`。
+                    // 旧密钥的本地行**已随 `revoke_key` 删掉**（M47-S1）：删行会经
+                    // `ON DELETE CASCADE` 带走它的绑定与漂移追溯，代价已记在
+                    // `Store::delete_key` 的文档里；最小溯源由 `revoke_key` 写的那条事件承担。
                     stopped_at: None,
                     stop_reason: if local_ok && vault_ok {
                         None
                     } else if !local_ok {
-                        Some("旧密钥站点侧已删除，但本地状态未写成 revoked".to_string())
+                        Some("旧密钥站点侧已删除，但本地记录未删除".to_string())
                     } else {
                         Some("旧密钥站点侧已删除，但保险库条目未删除".to_string())
                     },
@@ -4894,7 +5121,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 self.log(observability::event_with_payload(
                     Level::Warn,
                     "key",
-                    "轮换中断: 旧密钥回收失败",
+                    "轮换中断: 旧密钥删除失败",
                     serde_json::json!({
                         "step": crate::rotation::RotationStep::RevokeOld.as_str(),
                         "site_id": plan.site_id,
@@ -5640,35 +5867,40 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         self.store.get_probe_run(id)
     }
 
-    /// 回收站点上的某把令牌，并把本地记录标成**已回收**（B-82 的独立路径）。
+    /// 删除站点上的某把令牌，并**物理删掉**本地记录（B-82 的独立路径）。
     ///
     /// # 顺序（硬要求）
     ///
-    /// **先站点、后本地**。站点侧失败时**不**写本地状态——否则会出现「本地说已回收、
-    /// 站点上还活着」这种最坏的组合（用户以为泄漏面关掉了，实际没关）。
-    /// 反过来「站点已删、本地没标上」是可修的：本地状态没写上会**留痕**（Warn 事件），
-    /// 用户能在事件面板看到，`sync_site_keys` 下一轮也不会把它当成「站点上还有」。
+    /// **先站点、后本地**。站点侧失败时**不动**本地记录——否则会出现「本地已经没有这把
+    /// key、站点上还活着」这种最坏的组合（用户以为泄漏面关掉了，实际没关）。
+    /// 反过来「站点已删、本地没删掉」是可修的：删行失败会**留痕**（Warn 事件 + note），
+    /// 用户能在事件面板看到，界面下一次刷新还会列出那行。
     ///
     /// **订正（M8-S5A §4）**：本行原来写的是「下一次 `sync_site_keys` 会把它标成 `missing`」——
     /// **那句是假的**：`sync_site_keys` 从不改已有行的状态，而 `missing` 也不在 `set_key_status`
     /// 的合法值里。B-100 的处置一度建立在这个不存在的前提上。现在如实写成上面这句。
     ///
-    /// **已知缺口（未接线 + 去向）**：没有任何机制会主动发现「站点侧被删、本地仍是 enabled」
+    /// **已知缺口（未接线 + 去向）**：没有任何机制会主动发现「站点侧被删、本地仍存在」
     /// 的行——`sync_site_keys` 只看站点侧**还有**什么，不看**少了**什么。
     /// 去向：`docs/BACKLOG.md` 的 B-115。
     ///
-    /// # 为什么不删本地行
+    /// # 为什么现在删本地行（M47-S1，用户明确要求）
     ///
-    /// `bindings.key_id` 是 `ON DELETE CASCADE`——删行会把绑定与漂移追溯一起带走，
-    /// 而 `journals` 表**没有** `key_id`，溯源链的起点就是 `keys.id`（M7-S4 spec §6.1 有实测）。
-    /// 所以「回收」= 改状态，不是删记录。
+    /// 先前这里是「只改状态、不删行」：`bindings.key_id` 是 `ON DELETE CASCADE`，删行会把
+    /// 绑定与漂移追溯一起带走，而 `journals` 表**没有** `key_id`，溯源链的起点就是 `keys.id`
+    /// （M7-S4 spec §6.1 有实测）。代价是删掉的密钥会以「已回收」灰行永久留在列表里。
+    ///
+    /// 现在产品口径改成**删除即消失**：删掉的行不再出现在资产、投递、网关、用量任何列表里。
+    /// 代价因此从「列表留墓碑」变成「连带丢掉该 key 的绑定 / 采样 / 检测历史」，
+    /// 用一条 `events` 事件（带 id、名字、站点）补上最小溯源。逐条清单见
+    /// [`crate::store::Store::delete_key`]。
     pub async fn revoke_key(&self, site_id: i64, remote_id: &str) -> Result<RevokeReport> {
         let site = self.site(site_id)?;
         let kind = self.kind_of(&site)?;
         capability_gate(
             kind,
             crate::site::capability::capabilities(kind).revoke_key,
-            "回收令牌",
+            "删除令牌",
         )?;
         let session = self.session(site_id)?;
         let adapter = self.registry.adapter(kind);
@@ -5677,21 +5909,20 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             .await
         {
             Ok(()) => {
-                let mut local_status_updated = false;
                 let mut note: Option<String> = None;
                 // **读本地行失败也不能把整次操作报成失败**（M8-S5A §4）：
                 // 站点侧那一把已经删了，这个动作不可逆。原来的 `?` 会让「DELETE 成功、
-                // 但本地这一读失败」表现为「回收失败」——与下面 `set_key_status` 那条注释里
+                // 但本地这一读失败」表现为「删除失败」——与下面 `delete_key` 那条注释里
                 // 写着的原则**自相矛盾**（同一类事实，两种处置）。
                 let key_id = match self.local_key_id_for_remote(site_id, remote_id) {
                     Ok(id) => id,
                     Err(err) => {
                         let reason = crate::redact::scrub(&err.to_string());
-                        note = Some(format!("站点侧已回收，但读本地记录失败：{reason}"));
+                        note = Some(format!("站点侧已删除，但读本地记录失败：{reason}"));
                         self.log(observability::event_with_payload(
                             Level::Warn,
                             "key",
-                            "站点侧已回收，但读本地记录失败（本地状态没写上）",
+                            "站点侧已删除，但读本地记录失败（本地记录没删掉）",
                             serde_json::json!({
                                 "site_id": site_id,
                                 "reason": reason,
@@ -5700,67 +5931,80 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                         None
                     }
                 };
-                // 本地记账失败**不让命令失败**（M7-S4 复审 P2-1 的建议，Lead 采纳）。
+                // 本地删行失败**不让命令失败**（M7-S4 复审 P2-1 的建议，Lead 采纳）。
                 //
-                // 理由：站点侧那一把**已经删了**，这个动作不可逆。若因为本地写状态失败就返回
-                // `Err`，用户会看到「回收失败」并去重试——而重试**必然失败**（站点上已经没有它了），
+                // 理由：站点侧那一把**已经删了**，这个动作不可逆。若因为本地删行失败就返回
+                // `Err`，用户会看到「删除失败」并去重试——而重试**必然失败**（站点上已经没有它了），
                 // 更糟的是他会以为密钥还活着。把一次不可逆的成功报成失败，是比记账缺失更坏的结果。
                 //
-                // 代价是记账确实没写上，所以这里**必须留痕**：Warn 级事件带上原因（脱敏后），
-                // 用户能在事件面板看到；下一次 `sync_site_keys` 对账也会把它标出来。
+                // 代价是本地行确实还在（界面会继续列出它），所以这里**必须留痕**：Warn 级事件
+                // 带上原因（脱敏后），用户能在事件面板看到。
                 let mut vault_deleted = false;
+                let mut local_row_deleted = false;
                 if let Some(key_id) = key_id {
                     // M8-S1 §3.5-5：让**正在运行**的网关也立刻停止使用这把 key。
                     // `ensure_not_revoked` 只拦新启动；运行中的网关只看这个集合。
-                    // DEBUG-G5 P1-10：同时记下 secret_ref，供下面单删保险库条目。
+                    // 删行之后 `ensure_not_revoked` 再也看不到它（行没了），运行中的网关
+                    // 只能靠这个集合，所以这一句不能随删行一起省掉。
+                    //
+                    // 同时记下 `secret_ref` 与名字：前者用于下面单删保险库条目（**必须在删行
+                    // 之前读**——行没了就再也定位不到条目），后者用于删行后的那条溯源事件
+                    // （行没了之后，事件是唯一还知道「这里曾经有过一把什么」的地方）。
                     let mut secret_ref: Option<String> = None;
+                    let mut key_name: Option<String> = None;
                     if let Ok(Some(row)) = self.store.get_key(key_id) {
                         if let Ok(mut set) = self.revoked_refs.lock() {
                             set.insert(row.secret_ref.clone());
                         }
                         secret_ref = Some(row.secret_ref);
+                        key_name = Some(row.name);
                     }
-                    match self
-                        .store
-                        .set_key_status(key_id, crate::store::KEY_STATUS_REVOKED)
-                    {
-                        Ok(()) => local_status_updated = true,
-                        Err(err) => {
-                            let reason = crate::redact::scrub(&err.to_string());
-                            note = Some(format!("站点侧已回收，但本地状态没写上：{reason}"));
-                            self.log(observability::event_with_payload(
-                                Level::Warn,
-                                "key",
-                                "站点侧已回收，但本地状态没写上",
-                                serde_json::json!({
-                                    "site_id": site_id,
-                                    "key_id": key_id,
-                                    "reason": reason,
-                                }),
-                            ));
-                        }
-                    }
-                    // DEBUG-G5 P1-10：单删该 key 的保险库条目（明文材料），DB 行
-                    // 保留（上文 `set_key_status` 只改状态，不删行）。删除与状态
-                    // 写回互相独立：任一失败都不让另一次、更不让整次回收失败
-                    // （站点侧已删不可逆，同上文「本地记账失败不让命令失败」的
-                    // 口径）；删除失败必须留痕：Warn 事件 + note 追加，调用方与
-                    // 界面能看到「站点已删、本地保险库条目还在」，而不是静默残留。
-                    // `vault.delete` 幂等：条目本来就没了也算成功。
-                    if let Some(reference) = secret_ref {
-                        match self.vault.delete(&reference) {
-                            Ok(()) => vault_deleted = true,
+                    // 先删明文、后删它的索引。保险库删除失败时**保留 revoked 墓碑**：
+                    // 再删行会让残留明文失去 secret_ref，之后连定向清理都做不到。
+                    // revoked 行不会出现在资产里，且投递/启动/轮换都会被拒绝。
+                    let vault_ready_for_row_delete = match secret_ref {
+                        Some(reference) => match self.vault.delete(&reference) {
+                            Ok(()) => {
+                                vault_deleted = true;
+                                true
+                            }
                             Err(err) => {
                                 let reason = crate::redact::scrub(&err.to_string());
                                 let suffix = format!("保险库条目未删除：{reason}");
                                 note = Some(match note {
                                     Some(prev) => format!("{prev}；{suffix}"),
-                                    None => format!("站点侧已回收，但{suffix}"),
+                                    None => format!("站点侧已删除，但{suffix}"),
                                 });
                                 self.log(observability::event_with_payload(
                                     Level::Warn,
                                     "key",
-                                    "站点侧已回收，但保险库条目未删除",
+                                    "站点侧已删除，但保险库条目未删除",
+                                    serde_json::json!({
+                                        "site_id": site_id,
+                                        "key_id": key_id,
+                                        "reason": reason,
+                                    }),
+                                ));
+                                false
+                            }
+                        },
+                        // 读不到索引时不能宣称明文已清理；沿用不删除该行的保守路径。
+                        None => false,
+                    };
+                    if vault_ready_for_row_delete {
+                        match self.store.delete_key(key_id) {
+                            Ok(_) => local_row_deleted = true,
+                            Err(err) => {
+                                let reason = crate::redact::scrub(&err.to_string());
+                                let suffix = format!("本地记录未删除：{reason}");
+                                note = Some(match note {
+                                    Some(prev) => format!("{prev}；{suffix}"),
+                                    None => format!("站点侧已删除，但{suffix}"),
+                                });
+                                self.log(observability::event_with_payload(
+                                    Level::Warn,
+                                    "key",
+                                    "站点侧已删除，但本地记录未删除",
                                     serde_json::json!({
                                         "site_id": site_id,
                                         "key_id": key_id,
@@ -5770,17 +6014,55 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                             }
                         }
                     }
+                    if !local_row_deleted {
+                        // 明文删除成功但行删失败，或明文删除失败需要保留索引：两种情形都
+                        // 标 revoked，让旧行不会重新变成可投递/可启动网关的 enabled key。
+                        if let Err(err) = self
+                            .store
+                            .set_key_status(key_id, crate::store::KEY_STATUS_REVOKED)
+                        {
+                            let reason = crate::redact::scrub(&err.to_string());
+                            let suffix = format!("本地记录未能标为已删除：{reason}");
+                            note = Some(match note {
+                                Some(prev) => format!("{prev}；{suffix}"),
+                                None => format!("站点侧已删除，但{suffix}"),
+                            });
+                            self.log(observability::event_with_payload(
+                                Level::Warn,
+                                "key",
+                                "站点侧已删除，但本地记录未能标为已删除",
+                                serde_json::json!({
+                                    "site_id": site_id,
+                                    "key_id": key_id,
+                                    "reason": reason,
+                                }),
+                            ));
+                        }
+                    }
+                    // 溯源：`keys` 行没了之后，这条事件是唯一记录「曾经有过哪一把」的地方
+                    // （id / 名字 / 站点 / 远端 id，都是身份事实，不含任何密钥材料）。
+                    self.log(observability::event_with_payload(
+                        Level::Info,
+                        "key",
+                        "密钥本地删除结果（溯源留痕）",
+                        serde_json::json!({
+                            "site_id": site_id,
+                            "key_id": key_id,
+                            "key_name": key_name,
+                            "remote_id": remote_id,
+                            "local_row_deleted": local_row_deleted,
+                        }),
+                    ));
                 }
                 // payload 只记 id 与状态：这里经手的是「哪一把」，不是「那一把的值」。
                 self.log(observability::event_with_payload(
                     Level::Info,
                     "key",
-                    "已回收站点上的密钥",
+                    "已删除站点上的密钥",
                     serde_json::json!({
                         "site_id": site_id,
                         "key_id": key_id,
-                        "status": crate::store::KEY_STATUS_REVOKED,
-                        "local_status_updated": local_status_updated,
+                        "local_row_deleted": local_row_deleted,
                         "vault_deleted": vault_deleted,
                     }),
                 ));
@@ -5788,7 +6070,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     site_id,
                     remote_id: Some(remote_id.to_string()),
                     revoked: true,
-                    local_status_updated,
+                    local_row_deleted,
                     vault_deleted,
                     note,
                 })
@@ -5852,7 +6134,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                         site_id: row.site_id,
                         remote_id: Some(remote_id),
                         revoked: false,
-                        local_status_updated: false,
+                        local_row_deleted: false,
                         vault_deleted: false,
                         note: Some(crate::redact::scrub(&err.to_string())),
                     }),
@@ -6166,6 +6448,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         // `row.secret_ref` 与 `api_key` 同源：`api_key` 就是从这个引用取出来的，
         // 所以填它不会引入新的取密钥路径。
         config.legacy_key_ref = Some(row.secret_ref.clone());
+        // M47-S2：把名单交给网关——它需要「这个模型支不支持思考」来决定把入站的
+        // `thinking` 折算成 `reasoning_effort` 还是丢掉（翻译层不再因为该字段 400）。
+        config.catalog = Some(std::sync::Arc::clone(&self.catalog));
         // M14-S1：多站路由开关（B-99）。关时（默认）走 single_upstream——config.base_url
         // / api_key 是所选站点，M8-S4 §6.5 换站语义逐字不变；开时用 build_gateway_route
         // 填非空 route + keys_by_ref，网关按模型选路（多站聚合，FR-6 V1.1 可选）。
@@ -7900,11 +8185,17 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             }
             delivery::DeliverySource::Gateway(endpoint) => !endpoint.base_url.trim().is_empty(),
         };
+        let meta = self.meta_for(model);
         Ok(delivery::FieldSetOptions::new(
             delivery::opencode::OpenCodeWriter::DEFAULT_PROVIDER_ID,
             has_endpoint,
             model.map(str::trim).filter(|m| !m.is_empty()).is_some(),
-            self.meta_for(model).is_some(),
+            meta.is_some(),
+        )
+        .with_thinking(
+            meta.and_then(|m| m.thinking)
+                .map(|spec| spec.accepts(spec.default_level))
+                .unwrap_or(false),
         ))
     }
 
@@ -8436,6 +8727,7 @@ mod tests {
         ServiceConfig {
             vault: Arc::new(crate::vault::MemoryVault::new()),
             backup_dir: home.join(".tianshu-relay").join("backups"),
+            data_dir: None,
             home,
         }
     }
@@ -10176,6 +10468,7 @@ mod tests {
                 vault: Arc::clone(&vault) as Arc<dyn crate::vault::Vault>,
                 home: home.clone(),
                 backup_dir: home.join("backups"),
+                data_dir: None,
             },
         );
         let site = service
@@ -10288,6 +10581,7 @@ mod tests {
                 vault: Arc::new(crate::vault::MemoryVault::new()),
                 home: home.clone(),
                 backup_dir: home.join("backups"),
+                data_dir: None,
             },
         );
         let site = service
@@ -10425,6 +10719,7 @@ mod tests {
                 vault: Arc::clone(&vault) as Arc<dyn crate::vault::Vault>,
                 home: home.clone(),
                 backup_dir: home.join("backups"),
+                data_dir: None,
             },
         );
         let site = service
@@ -10566,6 +10861,7 @@ mod tests {
                 vault: Arc::clone(&vault) as Arc<dyn crate::vault::Vault>,
                 home: home.clone(),
                 backup_dir: home.join("backups"),
+                data_dir: None,
             },
         );
         service.transport_push(json_ok_with(
@@ -11242,6 +11538,35 @@ mod tests {
             "错误文案不得原样带出站点原文里的密钥形态：{text}"
         );
         assert!(text.contains("sk-***"), "应当留下脱敏痕迹：{text}");
+    }
+
+    /// M47-S2：`catalog_url` 为空（设置默认值）时必须折算成内置地址。
+    ///
+    /// 这条不是形式主义：第一版同步路径**没有**折算，实测拿着空串发请求，
+    /// 事件表里是「URL 非法（relative URL without a base）」——而界面那边显示的是默认地址。
+    #[tokio::test]
+    async fn empty_catalog_url_falls_back_to_the_default() {
+        let mut settings = crate::settings::Settings::default();
+        assert_eq!(settings.catalog_url, "", "前提：默认就是空串");
+        assert_eq!(
+            effective_catalog_url(Some(&settings)),
+            crate::model_catalog::CATALOG_URL
+        );
+        settings.catalog_url = "  ".to_string();
+        assert_eq!(
+            effective_catalog_url(Some(&settings)),
+            crate::model_catalog::CATALOG_URL,
+            "纯空白也算空"
+        );
+        settings.catalog_url = "https://mirror.example.com/models.json".to_string();
+        assert_eq!(
+            effective_catalog_url(Some(&settings)),
+            "https://mirror.example.com/models.json"
+        );
+        assert_eq!(
+            effective_catalog_url(None),
+            crate::model_catalog::CATALOG_URL
+        );
     }
 
     // ============================================================ M38-S1：会话持久化收口

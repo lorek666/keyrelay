@@ -2,7 +2,7 @@
 //!
 //! 复跑：
 //! ```text
-//! CARGO_TARGET_DIR=/Volumes/Date/kr-t-redact CARGO_BUILD_JOBS=4 \
+//! CARGO_TARGET_DIR=/tmp/kr-t-redact CARGO_BUILD_JOBS=4 \
 //!   cargo test -p tianshu-relay-core --test redact_credential_forms
 //! ```
 //!

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import Cockpit from "../pages/Cockpit";
@@ -26,6 +26,7 @@ vi.mock("../lib/api", async (importOriginal) => {
     recentGatewayUsage: vi.fn(),
     recentUsageSnapshots: vi.fn(),
     refreshAll: vi.fn(),
+    gatewayStatus: vi.fn(),
   };
 });
 
@@ -39,6 +40,7 @@ import {
   recentGatewayUsage,
   recentUsageSnapshots,
   refreshAll,
+  gatewayStatus,
   type AppInfo,
   type ConsentRow,
   type DriftReport,
@@ -74,6 +76,9 @@ function wrapper({ children }: { children: ReactNode }) {
 }
 
 beforeEach(() => {
+  vi.mocked(gatewayStatus).mockResolvedValue({
+    running: false, phase: "stopped", url: null, tokenPersistent: false,
+  } as unknown as Awaited<ReturnType<typeof gatewayStatus>>);
   vi.mocked(appInfo).mockResolvedValue({
     name: "Tianshu Relay",
     version: "9.9.9-test",
@@ -122,23 +127,25 @@ describe("Cockpit", () => {
   it("5 指标按既有口径计数", async () => {
     render(<Cockpit />, { wrapper });
     await waitFor(() => {
-      // 站点 2 / 本地密钥 3 / 有效同意 1（已回收的不计）/ 告警 2（info 不计）/ 漂移 1（intact 不计）
-      expect(screen.getByText("站点").closest(".hm-card")).toHaveTextContent("2");
-      expect(screen.getByText("本地密钥").closest(".hm-card")).toHaveTextContent("3");
-      expect(screen.getByText("有效同意").closest(".hm-card")).toHaveTextContent("1");
-      expect(screen.getByText("告警事件").closest(".hm-card")).toHaveTextContent("2");
-      expect(screen.getByText("配置漂移").closest(".hm-card")).toHaveTextContent("1");
+      // 站点 2 / 本地密钥 2（旧版已删除行不计）/ 有效同意 1 / 告警 2（info 不计）/ 漂移 1。
+      expect(screen.getByRole("button", { name: "2 站点", exact: true })).toHaveTextContent("2");
+      expect(screen.getByRole("button", { name: "2 本地密钥", exact: true })).toHaveTextContent("2");
+      expect(screen.queryByRole("button", { name: "3 本地密钥", exact: true })).toBeNull();
+      expect(screen.getByRole("button", { name: "1 有效同意", exact: true })).toHaveTextContent("1");
+      expect(screen.getByRole("button", { name: "2 告警事件", exact: true })).toHaveTextContent("2");
+      expect(screen.getByRole("button", { name: "1 配置漂移", exact: true })).toHaveTextContent("1");
     });
   });
 
-  it("运行状态与需登录卡渲染真实值", async () => {
+  it("运行状态收进系统详情，需登录项仍可定位", async () => {
     render(<Cockpit />, { wrapper });
-    await waitFor(() => {
-      // 版本同时出现在英雄卡与运行状态卡（两处同值是设计，不是重复渲染 bug）
-      expect(screen.getAllByText(/9\.9\.9-test/)).toHaveLength(2);
-      expect(screen.getByText("/tmp/test-data")).toBeTruthy();
-      expect(screen.getByText("Beta")).toBeTruthy();
-    });
+    await waitFor(() => expect(screen.getByText("Beta")).toBeTruthy());
+    // 版本不再为了填满 Hero 重复出现；技术信息保留在可展开的系统详情。
+    expect(screen.getAllByText(/9\.9\.9-test/)).toHaveLength(1);
+    const details = document.querySelector(".system-details") as HTMLDetailsElement;
+    fireEvent.click(within(details).getByText("运行与数据详情"));
+    expect(details.open).toBe(true);
+    expect(within(details).getByText("/tmp/test-data")).toBeTruthy();
   });
 
   it("漂移卡只列三态行，intact 行不得出现", async () => {
@@ -171,7 +178,7 @@ describe("Cockpit", () => {
     });
     expect(screen.queryByText("msg-6")).toBeNull();
     // 指标仍计 6 条（截断只影响卡片行数，不影响计数）
-    expect(screen.getByText("告警事件").closest(".hm-card")).toHaveTextContent("6");
+    expect(screen.getByRole("button", { name: "6 告警事件", exact: true })).toHaveTextContent("6");
   });
 
   it("刷新失败时红行带真实原因", async () => {
@@ -184,6 +191,20 @@ describe("Cockpit", () => {
     await waitFor(() => {
       expect(screen.getByText(/刷新失败：boom/)).toBeTruthy();
     });
+  });
+
+  it("已加载的空用量显示 0，加载中才显示 —", async () => {
+    vi.mocked(recentGatewayUsage).mockResolvedValue([]);
+    const { unmount } = render(<Cockpit />, { wrapper });
+    await waitFor(() => {
+      const usage = screen.getByText("网关转发（24h）").parentElement;
+      expect(usage).toHaveTextContent("0");
+      expect(usage).not.toHaveTextContent("—");
+    });
+    unmount();
+    vi.mocked(recentGatewayUsage).mockImplementation(() => new Promise(() => {}));
+    render(<Cockpit />, { wrapper });
+    expect(screen.getByText("网关转发（24h）").parentElement).toHaveTextContent("—");
   });
 
   it("内存 vault 时警告红行在列", async () => {
@@ -219,8 +240,8 @@ describe("Cockpit", () => {
     vi.mocked(driftReport).mockImplementation(() => new Promise(() => {}));
     render(<Cockpit />, { wrapper });
     await waitFor(() => {
-      expect(screen.getByText("告警事件").closest(".hm-card")).toHaveTextContent("—");
-      expect(screen.getByText("配置漂移").closest(".hm-card")).toHaveTextContent("—");
+      expect(screen.getByRole("button", { name: "— 告警事件", exact: true })).toHaveTextContent("—");
+      expect(screen.getByRole("button", { name: "— 配置漂移", exact: true })).toHaveTextContent("—");
     });
   });
 });

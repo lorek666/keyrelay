@@ -148,6 +148,70 @@ fn detect_system_proxy_returns_shape_without_acl_rejection() {
 }
 
 #[test]
+fn catalog_status_and_override_roundtrip_through_real_ipc() {
+    let (_app, webview) = build_app();
+    let initial = invoke_on(&webview, "catalog_status", json!({})).expect("读取内置名单");
+    assert_eq!(initial["source"], "bundled");
+    assert!(initial["entries"].as_u64().unwrap_or(0) >= 30);
+    assert!(initial["models"].as_array().is_some_and(|m| !m.is_empty()));
+    assert!(initial["models"][0].get("thinkingUnsupported").is_some());
+
+    let changed = invoke_on(
+        &webview,
+        "catalog_set_override",
+        json!({"modelId": "o3", "patch": {"thinkingLevel": "off", "priceInputPerMtok": 1.25, "priceOutputPerMtok": 2.5}}),
+    )
+    .expect("覆盖必须真的通过 IPC 保存");
+    let o3 = changed["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "o3")
+        .expect("o3 条目");
+    assert_eq!(o3["thinking"], Value::Null);
+    assert_eq!(o3["thinkingUnsupported"], true);
+    assert_eq!(o3["prices"][0]["inputPerMtok"], 1.25);
+    assert_eq!(changed["overrides"], 1);
+
+    let state = webview.app_handle().state::<tianshu_relay_lib::AppState>();
+    let prices = state.service.store().model_price_list().expect("价格表");
+    assert!(prices
+        .iter()
+        .any(|p| p.model == "o3" && p.input_per_mtok == 1.25 && p.output_per_mtok == 2.5));
+    assert_eq!(
+        state.service.catalog().dir(),
+        state.data_dir.join("catalog").as_path(),
+        "名单必须与实际数据目录同根，不能再从 home 反推"
+    );
+    assert!(state.data_dir.join("catalog/overrides.json").exists());
+
+    let restored = invoke_on(
+        &webview,
+        "catalog_set_override",
+        json!({"modelId": "o3", "patch": null}),
+    )
+    .expect("撤销覆盖");
+    let o3 = restored["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "o3")
+        .unwrap();
+    assert!(o3["thinking"].is_object());
+    assert_eq!(restored["overrides"], 0);
+    assert!(!state.data_dir.join("catalog/overrides.json").exists());
+
+    let err = invoke_on(
+        &webview,
+        "catalog_set_override",
+        json!({"modelId": "o3", "patch": {"thinkingLevel": "infinite"}}),
+    )
+    .expect_err("非法档位不能写入");
+    assert_not_acl_rejection("catalog_set_override", &err);
+    assert!(err.to_string().contains("思考档位"));
+}
+
+#[test]
 fn list_sites_returns_empty_array_on_fresh_state() {
     let value = invoke("list_sites").expect("list_sites 应成功");
     assert_eq!(value, json!([]));

@@ -44,6 +44,7 @@ fn setup() -> Fixture {
             vault,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 
@@ -106,6 +107,7 @@ fn setup_two_keys() -> (Fixture, i64) {
             vault,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 

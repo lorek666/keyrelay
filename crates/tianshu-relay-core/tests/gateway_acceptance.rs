@@ -92,6 +92,7 @@ fn config(route: Vec<Upstream>, keys: Vec<(&str, &str)>) -> GatewayConfig {
         map.insert(k.to_string(), zeroize::Zeroizing::new(v.to_string()));
     }
     GatewayConfig {
+        catalog: None,
         port: 0,
         token: TOKEN.to_string(),
         key_id: None,
@@ -632,6 +633,7 @@ async fn m44_c6_per_site_concurrency_cap() {
 async fn m44_c7_multi_key_shares_breaker() {
     let a = fake(vec!["503 Service Unavailable"], 0);
     let cfg = GatewayConfig {
+        catalog: None,
         route: RouteTable::new(vec![
             upstream(1, a.port, "r1a", vec!["gpt-4o"], 1.0),
             upstream(1, a.port, "r1b", vec!["gpt-4o"], 1.0),

@@ -1,0 +1,607 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-10-27T00:00:00Z",
+  "minAppVersion": "0.2.1",
+  "notes": "价格留空 = 未知（成本估算按「无价」处理，绝不按 0 计）；思考档位只在**核对过官方能力**后才写，没核对就留空（= 未知，投递不写该参数、网关丢弃该字段），不猜。",
+  "models": [
+    {
+      "id": "gpt-4o",
+      "displayName": "gpt-4o",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 128000,
+        "maxOutputTokens": 16384
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-4o-mini",
+      "displayName": "gpt-4o-mini",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 128000,
+        "maxOutputTokens": 16384
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-4-turbo",
+      "displayName": "gpt-4-turbo",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 128000,
+        "maxOutputTokens": 4096
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-4",
+      "displayName": "gpt-4",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 8192,
+        "maxOutputTokens": 4096
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gpt-3.5-turbo",
+      "displayName": "gpt-3.5-turbo",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 16385,
+        "maxOutputTokens": 4096
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "o1",
+      "displayName": "o1",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 100000
+      },
+      "thinking": {
+        "supported": true,
+        "param": "reasoning_effort",
+        "levels": [
+          "off",
+          "low",
+          "medium",
+          "high"
+        ],
+        "defaultLevel": "medium",
+        "budgetTokens": {}
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "o1-mini",
+      "displayName": "o1-mini",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 128000,
+        "maxOutputTokens": 65536
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "o3",
+      "displayName": "o3",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 100000
+      },
+      "thinking": {
+        "supported": true,
+        "param": "reasoning_effort",
+        "levels": [
+          "off",
+          "low",
+          "medium",
+          "high"
+        ],
+        "defaultLevel": "medium",
+        "budgetTokens": {}
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "o3-mini",
+      "displayName": "o3-mini",
+      "aliases": [],
+      "vendor": "openai",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 100000
+      },
+      "thinking": {
+        "supported": true,
+        "param": "reasoning_effort",
+        "levels": [
+          "off",
+          "low",
+          "medium",
+          "high"
+        ],
+        "defaultLevel": "medium",
+        "budgetTokens": {}
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-3-5-sonnet",
+      "displayName": "claude-3-5-sonnet",
+      "aliases": [],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 8192
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-3-5-haiku",
+      "displayName": "claude-3-5-haiku",
+      "aliases": [],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 8192
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-3-opus",
+      "displayName": "claude-3-opus",
+      "aliases": [],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 4096
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-3-sonnet",
+      "displayName": "claude-3-sonnet",
+      "aliases": [],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 4096
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "claude-3-haiku",
+      "displayName": "claude-3-haiku",
+      "aliases": [],
+      "vendor": "anthropic",
+      "protocol": {
+        "upstream": "anthropic_messages",
+        "anthropicCompatible": true
+      },
+      "limits": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 4096
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemini-2.0-flash",
+      "displayName": "gemini-2.0-flash",
+      "aliases": [],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "gemini",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemini-1.5-pro",
+      "displayName": "gemini-1.5-pro",
+      "aliases": [],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "gemini",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 2097152,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "gemini-1.5-flash",
+      "displayName": "gemini-1.5-flash",
+      "aliases": [],
+      "vendor": "google",
+      "protocol": {
+        "upstream": "gemini",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "deepseek-chat",
+      "displayName": "deepseek-chat",
+      "aliases": [],
+      "vendor": "deepseek",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 64000,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "deepseek-reasoner",
+      "displayName": "deepseek-reasoner",
+      "aliases": [],
+      "vendor": "deepseek",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 64000,
+        "maxOutputTokens": 8192
+      },
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "qwen-max",
+      "displayName": "qwen-max",
+      "aliases": [],
+      "vendor": "alibaba",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 32768,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "qwen-plus",
+      "displayName": "qwen-plus",
+      "aliases": [],
+      "vendor": "alibaba",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 131072,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "qwen-turbo",
+      "displayName": "qwen-turbo",
+      "aliases": [],
+      "vendor": "alibaba",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "abab6.5",
+      "displayName": "abab6.5",
+      "aliases": [],
+      "vendor": "minimax",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 245760,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "abab6.5s",
+      "displayName": "abab6.5s",
+      "aliases": [],
+      "vendor": "minimax",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 245760,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "glm-4",
+      "displayName": "glm-4",
+      "aliases": [],
+      "vendor": "zhipu",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 128000,
+        "maxOutputTokens": 4096
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "glm-4-plus",
+      "displayName": "glm-4-plus",
+      "aliases": [],
+      "vendor": "zhipu",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 128000,
+        "maxOutputTokens": 4096
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "glm-4-flash",
+      "displayName": "glm-4-flash",
+      "aliases": [],
+      "vendor": "zhipu",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 128000,
+        "maxOutputTokens": 4096
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "moonshot-v1-8k",
+      "displayName": "moonshot-v1-8k",
+      "aliases": [],
+      "vendor": "moonshot",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 8192,
+        "maxOutputTokens": 4096
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "moonshot-v1-32k",
+      "displayName": "moonshot-v1-32k",
+      "aliases": [],
+      "vendor": "moonshot",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 32768,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "moonshot-v1-128k",
+      "displayName": "moonshot-v1-128k",
+      "aliases": [],
+      "vendor": "moonshot",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 131072,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "mistral-large",
+      "displayName": "mistral-large",
+      "aliases": [],
+      "vendor": "mistral",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 128000,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "mixtral-8x7b",
+      "displayName": "mixtral-8x7b",
+      "aliases": [],
+      "vendor": "mistral",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 32768,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "llama-3.1-405b",
+      "displayName": "llama-3.1-405b",
+      "aliases": [],
+      "vendor": "meta",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 131072,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    },
+    {
+      "id": "llama-3.1-70b",
+      "displayName": "llama-3.1-70b",
+      "aliases": [],
+      "vendor": "meta",
+      "protocol": {
+        "upstream": "openai_chat",
+        "anthropicCompatible": false
+      },
+      "limits": {
+        "contextWindow": 131072,
+        "maxOutputTokens": 8192
+      },
+      "thinking": null,
+      "prices": [],
+      "deprecated": false
+    }
+  ]
+}

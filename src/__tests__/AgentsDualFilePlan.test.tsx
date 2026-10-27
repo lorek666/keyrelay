@@ -212,7 +212,28 @@ describe("P0-2 P1-2 Agents 双文件确认", () => {
     expect(applyButton.disabled).toBe(false);
   });
 
-  it("④ 投递成功提示列出全部写盘路径（确认弹窗里同样列出两文件）", async () => {
+  it("④ 重复展开同一计划保留勾选；实际切换投递模式仍强制重新确认", async () => {
+    await expandCodexRow();
+    const box = planBox();
+    await waitFor(() => expect(box.textContent).toContain("NEW-CONFIG"));
+    const checkbox = () => planBox().querySelector<HTMLInputElement>(".checkline input[type=checkbox]")!;
+    fireEvent.click(checkbox());
+    expect(checkbox().checked).toBe(true);
+    const toggle = () => document.querySelector<HTMLButtonElement>("[data-agent-channel='codex-auth-json'] .agent-row-toggle")!;
+    fireEvent.click(toggle());
+    expect(document.querySelector(".agent-row-plan")).toBeNull();
+    fireEvent.click(toggle());
+    await waitFor(() => expect(planBox().textContent).toContain("NEW-CONFIG"));
+    expect(checkbox().checked).toBe(true);
+
+    const direct = document.querySelectorAll<HTMLInputElement>('input[type="radio"]')[1];
+    fireEvent.click(direct);
+    await waitFor(() => expect(checkbox().checked).toBe(false));
+    const lastArg = (deliveryPlan as unknown as { mock: { calls: unknown[][] } }).mock.calls.at(-1)![0];
+    expect(lastArg).toMatchObject({ mode: "site" });
+  });
+
+  it("⑤ 投递成功提示列出全部写盘路径（确认弹窗里同样列出两文件）", async () => {
     await expandCodexRow();
     const box = planBox();
     await waitFor(() => expect(box.textContent).toContain("NEW-CONFIG"));

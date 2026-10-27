@@ -16,7 +16,7 @@ use crate::site::KeyStatus;
 ///
 /// 版本号只是「将来需要非幂等迁移」的锚点：新表由每次打开的幂等 `DDL` 建出。
 /// M39-S1 之后下一个用版本号的是 M40-S1（顺延为 8）。
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// 「已回收」——**本地**密钥生命周期状态（M7-S4 / FR-2）。
 ///
@@ -276,7 +276,9 @@ CREATE TABLE IF NOT EXISTS model_prices(
   output_per_mtok  REAL    NOT NULL,
   currency         TEXT    NOT NULL,
   effective_from   INTEGER NOT NULL,
-  created_at       INTEGER NOT NULL
+  created_at       INTEGER NOT NULL,
+  -- catalog = 名单/本机覆盖导入；manual = 用户手输，撤销覆盖不得删除它。
+  source           TEXT NOT NULL DEFAULT 'manual'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_model_prices_version
   ON model_prices(model, currency, effective_from);
@@ -674,6 +676,8 @@ pub struct ModelPriceRow {
     pub currency: String,
     pub effective_from: i64,
     pub created_at: i64,
+    /// `"manual"`（用户手输）/ `"catalog"`（名单或本机覆盖导入）。
+    pub source: String,
 }
 
 /// M46-S5：一行站点 / key 硬预算（`site_budgets` 表的一行）。
@@ -1203,6 +1207,13 @@ impl Store {
         // 行为与修前逐字相同）。版本号不 bump：本列迁移是幂等的
         // add_column_if_missing，与 delivery_mode 等列同口径。
         add_column_if_missing(&conn, "sites", "timeout_ms", "INTEGER")?;
+        // M47-S2（10 → 11）：名单价与用户手输价分开；旧行默认 manual，不能误删。
+        add_column_if_missing(
+            &conn,
+            "model_prices",
+            "source",
+            "TEXT NOT NULL DEFAULT 'manual'",
+        )?;
 
         // 版本号仍然只在升级时写，保留它作为「将来需要非幂等迁移」的锚点。
         if version < SCHEMA_VERSION {
@@ -2191,9 +2202,14 @@ impl Store {
     /// 行不存在时**报错**而不是静默成功（与 [`Store::set_site_health`] 同口径）：
     /// 静默成功会让调用方以为状态已落库，而界面会显示一个**不存在**的 key「已回收」。
     ///
-    /// **不删行**：回收语义只改状态。删 `keys` 行会经 `ON DELETE CASCADE` 带走该 key 的
+    /// **不删行**：这里只改状态。删 `keys` 行会经 `ON DELETE CASCADE` 带走该 key 的
     /// 全部 `bindings`（漂移检测的输入），而 `journals` 没有 `key_id` 列——溯源链的起点就是
     /// `keys.id`，删了它再也答不上「这次投递是哪把 key 造成的」（M7-S4 spec §6.1）。
+    ///
+    /// 界面上的「删除」现在**不再**走这里，而是走 [`Store::delete_key`] 物理删行
+    /// （用户明确要求删掉的密钥不要再出现在任何列表里）。本方法留下的
+    /// `revoked` 行只剩一种来源：**旧版本删过的历史行**——它们仍然被
+    /// `ensure_not_revoked` 拦住、被界面过滤掉，语义不变。
     pub fn set_key_status(&self, key_id: i64, status: &str) -> Result<()> {
         if !is_legal_key_status(status) {
             // 值本身也过 `scrub`：调用方可能把密钥误传进来，错误文案里不能出现它
@@ -2214,6 +2230,35 @@ impl Store {
             return Err(Error::Store(format!("密钥不存在: {key_id}")));
         }
         Ok(())
+    }
+
+    /// **物理删除**一把本地密钥行（资产页「删除」的落点）。
+    ///
+    /// 与 [`Store::set_key_status`] 的唯一区别是**行是否留下**。这里是删行，所以经
+    /// `ON DELETE CASCADE`（连接打开时 `PRAGMA foreign_keys = ON`）会一并带走该 key 的：
+    ///
+    /// - `bindings`（投递绑定 / 漂移追溯的输入，含 `managed_json` 与 `journal_id`）；
+    /// - `usage_samples`（按 key 的日用量采样）；
+    /// - `probe_runs`（模型检测历史）；
+    /// - key 级 `site_budgets`（站级预算 `key_id IS NULL` 不受影响）。
+    ///
+    /// `gateway_usage_log.key_id` **没有**外键，删行后留一个孤儿 id（用量页会把它显示成
+    /// `Key #<id>`）。以上都是「删除」这个动作的既定代价，不是 bug：用户要的就是这把 key
+    /// 从此不再出现在任何列表里。**所以调用方必须先留痕**——`events` 表里写一条带
+    /// id / 名字 / 站点的事件：`keys` 行消失之后，那是唯一还能回答「这里曾经有过一把什么」的地方。
+    ///
+    /// # 幂等
+    ///
+    /// 行不存在 ⇒ `Ok(false)` 且不报错。站点侧 DELETE 本身幂等，本地这条按同一口径：
+    /// 重复删除报错只会诱导用户去重试一次注定失败的操作（B-100 同一条教训）。
+    ///
+    /// 返回值 = 「这次真的删掉了一行」。
+    pub fn delete_key(&self, key_id: i64) -> Result<bool> {
+        let conn = self.lock()?;
+        let affected = conn
+            .execute("DELETE FROM keys WHERE id = ?1", params![key_id])
+            .map_err(|e| Error::Store(format!("删除密钥失败: {e}")))?;
+        Ok(affected > 0)
     }
 
     /// 读 `keys.status`。行不存在 ⇒ `Ok(None)`。
@@ -2650,7 +2695,7 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, model, input_per_mtok, output_per_mtok, currency, effective_from, created_at
+                "SELECT id, model, input_per_mtok, output_per_mtok, currency, effective_from, created_at, source
                  FROM model_prices ORDER BY model ASC, currency ASC, effective_from DESC",
             )
             .map_err(|e| Error::Store(format!("prepare model price list: {e}")))?;
@@ -2664,6 +2709,7 @@ impl Store {
                     currency: row.get(4)?,
                     effective_from: row.get(5)?,
                     created_at: row.get(6)?,
+                    source: row.get(7)?,
                 })
             })
             .map_err(|e| Error::Store(format!("query model price list: {e}")))?;
@@ -2700,8 +2746,8 @@ impl Store {
         }
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO model_prices(model, input_per_mtok, output_per_mtok, currency, effective_from, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO model_prices(model, input_per_mtok, output_per_mtok, currency, effective_from, created_at, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'manual')
              ON CONFLICT(model, currency, effective_from)
              DO UPDATE SET input_per_mtok = excluded.input_per_mtok,
                            output_per_mtok = excluded.output_per_mtok,
@@ -2717,6 +2763,83 @@ impl Store {
             )
             .map_err(|e| Error::Store(format!("读回模型单价 id 失败: {e}")))?;
         Ok(id)
+    }
+
+    /// 写入名单/本机覆盖导入的价格版本，不动任何手工价。
+    pub fn catalog_price_upsert(
+        &self,
+        model: &str,
+        input_per_mtok: f64,
+        output_per_mtok: f64,
+        currency: &str,
+        effective_from: i64,
+    ) -> Result<i64> {
+        // 先用既有校验检查数值，但不要复用 manual 写入路径。
+        for (name, value) in [("输入", input_per_mtok), ("输出", output_per_mtok)] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(Error::Store(format!("名单{name}价格必须大于 0")));
+            }
+        }
+        let model = model.trim();
+        let currency = currency.trim().to_ascii_uppercase();
+        if model.is_empty() || model.chars().count() > 128 {
+            return Err(Error::Store("名单模型名为空或超过 128 字符".into()));
+        }
+        if currency != "USD" && currency != "CNY" {
+            return Err(Error::Store("名单价格币种只支持 USD / CNY".into()));
+        }
+        let conn = self.lock()?;
+        // 已有手工版本就不覆盖：手工价的含义与优先级必须保留。
+        let existing: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, source FROM model_prices WHERE model = ?1 AND currency = ?2 AND effective_from = ?3",
+                params![model, currency, effective_from],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| Error::Store(format!("读取已有价格来源失败: {e}")))?;
+        if let Some((_, source)) = existing {
+            if source == "manual" {
+                return Err(Error::Store(format!(
+                    "模型 {model} 在该生效时间已有手工价格，未覆盖"
+                )));
+            }
+        }
+        conn.execute(
+            "INSERT INTO model_prices(model, input_per_mtok, output_per_mtok, currency, effective_from, created_at, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'catalog')
+             ON CONFLICT(model, currency, effective_from)
+             DO UPDATE SET input_per_mtok = excluded.input_per_mtok,
+                           output_per_mtok = excluded.output_per_mtok,
+                           created_at = excluded.created_at,
+                           source = 'catalog'",
+            params![model, input_per_mtok, output_per_mtok, currency, effective_from, now_secs()],
+        )
+        .map_err(|e| Error::Store(format!("写入名单价格失败: {e}")))?;
+        conn.query_row(
+            "SELECT id FROM model_prices WHERE model = ?1 AND currency = ?2 AND effective_from = ?3",
+            params![model, currency, effective_from],
+            |row| row.get(0),
+        )
+        .map_err(|e| Error::Store(format!("读回名单价格 id 失败: {e}")))
+    }
+
+    /// 撤销名单覆盖时只移除该模型（含别名）的名单导入价，不碰手工价。
+    pub fn catalog_price_delete_for(&self, model_ids: &[String]) -> Result<usize> {
+        if model_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.lock()?;
+        let mut total = 0;
+        for model in model_ids {
+            total += conn
+                .execute(
+                    "DELETE FROM model_prices WHERE model = ?1 AND source = 'catalog'",
+                    params![model],
+                )
+                .map_err(|e| Error::Store(format!("清理名单价格失败: {e}")))?;
+        }
+        Ok(total)
     }
 
     /// 删除一个价格版本。**允许删除**（估算是展示层：删掉后该时段的成本变回「未知」）。
@@ -3911,6 +4034,46 @@ mod tests {
     }
 
     #[test]
+    fn catalog_price_migration_preserves_manual_prices_and_only_removes_imported_ones() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("prices.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("造 v10 价格库");
+            conn.execute_batch(
+                "CREATE TABLE model_prices(
+                    id INTEGER PRIMARY KEY, model TEXT NOT NULL,
+                    input_per_mtok REAL NOT NULL, output_per_mtok REAL NOT NULL,
+                    currency TEXT NOT NULL, effective_from INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO model_prices VALUES(1, 'o3', 9, 18, 'USD', 1, 1);
+                PRAGMA user_version = 10;",
+            )
+            .expect("旧价格表");
+        }
+        let store = Store::open(&path).expect("迁移");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        store
+            .catalog_price_upsert("o3", 1.5, 3.0, "USD", 100)
+            .expect("名单价");
+        let prices = store.model_price_list().expect("读价格");
+        assert_eq!(prices.len(), 2);
+        assert!(prices
+            .iter()
+            .any(|p| p.source == "manual" && p.input_per_mtok == 9.0));
+        assert!(prices
+            .iter()
+            .any(|p| p.source == "catalog" && p.input_per_mtok == 1.5));
+        store
+            .catalog_price_delete_for(&["o3".to_string()])
+            .expect("清名单价");
+        let remaining = store.model_price_list().expect("手工价仍在");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].source, "manual");
+        assert_eq!(remaining[0].input_per_mtok, 9.0);
+    }
+
+    #[test]
     fn add_column_is_race_safe_when_the_column_appears_concurrently() {
         // **M16-S1 / P3-1 的确定性复现**（不靠概率）：
         // 把「另一个连接在窗口里把列加上」钉死在「查列」与「ALTER」之间——
@@ -4858,7 +5021,11 @@ mod tests {
             .expect("造旧库");
         }
         let store = Store::open(&path).expect("重新打开");
-        assert_eq!(store.schema_version().unwrap(), 10, "M43-S2 之后是 v10");
+        assert_eq!(
+            store.schema_version().unwrap(),
+            SCHEMA_VERSION,
+            "旧库应迁移到当前版本"
+        );
         let conn = rusqlite::Connection::open(&path).expect("直连");
         for table in ["site_model_catalog", "site_model_sync"] {
             let n: i64 = conn
@@ -5122,8 +5289,8 @@ mod tests {
         let store = Store::open(&path).expect("重新打开 v7 旧库");
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(
-            SCHEMA_VERSION, 10,
-            "M43-S2 占用 v10（M43-S1 占 v9、M40-S1 占 v8）"
+            SCHEMA_VERSION, 11,
+            "M47-S2 占用 v11（M43-S2 占 v10、M43-S1 占 v9、M40-S1 占 v8）"
         );
         let columns = usage_columns(&store);
         for expected in ["at", "key_id", "status", "latency_ms", "attempts", "stream"] {
@@ -5149,7 +5316,7 @@ mod tests {
         // 重复打开幂等（不 duplicate column）。
         drop(store);
         let store = Store::open(&path).expect("再次打开");
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(usage_columns(&store).len(), 15);
     }
 
@@ -5186,7 +5353,7 @@ mod tests {
 
         let store = Store::open(&path).expect("重新打开 v8 旧库");
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 10, "当前 schema 应为 v10");
+        assert_eq!(SCHEMA_VERSION, 11, "当前 schema 应为 v11");
         // v9 产物：令牌表 + 归因两列。
         let columns = usage_columns(&store);
         for expected in ["token_id", "agent_label"] {
@@ -5226,12 +5393,10 @@ mod tests {
     }
 
     #[test]
-    // B-224 P3（M43-S1 T4b 名实不符）：旧名写 v8、实际断言的是当前
-    // schema v10 的 15 列（其中 6 列是 M40 新增的），改名以免后人按
-    // 名去找一个不存在的 v8 夹具。
-    fn schema_v10_fresh_db_has_all_fifteen_columns() {
+    // 当前 schema 的 15 列（其中 6 列是 M40 新增的）。
+    fn current_schema_fresh_db_has_all_fifteen_columns() {
         let store = Store::open_in_memory().expect("内存库");
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let columns = usage_columns(&store);
         assert_eq!(
             columns.len(),

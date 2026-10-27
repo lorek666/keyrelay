@@ -48,6 +48,8 @@ pub struct CodexConfigWriter {
     path: PathBuf,
     base_url: String,
     model: Option<String>,
+    /// M47-S2：名单给的模型参数（窗口 / 输出 / 思考档位）。
+    meta: Option<crate::model_meta::ModelMeta>,
 }
 
 impl CodexConfigWriter {
@@ -57,6 +59,10 @@ impl CodexConfigWriter {
     pub const FIELD_NAME: &'static str = "name";
     pub const FIELD_BASE_URL: &'static str = "base_url";
     pub const FIELD_WIRE_API: &'static str = "wire_api";
+    /// M47-S2：名单带入的三条顶部键（codex 读它们决定上下文窗口、输出上限与思考档位）。
+    pub const FIELD_CONTEXT_WINDOW: &'static str = "model_context_window";
+    pub const FIELD_MAX_OUTPUT_TOKENS: &'static str = "model_max_output_tokens";
+    pub const FIELD_REASONING_EFFORT: &'static str = "model_reasoning_effort";
     pub const SECTION_PROVIDER: &'static str = "[model_providers.custom]";
     pub const PROVIDER_NAME: &'static str = "custom";
     pub const WIRE_API: &'static str = "responses";
@@ -70,7 +76,27 @@ impl CodexConfigWriter {
             path: path.into(),
             base_url: base_url.to_string(),
             model: None,
+            meta: None,
         }
+    }
+
+    /// M47-S2：带上名单参数。
+    pub fn with_meta(mut self, meta: Option<crate::model_meta::ModelMeta>) -> Self {
+        self.meta = meta;
+        self
+    }
+
+    /// 该写的思考档位：名单有可用默认档时写入。
+    /// `param` 是上游参数形态，不是 Codex 客户端的档位词表；两种形态都表达统一档位。
+    fn reasoning_effort(&self) -> Option<crate::model_catalog::ThinkingLevel> {
+        // 思考是**模型**的属性：没有模型名就不写（与 `model_context_window` 同一口径）。
+        self.model.as_ref()?;
+        let spec = self.meta?.thinking?;
+        // 档位是统一词表（off/low/medium/high/xhigh）：codex 的 `model_reasoning_effort`
+        // 收的正是这几个值，所以名单里的 `param` 是 `thinking`（预算形态）时也照写——
+        // 那一层翻译交给网关，客户端配置只表达「用户想要多深的思考」。
+        let level = spec.default_level;
+        spec.accepts(level).then_some(level)
     }
 
     pub fn with_model(home: &Path, base_url: &str, model: Option<&str>) -> Self {
@@ -104,6 +130,16 @@ impl DeliveryWriter for CodexConfigWriter {
         if self.model.is_some() {
             names.push(Self::FIELD_MODEL.to_string());
         }
+        if let Some(meta) = self.meta {
+            if self.model.is_some() {
+                names.push(Self::FIELD_CONTEXT_WINDOW.to_string());
+                names.push(Self::FIELD_MAX_OUTPUT_TOKENS.to_string());
+            }
+            if self.reasoning_effort().is_some() {
+                names.push(Self::FIELD_REASONING_EFFORT.to_string());
+            }
+            let _ = meta;
+        }
         // 段内键：name / base_url / wire_api 在 fields() 写，这里也列。
         names.push(Self::FIELD_NAME.to_string());
         if !self.base_url.trim().is_empty() {
@@ -122,6 +158,19 @@ impl DeliveryWriter for CodexConfigWriter {
         if let Some(m) = &self.model {
             fields.push(literal_field(Self::FIELD_MODEL, m));
         }
+        if let Some(meta) = self.meta.filter(|_| self.model.is_some()) {
+            fields.push(literal_field(
+                Self::FIELD_CONTEXT_WINDOW,
+                meta.context_window.to_string(),
+            ));
+            fields.push(literal_field(
+                Self::FIELD_MAX_OUTPUT_TOKENS,
+                meta.max_output_tokens.to_string(),
+            ));
+        }
+        if let Some(level) = self.reasoning_effort() {
+            fields.push(literal_field(Self::FIELD_REASONING_EFFORT, level.as_str()));
+        }
         fields.push(literal_field(Self::FIELD_NAME, Self::PROVIDER_NAME));
         if !self.base_url.trim().is_empty() {
             fields.push(literal_field(Self::FIELD_BASE_URL, &self.base_url));
@@ -132,7 +181,14 @@ impl DeliveryWriter for CodexConfigWriter {
 
     fn plan(&self, _api_key: &str) -> Result<Patch> {
         let before = read_text_or_empty(&self.path)?;
-        let after = build_after(&before, &self.base_url, &self.model, &self.path)?;
+        let after = build_after(
+            &before,
+            &self.base_url,
+            &self.model,
+            self.meta,
+            self.reasoning_effort(),
+            &self.path,
+        )?;
         Ok(Patch::secret_bearing(self.path.clone(), before, after))
     }
 }
@@ -144,6 +200,8 @@ fn build_after(
     before: &str,
     base_url: &str,
     model: &Option<String>,
+    meta: Option<crate::model_meta::ModelMeta>,
+    reasoning_effort: Option<crate::model_catalog::ThinkingLevel>,
     path: &Path,
 ) -> Result<String> {
     if base_url.trim().is_empty() {
@@ -157,7 +215,15 @@ fn build_after(
     //
     // 现在的顺序：① 新顶部键；② 空行；③ stripped 后的「段外其它内容」（含其它段，
     //   但**没有** `[model_providers.custom]` 段——它被 strip 了）；④ 新 `[model_providers.custom]` 段。
-    let stripped = strip_top_keys_and_section(before);
+    // 名单参数三键（窗口 / 输出 / 思考档位）只有**这次真的会写**时才当受管键清掉：
+    // `meta=None`（名单没覆盖）或 `model=None`（批量投递）时它们是用户自己写的，
+    // 删掉就是静默数据丢失。思考键还需要「支持」或「明确不支持」的事实；
+    // 没写 thinking 的名单条目是未知，不能因此清掉手调档位。
+    let strip_meta_keys = meta.is_some() && model.is_some();
+    let strip_thinking_key = meta
+        .map(|m| m.thinking_unsupported || reasoning_effort.is_some())
+        .unwrap_or(false);
+    let stripped = strip_top_keys_and_section(before, strip_meta_keys, strip_thinking_key);
     let stripped_clean = stripped.trim_matches('\n');
 
     let mut out = String::with_capacity(stripped.len() + 256);
@@ -166,6 +232,20 @@ fn build_after(
     if let Some(m) = model {
         out.push_str("model = \"");
         out.push_str(m);
+        out.push_str("\"\n");
+    }
+    // M47-S2：名单带入的窗口 / 输出上限。只在有模型名时写——没有模型名的配置里
+    // 这两条毫无意义，而且会盖掉用户自己的全局设置。
+    if let (Some(meta), Some(_)) = (meta, model) {
+        out.push_str(&format!("model_context_window = {}\n", meta.context_window));
+        out.push_str(&format!(
+            "model_max_output_tokens = {}\n",
+            meta.max_output_tokens
+        ));
+    }
+    if let Some(level) = reasoning_effort {
+        out.push_str("model_reasoning_effort = \"");
+        out.push_str(level.as_str());
         out.push_str("\"\n");
     }
     out.push_str("disable_response_storage = true\n");
@@ -194,7 +274,11 @@ fn build_after(
 /// M25-S1 复审 P1-1：原实现 `is_top_key` 不看「行在不在某个段里」⇒ 把段内
 /// 的 `model = "..."` 行也当顶部键删掉（数据丢失）。现在加 `in_any_section` 跟踪：
 /// 只有在**没有任何活动段**时，才认它是顶部键。
-fn strip_top_keys_and_section(text: &str) -> String {
+fn strip_top_keys_and_section(
+    text: &str,
+    strip_meta_keys: bool,
+    strip_thinking_key: bool,
+) -> String {
     let mut out = String::with_capacity(text.len());
     let mut skip_section = false;
     let mut in_any_section = false;
@@ -217,6 +301,11 @@ fn strip_top_keys_and_section(text: &str) -> String {
         if !in_any_section
             && (is_top_key(trimmed, CodexConfigWriter::FIELD_MODEL_PROVIDER)
                 || is_top_key(trimmed, CodexConfigWriter::FIELD_MODEL)
+                || (strip_meta_keys
+                    && (is_top_key(trimmed, CodexConfigWriter::FIELD_CONTEXT_WINDOW)
+                        || is_top_key(trimmed, CodexConfigWriter::FIELD_MAX_OUTPUT_TOKENS))
+                    || (strip_thinking_key
+                        && is_top_key(trimmed, CodexConfigWriter::FIELD_REASONING_EFFORT)))
                 || is_top_key(trimmed, CodexConfigWriter::FIELD_DISABLE_RESPONSE_STORAGE))
         {
             continue;
@@ -518,5 +607,162 @@ key = "v"
         assert!(patch.after.contains("[model_providers.custom]"));
         assert!(patch.after.contains(&format!("base_url = \"{BASE}\"")));
         assert!(patch.after.contains("wire_api = \"responses\""));
+    }
+
+    // ==================================================== M47-S2：名单带入窗口/输出/档位
+
+    fn catalog_meta(
+        level: Option<crate::model_catalog::ThinkingLevel>,
+    ) -> crate::model_meta::ModelMeta {
+        crate::model_meta::ModelMeta::from_catalog(
+            272_000,
+            128_000,
+            level.map(|level| crate::model_catalog::ThinkingSpec {
+                param: crate::model_catalog::ThinkingParam::ReasoningEffort,
+                max_level: crate::model_catalog::ThinkingLevel::XHigh,
+                default_level: level,
+                budget_low: 0,
+                budget_medium: 0,
+                budget_high: 0,
+                budget_xhigh: 0,
+                levels: 0b11111,
+            }),
+            level.is_none(),
+            crate::model_catalog::UpstreamProtocol::OpenAiChat,
+            false,
+        )
+    }
+
+    #[test]
+    fn writes_limits_and_effort_from_catalog() {
+        let dir = tmp();
+        let writer = writer_with_model(dir.path(), BASE, Some("gpt-4o")).with_meta(Some(
+            catalog_meta(Some(crate::model_catalog::ThinkingLevel::High)),
+        ));
+        let patch = writer.plan("").unwrap();
+        assert!(
+            patch.after.contains("model_context_window = 272000"),
+            "{}",
+            patch.after
+        );
+        assert!(
+            patch.after.contains("model_max_output_tokens = 128000"),
+            "{}",
+            patch.after
+        );
+        assert!(
+            patch.after.contains("model_reasoning_effort = \"high\""),
+            "{}",
+            patch.after
+        );
+        let names = writer.field_names();
+        for key in [
+            CodexConfigWriter::FIELD_CONTEXT_WINDOW,
+            CodexConfigWriter::FIELD_MAX_OUTPUT_TOKENS,
+            CodexConfigWriter::FIELD_REASONING_EFFORT,
+        ] {
+            assert!(
+                names.iter().any(|n| n == key),
+                "预览必须列出 {key}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_keys_do_not_duplicate_on_second_delivery() {
+        let dir = tmp();
+        let meta = Some(catalog_meta(Some(
+            crate::model_catalog::ThinkingLevel::Medium,
+        )));
+        let writer = writer_with_model(dir.path(), BASE, Some("m")).with_meta(meta);
+        let first = writer.plan("").unwrap();
+        std::fs::write(writer.path(), &first.after).unwrap();
+        let second = writer.plan("").unwrap();
+        assert_eq!(second.before, second.after, "第二次投递必须逐字不变");
+        assert_eq!(
+            second.after.matches("model_context_window").count(),
+            1,
+            "顶部键不能被重复写入：{}",
+            second.after
+        );
+    }
+
+    #[test]
+    fn no_model_means_no_catalog_keys() {
+        let dir = tmp();
+        let writer = writer_in(dir.path(), BASE).with_meta(Some(catalog_meta(Some(
+            crate::model_catalog::ThinkingLevel::High,
+        ))));
+        let patch = writer.plan("").unwrap();
+        assert!(
+            !patch.after.contains("model_context_window"),
+            "没有模型名时不写窗口：{}",
+            patch.after
+        );
+        assert!(!patch.after.contains("model_reasoning_effort"));
+    }
+
+    #[test]
+    fn unknown_thinking_does_not_remove_hand_written_effort() {
+        let dir = tmp();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "model_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        let mut meta = catalog_meta(None);
+        meta.thinking_unsupported = false;
+        let patch = writer_with_model(dir.path(), BASE, Some("gpt-4o"))
+            .with_meta(Some(meta))
+            .plan("")
+            .unwrap();
+        assert!(
+            patch.after.contains("model_reasoning_effort = \"high\""),
+            "未知不能删除手调档位: {}",
+            patch.after
+        );
+        meta.thinking_unsupported = true;
+        let patch = writer_with_model(dir.path(), BASE, Some("gpt-4o"))
+            .with_meta(Some(meta))
+            .plan("")
+            .unwrap();
+        assert!(
+            !patch.after.contains("model_reasoning_effort"),
+            "明确关闭才删除旧档位"
+        );
+    }
+
+    #[test]
+    fn keeps_hand_written_meta_keys_when_no_model_is_given() {
+        let dir = tmp();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "model = \"gpt-5-codex\"\nmodel_context_window = 400000\n\
+             model_max_output_tokens = 32000\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        // 批量投递（model=None）走的正是这条路：名单参数是「未知」，用户自己写的三条
+        // 顶部键必须原样保留（复审 P1-1：静默删除用户调参）。
+        let patch = writer_in(dir.path(), BASE)
+            .with_meta(Some(catalog_meta(Some(
+                crate::model_catalog::ThinkingLevel::High,
+            ))))
+            .plan("")
+            .unwrap();
+        assert!(
+            patch.after.contains("model_context_window = 400000"),
+            "{}",
+            patch.after
+        );
+        assert!(
+            patch.after.contains("model_max_output_tokens = 32000"),
+            "{}",
+            patch.after
+        );
+        assert!(
+            patch.after.contains("model_reasoning_effort = \"high\""),
+            "{}",
+            patch.after
+        );
     }
 }

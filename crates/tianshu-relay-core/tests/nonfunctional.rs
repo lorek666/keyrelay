@@ -248,6 +248,7 @@ fn injection_latency_p95() {
             vault,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     service

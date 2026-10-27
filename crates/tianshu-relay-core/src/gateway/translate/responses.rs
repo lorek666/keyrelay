@@ -15,6 +15,10 @@ const ALLOWED: &[&str] = &[
     "tools",
     "tool_choice",
     "stream",
+    // Codex 写 `model_reasoning_effort` 后，经 /v1/responses 发的是这个枚举字段。
+    // 上游固定 Chat，所以必须接住并翻译，不能在我们自己生成的配置下本地 400。
+    "reasoning_effort",
+    "reasoning",
 ];
 
 pub fn parse_request(v: &Value) -> Result<ChatRequest, TranslateError> {
@@ -103,6 +107,51 @@ pub fn parse_request(v: &Value) -> Result<ChatRequest, TranslateError> {
         }
     }
 
+    // OpenAI Responses 的实际形态是 `reasoning: {effort}`；兼容顶层枚举形态。
+    // 空对象/非字符串是畸形输入，不是「没开」；两个字段同时存在且不同必须拒绝。
+    let nested = match v.get("reasoning") {
+        None => None,
+        Some(reasoning) => {
+            let raw = reasoning
+                .get("effort")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    TranslateError::new(
+                        "unsupported_field",
+                        "Responses: reasoning.effort 必须是明确的档位字符串",
+                    )
+                })?;
+            Some(raw)
+        }
+    };
+    let flat = match v.get("reasoning_effort") {
+        None => None,
+        Some(value) => Some(value.as_str().ok_or_else(|| {
+            TranslateError::new(
+                "invalid_request",
+                "Responses: reasoning_effort 必须是明确的档位字符串",
+            )
+        })?),
+    };
+    if nested.is_some() && flat.is_some() && nested != flat {
+        return Err(TranslateError::new(
+            "invalid_request",
+            "Responses: reasoning.effort 与 reasoning_effort 不能给出不同档位",
+        ));
+    }
+    let reasoning_effort = nested
+        .or(flat)
+        .map(|raw| {
+            crate::model_catalog::ThinkingLevel::parse(raw).ok_or_else(|| {
+                TranslateError::new(
+                    "unsupported_field",
+                    format!("Responses: 不支持思考档位 `{raw}`"),
+                )
+            })
+        })
+        .transpose()?
+        .filter(|level| *level != crate::model_catalog::ThinkingLevel::Off);
+
     let tools = v
         .get("tools")
         .and_then(|x| x.as_array())
@@ -135,6 +184,7 @@ pub fn parse_request(v: &Value) -> Result<ChatRequest, TranslateError> {
             .map(|n| n as u32),
         stop: vec![],
         tools,
+        reasoning_effort,
         stream: false,
     })
 }

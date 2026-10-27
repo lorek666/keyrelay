@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Copy, Play, RefreshCw, Square } from "lucide-react";
+import { AlertTriangle, ChevronDown, Copy, Play, RefreshCw, Square } from "lucide-react";
 import {
   channelOfBinding,
   clineCliProbe,
@@ -125,6 +125,7 @@ export function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
       {candidates.length === 0 ? (
         <p className="muted">{t("gateway.metrics.singleUpstream")}</p>
       ) : (
+        <div className="table-wrap">
         <table className="table">
           <thead>
             <tr>
@@ -174,6 +175,7 @@ export function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
             ))}
           </tbody>
         </table>
+        </div>
       )}
     </div>
   );
@@ -376,6 +378,31 @@ function RoutingRulesEditor({
   );
 }
 
+function GatewaySection({
+  title,
+  description,
+  className = "",
+  children,
+}: {
+  title: string;
+  description: string;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <details className={`gateway-section ${className}`}>
+      <summary>
+        <span className="gateway-section-copy">
+          <strong>{title}</strong>
+          <small>{description}</small>
+        </span>
+        <ChevronDown size={16} aria-hidden="true" />
+      </summary>
+      <div className="gateway-section-body">{children}</div>
+    </details>
+  );
+}
+
 export default function GatewayCard({
   enabled,
   port,
@@ -462,9 +489,17 @@ export default function GatewayCard({
     }
   }
 
-  const activeSite = siteId ?? sites.data?.[0]?.id ?? null;
-  const siteKeys = (keys.data ?? []).filter((k) => k.siteId === activeSite);
-  const activeKey = keyId ?? siteKeys[0]?.id ?? null;
+  const activeSite = siteId !== null && sites.data?.some((site) => site.id === siteId)
+    ? siteId
+    : sites.data?.[0]?.id ?? null;
+  // 已删除的密钥（`revoked`，只可能是旧版本留下的行）不该再出现在这里：
+  // 拿它启动网关只会在 `ensure_not_revoked` 上被拒（M47-S1）。
+  const siteKeys = (keys.data ?? []).filter(
+    (k) => k.siteId === activeSite && k.status !== "revoked",
+  );
+  const activeKey = keyId !== null && siteKeys.some((key) => key.id === keyId)
+    ? keyId
+    : siteKeys[0]?.id ?? null;
 
   const start = useMutation({
     mutationFn: () => gatewayStart(activeSite!, activeKey!),
@@ -713,7 +748,7 @@ export default function GatewayCard({
 
   const running = status.data?.running ?? false;
   // M41-S1：三态 + 结束记录。`running` 只作兼容字段，展示以 `phase` 为准。
-  const phase = status.data?.phase ?? "stopped";
+  const phase = status.data?.phase ?? (status.isError ? "error" : "loading");
   const lastExit = status.data?.lastExit ?? null;
   const lastExitReason = lastExit
     ? lastExit.reason === "panicked"
@@ -724,24 +759,37 @@ export default function GatewayCard({
     : null;
 
   return (
-    <div className="card">
-      <h3>{t("gateway.title")}</h3>
-      <p className="muted" data-gateway-phase={phase}>
-        {phase === "running"
-          ? t("gateway.phase.running")
-          : phase === "crashed"
-            ? t("gateway.phase.crashed", {
-                time: lastExit
-                  ? new Date(lastExit.at * 1000).toLocaleString()
-                  : "—",
-                reason: lastExitReason ?? "",
-              })
-            : t("gateway.phase.stopped")}
-      </p>
-      <p className="muted">
-        {t("gateway.bodyPre")}<span className="mono">{t("gateway.bodyMid", { port })}</span>{t("gateway.bodyPost")}
-      </p>
+    <section className="card gateway-card">
+      <div className="gateway-card-header">
+        <div>
+          <h3>{t("gateway.title")}</h3>
+          <p className="muted gateway-intro">
+            {t("gateway.bodyPre")}<span className="mono">{t("gateway.bodyMid", { port })}</span>{t("gateway.bodyPost")}
+          </p>
+        </div>
+        <span
+          className={`badge gateway-phase-badge ${phase === "running" ? "badge-ok" : phase === "crashed" ? "badge-danger" : "badge-muted"}`}
+          data-gateway-phase={phase}
+          role="status"
+        >
+          {phase === "running"
+            ? t("gateway.phase.running")
+            : phase === "crashed"
+              ? t("gateway.phase.crashed", {
+                  time: lastExit
+                    ? new Date(lastExit.at * 1000).toLocaleString()
+                    : "—",
+                  reason: lastExitReason ?? "",
+                })
+              : phase === "error"
+                ? t("gateway.statusFailed", { error: (status.error as Error).message })
+                : phase === "loading"
+                  ? t("common.loading")
+                  : t("gateway.phase.stopped")}
+        </span>
+      </div>
 
+      <div className="gateway-runtime">
       <label className="checkline">
         <input
           type="checkbox"
@@ -750,263 +798,6 @@ export default function GatewayCard({
         />
         <span>{t("gateway.allowLabel")}</span>
       </label>
-
-      {/*
-        跨站选路（M16-S6b 新增接线）：`settings.gateway_multi_site` 是 B-99/B-109/B-110
-        「按模型跨站选路 / 模型别名 / 上游摘除与冷却回归」的**唯一开关**，此前只有 DTO 字段、
-        没有任何控件 ⇒ 那三个功能对用户实际不可达。
-        **不改默认值**（默认仍是关）：改默认会破坏既有用户「只用一个站点」的逐字节语义。
-      */}
-      <label className="checkline">
-        <input
-          type="checkbox"
-          checked={multiSite}
-          onChange={(e) => onMultiSiteChange(e.target.checked)}
-        />
-        <span>{t("gateway.multiSiteLabel")}</span>
-      </label>
-      <p className="muted">{t("gateway.multiSiteHint")}</p>
-
-      {/*
-        模型目录采集（M39-S2）。**独立开关**：它同时服务两件事——
-        ① `ModelsChanged` 通知（M14-S1 起就有）；② 网关的跨站选路目录（M39-S1）。
-        所以多站关闭时**仍然采集**（只是网关不用目录），这里不静默禁用、也不写
-        「仅多站模式下生效」——那会误导用户以为关掉多站就没必要采集。
-      */}
-      <label className="checkline">
-        <input
-          type="checkbox"
-          checked={collectModels}
-          onChange={(e) => onCollectModelsChange(e.target.checked)}
-        />
-        <span>{t("gateway.collectModelsLabel")}</span>
-      </label>
-      <p className="muted">{t("gateway.collectModelsHint")}</p>
-
-      <label className="field">
-        <span>{t("gateway.modelsIntervalLabel")}</span>
-        <input
-          className="input settings-inline-field"
-          type="number"
-          min={30}
-          max={86400}
-          step={1}
-          value={intervalText}
-          onChange={(e) => setIntervalText(e.target.value)}
-          // 越界/非数字 ⇒ **失焦时钳制**并提示（不边打边改，否则用户输 `5` 想输 `50` 会被打断）
-          onBlur={() => {
-            const parsed = Number(intervalText);
-            const clamped = Number.isFinite(parsed)
-              ? Math.min(86400, Math.max(30, Math.trunc(parsed)))
-              : 1800;
-            setIntervalText(String(clamped));
-            setClamped(clamped !== parsed || String(clamped) !== intervalText);
-            if (clamped !== modelsMinIntervalSecs) onModelsIntervalChange(clamped);
-          }}
-        />
-      </label>
-      <p className="muted">{t("gateway.modelsIntervalHint")}</p>
-      {clamped ? <p className="muted">{t("gateway.modelsIntervalClamped")}</p> : null}
-
-      <label className="field">
-        <span>{t("gateway.portLabel")}</span>
-        <input
-          className="input"
-          type="number"
-          min={1024}
-          max={65535}
-          value={port}
-          onChange={(e) => {
-            const n = Number(e.target.value);
-            // P3-14 / DEBUG-REPORT-v3 §3-14：与后端口径一致（≥1024 ≤65535）——
-            // min/max 是 HTML 提示，浏览器不强制，用户仍能输入 80 等特权端口；
-            // 超出范围不调 onPortChange（受控 value 不更新，输入被拒）。
-            if (Number.isFinite(n) && n >= 1024 && n <= 65535) {
-              onPortChange(n);
-            }
-          }}
-        />
-      </label>
-      {settingsDirty ? (
-        <p className="muted">{t("gateway.portDirtyHint")}</p>
-      ) : null}
-
-      {/*
-        M42-S1：请求体上限（MiB）。**只**限制请求体——响应体上限是固定 64 MiB 常量，
-        与这里无关（两个 64 数值相同纯属巧合）。保存后下次启动网关生效。
-      */}
-      <label className="field">
-        <span>{t("gateway.maxRequestLabel")}</span>
-        <input
-          className="input"
-          type="number"
-          min={1}
-          max={64}
-          step={1}
-          value={maxRequestMib}
-          onChange={(e) => {
-            const n = Number(e.target.value);
-            // 与端口输入框同口径：越界/非整数不更新受控值（后端 validate 是第二道）
-            if (Number.isInteger(n) && n >= 1 && n <= 64) {
-              onMaxRequestMibChange(n);
-            }
-          }}
-        />
-      </label>
-      <p className="muted">{t("gateway.maxRequestHint")}</p>
-
-      {/*
-        M46-S3：每站限流 burst。口径与请求体上限输入框相同（受控 number，
-        越界/非整数不调 onChange，后端 validate 是第二道）；保存后下次启动网关生效。
-        注意：设置页此前没有任何 per-site 字段的渲染位置（见 spec §4.6），本字段是
-        第一个落进网关卡的 per-site 字段；并发上限与每秒上限的控件仍缺，见 BACKLOG。
-      */}
-      <label className="field">
-        <span>{t("gateway.perSiteBurstLabel")}</span>
-        <input
-          className="input"
-          type="number"
-          min={0}
-          max={10000}
-          step={1}
-          value={perSiteBurst}
-          onChange={(e) => {
-            const n = Number(e.target.value);
-            if (Number.isInteger(n) && n >= 0 && n <= 10000) {
-              onPerSiteBurstChange(n);
-            }
-          }}
-        />
-      </label>
-      <p className="muted">{t("gateway.perSiteBurstHint")}</p>
-
-      {/*
-        M46-UI B-241：每站并发上限与每秒上限。口径与 burst 输入框相同（受控
-        number，越界/非整数不调 onChange，后端 validate 是第二道）；保存后
-        下次启动网关生效。两个字段都是 burst 的生效前提字段：burst 只抬高
-        令牌桶容量，不提高补充速率，且 rate = 0 时桶分支整体跳过、burst 无效。
-      */}
-      <label className="field">
-        <span>{t("gateway.perSiteConcurrencyLabel")}</span>
-        <input
-          className="input"
-          type="number"
-          min={1}
-          max={128}
-          step={1}
-          value={perSiteConcurrency}
-          onChange={(e) => {
-            const n = Number(e.target.value);
-            if (Number.isInteger(n) && n >= 1 && n <= 128) {
-              onPerSiteConcurrencyChange(n);
-            }
-          }}
-        />
-      </label>
-      <p className="muted">{t("gateway.perSiteConcurrencyHint")}</p>
-
-      <label className="field">
-        <span>{t("gateway.perSiteRateLimitLabel")}</span>
-        <input
-          className="input"
-          type="number"
-          min={0}
-          max={10000}
-          step={1}
-          value={perSiteRateLimit}
-          onChange={(e) => {
-            const n = Number(e.target.value);
-            if (Number.isInteger(n) && n >= 0 && n <= 10000) {
-              onPerSiteRateLimitChange(n);
-            }
-          }}
-        />
-      </label>
-      <p className="muted">{t("gateway.perSiteRateLimitHint")}</p>
-
-      {/*
-        M46-S4：每请求最多尝试候选数。口径与 burst 输入框相同（受控 number，
-        越界/非整数不调 onChange，后端 validate 是第二道）；保存后下次启动网关生效。
-      */}
-      <label className="field">
-        <span>{t("gateway.maxAttemptsLabel")}</span>
-        <input
-          className="input"
-          type="number"
-          min={0}
-          max={64}
-          step={1}
-          value={maxAttempts}
-          onChange={(e) => {
-            const n = Number(e.target.value);
-            if (Number.isInteger(n) && n >= 0 && n <= 64) {
-              onMaxAttemptsChange(n);
-            }
-          }}
-        />
-      </label>
-      <p className="muted">{t("gateway.maxAttemptsHint")}</p>
-
-      {/*
-        M46-UI B-237：密钥健康巡检间隔。语义与 M46-S1 一致：0 = 关，非 0 时
-        60..=86400 秒；失焦时钳制（1..59 钳到 60、>86400 钳到 86400、非数字/
-        清空钳到 0 = 关），钳制后提示；与采集间隔输入框同口径，保存后下次
-        启动网关生效，后端 validate 是第二道。
-      */}
-      <label className="field">
-        <span>{t("gateway.keyHealthIntervalLabel")}</span>
-        <input
-          className="input"
-          type="number"
-          min={0}
-          max={86400}
-          step={1}
-          value={healthIntervalText}
-          onChange={(e) => setHealthIntervalText(e.target.value)}
-          onBlur={() => {
-            const parsed = Number(healthIntervalText);
-            const clamped = !Number.isFinite(parsed)
-              ? 0
-              : Math.trunc(parsed) <= 0
-                ? 0
-                : Math.min(86400, Math.max(60, Math.trunc(parsed)));
-            setHealthIntervalText(String(clamped));
-            setHealthClamped(
-              clamped !== parsed || String(clamped) !== healthIntervalText,
-            );
-            if (clamped !== keyHealthIntervalSecs) {
-              onKeyHealthIntervalChange(clamped);
-            }
-          }}
-        />
-      </label>
-      <p className="muted">{t("gateway.keyHealthIntervalHint")}</p>
-      {healthClamped ? (
-        <p className="muted">{t("gateway.keyHealthIntervalClamped")}</p>
-      ) : null}
-
-      {/*
-        M46-UI B-255：按 agent 路由规则改为结构化编辑器（agent 下拉取令牌
-        label、站点多选、增删行、逐条未填完整提示）。解析权威仍在后端
-        validate：前端不复写解析、不拦截保存，非法时保存失败并由既有设置
-        保存错误路径回显后端文案。不可解析的文本回退到原文 textarea（见
-        RoutingRulesEditor）。保存后下次启动网关生效。
-      */}
-      <div className="field">
-        <span>{t("gateway.routingRulesLabel")}</span>
-        <RoutingRulesEditor
-          routingRules={routingRules}
-          onRoutingRulesChange={onRoutingRulesChange}
-          sites={sites.data ?? []}
-          tokenLabels={(tokenList.data ?? [])
-            .filter((tok) => tok.active)
-            .map((tok) => tok.label)}
-        />
-      </div>
-      <p className="muted">{t("gateway.routingRulesHint")}</p>
-
-      {/* M40-S2：指标面板（**所有相位都渲染**；未运行时由面板自己显示一行占位）。 */}
-      <GatewayMetricsPanel status={status.data} />
 
       {running ? (
         <>
@@ -1091,6 +882,7 @@ export default function GatewayCard({
               <span>{t("keys.siteSelect")}</span>
               <select
                 className="input"
+                aria-label={t("keys.siteSelect")}
                 value={activeSite ?? ""}
                 onChange={(e) => {
                   setSiteId(Number(e.target.value));
@@ -1108,6 +900,7 @@ export default function GatewayCard({
               <span>{t("agents.select.key")}</span>
               <select
                 className="input"
+                aria-label={t("agents.select.key")}
                 value={activeKey ?? ""}
                 onChange={(e) =>
                   // 空选择是 `null`，**不是 0**（M8-S5B §6.7）：
@@ -1141,8 +934,10 @@ export default function GatewayCard({
         </>
       )}
 
+      </div>
+
       {/* 批量改指网关（M8-S7 / B-116） */}
-      <div className="row">
+      <div className="row gateway-batch-action">
         <button
           type="button"
           className="btn"
@@ -1162,7 +957,7 @@ export default function GatewayCard({
       </div>
 
       {batchOpen ? (
-        <div className="card">
+        <div className="card gateway-batch-panel">
           <h4>{t("gateway.batch.title")}</h4>
           <p className="muted">
             {t("gateway.batch.bodyPre")}<strong>{t("gateway.batch.bodyStrong")}</strong>{t("gateway.batch.bodyPost")}
@@ -1304,10 +1099,16 @@ export default function GatewayCard({
                       {planOf(key).channel === "codex-auth-json" || planOf(key).channel === "codex-config" ? (
                         <p className="muted">{t("gateway.batch.stopCodex")}</p>
                       ) : null}
-                      {/* 与投递页同一处理（P2-5）：删除行的旧值不渲染出来 */}
-                      <pre className="mono">
-                        {maskRemovedValues(plan.preview, t("agents.plan.removedValueMasked"))}
-                      </pre>
+                      {/* Codex 是 auth + config 双文件；顶层 preview 只是入口文件，
+                          必须遍历 files，否则第二个文件的写入不在预览/同意里。 */}
+                      {(plan.files?.length ? plan.files : [{ targetPath: plan.targetPath, preview: plan.preview }]).map((file) => (
+                        <div key={file.targetPath}>
+                          <p className="mono">{t("gateway.batch.actualPathLabel")}{file.targetPath}</p>
+                          <pre className="mono">
+                            {maskRemovedValues(file.preview, t("agents.plan.removedValueMasked"))}
+                          </pre>
+                        </div>
+                      ))}
                     </>
                   )}
                 </div>
@@ -1371,7 +1172,7 @@ export default function GatewayCard({
       ) : null}
 
       {batchResults.length > 0 ? (
-        <div className="card">
+        <div className="card gateway-batch-result">
           <h4>{t("gateway.batch.resultTitle")}</h4>
           {batchResults.map((r) => (
             <p key={`${r.label}-${r.detail}`} className={r.ok ? "muted" : "error"} role={r.ok ? undefined : "alert"}>
@@ -1381,9 +1182,293 @@ export default function GatewayCard({
         </div>
       ) : null}
 
+
+      <GatewaySection
+        title={t("gateway.sections.advanced")}
+        description={t("gateway.sections.advancedHint")}
+        className="gateway-advanced"
+      >
+        <div className="gateway-form-sections">
+        <section className="gateway-form-group gateway-routing-group" aria-label={t("gateway.sections.routing")}>
+          <h4>{t("gateway.sections.routing")}</h4>
+      {/*
+        跨站选路（M16-S6b 新增接线）：`settings.gateway_multi_site` 是 B-99/B-109/B-110
+        「按模型跨站选路 / 模型别名 / 上游摘除与冷却回归」的**唯一开关**，此前只有 DTO 字段、
+        没有任何控件 ⇒ 那三个功能对用户实际不可达。
+        **不改默认值**（默认仍是关）：改默认会破坏既有用户「只用一个站点」的逐字节语义。
+      */}
+      <label className="checkline">
+        <input
+          type="checkbox"
+          checked={multiSite}
+          onChange={(e) => onMultiSiteChange(e.target.checked)}
+        />
+        <span>{t("gateway.multiSiteLabel")}</span>
+      </label>
+      <p className="muted">{t("gateway.multiSiteHint")}</p>
+
+      {/*
+        M46-S4：每请求最多尝试候选数。口径与 burst 输入框相同（受控 number，
+        越界/非整数不调 onChange，后端 validate 是第二道）；保存后下次启动网关生效。
+      */}
+      <label className="field">
+        <span>{t("gateway.maxAttemptsLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={0}
+          max={64}
+          step={1}
+          value={maxAttempts}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isInteger(n) && n >= 0 && n <= 64) {
+              onMaxAttemptsChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.maxAttemptsHint")}</p>
+
+      {/*
+        M46-UI B-255：按 agent 路由规则改为结构化编辑器（agent 下拉取令牌
+        label、站点多选、增删行、逐条未填完整提示）。解析权威仍在后端
+        validate：前端不复写解析、不拦截保存，非法时保存失败并由既有设置
+        保存错误路径回显后端文案。不可解析的文本回退到原文 textarea（见
+        RoutingRulesEditor）。保存后下次启动网关生效。
+      */}
+      <div className="field">
+        <span>{t("gateway.routingRulesLabel")}</span>
+        <RoutingRulesEditor
+          routingRules={routingRules}
+          onRoutingRulesChange={onRoutingRulesChange}
+          sites={sites.data ?? []}
+          tokenLabels={(tokenList.data ?? [])
+            .filter((tok) => tok.active)
+            .map((tok) => tok.label)}
+        />
+      </div>
+      <p className="muted">{t("gateway.routingRulesHint")}</p>
+
+        </section>
+        <section className="gateway-form-group" aria-label={t("gateway.sections.request")}>
+          <h4>{t("gateway.sections.request")}</h4>
+      <label className="field">
+        <span>{t("gateway.portLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={1024}
+          max={65535}
+          value={port}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            // P3-14 / DEBUG-REPORT-v3 §3-14：与后端口径一致（≥1024 ≤65535）——
+            // min/max 是 HTML 提示，浏览器不强制，用户仍能输入 80 等特权端口；
+            // 超出范围不调 onPortChange（受控 value 不更新，输入被拒）。
+            if (Number.isFinite(n) && n >= 1024 && n <= 65535) {
+              onPortChange(n);
+            }
+          }}
+        />
+      </label>
+      {settingsDirty ? (
+        <p className="muted">{t("gateway.portDirtyHint")}</p>
+      ) : null}
+
+      {/*
+        M42-S1：请求体上限（MiB）。**只**限制请求体——响应体上限是固定 64 MiB 常量，
+        与这里无关（两个 64 数值相同纯属巧合）。保存后下次启动网关生效。
+      */}
+      <label className="field">
+        <span>{t("gateway.maxRequestLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={1}
+          max={64}
+          step={1}
+          value={maxRequestMib}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            // 与端口输入框同口径：越界/非整数不更新受控值（后端 validate 是第二道）
+            if (Number.isInteger(n) && n >= 1 && n <= 64) {
+              onMaxRequestMibChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.maxRequestHint")}</p>
+
+      {/*
+        M46-S3：每站限流 burst。口径与请求体上限输入框相同（受控 number，
+        越界/非整数不调 onChange，后端 validate 是第二道）；保存后下次启动网关生效。
+        注意：设置页此前没有任何 per-site 字段的渲染位置（见 spec §4.6），本字段是
+        第一个落进网关卡的 per-site 字段；并发上限与每秒上限的控件仍缺，见 BACKLOG。
+      */}
+      <label className="field">
+        <span>{t("gateway.perSiteBurstLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={0}
+          max={10000}
+          step={1}
+          value={perSiteBurst}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isInteger(n) && n >= 0 && n <= 10000) {
+              onPerSiteBurstChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.perSiteBurstHint")}</p>
+
+      {/*
+        M46-UI B-241：每站并发上限与每秒上限。口径与 burst 输入框相同（受控
+        number，越界/非整数不调 onChange，后端 validate 是第二道）；保存后
+        下次启动网关生效。两个字段都是 burst 的生效前提字段：burst 只抬高
+        令牌桶容量，不提高补充速率，且 rate = 0 时桶分支整体跳过、burst 无效。
+      */}
+      <label className="field">
+        <span>{t("gateway.perSiteConcurrencyLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={1}
+          max={128}
+          step={1}
+          value={perSiteConcurrency}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isInteger(n) && n >= 1 && n <= 128) {
+              onPerSiteConcurrencyChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.perSiteConcurrencyHint")}</p>
+
+      <label className="field">
+        <span>{t("gateway.perSiteRateLimitLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={0}
+          max={10000}
+          step={1}
+          value={perSiteRateLimit}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isInteger(n) && n >= 0 && n <= 10000) {
+              onPerSiteRateLimitChange(n);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.perSiteRateLimitHint")}</p>
+
+      {/*
+        M46-UI B-237：密钥健康巡检间隔。语义与 M46-S1 一致：0 = 关，非 0 时
+        60..=86400 秒；失焦时钳制（1..59 钳到 60、>86400 钳到 86400、非数字/
+        清空钳到 0 = 关），钳制后提示；与采集间隔输入框同口径，保存后下次
+        启动网关生效，后端 validate 是第二道。
+      */}
+      <label className="field">
+        <span>{t("gateway.keyHealthIntervalLabel")}</span>
+        <input
+          className="input"
+          type="number"
+          min={0}
+          max={86400}
+          step={1}
+          value={healthIntervalText}
+          onChange={(e) => setHealthIntervalText(e.target.value)}
+          onBlur={() => {
+            const parsed = Number(healthIntervalText);
+            const clamped = !Number.isFinite(parsed)
+              ? 0
+              : Math.trunc(parsed) <= 0
+                ? 0
+                : Math.min(86400, Math.max(60, Math.trunc(parsed)));
+            setHealthIntervalText(String(clamped));
+            setHealthClamped(
+              clamped !== parsed || String(clamped) !== healthIntervalText,
+            );
+            if (clamped !== keyHealthIntervalSecs) {
+              onKeyHealthIntervalChange(clamped);
+            }
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.keyHealthIntervalHint")}</p>
+      {healthClamped ? (
+        <p className="muted">{t("gateway.keyHealthIntervalClamped")}</p>
+      ) : null}
+
+        </section>
+        <section className="gateway-form-group" aria-label={t("gateway.sections.models")}>
+          <h4>{t("gateway.sections.models")}</h4>
+      {/*
+        模型目录采集（M39-S2）。**独立开关**：它同时服务两件事——
+        ① `ModelsChanged` 通知（M14-S1 起就有）；② 网关的跨站选路目录（M39-S1）。
+        所以多站关闭时**仍然采集**（只是网关不用目录），这里不静默禁用、也不写
+        「仅多站模式下生效」——那会误导用户以为关掉多站就没必要采集。
+      */}
+      <label className="checkline">
+        <input
+          type="checkbox"
+          checked={collectModels}
+          onChange={(e) => onCollectModelsChange(e.target.checked)}
+        />
+        <span>{t("gateway.collectModelsLabel")}</span>
+      </label>
+      <p className="muted">{t("gateway.collectModelsHint")}</p>
+
+      <label className="field">
+        <span>{t("gateway.modelsIntervalLabel")}</span>
+        <input
+          className="input settings-inline-field"
+          type="number"
+          min={30}
+          max={86400}
+          step={1}
+          value={intervalText}
+          onChange={(e) => setIntervalText(e.target.value)}
+          // 越界/非数字 ⇒ **失焦时钳制**并提示（不边打边改，否则用户输 `5` 想输 `50` 会被打断）
+          onBlur={() => {
+            const parsed = Number(intervalText);
+            const clamped = Number.isFinite(parsed)
+              ? Math.min(86400, Math.max(30, Math.trunc(parsed)))
+              : 1800;
+            setIntervalText(String(clamped));
+            setClamped(clamped !== parsed || String(clamped) !== intervalText);
+            if (clamped !== modelsMinIntervalSecs) onModelsIntervalChange(clamped);
+          }}
+        />
+      </label>
+      <p className="muted">{t("gateway.modelsIntervalHint")}</p>
+      {clamped ? <p className="muted">{t("gateway.modelsIntervalClamped")}</p> : null}
+
+        </section>
+        </div>
+      </GatewaySection>
+
+      <GatewaySection
+        title={t("gateway.sections.metrics")}
+        description={t("gateway.sections.metricsHint")}
+      >
+        <GatewayMetricsPanel status={status.data} />
+      </GatewaySection>
+
+      <GatewaySection
+        title={t("gateway.sections.tokens")}
+        description={t("gateway.sections.tokensHint")}
+      >
       {/* M43-S1：Agent 令牌区块 */}
-      <div className="card">
-        <h4>{t("gateway.tokens.title")}</h4>
+      <div className="card gateway-tokens-panel">
+        <h4 className="sr-only">{t("gateway.tokens.title")}</h4>
         <p className="muted">{t("gateway.tokens.body")}</p>
         {status.data?.tokenGraceUntil &&
         status.data.tokenGraceUntil * 1000 > Date.now() ? (
@@ -1447,6 +1532,7 @@ export default function GatewayCard({
         <div className="row">
           <input
             value={newTokenLabel}
+            aria-label={t("gateway.tokens.labelPlaceholder")}
             placeholder={t("gateway.tokens.labelPlaceholder")}
             onChange={(e) => setNewTokenLabel(e.target.value)}
             maxLength={64}
@@ -1463,6 +1549,8 @@ export default function GatewayCard({
           </button>
         </div>
       </div>
+
+      </GatewaySection>
 
       {createdToken ? (
         <div className="card" data-created-token>
@@ -1505,6 +1593,6 @@ export default function GatewayCard({
       </ConfirmDialog>
 
       {error ? <p className="error" role="alert">{error}</p> : null}
-    </div>
+    </section>
   );
 }

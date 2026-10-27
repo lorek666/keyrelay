@@ -64,6 +64,7 @@ async fn setup() -> Fixture {
             vault,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     mock.push(encryption_disabled());
@@ -101,11 +102,7 @@ async fn first_delivery_imports_existing_values_and_apply_ignores_them() {
 
     let plan = f
         .service
-        .delivery_plan_with_model(
-            f.key_id,
-            DeliveryChannel::ClaudeCodeSettings,
-            Some("gpt-4o"),
-        )
+        .delivery_plan_with_model(f.key_id, DeliveryChannel::ClaudeCodeSettings, Some("o3"))
         .unwrap();
     assert!(plan.is_first_delivery, "从未投递过的通道应算首次");
     assert!(!plan.preview_only, "既有预览入口的 preview_only 应为 false");
@@ -136,7 +133,10 @@ async fn first_delivery_imports_existing_values_and_apply_ignores_them() {
         vec![
             ("ANTHROPIC_AUTH_TOKEN", "…9999"),
             ("ANTHROPIC_BASE_URL", BASE),
-            ("ANTHROPIC_MODEL", "gpt-4o"),
+            ("ANTHROPIC_MODEL", "o3"),
+            // M47-S2：`o3` 在内置名单里是**核对过**的 `reasoning_effort` 条目 ⇒ 投递会按名单
+            // 带入默认档位。未核对过思考能力的模型（如 `gpt-4o`）留空 = 未知，不写这个键。
+            ("CLAUDE_CODE_EFFORT_LEVEL", "medium"),
         ]
     );
     // 预览本身一个字节都不动文件。

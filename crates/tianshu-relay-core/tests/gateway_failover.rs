@@ -185,6 +185,7 @@ async fn start_routed_full(
     let obs_sink = Arc::clone(&observations);
 
     let handle = start(GatewayConfig {
+        catalog: None,
         port: 0,
         token: generate_token(),
         key_id: None,
@@ -278,6 +279,7 @@ async fn route_and_keys_by_ref_must_agree() {
             map.insert((*r).to_string(), Zeroizing::new(plain.to_string()));
         }
         GatewayConfig {
+            catalog: None,
             port: 0,
             token: generate_token(),
             key_id: None,
@@ -793,6 +795,7 @@ async fn failure_event_scrubs_a_key_shaped_model() {
         keys.insert(REF_B.to_string(), Zeroizing::new(KEY_B.to_string()));
 
         let handle = start(GatewayConfig {
+            catalog: None,
             port: 0,
             token: generate_token(),
             key_id: None,
@@ -1060,6 +1063,7 @@ async fn a_missing_plaintext_is_refused_at_startup() {
     let a = spawn_upstream_always(1, REF_A, "200 OK");
 
     let err = start(GatewayConfig {
+        catalog: None,
         port: 0,
         token: generate_token(),
         key_id: None,
@@ -1711,6 +1715,7 @@ async fn start_priority_routed(
     map.insert(REF_B.to_string(), Zeroizing::new(KEY_B.to_string()));
     map.insert(REF_C.to_string(), Zeroizing::new(KEY_C.to_string()));
     start(GatewayConfig {
+        catalog: None,
         port: 0,
         token: generate_token(),
         key_id: None,

@@ -90,6 +90,35 @@ fn responses_request_and_response_roundtrip() {
     assert_eq!(out["usage"]["input_tokens"], 3);
 }
 
+#[test]
+fn responses_reasoning_accepts_only_a_known_effort_enum() {
+    for body in [
+        json!({"model":"o3", "input":"x", "reasoning":{"effort":"high"}}),
+        json!({"model":"o3", "input":"x", "reasoning_effort":"low"}),
+    ] {
+        let req = parse_request(Protocol::OpenAiResponses, body.to_string().as_bytes()).unwrap();
+        assert_eq!(
+            req.to_upstream_json()["reasoning_effort"],
+            body.get("reasoning")
+                .and_then(|r| r.get("effort"))
+                .and_then(Value::as_str)
+                .or_else(|| body.get("reasoning_effort").and_then(Value::as_str))
+                .unwrap()
+        );
+    }
+    for bad in [
+        json!({"model":"o3", "input":"x", "reasoning":{"effort":"20000"}}),
+        json!({"model":"o3", "input":"x", "reasoning":{}}),
+        json!({"model":"o3", "input":"x", "reasoning":{"effort":20}}),
+        json!({"model":"o3", "input":"x", "reasoning_effort":"low", "reasoning":{"effort":"high"}}),
+    ] {
+        assert!(
+            parse_request(Protocol::OpenAiResponses, bad.to_string().as_bytes()).is_err(),
+            "畸形、预算值和冲突档位必须拒绝: {bad}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------- T4 Anthropic
 
 #[test]
@@ -253,8 +282,8 @@ fn unsupported_fields_are_named_not_dropped() {
         ),
         (
             Protocol::AnthropicMessages,
-            json!({"model":"m","max_tokens":1,"messages":[],"thinking":{}}),
-            "thinking",
+            json!({"model":"m","max_tokens":1,"messages":[],"top_k":5}),
+            "top_k",
         ),
         (
             Protocol::GeminiGenerateContent,

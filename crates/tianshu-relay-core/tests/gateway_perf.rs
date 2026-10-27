@@ -54,6 +54,7 @@ fn fake(delay_ms: u64) -> (u16, Arc<AtomicUsize>) {
 
 fn cfg(port: u16) -> GatewayConfig {
     GatewayConfig {
+        catalog: None,
         port: 0,
         token: TOKEN.to_string(),
         key_id: Some(1),
@@ -239,6 +240,7 @@ async fn m44_f5_core_cold_start() {
                 vault: Arc::new(tianshu_relay_core::vault::MemoryVault::new()),
                 home: dir.clone(),
                 backup_dir: dir.join("backups"),
+                data_dir: None,
             },
         );
         let _ = svc.sites().unwrap();

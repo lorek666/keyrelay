@@ -496,6 +496,10 @@ export type Settings = {
   collectModels: boolean;
   /** M14-S1：模型采集最小间隔秒（默认 1800 = 30min）。 */
   modelsMinIntervalSecs: number;
+  /** M47-S2：是否跟随 GitHub 每天同步一次内置模型名单（默认开）。 */
+  catalogAutoSync: boolean;
+  /** M47-S2：名单地址；空 = 用内置默认地址。 */
+  catalogUrl: string;
   /** M39-S3：加权轮询参与的健康候选数（默认 3；1 = 关闭负载均衡）。 */
   gatewayLbTopN: number;
   /** M39-S3：每站并发上限（默认 8；1..=128）。 */
@@ -662,15 +666,15 @@ const stoppedGatewayMetrics = () => ({
 });
 
 
-/** 一次回收（站点侧删除）的回报（B-100）。 */
+/** 一次删除（站点侧删除 + 本地删行）的回报（B-100）。 */
 export type RevokeReport = {
   siteId: number;
   remoteId?: string | null;
   /** 站点侧确认删除（不可逆） */
   revoked: boolean;
-  /** 本地 `keys.status` 是否写上 */
-  localStatusUpdated: boolean;
-  /** 该 key 的保险库条目是否已删（DB 行保留，只删明文材料） */
+  /** 本地 `keys` 行是否已删掉（`false` = 删行失败，见 note；整体仍算成功） */
+  localRowDeleted: boolean;
+  /** 该 key 的保险库条目（明文材料）是否已删 */
   vaultDeleted: boolean;
   note?: string | null;
 };
@@ -1806,6 +1810,123 @@ export async function modelPriceDelete(id: number): Promise<boolean> {
   return invokeCommand<boolean>("model_price_delete", { id });
 }
 
+// ==================================================== M47-S2：内置模型名单
+
+/** 思考能力（名单声明的事实，不是用户当前选择）。 */
+export type CatalogThinking = {
+  /** "thinking"（预算形态）| "reasoning_effort"（枚举形态） */
+  param: string;
+  maxLevel: string;
+  defaultLevel: string;
+  budgetLow: number;
+  budgetMedium: number;
+  budgetHigh: number;
+  budgetXhigh: number;
+};
+
+export type CatalogPrice = {
+  currency: string;
+  inputPerMtok: number;
+  outputPerMtok: number;
+  cacheReadPerMtok?: number | null;
+};
+
+/** 名单里的一条（**已合并本机覆盖**的生效值）。 */
+export type CatalogModel = {
+  id: string;
+  displayName: string;
+  vendor: string;
+  /** "openai_chat" | "openai_responses" | "anthropic_messages" | "gemini" */
+  protocol: string;
+  anthropicCompatible: boolean;
+  contextWindow: number;
+  maxOutputTokens: number;
+  thinking: CatalogThinking | null;
+  /** 明确声明不支持（true）；没有声明时为 false，而不是把未知当成不支持。 */
+  thinkingUnsupported: boolean;
+  prices: CatalogPrice[];
+  deprecated: boolean;
+  /** 该条是否被本机覆盖改过。 */
+  overridden: boolean;
+};
+
+export type CatalogStatus = {
+  /** "remote"（GitHub 缓存）| "bundled"（内置）| "empty" */
+  source: string;
+  schemaVersion: number;
+  generatedAt: string;
+  entries: number;
+  overrides: number;
+  lastSuccessAt: number;
+  lastError?: string | null;
+  url: string;
+  autoSync: boolean;
+  models: CatalogModel[];
+};
+
+export type CatalogSync = {
+  bytes: number;
+  accepted: number;
+  skipped: number;
+  generatedAt: string;
+  unchanged: boolean;
+  status: CatalogStatus;
+};
+
+/** 本机覆盖入参：只传真要覆盖的字段；`null` 整条撤销。 */
+export type CatalogOverrideInput = {
+  contextWindow?: number | null;
+  maxOutputTokens?: number | null;
+  thinkingLevel?: string | null;
+  thinkingSupported?: boolean | null;
+  priceInputPerMtok?: number | null;
+  priceOutputPerMtok?: number | null;
+  priceCurrency?: string | null;
+};
+
+/** 名单现状（只读，不联网）。 */
+export async function catalogStatus(): Promise<CatalogStatus> {
+  if (!hasTauri) {
+    return mock({
+      source: "bundled",
+      schemaVersion: 1,
+      generatedAt: "2026-10-27T00:00:00Z",
+      entries: 0,
+      overrides: 0,
+      lastSuccessAt: 0,
+      lastError: null,
+      url: "",
+      autoSync: true,
+      models: [],
+    });
+  }
+  return invokeCommand<CatalogStatus>("catalog_status");
+}
+
+/** 从 GitHub 拉一次名单（失败保留旧缓存）。 */
+export async function catalogSyncNow(): Promise<CatalogSync> {
+  if (!hasTauri) {
+    return mock({
+      bytes: 0,
+      accepted: 0,
+      skipped: 0,
+      generatedAt: "",
+      unchanged: true,
+      status: await catalogStatus(),
+    });
+  }
+  return invokeCommand<CatalogSync>("catalog_sync");
+}
+
+/** 写 / 撤销一条本机覆盖（`patch = null` 即撤销）。 */
+export async function catalogSetOverride(
+  modelId: string,
+  patch: CatalogOverrideInput | null,
+): Promise<CatalogStatus> {
+  if (!hasTauri) return catalogStatus();
+  return invokeCommand<CatalogStatus>("catalog_set_override", { modelId, patch });
+}
+
 /** M46-S5：一行硬预算（`spentUsd` = 当期已花，后端逐行算）。 */
 export type SiteBudget = {
   id: number;
@@ -2087,10 +2208,12 @@ export async function getSettings(): Promise<Settings> {
  * 预览模式下的设置「库」（M9-S4）。`updateSettings` 写回这里：主题保存后 `["settings"]`
  * 会被重读，读到的若还是写死的初始值，界面就会立刻弹回「跟随系统」——预览里核不了主题。
  */
-let mockSettings: Settings = {
+export const MOCK_SETTINGS: Settings = {
   refreshIntervalSecs: 0,
   balanceAlertThreshold: 0,
   driftCheckOnStart: true,
+  catalogAutoSync: true,
+  catalogUrl: "",
   gatewayEnabled: false,
   gatewayPort: 8787,
   gatewayMaxRequestMib: 16,
@@ -2124,6 +2247,7 @@ let mockSettings: Settings = {
   closeToTray: true,
   startHidden: false,
 };
+let mockSettings: Settings = { ...MOCK_SETTINGS };
 
 /**
  * 保存设置（M41-S1）。返回设置 + 网关状态 + 网关动作的失败原因。
@@ -2360,10 +2484,12 @@ export async function rotateKey(keyId: number, name: string): Promise<RotationRu
 }
 
 /**
- * 回收站点上的某把令牌（B-82 的独立路径）。
+ * 删除站点上的某把令牌（B-82 的独立路径）。
  *
- * **不是**「删除本地记录」：本地行会被标成 `revoked` 并保留——`bindings` 与漂移追溯
- * 靠 `keys.id` 存活，删行会把它们一起带走。
+ * 两件事一起做（M47-S1）：站点侧 DELETE，然后**物理删掉**本地 `keys` 行。用户要求
+ * 「删除后的密钥不要再显示」，所以本地不再保留「已回收」墓碑行；代价是删行会经
+ * `ON DELETE CASCADE` 带走该 key 的投递绑定、用量采样与检测历史（详见
+ * `crates/tianshu-relay-core/src/store/mod.rs` 的 `Store::delete_key`）。
  *
  * 破坏性且不可逆（站点侧那把 key 真的没了），所以 `confirm` 必须显式为 `true`；
  * 核心层会拒绝 `false`，界面上也必须先问过一次。
@@ -2378,7 +2504,7 @@ export async function revokeKey(
       siteId,
       remoteId,
       revoked: true,
-      localStatusUpdated: true,
+      localRowDeleted: true,
       vaultDeleted: true,
       note: null,
     });
@@ -2407,7 +2533,7 @@ export async function unbindAgent(
               siteId: 1,
               remoteId: "mock-remote-1",
               revoked: true,
-              localStatusUpdated: true,
+              localRowDeleted: true,
               vaultDeleted: true,
               note: null,
             },

@@ -174,6 +174,7 @@ fn three_site_config(
     breaker: BreakerPolicy,
 ) -> GatewayConfig {
     GatewayConfig {
+        catalog: None,
         port: 0,
         token: "kr-gw-s7-legacy".to_string(),
         key_id: None,

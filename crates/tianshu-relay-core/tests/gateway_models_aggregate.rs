@@ -169,6 +169,7 @@ fn base_config(
     keys_by_ref: HashMap<String, Zeroizing<String>>,
 ) -> GatewayConfig {
     GatewayConfig {
+        catalog: None,
         port: 0,
         token: TOKEN.to_string(),
         key_id: None,

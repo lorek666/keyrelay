@@ -130,6 +130,10 @@ export function I18nProvider({
   });
 
   useEffect(() => {
+    document.documentElement.lang = lang;
+  }, [lang]);
+
+  useEffect(() => {
     let cancelled = false;
     loadDict(lang).then((d) => {
       if (!cancelled) {

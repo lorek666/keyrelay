@@ -133,6 +133,7 @@ fn setup_with_sites(site_count: usize) -> Svc {
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     Svc {

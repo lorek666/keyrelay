@@ -43,8 +43,10 @@ export default function Probe() {
 
   const activeSiteId = siteId ?? sites.data?.[0]?.id ?? null;
   const activeSite = (sites.data ?? []).find((s) => s.id === activeSiteId);
+  // 已删除的密钥（`revoked`，只可能是旧版本留下的行）不列出来：拿它探测只会在
+  // `ensure_not_revoked` 上被拒（M47-S1）。
   const siteKeys = (keys.data ?? []).filter(
-    (k: StoredKeyRow) => k.siteId === activeSiteId,
+    (k: StoredKeyRow) => k.siteId === activeSiteId && k.status !== "revoked",
   );
 
   const defaultBaseUrl = activeSite

@@ -1,6 +1,14 @@
 <!doctype html>
 <html lang="zh-CN">
   <head>
+    <script>
+      // 在 React 和样式加载前确定外观，避免设置读取期间混用深浅主题。
+      (() => {
+        const dark = matchMedia("(prefers-color-scheme: dark)");
+        document.documentElement.dataset.theme = dark.matches ? "dark" : "light";
+        document.documentElement.style.colorScheme = dark.matches ? "dark" : "light";
+      })();
+    </script>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>天枢 Relay · 中转站钥匙管家</title>

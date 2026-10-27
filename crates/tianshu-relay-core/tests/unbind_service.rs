@@ -68,6 +68,7 @@ async fn setup() -> Fixture {
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     mock.push(encryption_disabled());
@@ -119,12 +120,12 @@ async fn unbind_without_revoke_sends_no_site_request() {
     assert_ne!(
         status_before.as_deref(),
         Some(KEY_STATUS_REVOKED),
-        "前提：解绑前这把 key 不是已回收状态"
+        "前提：解绑前这把 key 不是已删除状态"
     );
     assert_eq!(
         f.service.store().key_status(f.key_id).unwrap(),
         status_before,
-        "解绑 ≠ 回收：`keys.status` 一个字都不动"
+        "解绑 ≠ 删除：`keys.status` 一个字都不动"
     );
 }
 
@@ -144,13 +145,13 @@ async fn unbind_with_revoke_reports_both_worlds() {
     assert_eq!(outcome.revoked.len(), 1, "一把 key 一条回报");
     let report = &outcome.revoked[0];
     assert!(report.revoked, "站点侧确认删除");
-    assert!(report.local_status_updated, "本地状态写上了");
+    assert!(report.local_row_deleted, "本地记录删掉了");
     assert_eq!(report.site_id, f.site_id);
     assert_eq!(report.remote_id.as_deref(), Some("1"));
     assert!(report.note.is_none(), "{:?}", report.note);
-    assert_eq!(
-        f.service.store().key_status(f.key_id).unwrap().as_deref(),
-        Some(KEY_STATUS_REVOKED)
+    assert!(
+        f.service.store().get_key(f.key_id).unwrap().is_none(),
+        "M47-S1：`also_revoke` 走的是同一条删除路径，本地行必须被删掉"
     );
 }
 
@@ -242,6 +243,7 @@ async fn a_binding_without_a_remote_id_is_skipped_with_a_note() {
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     service

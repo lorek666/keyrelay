@@ -1,9 +1,26 @@
-import { useEffect, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { AlertTriangle } from "lucide-react";
+import {
+  Activity,
+  AlertTriangle,
+  ArrowRight,
+  ArrowUpRight,
+  CheckCircle2,
+  ChevronDown,
+  CircleAlert,
+  FileWarning,
+  KeyRound,
+  Layers3,
+  Plug,
+  RefreshCw,
+  Server,
+  Settings2,
+  ShieldCheck,
+  Zap,
+} from "lucide-react";
 import {
   appInfo,
   driftReport,
+  gatewayStatus,
   listConsents,
   listSites,
   listStoredKeys,
@@ -12,23 +29,20 @@ import {
   recentUsageSnapshots,
   refreshAll,
   runtimeMode,
+  type EventRow,
+  type SiteRow,
 } from "../lib/api";
 import { useTranslation } from "../i18n";
+import { formatTokens } from "../lib/usageAgg";
 import RebrandNotice from "../components/RebrandNotice";
+import { BusyLabel, InlineNotice, MetricCard, SectionHeader, StatusDot } from "../components/Ui";
 
-/**
- * 指挥舱（M45-S1）：总览页的数据逻辑，只换 Harmony 呈现。
- * 口径与 Overview.tsx 逐项一致：5 指标定义、漂移三态过滤、告警 top5 截断、
- * 用量 24h 分站点汇总与 7d 余额快照 delta——改任一口径都必须同步改单测。
- */
-export default function Cockpit() {
+type Destination = "traffic" | "health" | "assets" | "delivery" | "settings";
+
+/** 指挥舱只组织既有只读数据；跳转由 App 注入，独立渲染时操作安全地退化为无动作。 */
+export default function Cockpit({ onNavigate }: { onNavigate?: (page: Destination) => void }) {
   const { t } = useTranslation();
-  const [now, setNow] = useState(() => new Date());
-  useEffect(() => {
-    const timer = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(timer);
-  }, []);
-
+  const navigate = onNavigate ?? (() => {});
   const info = useQuery({ queryKey: ["app-info"], queryFn: appInfo });
   const sites = useQuery({ queryKey: ["sites"], queryFn: listSites });
   const keys = useQuery({ queryKey: ["stored-keys"], queryFn: listStoredKeys });
@@ -37,13 +51,18 @@ export default function Cockpit() {
   const gatewayUsage = useQuery({ queryKey: ["gateway-usage"], queryFn: () => recentGatewayUsage(24) });
   const usageSnapshots = useQuery({ queryKey: ["usage-snapshots"], queryFn: () => recentUsageSnapshots(168) });
   const drift = useQuery({ queryKey: ["drift"], queryFn: driftReport });
+  const gateway = useQuery({ queryKey: ["gateway"], queryFn: gatewayStatus });
 
   const refresh = useMutation({
     mutationFn: refreshAll,
     onSuccess: async () => {
-      await events.refetch();
-      await sites.refetch();
-      await keys.refetch();
+      await Promise.all([
+        events.refetch(),
+        sites.refetch(),
+        keys.refetch(),
+        gatewayUsage.refetch(),
+        usageSnapshots.refetch(),
+      ]);
     },
   });
 
@@ -53,280 +72,146 @@ export default function Cockpit() {
   const hasUnreadable = drifted.some((r) => r.state === "unreadable");
   const needsLogin = (sites.data ?? []).filter((s) => s.health === "needs_login");
   const warnings = (events.data ?? []).filter((e) => e.level === "warn" || e.level === "error");
+  const issueCount = warnings.length + needsLogin.length + drifted.length;
+  const gatewayPhase = gateway.data?.phase;
+  const gatewayTone = gatewayPhase === "running" ? "ok" : gatewayPhase === "crashed" ? "danger" : "muted";
+  const healthySites = (sites.data ?? []).filter((site) => site.health === "ok").length;
+
+  const usageBySite = new Map<number, { prompt: number; completion: number; total: number }>();
+  for (const row of gatewayUsage.data ?? []) {
+    const current = usageBySite.get(row.siteId) ?? { prompt: 0, completion: 0, total: 0 };
+    current.prompt += row.promptTokens;
+    current.completion += row.completionTokens;
+    current.total += row.totalTokens;
+    usageBySite.set(row.siteId, current);
+  }
+  const totalTokens = [...usageBySite.values()].reduce((sum, row) => sum + row.total, 0);
+  const siteName = (id: number) =>
+    sites.data?.find((site) => site.id === id)?.displayName ?? t("overview.usage.siteFallback", { id });
 
   return (
-    <section className="page">
-      <div className="hm-hero">
-        <div>
-          <h1>
-            {t("nav.brand")} <span>Relay</span>
-          </h1>
-          <p>
-            {info.data ? `${t("nav.brand")} ${info.data.version}` : "…"} · {t("overview.runState.mode")}
-            :{" "}
-            {runtimeMode === "tauri"
-              ? t("overview.runState.modeTauri")
-              : t("overview.runState.modeBrowser")}
-          </p>
-        </div>
-        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <span className="hm-pill">
-            {t("cockpit.live")} {now.toTimeString().slice(0, 8)}
-          </span>
-        </div>
-      </div>
-
-      <div className="hm-grid8">
-        <div className="hm-card hm-metric" style={{ margin: 0 }}>
-          <div className="hm-label">{t("overview.stat.sites")}</div>
-          <div className="hm-num">{sites.data?.length ?? "—"}</div>
-        </div>
-        <div className="hm-card hm-metric" style={{ margin: 0 }}>
-          <div className="hm-label">{t("overview.stat.keys")}</div>
-          <div className="hm-num">{keys.data?.length ?? "—"}</div>
-        </div>
-        <div className="hm-card hm-metric" style={{ margin: 0 }}>
-          <div className="hm-label">{t("overview.stat.consents")}</div>
-          <div className="hm-num">
-            {consents.data ? consents.data.filter((c) => !c.revokedAt).length : "—"}
+    <section className="page cockpit-page">
+      <div className="cockpit-hero">
+        <div className="cockpit-hero-copy">
+          <div className="eyebrow"><ShieldCheck size={14} aria-hidden="true" />{t("cockpit.heroEyebrow")}</div>
+          <h2>{t("cockpit.heroTitle")}</h2>
+          <p>{t("cockpit.heroBody")}</p>
+          <div className="cockpit-hero-meta">
+            <span><StatusDot tone={info.data?.vaultBackend === "memory" ? "danger" : "ok"} />{t("cockpit.localData")}</span>
+            <span className="hero-meta-divider" aria-hidden="true" />
+            <span>{runtimeMode === "tauri" ? t("overview.runState.modeTauri") : t("overview.runState.modeBrowser")}</span>
           </div>
         </div>
-        <div className="hm-card hm-metric" style={{ margin: 0 }}>
-          <div className="hm-label">{t("overview.stat.alerts")}</div>
-          <div className="hm-num">{events.isLoading ? "—" : warnings.length}</div>
-        </div>
-        <div className="hm-card hm-metric" style={{ margin: 0 }}>
-          <div className="hm-label">{t("overview.stat.drift")}</div>
-          <div className="hm-num">{drift.isLoading ? "—" : drifted.length}</div>
-        </div>
-        <div className="hm-card hm-metric" style={{ margin: 0 }}>
-          <div className="hm-label">{t("overview.runState.dataDir")}</div>
-          <div className="hm-num-sm mono ellipsis" title={info.data?.dataDir}>
-            {info.data?.dataDir ?? "…"}
+        <div className="gateway-overview">
+          <div className="gateway-overview-heading">
+            <span className="gateway-symbol"><Zap size={19} aria-hidden="true" /></span>
+            <span>{t("gateway.title")}</span>
+            <StatusDot tone={gatewayTone} />
           </div>
+          <strong>{gatewayPhase ? t(`shell.gatewayPhase.${gatewayPhase}`) : gateway.isError ? t("gateway.statusUnknown") : t("common.loading")}</strong>
+          <span className="gateway-overview-url">{gateway.data?.url ?? t("cockpit.gatewayIdle")}</span>
+          <button type="button" className="text-button" onClick={() => navigate("settings")}>
+            {t("cockpit.manageGateway")}<ArrowUpRight size={14} aria-hidden="true" />
+          </button>
         </div>
-        <div className="hm-card hm-metric" style={{ margin: 0 }}>
-          <div className="hm-label">{t("overview.runState.db")}</div>
-          <div className="hm-num-sm mono ellipsis" title={info.data?.dbPath}>
-            {info.data?.dbPath ?? "…"}
-          </div>
-        </div>
-        <div className="hm-card hm-metric" style={{ margin: 0 }}>
-          <div className="hm-label">{t("overview.runState.vault")}</div>
-          <div className="hm-num-sm mono">{info.data?.vaultBackend ?? "…"}</div>
-        </div>
-      </div>
-
-      <div className="hm-card">
-        <h3>{t("overview.runState.title")}</h3>
-        <dl className="kv">
-          <dt>{t("overview.runState.mode")}</dt>
-          <dd className="mono">
-            {runtimeMode === "tauri"
-              ? t("overview.runState.modeTauri")
-              : t("overview.runState.modeBrowser")}
-          </dd>
-          <dt>{t("overview.runState.version")}</dt>
-          <dd className="mono">{info.data ? `${t("nav.brand")} ${info.data.version}` : "…"}</dd>
-        </dl>
-        <button
-          type="button"
-          className="btn"
-          disabled={refresh.isPending}
-          onClick={() => refresh.mutate()}
-        >
-          {refresh.isPending ? t("overview.btn.refreshing") : t("overview.btn.refreshNow")}
+        <button type="button" className="btn btn-primary cockpit-refresh" disabled={refresh.isPending} onClick={() => refresh.mutate()}>
+          <BusyLabel busy={refresh.isPending}>{!refresh.isPending ? <RefreshCw size={15} aria-hidden="true" /> : null}{t(refresh.isPending ? "overview.btn.refreshing" : "overview.btn.refreshNow")}</BusyLabel>
         </button>
-        {refresh.data ? (
-          <p className="muted">
-            {t("overview.refreshResult.base", {
-              ok: refresh.data.sitesOk,
-              failed: refresh.data.sitesFailed,
-              keys: refresh.data.keysTotal,
-            })}
-            {refresh.data.balanceAlerts.length
-              ? t("overview.refreshResult.balanceAlerts", { count: refresh.data.balanceAlerts.length })
-              : ""}
-            {refresh.data.needsLogin.length
-              ? t("overview.refreshResult.needsLogin", { count: refresh.data.needsLogin.length })
-              : ""}
-          </p>
-        ) : null}
-        {refresh.isError ? (
-          <p className="error" role="alert">
-            <AlertTriangle size={14} aria-hidden />{" "}
-            {t("overview.error.refreshFailed", { error: refresh.error.message })}
-          </p>
-        ) : null}
-        {info.data?.vaultBackend === "memory" ? (
-          <p className="error" role="alert">
-            <AlertTriangle size={14} aria-hidden /> {t("overview.error.memoryVaultPre")}
-            {t("overview.error.memoryVaultPost")}
-          </p>
-        ) : null}
-        {runtimeMode === "browser" ? (
-          <p className="warn" role="status">
-            {t("overview.warn.browserPreviewPre")}
-            <span className="mono">pnpm tauri dev</span>
-            {t("overview.warn.browserPreviewPost")}
-          </p>
-        ) : null}
+      </div>
+
+      {refresh.data ? (
+        <InlineNotice tone="success">
+          <CheckCircle2 size={16} aria-hidden="true" />
+          <span>{t("overview.refreshResult.base", { ok: refresh.data.sitesOk, failed: refresh.data.sitesFailed, keys: refresh.data.keysTotal })}{refresh.data.balanceAlerts.length ? t("overview.refreshResult.balanceAlerts", { count: refresh.data.balanceAlerts.length }) : ""}{refresh.data.needsLogin.length ? t("overview.refreshResult.needsLogin", { count: refresh.data.needsLogin.length }) : ""}</span>
+        </InlineNotice>
+      ) : null}
+      {refresh.isError ? <InlineNotice tone="danger"><AlertTriangle size={16} aria-hidden="true" />{t("overview.error.refreshFailed", { error: refresh.error.message })}</InlineNotice> : null}
+      {info.data?.vaultBackend === "memory" ? <InlineNotice tone="danger"><AlertTriangle size={16} aria-hidden="true" /><span>{t("overview.error.memoryVaultPre")}{t("overview.error.memoryVaultPost")}</span></InlineNotice> : null}
+      {runtimeMode === "browser" ? <InlineNotice tone="info"><ShieldCheck size={16} aria-hidden="true" /><span>{t("overview.warn.browserPreviewPre")}<span className="mono">pnpm tauri dev</span>{t("overview.warn.browserPreviewPost")}</span></InlineNotice> : null}
+
+      <div className="overview-metrics" aria-label={t("cockpit.summary")}>
+        <MetricCard label={t("overview.stat.sites")} value={sites.data?.length ?? "—"} detail={t("cockpit.healthySites", { count: healthySites })} icon={<Server size={18} aria-hidden="true" />} tone="accent" onClick={() => navigate("assets")} />
+        <MetricCard label={t("overview.stat.keys")} value={keys.data ? keys.data.filter((key) => key.status !== "revoked").length : "—"} detail={t("cockpit.keyStorage")} icon={<KeyRound size={18} aria-hidden="true" />} onClick={() => navigate("assets")} />
+        <MetricCard label={t("overview.stat.consents")} value={consents.data ? consents.data.filter((c) => !c.revokedAt).length : "—"} detail={t("cockpit.agentAccess")} icon={<Plug size={18} aria-hidden="true" />} onClick={() => navigate("delivery")} />
+        <MetricCard label={t("overview.stat.alerts")} value={events.isLoading ? "—" : warnings.length} detail={t("cockpit.recentEvents")} icon={<CircleAlert size={18} aria-hidden="true" />} tone={warnings.length ? "warn" : "ok"} onClick={() => navigate("health")} />
+        <MetricCard label={t("overview.stat.drift")} value={drift.isLoading ? "—" : drifted.length} detail={t("cockpit.externalChanges")} icon={<FileWarning size={18} aria-hidden="true" />} tone={drifted.length ? "warn" : "ok"} onClick={() => navigate("delivery")} />
+      </div>
+
+      {sites.data?.length === 0 ? (
+        <div className="onboarding-panel">
+          <div><span className="eyebrow">{t("cockpit.getStarted")}</span><h2>{t("cockpit.onboardingTitle")}</h2><p>{t("cockpit.onboardingBody")}</p></div>
+          <div className="onboarding-steps">
+            {(["assets", "delivery", "settings"] as const).map((destination, index) => (
+              <button type="button" className="onboarding-step" key={destination} onClick={() => navigate(destination)}>
+                <span className="step-number">0{index + 1}</span><span><strong>{t(`cockpit.steps.${destination}`)}</strong><small>{t(`cockpit.stepBodies.${destination}`)}</small></span><ArrowRight size={16} aria-hidden="true" />
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      <div className="cockpit-workspace">
+        <section className="attention-panel" aria-labelledby="attention-title">
+          <SectionHeader title={<span id="attention-title">{t("cockpit.attentionTitle")}</span>} description={t("cockpit.attentionBody")} action={<span className={`count-badge${issueCount ? " has-issues" : ""}`}>{sites.isLoading || drift.isLoading || events.isLoading ? "—" : issueCount}</span>} />
+          {issueCount === 0 && sites.data && drift.data && events.data ? (
+            <div className="healthy-empty"><span className="healthy-empty-icon"><CheckCircle2 size={23} aria-hidden="true" /></span><h3>{t("cockpit.allClear")}</h3><p>{t("cockpit.allClearBody")}</p></div>
+          ) : (
+            <div className="issue-list">
+              {needsLogin.map((site: SiteRow) => <IssueRow key={`login-${site.id}`} tone="warn" icon={<KeyRound size={16} aria-hidden="true" />} title={site.displayName || site.baseUrl} detail={t("cockpit.loginNeeded")} badge="needs_login" action={() => navigate("assets")} actionLabel={t("cockpit.viewAssets")} />)}
+              {drifted.map((row) => <IssueRow key={`drift-${row.journalId}`} tone="warn" icon={<FileWarning size={16} aria-hidden="true" />} title={row.targetPath} detail={row.agentId} badge={row.state} action={() => navigate("delivery")} actionLabel={t("cockpit.reviewDelivery")} />)}
+              {warnings.slice(0, 5).map((row: EventRow) => <IssueRow key={`event-${row.id}`} tone={row.level === "error" ? "danger" : "warn"} icon={<CircleAlert size={16} aria-hidden="true" />} title={row.message} detail={row.source} badge={row.level} action={() => navigate("health")} actionLabel={t("cockpit.viewHealth")} />)}
+            </div>
+          )}
+          {issueCount > 0 ? <button type="button" className="panel-footer-link" onClick={() => navigate("health")}>{t("cockpit.allHealth")}<ArrowRight size={15} aria-hidden="true" /></button> : null}
+          {needsLogin.length ? <p className="panel-footnote">{t("overview.needsLogin.hint")}</p> : null}
+          {drifted.length ? <details className="drift-help"><summary>{t("cockpit.driftHelp")}</summary><p>{t("overview.drift.hint1Pre")}<span className="mono">missing</span>{t("overview.drift.hint1Mid")}<span className="mono">modified</span>{t("overview.drift.hint1Post")}</p><p><strong>{t("overview.drift.hint2Pre")}</strong>{t("overview.drift.hint2Post")}</p>{hasUnreadable ? <p>{t("overview.drift.hint3Pre")}<span className="mono">unreadable</span>{t("overview.drift.hint3Mid1")}<strong>{t("overview.drift.hint3Mid2")}</strong>{t("overview.drift.hint3Post")}</p> : null}</details> : null}
+        </section>
+
+        <section className="activity-panel" aria-labelledby="activity-title">
+          <SectionHeader title={<span id="activity-title">{t("cockpit.activityTitle")}</span>} description={t("cockpit.activityBody")} action={<button type="button" className="icon-button" title={t("cockpit.viewTraffic")} aria-label={t("cockpit.viewTraffic")} onClick={() => navigate("traffic")}><ArrowUpRight size={17} aria-hidden="true" /></button>} />
+          <div className="usage-highlight"><div><span>{t("overview.usage.gateway24h")}</span><strong>{gatewayUsage.data ? (gatewayUsage.data.length ? formatTokens(totalTokens) : "0") : "—"}</strong></div><span className="usage-highlight-icon"><Activity size={22} aria-hidden="true" /></span></div>
+          {usageBySite.size ? <div className="usage-site-list">{[...usageBySite.entries()].map(([siteId, usage]) => <div className="usage-site-row" key={siteId}><span className="usage-site-name"><StatusDot tone="accent" />{siteName(siteId)}</span><span className="usage-site-total">{usage.total.toLocaleString()}<small> tokens</small></span><span className="usage-site-detail">{t("overview.usage.tokens", { site: siteName(siteId), total: usage.total.toLocaleString(), prompt: usage.prompt.toLocaleString(), completion: usage.completion.toLocaleString() })}</span></div>)}</div> : <div className="activity-empty"><Activity size={22} aria-hidden="true" /><p>{t("cockpit.noActivity")}</p></div>}
+          {usageSnapshots.data?.length ? <BalanceSnapshots snapshots={usageSnapshots.data} siteName={siteName} /> : null}
+          <button type="button" className="panel-footer-link" onClick={() => navigate("traffic")}>{t("cockpit.viewTraffic")}<ArrowRight size={15} aria-hidden="true" /></button>
+        </section>
       </div>
 
       <RebrandNotice rebrand={info.data?.rebrand} dataDir={info.data?.dataDir} />
 
-      {needsLogin.length ? (
-        <div className="hm-card">
-          <h3>
-            <AlertTriangle size={15} aria-hidden />{" "}
-            {t("overview.needsLogin.title", { count: needsLogin.length })}
-          </h3>
-          <ul className="list">
-            {needsLogin.map((s) => (
-              <li key={s.id}>
-                <span className="badge badge-warn">needs_login</span>{" "}
-                <span className="mono ellipsis" title={s.baseUrl}>
-                  {s.displayName || s.baseUrl}
-                </span>
-              </li>
-            ))}
-          </ul>
-          <p className="muted">{t("overview.needsLogin.hint")}</p>
-        </div>
-      ) : null}
+      <div className="quick-actions" aria-label={t("cockpit.quickActions")}>
+        <QuickAction icon={<Layers3 size={18} aria-hidden="true" />} title={t("cockpit.quickAssets")} body={t("cockpit.quickAssetsBody")} onClick={() => navigate("assets")} />
+        <QuickAction icon={<Plug size={18} aria-hidden="true" />} title={t("cockpit.quickDelivery")} body={t("cockpit.quickDeliveryBody")} onClick={() => navigate("delivery")} />
+        <QuickAction icon={<Settings2 size={18} aria-hidden="true" />} title={t("cockpit.quickSettings")} body={t("cockpit.quickSettingsBody")} onClick={() => navigate("settings")} />
+      </div>
 
-      {drifted.length ? (
-        <div className="hm-card">
-          <h3>
-            <AlertTriangle size={15} aria-hidden />{" "}
-            {t("overview.drift.title", { count: drifted.length })}
-          </h3>
-          <ul className="list">
-            {drifted.map((r) => (
-              <li key={r.targetPath}>
-                <span className="badge badge-warn">{r.state}</span>{" "}
-                <span className="mono">{r.agentId}</span>{" "}
-                <span className="mono ellipsis" title={r.targetPath}>
-                  {r.targetPath}
-                </span>
-              </li>
-            ))}
-          </ul>
-          <p className="muted">
-            {t("overview.drift.hint1Pre")}
-            <span className="mono">missing</span>
-            {t("overview.drift.hint1Mid")}
-            <span className="mono">modified</span>
-            {t("overview.drift.hint1Post")}
-          </p>
-          <p className="muted">
-            <strong>{t("overview.drift.hint2Pre")}</strong>
-            {t("overview.drift.hint2Post")}
-          </p>
-          {hasUnreadable ? (
-            <p className="muted">
-              {t("overview.drift.hint3Pre")}
-              <span className="mono">unreadable</span>
-              {t("overview.drift.hint3Mid1")}
-              <strong>{t("overview.drift.hint3Mid2")}</strong>
-              {t("overview.drift.hint3Post")}
-            </p>
-          ) : null}
-        </div>
-      ) : null}
-
-      {warnings.length ? (
-        <div className="hm-card">
-          <h3>{t("overview.alerts.title")}</h3>
-          <ul className="list">
-            {warnings.slice(0, 5).map((row) => (
-              <li key={row.id}>
-                <span className={`badge badge-${row.level === "error" ? "danger" : "warn"}`}>
-                  {row.level}
-                </span>{" "}
-                <span className="mono">{row.source}</span> {row.message}
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-
-      {gatewayUsage.data?.length || usageSnapshots.data?.length ? (
-        <div className="hm-card">
-          <h3>{t("overview.usage.title")}</h3>
-          {(() => {
-            const siteName = (id: number) =>
-              sites.data?.find((s) => s.id === id)?.displayName ??
-              t("overview.usage.siteFallback", { id });
-            const usageBySite = new Map<number, { prompt: number; completion: number; total: number }>();
-            for (const row of gatewayUsage.data ?? []) {
-              const cur = usageBySite.get(row.siteId) ?? { prompt: 0, completion: 0, total: 0 };
-              cur.prompt += row.promptTokens;
-              cur.completion += row.completionTokens;
-              cur.total += row.totalTokens;
-              usageBySite.set(row.siteId, cur);
-            }
-            return (
-              <>
-                {gatewayUsage.data?.length ? (
-                  <dl className="kv">
-                    <dt>{t("overview.usage.gateway24h")}</dt>
-                    <dd className="mono">
-                      {Array.from(usageBySite.entries()).map(([siteId, v], i) => (
-                        <span key={siteId}>
-                          {i > 0 ? " / " : ""}
-                          {t("overview.usage.tokens", {
-                            site: siteName(siteId),
-                            total: v.total.toLocaleString(),
-                            prompt: v.prompt.toLocaleString(),
-                            completion: v.completion.toLocaleString(),
-                          })}
-                        </span>
-                      ))}
-                    </dd>
-                  </dl>
-                ) : null}
-                {usageSnapshots.data?.length ? (
-                  <dl className="kv">
-                    <dt>{t("overview.usage.snapshot7d")}</dt>
-                    <dd className="mono">
-                      {(() => {
-                        const bySite = new Map<number, typeof usageSnapshots.data>();
-                        for (const s of usageSnapshots.data) {
-                          if (!bySite.has(s.siteId)) bySite.set(s.siteId, []);
-                          bySite.get(s.siteId)!.push(s);
-                        }
-                        return Array.from(bySite.entries()).map(([siteId, snaps], i) => {
-                          const latest = snaps[0];
-                          const prev = snaps[1];
-                          const delta = prev ? latest.used - prev.used : null;
-                          return (
-                            <span key={siteId}>
-                              {i > 0 ? " / " : ""}
-                              {t("overview.usage.balance", {
-                                site: siteName(siteId),
-                                used: latest.used.toFixed(2),
-                                currency: latest.currency,
-                                remaining: latest.remaining.toFixed(2),
-                                delta:
-                                  delta !== null
-                                    ? t("overview.usage.delta", {
-                                        delta: `${delta > 0 ? "+" : ""}${delta.toFixed(2)}`,
-                                      })
-                                    : "",
-                              })}
-                            </span>
-                          );
-                        });
-                      })()}
-                    </dd>
-                  </dl>
-                ) : null}
-              </>
-            );
-          })()}
-        </div>
-      ) : null}
+      <details className="system-details">
+        <summary><span><Settings2 size={15} aria-hidden="true" />{t("cockpit.systemDetails")}</span><ChevronDown size={15} aria-hidden="true" /></summary>
+        <dl className="system-details-grid">
+          <div><dt>{t("overview.runState.mode")}</dt><dd>{runtimeMode === "tauri" ? t("overview.runState.modeTauri") : t("overview.runState.modeBrowser")}</dd></div>
+          <div><dt>{t("overview.runState.version")}</dt><dd className="mono">{info.data ? `${t("nav.brand")} ${info.data.version}` : "—"}</dd></div>
+          <div><dt>{t("overview.runState.vault")}</dt><dd className="mono">{info.data?.vaultBackend ?? "—"}</dd></div>
+          <div><dt>{t("overview.runState.dataDir")}</dt><dd className="mono" title={info.data?.dataDir}>{info.data?.dataDir ?? "—"}</dd></div>
+          <div><dt>{t("overview.runState.db")}</dt><dd className="mono" title={info.data?.dbPath}>{info.data?.dbPath ?? "—"}</dd></div>
+        </dl>
+      </details>
     </section>
   );
+}
+
+function IssueRow({ tone, icon, title, detail, badge, action, actionLabel }: { tone: "warn" | "danger"; icon: React.ReactNode; title: string; detail: string; badge: string; action: () => void; actionLabel: string }) {
+  return <div className={`issue-row issue-${tone}`}><span className="issue-icon">{icon}</span><div className="issue-copy"><strong title={title}>{title}</strong><span><code>{badge}</code>{detail}</span></div><button type="button" className="icon-button" title={actionLabel} aria-label={actionLabel} onClick={action}><ArrowUpRight size={16} aria-hidden="true" /></button></div>;
+}
+
+function QuickAction({ icon, title, body, onClick }: { icon: React.ReactNode; title: string; body: string; onClick: () => void }) {
+  return <button type="button" className="quick-action" onClick={onClick}><span className="quick-action-icon">{icon}</span><span><strong>{title}</strong><small>{body}</small></span><ArrowUpRight size={15} aria-hidden="true" /></button>;
+}
+
+function BalanceSnapshots({ snapshots, siteName }: { snapshots: Array<{ siteId: number; ts: number; used: number; remaining: number; currency: string }>; siteName: (id: number) => string }) {
+  const { t } = useTranslation();
+  const bySite = new Map<number, typeof snapshots>();
+  for (const snapshot of snapshots) {
+    if (!bySite.has(snapshot.siteId)) bySite.set(snapshot.siteId, []);
+    bySite.get(snapshot.siteId)!.push(snapshot);
+  }
+  return <div className="balance-snapshots"><h3>{t("overview.usage.snapshot7d")}</h3>{[...bySite.entries()].map(([siteId, rows]) => { const latest = rows[0]; const previous = rows[1]; const delta = previous ? latest.used - previous.used : null; return <p key={siteId}>{t("overview.usage.balance", { site: siteName(siteId), used: latest.used.toFixed(2), currency: latest.currency, remaining: latest.remaining.toFixed(2), delta: delta !== null ? t("overview.usage.delta", { delta: `${delta > 0 ? "+" : ""}${delta.toFixed(2)}` }) : "" })}</p>; })}</div>;
 }

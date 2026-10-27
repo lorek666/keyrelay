@@ -88,6 +88,9 @@ pub const COMMANDS: &[&str] = &[
     "model_price_list",
     "model_price_upsert",
     "model_price_delete",
+    "catalog_status",
+    "catalog_sync",
+    "catalog_set_override",
     // M46-S5：站点 / key 硬预算
     "site_budget_list",
     "site_budget_create",

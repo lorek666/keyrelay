@@ -24,18 +24,54 @@ use crate::site::transport::{HttpRequest, HttpTransport, Method};
 /// GPT 模型的窗口封顶（中转站分发的是订阅制窗口，非 API 的 1.05M）。
 pub const GPT_CONTEXT_WINDOW_CAP: u32 = 272_000;
 
-/// 一个模型的上下文/输出参数。
+/// 一个模型的投递参数：窗口 / 输出 / 思考能力 / 原生协议。
+///
+/// **`Copy` 是刻意的**：投递层到处在拷贝它（`resolve_for_binding_with_meta` 每个通道一份），
+/// 所以这里只放定长值类型——价格带 `String`/版本，留在
+/// [`crate::model_catalog::CatalogPrice`] 里，不进来。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelMeta {
     pub context_window: u32,
     pub max_output_tokens: u32,
+    /// 思考能力。`None` = 不知道或不支持 ⇒ 调用方不写任何思考参数。
+    pub thinking: Option<crate::model_catalog::ThinkingSpec>,
+    /// 只有名单/本机覆盖明确声明不支持时才为 true；未知不删除用户配置。
+    pub thinking_unsupported: bool,
+    /// 模型**原生**协议（名单给；内置表与 models.dev 都按 OpenAI Chat 记）。
+    pub protocol: crate::model_catalog::UpstreamProtocol,
+    /// 是否原生兼容 Anthropic Messages（Claude Code 这类客户端要这项）。
+    pub anthropic_compatible: bool,
 }
 
 impl ModelMeta {
+    /// 只带窗口/输出的最小形态（内置表与 models.dev 走这条）。
     const fn new(context_window: u32, max_output_tokens: u32) -> Self {
         Self {
             context_window,
             max_output_tokens,
+            thinking: None,
+            thinking_unsupported: false,
+            protocol: crate::model_catalog::UpstreamProtocol::OpenAiChat,
+            anthropic_compatible: false,
+        }
+    }
+
+    /// 名单条目的投影（`crate::model_catalog::CatalogModel::to_meta` 用它）。
+    pub const fn from_catalog(
+        context_window: u32,
+        max_output_tokens: u32,
+        thinking: Option<crate::model_catalog::ThinkingSpec>,
+        thinking_unsupported: bool,
+        protocol: crate::model_catalog::UpstreamProtocol,
+        anthropic_compatible: bool,
+    ) -> Self {
+        Self {
+            context_window,
+            max_output_tokens,
+            thinking,
+            thinking_unsupported,
+            protocol,
+            anthropic_compatible,
         }
     }
 }

@@ -48,6 +48,7 @@ fn setup() -> Fixture {
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 

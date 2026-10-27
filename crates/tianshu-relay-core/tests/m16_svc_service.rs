@@ -75,6 +75,7 @@ fn fixture_with_group(
             vault,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     Fixture {
@@ -341,6 +342,7 @@ async fn balance_alert_skips_unknown_balance() {
             vault: Arc::clone(&vault) as Arc<dyn Vault>,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     service.restore_sessions();
@@ -436,6 +438,7 @@ async fn gateway_token_read_failure_keeps_the_persisted_token() {
             vault: Arc::clone(&vault) as Arc<dyn Vault>,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 
@@ -496,6 +499,7 @@ async fn logout_deletes_the_persisted_session() {
             vault: Arc::new(MemoryVault::new()),
             home: f.home.clone(),
             backup_dir: f.home.join("backups"),
+            data_dir: None,
         },
     );
     fresh.restore_sessions();
@@ -575,6 +579,7 @@ async fn restore_sessions_skips_expired_jwt() {
             vault: Arc::clone(&vault) as Arc<dyn Vault>,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     service.restore_sessions();
@@ -708,6 +713,7 @@ async fn notify_baseline_refusal_is_visible_not_silent() {
             vault: Arc::clone(&vault) as Arc<dyn Vault>,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     service.restore_sessions();
@@ -798,6 +804,7 @@ async fn refresh_events_are_ordered_by_site_id() {
             vault: Arc::clone(&vault) as Arc<dyn Vault>,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     service.restore_sessions();
@@ -894,6 +901,7 @@ async fn overlapping_refresh_all_calls_serialize() {
             vault: Arc::clone(&vault) as Arc<dyn Vault>,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     service.restore_sessions();
@@ -938,6 +946,7 @@ async fn notify_baseline_persists_across_instances() {
             vault: Arc::new(MemoryVault::new()),
             home: f.home.clone(),
             backup_dir: f.home.join("backups"),
+            data_dir: None,
         },
     );
     assert!(
@@ -1015,19 +1024,14 @@ async fn auth_failure_deletes_the_persisted_session() {
 
 // ============================================================ B-155（M16-S10 ②）
 
-/// **B-155 ②**（原 §7 名 `rotation_reports_local_status_not_updated`，本增量**改名**）：
-/// 站点侧删成功、**本地 `keys.status` 写失败** ⇒ `revoked == true` 且
-/// `local_status_updated == false`。轮换收尾据此报「站点侧已删、本地未写成 revoked」，
-/// 而不是纯「已回收」（否则用户以为本地也清了）。
+/// **B-155 ②**（M47-S1 改口径后仍是同一条纪律）：站点侧删成功、**本地 `keys` 行删失败**
+/// ⇒ `revoked == true` 且 `local_row_deleted == false`。轮换收尾据此报
+/// 「站点侧已删、本地记录未删除」，而不是纯「已删除」（否则用户以为本地也清了）。
 ///
-/// **为什么改名**：拥有 `local_status_updated` 字段、能被确定断言的是 `revoke_key`；
-/// 轮换层只是把它转述成文案（那句文案仍由读码覆盖，见 spec §11）。原名会把断言引向
-/// 快乐路径（`true`），与名字不符。
-///
-/// **诱导方式（确定性，不靠概率/时序）**：SQLite 触发器只让 `keys` 表的 UPDATE 失败
+/// **诱导方式（确定性，不靠概率/时序）**：SQLite 触发器只让 `keys` 表的 **DELETE** 失败
 /// （`RAISE(ABORT, …)`）——`journals` / `bindings` / `events` 照常可写 ⇒ 精确命中该分支。
 #[tokio::test]
-async fn revoke_key_reports_local_status_not_updated_when_the_keys_update_fails() {
+async fn revoke_key_reports_local_row_not_deleted_when_the_keys_delete_fails() {
     let f = fixture(vec![
         login_response(&jwt_with_exp(9_999_999_999)),
         HttpResponse::new(204, Vec::new()), // 第一次 DELETE /api/v1/keys/1
@@ -1038,10 +1042,10 @@ async fn revoke_key_reports_local_status_not_updated_when_the_keys_update_fails(
         .await
         .expect("登录");
 
-    // 只挡 keys 表的 UPDATE（其它表照常可写）
+    // 只挡 keys 表的 DELETE（其它表照常可写）
     let conn = rusqlite::Connection::open(&f.db_path).expect("注入连接");
     conn.execute_batch(
-        "CREATE TRIGGER block_key_status BEFORE UPDATE ON keys
+        "CREATE TRIGGER block_key_delete BEFORE DELETE ON keys
          BEGIN SELECT RAISE(ABORT, 'blocked by M16-S10 test'); END;",
     )
     .expect("建触发器");
@@ -1054,30 +1058,38 @@ async fn revoke_key_reports_local_status_not_updated_when_the_keys_update_fails(
         .expect("站点侧已删 ⇒ 整体仍是 Ok（本地没记上不改变「站点上那把已经没了」）");
     assert!(report.revoked, "站点侧必须确认删除: {report:?}");
     assert!(
-        !report.local_status_updated,
-        "本地写状态被挡住 ⇒ 必须如实报 false（调用方据此提示「本地未写成 revoked」）: {report:?}"
+        !report.local_row_deleted,
+        "本地删行被挡住 ⇒ 必须如实报 false（调用方据此提示「本地记录未删除」）: {report:?}"
     );
+    let tombstone = f
+        .service
+        .store()
+        .get_key(f.key_id)
+        .expect("读保留的索引")
+        .expect("删行失败时应保留可定位的记录");
+    assert_eq!(tombstone.status, "revoked", "残留记录必须禁用且被界面隐藏");
 
-    // 反向：去掉触发器后同一条路必须能写上 ⇒ 证明上面的 false 是触发器造成的
+    // 反向：去掉触发器后同一条路必须能删掉 ⇒ 证明上面的 false 是触发器造成的
     let conn = rusqlite::Connection::open(&f.db_path).expect("再开");
-    conn.execute_batch("DROP TRIGGER block_key_status")
+    conn.execute_batch("DROP TRIGGER block_key_delete")
         .expect("删触发器");
     drop(conn);
     let report = f
         .service
         .revoke_key(f.site_id, "1")
         .await
-        .expect("第二次回收");
+        .expect("第二次删除");
     assert!(
-        report.local_status_updated,
-        "没有触发器时必须写上 revoked: {report:?}"
+        report.local_row_deleted,
+        "没有触发器时必须删掉本地行: {report:?}"
     );
 }
 
 #[tokio::test]
-async fn revoke_key_deletes_vault_entry_but_keeps_db_row() {
-    // DEBUG-G5 P1-10：回收 = 站点删 + 本地状态 revoked + 保险库条目单删；
-    // DB 行必须保留（绑定与漂移追溯靠 keys.id），只分离明文材料。
+async fn revoke_key_deletes_vault_entry_and_db_row() {
+    // M47-S1：删除 = 站点删 + 保险库条目单删 + **本地行物理删除**。
+    // 用户要求「删除后的密钥不要再显示」，所以不再保留「已回收」墓碑行；
+    // 代价（绑定 / 采样 / 检测历史随 CASCADE 一起走）记在 `Store::delete_key` 的文档里。
     let f = fixture(vec![
         login_response(&jwt_with_exp(9_999_999_999)),
         HttpResponse::new(204, Vec::new()),
@@ -1091,24 +1103,19 @@ async fn revoke_key_deletes_vault_entry_but_keeps_db_row() {
         f.service.vault_has_for_test(&reference).expect("查钥匙串"),
         "回收前保险库条目应在"
     );
-    let report = f.service.revoke_key(f.site_id, "1").await.expect("回收");
+    let report = f.service.revoke_key(f.site_id, "1").await.expect("删除");
     assert!(report.revoked, "站点侧必须确认删除: {report:?}");
-    assert!(
-        report.local_status_updated,
-        "本地状态应写上 revoked: {report:?}"
-    );
+    assert!(report.local_row_deleted, "本地行必须已删除: {report:?}");
     assert!(report.vault_deleted, "保险库条目必须单删: {report:?}");
     assert!(
         !f.service.vault_has_for_test(&reference).expect("查钥匙串"),
-        "回收后保险库条目必须不在"
+        "删除后保险库条目必须不在"
     );
-    let row = f
-        .service
-        .store()
-        .get_key(f.key_id)
-        .expect("读 key 行")
-        .expect("DB 行必须保留，不得删行");
-    assert_eq!(row.status, "revoked", "行保留、状态改 revoked: {row:?}");
+    let row = f.service.store().get_key(f.key_id).expect("读 key 行");
+    assert!(
+        row.is_none(),
+        "本地行必须被物理删除（删除后的密钥不再显示）：{row:?}"
+    );
 }
 
 #[tokio::test]
@@ -1170,6 +1177,7 @@ async fn revoke_key_vault_delete_failure_is_visible_not_fatal() {
             vault,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     service
@@ -1193,6 +1201,22 @@ async fn revoke_key_vault_delete_failure_is_visible_not_fatal() {
             .contains("保险库"),
         "note 必须点名保险库残留，不得静默: {report:?}"
     );
+    assert!(!report.local_row_deleted, "明文没删掉就不能丢索引");
+    let key_id = service
+        .store()
+        .list_keys()
+        .expect("列出密钥")
+        .into_iter()
+        .next()
+        .expect("保留可定位的密钥索引")
+        .id;
+    let tombstone = service
+        .store()
+        .get_key(key_id)
+        .expect("读取残留索引")
+        .expect("必须保留 secret_ref 以便后续清理");
+    assert_eq!(tombstone.secret_ref, reference);
+    assert_eq!(tombstone.status, "revoked", "残留密钥必须隐藏且禁止使用");
 }
 
 // ============================================================ B-179

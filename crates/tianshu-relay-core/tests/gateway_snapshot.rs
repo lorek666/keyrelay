@@ -142,6 +142,7 @@ fn base_config(
     keys_by_ref: HashMap<String, Zeroizing<String>>,
 ) -> GatewayConfig {
     GatewayConfig {
+        catalog: None,
         port: 0,
         token: "local-token-for-snapshot-tests".to_string(),
         key_id: None,

@@ -364,7 +364,11 @@ fn state_in_memory(store: Store, db_path: PathBuf) -> AppState {
         store,
         db_path,
         None,
-        ServiceConfig::in_memory(tmp.clone()),
+        ServiceConfig::with_vault_at(
+            std::sync::Arc::new(tianshu_relay_core::vault::MemoryVault::new()),
+            tmp.clone(),
+            tmp.clone(),
+        ),
         OnlineModelMeta::Disabled,
         tmp,
         rebrand,
@@ -634,6 +638,9 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::model_price_list,
             commands::model_price_upsert,
             commands::model_price_delete,
+            commands::catalog_status,
+            commands::catalog_sync,
+            commands::catalog_set_override,
             // M46-S5：站点 / key 硬预算
             commands::site_budget_list,
             commands::site_budget_create,
@@ -759,6 +766,53 @@ pub fn spawn_maintenance_tasks<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
             }
             Err(err) => eprintln!("[tianshu-relay] 漂移检测失败: {err}"),
         }
+    }
+
+    // M47-S2：内置模型名单的自动同步。
+    //
+    // 节奏刻意保守：启动后等 20s（让首屏与网关先起来），之后每 24h 一次；开关关掉
+    // 就完全不联网（用户仍可在「模型名单」页点「立即同步」）。
+    // 失败只留一行运维日志 + 事件表里的一条 Warn，**绝不影响投递**：
+    // 投递读的是内存快照，名单拉不到就继续用磁盘缓存 / 内置 34 条。
+    // 循环**无条件**启动：开关在运行中可以被用户改（在「成本中心 → 内置模型名单」里保存），
+    // 「保存了却要重启应用才生效」是不能接受的。关掉时不联网，只是每 2 分钟回来看一眼开关。
+    {
+        let catalog_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            loop {
+                let Some(state) = catalog_handle.try_state::<AppState>() else {
+                    return;
+                };
+                // 每一轮都重新读设置：用户中途关掉开关时下一轮就停（不必重启应用）。
+                let enabled = state
+                    .service
+                    .settings()
+                    .map(|s| s.catalog_auto_sync)
+                    .unwrap_or(false);
+                if !enabled {
+                    // 关着就完全不联网；2 分钟后回来再看开关（醒来只是读一次设置，无 I/O）。
+                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                    continue;
+                }
+                match state.service.sync_model_catalog().await {
+                    Ok(report) => {
+                        if !report.unchanged {
+                            eprintln!(
+                                "[tianshu-relay] 模型名单已同步：{} 条（跳过 {} 条不合规）",
+                                report.accepted, report.skipped
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[tianshu-relay] 模型名单同步失败（沿用旧缓存，24h 后重试）: {err}"
+                        );
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+            }
+        });
     }
 
     // M29-S1 / B-193：NewAPI 的 access token 只有 15 分钟寿命（`AccessTokenTTL`），

@@ -93,6 +93,7 @@ fn setup() -> Fixture {
             vault: vault.clone(),
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 

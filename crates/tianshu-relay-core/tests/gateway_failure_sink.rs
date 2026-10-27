@@ -29,6 +29,7 @@ fn service() -> (tempfile::TempDir, TianshuRelayService<MockTransport>) {
             vault: Arc::new(MemoryVault::new()),
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     (dir, service)

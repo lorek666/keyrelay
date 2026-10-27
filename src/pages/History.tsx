@@ -105,8 +105,8 @@ export default function History() {
   };
 
   return (
-    <section className="page">
-      <p className="muted">{t("history.intro")}</p>
+    <section className="page delivery-history">
+      <p className="page-intro">{t("history.intro")}</p>
 
       {notice ? <p className="ok" role="status">{notice}</p> : null}
 

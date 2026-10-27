@@ -69,6 +69,7 @@ fn setup() -> Fixture {
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 
@@ -89,12 +90,19 @@ fn target_path(f: &Fixture, channel: DeliveryChannel) -> PathBuf {
 }
 
 /// 投递一次并返回结果。Continue 之外没有通道需要模型名（Continue 的 schema 必填）。
+/// 这些用例断言历史/回滚结果而非瞬时锁拒绝，故沿用仓库既有 FileBusy 有限重试约定。
 fn deliver(f: &Fixture, key_id: i64, channel: DeliveryChannel) -> DeliveryOutcome {
     f.service.grant_consent(key_id, channel).unwrap();
     let model = (channel == DeliveryChannel::OpenClaw).then_some("gpt-4o");
-    f.service
-        .apply_delivery_with_model(key_id, channel, model)
-        .unwrap()
+    for attempt in 0..10 {
+        match f.service.apply_delivery_with_model(key_id, channel, model) {
+            Err(tianshu_relay_core::error::Error::FileBusy(_)) if attempt < 9 => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result.unwrap(),
+        }
+    }
+    unreachable!("有限重试在第十次必然返回结果")
 }
 
 #[test]

@@ -521,9 +521,19 @@ fn config_only_detail(spec: &AgentSpec, home: &Path) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn detect_app(spec: &AgentSpec, home: &Path, bundles: &[&'static str]) -> AgentStatus {
+    detect_app_at(spec, home, bundles, Path::new("/Applications"))
+}
+
+#[cfg(target_os = "macos")]
+fn detect_app_at(
+    spec: &AgentSpec,
+    home: &Path,
+    bundles: &[&'static str],
+    system_applications: &Path,
+) -> AgentStatus {
     for bundle in bundles {
         let candidates = [
-            PathBuf::from("/Applications").join(format!("{bundle}.app")),
+            system_applications.join(format!("{bundle}.app")),
             home.join("Applications").join(format!("{bundle}.app")),
         ];
         for app in candidates {
@@ -1174,7 +1184,9 @@ mod tests {
         )
         .expect("写 plist");
         let spec = specs().iter().find(|s| s.channel == "dsh").unwrap();
-        let status = detect_one(spec, home);
+        // 显式注入空的系统应用目录：不能因本机已装同名 App 而覆盖夹具 home。
+        let system_applications = dir.path().join("system-applications");
+        let status = detect_app_at(spec, home, &["DeepSeek Harness"], &system_applications);
         assert!(status.installed, "{status:?}");
         assert_eq!(status.version.as_deref(), Some("0.2.1-rc.2"));
         assert!(status

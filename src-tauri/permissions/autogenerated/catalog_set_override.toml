@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-catalog-set-override"
+description = "Enables the catalog_set_override command without any pre-configured scope."
+commands.allow = ["catalog_set_override"]
+
+[[permission]]
+identifier = "deny-catalog-set-override"
+description = "Denies the catalog_set_override command without any pre-configured scope."
+commands.deny = ["catalog_set_override"]

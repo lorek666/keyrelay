@@ -148,6 +148,7 @@ async fn service_with_one_key() -> (tempfile::TempDir, TianshuRelayService<MockT
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     mock.push(

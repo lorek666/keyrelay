@@ -114,6 +114,7 @@ fn setup() -> Fixture {
             vault,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     Fixture {
@@ -554,6 +555,7 @@ async fn auth_failure_marks_needs_login_and_notifies() {
             vault: Arc::new(MemoryVault::new()),
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     )
     // 两个发送出口都关掉：这里验证的是「事实有没有走到规则」，不是发送

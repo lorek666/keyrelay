@@ -315,6 +315,12 @@ pub struct FieldSetOptions<'a> {
     pub has_endpoint: bool,
     pub has_model: bool,
     pub has_meta: bool,
+    /// M47-S2：名单说这个模型**支持思考**（且支持它自己的默认档位）。
+    ///
+    /// 单独一个标志而不是从 `has_meta` 推：`has_meta` 只表示「有没有窗口/输出」，
+    /// 而思考参数是可选能力——合成一个 bool 会让 `expected_fields` 与 writer 的
+    /// gating 失去同步（codex 只写 `model_reasoning_effort`、claude 只写 effort 档位）。
+    pub has_thinking: bool,
 }
 
 impl<'a> FieldSetOptions<'a> {
@@ -324,7 +330,14 @@ impl<'a> FieldSetOptions<'a> {
             has_endpoint,
             has_model,
             has_meta,
+            has_thinking: false,
         }
+    }
+
+    /// M47-S2：声明「名单支持思考」。构造后链式调用，既有调用点零改动。
+    pub fn with_thinking(mut self, has_thinking: bool) -> Self {
+        self.has_thinking = has_thinking;
+        self
     }
 }
 
@@ -362,11 +375,12 @@ fn opencode_qualified_field(provider_id: &str, field: &str) -> String {
 /// `P` = 仅 `has_model && has_meta` 时有）：
 /// - codex-auth-json：`auth_mode`、`OPENAI_API_KEY`（恒定两项；**不含**任何端点/模型键——
 ///   api_key 不进 config，endpoint 在另一张表）。
-/// - codex-config：`model_provider`、`disable_response_storage`、`[M] model`、`name`、
-///   `[E] base_url`、`wire_api`（**不含** api_key——密钥只在 auth.json 里，这是两张表
+/// - codex-config：`model_provider`、`disable_response_storage`、`[M] model`、
+///   `[P] model_context_window`、`[P] model_max_output_tokens`、`[M + 思考] model_reasoning_effort`、
+///   `name`、`[E] base_url`、`wire_api`（**不含** api_key——密钥只在 auth.json 里，这是两张表
 ///   必须分开的理由；混成一张会把「密钥进了 config.toml」误判为正常）。
 /// - claude-code-settings：`ANTHROPIC_AUTH_TOKEN`、`[E] ANTHROPIC_BASE_URL`、
-///   `[M] ANTHROPIC_MODEL`。
+///   `[M] ANTHROPIC_MODEL`、`[M + 思考] CLAUDE_CODE_EFFORT_LEVEL`（M47-S2）。
 /// - opencode / opencode-jsonc（同一写入器）：`provider.<id>.options.apiKey`、
 ///   `[E] provider.<id>.options.baseURL`、`[M] model`（meta 不进 `fields()`，故无参数行）。
 /// - gemini-cli：`GEMINI_API_KEY`、`[E] GOOGLE_GEMINI_BASE_URL`、`[M] GEMINI_MODEL`。
@@ -407,6 +421,13 @@ pub fn expected_fields(channel: DeliveryChannel, opts: &FieldSetOptions<'_>) -> 
             if model {
                 push(codex_config::CodexConfigWriter::FIELD_MODEL.to_string());
             }
+            if params {
+                push(codex_config::CodexConfigWriter::FIELD_CONTEXT_WINDOW.to_string());
+                push(codex_config::CodexConfigWriter::FIELD_MAX_OUTPUT_TOKENS.to_string());
+            }
+            if model && opts.has_thinking {
+                push(codex_config::CodexConfigWriter::FIELD_REASONING_EFFORT.to_string());
+            }
             push(codex_config::CodexConfigWriter::FIELD_NAME.to_string());
             if endpoint {
                 push(codex_config::CodexConfigWriter::FIELD_BASE_URL.to_string());
@@ -420,6 +441,9 @@ pub fn expected_fields(channel: DeliveryChannel, opts: &FieldSetOptions<'_>) -> 
             }
             if model {
                 push(claude_code::ClaudeCodeWriter::FIELD_MODEL.to_string());
+            }
+            if model && opts.has_thinking {
+                push(claude_code::ClaudeCodeWriter::FIELD_THINKING_LEVEL.to_string());
             }
         }
         DeliveryChannel::OpenCode | DeliveryChannel::OpenCodeJsonc => {
@@ -2103,13 +2127,14 @@ pub fn resolve_for_binding_with_meta(
 
     match channel {
         DeliveryChannel::CodexAuthJson => Ok(Box::new(codex_auth::CodexAuthWriter::new(home))),
-        DeliveryChannel::CodexConfig => Ok(Box::new(codex_config::CodexConfigWriter::with_model(
-            home,
-            base_url,
-            model_owned.as_deref(),
-        ))),
+        // M47-S2：这两条通道也开始吃名单参数（窗口 / 输出 / 思考档位）。
+        DeliveryChannel::CodexConfig => Ok(Box::new(
+            codex_config::CodexConfigWriter::with_model(home, base_url, model_owned.as_deref())
+                .with_meta(meta),
+        )),
         DeliveryChannel::ClaudeCodeSettings => Ok(Box::new(
-            claude_code::ClaudeCodeWriter::with_model(home, base_url, model_owned.as_deref()),
+            claude_code::ClaudeCodeWriter::with_model(home, base_url, model_owned.as_deref())
+                .with_meta(meta),
         )),
         DeliveryChannel::OpenCode | DeliveryChannel::OpenCodeJsonc => {
             if provider_id.trim().is_empty() {
@@ -3301,13 +3326,42 @@ mod tests {
         let meta = Some(crate::model_meta::ModelMeta {
             context_window: 128_000,
             max_output_tokens: 4_096,
+            thinking: None,
+            thinking_unsupported: false,
+            protocol: crate::model_catalog::UpstreamProtocol::OpenAiChat,
+            anthropic_compatible: false,
         });
-        let configs: [(&str, Option<&str>, Option<crate::model_meta::ModelMeta>); 5] = [
-            ("", None, None),
-            ("   ", None, None),
-            ("https://relay.example.com", None, None),
-            ("https://relay.example.com", Some("gpt-4o"), None),
-            ("https://relay.example.com", Some("gpt-4o"), meta),
+        // 第 6 格是「名单支持思考」：`has_thinking` 是独立标志，没有这一格就永远测不到
+        // `CLAUDE_CODE_EFFORT_LEVEL` / `model_reasoning_effort` 两行（复审 P2-15）。
+        let thinking_meta = Some(crate::model_meta::ModelMeta {
+            context_window: 200_000,
+            max_output_tokens: 100_000,
+            thinking: Some(crate::model_catalog::ThinkingSpec {
+                param: crate::model_catalog::ThinkingParam::ReasoningEffort,
+                max_level: crate::model_catalog::ThinkingLevel::High,
+                default_level: crate::model_catalog::ThinkingLevel::Medium,
+                budget_low: 0,
+                budget_medium: 0,
+                budget_high: 0,
+                budget_xhigh: 0,
+                levels: 0b11111,
+            }),
+            thinking_unsupported: false,
+            protocol: crate::model_catalog::UpstreamProtocol::OpenAiChat,
+            anthropic_compatible: false,
+        });
+        let configs: [(
+            &str,
+            Option<&str>,
+            Option<crate::model_meta::ModelMeta>,
+            bool,
+        ); 6] = [
+            ("", None, None, false),
+            ("   ", None, None, false),
+            ("https://relay.example.com", None, None, false),
+            ("https://relay.example.com", Some("gpt-4o"), None, false),
+            ("https://relay.example.com", Some("gpt-4o"), meta, false),
+            ("https://relay.example.com", Some("o3"), thinking_meta, true),
         ];
         let mut checked = 0usize;
         for channel in DeliveryChannel::ALL {
@@ -3316,7 +3370,7 @@ mod tests {
             if channel == DeliveryChannel::ClineDesktop {
                 continue;
             }
-            for (base_url, model, meta) in configs {
+            for (base_url, model, meta, has_thinking) in configs {
                 let writer = resolve_for_binding_with_meta(
                     channel,
                     home.path(),
@@ -3331,7 +3385,8 @@ mod tests {
                     !base_url.trim().is_empty(),
                     model.is_some(),
                     meta.is_some(),
-                );
+                )
+                .with_thinking(has_thinking);
                 let expected = expected_fields(channel, &opts);
                 let actual: Vec<String> = writer
                     .fields("sk-probe-0123456789abcdef")
@@ -3341,7 +3396,7 @@ mod tests {
                 assert_eq!(
                     actual,
                     expected,
-                    "{} 在 base_url={base_url:?} model={model:?} meta={} 时表与 writer 产出不一致",
+                    "{} 在 base_url={base_url:?} model={model:?} meta={} thinking={has_thinking} 时表与 writer 产出不一致",
                     channel.as_str(),
                     meta.is_some()
                 );
@@ -3349,7 +3404,7 @@ mod tests {
             }
         }
         // B-292：ClineDesktop 已下线，不计入本矩阵（19 条 × 5 种构造输入）。
-        assert_eq!(checked, (DeliveryChannel::ALL.len() - 1) * 5);
+        assert_eq!(checked, (DeliveryChannel::ALL.len() - 1) * 6);
         // opencode 限定键的 provider 段：点号 provider 与带点 provider（方括号形态）
         // 都要与 writer 的 qualified_field 逐字一致。
         for provider in ["my-relay", "a.b"] {

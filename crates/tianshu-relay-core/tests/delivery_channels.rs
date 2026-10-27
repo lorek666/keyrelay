@@ -50,6 +50,7 @@ fn setup() -> Fixture {
             vault,
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 
@@ -78,6 +79,33 @@ fn target_of(f: &Fixture, channel: DeliveryChannel) -> PathBuf {
         .target_path
 }
 
+/// 幂等/恢复场景只对瞬时 FileBusy 有限重试；真正的锁互斥测试不走这里。
+fn apply_retry_on_busy_with_model(
+    f: &Fixture,
+    channel: DeliveryChannel,
+    model: Option<&str>,
+) -> tianshu_relay_core::error::Result<tianshu_relay_core::delivery::DeliveryOutcome> {
+    for attempt in 0..10 {
+        match f
+            .service
+            .apply_delivery_with_model(f.key_id, channel, model)
+        {
+            Err(Error::FileBusy(_)) if attempt < 9 => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("有限重试在第十次必然返回结果")
+}
+
+fn apply_retry_on_busy(
+    f: &Fixture,
+    channel: DeliveryChannel,
+) -> tianshu_relay_core::error::Result<tianshu_relay_core::delivery::DeliveryOutcome> {
+    apply_retry_on_busy_with_model(f, channel, None)
+}
+
 /// 三个通道共用的「投递 → 校验 → 回滚」流程。
 fn round_trip(f: &Fixture, channel: DeliveryChannel, preexisting: Option<(&Path, &str)>) {
     let target = target_of(f, channel);
@@ -88,9 +116,7 @@ fn round_trip(f: &Fixture, channel: DeliveryChannel, preexisting: Option<(&Path,
     let before_bytes = fs::read(&target).ok();
 
     f.service.grant_consent(f.key_id, channel).expect("同意");
-    let outcome = f
-        .service
-        .apply_delivery(f.key_id, channel)
+    let outcome = apply_retry_on_busy(f, channel)
         .unwrap_or_else(|e| panic!("{} 投递失败: {e}", channel.as_str()));
 
     assert_eq!(outcome.target_path, target);
@@ -109,9 +135,7 @@ fn round_trip(f: &Fixture, channel: DeliveryChannel, preexisting: Option<(&Path,
     assert!(target.exists(), "{} 投递后目标文件应存在", channel.as_str());
 
     // 幂等：再投一次内容不变
-    f.service
-        .apply_delivery(f.key_id, channel)
-        .expect("二次投递");
+    apply_retry_on_busy(f, channel).expect("二次投递");
     assert_eq!(
         fs::read_to_string(&target).unwrap(),
         written,
@@ -202,9 +226,7 @@ fn claude_code_preserves_unrelated_keys_and_env() {
     f.service
         .grant_consent(f.key_id, DeliveryChannel::ClaudeCodeSettings)
         .unwrap();
-    f.service
-        .apply_delivery(f.key_id, DeliveryChannel::ClaudeCodeSettings)
-        .unwrap();
+    apply_retry_on_busy(&f, DeliveryChannel::ClaudeCodeSettings).unwrap();
 
     let after: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
@@ -237,9 +259,7 @@ fn hermes_preserves_everything_outside_the_block() {
     f.service
         .grant_consent(f.key_id, DeliveryChannel::Hermes)
         .unwrap();
-    f.service
-        .apply_delivery(f.key_id, DeliveryChannel::Hermes)
-        .unwrap();
+    apply_retry_on_busy(&f, DeliveryChannel::Hermes).unwrap();
 
     let written = fs::read_to_string(&target).unwrap();
     assert!(
@@ -253,9 +273,7 @@ fn hermes_preserves_everything_outside_the_block() {
     assert_eq!(written.matches(BLOCK_BEGIN).count(), 1, "区块只应出现一次");
 
     // 再投一次：区块之外仍然逐字节相同
-    f.service
-        .apply_delivery(f.key_id, DeliveryChannel::Hermes)
-        .unwrap();
+    apply_retry_on_busy(&f, DeliveryChannel::Hermes).unwrap();
     let again = fs::read_to_string(&target).unwrap();
     assert!(again.starts_with(outside), "二次投递后区块外被改动");
     assert_eq!(again, written, "二次投递必须幂等");
@@ -273,9 +291,7 @@ fn hermes_does_not_touch_a_users_own_assignment() {
     f.service
         .grant_consent(f.key_id, DeliveryChannel::Hermes)
         .unwrap();
-    f.service
-        .apply_delivery(f.key_id, DeliveryChannel::Hermes)
-        .unwrap();
+    apply_retry_on_busy(&f, DeliveryChannel::Hermes).unwrap();
 
     let written = fs::read_to_string(&target).unwrap();
     assert!(
@@ -350,10 +366,7 @@ fn all_channels_leave_no_plaintext_outside_their_target() {
             "{} 的 Debug 泄漏",
             channel.as_str()
         );
-        let outcome = f
-            .service
-            .apply_delivery_with_model(f.key_id, channel, model_for(channel))
-            .unwrap();
+        let outcome = apply_retry_on_busy_with_model(&f, channel, model_for(channel)).unwrap();
         assert!(
             !format!("{outcome:?}").contains(SECRET),
             "{} 的结果泄漏",

@@ -231,6 +231,7 @@ mod production_wiring {
                 vault: Arc::clone(&vault) as Arc<dyn Vault>,
                 home,
                 backup_dir: dir.path().join("backups"),
+                data_dir: None,
             },
         );
         (dir, service, a, key_a, ref_a, ref_b)

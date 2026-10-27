@@ -34,6 +34,7 @@ fn config() -> GatewayConfig {
         zeroize::Zeroizing::new("sk-test-health-2".to_string()),
     );
     GatewayConfig {
+        catalog: None,
         port: 0,
         token: "kr-gw-health".to_string(),
         key_id: None,

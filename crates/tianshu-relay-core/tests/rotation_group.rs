@@ -184,6 +184,7 @@ async fn setup_with_login(
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     if login {

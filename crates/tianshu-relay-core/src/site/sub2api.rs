@@ -1,6 +1,6 @@
 //! Sub2API 适配器（含 TOTP 二次验证）。
 //!
-//! **契约全部来自本地源码实测**（`/Volumes/Date/mimimimi/sub2api/backend`：
+//! **契约全部来自本地源码实测**（Sub2API 本地源码实测：
 //! `internal/handler/auth_handler.go`、`internal/handler/api_key_handler.go`、
 //! `internal/handler/dto/types.go`、`internal/handler/setting_handler.go`、
 //! `internal/pkg/response/response.go`、`internal/server/routes/{auth,user}.go`）。

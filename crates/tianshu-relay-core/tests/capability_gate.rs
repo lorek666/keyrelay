@@ -62,6 +62,7 @@ fn setup(kind: &str) -> Fixture {
             vault: Arc::new(MemoryVault::new()),
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     )
     .with_notify(threshold_notify());

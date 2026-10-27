@@ -68,6 +68,7 @@ pub fn build_service(
             vault,
             home: home.to_path_buf(),
             backup_dir: backup_dir.to_path_buf(),
+            data_dir: None,
         },
     ))
 }

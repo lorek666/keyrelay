@@ -30,6 +30,7 @@ vi.mock("../lib/api", async (importOriginal) => {
 import {
   applyDelivery,
   deliveryPlan,
+  type DeliveryPlan,
   gatewayStatus,
   gatewayTokenList,
   listChannelBindings,
@@ -127,6 +128,38 @@ beforeEach(() => {
   vi.mocked(listStoredKeys).mockResolvedValue([]);
   vi.mocked(listChannelBindings).mockResolvedValue([]);
   vi.mocked(gatewayTokenList).mockResolvedValue([]);
+});
+
+describe("GatewayCard 高级设置分组", () => {
+  it("默认收起高级表单；展开后保持原有字段回调与分组", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(status());
+    const onChange = vi.fn();
+    renderCard({ onMaxRequestMibChange: onChange });
+    const advanced = document.querySelector<HTMLDetailsElement>(".gateway-advanced")!;
+    expect(advanced.open).toBe(false);
+    expect(screen.getByLabelText(zhCN.gateway.allowLabel)).toBeChecked();
+
+    fireEvent.click(screen.getByText(zhCN.gateway.sections.advanced));
+    expect(advanced.open).toBe(true);
+    expect(document.querySelectorAll(".gateway-form-group")).toHaveLength(3);
+    const input = screen.getByLabelText(zhCN.gateway.maxRequestLabel);
+    fireEvent.change(input, { target: { value: "32" } });
+    expect(onChange).toHaveBeenCalledWith(32);
+
+    fireEvent.click(screen.getByText(zhCN.gateway.sections.advanced));
+    expect(advanced.open).toBe(false);
+    // 收起不触发额外回调；完整父级草稿保留由 SettingsCenter 用例覆盖。
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("运行开关绑定 enabled，跨站选路独立留在高级路由组", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(status());
+    renderCard();
+    expect(screen.getByLabelText(zhCN.gateway.allowLabel).closest(".gateway-runtime")).not.toBeNull();
+    expect(screen.getByLabelText(zhCN.gateway.multiSiteLabel).closest(".gateway-routing-group")).not.toBeNull();
+    expect(document.querySelector(".gateway-runtime .gateway-phase-badge")).toBeNull();
+    await waitFor(() => expect(document.querySelector(".gateway-card-header [data-gateway-phase]")?.textContent).toBe(zhCN.gateway.phase.stopped));
+  });
 });
 
 describe("GatewayCard 三态（M41-S1）", () => {
@@ -746,6 +779,45 @@ describe("合并回归（main ← feat-m46-ui）：老调用方不传 routingRul
     await waitFor(() =>
       expect(screen.getByText(zhCN.gateway.routingRulesAddRow)).toBeInTheDocument(),
     );
+  });
+});
+
+describe("网关批量改指与状态真实性", () => {
+  it("Codex 双文件批量预览同时展示 auth 与 config，而不是只显示入口文件", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(status({ running: true, phase: "running", url: "http://127.0.0.1:8787" }));
+    vi.mocked(listChannelBindings).mockResolvedValue([
+      { bindingId: 1, agentId: "codex", keyId: 7, targetPath: "/home/u/.codex/auth.json", siteId: 0 },
+    ]);
+    vi.mocked(deliveryPlan).mockResolvedValue({
+      targetPath: "/home/u/.codex/auth.json",
+      preview: "AUTH DIFF",
+      targetExists: true,
+      mode: "gateway",
+      warnings: [],
+      files: [
+        { targetPath: "/home/u/.codex/auth.json", preview: "AUTH DIFF" },
+        { targetPath: "/home/u/.codex/config.toml", preview: "CONFIG DIFF" },
+      ],
+    } as unknown as DeliveryPlan);
+    renderCard();
+    await waitFor(() => expect(phaseLine()?.dataset.gatewayPhase).toBe("running"));
+    const batch = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.includes(zhCN.gateway.batch.btn))!;
+    fireEvent.click(batch);
+    const checkbox = await screen.findByRole("checkbox", { name: /codex/i });
+    fireEvent.click(checkbox);
+    const preview = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.includes(zhCN.gateway.batch.previewBtnIdle))!;
+    fireEvent.click(preview);
+    await waitFor(() => expect(document.body.textContent).toContain("CONFIG DIFF"));
+    expect(document.body.textContent).toContain("AUTH DIFF");
+    expect(document.body.textContent).toContain("/home/u/.codex/config.toml");
+  });
+
+  it("状态查询失败显示错误，不伪装成 stopped", async () => {
+    vi.mocked(gatewayStatus).mockRejectedValue(new Error("IPC down"));
+    renderCard();
+    await waitFor(() => expect(phaseLine()?.dataset.gatewayPhase).toBe("error"));
+    expect(phaseLine()?.textContent).toContain("IPC down");
+    expect(phaseLine()?.textContent).not.toBe(zhCN.gateway.phase.stopped);
   });
 });
 

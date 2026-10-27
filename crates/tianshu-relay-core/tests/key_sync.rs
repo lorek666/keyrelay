@@ -142,6 +142,7 @@ async fn setup() -> Fixture {
             vault: Arc::clone(&vault) as Arc<dyn Vault>,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     service

@@ -50,6 +50,7 @@ fn setup() -> Fixture {
             vault,
             home: home.clone(),
             backup_dir: backup_dir.clone(),
+            data_dir: None,
         },
     );
 

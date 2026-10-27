@@ -61,6 +61,7 @@ async fn setup() -> Fixture {
             vault: vault.clone(),
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     mock.push(encryption_disabled());
@@ -142,6 +143,7 @@ async fn a_missing_vault_degrades_to_a_temporary_token_and_says_so() {
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     mock.push(encryption_disabled());
@@ -320,6 +322,7 @@ async fn a_flaky_read_does_not_overwrite_the_persisted_gateway_token() {
             vault: vault.clone(),
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     mock.push(encryption_disabled());

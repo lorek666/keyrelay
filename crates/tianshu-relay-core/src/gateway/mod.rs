@@ -607,6 +607,12 @@ pub struct GatewayConfig {
     /// 值是 [`Zeroizing<String>`]：`GatewayConfig` 在每请求里被 clone，
     /// 用 `Zeroizing` 让这些副本在 drop 时擦掉内存（M7-S1 章程 v1.1 的硬化要求）。
     pub keys_by_ref: HashMap<String, Zeroizing<String>>,
+    /// M47-S2：内置模型名单（只读快照）。
+    ///
+    /// 用途只有一个：判断「这个模型支不支持思考」。翻译层收到 Anthropic 的
+    /// `thinking` 时，名单说支持 ⇒ 映射成 Chat 的 `reasoning_effort`；不支持 / 不在名单
+    /// ⇒ **丢弃**该字段（而不是整单 400）。`None` ⇒ 按「不知道」处理，同样丢弃并留 stderr。
+    pub catalog: Option<std::sync::Arc<crate::model_catalog::CatalogStore>>,
     /// 失败事件的出口。`None` = 不记（`single_upstream` 的默认 ⇒ 既有行为不变）。
     ///
     /// 用注入出口而不是直接依赖 `store`：网关不该为了记一条事件而拿到整个存储层。
@@ -868,6 +874,107 @@ pub struct GatewayFailure {
     pub reason: String,
 }
 
+/// M47-S2：把入站 `thinking` 折算成上游 Chat 的 `reasoning_effort`。
+///
+/// 返回 `None` = **丢弃**：客户端自己关掉了（`type: disabled/off`）、名单没覆盖这个模型、
+/// 或者名单声明支持但折算出来的档位超过它声明的上限。
+/// 只有入站真的带了 `thinking` 才会走到这里（没有该字段的请求零变化）。
+///
+/// 两种形态分开折算：`param: thinking` 按名单的 `budgetTokens` 表把预算映射成档位；
+/// `param: reasoning_effort` 没有预算表，直接用名单默认档——**不按预算猜**（与投递层
+/// `delivery::codex_config` 同一口径）。
+fn thinking_effort_for(config: &GatewayConfig, model: &str, body: &[u8]) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let thinking = value.get("thinking")?;
+    // `null` / `{"type":"disabled"}` / `{"type":"off"}` 都是「没开」，不折算。
+    //
+    // 漏判 `disabled` 会把「明确关掉思考」的请求反向打开（往上游写 `reasoning_effort`），
+    // 这比丢弃更糟：客户端说什么就得是什么。
+    if thinking.is_null() {
+        return None;
+    }
+    let kind = thinking.get("type").and_then(serde_json::Value::as_str);
+    if matches!(
+        kind.map(|k| k.trim().to_ascii_lowercase()).as_deref(),
+        Some("disabled") | Some("off")
+    ) {
+        return None;
+    }
+    // 只有明确 enabled 才能开启。空对象、未知 type 都不是用户授权的思考请求；
+    // 上游不接受模糊的 thinking，直接丢给上游验证并返回真实错误，不伪造默认档。
+    if kind.map(str::trim) != Some("enabled") {
+        return Some("");
+    }
+    let budget = thinking
+        .get("budget_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let spec = config
+        .catalog
+        .as_ref()
+        .and_then(|catalog| catalog.resolve(model))
+        .and_then(|entry| entry.thinking);
+    let Some(spec) = spec else {
+        // 分两种说清楚，否则运维按日志排查会找错方向（模型明明在名单里）。
+        let why = match config
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.resolve(model))
+        {
+            None => "不在名单",
+            Some(_) => "在名单里但没有声明思考能力",
+        };
+        eprintln!("[tianshu-relay] 网关丢弃 thinking 字段：模型 {model} {why}");
+        return None;
+    };
+    let level = match spec.param {
+        // 预算形态（Anthropic 的 `thinking`）：名单带预算表，按预算取档位——
+        // 小于最低档给 low，介于档位之间取下界，超过最高档给最高档。
+        crate::model_catalog::ThinkingParam::Thinking if spec.has_budgets() => {
+            if budget == 0 {
+                return Some("");
+            }
+            let budget = budget.min(u32::MAX as u64) as u32;
+            let candidates = [
+                crate::model_catalog::ThinkingLevel::Low,
+                crate::model_catalog::ThinkingLevel::Medium,
+                crate::model_catalog::ThinkingLevel::High,
+                crate::model_catalog::ThinkingLevel::XHigh,
+            ];
+            let Some(minimum) = candidates.iter().find_map(|level| spec.budget(*level)) else {
+                return Some("");
+            };
+            if budget < minimum {
+                eprintln!("[tianshu-relay] thinking 预算低于名单最低档，拒绝该请求");
+                return Some("");
+            }
+            // 只从「明确声明且有预算」的档位里取下界，不制造名单没有的 medium。
+            let mut chosen = None;
+            for candidate in candidates {
+                if spec.budget(candidate).is_some_and(|value| value <= budget) {
+                    chosen = Some(candidate);
+                }
+            }
+            let Some(chosen) = chosen else {
+                return Some("");
+            };
+            chosen
+        }
+        // 枚举形态（`reasoning_effort`）：名单没有预算表，**不替用户猜档位**
+        // （与 codex 投递同一口径，见 `delivery::codex_config`），直接用名单默认档。
+        _ => spec.default_level,
+    };
+    if !spec.accepts(level) {
+        eprintln!(
+            "[tianshu-relay] 网关丢弃 thinking 字段：模型 {model} 的名单声明最高只到 {}，给不了 {} 档",
+            spec.max_level.as_str(),
+            level.as_str()
+        );
+        return None;
+    }
+    Some(level.as_str())
+}
+
 impl std::fmt::Debug for GatewayConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // 令牌与密钥都不打印。**新增字段刻意不进 field 列表**：
@@ -915,6 +1022,7 @@ impl GatewayConfig {
             max_attempts: 0,
             guard_policy: SiteGuardPolicy::default(),
             keys_by_ref: HashMap::new(),
+            catalog: None,
             on_failure: None,
             upstream_timeout: UpstreamTimeout::default(),
             revoked_refs: None,
@@ -2378,7 +2486,70 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                     // 上游收到的是非流式请求，整个流式路径形同虚设。
                     req.stream = req.stream || gemini_stream;
                     translate_stream = req.stream;
-                    let json = req.to_upstream_json().to_string();
+                    let mut upstream = req.to_upstream_json();
+                    // M47-S2：`thinking` 的落点。
+                    //
+                    // ADR-0005 的上游固定是 OpenAI Chat，没有 `thinking` 这个概念；
+                    // 名单说这个模型支持思考 ⇒ 折算成 `reasoning_effort`；
+                    // 不支持 / 不在名单 ⇒ 丢掉这个字段（并留一行 stderr）。
+                    //
+                    // **为什么不再 400**：一个可选字段把整次请求打死，用户看到的是
+                    // 「换个客户端就用不了」，而不是「这个模型不支持思考」。丢弃是
+                    // 有代价的（思考被静默降级），所以名单里 `thinking.supported`
+                    // 是显式事实，界面上也标出来了。
+                    match proto {
+                        translate::Protocol::AnthropicMessages => {
+                            if let Some(level) =
+                                thinking_effort_for(&state.config, &req.model, &body)
+                            {
+                                if level.is_empty() {
+                                    return local_error(
+                                        StatusCode::BAD_REQUEST,
+                                        GatewayErrorKind::InvalidRequest,
+                                        "invalid_request",
+                                        "thinking 必须明确 type=enabled，且 budget_tokens 不得低于名单最低档",
+                                    );
+                                }
+                                upstream["reasoning_effort"] = serde_json::json!(level);
+                            }
+                        }
+                        translate::Protocol::OpenAiResponses => {
+                            if let Some(level) = req.reasoning_effort {
+                                match state
+                                    .config
+                                    .catalog
+                                    .as_ref()
+                                    .and_then(|catalog| catalog.resolve(&req.model))
+                                {
+                                    Some(entry)
+                                        if entry
+                                            .thinking
+                                            .is_some_and(|spec| spec.accepts(level)) => {}
+                                    Some(entry) if entry.thinking_unsupported => {
+                                        // 用户已明确关闭，不再转发思考参数。
+                                        upstream
+                                            .as_object_mut()
+                                            .map(|body| body.remove("reasoning_effort"));
+                                    }
+                                    Some(entry) => {
+                                        if let Some(spec) = entry.thinking {
+                                            // 保留用户选档，只在名单明确声明的能力边界内封顶；
+                                            // 未声明（unknown）不猜、也不强制改成名单默认档。
+                                            let capped = level.min(spec.max_level);
+                                            if capped != level {
+                                                eprintln!("[tianshu-relay] 网关将 reasoning 档位从 {} 降为名单上限 {}", level.as_str(), capped.as_str());
+                                            }
+                                            upstream["reasoning_effort"] =
+                                                serde_json::json!(capped.as_str());
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    let json = upstream.to_string();
                     (bytes::Bytes::from(json), Some(proto))
                 }
                 Err(e) => {
@@ -5274,5 +5445,232 @@ mod tests {
         );
 
         hold.abort();
+    }
+
+    // ==================================================== M47-S2：thinking 折算/丢弃
+
+    /// 带名单的 config（名单里 `glm-4` 声明支持 `thinking`，预算 4k/16k/32k…）。
+    fn config_with_catalog(dir: &std::path::Path) -> GatewayConfig {
+        let mut config = GatewayConfig::single_upstream(
+            8787,
+            "kr-gw-token".to_string(),
+            "https://relay.example.com".to_string(),
+            zeroize::Zeroizing::new("sk-test-key".to_string()),
+            "测试站".to_string(),
+        );
+        config.catalog = Some(std::sync::Arc::new(
+            crate::model_catalog::CatalogStore::open(dir),
+        ));
+        config
+    }
+
+    /// 往临时数据目录里塞一份名单再打开——内置名单里**故意**没有 `thinking` 形态的条目
+    /// （未核对官方能力就不写），预算折算这条分支只能靠夹具覆盖。
+    fn config_with_catalog_json(dir: &std::path::Path, json: &str) -> GatewayConfig {
+        let catalog_dir = dir.join(crate::model_catalog::CATALOG_DIR);
+        std::fs::create_dir_all(&catalog_dir).unwrap();
+        std::fs::write(
+            catalog_dir.join(crate::model_catalog::CACHE_FILE),
+            json.as_bytes(),
+        )
+        .unwrap();
+        config_with_catalog(dir)
+    }
+
+    fn budget_catalog() -> String {
+        serde_json::json!({
+            "schemaVersion": 1,
+            "generatedAt": "2026-10-27T00:00:00Z",
+            "models": [
+                {
+                    "id": "claude-x",
+                    "displayName": "claude-x",
+                    "vendor": "anthropic",
+                    "protocol": {"upstream": "anthropic_messages", "anthropicCompatible": true},
+                    "limits": {"contextWindow": 200000, "maxOutputTokens": 8192},
+                    "thinking": {
+                        "supported": true,
+                        "param": "thinking",
+                        "levels": ["off", "low", "medium", "high"],
+                        "defaultLevel": "medium",
+                        "budgetTokens": {"low": 4096, "medium": 16384, "high": 32768}
+                    }
+                },
+                {
+                    "id": "no-budget",
+                    "displayName": "no-budget",
+                    "protocol": {"upstream": "openai_chat", "anthropicCompatible": false},
+                    "limits": {"contextWindow": 128000, "maxOutputTokens": 8192},
+                    "thinking": {
+                        "supported": true,
+                        "param": "thinking",
+                        "levels": ["off", "low", "medium", "high"],
+                        "defaultLevel": "medium",
+                        "budgetTokens": {}
+                    }
+                },
+                {
+                    "id": "capped",
+                    "displayName": "capped",
+                    "protocol": {"upstream": "openai_chat", "anthropicCompatible": false},
+                    "limits": {"contextWindow": 200000, "maxOutputTokens": 8192},
+                    "thinking": {
+                        "supported": true,
+                        "param": "thinking",
+                        "levels": ["off", "low", "medium"],
+                        "defaultLevel": "medium",
+                        "budgetTokens": {"low": 1024, "medium": 8192}
+                    }
+                }
+            ]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn budget_style_thinking_maps_onto_the_declared_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_catalog_json(dir.path(), &budget_catalog());
+        let body = serde_json::json!({
+            "model": "claude-x",
+            "max_tokens": 1,
+            "messages": [],
+            "thinking": {"type": "enabled", "budget_tokens": 20000}
+        })
+        .to_string();
+        assert_eq!(
+            thinking_effort_for(&config, "claude-x", body.as_bytes()),
+            Some("medium"),
+            "20k 预算落在 16k(medium) 与 32k(high) 之间 ⇒ 取下界 medium"
+        );
+        let big = serde_json::json!({
+            "model": "claude-x",
+            "max_tokens": 1,
+            "messages": [],
+            "thinking": {"type": "enabled", "budget_tokens": 40000}
+        })
+        .to_string();
+        assert_eq!(
+            thinking_effort_for(&config, "claude-x", big.as_bytes()),
+            Some("high"),
+            "超过最高档预算 ⇒ 封顶到名单声明的最高档"
+        );
+        // 名单只声明到 medium：给 100k 也只能落到 medium，不许越过 max_level。
+        let capped = serde_json::json!({
+            "model": "capped",
+            "max_tokens": 1,
+            "messages": [],
+            "thinking": {"type": "enabled", "budget_tokens": 100000}
+        })
+        .to_string();
+        assert_eq!(
+            thinking_effort_for(&config, "capped", capped.as_bytes()),
+            Some("medium"),
+            "预算再大也不越过 max_level"
+        );
+        // 预算表为空不是「用户要 low」而是「名单没数据」：退回默认档。
+        let no_budget = serde_json::json!({
+            "model": "no-budget",
+            "max_tokens": 1,
+            "messages": [],
+            "thinking": {"type": "enabled", "budget_tokens": 20000}
+        })
+        .to_string();
+        assert_eq!(
+            thinking_effort_for(&config, "no-budget", no_budget.as_bytes()),
+            Some("medium"),
+            "param=thinking 但没预算表 ⇒ 用默认档，不是 low"
+        );
+    }
+
+    #[test]
+    fn effort_style_thinking_does_not_guess_a_tier_from_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_catalog(dir.path());
+        // o3 是内置名单里**核对过**的 `reasoning_effort` 条目（无预算表）。
+        // 回归：此前 `budget_tokens > 0` 会被 `spec.budget(default)` 判成 None，
+        // 于是整条思考被静默丢掉——而 Claude Code 每次开思考都带预算。
+        let body = serde_json::json!({
+            "model": "o3",
+            "max_tokens": 1,
+            "messages": [],
+            "thinking": {"type": "enabled", "budget_tokens": 20000}
+        })
+        .to_string();
+        assert_eq!(
+            thinking_effort_for(&config, "o3", body.as_bytes()),
+            Some("medium"),
+            "枚举形态不按预算猜档位 ⇒ 用名单默认档 medium"
+        );
+        let no_budget = serde_json::json!({
+            "model": "o3",
+            "max_tokens": 1,
+            "messages": [],
+            "thinking": {"type": "enabled"}
+        })
+        .to_string();
+        assert_eq!(
+            thinking_effort_for(&config, "o3", no_budget.as_bytes()),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn disabled_thinking_is_never_turned_back_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_catalog(dir.path());
+        for body in [
+            serde_json::json!({"model": "o3", "thinking": {"type": "disabled"}}),
+            serde_json::json!({"model": "o3", "thinking": {"type": "off"}}),
+            serde_json::json!({"model": "o3", "thinking": null}),
+        ] {
+            assert_eq!(
+                thinking_effort_for(&config, "o3", body.to_string().as_bytes()),
+                None,
+                "客户端明确关掉思考 ⇒ 不许写 reasoning_effort：{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_is_dropped_when_the_catalog_says_unsupported_or_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_catalog(dir.path());
+        let body = serde_json::json!({
+            "model": "some-unlisted-model",
+            "max_tokens": 1,
+            "messages": [],
+            "thinking": {"type": "enabled", "budget_tokens": 8000}
+        })
+        .to_string();
+        assert_eq!(
+            thinking_effort_for(&config, "some-unlisted-model", body.as_bytes()),
+            None,
+            "名单没覆盖 ⇒ 丢弃（不再整单 400）"
+        );
+        // 纯文本模型（名单里没有 thinking 能力）同样丢弃。
+        let text_body = serde_json::json!({
+            "model": "glm-4",
+            "max_tokens": 1,
+            "messages": [],
+            "thinking": {"type": "enabled", "budget_tokens": 8000}
+        })
+        .to_string();
+        assert_eq!(
+            thinking_effort_for(&config, "glm-4", text_body.as_bytes()),
+            None
+        );
+    }
+
+    #[test]
+    fn requests_without_thinking_are_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_catalog_json(dir.path(), &budget_catalog());
+        let body =
+            serde_json::json!({"model": "claude-x", "max_tokens": 1, "messages": []}).to_string();
+        assert_eq!(
+            thinking_effort_for(&config, "claude-x", body.as_bytes()),
+            None
+        );
     }
 }

@@ -14,6 +14,7 @@ import {
   sumByCurrency,
 } from "../lib/usageCost";
 import { formatTokens } from "../lib/usageAgg";
+import ModelCatalogCard from "../components/ModelCatalogCard";
 import ModelPricesCard from "../components/ModelPricesCard";
 import BudgetsCard from "../components/BudgetsCard";
 import ReconciliationCard from "../components/ReconciliationCard";
@@ -305,6 +306,7 @@ export default function Cost() {
         )}
       </div>
 
+      <ModelCatalogCard />
       <ModelPricesCard />
       <BudgetsCard />
       <ReconciliationCard />

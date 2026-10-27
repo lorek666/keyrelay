@@ -197,6 +197,7 @@ fn routed_config(upstreams: Vec<Upstream>, keys: &[(&str, &str)], port: u16) -> 
         map.insert(reference.to_string(), Zeroizing::new((*plain).to_string()));
     }
     GatewayConfig {
+        catalog: None,
         port,
         token: "local-token-envelope-tests".to_string(),
         site_id: 0,

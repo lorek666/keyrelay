@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Save } from "lucide-react";
-import { ShieldCheck } from "lucide-react";
+import { AlertTriangle, Bell, Database, Save, Settings2, ShieldCheck, SlidersHorizontal, X } from "lucide-react";
 import {
   auditRedaction,
   autostartStatus,
@@ -25,6 +24,10 @@ import VaultMigrationCard from "../components/VaultMigrationCard";
 import UpdateChecker from "../components/UpdateChecker";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { useTranslation, translate, getCurrentDict } from "../i18n";
+
+function SettingsSection({ id, title, body }: { id: string; title: string; body: string }) {
+  return <div className="settings-section-heading" id={`settings-${id}`}><h2>{title}</h2><p>{body}</p></div>;
+}
 
 /** 「系统里的实际状态」的显示文案。`unknown` 是「读不出来」，不是「没开」——两者不能混。 */
 function autostartStateLabel(state: string): string {
@@ -439,7 +442,7 @@ function AuditCard() {
 export default function SettingsPage() {
   const { t } = useTranslation();
   const qc = useQueryClient();
-  const current = useQuery({ queryKey: ["settings"], queryFn: getSettings });
+  const current = useQuery({ queryKey: ["settings"], queryFn: getSettings, retry: false });
   // 系统里自启的**实际**状态（不是设置里那个意愿）。见下方 autostartStateLabel 处的说明。
   const autostart = useQuery({
     queryKey: ["autostart-status"],
@@ -447,6 +450,8 @@ export default function SettingsPage() {
     retry: false,
   });
   const [draft, setDraft] = useState<Settings | null>(null);
+  // 草稿的**服务端基线**，不能用随时会被其它页面 invalidate 的 current.data 代替。
+  const [baseline, setBaseline] = useState<Settings | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -460,8 +465,27 @@ export default function SettingsPage() {
   });
 
   useEffect(() => {
-    if (current.data && draft === null) setDraft(current.data);
-  }, [current.data, draft]);
+    if (!current.data) return;
+    if (baseline === null || draft === null) {
+      setBaseline(current.data);
+      setDraft(current.data);
+      return;
+    }
+    // 三方合并：保留本页改过的字段，接收成本页等其它入口刚保存的字段。
+    // 否则下一次保存会把旧 catalogUrl/catalogAutoSync 整包写回去。
+    setDraft((previous) => {
+      if (!previous) return current.data;
+      const merged: Settings = { ...current.data };
+      const mutable = merged as Record<keyof Settings, Settings[keyof Settings]>;
+      for (const key of Object.keys(previous) as (keyof Settings)[]) {
+        if (JSON.stringify(previous[key]) !== JSON.stringify(baseline[key])) {
+          mutable[key] = previous[key];
+        }
+      }
+      return merged;
+    });
+    setBaseline(current.data);
+  }, [current.data]);
 
   /**
    * 开关与系统实际状态不一致时的说明。`null` = 一致、或读不到、或用户还没动过草稿。
@@ -563,6 +587,7 @@ export default function SettingsPage() {
         setNotice(t("settings.save.ok"));
       }
       setDraft(saved);
+      setBaseline(saved);
       await qc.invalidateQueries({ queryKey: ["settings"] });
       await qc.invalidateQueries({ queryKey: ["gateway"] });
       // 重读系统里的实际状态，让上面那句「系统里的实际状态」立刻跟上
@@ -576,12 +601,12 @@ export default function SettingsPage() {
 
   const dirty =
     draft !== null &&
-    current.data !== undefined &&
-    JSON.stringify(draft) !== JSON.stringify(current.data);
+    baseline !== null &&
+    JSON.stringify(draft) !== JSON.stringify(baseline);
 
   return (
     <section className={dirty ? "page settings-page has-dirty" : "page settings-page"}>
-      <p className="muted">{t("settings.intro")}</p>
+      <p className="page-intro">{t("settings.intro")}</p>
 
       {notice ? <p className="ok" role="status">{notice}</p> : null}
       {error ? (
@@ -591,11 +616,32 @@ export default function SettingsPage() {
       ) : null}
 
       {draft === null ? (
-        <p className="muted">{t("settings.loading")}</p>
+        current.isError ? (
+          <div>
+            <p className="error" role="alert">{t("settings.loadFailed", { error: (current.error as Error).message })}</p>
+            <button type="button" className="btn" onClick={() => void current.refetch()}>{t("common.retry")}</button>
+          </div>
+        ) : <p className="muted">{t("settings.loading")}</p>
       ) : (
         <>
-          <div className="settings-grid">
+          <div className="settings-layout">
+            <nav className="settings-nav" aria-label={t("settings.sections.navigation")}>
+              {([
+                ["general", Settings2],
+                ["sync", Bell],
+                ["gateway", SlidersHorizontal],
+                ["data", Database],
+              ] as const).map(([id, Icon]) => (
+                <a key={id} href={`#settings-${id}`}><Icon size={15} aria-hidden="true" />{t(`settings.sections.${id}`)}</a>
+              ))}
+            </nav>
+            <div className="settings-content">
+            <SettingsSection id="general" title={t("settings.sections.general")} body={t("settings.sections.generalBody")} />
+            <div className="settings-grid">
             <VaultMigrationCard />
+            </div>
+            <SettingsSection id="sync" title={t("settings.sections.sync")} body={t("settings.sections.syncBody")} />
+            <div className="settings-grid">
             <div className="card">
               <h3>{t("settings.autorefresh.title")}</h3>
               <p className="muted">{t("settings.autorefresh.body")}</p>
@@ -653,12 +699,16 @@ export default function SettingsPage() {
               </label>
             </div>
 
+            </div>
+            <div className="settings-section-subheading"><h3>{t("settings.sections.ui")}</h3><p>{t("settings.sections.uiBody")}</p></div>
+            <div className="settings-grid">
             <div className="card">
               <h3>{t("settings.ui.title")}</h3>
               <label className="field">
                 <span>{t("settings.ui.theme")}</span>
                 <select
                   className="input"
+                  aria-label={t("settings.ui.theme")}
                   value={draft.theme}
                   onChange={(e) => setDraft({ ...draft, theme: e.target.value })}
                 >
@@ -671,6 +721,7 @@ export default function SettingsPage() {
                 <span>{t("settings.ui.language")}</span>
                 <select
                   className="input"
+                  aria-label={t("settings.ui.language")}
                   value={draft.language}
                   onChange={(e) => setDraft({ ...draft, language: e.target.value })}
                 >
@@ -751,6 +802,8 @@ export default function SettingsPage() {
               <p className="muted">{t("settings.ui.proxyHint")}</p>
             </div>
 
+            </div>
+            <div className="settings-grid">
             <div className="card">
               <h3>{t("settings.notify.title")}</h3>
               <p className="muted">{t("settings.notify.body")}</p>
@@ -940,34 +993,12 @@ export default function SettingsPage() {
               </label>
             </div>
           </div>
-          <div className="row">
-            <label style={{ fontWeight: 600, marginBottom: 4 }}>{t("settings.updateTitle")}</label>
+          <div className="row settings-update-row">
+            <label className="settings-update-label">{t("settings.updateTitle")}</label>
             <UpdateChecker autoCheckOnMount={current.data?.autoUpdateEnabled ?? false} />
           </div>
 
-          <div className={dirty ? "row settings-savebar floating" : "row settings-savebar"}>
-            <button
-              type="button"
-              className="btn btn-primary"
-              disabled={!dirty || save.isPending}
-              onClick={() => {
-                if (!draft) return;
-                // 提交前校验（M8-S5B §6.6）：不合法就不发请求，并说清是哪一字段
-                const problem = validateDraft(draft);
-                if (problem !== null) {
-                  setNotice(null);
-                  setError(problem);
-                  return;
-                }
-                setError(null);
-                save.mutate(draft);
-              }}
-            >
-              <Save size={14} aria-hidden /> {t("settings.save.btn")}
-            </button>
-            {dirty ? <span className="muted">{t("settings.save.dirty")}</span> : null}
-          </div>
-
+          <SettingsSection id="gateway" title={t("settings.sections.gateway")} body={t("settings.sections.gatewayBody")} />
           <div className="card">
             <h3>{t("settings.gatewayAutoStart.title")}</h3>
             <label className="checkline">
@@ -1050,6 +1081,8 @@ export default function SettingsPage() {
             settingsDirty={dirty}
           />
 
+          <SettingsSection id="data" title={t("settings.sections.data")} body={t("settings.sections.dataBody")} />
+          <div className="settings-data-grid">
           <AliasCard />
 
           <ExportCard />
@@ -1057,6 +1090,33 @@ export default function SettingsPage() {
           <KeychainCard />
 
           <AuditCard />
+          </div>
+          </div>
+
+          <div className={dirty ? "row settings-savebar floating" : "row settings-savebar"}>
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={!dirty || save.isPending}
+              onClick={() => {
+                if (!draft) return;
+                // 提交前校验（M8-S5B §6.6）：不合法就不发请求，并说清是哪一字段
+                const problem = validateDraft(draft);
+                if (problem !== null) {
+                  setNotice(null);
+                  setError(problem);
+                  return;
+                }
+                setError(null);
+                save.mutate(draft);
+              }}
+            >
+              <Save size={14} aria-hidden /> {t("settings.save.btn")}
+            </button>
+            {dirty ? <span className="muted">{t("settings.save.dirty")}</span> : null}
+            {dirty ? <button type="button" className="btn btn-ghost" disabled={save.isPending} onClick={() => { if (current.data) { setDraft(current.data); setBaseline(current.data); } setError(null); }}><X size={14} aria-hidden="true" />{t("settings.save.discard")}</button> : null}
+          </div>
+          </div>
         </>
       )}
     </section>

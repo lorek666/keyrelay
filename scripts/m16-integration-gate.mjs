@@ -37,6 +37,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 
 const USAGE = `用法: node scripts/m16-integration-gate.mjs [--branches a,b,c] [--base main] [--keep] [--node-modules <路径>]`;
 
@@ -167,8 +168,9 @@ const mainWorktree = (() => {
 })();
 
 const stamp = nowStamp();
-const worktreePath = `/Volumes/Date/kr-m16-int-${stamp}`;
-const targetDir = `/Volumes/Date/kr-t-int-${stamp}`;
+const tempRoot = process.env.TIANSHU_INTEGRATION_TMPDIR || tmpdir();
+const worktreePath = join(tempRoot, `kr-m16-int-${stamp}`);
+const targetDir = join(tempRoot, `kr-t-int-${stamp}`);
 const logsDir = join(worktreePath, ".m16-gate-logs");
 
 // 分支列表：显式给就用给的（允许空串 = 只跑 base），否则自动列 m16/*
@@ -221,7 +223,7 @@ function cleanup() {
         : `\n清理 worktree 失败（可手动 git worktree remove --force ${worktreePath}）：${r.out.trim()}`,
     );
   }
-  if (targetDir.startsWith("/Volumes/Date/kr-t-int-")) {
+  if (targetDir.startsWith(join(tempRoot, "kr-t-int-"))) {
     rmSync(targetDir, { recursive: true, force: true });
     console.log(`已清理 target: ${targetDir}`);
   }

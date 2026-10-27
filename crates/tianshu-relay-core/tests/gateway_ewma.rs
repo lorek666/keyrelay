@@ -171,6 +171,7 @@ fn config(
     top_n: usize,
 ) -> GatewayConfig {
     GatewayConfig {
+        catalog: None,
         port: 0,
         token: "local-token-for-ewma-tests".to_string(),
         key_id: None,

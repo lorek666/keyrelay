@@ -3,13 +3,15 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
   AlertTriangle,
-  Wallet,
+  ArrowUpRight,
+  ChevronRight,
   HeartPulse,
-  KeyRound,
-  LayoutDashboard,
   Layers,
+  LayoutDashboard,
   Plug,
   Settings as SettingsIcon,
+  ShieldCheck,
+  Wallet,
 } from "lucide-react";
 import Cockpit from "./pages/Cockpit";
 import Traffic from "./pages/Traffic";
@@ -18,41 +20,35 @@ import Health from "./pages/Health";
 import Assets from "./pages/Assets";
 import Delivery from "./pages/Delivery";
 import SettingsPage from "./pages/Settings";
-import { appInfo, getSettings, reportUiReady, runtimeMode } from "./lib/api";
+import {
+  appInfo,
+  gatewayStatus,
+  getSettings,
+  reportUiReady,
+  runtimeMode,
+} from "./lib/api";
 import { useApplyTheme } from "./lib/theme";
 import { I18nProvider, normalizeLang, useTranslation, type Lang } from "./i18n";
+import BrandMark from "./components/BrandMark";
+import { StatusDot } from "./components/Ui";
 
-// 侧栏分组（M11-S1 §2）：日常 / 资产 / 投递 / 系统。
-// `group` 只影响侧栏的归类与标题，不改页面组件、不改切换逻辑（本地 state 切换六个原页面）。
-// M14-S2：分组标签改成 i18n key，渲染时 `t(group)`。
-const NAV_GROUPS = [
-  "nav.group.daily",
-  "nav.group.asset",
-  "nav.group.delivery",
-  "nav.group.system",
-] as const;
+const NAV_GROUPS = ["nav.group.daily", "nav.group.asset", "nav.group.delivery", "nav.group.system"] as const;
 
 const PAGES = [
-  { id: "cockpit", labelKey: "nav.cockpit", icon: LayoutDashboard, group: "nav.group.daily", render: () => <Cockpit /> },
-  { id: "traffic", labelKey: "nav.traffic", icon: Activity, group: "nav.group.daily", render: () => <Traffic /> },
-  { id: "cost", labelKey: "nav.cost", icon: Wallet, group: "nav.group.daily", render: () => <Cost /> },
-  { id: "health", labelKey: "nav.health", icon: HeartPulse, group: "nav.group.daily", render: () => <Health /> },
-  { id: "assets", labelKey: "nav.assets", icon: Layers, group: "nav.group.asset", render: () => <Assets /> },
-  { id: "delivery", labelKey: "nav.delivery", icon: Plug, group: "nav.group.delivery", render: () => <Delivery /> },
-  { id: "settings", labelKey: "nav.settings", icon: SettingsIcon, group: "nav.group.system", render: () => <SettingsPage /> },
+  { id: "cockpit", labelKey: "nav.cockpit", descriptionKey: "shell.pages.cockpit", icon: LayoutDashboard, group: "nav.group.daily", render: () => <Cockpit /> },
+  { id: "traffic", labelKey: "nav.traffic", descriptionKey: "shell.pages.traffic", icon: Activity, group: "nav.group.daily", render: () => <Traffic /> },
+  { id: "cost", labelKey: "nav.cost", descriptionKey: "shell.pages.cost", icon: Wallet, group: "nav.group.daily", render: () => <Cost /> },
+  { id: "health", labelKey: "nav.health", descriptionKey: "shell.pages.health", icon: HeartPulse, group: "nav.group.daily", render: () => <Health /> },
+  { id: "assets", labelKey: "nav.assets", descriptionKey: "shell.pages.assets", icon: Layers, group: "nav.group.asset", render: () => <Assets /> },
+  { id: "delivery", labelKey: "nav.delivery", descriptionKey: "shell.pages.delivery", icon: Plug, group: "nav.group.delivery", render: () => <Delivery /> },
+  { id: "settings", labelKey: "nav.settings", descriptionKey: "shell.pages.settings", icon: SettingsIcon, group: "nav.group.system", render: () => <SettingsPage /> },
 ] as const;
 
 type PageId = (typeof PAGES)[number]["id"];
 
-/**
- * App：挂 `I18nProvider`。语言来自 `settings.language`（与主题同一 query），未知值回落 zh-CN。
- * `initialDict` 由 `main.tsx` 预加载 zh-CN 传入，保证默认语言首屏不空（M14-S2 §9.2）。
- */
-/** M16-S9 接线补丁：首屏就绪信号的一次性守卫（模块级，跨重挂载只报一次）。 */
 let uiReadyReported = false;
 
 export default function App({ initialDict }: { initialDict?: Record<string, unknown> | null }) {
-  // 与设置页共用 `["settings"]`：设置页保存后会失效这个键，主题随之立即生效（M9-S4 / F）
   const { data: settings } = useQuery({ queryKey: ["settings"], queryFn: getSettings });
   useApplyTheme(settings?.theme);
   const lang: Lang = normalizeLang(settings?.language);
@@ -67,24 +63,33 @@ function AppInner() {
   const { t } = useTranslation();
   const [page, setPage] = useState<PageId>("cockpit");
   const { data: info } = useQuery({ queryKey: ["app-info"], queryFn: appInfo });
+  const gatewayQuery = useQuery({ queryKey: ["gateway"], queryFn: gatewayStatus });
+  const gateway = gatewayQuery.data;
   const current = PAGES.find((p) => p.id === page) ?? PAGES[0];
+  const gatewayTone = gatewayQuery.isError ? "warn" : gateway?.phase === "running" ? "ok" : gateway?.phase === "crashed" ? "danger" : "muted";
 
-  // M16-S9 接线补丁：首屏渲染完成后**一次性**回报「界面就绪」（M16-S7 的可观测判据）。
-  // 它是观测信号，**绝不能**影响界面 ⇒ 一次性守卫 + 吞掉失败。
   useEffect(() => {
     if (uiReadyReported) return;
     uiReadyReported = true;
     void reportUiReady().catch(() => {});
   }, []);
 
+  const openPage = (next: PageId) => {
+    setPage(next);
+    document.querySelector(".content")?.scrollTo({ top: 0, behavior: "auto" });
+  };
+
   return (
     <div className="app harmony">
-      <aside className="sidebar">
+      <aside className="sidebar" aria-label={t("shell.navigation")}>
         <div className="brand">
-          <KeyRound size={18} aria-hidden />
-          <span>{t("nav.brand")}</span>
+          <BrandMark />
+          <div className="brand-copy">
+            <span className="brand-name">{t("nav.brand")}</span>
+            <span className="brand-subtitle">{t("shell.tagline")}</span>
+          </div>
         </div>
-        <nav>
+        <nav className="sidebar-nav">
           {NAV_GROUPS.map((group) => (
             <div className="nav-group" key={group}>
               <p className="nav-group-label">{t(group)}</p>
@@ -96,38 +101,52 @@ function AppInner() {
                     type="button"
                     className={item.id === page ? "nav-item active" : "nav-item"}
                     aria-current={item.id === page ? "page" : undefined}
-                    onClick={() => setPage(item.id)}
+                    aria-label={t(item.labelKey)}
+                    title={t(item.labelKey)}
+                    onClick={() => openPage(item.id)}
                   >
-                    <Icon size={15} aria-hidden />
+                    <Icon size={17} strokeWidth={1.8} aria-hidden="true" />
                     <span>{t(item.labelKey)}</span>
+                    {item.id === page ? <ChevronRight className="nav-current-icon" size={14} aria-hidden="true" /> : null}
                   </button>
                 );
               })}
             </div>
           ))}
         </nav>
-        {runtimeMode === "browser" ? (
-          <p className="sidebar-note">{t("app.browserPreviewNote")}</p>
-        ) : null}
+        <div className="sidebar-footer">
+          <button type="button" className="sidebar-gateway" onClick={() => openPage("settings")} aria-label={t("shell.gatewaySettings")}>
+            <span className="sidebar-gateway-icon"><StatusDot tone={gatewayTone} /></span>
+            <span className="sidebar-gateway-copy">
+              <strong>{t("gateway.title")}</strong>
+              <span>{gateway ? t(`shell.gatewayPhase.${gateway.phase}`) : gatewayQuery.isError ? t("gateway.statusUnknown") : t("common.loading")}</span>
+            </span>
+            <ArrowUpRight size={14} aria-hidden="true" />
+          </button>
+          <div className="sidebar-local"><ShieldCheck size={13} aria-hidden="true" /><span>{t("shell.localOnly")}</span></div>
+          {runtimeMode === "browser" ? <p className="sidebar-note">{t("app.browserPreviewNote")}</p> : null}
+        </div>
       </aside>
 
       <main className="content">
         <header className="topbar">
-          <h1>{t(current.labelKey)}</h1>
-          <span className="muted mono">
-            {info ? `${info.name} ${info.version}` : ""}
-          </span>
+          <div className="topbar-heading">
+            <div className="topbar-eyebrow"><span>{t("shell.workspace")}</span><span className="topbar-separator">/</span><span>{t(current.labelKey)}</span></div>
+            <h1>{t(current.labelKey)}</h1>
+            <p>{t(current.descriptionKey)}</p>
+          </div>
+          <div className="topbar-meta">
+            {info ? <span className="version-badge">v{info.version}</span> : null}
+            <span className="local-badge"><ShieldCheck size={14} aria-hidden="true" />{t("shell.localWorkspace")}</span>
+          </div>
         </header>
 
         {info?.dbError ? (
-          <p className="error" role="alert">
-            <AlertTriangle size={14} aria-hidden /> {t("app.dbError", { error: info.dbError })}
-          </p>
+          <p className="error" role="alert"><AlertTriangle size={14} aria-hidden="true" /> {t("app.dbError", { error: info.dbError })}</p>
         ) : null}
 
-        {/* M33-S1：key={page} ⇒ 切页时容器重挂载，一次性淡入/上移动效只播一次 */}
         <div className="page-stage" key={page}>
-          {current.render()}
+          {page === "cockpit" ? <Cockpit onNavigate={openPage} /> : current.render()}
         </div>
       </main>
     </div>

@@ -14,8 +14,8 @@ function followsSystem(setting: string): boolean {
 const DARK_QUERY = "(prefers-color-scheme: dark)";
 
 /**
- * 把主题写到 `<html data-theme>` 上。`setting` 还没读出来（`undefined`）时什么都不做：
- * 样式表的缺省就是深色——也就是本步之前一直以来的样子。
+ * 把主题写到 `<html data-theme>` 上。`setting` 还没读出来（`undefined`）时沿用
+ * index.html 内联引导写入的系统外观；不在此处再猜一次或回到固定深色。
  *
  * 只有「跟随系统」时才订阅系统外观变化：只在打开窗口那一刻读一次的话，用户切了系统外观之后
  * 界面不跟，那就不叫跟随系统；而固定了浅色 / 深色之后还订阅，就是一个永远不该生效的监听。

@@ -14,6 +14,8 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     pub stop: Vec<String>,
     pub tools: Vec<ToolSpec>,
+    /// 客户端明确给出的思考档位（统一枚举，不是 Anthropic 的预算值）。
+    pub reasoning_effort: Option<crate::model_catalog::ThinkingLevel>,
     /// M42-S2b：入站是否要流式。为真时上游必须是 `stream: true`，
     /// 响应按 SSE 增量渲染回入站协议。
     pub stream: bool,
@@ -142,6 +144,9 @@ impl ChatRequest {
         }
 
         let mut body = json!({ "model": self.model, "messages": messages });
+        if let Some(level) = self.reasoning_effort {
+            body["reasoning_effort"] = json!(level.as_str());
+        }
         if let Some(t) = self.temperature {
             body["temperature"] = json!(t);
         }

@@ -98,6 +98,9 @@ const KEY_ROTATION_WARN: &str = "rotation_warn_before_days";
 const KEY_AUTOSTART: &str = "autostart_enabled";
 const KEY_CLOSE_TO_TRAY: &str = "close_to_tray";
 const KEY_START_HIDDEN: &str = "start_hidden";
+// M47-S2：内置模型名单的自动同步开关与地址（空 = 用内置默认地址）。
+const KEY_CATALOG_AUTO_SYNC: &str = "catalog_auto_sync";
+const KEY_CATALOG_URL: &str = "catalog_url";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -178,6 +181,14 @@ pub struct Settings {
     /// 自动更新开关。默认关。
     pub auto_update_enabled: bool,
 
+    // ---- M47-S2：内置模型名单 ----
+    /// 是否跟随 GitHub 自动同步模型名单（每天一次）。**默认开**：名单只是元数据，
+    /// 拉取失败一律保留旧缓存、不影响投递，所以开着的风险很低；不想联网可以关掉，
+    /// 关掉后仍可用「立即同步」手动拉。
+    pub catalog_auto_sync: bool,
+    /// 名单地址。空 = 用内置默认（公开仓 `main` 分支的 `catalog/models.json`）。
+    pub catalog_url: String,
+
     // ---- M6-S5：FR-3 通知 ----
     /// **通知总开关**。默认**关**（M16-S9 / S5 复审 P1-1）。
     ///
@@ -253,6 +264,10 @@ impl Default for Settings {
             // PRD §5：默认零遥测
             telemetry_enabled: false,
             auto_update_enabled: false,
+
+            // M47-S2：默认跟随 GitHub 同步，地址留空 = 内置默认
+            catalog_auto_sync: true,
+            catalog_url: String::new(),
 
             // PRD FR-3：系统通知是默认渠道
             notify_enabled: false,
@@ -347,6 +362,18 @@ impl Settings {
         if !self.routing_rules.trim().is_empty() {
             if let Err(reason) = crate::routing::parse_routing_rules(&self.routing_rules) {
                 return Err(Error::Store(format!("路由规则无效：{reason}")));
+            }
+        }
+        let catalog_url = self.catalog_url.trim();
+        if !catalog_url.is_empty() {
+            let valid = reqwest::Url::parse(catalog_url)
+                .ok()
+                .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+                .is_some();
+            if !valid {
+                return Err(Error::Store(
+                    "名单地址必须是有效的 http(s) URL，或留空使用默认地址".to_string(),
+                ));
             }
         }
         if !THEMES.contains(&self.theme.as_str()) {
@@ -462,6 +489,9 @@ impl Settings {
             "language": self.language,
             "telemetry_enabled": self.telemetry_enabled,
             "auto_update_enabled": self.auto_update_enabled,
+            "catalog_auto_sync": self.catalog_auto_sync,
+            // 地址只报「配没配」，与 proxy_url / routing_rules 同一口径。
+            "catalog_url_configured": !self.catalog_url.trim().is_empty(),
             "notify_enabled": self.notify_enabled,
             "notify_system_enabled": self.notify_system_enabled,
             "notify_timeout_secs": self.notify_timeout_secs,
@@ -682,6 +712,21 @@ impl Settings {
                         settings.auto_update_enabled = flag;
                     }
                 }
+                KEY_CATALOG_AUTO_SYNC => {
+                    if let Some(flag) = parse_bool(value) {
+                        settings.catalog_auto_sync = flag;
+                    }
+                }
+                KEY_CATALOG_URL => {
+                    // 只收 http(s)：名单走通用传输层，别的 scheme 一律当没填（回落默认地址）。
+                    let trimmed = value.trim();
+                    if trimmed.is_empty()
+                        || trimmed.starts_with("https://")
+                        || trimmed.starts_with("http://")
+                    {
+                        settings.catalog_url = trimmed.to_string();
+                    }
+                }
                 KEY_NOTIFY_ENABLED => {
                     if let Some(flag) = parse_bool(value) {
                         settings.notify_enabled = flag;
@@ -811,6 +856,8 @@ impl Settings {
             (KEY_PROXY_MODE, self.proxy_mode.clone()),
             (KEY_TELEMETRY, self.telemetry_enabled.to_string()),
             (KEY_AUTO_UPDATE, self.auto_update_enabled.to_string()),
+            (KEY_CATALOG_AUTO_SYNC, self.catalog_auto_sync.to_string()),
+            (KEY_CATALOG_URL, self.catalog_url.clone()),
             (KEY_NOTIFY_ENABLED, self.notify_enabled.to_string()),
             (KEY_NOTIFY_SYSTEM, self.notify_system_enabled.to_string()),
             (KEY_NOTIFY_WEBHOOK, self.notify_webhook_url.clone()),
@@ -844,7 +891,7 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 35] = [
+    pub const KEYS: [&'static str; 37] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
@@ -881,6 +928,9 @@ impl Settings {
         KEY_AUTOSTART,
         KEY_CLOSE_TO_TRAY,
         KEY_START_HIDDEN,
+        // M47-S2
+        KEY_CATALOG_AUTO_SYNC,
+        KEY_CATALOG_URL,
     ];
 }
 
@@ -1219,6 +1269,8 @@ mod tests {
             proxy_mode: "manual".to_string(),
             telemetry_enabled: true,
             auto_update_enabled: true,
+            catalog_auto_sync: false,
+            catalog_url: "https://example.com/models.json".to_string(),
             notify_system_enabled: false,
             notify_webhook_url: "https://hooks.example.com/kr".to_string(),
             notify_timeout_secs: 25,

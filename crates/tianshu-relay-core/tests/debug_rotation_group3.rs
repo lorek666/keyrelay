@@ -59,6 +59,7 @@ async fn setup_rotatable() -> Fixture {
             vault: vault.clone(),
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 
@@ -112,6 +113,7 @@ fn setup_plain() -> Fixture {
             vault: vault.clone(),
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 

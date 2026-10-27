@@ -4,7 +4,7 @@
 
 你手里有两三个中转站账号，本机又装了好几个 AI 编程 agent——每次换站、换 key 都要逐个改配置文件，改错一个就是静默 401，额度用完才发现没钱。天枢 Relay 就是把这套手工活收进一个桌面 App：站点侧取 key、管 key、看余额，agent 侧一键注入、随时回滚。
 
-- **下载最新版**：[Releases](https://github.com/lorek666/keyrelay/releases/latest)（macOS universal dmg / Windows x64-setup.exe）
+- **下载最新版**：[Releases](https://github.com/lorek666/keyrelay/releases/latest)（macOS 按芯片的 dmg / Windows x64-setup.exe）
 - **当前版本**：v0.2.1
 - **适用人群**：手里 2–6 个中转站账号、本机 3–8 个 agent 的重度 AI 编码用户；以及给团队成员发 key 的自建站站长。
 
@@ -22,7 +22,7 @@
 ## 功能一览
 
 - **站点接入**：填 `base_url` 自动识别站点类型（NewAPI 系 / Sub2API / 自定义 OpenAI 兼容），登录、列出已有 key 与余额。支持 TOTP 二次验证；撞上验证码时不绕过，走内嵌 WebView 官方页面手动过一次。
-- **密钥管理**：跨站新建、查看、回收 key；站点侧分组与倍率拉取后供选择；新建 key 默认按 `<应用>/<agent>/<日期>` 命名，站点侧一眼看出给谁用；解绑默认只解绑不回收，可恢复。
+- **密钥管理**：跨站新建、查看、删除 key；站点侧分组与倍率拉取后供选择；新建 key 默认按 `<应用>/<agent>/<日期>` 命名，站点侧一眼看出给谁用；解绑默认只解绑不删除，可恢复。
 - **一键注入与回滚**：每个 agent 一个注入器：探测安装 → 生成 diff → 原子写入 → 回读校验；写前自动备份，注入后 agent 起不来可一键回滚到字节一致的旧配置；只改受管字段，不动你手工写过的其他内容，格式与注释原样保留。
 - **本地网关**：本机起一个 OpenAI / Anthropic 兼容端口（默认 `127.0.0.1:8787`），agent 只连本地、只用本地签发的 `local-` token，真实站点 key 不出保险库；上游故障自动切换、熔断后探活回归。
 - **多站路由与成本**：按余额健康度、倍率、延迟（EWMA）选路；分 agent 路由规则；重试预算与分站点超时；硬预算（v1 按 USD 计）；账单对账与用量成本估算。
@@ -34,7 +34,7 @@
 
 从 [Releases](https://github.com/lorek666/keyrelay/releases/latest) 下载：
 
-- **macOS**：universal dmg（arm64 + x86_64），要求 macOS 12+
+- **macOS**：按芯片下载（Apple Silicon 为 `*_aarch64.dmg`，Intel 为 `*_x64.dmg`），要求 macOS 12+
 - **Windows**：x64-setup.exe，要求 Windows 10/11
 
 装好后打开即用；后续更新由应用内更新通道推送（设置里可开关自动更新）。
@@ -67,13 +67,23 @@
 | ---- | ---- |
 | 指挥舱 | 站点卡片（余额、登录态、key 数、最近告警）+ 全局快捷操作 |
 | 流量 | 网关请求与各站用量趋势 |
-| 成本 | 预算、账单对账、模型价格与用量成本估算 |
+| 成本 | 预算、账单对账、模型价格与用量成本估算、内置模型名单与本机覆盖 |
 | 健康 | 网关与各站健康状态、密钥健康探测、故障切换记录 |
 | 资产 | 跨站 key 表格与各 key 的绑定 agent |
 | 投递 | 已检测到的 agent、当前绑定、注入/回滚、配置 diff 预览 |
 | 设置 | 刷新间隔、告警阈值、代理、自启与常驻、自动更新、语言、诊断导出 |
 
-关键交互约束：**所有写操作先出 diff**；危险操作（回收 key、覆盖手工改动）二次确认。
+关键交互约束：**所有写操作先出 diff**；危险操作（删除 key、覆盖手工改动）二次确认。
+
+### 密钥删除与模型名单
+
+- 在资产中删除 key，会先删除站点上的 key，再删除本地保险库明文与本地记录；**不可恢复**。
+  该 key 的投递绑定、按 key 用量采样、检测历史与 key 级预算会一并删除，不再在列表中显示。
+  已写入 agent 的配置不会自动清除，需要重新投递有效 key。解绑并删除前也会明确提示这些影响。
+- 默认在启动约 20 秒及之后每 24 小时，从公开仓库下载一次模型元数据（窗口、输出、协议、
+  思考档位与价格），缓存在本机数据目录的 `catalog/models.json`。可手动同步、本机覆盖，
+  或在「成本 → 内置模型名单」关闭自动同步。同步不上传密钥、设置或使用内容，失败保留旧名单。
+  未核对的参数按未知处理，不会擅自写入或删除用户配置。
 
 ## 支持的站点
 
@@ -120,7 +130,7 @@
 - **写密钥需你同意**：把密钥写进 agent 配置必须先有你的显式同意；外部改动过的目标文件不会被静默覆盖。
 - **导出加密**：导出包为 AES-GCM 加密包（口令派生），默认不含站点密码；无口令不可读。
 - **内存卫生**：敏感字符串用 `zeroize` 清零；不写入剪贴板历史。
-- **隐私**：默认零遥测，不采集 prompt 正文、不采集密钥，数据默认只在本机；遥测开关默认关闭且明示发送内容。
+- **隐私**：默认零遥测，不采集 prompt 正文、不采集密钥，数据默认只在本机；模型名单自动同步仅下载公开元数据，可关闭，详见上文。遥测开关默认关闭且明示发送内容。
 
 ### 本产品不做的事
 
@@ -165,7 +175,7 @@ A：不要公开提 Issue，按 [SECURITY.md](SECURITY.md) 走 GitHub 私密漏�
 
 ### 环境要求
 
-- Rust 1.89+（`Cargo.toml` 的 `rust-version`；本机 1.99）、Node 20+（本机 24）、pnpm 10+
+- Rust 1.89+（`Cargo.toml` 的 `rust-version`；本机 1.99）、Node 20+（CI 24）、pnpm 9+
 - macOS 12+ 或 Windows 10+（Tauri 依赖系统 WebView）
 
 ### 常用命令
@@ -175,9 +185,13 @@ pnpm install            # 前端依赖（pnpm 11 默认拦截构建脚本，配�
 pnpm build              # 前端构建（tsc --noEmit + vite build）
 pnpm tauri dev          # 桌面端开发（需先 pnpm install）
 
-cargo test -p tianshu-relay-core    # 核心库测试（含契约测试与注入回滚测试）
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+cargo test --workspace --no-fail-fast  # 全部 Rust 测试（含契约与注入回滚）
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --check --all
+CI=true pnpm test
+CI=true pnpm build
+node scripts/check-commands.mjs
+node scripts/check-model-catalog.mjs
 cargo check -p tianshu-relay        # 桌面壳类型检查（需先 pnpm build 产出 dist/）
 ```
 

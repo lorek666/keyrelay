@@ -7,6 +7,7 @@ import {
   Copy,
   Download,
   RotateCcw,
+  Search,
   Send,
   ShieldCheck,
   Undo2,
@@ -49,6 +50,7 @@ import {
 import ConfirmDialog from "../components/ConfirmDialog";
 import AgentIcon from "../components/AgentIcon";
 import ModelPicker from "../components/ModelPicker";
+import { BusyLabel } from "../components/Ui";
 import { loadAgentPrefs, saveAgentPrefs, type AgentPref } from "../lib/agentPrefs";
 import { useTranslation, translate, getCurrentDict } from "../i18n";
 
@@ -190,6 +192,10 @@ export default function Agents() {
   // ---- M31-S1：每行独立偏好（key + 模型），按站点持久化到 localStorage ----
   const [prefs, setPrefs] = useState<Record<string, AgentPref>>({});
   const [expanded, setExpanded] = useState<string | null>(null);
+  // 仅过滤展示，不重置通道、密钥、模型或展开状态。
+  const [channelQuery, setChannelQuery] = useState("");
+  const [installedOnly, setInstalledOnly] = useState(false);
+  const [updatesOpen, setUpdatesOpen] = useState(false);
   const [modelDraft, setModelDraft] = useState<Record<string, string>>({});
   const [modelDebounced, setModelDebounced] = useState<Record<string, string>>({});
 
@@ -316,6 +322,12 @@ export default function Agents() {
   const [updateAgree, setUpdateAgree] = useState(false);
   const [updateOutcome, setUpdateOutcome] = useState<AgentUpdateOutcome | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
+  // 从通道行发起更新后展开结果；正常投递时更新区保持收起。
+  useEffect(() => {
+    if (updateOutcome !== null || updateError !== null || updatesQuery.isError) {
+      setUpdatesOpen(true);
+    }
+  }, [updateOutcome, updateError, updatesQuery.isError]);
   // 「上次检查时间」直接从 query 的 `dataUpdatedAt` 派生，不额外存 state：
   // 多一个 state + effect 只会在测试里制造一次 act() 之外的更新。
   const lastCheckedAt =
@@ -425,17 +437,33 @@ export default function Agents() {
     retry: false,
   });
 
-  // 切换 key/通道/模型名/模式/预览模式/变体/保留开关时，同意勾选必须重置
-  // （避免「上次勾过了」的错觉：预览已经变了）
+  // 实际预览参数变化时，同意勾选必须重置，避免拿旧确认执行新计划。
+  // 折叠或切换历史会让 activeKey 暂时为空，并不是参数变化：只跟踪打开的
+  // 有效上下文，重新展开同一计划时保留尚未执行的勾选。
+  const previousConsentContext = useRef<string | null>(null);
+  const consentContext = expanded === null ? null : JSON.stringify({
+    channel: expanded,
+    keyId: activeKey,
+    model,
+    mode,
+    previewOnly,
+    variantOverride,
+    preserveAuth,
+  });
   useEffect(() => {
+    if (consentContext === null || consentContext === previousConsentContext.current) return;
+    previousConsentContext.current = consentContext;
     setAgreeChecked(false);
     setNotice(null);
     setError(null);
-  }, [activeKey, channel, model, mode, previewOnly, variantOverride, preserveAuth]);
+  }, [consentContext]);
 
-  // 切换通道时变体选择与保留开关复位（变体只对 Cline 有意义、保留只对 Codex
-  // 有意义，上一通道的选项不得带到下一通道——带过去会在后端被直接拒绝，但复位更干净）。
+  // 只有真正切换通道才复位通道专属选项。activeKey 变回 null 会让 channel
+  // 暂时回退到首行；若因此复位 preserveAuth，会把用户的 Codex 选项悄悄改掉。
+  const previousChannel = useRef(channel);
   useEffect(() => {
+    if (previousChannel.current === channel) return;
+    previousChannel.current = channel;
     setVariantOverride(null);
     setPreserveAuth(false);
   }, [channel]);
@@ -562,9 +590,31 @@ export default function Agents() {
     },
   });
 
+  const normalizedChannelQuery = channelQuery.trim().toLocaleLowerCase();
+  const visibleChannels = CHANNELS.filter((c) => {
+    if (installedOnly && agentByChannel.get(c.id)?.installed !== true) return false;
+    if (!normalizedChannelQuery) return true;
+    return `${c.label} ${c.id} ${c.agent}`.toLocaleLowerCase().includes(normalizedChannelQuery);
+  });
+  const workflowStep =
+    lastOutcome !== null && lastOutcome.channel === expanded ? 3 : expanded !== null ? 2 : 1;
+
   return (
-    <section className="page">
-      <p className="muted">{t("agents.intro")}</p>
+    <section className="page delivery-configure">
+      <p className="page-intro">{t("agents.intro")}</p>
+
+      <ol className="delivery-steps" aria-label={t("agents.workflow.label")}>
+        {(["configure", "review", "result"] as const).map((step, index) => (
+          <li
+            key={step}
+            className={workflowStep === index + 1 ? "current" : workflowStep > index + 1 ? "complete" : ""}
+            aria-current={workflowStep === index + 1 ? "step" : undefined}
+          >
+            <span className="delivery-step-number" aria-hidden="true">{index + 1}</span>
+            <span>{t(`agents.workflow.${step}`)}</span>
+          </li>
+        ))}
+      </ol>
 
       {notice ? <p className="ok" role="status">{notice}</p> : null}
 
@@ -589,7 +639,14 @@ export default function Agents() {
       ) : null}
 
       {/* 顶部：站点选择 + 网关模式（全局密钥/模型下拉已移除，改为每行独立） */}
-      <div className="card">
+      <div className="card delivery-setup">
+        <div className="delivery-card-heading">
+          <span className="delivery-card-number" aria-hidden="true">01</span>
+          <div>
+            <h3>{t("agents.workflow.configure")}</h3>
+            <p>{t("delivery.configureHint")}</p>
+          </div>
+        </div>
         <div className="row">
           <label className="field-inline">
             <span>{t("agents.select.site")}</span>
@@ -681,104 +738,46 @@ export default function Agents() {
       ) : null}
 
       {/*
-        M34-S1：Agent 更新汇总卡。**只提示，不动手**——真正的执行必须点开确认弹窗、
-        勾选同意后才会调 `update_agent`（前端只传 channel，命令来自后端静态表）。
-        检查失败不阻塞工作台：这里只多一条错误 + 重试。
-      */}
-      <div className="card agent-updates">
-        <div className="agent-updates-head">
-          <h3>{t("agents.update.title")}</h3>
-          <button
-            type="button"
-            className="btn agent-updates-refresh"
-            disabled={updatesQuery.isFetching || !agentsQuery.isSuccess}
-            onClick={() => {
-              void updatesQuery.refetch();
-            }}
-          >
-            {updatesQuery.isFetching ? t("agents.update.checking") : t("agents.update.refresh")}
-          </button>
-        </div>
-        {updatesQuery.isError ? (
-          <p className="error" role="alert">
-            <AlertTriangle size={14} aria-hidden />{" "}
-            {t("agents.update.checkFailed", { error: (updatesQuery.error as Error).message })}{" "}
-            <button type="button" className="btn" onClick={() => void updatesQuery.refetch()}>
-              {t("agents.update.retry")}
-            </button>
-          </p>
-        ) : (
-          <p className="agent-updates-summary">
-            {updatesQuery.isLoading
-              ? t("agents.update.checking")
-              : t("agents.update.summary", {
-                  available: updateCounts.available,
-                  upToDate: updateCounts.upToDate,
-                  unsupported: updateCounts.unsupported,
-                  error: updateCounts.failed,
-                })}
-          </p>
-        )}
-        {hasDelistedUpdateRow ? (
-          <p className="muted">{t("agents.update.clineDesktopNote")}</p>
-        ) : null}
-        {lastCheckedAt ? (
-          <p className="muted">
-            {t("agents.update.lastChecked", {
-              time: lastCheckedAt.toLocaleTimeString(undefined, {
-                hour: "2-digit",
-                minute: "2-digit",
-              }),
-            })}
-          </p>
-        ) : null}
-
-        {/* 结果：成功走 p.ok[role=status]（含 from → to），失败走 warnbox 逐条列 attempts。
-            复审 P2-1：`versionAfter === null` 时**不得**说「已更新到未知」——后端已给了准确
-            话术（「更新后无法读取版本」），这里用同义的 i18n 文案，不用 `versionUnknown` 拼接。 */}
-        {updateOutcome ? (
-          updateOutcome.success ? (
-            <p className="ok" role="status">
-              {updateOutcome.versionAfter === null
-                ? t("agents.update.versionUnreadable")
-                : updateOutcome.versionChanged
-                  ? t("agents.update.success", {
-                      from: updateOutcome.versionBefore ?? t("agents.update.versionUnknown"),
-                      to: updateOutcome.versionAfter,
-                    })
-                  : t("agents.update.unchanged")}
-            </p>
-          ) : (
-            <div className="warnbox" role="alert">
-              <p>
-                <AlertTriangle size={14} aria-hidden /> {t("agents.update.failed")}
-                {updateOutcome.message ? `：${updateOutcome.message}` : ""}
-              </p>
-              <UpdateAttempts outcome={updateOutcome} />
-            </div>
-          )
-        ) : null}
-        {updateError ? (
-          <div className="warnbox" role="alert">
-            <p>
-              <AlertTriangle size={14} aria-hidden /> {t("agents.update.failed")}：{updateError}
-            </p>
-          </div>
-        ) : null}
-      </div>
-
-      {/*
         M31-S1：单列工作台。一行一个落点——**不合并**同 agent 的多个目标文件
         （Codex / OpenCode / Cline 各有多处落点，合并会让用户看不到真实可投递面）。
       */}
       <div className="card agents-workbench">
-        <h3>{t("agents.workbench.title", { count: CHANNELS.length })}</h3>
-        <p className="muted">{t("agents.workbench.hint")}</p>
+        <div className="delivery-card-heading">
+          <span className="delivery-card-number" aria-hidden="true">02</span>
+          <div>
+            <h3>{t("agents.workbench.title", { count: CHANNELS.length })}</h3>
+            <p>{t("agents.workbench.hint")}</p>
+          </div>
+        </div>
+        <div className="delivery-filters">
+          <label className="delivery-search">
+            <Search size={15} aria-hidden="true" />
+            <input
+              className="input"
+              type="search"
+              aria-label={t("agents.workbench.searchLabel")}
+              placeholder={t("agents.workbench.searchPlaceholder")}
+              value={channelQuery}
+              onChange={(event) => setChannelQuery(event.target.value)}
+            />
+          </label>
+          <label className="checkline delivery-installed-filter">
+            <input
+              type="checkbox"
+              checked={installedOnly}
+              onChange={(event) => setInstalledOnly(event.target.checked)}
+            />
+            <span>{t("agents.workbench.installedOnly")}</span>
+          </label>
+          <span className="muted" aria-live="polite">
+            {t("agents.workbench.resultCount", { shown: visibleChannels.length, total: CHANNELS.length })}
+          </span>
+        </div>
         {revokedHidden > 0 ? (
           <p className="muted">{t("agents.select.revokedHidden", { count: revokedHidden })}</p>
         ) : null}
         <ul className="agent-list">
-          {CHANNELS.map((c) => {
+          {visibleChannels.map((c) => {
             const status = agentByChannel.get(c.id);
             // M34-S1：更新检查结果（没有检查结果时 `undefined`，行上不渲染任何更新控件）。
             const update = updateByChannel.get(c.id);
@@ -914,7 +913,7 @@ export default function Agents() {
                         {(plan.error as Error).message}
                       </p>
                     ) : plan.isLoading ? (
-                      <p className="muted">{t("agents.plan.generating")}</p>
+                      <p className="muted" role="status">{t("agents.plan.generating")}</p>
                     ) : plan.data ? (
                       <PlanView
                         plan={plan.data}
@@ -935,10 +934,25 @@ export default function Agents() {
             );
           })}
         </ul>
+        {visibleChannels.length === 0 ? (
+          <div className="empty delivery-filter-empty">
+            <p>{t("agents.workbench.empty")}</p>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => {
+                setChannelQuery("");
+                setInstalledOnly(false);
+              }}
+            >
+              {t("agents.workbench.clearFilters")}
+            </button>
+          </div>
+        ) : null}
       </div>
       {lastOutcome ? (
-        <div className="card">
-          <h3>{t("agents.lastDelivery.title")}</h3>
+        <div className="card delivery-result">
+          <h3>{t("agents.secondary.resultTitle")}</h3>
           <p className="mono">
             {lastOutcome.channel} → {lastOutcome.targetPath}
           </p>
@@ -959,6 +973,121 @@ export default function Agents() {
         </div>
       ) : null}
 
+      <details
+        className="card delivery-secondary"
+        open={updatesOpen}
+        onToggle={(event) => setUpdatesOpen(event.currentTarget.open)}
+      >
+        <summary>
+          <span>
+            <strong>{t("agents.secondary.updatesTitle")}</strong>
+            <small>{t("agents.secondary.updatesHint")}</small>
+          </span>
+          {updateCounts.available > 0 ? (
+            <span className="badge badge-warn">{updateCounts.available}</span>
+          ) : null}
+          <ChevronDown size={16} aria-hidden="true" />
+        </summary>
+        <div className="delivery-secondary-body">
+      {/*
+        M34-S1：Agent 更新汇总卡。**只提示，不动手**——真正的执行必须点开确认弹窗、
+        勾选同意后才会调 `update_agent`（前端只传 channel，命令来自后端静态表）。
+        检查失败不阻塞工作台：这里只多一条错误 + 重试。
+      */}
+      <div className="card agent-updates">
+        <div className="agent-updates-head">
+          <h3>{t("agents.update.title")}</h3>
+          <button
+            type="button"
+            className="btn agent-updates-refresh"
+            disabled={updatesQuery.isFetching || !agentsQuery.isSuccess}
+            onClick={() => {
+              void updatesQuery.refetch();
+            }}
+          >
+            {updatesQuery.isFetching ? t("agents.update.checking") : t("agents.update.refresh")}
+          </button>
+        </div>
+        {updatesQuery.isError ? (
+          <p className="error" role="alert">
+            <AlertTriangle size={14} aria-hidden />{" "}
+            {t("agents.update.checkFailed", { error: (updatesQuery.error as Error).message })}{" "}
+            <button type="button" className="btn" onClick={() => void updatesQuery.refetch()}>
+              {t("agents.update.retry")}
+            </button>
+          </p>
+        ) : (
+          <p className="agent-updates-summary">
+            {updatesQuery.isLoading
+              ? t("agents.update.checking")
+              : t("agents.update.summary", {
+                  available: updateCounts.available,
+                  upToDate: updateCounts.upToDate,
+                  unsupported: updateCounts.unsupported,
+                  error: updateCounts.failed,
+                })}
+          </p>
+        )}
+        {hasDelistedUpdateRow ? (
+          <p className="muted">{t("agents.update.clineDesktopNote")}</p>
+        ) : null}
+        {lastCheckedAt ? (
+          <p className="muted">
+            {t("agents.update.lastChecked", {
+              time: lastCheckedAt.toLocaleTimeString(undefined, {
+                hour: "2-digit",
+                minute: "2-digit",
+              }),
+            })}
+          </p>
+        ) : null}
+
+        {/* 结果：成功走 p.ok[role=status]（含 from → to），失败走 warnbox 逐条列 attempts。
+            复审 P2-1：`versionAfter === null` 时**不得**说「已更新到未知」——后端已给了准确
+            话术（「更新后无法读取版本」），这里用同义的 i18n 文案，不用 `versionUnknown` 拼接。 */}
+        {updateOutcome ? (
+          updateOutcome.success ? (
+            <p className="ok" role="status">
+              {updateOutcome.versionAfter === null
+                ? t("agents.update.versionUnreadable")
+                : updateOutcome.versionChanged
+                  ? t("agents.update.success", {
+                      from: updateOutcome.versionBefore ?? t("agents.update.versionUnknown"),
+                      to: updateOutcome.versionAfter,
+                    })
+                  : t("agents.update.unchanged")}
+            </p>
+          ) : (
+            <div className="warnbox" role="alert">
+              <p>
+                <AlertTriangle size={14} aria-hidden /> {t("agents.update.failed")}
+                {updateOutcome.message ? `：${updateOutcome.message}` : ""}
+              </p>
+              <UpdateAttempts outcome={updateOutcome} />
+            </div>
+          )
+        ) : null}
+        {updateError ? (
+          <div className="warnbox" role="alert">
+            <p>
+              <AlertTriangle size={14} aria-hidden /> {t("agents.update.failed")}：{updateError}
+            </p>
+          </div>
+        ) : null}
+      </div>
+
+        </div>
+      </details>
+
+      <details className="card delivery-secondary">
+        <summary>
+          <span>
+            <strong>{t("agents.secondary.accessTitle")}</strong>
+            <small>{t("agents.secondary.accessHint")}</small>
+          </span>
+          <ChevronDown size={16} aria-hidden="true" />
+        </summary>
+        <div className="delivery-secondary-body">
       {/*
         未托管落点（M7-S3 / 章程 R-7）：只读探测。
         存在的理由是**不静默**——用户在 Cline / Roo Code 里配了中转站，本产品既不能
@@ -1086,7 +1215,7 @@ export default function Agents() {
                     <span className="mono">
                       {t("agents.unbindResult.siteLine", { siteId: r.siteId, remoteId: r.remoteId ?? t("agents.unbindResult.localOnly") })}
                     </span>
-                    {r.revoked && !r.localStatusUpdated ? (
+                    {r.revoked && !r.localRowDeleted ? (
                       <div className="muted">{t("agents.unbindResult.localFail")}</div>
                     ) : null}
                     {r.note ? <div className="muted">{r.note}</div> : null}
@@ -1100,6 +1229,9 @@ export default function Agents() {
           </div>
         ) : null}
       </div>
+
+        </div>
+      </details>
 
       <ConfirmDialog
         open={confirming}
@@ -1229,6 +1361,7 @@ export default function Agents() {
             {t("agents.unbindDialog.alsoRevokePre")}<strong>{t("agents.unbindDialog.alsoRevokeStrong")}</strong>{t("agents.unbindDialog.alsoRevokePost")}
           </span>
         </label>
+        {alsoRevoke ? <p className="muted">{t("agents.unbindDialog.revokeDataWarning")}</p> : null}
       </ConfirmDialog>
     
       {/*
@@ -2002,7 +2135,10 @@ function PlanView({
           }
           onClick={onApply}
         >
-          <Send size={14} aria-hidden /> {t("agents.btn.apply")}
+          <BusyLabel busy={busy}>
+            {!busy ? <Send size={14} aria-hidden /> : null}
+            {busy ? t("agents.btn.applying") : t("agents.btn.apply")}
+          </BusyLabel>
         </button>
         {previewOnly ? null : plan.consent === "granted" ? (
           <button type="button" className="btn" onClick={onRevoke}>

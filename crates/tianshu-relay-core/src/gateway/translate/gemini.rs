@@ -147,6 +147,7 @@ pub fn parse_request(v: &Value) -> Result<ChatRequest, TranslateError> {
             })
             .unwrap_or_default(),
         tools,
+        reasoning_effort: None,
         stream: false,
     })
 }

@@ -43,6 +43,7 @@ fn setup(responses: Vec<HttpResponse>) -> Fixture {
             vault: Arc::new(MemoryVault::new()),
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     Fixture { dir, service, mock }

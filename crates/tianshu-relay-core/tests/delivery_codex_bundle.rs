@@ -54,6 +54,7 @@ fn setup() -> Fixture {
             vault: vault.clone(),
             home: home.clone(),
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 
@@ -290,7 +291,7 @@ fn config_symlink_failure_rolls_auth_back_then_recovery_succeeds() {
     // 恢复：拆掉链接、放回普通文件，重投成功。
     fs::remove_file(&f.config_target).unwrap();
     fs::write(&f.config_target, config_old).unwrap();
-    let outcome = f.service.apply_codex(f.key_id, None, false).unwrap();
+    let outcome = apply_codex_retry_on_busy(&f, false).unwrap();
     assert!(outcome.auth.is_some());
     let parsed: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&f.auth_target).unwrap()).unwrap();

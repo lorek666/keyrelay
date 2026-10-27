@@ -43,7 +43,7 @@ function parseArgs(argv) {
   const opts = {
     runs: 10,
     // 默认 null：M27-S1 起 `--app` 与 `--binary` 二选一必填其一。
-    // 旧默认 `/Volumes/Date/kr-t-gui/release/tianshu-relay` 是 M16-S7 的开发机路径，
+    // 旧默认是一个开发机绝对路径，
     // 默默继续沿用会让「照文档复跑」跑到一个不存在的二进制 ⇒ 误判环境。
     app: null,
     binary: null,

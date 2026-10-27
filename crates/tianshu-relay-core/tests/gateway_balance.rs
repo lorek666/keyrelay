@@ -257,6 +257,7 @@ fn config(
     let failures: Failures = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&failures);
     let config = GatewayConfig {
+        catalog: None,
         port: 0,
         token: "local-token-for-balance-tests".to_string(),
         key_id: None,
@@ -1139,6 +1140,7 @@ fn multiple_keys_per_site_expand_into_multiple_upstreams() {
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
 

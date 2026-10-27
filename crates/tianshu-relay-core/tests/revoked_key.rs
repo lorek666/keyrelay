@@ -1,8 +1,8 @@
-//! 「已回收」（`keys.status = revoked`）必须有读者（M7-S4 写入、无人读取的缺口）。
+//! 「已删除」（`keys.status = revoked`，**只可能是旧版本留下的行**）必须有读者（M7-S4 写入、无人读取的缺口）。
 //!
 //! M7-S4 让 `revoke_key` 把本地行标成 `revoked`，但服务层没有任何一处读它：
 //! 回收后这把 key 仍被判「该轮换」、仍能投递、仍能组装网关；对它点「轮换」会先在站点上
-//! **新建**一把，再去 DELETE 一个早已不存在的 id。这里逐条钉住「已回收 ⇒ 不再被使用」。
+//! **新建**一把，再去 DELETE 一个早已不存在的 id。这里逐条钉住「已删除 ⇒ 不再被使用」。
 
 use std::fs;
 use std::path::PathBuf;
@@ -73,6 +73,7 @@ async fn setup() -> Fixture {
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     mock.push(encryption_disabled());
@@ -105,13 +106,19 @@ fn backdate(f: &Fixture, key_id: i64, days: i64) {
     .unwrap();
 }
 
+/// 把行标成 `revoked`（= 「旧版本删过的历史行」）。
+///
+/// **刻意不走 `revoke_key`**：M47-S1 之后那条路径会物理删行，行没了就没有「已删除」
+/// 状态可测了。守卫本身仍在（旧库升级上来的行就是这个形态），所以夹具直接写状态。
 async fn revoke(f: &Fixture) {
-    f.mock.push(delete_ok());
-    f.service.revoke_key(f.site_id, "1").await.expect("回收");
+    f.service
+        .store()
+        .set_key_status(f.key_id, KEY_STATUS_REVOKED)
+        .expect("标成已删除（模拟旧版本留下的行）");
     assert_eq!(
         f.service.store().key_status(f.key_id).unwrap().as_deref(),
         Some(KEY_STATUS_REVOKED),
-        "前提：本地状态已写成 revoked"
+        "前提：本地状态是 revoked"
     );
 }
 
@@ -128,13 +135,13 @@ fn due_ids(f: &Fixture) -> Vec<i64> {
 async fn revoked_key_is_not_reported_as_rotation_due() {
     let f = setup().await;
     backdate(&f, f.key_id, 40);
-    assert_eq!(due_ids(&f), vec![f.key_id], "前提：回收前已到期");
+    assert_eq!(due_ids(&f), vec![f.key_id], "前提：删除前已到期");
 
     revoke(&f).await;
 
     assert!(
         due_ids(&f).is_empty(),
-        "已回收的 key 不该再被提醒轮换: {:?}",
+        "已删除的 key 不该再被提醒轮换: {:?}",
         due_ids(&f)
     );
 }
@@ -178,12 +185,12 @@ async fn revoked_key_cannot_be_delivered() {
     let preview = f
         .service
         .delivery_plan(f.key_id, DeliveryChannel::CodexAuthJson);
-    assert!(preview.is_err(), "已回收的 key 不该出投递预览");
+    assert!(preview.is_err(), "已删除的 key 不该出投递预览");
     let err = f
         .service
         .apply_delivery(f.key_id, DeliveryChannel::CodexAuthJson)
         .unwrap_err();
-    assert!(err.to_string().contains("已回收"), "{err}");
+    assert!(err.to_string().contains("已在站点上删除"), "{err}");
     let target = f
         .service
         .home()
@@ -200,7 +207,7 @@ async fn revoked_key_cannot_back_the_gateway() {
         .service
         .gateway_config(f.site_id, f.key_id, 0)
         .unwrap_err();
-    assert!(err.to_string().contains("已回收"), "{err}");
+    assert!(err.to_string().contains("已在站点上删除"), "{err}");
 }
 
 #[tokio::test]
@@ -210,7 +217,7 @@ async fn rotating_a_revoked_key_is_refused_before_any_site_request() {
     let before = f.mock.request_count();
 
     let err = f.service.rotation_plan(f.key_id).unwrap_err();
-    assert!(err.to_string().contains("已回收"), "{err}");
+    assert!(err.to_string().contains("已在站点上删除"), "{err}");
 
     // 若不在动手前拒绝：站点上会**先建一把新 key**，再去 DELETE 一个早已不存在的 id
     f.mock.push(create_key_ok());
@@ -219,11 +226,11 @@ async fn rotating_a_revoked_key_is_refused_before_any_site_request() {
         .rotate_key(f.key_id, KeySpec::named("codex/rotated"))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("已回收"), "{err}");
+    assert!(err.to_string().contains("已在站点上删除"), "{err}");
     assert_eq!(
         f.mock.request_count(),
         before,
-        "对已回收的 key 发起轮换不得发出任何站点请求"
+        "对已删除的 key 发起轮换不得发出任何站点请求"
     );
 }
 

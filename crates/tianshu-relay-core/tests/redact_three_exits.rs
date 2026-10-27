@@ -2,7 +2,7 @@
 //!
 //! 复跑：
 //! ```text
-//! CARGO_TARGET_DIR=/Volumes/Date/kr-t-redact CARGO_BUILD_JOBS=4 \
+//! CARGO_TARGET_DIR=/tmp/kr-t-redact CARGO_BUILD_JOBS=4 \
 //!   cargo test -p tianshu-relay-core --test redact_three_exits
 //! ```
 //!
@@ -45,6 +45,7 @@ fn setup() -> Fixture {
             vault: Arc::new(MemoryVault::new()),
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     Fixture {
@@ -284,7 +285,7 @@ fn p2_26_lookalikes_encode_and_real_keys_still_refuse() {
             quota_exceeded: false,
             models: Some(vec!["gpt-4".to_string()]),
             drift: vec![DriftFact {
-                target_path: "/Users/me/.codex/auth.json".to_string(),
+                target_path: "/home/example-user/.codex/auth.json".to_string(),
                 agent_id: "codex".to_string(),
                 channel: "codex_auth_json".to_string(),
                 state: DriftState::Modified,

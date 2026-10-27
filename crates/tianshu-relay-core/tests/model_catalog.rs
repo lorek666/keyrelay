@@ -114,6 +114,7 @@ fn setup(site_count: usize, delay: Duration) -> Svc {
             vault,
             home,
             backup_dir: dir.path().join("backups"),
+            data_dir: None,
         },
     );
     Svc {

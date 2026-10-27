@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-catalog-sync"
+description = "Enables the catalog_sync command without any pre-configured scope."
+commands.allow = ["catalog_sync"]
+
+[[permission]]
+identifier = "deny-catalog-sync"
+description = "Denies the catalog_sync command without any pre-configured scope."
+commands.deny = ["catalog_sync"]
