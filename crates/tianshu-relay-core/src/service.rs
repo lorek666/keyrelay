@@ -6474,6 +6474,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             .clamp(1, crate::gateway::MAX_REQUEST_BYTES_LIMIT);
         if settings.gateway_multi_site {
             let (route, keys) = self.build_gateway_route()?;
+            config.key_quotas = Self::build_key_quotas(&self.store, &route)?;
             config.route = route;
             config.keys_by_ref = keys;
             // M39-S1：非空路由 ⇒ 装一个热更新句柄（首个快照 generation = 1）。
@@ -6483,7 +6484,8 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     1,
                     config.route.clone(),
                     config.keys_by_ref.clone(),
-                );
+                )
+                .with_key_quotas(config.key_quotas.clone());
                 let runtime = Arc::new(std::sync::RwLock::new(Arc::new(snapshot)));
                 if let Ok(mut slot) = self.gateway_runtime.lock() {
                     *slot = Some(Arc::clone(&runtime));
@@ -6938,6 +6940,36 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// **每个站点取哪一把 key**：取该站点**最新**的一条（`list_keys` 按 id 倒序无所谓，
     /// 这里显式按 id 取最大）。多把 key 的站点应当由用户自己决定用哪把——今天没有这个界面，
     /// 登记为限制（不是缺陷：站点的多把 key 在额度上等价，取最新那把是最不容易过期的）。
+    /// M3：从当前 key 快照读取额度事实。`None` 一律保留 Unknown；
+    /// observed_at 是本次装配读取时刻，source 明确标成启动快照，不冒充实时窗口。
+    fn build_key_quotas(
+        store: &crate::store::Store,
+        route: &crate::routing::RouteTable,
+    ) -> Result<std::collections::HashMap<i64, crate::gateway::quota::KeyQuotaSnapshot>> {
+        let mut quotas = std::collections::HashMap::new();
+        for upstream in route.all_candidates() {
+            let Some(key_id) = upstream.key_id else {
+                continue;
+            };
+            if quotas.contains_key(&key_id) {
+                continue;
+            }
+            let Some(row) = store.get_key(key_id)? else {
+                continue;
+            };
+            quotas.insert(
+                key_id,
+                crate::gateway::quota::KeyQuotaSnapshot::from_stored(
+                    row.quota_used,
+                    row.quota_limit,
+                    Some(unix_now_secs()),
+                    "key_store_at_gateway_start",
+                ),
+            );
+        }
+        Ok(quotas)
+    }
+
     /// B-99 接线后启用（M14-S1 接线）：`gateway_config` 在 `gateway_multi_site` 开关开时调用（多站路由）。
     fn build_gateway_route(
         &self,
@@ -7429,6 +7461,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 下一次 `gateway_config()` 自然会读到它。
     pub fn publish_gateway_snapshot(&self) -> Result<u64> {
         let (route, keys) = self.build_gateway_route()?;
+        let quotas = Self::build_key_quotas(&self.store, &route)?;
         let slot = self
             .gateway_runtime
             .lock()
@@ -7441,7 +7474,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             .write()
             .map_err(|_| Error::Store("网关快照锁已中毒".into()))?;
         let next = guard.generation.saturating_add(1);
-        *guard = Arc::new(crate::gateway::GatewaySnapshot::new(next, route, keys));
+        *guard = Arc::new(
+            crate::gateway::GatewaySnapshot::new(next, route, keys).with_key_quotas(quotas),
+        );
         Ok(next)
     }
 

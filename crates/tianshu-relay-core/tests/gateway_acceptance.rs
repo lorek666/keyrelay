@@ -117,6 +117,7 @@ fn config(route: Vec<Upstream>, keys: Vec<(&str, &str)>) -> GatewayConfig {
         lb_top_n: 3,
         max_attempts: 0,
         session_affinity: false,
+        key_quotas: std::collections::HashMap::new(),
         guard_policy: SiteGuardPolicy::default(),
         runtime: None,
         on_failure: None,
@@ -673,6 +674,7 @@ async fn m44_c9_hot_reload_takes_effect_on_next_request() {
         generation: 1,
         route: RouteTable::new(vec![upstream(1, a.port, "r1", vec!["gpt-4o"], 1.0)]),
         keys_by_ref: cfg.keys_by_ref.clone(),
+        key_quotas: std::collections::HashMap::new(),
     })));
     cfg.runtime = Some(Arc::clone(&runtime));
     let h = gateway::start(cfg).await.unwrap();
@@ -688,6 +690,7 @@ async fn m44_c9_hot_reload_takes_effect_on_next_request() {
         generation: 2,
         route: RouteTable::new(vec![upstream(2, b.port, "r2", vec!["gpt-4o"], 1.0)]),
         keys_by_ref: keys,
+        key_quotas: std::collections::HashMap::new(),
     });
     assert_eq!(
         request(p, "POST", "/v1/chat/completions", Some(BODY)).0,

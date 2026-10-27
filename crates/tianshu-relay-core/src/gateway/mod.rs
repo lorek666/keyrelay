@@ -16,10 +16,14 @@
 //! 的调用方必须用 [`GatewayHandle::shutdown_and_wait`]；`start()` 另外对 bind 的
 //! `AddrInUse` 做有界退避重试（见 [`BIND_RETRY_ATTEMPTS`] / [`BIND_RETRY_DELAY`]）。
 
+pub mod cooldown;
+pub mod quota;
 pub mod session;
 pub mod trace;
 pub mod translate;
 
+use cooldown::KeyCooldownTable;
+use quota::KeyQuotaSnapshot;
 use session::{SessionAffinityStore, SessionIdentity, SessionPin, SessionScope, UpstreamProtocol};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -606,6 +610,8 @@ pub struct GatewayConfig {
     pub max_attempts: usize,
     /// M2：显式会话粘性。默认关闭；只有请求带可靠会话 id 时建立内存 pin。
     pub session_affinity: bool,
+    /// M3：逐 key 额度快照（不含密钥；只用于软排序与解释）。
+    pub key_quotas: HashMap<i64, KeyQuotaSnapshot>,
     /// M39-S3 §4.2：每站并发/限速策略。
     pub guard_policy: SiteGuardPolicy,
     /// `key_ref` → 明文。**仅进程内**；`Debug` 不打印（见下方手写 `Debug`）。
@@ -1027,6 +1033,7 @@ impl GatewayConfig {
             // M46-S4：0 = 走全部候选；legacy 只有一个候选，预算恒不截断。
             max_attempts: 0,
             session_affinity: false,
+            key_quotas: HashMap::new(),
             guard_policy: SiteGuardPolicy::default(),
             keys_by_ref: HashMap::new(),
             catalog: None,
@@ -1072,6 +1079,8 @@ pub struct GatewaySnapshot {
     /// `key_ref` → 明文。与 [`GatewayConfig::keys_by_ref`] **同一类型**（`Zeroizing`），
     /// 这样请求路径的「取密钥」只有一种写法。
     pub keys_by_ref: HashMap<String, Zeroizing<String>>,
+    /// M3：逐 key 额度事实；与 route 同快照发布，避免新路由配旧额度。
+    pub key_quotas: HashMap<i64, KeyQuotaSnapshot>,
 }
 
 impl GatewaySnapshot {
@@ -1084,7 +1093,13 @@ impl GatewaySnapshot {
             generation,
             route,
             keys_by_ref,
+            key_quotas: HashMap::new(),
         }
+    }
+
+    pub fn with_key_quotas(mut self, key_quotas: HashMap<i64, KeyQuotaSnapshot>) -> Self {
+        self.key_quotas = key_quotas;
+        self
     }
 }
 
@@ -1121,6 +1136,13 @@ impl RouteView<'_> {
         match self {
             RouteView::Static(config) => &config.keys_by_ref,
             RouteView::Snapshot(snapshot) => &snapshot.keys_by_ref,
+        }
+    }
+
+    pub fn key_quotas(&self) -> &HashMap<i64, KeyQuotaSnapshot> {
+        match self {
+            RouteView::Static(config) => &config.key_quotas,
+            RouteView::Snapshot(snapshot) => &snapshot.key_quotas,
         }
     }
 
@@ -2014,6 +2036,7 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
         metrics: Arc::clone(&metrics),
         traces: Arc::clone(&traces),
         sessions: Arc::clone(&sessions),
+        key_cooldowns: Arc::new(KeyCooldownTable::new()),
         breaker: Arc::clone(&breaker),
         round_robin: Arc::new(Mutex::new(RoundRobinState::default())),
         guards: Arc::new(Mutex::new(HashMap::new())),
@@ -2162,6 +2185,7 @@ struct AppState {
     metrics: Arc<GatewayMetrics>,
     traces: Arc<RouteTraceStore>,
     sessions: Arc<SessionAffinityStore>,
+    key_cooldowns: Arc<KeyCooldownTable>,
     config: GatewayConfig,
     /// M43-S1：运行态认证集合。`tokens` 非空 ⇒ 只认集合（hash + 常量时间 + grace）；
     /// 空 ⇒ 回退 `config.token`（legacy 单令牌，行为与今天逐字相同）。
@@ -3062,7 +3086,49 @@ async fn proxy_inner(
     // 所以 cursor 消耗规则逐字不变；权重公式在 weighted_pick 内只由 rate 定，
     // 重排只改变组首次出现顺序与失败切换顺序）。
     let ewma = state.metrics.ewma_latency_map();
-    let sendable = reorder_by_effective_latency(sendable, &|site_id| ewma.get(&site_id).copied());
+    let mut sendable =
+        reorder_by_effective_latency(sendable, &|site_id| ewma.get(&site_id).copied());
+    // M3：冷却 key 排到队尾，但绝不删除；全部都在冷却时仍按原顺序尝试。
+    // 排序稳定，未命中冷却的部署保持逐字不变。
+    let cooldown_now = Instant::now();
+    sendable.sort_by_key(|candidate| {
+        let cooling = u8::from(state.key_cooldowns.is_cooling(
+            candidate.upstream.site_id,
+            candidate.upstream.key_id,
+            cooldown_now,
+        ));
+        let quota = candidate
+            .upstream
+            .key_id
+            .and_then(|key_id| view.key_quotas().get(&key_id))
+            .map(|snapshot| snapshot.sort_key())
+            .unwrap_or(1);
+        (cooling, quota)
+    });
+    draft.decision(
+        "quota",
+        sendable
+            .iter()
+            .map(|candidate| {
+                let quota_rank = candidate
+                    .upstream
+                    .key_id
+                    .and_then(|key_id| view.key_quotas().get(&key_id))
+                    .map(|snapshot| snapshot.rank());
+                RouteCandidate {
+                    site_id: candidate.upstream.site_id,
+                    key_id: candidate.upstream.key_id,
+                    state: match quota_rank {
+                        Some(quota::QuotaRank::Healthy) => "quota_healthy",
+                        Some(quota::QuotaRank::NearLimit) => "quota_near_limit",
+                        Some(quota::QuotaRank::Exhausted) => "quota_exhausted_soft",
+                        Some(quota::QuotaRank::Unlimited) => "quota_unlimited",
+                        _ => "quota_unknown",
+                    },
+                }
+            })
+            .collect(),
+    );
     draft.decision(
         "sendable",
         eligible
@@ -3119,6 +3185,17 @@ async fn proxy_inner(
                         && candidate.upstream.key_id == pin.key_id
                         && pin.model == usage_model
                         && pin.generation == view.generation()
+                        && !state.key_cooldowns.is_cooling(
+                            candidate.upstream.site_id,
+                            candidate.upstream.key_id,
+                            cooldown_now,
+                        )
+                        && candidate
+                            .upstream
+                            .key_id
+                            .and_then(|key_id| view.key_quotas().get(&key_id))
+                            .map(|quota| quota.rank() != quota::QuotaRank::Exhausted)
+                            .unwrap_or(true)
                 })
                 .map(|candidate| candidate.upstream)
         });
@@ -3353,6 +3430,18 @@ async fn proxy_inner(
                     .metrics
                     .record_attempt(upstream.site_id, status, latency_ms);
                 let replayable = status_allows_replay(status);
+                if status == 429 {
+                    let retry_after = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok());
+                    state.key_cooldowns.record_retry_after(
+                        upstream.site_id,
+                        upstream.key_id,
+                        retry_after,
+                        Instant::now(),
+                    );
+                }
                 if should_failover(status) {
                     // §3.5-1：`opened_at` 必须是**失败发生**的时刻，不是请求开始的时刻。
                     // 用请求开始时刻的话，一次比冷却期还慢的失败（524 ≈ 100s > 冷却 60s）
@@ -4531,7 +4620,7 @@ fn classify_send_error(e: &reqwest::Error) -> AttemptFailure {
 /// 重复计费不可逆，而可用性由「熔断 → 下一个请求换上游」承接。
 /// 4xx 里除 429 外本来就 `should_failover == false`，走不到这里。
 fn status_allows_replay(status: u16) -> bool {
-    status == 429
+    crate::routing::status_failure_policy(status).replay == crate::routing::ReplayDecision::Allow
 }
 
 /// 从请求体里**尽力**取出 `model`。取不到返回 `None`，不报错——

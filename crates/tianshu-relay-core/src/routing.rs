@@ -926,23 +926,70 @@ impl SiteGuard {
     }
 }
 
-/// 纯函数：该 HTTP 状态是否应当切下一个上游。
+/// M3：HTTP 失败的生产语义。**只描述事实，不直接决定动作**。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureClass {
+    RequestError,
+    Authentication,
+    RateLimit,
+    PaymentRequired,
+    UpstreamError,
+}
+
+/// 是否更新健康 / 熔断。与「本次能否重放」严格分开。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HealthUpdate {
+    None,
+    RecordFailure,
+}
+
+/// 是否允许把同一个请求再发给下一个上游。计费安全决策，不是错误分类。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayDecision {
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FailurePolicy {
+    pub class: FailureClass,
+    pub health: HealthUpdate,
+    pub replay: ReplayDecision,
+}
+
+/// 纯函数：把状态码映射为三个独立结论。
 ///
-/// `429` 与 `5xx` ⇒ `true`；其余（含 `400`/`401`/`403`/`404`/`422`）⇒ `false`。
-///
-/// 理由：400 类是**请求本身**的问题，换上游只会把同一个错误再犯一次；
-/// 401/403 是凭证问题，重试别的上游等于把「密钥无效」误报成「上游故障」，
-/// 而且会把**其它站点的密钥**也拿去试一遍。
-///
-/// **额度耗尽的 403 也落在 `false` 里**——这是**决策**不是遗漏：
-/// 上游回「额度不足」是**一个答案**，不是**一次故障**；静默切到另一个站点等于花用户没指定的那份钱。
-/// 缓解在**选路时**做（`balance_usd` 把余额耗尽的站点排到最后），见 M7-S0 §3.1 的 D-2 裁决。
-/// DEBUG-G7 P3-D1 命名陷阱，注释澄清、不改名：本函数对 5xx 返回 true，
-/// 但那只是**熔断语义**（该 (站点, 模型) 记一次失败），**不是重放语义**——
-/// 网关主循环只对 429 / 连接层失败重放下一候选，5xx 不重放。
-/// 读到 `should_failover(status) == true` 时不得推断“会换候选重试”。
+/// 429 是上游在处理前拒绝，允许换候选；5xx 可能已计费，只记失败、绝不重放。
+/// 401/403 是凭证 / 策略答案，不喂熔断也不拿其他站点 key 试探。
+pub fn status_failure_policy(status: u16) -> FailurePolicy {
+    let class = match status {
+        401 | 403 => FailureClass::Authentication,
+        402 => FailureClass::PaymentRequired,
+        429 => FailureClass::RateLimit,
+        500..=599 => FailureClass::UpstreamError,
+        _ => FailureClass::RequestError,
+    };
+    let health = if status == 429 || (500..=599).contains(&status) {
+        HealthUpdate::RecordFailure
+    } else {
+        HealthUpdate::None
+    };
+    let replay = if status == 429 {
+        ReplayDecision::Allow
+    } else {
+        ReplayDecision::Deny
+    };
+    FailurePolicy {
+        class,
+        health,
+        replay,
+    }
+}
+
+/// 兼容旧调用点的熔断语义。**它不是重放许可**；新代码应读
+/// [`status_failure_policy`] 的三个字段。
 pub fn should_failover(status: u16) -> bool {
-    status == 429 || (500..=599).contains(&status)
+    status_failure_policy(status).health == HealthUpdate::RecordFailure
 }
 
 /// 熔断键（M39-S3 §4.4）：`(site_id, model)`。

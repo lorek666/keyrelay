@@ -59,6 +59,7 @@ fn config() -> GatewayConfig {
         lb_top_n: 3,
         max_attempts: 0,
         session_affinity: false,
+        key_quotas: std::collections::HashMap::new(),
         guard_policy: SiteGuardPolicy::default(),
         runtime: None,
         on_failure: None,

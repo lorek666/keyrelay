@@ -1563,7 +1563,12 @@
         "probe_in_flight": "Probe in flight",
         "breaker_unknown": "Circuit state unknown",
         "revoked": "Key revoked",
-        "missing_secret": "Missing key material"
+        "missing_secret": "Missing key material",
+        "quota_healthy": "Quota healthy",
+        "quota_near_limit": "Quota near limit",
+        "quota_exhausted_soft": "Quota at limit (soft)",
+        "quota_unlimited": "Quota unlimited",
+        "quota_unknown": "Quota unknown"
       },
       "end": {
         "response_started": "Response started",

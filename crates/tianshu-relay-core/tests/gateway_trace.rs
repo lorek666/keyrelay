@@ -89,6 +89,7 @@ async fn start_with_affinity(upstreams: Vec<Upstream>, session_affinity: bool) -
         lb_top_n: 3,
         max_attempts: 0,
         session_affinity,
+        key_quotas: std::collections::HashMap::new(),
         guard_policy: SiteGuardPolicy::default(),
         runtime: None,
         on_failure: None,

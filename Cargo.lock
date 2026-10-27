@@ -4899,6 +4899,7 @@ dependencies = [
  "hex",
  "http-body",
  "http-body-util",
+ "httpdate",
  "keyring",
  "pbkdf2",
  "pin-project-lite",
