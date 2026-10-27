@@ -209,6 +209,7 @@ fn routed_config(upstreams: Vec<Upstream>, keys: &[(&str, &str)], port: u16) -> 
         breaker: tianshu_relay_core::routing::BreakerPolicy::default(),
         lb_top_n: 1,
         max_attempts: 0,
+        session_affinity: false,
         guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
         keys_by_ref: map,
         upstream_timeout: UpstreamTimeout::default(),

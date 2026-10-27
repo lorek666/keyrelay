@@ -55,6 +55,10 @@ fn candidate(site_id: i64, upstream: &FakeUpstream, rate: f64) -> Upstream {
 }
 
 async fn start(upstreams: Vec<Upstream>) -> GatewayHandle {
+    start_with_affinity(upstreams, false).await
+}
+
+async fn start_with_affinity(upstreams: Vec<Upstream>, session_affinity: bool) -> GatewayHandle {
     let mut keys = std::collections::HashMap::new();
     for upstream in &upstreams {
         keys.insert(
@@ -84,6 +88,7 @@ async fn start(upstreams: Vec<Upstream>) -> GatewayHandle {
         legacy_key_ref: None,
         lb_top_n: 3,
         max_attempts: 0,
+        session_affinity,
         guard_policy: SiteGuardPolicy::default(),
         runtime: None,
         on_failure: None,
@@ -97,10 +102,15 @@ async fn start(upstreams: Vec<Upstream>) -> GatewayHandle {
 }
 
 fn request(port: u16, body: &str) -> u16 {
+    request_with_session(port, body, None)
+}
+
+fn request_with_session(port: u16, body: &str, session: Option<&str>) -> u16 {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     let request = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{body}",
+        body.len(),
+        session.map(|value| format!("X-Tianshu-Session: {value}\r\n")).unwrap_or_default()
     );
     stream.write_all(request.as_bytes()).unwrap();
     let mut bytes = Vec::new();
@@ -207,5 +217,89 @@ async fn token_registry_is_not_serialized_as_a_secret() {
     assert!(!serde_json::to_string(&trace)
         .unwrap()
         .contains("not-a-plaintext-token"));
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_session_sticks_and_disabled_affinity_keeps_rotation() {
+    let body = r#"{"model":"gpt-trace","messages":[]}"#;
+    let a = upstream("200 OK", "{}");
+    let b = upstream("200 OK", "{}");
+    let handle =
+        start_with_affinity(vec![candidate(1, &a, 1.0), candidate(2, &b, 1.0)], true).await;
+    assert_eq!(
+        request_with_session(handle.addr.port(), body, Some("session-a")),
+        200
+    );
+    assert_eq!(
+        request_with_session(handle.addr.port(), body, Some("session-a")),
+        200
+    );
+    assert_eq!(a.hits.load(Ordering::SeqCst), 2, "pin 必须回到上次成功站点");
+    assert_eq!(b.hits.load(Ordering::SeqCst), 0);
+    assert_eq!(request(handle.addr.port(), body), 200);
+    assert_eq!(b.hits.load(Ordering::SeqCst), 1, "无会话身份仍按原轮转");
+    assert_eq!(handle.session_pin_count(), 1);
+    handle.shutdown_and_wait().await;
+
+    let a = upstream("200 OK", "{}");
+    let b = upstream("200 OK", "{}");
+    let handle =
+        start_with_affinity(vec![candidate(1, &a, 1.0), candidate(2, &b, 1.0)], false).await;
+    assert_eq!(
+        request_with_session(handle.addr.port(), body, Some("session-a")),
+        200
+    );
+    assert_eq!(
+        request_with_session(handle.addr.port(), body, Some("session-a")),
+        200
+    );
+    assert_eq!(a.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(b.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(handle.session_pin_count(), 0);
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_429_failover_pins_only_the_site_that_succeeded() {
+    let body = r#"{"model":"gpt-trace","messages":[]}"#;
+    let a = upstream("429 Too Many Requests", "{}");
+    let b = upstream("200 OK", "{}");
+    let handle =
+        start_with_affinity(vec![candidate(1, &a, 0.1), candidate(2, &b, 1.0)], true).await;
+    assert_eq!(
+        request_with_session(handle.addr.port(), body, Some("session-retry")),
+        200
+    );
+    assert_eq!(
+        request_with_session(handle.addr.port(), body, Some("session-retry")),
+        200
+    );
+    assert_eq!(
+        a.hits.load(Ordering::SeqCst),
+        1,
+        "失败站点不得被 pin 拉回首位"
+    );
+    assert_eq!(b.hits.load(Ordering::SeqCst), 2);
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_session_identity_is_ignored_without_affinity() {
+    let body = r#"{"model":"gpt-trace","messages":[]}"#;
+    let a = upstream("200 OK", "{}");
+    let b = upstream("200 OK", "{}");
+    let handle =
+        start_with_affinity(vec![candidate(1, &a, 1.0), candidate(2, &b, 1.0)], true).await;
+    assert_eq!(
+        request_with_session(handle.addr.port(), body, Some("prompt text with spaces")),
+        200
+    );
+    assert_eq!(
+        request_with_session(handle.addr.port(), body, Some("prompt text with spaces")),
+        200
+    );
+    assert_eq!(a.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(b.hits.load(Ordering::SeqCst), 1, "非法身份不建立 pin");
     handle.shutdown_and_wait().await;
 }

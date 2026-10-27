@@ -269,6 +269,7 @@ fn config(
         breaker,
         lb_top_n: top_n,
         max_attempts: 0,
+        session_affinity: false,
         guard_policy: guard,
         keys_by_ref,
         upstream_timeout: UpstreamTimeout::default(),

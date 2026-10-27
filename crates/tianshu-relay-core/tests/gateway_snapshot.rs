@@ -170,6 +170,7 @@ fn base_config(
         lb_top_n: 1,
         // M46-S4：机械补字段，行为不变（0 = 走全部候选）
         max_attempts: 0,
+        session_affinity: false,
         guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
         runtime: None,
     }

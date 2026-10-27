@@ -116,6 +116,7 @@ fn config(route: Vec<Upstream>, keys: Vec<(&str, &str)>) -> GatewayConfig {
         legacy_key_ref: None,
         lb_top_n: 3,
         max_attempts: 0,
+        session_affinity: false,
         guard_policy: SiteGuardPolicy::default(),
         runtime: None,
         on_failure: None,

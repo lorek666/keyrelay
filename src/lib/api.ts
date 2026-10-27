@@ -510,6 +510,8 @@ export type Settings = {
   gatewayPerSiteBurst: number;
   /** M46-S4：每请求最多尝试候选数（默认 0 = 走全部；0..=64）。 */
   gatewayMaxAttempts: number;
+  /** M2：显式会话粘性开关；默认关，只有明确会话 id 时生效。 */
+  gatewaySessionAffinity: boolean;
   /** M46-S7：按 agent 路由规则 JSON（空 = 无规则）；保存后下次启动网关生效。 */
   routingRules: string;
   /** M46-S1：密钥健康巡检间隔秒（默认 0 = 关；非 0 时 60..=86400）。 */
@@ -2264,6 +2266,7 @@ export const MOCK_SETTINGS: Settings = {
   gatewayPerSiteRateLimit: 0,
   gatewayPerSiteBurst: 0,
   gatewayMaxAttempts: 0,
+  gatewaySessionAffinity: false,
   routingRules: "",
   gatewayKeyHealthIntervalSecs: 0,
   theme: "system",

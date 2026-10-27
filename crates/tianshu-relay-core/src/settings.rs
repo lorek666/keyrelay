@@ -81,6 +81,8 @@ const KEY_GATEWAY_PER_SITE_RATE_LIMIT: &str = "gateway_per_site_rate_limit";
 const KEY_GATEWAY_PER_SITE_BURST: &str = "gateway_per_site_burst";
 // M46-S4：每请求最多尝试候选数（0 = 走全部候选，即今天行为）
 const KEY_GATEWAY_MAX_ATTEMPTS: &str = "gateway_max_attempts";
+// M2：显式会话粘性灰度开关（默认关；重启网关生效）。
+const KEY_GATEWAY_SESSION_AFFINITY: &str = "gateway_session_affinity";
 // M46-S7：按 agent 路由规则 JSON（空 = 无规则；schema 见 routing.rs）。
 const KEY_ROUTING_RULES: &str = "routing_rules";
 const KEY_THEME: &str = "theme";
@@ -156,6 +158,9 @@ pub struct Settings {
     /// 每请求最多尝试的候选数（M46-S4）：**默认 0（走全部候选，即今天行为）**，
     /// 范围 `0..=64`。只计实际发出去的上游尝试，本地保护拒绝的候选不计。
     pub gateway_max_attempts: usize,
+    /// M2：显式会话粘性灰度开关。**默认 false**；只有请求带明确
+    /// `X-Tianshu-Session` 或 `prompt_cache_key` 时生效。重启网关生效。
+    pub gateway_session_affinity: bool,
     /// 按 agent 路由规则 JSON（M46-S7）：**默认空（无规则，走全局加权）**。
     /// Schema 见 `crate::routing::parse_routing_rules`；非法值由 `validate` 拒绝，
     /// 不落库。保存后下次启动网关生效。
@@ -253,6 +258,8 @@ impl Default for Settings {
             gateway_per_site_burst: 0,
             // M46-S4：0 = 走全部候选（默认行为与今天逐字相同）。
             gateway_max_attempts: 0,
+            // M2：默认关闭，只有用户显式开启且请求带可靠会话 id 时生效。
+            gateway_session_affinity: false,
             // M46-S7：空 = 无规则（默认行为与今天逐字相同）。
             routing_rules: String::new(),
 
@@ -672,6 +679,11 @@ impl Settings {
                         }
                     }
                 }
+                KEY_GATEWAY_SESSION_AFFINITY => {
+                    if let Some(flag) = parse_bool(value) {
+                        settings.gateway_session_affinity = flag;
+                    }
+                }
                 // M46-S7：规则 JSON 原样收下（解析只在 validate 与 gateway_config 做；
                 // from_pairs 的「非法项退回默认」口径不适用于整串 JSON——非法串的
                 // 唯一 gate 是 validate）。
@@ -849,6 +861,10 @@ impl Settings {
                 KEY_GATEWAY_MAX_ATTEMPTS,
                 self.gateway_max_attempts.to_string(),
             ),
+            (
+                KEY_GATEWAY_SESSION_AFFINITY,
+                self.gateway_session_affinity.to_string(),
+            ),
             (KEY_ROUTING_RULES, self.routing_rules.clone()),
             (KEY_THEME, self.theme.clone()),
             (KEY_LANGUAGE, self.language.clone()),
@@ -891,7 +907,7 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 37] = [
+    pub const KEYS: [&'static str; 38] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
@@ -912,6 +928,7 @@ impl Settings {
         KEY_GATEWAY_PER_SITE_RATE_LIMIT,
         KEY_GATEWAY_PER_SITE_BURST,
         KEY_GATEWAY_MAX_ATTEMPTS,
+        KEY_GATEWAY_SESSION_AFFINITY,
         KEY_ROUTING_RULES,
         KEY_THEME,
         KEY_LANGUAGE,
@@ -1262,6 +1279,7 @@ mod tests {
             gateway_per_site_rate_limit: 0,
             gateway_per_site_burst: 0,
             gateway_max_attempts: 0,
+            gateway_session_affinity: false,
             routing_rules: String::new(),
             theme: "dark".to_string(),
             language: "en-US".to_string(),

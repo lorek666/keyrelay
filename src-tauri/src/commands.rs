@@ -504,6 +504,8 @@ pub struct SettingsDto {
     gateway_per_site_burst: u32,
     // M46-S4：每请求最多尝试候选数（默认 0 = 走全部；camelCase `gatewayMaxAttempts`）。
     gateway_max_attempts: usize,
+    // M2：显式会话粘性灰度开关（默认关；camelCase `gatewaySessionAffinity`）。
+    gateway_session_affinity: bool,
     // M46-S7：按 agent 路由规则 JSON（默认空 = 无规则；camelCase `routingRules`）。
     routing_rules: String,
     // ---- M6-S5：FR-9 界面与隐私 ----
@@ -793,7 +795,18 @@ pub struct CreateKeyArgs {
 /// 删除失败返回错误（`Error::Vault`），调用方据此显示可读原因。
 #[tauri::command]
 pub fn logout_site(state: State<'_, AppState>, site_id: i64) -> Result<(), String> {
-    state.service.logout(site_id).map_err(|e| e.to_string())
+    state.service.logout(site_id).map_err(|e| e.to_string())?;
+    clear_gateway_session_pins(&state);
+    Ok(())
+}
+
+/// M2：key/site 生命周期变化后，旧会话 pin 不再可靠；只清运行态内存。
+fn clear_gateway_session_pins(state: &AppState) {
+    if let Ok(guard) = state.gateway.lock() {
+        if let Some(run) = guard.as_ref() {
+            run.handle.clear_session_pins();
+        }
+    }
 }
 
 #[tauri::command]
@@ -2518,6 +2531,7 @@ fn settings_from_dto(dto: &SettingsDto) -> tianshu_relay_core::settings::Setting
         gateway_per_site_rate_limit: dto.gateway_per_site_rate_limit,
         gateway_per_site_burst: dto.gateway_per_site_burst,
         gateway_max_attempts: dto.gateway_max_attempts,
+        gateway_session_affinity: dto.gateway_session_affinity,
         routing_rules: dto.routing_rules.clone(),
         theme: dto.theme.clone(),
         language: dto.language.clone(),
@@ -2560,6 +2574,7 @@ fn settings_to_dto(settings: &tianshu_relay_core::settings::Settings) -> Setting
         gateway_per_site_rate_limit: settings.gateway_per_site_rate_limit,
         gateway_per_site_burst: settings.gateway_per_site_burst,
         gateway_max_attempts: settings.gateway_max_attempts,
+        gateway_session_affinity: settings.gateway_session_affinity,
         routing_rules: settings.routing_rules.clone(),
         theme: settings.theme.clone(),
         language: settings.language.clone(),
@@ -2994,6 +3009,7 @@ fn gateway_transition(
         || prev.gateway_per_site_rate_limit != next.gateway_per_site_rate_limit
         || prev.gateway_per_site_burst != next.gateway_per_site_burst
         || prev.gateway_max_attempts != next.gateway_max_attempts
+        || prev.gateway_session_affinity != next.gateway_session_affinity
         || prev.routing_rules != next.routing_rules
     {
         GatewayTransition::Restart
@@ -3902,6 +3918,7 @@ pub async fn rotate_key(
         .rotate_key(key_id, tianshu_relay_core::site::KeySpec::named(name))
         .await
         .map_err(|e| e.to_string())?;
+    clear_gateway_session_pins(&state);
     let (revoke, revoke_reason) = match &run.revoke {
         tianshu_relay_core::service::RevokeOutcome::Revoked => ("revoked".to_string(), None),
         tianshu_relay_core::service::RevokeOutcome::SkippedNoRemoteId => {
@@ -4263,12 +4280,15 @@ pub async fn revoke_key(
     if !confirm {
         return Err("删除站点侧密钥需要二次确认".to_string());
     }
-    state
+    let report = state
         .service
         .revoke_key(site_id, &remote_id)
         .await
-        .map(RevokeReportDto::from)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // M2：密钥生命周期变化后旧 pin 不再可靠（本地自增 id 可能复用）。
+    // 清空是保守且便宜的；失败不影响已经完成的撤销结果。
+    clear_gateway_session_pins(&state);
+    Ok(RevokeReportDto::from(report))
 }
 
 /// 解绑一个 agent 与它的密钥（FR-2:115 / M8-S4 §5.4）。
@@ -6793,6 +6813,10 @@ mod m41s1_tests {
             },
             Settings {
                 gateway_max_attempts: 3,
+                ..enabled.clone()
+            },
+            Settings {
+                gateway_session_affinity: true,
                 ..enabled.clone()
             },
             Settings {

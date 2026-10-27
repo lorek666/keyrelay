@@ -190,6 +190,7 @@ fn three_site_config(
         breaker,
         lb_top_n: 3,
         max_attempts: 0,
+        session_affinity: false,
         guard_policy: SiteGuardPolicy {
             max_concurrency: 0,
             rate_limit_per_sec: 0,

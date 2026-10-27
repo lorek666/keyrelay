@@ -1044,6 +1044,7 @@ export default function SettingsPage() {
             perSiteConcurrency={draft.gatewayPerSiteConcurrency}
             perSiteRateLimit={draft.gatewayPerSiteRateLimit}
             maxAttempts={draft.gatewayMaxAttempts}
+            sessionAffinity={draft.gatewaySessionAffinity}
             keyHealthIntervalSecs={draft.gatewayKeyHealthIntervalSecs}
             routingRules={draft.routingRules}
             onToggle={(enabled) => setDraft({ ...draft, gatewayEnabled: enabled })}
@@ -1071,6 +1072,9 @@ export default function SettingsPage() {
             }
             onMaxAttemptsChange={(gatewayMaxAttempts) =>
               setDraft({ ...draft, gatewayMaxAttempts })
+            }
+            onSessionAffinityChange={(gatewaySessionAffinity) =>
+              setDraft({ ...draft, gatewaySessionAffinity })
             }
             onKeyHealthIntervalChange={(gatewayKeyHealthIntervalSecs) =>
               setDraft({ ...draft, gatewayKeyHealthIntervalSecs })

@@ -6459,6 +6459,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         config.lb_top_n = settings.gateway_lb_top_n;
         // M46-S4：重试预算（同口径：下次启动网关生效；0 = 走全部候选）。
         config.max_attempts = settings.gateway_max_attempts;
+        config.session_affinity = settings.gateway_session_affinity;
         config.guard_policy = crate::routing::SiteGuardPolicy {
             max_concurrency: settings.gateway_per_site_concurrency,
             rate_limit_per_sec: settings.gateway_per_site_rate_limit,

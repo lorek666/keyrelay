@@ -1475,6 +1475,8 @@
     "perSiteRateLimitHint": "每站每秒允许的新请求数；0 = 不限速，此时 burst 也不生效（burst 只有在每秒上限大于 0 时才抬高令牌桶容量）。保存后下次启动网关生效。",
     "maxAttemptsLabel": "每请求最多尝试候选数（0–64，0=走全部）",
     "maxAttemptsHint": "0 = 走全部候选（今天行为）；大于 0 时每请求最多尝试这么多个候选，超了就返回最后一条真实错误，不编新错误。只计实际发出去的上游尝试，本地保护拒绝的候选不计。保存后下次启动网关生效。",
+    "sessionAffinityLabel": "显式会话粘性（实验）",
+    "sessionAffinityHint": "只有请求带 X-Tianshu-Session 或 prompt_cache_key 时才生效：成功请求后的后续请求优先回到同一站点/key/模型；不越过规则、预算、熔断和密钥撤销。默认关闭，内存保存 30 分钟，网关重启即清空。保存后下次启动网关生效。",
     "keyHealthIntervalLabel": "密钥健康巡检间隔（秒，0=关）",
     "keyHealthIntervalHint": "0 = 关闭巡检；非 0 时每隔这么多秒用 GET /v1/models 探活一次，死 key 提前标红摘除。合法范围 60–86400 秒，超出会在失焦时钳制。巡检花上游配额，默认关闭。保存后下次启动网关生效。",
     "keyHealthIntervalClamped": "已钳制到合法范围（0=关，或 60–86400 秒）。",

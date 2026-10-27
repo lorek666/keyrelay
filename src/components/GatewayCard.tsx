@@ -49,6 +49,9 @@ type Props = {
   perSiteRateLimit: number;
   /** 每请求最多尝试候选数（M46-S4）：0 = 走全部候选，0..=64。 */
   maxAttempts: number;
+  /** M2：显式会话粘性灰度开关；缺省 = 关闭（兼容旧调用点）。 */
+  sessionAffinity?: boolean;
+  onSessionAffinityChange?: (enabled: boolean) => void;
   /** 密钥健康巡检间隔（秒，M46-UI B-237）：0 = 关，非 0 时 60..=86400。 */
   keyHealthIntervalSecs: number;
   /** 按 agent 路由规则 JSON（M46-S7）：空 = 无规则，走全局加权。 */
@@ -499,6 +502,8 @@ export default function GatewayCard({
   perSiteConcurrency,
   perSiteRateLimit,
   maxAttempts,
+  sessionAffinity = false,
+  onSessionAffinityChange,
   keyHealthIntervalSecs,
   routingRules,
   onToggle,
@@ -1314,6 +1319,16 @@ export default function GatewayCard({
         />
       </label>
       <p className="muted">{t("gateway.maxAttemptsHint")}</p>
+
+      <label className="checkline">
+        <input
+          type="checkbox"
+          checked={sessionAffinity}
+          onChange={(e) => onSessionAffinityChange?.(e.target.checked)}
+        />
+        <span>{t("gateway.sessionAffinityLabel")}</span>
+      </label>
+      <p className="muted">{t("gateway.sessionAffinityHint")}</p>
 
       {/*
         M46-UI B-255：按 agent 路由规则改为结构化编辑器（agent 下拉取令牌

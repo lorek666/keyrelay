@@ -1475,6 +1475,8 @@
     "perSiteRateLimitHint": "New requests allowed per site per second; 0 = unlimited, in which case burst has no effect either (burst only raises the token bucket capacity when the per-second limit is greater than 0). Applies the next time the gateway starts.",
     "maxAttemptsLabel": "Max attempts per request (0–64, 0=walk all)",
     "maxAttemptsHint": "0 = walk all candidates (today's behavior); greater than 0 caps each request at that many candidates, and once exceeded the last real error is returned without inventing a new one. Only actually-sent upstream attempts count; locally rejected candidates do not. Applies the next time the gateway starts.",
+    "sessionAffinityLabel": "Explicit session affinity (experimental)",
+    "sessionAffinityHint": "Applies only when a request carries X-Tianshu-Session or prompt_cache_key: later requests prefer the site/key/model that last succeeded. It never overrides routing rules, budgets, circuit breakers, or revoked keys. Off by default; pins live in memory for 30 minutes and clear on gateway restart. Takes effect after the gateway restarts.",
     "keyHealthIntervalLabel": "Key health probe interval (seconds, 0=off)",
     "keyHealthIntervalHint": "0 = probes disabled; otherwise probe with GET /v1/models every this many seconds so dead keys are flagged and removed early. Valid range is 60–86400 seconds; out-of-range input is clamped on blur. Probing spends upstream quota and is off by default. Applies the next time the gateway starts.",
     "keyHealthIntervalClamped": "Clamped to the valid range (0=off, or 60–86400 seconds).",

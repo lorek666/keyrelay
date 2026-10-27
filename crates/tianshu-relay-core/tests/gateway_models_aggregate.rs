@@ -195,6 +195,7 @@ fn base_config(
         // M39-S3：单候选 + 默认 guard（聚合测试与负载均衡无关）
         lb_top_n: 1,
         max_attempts: 0,
+        session_affinity: false,
         guard_policy: tianshu_relay_core::routing::SiteGuardPolicy::default(),
         runtime: None,
     }

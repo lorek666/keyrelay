@@ -183,6 +183,7 @@ fn config(
         breaker: BreakerPolicy::default(),
         lb_top_n: top_n,
         max_attempts: 0,
+        session_affinity: false,
         guard_policy: SiteGuardPolicy {
             max_concurrency: 0,
             rate_limit_per_sec: 0,

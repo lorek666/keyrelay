@@ -16,9 +16,11 @@
 //! 的调用方必须用 [`GatewayHandle::shutdown_and_wait`]；`start()` 另外对 bind 的
 //! `AddrInUse` 做有界退避重试（见 [`BIND_RETRY_ATTEMPTS`] / [`BIND_RETRY_DELAY`]）。
 
+pub mod session;
 pub mod trace;
 pub mod translate;
 
+use session::{SessionAffinityStore, SessionIdentity, SessionPin, SessionScope, UpstreamProtocol};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -602,6 +604,8 @@ pub struct GatewayConfig {
     /// 各候选的读超时串行叠加，最坏总耗时 = 候选数 × 单候选超时；需要封顶时
     /// 配非零 `max_attempts`。默认值不动（改默认会改变既有重试语义）。
     pub max_attempts: usize,
+    /// M2：显式会话粘性。默认关闭；只有请求带可靠会话 id 时建立内存 pin。
+    pub session_affinity: bool,
     /// M39-S3 §4.2：每站并发/限速策略。
     pub guard_policy: SiteGuardPolicy,
     /// `key_ref` → 明文。**仅进程内**；`Debug` 不打印（见下方手写 `Debug`）。
@@ -1022,6 +1026,7 @@ impl GatewayConfig {
             lb_top_n: 1,
             // M46-S4：0 = 走全部候选；legacy 只有一个候选，预算恒不截断。
             max_attempts: 0,
+            session_affinity: false,
             guard_policy: SiteGuardPolicy::default(),
             keys_by_ref: HashMap::new(),
             catalog: None,
@@ -1590,6 +1595,7 @@ pub struct GatewayHandle {
     /// M40-S2：内存指标（与 `AppState` 共享同一个 Arc）。
     metrics: Arc<GatewayMetrics>,
     traces: Arc<RouteTraceStore>,
+    sessions: Arc<SessionAffinityStore>,
     /// M40-S2：装配时的路由是否为空（`runtime` 为 `None` 时的 fallback）。
     initial_route_is_empty: bool,
     /// M39-S1 的运行时快照（热更新后会变）；`mode` 按它取**当前**真实路由。
@@ -1636,6 +1642,16 @@ impl GatewayHandle {
     /// M1：仅供本地 UI 查询的完成轨迹，不提供 HTTP 查询端点。
     pub fn route_traces(&self) -> Vec<trace::RouteTrace> {
         self.traces.snapshot()
+    }
+
+    /// M2：当前进程的会话 pin 数（只用于状态展示；不暴露身份）。
+    pub fn session_pin_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// M2：显式清空会话 pin（密钥生命周期或运维需要时）。
+    pub fn clear_session_pins(&self) -> usize {
+        self.sessions.clear()
     }
 
     /// M40-S2：M39-S1 的运行时 generation（单上游 / 无 runtime ⇒ 0）。
@@ -1978,6 +1994,14 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
     let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let metrics = GatewayMetrics::new();
     let traces = Arc::new(RouteTraceStore::new(trace::ROUTE_TRACE_CAPACITY));
+    let sessions = Arc::new(
+        SessionAffinityStore::new(
+            config.session_affinity,
+            session::DEFAULT_SESSION_CAPACITY,
+            session::DEFAULT_SESSION_TTL,
+        )
+        .map_err(Error::Store)?,
+    );
     let breaker = Arc::new(Mutex::new(Breaker::new(config.breaker.clone())));
     let runtime_for_handle = config.runtime.clone();
     let route_for_handle = config.route.clone();
@@ -1989,6 +2013,7 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
     let state = AppState {
         metrics: Arc::clone(&metrics),
         traces: Arc::clone(&traces),
+        sessions: Arc::clone(&sessions),
         breaker: Arc::clone(&breaker),
         round_robin: Arc::new(Mutex::new(RoundRobinState::default())),
         guards: Arc::new(Mutex::new(HashMap::new())),
@@ -2119,6 +2144,7 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
         exit,
         metrics,
         traces,
+        sessions,
         initial_route_is_empty,
         runtime: runtime_for_handle,
         breaker,
@@ -2135,6 +2161,7 @@ struct AppState {
     /// M40-S2：内存指标（与 `GatewayHandle` 共享同一个 Arc）。
     metrics: Arc<GatewayMetrics>,
     traces: Arc<RouteTraceStore>,
+    sessions: Arc<SessionAffinityStore>,
     config: GatewayConfig,
     /// M43-S1：运行态认证集合。`tokens` 非空 ⇒ 只认集合（hash + 常量时间 + grace）；
     /// 空 ⇒ 回退 `config.token`（legacy 单令牌，行为与今天逐字相同）。
@@ -2519,6 +2546,49 @@ fn local_error_code(response: &Response) -> Option<&'static str> {
         .map(|code| code.0)
 }
 
+fn session_protocol(
+    method: &axum::http::Method,
+    path: &str,
+    headers: &HeaderMap,
+) -> Option<UpstreamProtocol> {
+    match translate::detect(method, path, headers) {
+        Some(translate::Protocol::OpenAiChat) => Some(UpstreamProtocol::OpenAiChat),
+        Some(translate::Protocol::OpenAiResponses) => Some(UpstreamProtocol::OpenAiResponses),
+        Some(translate::Protocol::AnthropicMessages) => Some(UpstreamProtocol::AnthropicMessages),
+        Some(translate::Protocol::GeminiGenerateContent) => {
+            Some(UpstreamProtocol::GeminiGenerateContent)
+        }
+        None => None,
+    }
+}
+
+fn remember_session_pin(
+    state: &AppState,
+    identity: &Option<SessionIdentity>,
+    upstream: &Upstream,
+    model: &str,
+    generation: u64,
+    success: bool,
+) {
+    if !success {
+        return;
+    }
+    let Some(identity) = identity.clone() else {
+        return;
+    };
+    // 调用方传的是已解析别名的 usage_model；这里不再二次读运行时快照。
+    let Some(pin) = SessionPin::new(
+        upstream.site_id,
+        upstream.key_id,
+        model,
+        UpstreamProtocol::OpenAiChat,
+    )
+    .map(|pin| pin.at_generation(generation)) else {
+        return;
+    };
+    state.sessions.pin(identity, pin, Instant::now());
+}
+
 fn trace_protocol(method: &axum::http::Method, path: &str, headers: &HeaderMap) -> &'static str {
     if method == axum::http::Method::GET && path == "/v1/models" {
         return "models";
@@ -2619,6 +2689,20 @@ async fn proxy_inner(
     } else {
         draft.model(model_from_body(&body));
     }
+
+    // M2：只用明确身份。必须读取**翻译前**的原始 body；header 存在但非法时
+    // session 模块不再回退到 body。原始 id 由模块在栈上清零，不进入轨迹。
+    let session_protocol = session_protocol(&method, &path, &inbound);
+    let session_header = inbound
+        .get("x-tianshu-session")
+        .map(|value| value.to_str().unwrap_or(""));
+    let session_identity = session_protocol.and_then(|protocol| {
+        state.sessions.identity_from_header_or_body(
+            session_header,
+            Some(body.as_ref()),
+            SessionScope::new(identity.token_id, protocol),
+        )
+    });
 
     // Chat **零翻译**（不进本分支，body 逐字节不动）；其余三种先解析成 IR，
     // 再序列化成 OpenAI Chat body。**解析失败发生在发请求之前** ⇒ 不可能产生上游计费（ADR D5）。
@@ -3019,13 +3103,49 @@ async fn proxy_inner(
 
     // M39-S3 §4.1：加权轮转只决定**第一个**尝试谁；失败切换仍按确定性顺序走其余候选。
     // 单候选 / 有探针时不读计数器（`weighted_pick` 内部保证）。
+    // M2：pin 只能在已经通过规则、模型、撤销、熔断与 local guard 台账的候选里生效。
+    // 它把一个合法候选提到首位，不会把被排除的候选拉回来；预算仍在发送前逐次检查。
+    let pinned_upstream = session_identity
+        .as_ref()
+        .and_then(|identity| state.sessions.lookup(identity, now))
+        .and_then(|pin| {
+            if pin.upstream_protocol != UpstreamProtocol::OpenAiChat {
+                return None;
+            }
+            sendable
+                .iter()
+                .find(|candidate| {
+                    candidate.upstream.site_id == pin.site_id
+                        && candidate.upstream.key_id == pin.key_id
+                        && pin.model == usage_model
+                        && pin.generation == view.generation()
+                })
+                .map(|candidate| candidate.upstream)
+        });
+    draft.decision(
+        "session",
+        pinned_upstream
+            .map(|upstream| {
+                vec![RouteCandidate {
+                    site_id: upstream.site_id,
+                    key_id: upstream.key_id,
+                    state: "pin_selected",
+                }]
+            })
+            .unwrap_or_default(),
+    );
     let top_n = state.config.lb_top_n;
-    let cursor = if sendable.len() > 1 && !sendable.iter().any(|c| c.probe) {
-        state.round_robin.lock().map(|mut g| g.next()).unwrap_or(0)
+    let first = if pinned_upstream.is_some() {
+        // pin 命中时不读轮转计数器，避免为一次固定选择消耗全局 cursor。
+        pinned_upstream
     } else {
-        0
+        let cursor = if sendable.len() > 1 && !sendable.iter().any(|c| c.probe) {
+            state.round_robin.lock().map(|mut g| g.next()).unwrap_or(0)
+        } else {
+            0
+        };
+        weighted_pick(&sendable, top_n, cursor)
     };
-    let first = weighted_pick(&sendable, top_n, cursor);
     let mut order: Vec<&Upstream> = Vec::with_capacity(sendable.len());
     if let Some(f) = first {
         order.push(f);
@@ -3294,7 +3414,7 @@ async fn proxy_inner(
                     });
                     continue;
                 }
-                return maybe_translate_response(
+                let response = maybe_translate_response(
                     &state,
                     translate_proto,
                     response,
@@ -3311,6 +3431,17 @@ async fn proxy_inner(
                     translate_stream,
                 )
                 .await;
+                // 只有最终 2xx 才建立 / 刷新会话 pin；429→B 成功时 pin 的是 B，
+                // 5xx / 4xx / 本地渲染失败都不会把会话粘在坏候选上。
+                remember_session_pin(
+                    &state,
+                    &session_identity,
+                    upstream,
+                    &usage_model,
+                    view.generation(),
+                    response.status().is_success(),
+                );
+                return response;
             }
             Err(failure) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
@@ -5245,6 +5376,12 @@ mod tests {
             // M40-S2：测试用句柄的指标占位（不参与本用例断言）
             metrics: GatewayMetrics::new(),
             traces: Arc::new(RouteTraceStore::new(trace::ROUTE_TRACE_CAPACITY)),
+            sessions: Arc::new(SessionAffinityStore::with_salt(
+                false,
+                session::DEFAULT_SESSION_CAPACITY,
+                session::DEFAULT_SESSION_TTL,
+                [0; 32],
+            )),
             initial_route_is_empty: true,
             runtime: None,
             breaker: Arc::new(Mutex::new(Breaker::new(BreakerPolicy::default()))),
