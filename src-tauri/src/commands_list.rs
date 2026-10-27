@@ -36,6 +36,7 @@ pub const COMMANDS: &[&str] = &[
     "audit_redaction",
     "report_ui_ready",
     "gateway_status",
+    "gateway_route_traces",
     "gateway_start",
     "gateway_stop",
     "export_bundle",

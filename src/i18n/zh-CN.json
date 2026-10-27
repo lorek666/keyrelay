@@ -1540,6 +1540,37 @@
       "clineProbeVersionUnknown": "未确认",
       "clineProbeNotFound": "在应用的搜索范围里没找到 cline CLI。"
     },
+    "traces": {
+      "title": "最近路由轨迹",
+      "privacy": "仅当前网关进程，最多 60 条；不含密钥、URL、请求或响应正文。",
+      "notRunning": "网关未运行，没有轨迹。",
+      "empty": "还没有已完成的请求。",
+      "error": "读取路由轨迹失败：{error}",
+      "unknownModel": "模型未提供或不可安全显示",
+      "noAttempts": "未向上游发送请求。",
+      "defaultAgent": "默认令牌",
+      "outcome": {
+        "local_budget_rejected": "本地预算跳过",
+        "local_guard_rejected": "本地限流跳过",
+        "connection_not_accepted": "连接未建立",
+        "ambiguous_transport": "传输结果不确定",
+        "upstream_response": "上游响应"
+      },
+      "state": {
+        "breaker_open": "熔断中",
+        "probe_in_flight": "探针进行中",
+        "breaker_unknown": "熔断状态未知",
+        "revoked": "密钥已回收",
+        "missing_secret": "缺少密钥明文"
+      },
+      "end": {
+        "response_started": "已开始响应",
+        "body_end": "响应结束",
+        "body_error": "响应体错误",
+        "body_dropped": "未观察到响应体结束（可能断开）",
+        "request_cancelled": "请求在响应前取消"
+      }
+    },
     "statusFailed": "读不到网关状态：{error}",
     "statusUnknown": "状态未知",
     "copyFail": "复制失败（{error}）——请手动选中上面的令牌文本。",

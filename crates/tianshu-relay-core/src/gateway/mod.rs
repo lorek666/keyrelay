@@ -16,12 +16,14 @@
 //! 的调用方必须用 [`GatewayHandle::shutdown_and_wait`]；`start()` 另外对 bind 的
 //! `AddrInUse` 做有界退避重试（见 [`BIND_RETRY_ATTEMPTS`] / [`BIND_RETRY_DELAY`]）。
 
+pub mod trace;
 pub mod translate;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use trace::{RouteAttempt, RouteCandidate, RouteTraceDraft, RouteTraceStore};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -1587,6 +1589,7 @@ pub struct GatewayHandle {
     exit: Arc<std::sync::Mutex<Option<GatewayExit>>>,
     /// M40-S2：内存指标（与 `AppState` 共享同一个 Arc）。
     metrics: Arc<GatewayMetrics>,
+    traces: Arc<RouteTraceStore>,
     /// M40-S2：装配时的路由是否为空（`runtime` 为 `None` 时的 fallback）。
     initial_route_is_empty: bool,
     /// M39-S1 的运行时快照（热更新后会变）；`mode` 按它取**当前**真实路由。
@@ -1628,6 +1631,11 @@ impl GatewayHandle {
     /// M40-S2：一份当前指标快照。
     pub fn metrics(&self) -> GatewayMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// M1：仅供本地 UI 查询的完成轨迹，不提供 HTTP 查询端点。
+    pub fn route_traces(&self) -> Vec<trace::RouteTrace> {
+        self.traces.snapshot()
     }
 
     /// M40-S2：M39-S1 的运行时 generation（单上游 / 无 runtime ⇒ 0）。
@@ -1969,6 +1977,7 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
     // 句柄置位（停止信号发出之前），请求路径读取。
     let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let metrics = GatewayMetrics::new();
+    let traces = Arc::new(RouteTraceStore::new(trace::ROUTE_TRACE_CAPACITY));
     let breaker = Arc::new(Mutex::new(Breaker::new(config.breaker.clone())));
     let runtime_for_handle = config.runtime.clone();
     let route_for_handle = config.route.clone();
@@ -1979,6 +1988,7 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
         Arc::new(std::sync::RwLock::new(Vec::new()));
     let state = AppState {
         metrics: Arc::clone(&metrics),
+        traces: Arc::clone(&traces),
         breaker: Arc::clone(&breaker),
         round_robin: Arc::new(Mutex::new(RoundRobinState::default())),
         guards: Arc::new(Mutex::new(HashMap::new())),
@@ -2108,6 +2118,7 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
         stopping,
         exit,
         metrics,
+        traces,
         initial_route_is_empty,
         runtime: runtime_for_handle,
         breaker,
@@ -2123,6 +2134,7 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
 struct AppState {
     /// M40-S2：内存指标（与 `GatewayHandle` 共享同一个 Arc）。
     metrics: Arc<GatewayMetrics>,
+    traces: Arc<RouteTraceStore>,
     config: GatewayConfig,
     /// M43-S1：运行态认证集合。`tokens` 非空 ⇒ 只认集合（hash + 常量时间 + grace）；
     /// 空 ⇒ 回退 `config.token`（legacy 单令牌，行为与今天逐字相同）。
@@ -2253,7 +2265,10 @@ pub(crate) fn local_error(
             code,
         },
     };
-    (status, axum::Json(body)).into_response()
+    let mut response = (status, axum::Json(body)).into_response();
+    // 稳定错误码只附在本地 Response 上；轨迹不读取错误正文。
+    response.extensions_mut().insert(LocalErrorCode(code));
+    response
 }
 
 /// 本地 401（保留函数名，调用点不变；M42-S1 起走统一信封）。
@@ -2371,18 +2386,163 @@ fn models_list_response(models: &[String]) -> axum::response::Response {
 async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     // M40-S2：全局计数与「在途」在这里进出（status 取**最终返回给客户端**的那个）。
     let _inflight = state.metrics.on_request_started();
-    let response = proxy_inner(State(state.clone()), request).await;
+    let protocol = trace_protocol(request.method(), request.uri().path(), request.headers());
+    let draft = RouteTraceDraft::new(unix_now_secs(), protocol, String::new());
+    let mut completion = TraceCompletion {
+        store: Arc::clone(&state.traces),
+        draft: Some(draft),
+    };
+    let response = proxy_inner(
+        State(state.clone()),
+        request,
+        completion
+            .draft
+            .as_mut()
+            .expect("draft held until response"),
+    )
+    .await;
     state
         .metrics
         .on_request_finished(response.status().as_u16());
-    response
+    completion.finish(response)
 }
 
-async fn proxy_inner(State(state): State<AppState>, request: Request) -> Response {
+struct TraceCompletion {
+    store: Arc<RouteTraceStore>,
+    draft: Option<RouteTraceDraft>,
+}
+
+impl TraceCompletion {
+    /// 只在最外层包 Body；内部的 SiteLease / UsageCapture 保持原所有权与生命周期。
+    fn finish(&mut self, response: Response) -> Response {
+        let Some(mut draft) = self.draft.take() else {
+            return response;
+        };
+        draft.to_headers_ms = draft.started.elapsed().as_millis() as u64;
+        let status = response.status().as_u16();
+        let final_kind = local_error_code(&response).unwrap_or("response");
+        let (parts, body) = response.into_parts();
+        let body = TraceBody {
+            inner: body,
+            completion: Some(BodyCompletion {
+                store: Arc::clone(&self.store),
+                draft,
+                status,
+                final_kind,
+            }),
+        };
+        Response::from_parts(parts, Body::new(body))
+    }
+}
+
+impl Drop for TraceCompletion {
+    fn drop(&mut self) {
+        // 任务被取消时没有 Response；不能编造状态码，也不持有锁。
+        let Some(draft) = self.draft.take() else {
+            return;
+        };
+        self.store
+            .finish(draft, 0, "request_cancelled", "request_cancelled");
+    }
+}
+
+struct BodyCompletion {
+    store: Arc<RouteTraceStore>,
+    draft: RouteTraceDraft,
+    status: u16,
+    final_kind: &'static str,
+}
+
+impl BodyCompletion {
+    fn finish(mut self, end_kind: &'static str) {
+        self.draft.total_ms = self.draft.started.elapsed().as_millis() as u64;
+        self.store
+            .finish(self.draft, self.status, self.final_kind, end_kind);
+    }
+}
+
+#[allow(unused_imports)] // pin_project_lite 的 PinnedDrop 签名在宏展开中使用。
+use std::pin::Pin;
+
+pin_project_lite::pin_project! {
+    struct TraceBody {
+        #[pin]
+        inner: Body,
+        completion: Option<BodyCompletion>,
+    }
+
+    impl PinnedDrop for TraceBody {
+        fn drop(this: Pin<&mut Self>) {
+            // EOF / Err 已 take；客户端提前断开 / 任务取消只能在此补一次。
+            if let Some(completion) = this.project().completion.take() {
+                completion.finish("body_dropped");
+            }
+        }
+    }
+}
+
+impl http_body::Body for TraceBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>>
+    {
+        let this = self.project();
+        match this.inner.poll_frame(context) {
+            std::task::Poll::Ready(None) => {
+                if let Some(completion) = this.completion.take() {
+                    completion.finish("body_end");
+                }
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                if let Some(completion) = this.completion.take() {
+                    completion.finish("body_error");
+                }
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            other => other,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LocalErrorCode(&'static str);
+
+fn local_error_code(response: &Response) -> Option<&'static str> {
+    response
+        .extensions()
+        .get::<LocalErrorCode>()
+        .map(|code| code.0)
+}
+
+fn trace_protocol(method: &axum::http::Method, path: &str, headers: &HeaderMap) -> &'static str {
+    if method == axum::http::Method::GET && path == "/v1/models" {
+        return "models";
+    }
+    match translate::detect(method, path, headers) {
+        Some(translate::Protocol::OpenAiChat) => "openai_chat",
+        Some(translate::Protocol::OpenAiResponses) => "openai_responses",
+        Some(translate::Protocol::AnthropicMessages) => "anthropic_messages",
+        Some(translate::Protocol::GeminiGenerateContent) => "gemini_generate_content",
+        None => "unknown",
+    }
+}
+
+async fn proxy_inner(
+    State(state): State<AppState>,
+    request: Request,
+    draft: &mut RouteTraceDraft,
+) -> Response {
     // ① 令牌校验：不通过就**不转发**。M43-S1：与 `/health` 共用 `authenticate()`。
     let Some(identity) = authenticate(request.headers(), &state) else {
         return unauthorized("缺少或错误的本地令牌");
     };
+    draft.token_id = identity.token_id;
+    draft.agent_label(identity.label.clone().unwrap_or_default());
 
     let path = request.uri().path().to_string();
     let query = request
@@ -2453,6 +2613,13 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
 
     // ④′ M42-S2a：协议翻译（非流式 MVP）。
     //
+    // Gemini 的模型在路径中，必须在翻译前取出；其他协议保留原始 JSON 模型名。
+    if path.starts_with("/v1beta/models/") {
+        draft.model(gemini_model_from_path(&path));
+    } else {
+        draft.model(model_from_body(&body));
+    }
+
     // Chat **零翻译**（不进本分支，body 逐字节不动）；其余三种先解析成 IR，
     // 再序列化成 OpenAI Chat body。**解析失败发生在发请求之前** ⇒ 不可能产生上游计费（ADR D5）。
     let mut translate_stream = false;
@@ -2569,6 +2736,12 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     // 之后所有 route / keys_by_ref 的读取都走 `view`——否则会分叉成「一半按新路由、
     // 一半按旧路由」。`runtime == None` 时它借用 `config`，与加这个字段之前逐字相同。
     let view = state.config.view();
+    draft.generation = view.generation();
+    draft.mode = if view.route().is_empty() {
+        "single"
+    } else {
+        "multi"
+    };
 
     // ②′ M39-S2：`GET /v1/models` 在**非空路由 + 目录非空**时**本地聚合**（不向上游发请求）。
     //
@@ -2595,6 +2768,14 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     //    M16-S4 / P3-3 的唯一增量：**停止信号已发出时一个字节都不发**。
     //    这不是「上游失败」，是本地状态 ⇒ 不写事件、不改响应形态（只在停止期间生效）。
     if view.route().is_empty() {
+        draft.decision(
+            "legacy",
+            vec![RouteCandidate {
+                site_id: state.config.site_id,
+                key_id: state.config.key_id,
+                state: "selected",
+            }],
+        );
         if is_stopping(&state) {
             return stopping_response();
         }
@@ -2647,12 +2828,14 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
             &identity,
             translate_proto,
             translate_stream,
+            draft,
         )
         .await;
     }
 
     // ④ 路由非空：选候选（首位即首选，顺序由 `RouteTable` 保证确定）
-    let model = model_from_body(&body);
+    // Gemini 的模型来自路径，不能从翻译后的 Chat body 反推原始协议。
+    let model = draft.requested_model().map(str::to_owned);
     let candidates: Vec<&Upstream> = match &model {
         Some(m) => view.route().candidates(m),
         // 没有 body（`GET /v1/models`）或 body 里没有 `model`：用**所有**上游的有序
@@ -2660,6 +2843,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         // （B-98 / P2-9）。开了路由不该把一个 PRD 端点变成 404。
         None => view.route().all_candidates(),
     };
+    draft.decision("model", trace_upstreams(&candidates, "candidate"));
     if candidates.is_empty() {
         return local_error(
             StatusCode::NOT_FOUND,
@@ -2683,6 +2867,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
         &identity.label.clone().unwrap_or_default(),
     );
     let candidates = crate::routing::filter_upstreams_by_sites(candidates, allowed);
+    draft.decision("agent_rule", trace_upstreams(&candidates, "candidate"));
     if candidates.is_empty() {
         // 命中规则但规则内无此模型候选（规则站点不在路由内，或不服务该模型）：
         // kind 与既有 404 分支相同，不新造错误码；文案点名路由规则，
@@ -2701,7 +2886,32 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     }
 
     let now = Instant::now();
-    let eligible = eligible_candidates(&state.breaker, &candidates, model.as_deref(), now);
+    let (eligible, excluded) =
+        eligible_candidates(&state.breaker, &candidates, model.as_deref(), now);
+    draft.decision(
+        "breaker",
+        candidates
+            .iter()
+            .map(|upstream| {
+                let eligible = eligible
+                    .iter()
+                    .find(|candidate| std::ptr::eq(candidate.upstream, *upstream));
+                RouteCandidate {
+                    site_id: upstream.site_id,
+                    key_id: upstream.key_id,
+                    state: match eligible {
+                        Some(candidate) if candidate.probe => "probe",
+                        Some(_) => "eligible",
+                        None => excluded
+                            .iter()
+                            .find(|(excluded, _)| std::ptr::eq(*excluded, *upstream))
+                            .map(|(_, reason)| *reason)
+                            .unwrap_or("breaker_unknown"),
+                    },
+                }
+            })
+            .collect(),
+    );
     if eligible.is_empty() {
         // §9 第 2 条：**「一个候选都没发出去」也必须可见**。
         //
@@ -2748,6 +2958,9 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     } else {
         view.route().resolve_model(&event_model)
     };
+    if !usage_model.is_empty() {
+        draft.resolved_model(usage_model.clone());
+    }
 
     // §3.5-3 / §10：先把候选分成「发得出去」与「发不出去」两类。
     //
@@ -2766,6 +2979,25 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
     // 重排只改变组首次出现顺序与失败切换顺序）。
     let ewma = state.metrics.ewma_latency_map();
     let sendable = reorder_by_effective_latency(sendable, &|site_id| ewma.get(&site_id).copied());
+    draft.decision(
+        "sendable",
+        eligible
+            .iter()
+            .map(|candidate| RouteCandidate {
+                site_id: candidate.upstream.site_id,
+                key_id: candidate.upstream.key_id,
+                state: if is_revoked(&state, candidate.upstream) {
+                    "revoked"
+                } else if !view.keys().contains_key(&candidate.upstream.key_ref) {
+                    "missing_secret"
+                } else if candidate.probe {
+                    "probe"
+                } else {
+                    "sendable"
+                },
+            })
+            .collect(),
+    );
 
     // DEBUG-G5 P1-7：预算检查**不在请求开始时预算**，改在循环内每次尝试前现查。
     // 旧预算法在请求开始时把全部候选各查一次：一次长请求（多次失败切换）或
@@ -2818,6 +3050,18 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
             order.extend(crate::routing::reorder_failover_tail(rest, priority));
         }
     }
+    draft.decision(
+        "weighted",
+        order
+            .iter()
+            .enumerate()
+            .map(|(index, upstream)| RouteCandidate {
+                site_id: upstream.site_id,
+                key_id: upstream.key_id,
+                state: if index == 0 { "selected" } else { "backup" },
+            })
+            .collect(),
+    );
 
     let mut last_error: Option<String> = None;
     // DELIVERY-P2-10：本次请求实际发出去的尝试序列（站点 id + 结果标签），
@@ -2889,6 +3133,15 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             local_rejected += 1;
             budget_rejected += 1;
+            draft.attempt(RouteAttempt {
+                site_id: upstream.site_id,
+                key_id: upstream.key_id,
+                sent: false,
+                http_status: None,
+                outcome: "local_budget_rejected",
+                latency_ms: None,
+                continued: true,
+            });
             if budget_breach_fired.insert((breach.site_id, breach.key_id, breach.period)) {
                 if let Some(sink) = &state.config.on_budget_breach {
                     sink(breach.clone());
@@ -2915,6 +3168,15 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                 local_rejected += 1;
                 // M40-S2：本地限流「切到下一个候选」也计一次失败切换（与 429 同口径）。
                 state.metrics.record_failover(upstream.site_id);
+                draft.attempt(RouteAttempt {
+                    site_id: upstream.site_id,
+                    key_id: upstream.key_id,
+                    sent: false,
+                    http_status: None,
+                    outcome: "local_guard_rejected",
+                    latency_ms: None,
+                    continued: true,
+                });
                 continue;
             }
         };
@@ -2949,6 +3211,15 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                 let status = response.status().as_u16();
                 // DELIVERY-P2-10：一次真实发送即记一次尝试（含随后被重放的 429）。
                 attempted.push((upstream.site_id, format!("HTTP {status}")));
+                draft.attempt(RouteAttempt {
+                    site_id: upstream.site_id,
+                    key_id: upstream.key_id,
+                    sent: true,
+                    http_status: Some(status),
+                    outcome: "upstream_response",
+                    latency_ms: Some(latency_ms),
+                    continued: false,
+                });
                 // DEBUG P1-1：「成功」只认 2xx。`should_failover` 只决定「是否喂
                 // 熔断失败」，不能兼任「是否成功」：旧代码用 `!should_failover`
                 // 当成功，使 401/403/404/400 也清零熔断计数、把快速拒绝延迟喂进
@@ -3004,6 +3275,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                 // 重复计费不可逆，可用性由「熔断 → 下一个请求换上游」承接。
                 // 不可切换的状态、或已经是最后一个候选 ⇒ 同样如实返回（不做 500 兜底）。
                 if replayable && !is_last {
+                    draft.continued_last();
                     // M40-S2：真的切了候选 ⇒ 计一次失败切换（只数 429/连接层/本地限流）。
                     state.metrics.record_failover(upstream.site_id);
                     // 留着这条响应（含 lease），继续试下一个候选；若后面全军覆没，
@@ -3047,6 +3319,19 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                     .metrics
                     .record_attempt(upstream.site_id, 502, latency_ms);
                 let replayable = failure.is_replayable();
+                draft.attempt(RouteAttempt {
+                    site_id: upstream.site_id,
+                    key_id: upstream.key_id,
+                    sent: true,
+                    http_status: None,
+                    outcome: if replayable {
+                        "connection_not_accepted"
+                    } else {
+                        "ambiguous_transport"
+                    },
+                    latency_ms: Some(latency_ms),
+                    continued: false,
+                });
                 let message = failure.message().to_string();
                 // DELIVERY-P2-10：传输层尝试同样记入序列（只记结果类别，不记原文，
                 // 原文仍只走既有的 last_error / 失败事件）。
@@ -3087,6 +3372,7 @@ async fn proxy_inner(State(state): State<AppState>, request: Request) -> Respons
                     break;
                 }
                 // M40-S2：连接层失败且还有候选 ⇒ 切下一个（计一次失败切换）。
+                draft.continued_last();
                 state.metrics.record_failover(upstream.site_id);
             }
         }
@@ -3221,6 +3507,17 @@ fn is_sendable(
 /// 回收只拦新启动是不够的：网关运行期间某把 key 被回收后，它仍在 `keys_by_ref` 里。
 /// 服务侧在 `revoke_key` 成功后把 `secret_ref` 插进这个集合，网关只查它——
 /// **不新开取密钥路径**。
+fn trace_upstreams(upstreams: &[&Upstream], state: &'static str) -> Vec<RouteCandidate> {
+    upstreams
+        .iter()
+        .map(|upstream| RouteCandidate {
+            site_id: upstream.site_id,
+            key_id: upstream.key_id,
+            state,
+        })
+        .collect()
+}
+
 fn is_revoked(state: &AppState, upstream: &Upstream) -> bool {
     let Some(refs) = &state.config.revoked_refs else {
         return false;
@@ -3320,8 +3617,9 @@ async fn forward_to(
     identity: &AuthIdentity,
     translate_proto: Option<translate::Protocol>,
     translate_stream: bool,
+    draft: &mut RouteTraceDraft,
 ) -> Response {
-    let model = model_from_body(&body).unwrap_or_default();
+    let model = draft.requested_model().unwrap_or_default().to_string();
     // B-224 长尾（M42-S2b §4.4）：legacy 单上游此前传 `lease: None`，流式翻译
     // 全程不受每站并发约束——与「流式请求同样受每站并发/令牌桶约束」矛盾。
     // 现与多上游路径同口径：发请求前 `try_admit`，拿不到即 429（不发上游、
@@ -3334,6 +3632,15 @@ async fn forward_to(
             if let Some(sink) = &state.config.on_budget_breach {
                 sink(breach);
             }
+            draft.attempt(RouteAttempt {
+                site_id: state.config.site_id,
+                key_id: state.config.key_id,
+                sent: false,
+                http_status: None,
+                outcome: "local_budget_rejected",
+                latency_ms: None,
+                continued: false,
+            });
             return local_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 GatewayErrorKind::RateLimit,
@@ -3351,6 +3658,15 @@ async fn forward_to(
             state
                 .local_rejects
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            draft.attempt(RouteAttempt {
+                site_id: state.config.site_id,
+                key_id: state.config.key_id,
+                sent: false,
+                http_status: None,
+                outcome: "local_guard_rejected",
+                latency_ms: None,
+                continued: false,
+            });
             return local_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 GatewayErrorKind::RateLimit,
@@ -3378,6 +3694,15 @@ async fn forward_to(
                 response.status().as_u16(),
                 latency_ms,
             );
+            draft.attempt(RouteAttempt {
+                site_id: state.config.site_id,
+                key_id: state.config.key_id,
+                sent: true,
+                http_status: Some(response.status().as_u16()),
+                outcome: "upstream_response",
+                latency_ms: Some(latency_ms),
+                continued: false,
+            });
             // legacy 单上游：`key_id` 回退到启动参数（M40-S1 §4.1）。
             // M42-S2a：翻译协议在 legacy 单上游上同样生效（Chat 仍是零翻译直通）。
             maybe_translate_response(
@@ -3397,12 +3722,27 @@ async fn forward_to(
             )
             .await
         }
-        Err(failure) => local_error(
-            StatusCode::BAD_GATEWAY,
-            GatewayErrorKind::Api,
-            "upstream_failed",
-            failure.message(),
-        ),
+        Err(failure) => {
+            draft.attempt(RouteAttempt {
+                site_id: state.config.site_id,
+                key_id: state.config.key_id,
+                sent: true,
+                http_status: None,
+                outcome: if failure.is_replayable() {
+                    "connection_not_accepted"
+                } else {
+                    "ambiguous_transport"
+                },
+                latency_ms: Some(started.elapsed().as_millis() as u64),
+                continued: false,
+            });
+            local_error(
+                StatusCode::BAD_GATEWAY,
+                GatewayErrorKind::Api,
+                "upstream_failed",
+                failure.message(),
+            )
+        }
     }
 }
 
@@ -3865,26 +4205,33 @@ fn eligible_candidates<'a>(
     candidates: &[&'a Upstream],
     model: Option<&str>,
     now: Instant,
-) -> Vec<Candidate<'a>> {
+) -> (Vec<Candidate<'a>>, Vec<(&'a Upstream, &'static str)>) {
     let Ok(mut guard) = breaker.lock() else {
         // 锁中毒：放行全部候选。可用性优先——一次 panic 不该让网关永久 503。
-        return candidates
-            .iter()
-            .map(|u| Candidate {
-                upstream: u,
-                probe: false,
-            })
-            .collect();
+        return (
+            candidates
+                .iter()
+                .map(|u| Candidate {
+                    upstream: u,
+                    probe: false,
+                })
+                .collect(),
+            Vec::new(),
+        );
     };
     let mut out = Vec::with_capacity(candidates.len());
-    for upstream in candidates {
+    let mut excluded = Vec::new();
+    for upstream in candidates.iter().copied() {
         // M39-S3 §4.4：熔断键 `(site_id, Some(model))`；无 model ⇒ `(site_id, None)`。
         let key = match model {
             Some(m) => model_key(upstream.site_id, m),
             None => site_key(upstream.site_id),
         };
         match guard.state(&key, now) {
-            BreakerState::Open => continue,
+            BreakerState::Open => {
+                excluded.push((upstream, "breaker_open"));
+                continue;
+            }
             BreakerState::HalfOpen => {
                 // P2-8：第一个拿到探针的请求在 Breaker 里标记，其余并发请求看到标记
                 // 即跳过。探针结果回来后按结果分流清除标记：2xx / failover 由
@@ -3896,6 +4243,8 @@ fn eligible_candidates<'a>(
                         upstream,
                         probe: true,
                     });
+                } else {
+                    excluded.push((upstream, "probe_in_flight"));
                 }
             }
             BreakerState::Closed => out.push(Candidate {
@@ -3904,7 +4253,7 @@ fn eligible_candidates<'a>(
             }),
         }
     }
-    out
+    (out, excluded)
 }
 
 /// M40-S2：`BreakerState` → DTO 字符串（唯一出处）。
@@ -4895,6 +5244,7 @@ mod tests {
             exit: Arc::new(std::sync::Mutex::new(None)),
             // M40-S2：测试用句柄的指标占位（不参与本用例断言）
             metrics: GatewayMetrics::new(),
+            traces: Arc::new(RouteTraceStore::new(trace::ROUTE_TRACE_CAPACITY)),
             initial_route_is_empty: true,
             runtime: None,
             breaker: Arc::new(Mutex::new(Breaker::new(BreakerPolicy::default()))),
@@ -5357,19 +5707,40 @@ mod tests {
 
     // ---------- M16-S4 / P2-13：重放安全性的分类 ----------
 
-    /// `status_allows_replay`：**只有 429** 算「上游没处理这个请求」。
-    ///
-    /// 这一格是计费决策的判据，逐值钉死：5xx（含 524 / 504 这类可能已经跑完计费的超时）
-    /// 一律不许重放；429 是限流，发生在处理之前。
+    /// M0：状态码矩阵同时钉住「是否记上游失败」与「是否允许本次重放」。
+    /// 两列刻意独立：5xx 记失败、参与后续熔断恢复，但当前请求绝不换站重放。
     #[test]
-    fn only_429_allows_replay_after_a_status_code() {
-        assert!(status_allows_replay(429), "429 = 限流，未进入处理 ⇒ 可重放");
-        for status in [
-            400u16, 401, 402, 403, 404, 408, 422, 499, 500, 502, 503, 504, 520, 524, 529,
-        ] {
-            assert!(
-                !status_allows_replay(status),
-                "{status} 可能已计费（或本就不该切换）⇒ 不许重放"
+    fn http_status_failure_and_replay_matrix() {
+        let cases = [
+            (200u16, false, false),
+            (204, false, false),
+            (400, false, false),
+            (401, false, false),
+            (402, false, false),
+            (403, false, false),
+            (404, false, false),
+            (408, false, false),
+            (422, false, false),
+            (429, true, true),
+            (499, false, false),
+            (500, true, false),
+            (502, true, false),
+            (503, true, false),
+            (504, true, false),
+            (524, true, false),
+            (599, true, false),
+            (600, false, false),
+        ];
+        for (status, record_failure, allow_replay) in cases {
+            assert_eq!(
+                should_failover(status),
+                record_failure,
+                "HTTP {status} 的上游失败 / 熔断语义"
+            );
+            assert_eq!(
+                status_allows_replay(status),
+                allow_replay,
+                "HTTP {status} 的本次请求重放许可"
             );
         }
     }

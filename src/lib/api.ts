@@ -644,6 +644,36 @@ export type GatewayStatus = {
   ewmaLatencyMs?: Record<number, number>;
 };
 
+export type RouteTrace = {
+  id: number;
+  startedAt: number;
+  toHeadersMs: number;
+  totalMs: number;
+  endKind: string;
+  protocol: string;
+  tokenId: number | null;
+  generation: number;
+  mode: string;
+  agentLabel: string;
+  model: string | null;
+  resolvedModel: string | null;
+  decisions: {
+    stage: string;
+    candidates: { siteId: number; keyId: number | null; state: string }[];
+  }[];
+  attempts: {
+    siteId: number;
+    keyId: number | null;
+    sent: boolean;
+    httpStatus: number | null;
+    outcome: string;
+    latencyMs: number | null;
+    continued: boolean;
+  }[];
+  finalStatus: number;
+  finalKind: string;
+};
+
 export type GatewayCandidate = {
   siteId: number;
   /** 站点显示名（与站点列表同源；不是 base_url）。 */
@@ -2088,6 +2118,11 @@ export async function gatewayStatus(): Promise<GatewayStatus> {
     });
   }
   return invokeCommand<GatewayStatus>("gateway_status");
+}
+
+export async function gatewayRouteTraces(): Promise<RouteTrace[]> {
+  if (!hasTauri) return mock([]);
+  return invokeCommand<RouteTrace[]>("gateway_route_traces");
 }
 
 export async function gatewayStart(

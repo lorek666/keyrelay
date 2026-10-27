@@ -1540,6 +1540,37 @@
       "clineProbeVersionUnknown": "unknown",
       "clineProbeNotFound": "No cline CLI found in the app's search scope."
     },
+    "traces": {
+      "title": "Recent routing traces",
+      "privacy": "Current gateway process only, up to 60 entries; no secrets, URLs, or request/response bodies.",
+      "notRunning": "The gateway is not running; no traces.",
+      "empty": "No completed requests yet.",
+      "error": "Cannot read routing traces: {error}",
+      "unknownModel": "Model unavailable or not safe to display",
+      "noAttempts": "No request was sent upstream.",
+      "defaultAgent": "Default token",
+      "outcome": {
+        "local_budget_rejected": "Skipped by local budget",
+        "local_guard_rejected": "Skipped by local guard",
+        "connection_not_accepted": "Connection not established",
+        "ambiguous_transport": "Ambiguous transport failure",
+        "upstream_response": "Upstream response"
+      },
+      "state": {
+        "breaker_open": "Circuit open",
+        "probe_in_flight": "Probe in flight",
+        "breaker_unknown": "Circuit state unknown",
+        "revoked": "Key revoked",
+        "missing_secret": "Missing key material"
+      },
+      "end": {
+        "response_started": "Response started",
+        "body_end": "Response complete",
+        "body_error": "Response body error",
+        "body_dropped": "Body end not observed (possibly disconnected)",
+        "request_cancelled": "Cancelled before response"
+      }
+    },
     "statusFailed": "Could not read gateway status: {error}",
     "statusUnknown": "Status unknown",
     "copyFail": "Copy failed ({error})—select the token text above manually.",

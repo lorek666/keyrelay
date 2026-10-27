@@ -18,6 +18,7 @@ vi.mock("../lib/api", async (importOriginal) => {
   return {
     ...actual,
     gatewayStatus: vi.fn(),
+    gatewayRouteTraces: vi.fn(),
     listSites: vi.fn(),
     listStoredKeys: vi.fn(),
     listChannelBindings: vi.fn(),
@@ -31,6 +32,7 @@ import {
   applyDelivery,
   deliveryPlan,
   type DeliveryPlan,
+  gatewayRouteTraces,
   gatewayStatus,
   gatewayTokenList,
   listChannelBindings,
@@ -124,6 +126,8 @@ const phaseLine = () =>
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(gatewayStatus).mockResolvedValue(status());
+  vi.mocked(gatewayRouteTraces).mockResolvedValue([]);
   vi.mocked(listSites).mockResolvedValue([]);
   vi.mocked(listStoredKeys).mockResolvedValue([]);
   vi.mocked(listChannelBindings).mockResolvedValue([]);
@@ -159,6 +163,75 @@ describe("GatewayCard 高级设置分组", () => {
     expect(screen.getByLabelText(zhCN.gateway.multiSiteLabel).closest(".gateway-routing-group")).not.toBeNull();
     expect(document.querySelector(".gateway-runtime .gateway-phase-badge")).toBeNull();
     await waitFor(() => expect(document.querySelector(".gateway-card-header [data-gateway-phase]")?.textContent).toBe(zhCN.gateway.phase.stopped));
+  });
+});
+
+describe("M1 路由轨迹", () => {
+  it("running：显示真实尝试与候选排除原因；不渲染正文", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(
+      status({
+        running: true,
+        phase: "running",
+        url: "http://127.0.0.1:8787",
+        token: "kr-gw-test",
+      }),
+    );
+    vi.mocked(gatewayRouteTraces).mockResolvedValue([
+      {
+        id: 3,
+        startedAt: 1_700_000_000,
+        toHeadersMs: 5,
+        totalMs: 8,
+        endKind: "body_end",
+        protocol: "openai_chat",
+        tokenId: null,
+        generation: 2,
+        mode: "multi",
+        agentLabel: "codex",
+        model: "gpt-trace",
+        resolvedModel: null,
+        decisions: [
+          {
+            stage: "breaker",
+            candidates: [
+              { siteId: 1, keyId: 11, state: "breaker_open" },
+              { siteId: 2, keyId: 12, state: "eligible" },
+            ],
+          },
+        ],
+        attempts: [
+          {
+            siteId: 2,
+            keyId: 12,
+            sent: true,
+            httpStatus: 200,
+            outcome: "upstream_response",
+            latencyMs: 8,
+            continued: false,
+          },
+        ],
+        finalStatus: 200,
+        finalKind: "response",
+      },
+    ]);
+    renderCard();
+    await waitFor(() =>
+      expect(document.querySelector("[data-route-traces]")?.textContent).toContain("gpt-trace"),
+    );
+    const panel = document.querySelector("[data-route-traces]")!;
+    expect(panel.textContent).toContain("熔断中");
+    expect(panel.textContent).toContain("响应结束");
+    expect(panel.textContent).not.toContain("kr-gw-test");
+  });
+
+  it("stopped：不显示轨迹空表或请求按钮可用状态", async () => {
+    renderCard();
+    await waitFor(() =>
+      expect(document.querySelector("[data-route-traces]")?.textContent).toContain(
+        zhCN.gateway.traces.notRunning,
+      ),
+    );
+    expect(gatewayRouteTraces).not.toHaveBeenCalled();
   });
 });
 

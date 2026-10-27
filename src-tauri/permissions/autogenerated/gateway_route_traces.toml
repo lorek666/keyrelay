@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gateway-route-traces"
+description = "Enables the gateway_route_traces command without any pre-configured scope."
+commands.allow = ["gateway_route_traces"]
+
+[[permission]]
+identifier = "deny-gateway-route-traces"
+description = "Denies the gateway_route_traces command without any pre-configured scope."
+commands.deny = ["gateway_route_traces"]

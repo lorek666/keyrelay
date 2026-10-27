@@ -591,6 +591,7 @@ pub fn configure_with_state<R: tauri::Runtime>(
             commands::audit_redaction,
             commands::report_ui_ready,
             commands::gateway_status,
+            commands::gateway_route_traces,
             commands::gateway_start,
             commands::gateway_stop,
             commands::export_bundle,

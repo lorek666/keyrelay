@@ -7,6 +7,7 @@ import {
   isDelistedBindingAgent,
   deliveryPlan,
   gatewayRotateToken,
+  gatewayRouteTraces,
   gatewayStart,
   gatewayStatus,
   gatewayStop,
@@ -16,6 +17,7 @@ import {
   listChannelBindings,
   listSites,
   listStoredKeys,
+  type RouteTrace,
   applyDelivery,
   type ChannelBinding,
   type ClineCliProbe,
@@ -178,6 +180,89 @@ export function GatewayMetricsPanel({ status }: { status?: GatewayStatus }) {
         </div>
       )}
     </div>
+  );
+}
+
+export function GatewayRouteTracesPanel({ running }: { running: boolean }) {
+  const { t } = useTranslation();
+  const traces = useQuery({
+    queryKey: ["gateway-route-traces"],
+    queryFn: gatewayRouteTraces,
+    enabled: running,
+    refetchInterval: 2000,
+    refetchIntervalInBackground: false,
+  });
+  const sites = useQuery({ queryKey: ["sites"], queryFn: listSites });
+  const names = new Map((sites.data ?? []).map((site) => [site.id, site.displayName]));
+  const siteName = (id: number) => names.get(id) ?? `#${id}`;
+  return (
+    <div className="gateway-metrics" data-route-traces>
+      <div className="row row-between">
+        <h4>{t("gateway.traces.title")}</h4>
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={() => traces.refetch()}
+          disabled={!running || traces.isFetching}
+        >
+          <RefreshCw size={14} aria-hidden /> {t("common.refresh")}
+        </button>
+      </div>
+      <p className="muted">{t("gateway.traces.privacy")}</p>
+      {!running ? <p className="muted">{t("gateway.traces.notRunning")}</p> : null}
+      {running && traces.isLoading ? <p className="muted">{t("common.loading")}</p> : null}
+      {traces.isError ? (
+        <p className="error" role="alert">
+          {t("gateway.traces.error", { error: (traces.error as Error).message })}
+        </p>
+      ) : null}
+      {running && traces.data?.length === 0 ? (
+        <p className="muted">{t("gateway.traces.empty")}</p>
+      ) : null}
+      {(traces.data ?? []).map((trace) => (
+        <TraceEntry key={trace.id} trace={trace} siteName={siteName} />
+      ))}
+    </div>
+  );
+}
+
+function TraceEntry({
+  trace,
+  siteName,
+}: {
+  trace: RouteTrace;
+  siteName: (id: number) => string;
+}) {
+  const { t } = useTranslation();
+  const attempts = trace.attempts
+    .map((attempt) => {
+      const target = `${siteName(attempt.siteId)}${attempt.keyId == null ? "" : ` / key #${attempt.keyId}`}`;
+      if (!attempt.sent) return `${target} · ${t(`gateway.traces.outcome.${attempt.outcome}`)}`;
+      return `${target} · ${attempt.httpStatus ?? t(`gateway.traces.outcome.${attempt.outcome}`)}${attempt.continued ? " →" : ""}`;
+    })
+    .join("；");
+  return (
+    <details className="gateway-trace-entry">
+      <summary>
+        <span className="badge">{trace.finalStatus || "—"}</span>{" "}
+        <span className="mono">{trace.model ?? t("gateway.traces.unknownModel")}</span>{" "}
+        <span className="muted">{trace.protocol} · {trace.totalMs} ms</span>
+      </summary>
+      <p>{attempts || t("gateway.traces.noAttempts")}</p>
+      <p className="muted">
+        {trace.agentLabel || t("gateway.traces.defaultAgent")} · {t(`gateway.traces.end.${trace.endKind}`)}
+        {trace.resolvedModel && trace.resolvedModel !== trace.model ? ` → ${trace.resolvedModel}` : ""}
+      </p>
+      {trace.decisions.filter((decision) => decision.candidates.some((candidate) =>
+        !["candidate", "eligible", "sendable", "selected", "backup", "probe"].includes(candidate.state),
+      )).map((decision) => (
+        <p className="muted" key={decision.stage}>
+          {decision.stage}: {decision.candidates.filter((candidate) =>
+            !["candidate", "eligible", "sendable", "selected", "backup", "probe"].includes(candidate.state),
+          ).map((candidate) => `${siteName(candidate.siteId)}=${t(`gateway.traces.state.${candidate.state}`)}`).join("，")}
+        </p>
+      ))}
+    </details>
   );
 }
 
@@ -1460,6 +1545,7 @@ export default function GatewayCard({
         description={t("gateway.sections.metricsHint")}
       >
         <GatewayMetricsPanel status={status.data} />
+        <GatewayRouteTracesPanel running={status.data?.running ?? false} />
       </GatewaySection>
 
       <GatewaySection

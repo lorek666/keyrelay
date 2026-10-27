@@ -35,6 +35,7 @@
     "allow-audit-redaction",
     "allow-report-ui-ready",
     "allow-gateway-status",
+    "allow-gateway-route-traces",
     "allow-gateway-start",
     "allow-gateway-stop",
     "allow-export-bundle",

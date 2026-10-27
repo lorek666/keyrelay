@@ -3054,6 +3054,22 @@ pub fn gateway_status(state: State<'_, AppState>) -> Result<GatewayStatusDto, St
     Ok(gateway_status_of(&state))
 }
 
+/// M1：当前网关进程内的路由轨迹；停止 / 重启后为空，不落库、不走网络。
+#[tauri::command]
+pub fn gateway_route_traces(
+    state: State<'_, AppState>,
+) -> Result<Vec<tianshu_relay_core::gateway::trace::RouteTrace>, String> {
+    let guard = state
+        .gateway
+        .lock()
+        .map_err(|_| "网关状态锁不可用".to_string())?;
+    Ok(guard
+        .as_ref()
+        .filter(|run| run.handle.alive())
+        .map(|run| run.handle.route_traces())
+        .unwrap_or_default())
+}
+
 /// 等待网关真正停止的**上界**（M5-S5 接线 / 处置 M5-S4 复审 P2-1）。
 ///
 /// `GatewayHandle::shutdown_and_wait()` 本身没有上界：上游卡住且仍有客户端在等时，
