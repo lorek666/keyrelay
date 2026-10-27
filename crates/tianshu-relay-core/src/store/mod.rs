@@ -2499,6 +2499,10 @@ impl Store {
     /// （`at` 是请求完成时刻）。直接吃 `GatewayUsage` 而不是 11 个标量参数：账目只有一个
     /// 结构，参数化只能靠位置对齐，`model` 写进 `key_id` 这种错位编译器抓不到。
     pub fn insert_gateway_usage(&self, usage: &crate::gateway::GatewayUsage) -> Result<()> {
+        // 用量账本同样只接受模型标识形状的 model、去 URL 的有界 label：
+        // 这两列来自请求/本地标签，不能成为任意自由文本（甚至 prompt/URL）的落库通道。
+        let model = crate::gateway::trace::safe_model_text(&usage.model).unwrap_or_default();
+        let agent_label = crate::gateway::trace::safe_agent_label(&usage.agent_label);
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO gateway_usage_log(ts, at, site_id, key_id, model, prompt_tokens, completion_tokens, total_tokens, status, latency_ms, attempts, stream, token_id, agent_label) \
@@ -2508,7 +2512,7 @@ impl Store {
                 usage.at,
                 usage.site_id,
                 usage.key_id,
-                usage.model,
+                model,
                 usage.prompt_tokens,
                 usage.completion_tokens,
                 usage.total_tokens,
@@ -2517,7 +2521,7 @@ impl Store {
                 i64::from(usage.attempts),
                 i64::from(usage.stream),
                 usage.token_id,
-                usage.agent_label,
+                agent_label,
             ],
         ).map_err(|e| Error::Store(format!("gateway usage insert: {e}")))?;
         Ok(())
@@ -4668,6 +4672,42 @@ mod tests {
         assert_eq!(rows[1].prompt_tokens, 100);
         assert_eq!(rows[1].model, "gpt-4");
         assert_eq!(rows[1].site_id, site_id);
+    }
+
+    #[test]
+    fn gateway_usage_insert_drops_url_shaped_model_and_label() {
+        let store = Store::open_in_memory().unwrap();
+        let site_id = store.upsert_site("newapi", "https://a", "A").unwrap();
+        store
+            .insert_gateway_usage(&crate::gateway::GatewayUsage {
+                at: now_secs(),
+                site_id,
+                key_id: None,
+                model: "https://relay.example/private-prompt".to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+                status: 200,
+                latency_ms: 1,
+                attempts: 1,
+                stream: false,
+                token_id: None,
+                agent_label: "mailto:agent@example.com".to_string(),
+            })
+            .unwrap();
+        let conn = store.lock().unwrap();
+        let (model, label): (String, String) = conn
+            .query_row(
+                "SELECT model, agent_label FROM gateway_usage_log",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(model, "", "URL-shaped model must not enter the ledger");
+        assert_eq!(
+            label, "",
+            "URL-shaped agent label must not enter the ledger"
+        );
     }
 
     #[test]

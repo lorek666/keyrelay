@@ -477,6 +477,45 @@ async fn explicit_anthropic_upstream_preserves_native_request_and_response() {
     handle.shutdown_and_wait().await;
 }
 
+fn request_native_anthropic_dual_headers(port: u16, body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let request = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: real-anthropic-key-canary\r\nAuthorization: Bearer {TOKEN}\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).unwrap();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let status = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, text)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_dual_auth_prefers_local_bearer_and_never_leaks_real_key() {
+    let a = upstream("200 OK", r#"{"type":"message","content":[]}"#);
+    let mut candidate = candidate(1, &a, 1.0);
+    candidate.models = vec!["claude-native".into()];
+    let handle =
+        start_with_options(vec![candidate], false, UpstreamProtocol::AnthropicMessages).await;
+    let (status, body) = request_native_anthropic_dual_headers(
+        handle.addr.port(),
+        r#"{"model":"claude-native","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+    );
+    assert_eq!(status, 200, "{body}");
+    let seen = a.seen.lock().unwrap().join("\n");
+    assert!(
+        !seen.contains("real-anthropic-key-canary"),
+        "客户端的真实 x-api-key 绝不能转发: {seen}"
+    );
+    assert!(
+        seen.to_ascii_lowercase()
+            .contains("x-api-key: sk-test-trace-1"),
+        "上游应收到站点 key: {seen}"
+    );
+    handle.shutdown_and_wait().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn anthropic_upstream_rejects_chat_before_sending() {
     let a = upstream("200 OK", "{}");

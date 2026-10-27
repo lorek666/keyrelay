@@ -124,12 +124,14 @@ fn should_strip_response_header(name: &str) -> bool {
 /// **不得**送到任何上游（否则等于把一个长期关联标识泄漏给多个站点）。
 fn should_strip_request_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    const STRIP: [&str; 15] = [
+    const STRIP: [&str; 17] = [
         // 令牌载体：必须换掉（旧名 `x-keyrelay-token` 仍兼容一个版本）。
-        // `x-api-key` 是 Anthropic 客户端的标准认证头；绝不能把客户端的真实
-        // Anthropic key 原样转发给另一个上游（否则会覆盖站点密钥并按错误账户计费）。
+        // `x-api-key` / `x-goog-api-key` / `api-key` 是 Anthropic / Gemini / Azure
+        // 风格客户端的标准认证头；绝不能把客户端真实密钥原样转发给另一个上游。
         "authorization",
         "x-api-key",
+        "x-goog-api-key",
+        "api-key",
         "x-tianshu-relay-token",
         "x-keyrelay-token",
         // 本地会话粘性标识：只在网关内派生哈希，不向上游传播。
@@ -232,10 +234,16 @@ fn merge_usage_from_json(
             .get("message")
             .and_then(|message| message.get("usage"))
     })?;
-    let base_input = usage
+    // OpenAI 的 `prompt_tokens` 已经包含缓存命中；只有 Anthropic 的
+    // `input_tokens` 才需要把两个 cache 字段加进来。不要把两种口径混用。
+    let openai_prompt = usage
         .get("prompt_tokens")
-        .or_else(|| usage.get("input_tokens"))
-        .and_then(|v| v.as_i64());
+        .and_then(|v| v.as_i64())
+        .filter(|tokens| *tokens >= 0);
+    let anthropic_input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_i64())
+        .filter(|tokens| *tokens >= 0);
     let cache_creation = usage
         .get("cache_creation_input_tokens")
         .and_then(|v| v.as_i64())
@@ -246,8 +254,9 @@ fn merge_usage_from_json(
         .and_then(|v| v.as_i64())
         .filter(|tokens| *tokens >= 0)
         .unwrap_or(0);
-    let prompt = match base_input {
-        Some(input) if input >= 0 => input
+    let prompt = match (openai_prompt, anthropic_input) {
+        (Some(prompt), _) => prompt,
+        (None, Some(input)) => input
             .saturating_add(cache_creation)
             .saturating_add(cache_read),
         _ => previous.map(|old| old.0)?,
@@ -2299,26 +2308,38 @@ struct AppState {
 }
 
 /// 取出请求里的本地令牌。支持 `Authorization: Bearer`、`X-Api-Key`、
-/// `X-Tianshu-Relay-Token`，以及旧版 `X-KeyRelay-Token`（兼容一个版本，避免已投递的
-/// 本地网关客户端升级后 401）。
+/// `X-Goog-Api-Key` / `Api-Key`、`X-Tianshu-Relay-Token`，以及旧版
+/// `X-KeyRelay-Token`（兼容一个版本，避免已投递的本地网关客户端升级后 401）。
 ///
-/// `X-Api-Key` 是 Anthropic SDK 的标准认证头。这里接受的是**本地网关令牌**，
-/// 不是上游 Anthropic key；后续构造上游请求时会无条件换成本次命中的站点密钥。
+/// `X-Api-Key` 是 Anthropic SDK 的标准认证头，`X-Goog-Api-Key` / `Api-Key`
+/// 分别对应 Gemini / Azure 风格客户端。这里接受的都是**本地网关令牌**，
+/// 不是上游密钥；后续构造上游请求时会无条件换成本次命中的站点密钥。
+///
+/// 优先级：专用头 > `Authorization: Bearer` > `X-Api-Key` > Gemini/Azure 头。
+/// 这样「真实 `X-Api-Key` + 本地 Bearer」的双头客户端不会被真实上游 key 抢先匹配而 401。
 fn presented_token(headers: &HeaderMap) -> Option<String> {
-    for name in ["x-tianshu-relay-token", "x-keyrelay-token", "x-api-key"] {
+    for name in ["x-tianshu-relay-token", "x-keyrelay-token"] {
         if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
-            // P3-6：两个令牌头都要 trim（与 Bearer 路径同口径）。
+            // P3-6：专用令牌头要 trim（与 Bearer 路径同口径）。
             return Some(value.trim().to_string());
         }
     }
-    let auth = headers.get("authorization")?.to_str().ok()?;
-    // P3-6：Bearer scheme 大小写不敏感（RFC 7235 scheme 是 case-insensitive），
-    // 不只认 "Bearer"/"bearer" 两种。
-    let (scheme, rest) = auth.split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("bearer") {
-        return None;
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        // P3-6：Bearer scheme 大小写不敏感（RFC 7235 scheme 是 case-insensitive），
+        // 不只认 "Bearer"/"bearer" 两种。非 Bearer 的 Authorization 不阻止
+        // 后面的标准 API-key 头继续参与认证。
+        if let Some((scheme, rest)) = auth.split_once(' ') {
+            if scheme.eq_ignore_ascii_case("bearer") {
+                return Some(rest.trim().to_string());
+            }
+        }
     }
-    Some(rest.trim().to_string())
+    for name in ["x-api-key", "x-goog-api-key", "api-key"] {
+        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
 }
 
 /// P3-6：恒定时间比较令牌。`==` / `!=` 在第一个不匹配字节就提前返回，理论上能
@@ -5293,6 +5314,30 @@ mod tests {
             Some("agent-local-token")
         );
 
+        // Claude Code 会写 Authorization，而环境里可能同时残留真实的 ANTHROPIC_API_KEY。
+        // 本地 Bearer 必须优先，否则双头请求会拿真实上游 key 去和本地 registry 比较 → 401。
+        let mut dual = HeaderMap::new();
+        dual.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer local-agent-token"),
+        );
+        dual.insert("x-api-key", HeaderValue::from_static("real-anthropic-key"));
+        assert_eq!(
+            presented_token(&dual).as_deref(),
+            Some("local-agent-token"),
+            "本地 Bearer 必须优先于真实的 x-api-key"
+        );
+
+        let mut gemini = HeaderMap::new();
+        gemini.insert(
+            "x-goog-api-key",
+            HeaderValue::from_static("local-gemini-token"),
+        );
+        assert_eq!(
+            presented_token(&gemini).as_deref(),
+            Some("local-gemini-token")
+        );
+
         let mut headers = HeaderMap::new();
         headers.insert("authorization", HeaderValue::from_static("Basic abc"));
         assert_eq!(presented_token(&headers), None, "非 Bearer 不认");
@@ -5412,6 +5457,8 @@ mod tests {
         for name in [
             "authorization",
             "x-api-key",
+            "x-goog-api-key",
+            "api-key",
             "X-Tianshu-Relay-Token",
             "X-KeyRelay-Token",
             "X-Tianshu-Session",
@@ -5424,7 +5471,13 @@ mod tests {
         ] {
             assert!(should_strip_request_header(name), "「{name}」不该转发");
         }
-        for name in ["content-type", "accept", "user-agent", "x-request-id"] {
+        for name in [
+            "content-type",
+            "accept",
+            "user-agent",
+            "x-request-id",
+            "api-version",
+        ] {
             assert!(!should_strip_request_header(name), "「{name}」该转发");
         }
     }
@@ -5901,6 +5954,12 @@ mod tests {
             extract_usage_from_json(cached),
             Some((159, 2, 161)),
             "cache creation/read are billed input and must be counted"
+        );
+        let openai_with_cache_metadata = br#"{"usage":{"prompt_tokens":159,"cache_creation_input_tokens":100,"cache_read_input_tokens":50,"completion_tokens":2,"total_tokens":161}}"#;
+        assert_eq!(
+            extract_usage_from_json(openai_with_cache_metadata),
+            Some((159, 2, 161)),
+            "OpenAI prompt_tokens already includes cached tokens; do not add cache fields twice"
         );
         let nested = br#"{"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}"#;
         assert_eq!(extract_usage_from_json(nested), Some((12, 1, 13)));
