@@ -422,11 +422,22 @@ fn parse_key_meta(item: &Value, quota_per_unit: i64) -> Result<Option<KeyMeta>> 
     //（M9-S6 §1）。整数 token 配额单位，`/ quota_per_unit` 换算成 USD（与 `balance()` 同口径）。
     // `quota_per_unit` 是 `/api/user/self` 字段、`list_keys` 响应不返回，这里用适配器持有的值
     //（`DEFAULT_QUOTA_PER_UNIT` 兜底，见 spec §11 差异⑤）。缺字段 ⇒ `None`（不写 0）。
+    //
+    // 关键：`remain_quota` 是**剩余额度**，不是总额。网关的额度健康度按
+    // `used / limit` 计算，直接把 remain 写进 `quota_limit` 会得到相反结论
+    //（用掉一半时 ratio=1，被误判成已耗尽）。NewAPI 没有单独的总额字段，
+    // 因此只有 `used_quota` 与 `remain_quota` **同时存在**时才能无损重建
+    // `limit = used + remaining`；任一缺失都保持 unknown，绝不猜。
     let unit = quota_per_unit.max(1) as f64;
-    let quota_used = item
+    let used_units = item
         .get("used_quota")
         .and_then(|v| v.as_i64())
-        .map(|q| q as f64 / unit);
+        .filter(|q| *q >= 0);
+    let remain_units = item
+        .get("remain_quota")
+        .and_then(|v| v.as_i64())
+        .filter(|q| *q >= 0);
+    let quota_used = used_units.map(|q| q as f64 / unit);
     let unlimited = item
         .get("unlimited_quota")
         .and_then(|v| v.as_bool())
@@ -434,9 +445,9 @@ fn parse_key_meta(item: &Value, quota_per_unit: i64) -> Result<Option<KeyMeta>> 
     let quota_limit = if unlimited {
         None
     } else {
-        item.get("remain_quota")
-            .and_then(|v| v.as_i64())
-            .map(|q| q as f64 / unit)
+        used_units
+            .zip(remain_units)
+            .map(|(used, remaining)| used.saturating_add(remaining) as f64 / unit)
     };
     // 只在至少解析到一个用量字段时才标币种（避免给「全 None」的 key 一个误导性的 USD 标签）。
     let currency = if quota_used.is_some() || quota_limit.is_some() {

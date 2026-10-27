@@ -4,6 +4,7 @@
 //! spec §11 差异②）。
 
 use serde_json::json;
+use tianshu_relay_core::gateway::quota::{KeyQuotaSnapshot, QuotaRank};
 use tianshu_relay_core::site::newapi::NewApi;
 use tianshu_relay_core::site::sub2api::Sub2Api;
 use tianshu_relay_core::site::transport::{HttpResponse, MockTransport};
@@ -136,6 +137,7 @@ async fn sub2api_fetch_daily_usage_401_is_auth_failed() {
 #[tokio::test]
 async fn newapi_list_keys_parses_used_quota_into_usd() {
     // used_quota=500_000, quota_per_unit=500_000 (DEFAULT) ⇒ quota_used=1.0 USD
+    // remain_quota=4_500_000 ⇒ 总额 = used + remaining = 5_000_000 ⇒ 10.0 USD
     let resp = HttpResponse::json(
         200,
         json!({
@@ -160,10 +162,43 @@ async fn newapi_list_keys_parses_used_quota_into_usd() {
     );
     assert_eq!(
         keys[0].quota_limit,
-        Some(9.0),
-        "remain_quota / quota_per_unit = 9.0 USD"
+        Some(10.0),
+        "quota_limit 必须是 used + remain = 10.0 USD，不能把 remain 当总额"
     );
     assert_eq!(keys[0].currency.as_deref(), Some("USD"));
+}
+
+#[tokio::test]
+async fn newapi_half_used_key_ranks_healthy_not_exhausted() {
+    // 复审 H2 回归：used=5, remain=5 是「用了一半」，不是「额度耗尽」。
+    // 旧实现把 remain 当 limit，ratio=5/5=1.0 ⇒ Exhausted，完全反过来。
+    let resp = HttpResponse::json(
+        200,
+        json!({
+            "success": true,
+            "data": {
+                "items": [{
+                    "id": 15, "name": "half-used", "status": 1,
+                    "used_quota": 2_500_000, "remain_quota": 2_500_000,
+                    "unlimited_quota": false
+                }],
+                "total": 1
+            }
+        }),
+    )
+    .expect("构造响应");
+    let adapter = NewApi::new(MockTransport::new(vec![resp]));
+    let keys = adapter.list_keys(BASE, &bearer()).await.unwrap();
+    assert_eq!(keys[0].quota_used, Some(5.0));
+    assert_eq!(keys[0].quota_limit, Some(10.0));
+    let snapshot = KeyQuotaSnapshot::from_stored(
+        keys[0].quota_used,
+        keys[0].quota_limit,
+        Some(1_000),
+        "newapi_list_keys",
+    );
+    assert_eq!(snapshot.rank_at(1_000), QuotaRank::Healthy);
+    assert_ne!(snapshot.rank_at(1_000), QuotaRank::Exhausted);
 }
 
 #[tokio::test]

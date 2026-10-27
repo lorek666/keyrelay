@@ -1568,7 +1568,8 @@
         "quota_near_limit": "Quota near limit",
         "quota_exhausted_soft": "Quota at limit (soft)",
         "quota_unlimited": "Quota unlimited",
-        "quota_unknown": "Quota unknown"
+        "quota_unknown": "Quota unknown",
+        "quota_stale": "Quota snapshot stale (not ranked)"
       },
       "end": {
         "response_started": "Response started",

@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tianshu_relay_core::gateway::{
-    session::UpstreamProtocol, GatewayConfig, GatewayHandle, GatewayTokenEntry, UpstreamTimeout,
+    session::UpstreamProtocol, GatewayConfig, GatewayHandle, GatewayTokenEntry, GatewayUsage,
+    UpstreamTimeout,
 };
 use tianshu_relay_core::routing::{BreakerPolicy, RouteTable, SiteGuardPolicy, Upstream};
 use zeroize::Zeroizing;
@@ -21,6 +22,14 @@ struct FakeUpstream {
 }
 
 fn upstream(status: &'static str, body: &'static str) -> FakeUpstream {
+    upstream_with_headers(status, body, "")
+}
+
+fn upstream_with_headers(
+    status: &'static str,
+    body: &'static str,
+    extra_headers: &'static str,
+) -> FakeUpstream {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let hits = Arc::new(AtomicUsize::new(0));
@@ -38,7 +47,7 @@ fn upstream(status: &'static str, body: &'static str) -> FakeUpstream {
                 .unwrap()
                 .push(String::from_utf8_lossy(&buffer[..n]).to_string());
             let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes());
@@ -73,6 +82,15 @@ async fn start_with_options(
     upstreams: Vec<Upstream>,
     session_affinity: bool,
     upstream_protocol: UpstreamProtocol,
+) -> GatewayHandle {
+    start_with_options_and_usage(upstreams, session_affinity, upstream_protocol, None).await
+}
+
+async fn start_with_options_and_usage(
+    upstreams: Vec<Upstream>,
+    session_affinity: bool,
+    upstream_protocol: UpstreamProtocol,
+    on_usage: Option<Arc<dyn Fn(GatewayUsage) + Send + Sync>>,
 ) -> GatewayHandle {
     let mut keys = std::collections::HashMap::new();
     for upstream in &upstreams {
@@ -110,7 +128,7 @@ async fn start_with_options(
         guard_policy: SiteGuardPolicy::default(),
         runtime: None,
         on_failure: None,
-        on_usage: None,
+        on_usage,
         budget_check: None,
         on_budget_breach: None,
         routing_rules: Vec::new(),
@@ -239,6 +257,27 @@ async fn token_registry_is_not_serialized_as_a_secret() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn key_cooldown_can_be_cleared_on_lifecycle_change() {
+    let a = upstream_with_headers(
+        "429 Too Many Requests",
+        r#"{"error":"rate limited"}"#,
+        "Retry-After: 60\r\n",
+    );
+    let handle = start(vec![candidate(1, &a, 1.0)]).await;
+    let body = r#"{"model":"gpt-trace","messages":[]}"#;
+    assert_eq!(request(handle.addr.port(), body), 429);
+    assert_eq!(
+        handle.key_cooldown_count(),
+        1,
+        "Retry-After 应建立 key 级冷却"
+    );
+    assert_eq!(handle.clear_key_cooldowns(), 1);
+    assert_eq!(handle.key_cooldown_count(), 0);
+    assert_eq!(request(handle.addr.port(), body), 429);
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_session_sticks_and_disabled_affinity_keeps_rotation() {
     let body = r#"{"model":"gpt-trace","messages":[]}"#;
     let a = upstream("200 OK", "{}");
@@ -322,10 +361,47 @@ async fn malformed_session_identity_is_ignored_without_affinity() {
     handle.shutdown_and_wait().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_upstream_response_is_recorded_as_complete_not_dropped() {
+    let a = upstream("204 No Content", "");
+    let handle = start(vec![candidate(1, &a, 1.0)]).await;
+    assert_eq!(
+        request(handle.addr.port(), r#"{"model":"gpt-trace","messages":[]}"#,),
+        204
+    );
+    let traces = handle.route_traces();
+    assert_eq!(traces.len(), 1);
+    assert_eq!(
+        traces[0].end_kind, "body_end",
+        "正常空响应不能被误报为 body_dropped"
+    );
+    handle.shutdown_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_redirects_are_not_followed_with_credentials() {
+    let target = upstream("200 OK", "{}");
+    let location =
+        Box::leak(format!("Location: http://127.0.0.1:{}/steal\r\n", target.port).into_boxed_str());
+    let redirect = upstream_with_headers("302 Found", "", location);
+    let handle = start(vec![candidate(1, &redirect, 1.0)]).await;
+    assert_eq!(
+        request(handle.addr.port(), r#"{"model":"gpt-trace","messages":[]}"#,),
+        302,
+        "3xx 必须原样返回，不能带着站点密钥跟随到另一个主机"
+    );
+    assert_eq!(
+        target.hits.load(Ordering::SeqCst),
+        0,
+        "重定向目标绝不能收到带站点密钥的请求"
+    );
+    handle.shutdown_and_wait().await;
+}
+
 fn request_native_anthropic(port: u16, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     let request = format!(
-        "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TOKEN}\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: {TOKEN}\r\nX-Tianshu-Session: local-only-session\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).unwrap();
@@ -338,12 +414,22 @@ fn request_native_anthropic(port: u16, body: &str) -> (u16, String) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_anthropic_upstream_preserves_native_request_and_response() {
-    let response = r#"{"id":"msg_1","type":"message","content":[],"usage":{"input_tokens":9,"output_tokens":2}}"#;
+    let response = r#"{"id":"msg_1","type":"message","content":[],"usage":{"input_tokens":9,"cache_creation_input_tokens":100,"cache_read_input_tokens":50,"output_tokens":2}}"#;
     let a = upstream("200 OK", response);
     let mut candidate = candidate(1, &a, 1.0);
     candidate.models = vec!["claude-native".into()];
-    let handle =
-        start_with_options(vec![candidate], false, UpstreamProtocol::AnthropicMessages).await;
+    let usage: Arc<std::sync::Mutex<Vec<GatewayUsage>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let usage_sink = Arc::clone(&usage);
+    let handle = start_with_options_and_usage(
+        vec![candidate],
+        false,
+        UpstreamProtocol::AnthropicMessages,
+        Some(Arc::new(move |usage_row| {
+            usage_sink.lock().unwrap().push(usage_row);
+        })),
+    )
+    .await;
     let (status, body) = request_native_anthropic(
         handle.addr.port(),
         r#"{"model":"claude-native","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
@@ -364,6 +450,30 @@ async fn explicit_anthropic_upstream_preserves_native_request_and_response() {
         "原生 body 必须保留: {seen}"
     );
     assert!(!seen.contains("chat/completions"));
+    let seen_lower = seen.to_ascii_lowercase();
+    assert!(
+        seen_lower.contains("x-api-key: sk-test-trace-1"),
+        "上游必须收到站点 key: {seen}"
+    );
+    assert!(
+        !seen.contains(TOKEN),
+        "本地网关 token 绝不能作为 x-api-key 发给上游: {seen}"
+    );
+    assert!(
+        !seen.contains("local-only-session"),
+        "本地会话标识不得跨站转发: {seen}"
+    );
+    let usage = usage.lock().unwrap().clone();
+    assert_eq!(usage.len(), 1, "原生 Anthropic 也必须记一条用量");
+    assert_eq!(
+        (
+            usage[0].prompt_tokens,
+            usage[0].completion_tokens,
+            usage[0].total_tokens
+        ),
+        (159, 2, 161),
+        "缓存创建/读取 token 都是计费输入，不能漏记"
+    );
     handle.shutdown_and_wait().await;
 }
 

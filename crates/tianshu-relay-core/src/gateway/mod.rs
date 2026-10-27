@@ -35,6 +35,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use http_body::Body as _;
 use std::time::Duration;
 
 use axum::routing::any;
@@ -115,16 +116,24 @@ fn should_strip_response_header(name: &str) -> bool {
 
 /// 转发时**丢弃**的请求头。
 ///
-/// `authorization` / `x-tianshu-relay-token` 是本地令牌的载体（换成站点密钥）；
-/// 其余是 hop-by-hop 头，或调用方不该借我们的手送给上游的凭证类头
-/// （M4-S2 复审 P2-2：`Cookie` / `Proxy-Authorization` 之前会被原样转发）。
+/// `authorization` / `x-api-key` / `x-tianshu-relay-token` 都是本地令牌的载体
+/// （换成站点密钥）；其余是 hop-by-hop 头，或调用方不该借我们的手送给上游的
+/// 凭证类头（M4-S2 复审 P2-2：`Cookie` / `Proxy-Authorization` 之前会被原样转发）。
+///
+/// `x-tianshu-session` 只用于本地显式会话粘性：它由客户端自由选择且可能稳定跨请求，
+/// **不得**送到任何上游（否则等于把一个长期关联标识泄漏给多个站点）。
 fn should_strip_request_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    const STRIP: [&str; 13] = [
-        // 令牌载体：必须换掉（旧名 `x-keyrelay-token` 仍兼容一个版本）
+    const STRIP: [&str; 15] = [
+        // 令牌载体：必须换掉（旧名 `x-keyrelay-token` 仍兼容一个版本）。
+        // `x-api-key` 是 Anthropic 客户端的标准认证头；绝不能把客户端的真实
+        // Anthropic key 原样转发给另一个上游（否则会覆盖站点密钥并按错误账户计费）。
         "authorization",
+        "x-api-key",
         "x-tianshu-relay-token",
         "x-keyrelay-token",
+        // 本地会话粘性标识：只在网关内派生哈希，不向上游传播。
+        "x-tianshu-session",
         // 由我们重新计算 / 由连接层决定
         "host",
         "content-length",
@@ -207,6 +216,12 @@ fn extract_usage_from_json(body: &[u8]) -> Option<(i64, i64, i64)> {
 /// M4：Anthropic 原生流会在 `message_start.message.usage` 给输入用量、
 /// 在 `message_delta.usage` 只给最终输出用量；用前值补齐缺失的一半，
 /// 不把缺失字段猜成 0。OpenAI Chat 的完整 usage 仍按 last-wins 覆盖。
+///
+/// Anthropic 的 prompt 输入分三部分计费：`input_tokens` +
+/// `cache_creation_input_tokens` + `cache_read_input_tokens`。后两种缓存 token
+/// 同样是真实输入，必须合并进 `prompt_tokens`，否则预算与用量会系统性低估。
+/// 只有当前事件明确给出基础输入字段时才重算输入总量；只带 `output_tokens` 的
+/// `message_delta` 继续沿用前值，避免把缓存字段重复累加。
 fn merge_usage_from_json(
     body: &[u8],
     previous: Option<(i64, i64, i64)>,
@@ -217,11 +232,26 @@ fn merge_usage_from_json(
             .get("message")
             .and_then(|message| message.get("usage"))
     })?;
-    let prompt = usage
+    let base_input = usage
         .get("prompt_tokens")
         .or_else(|| usage.get("input_tokens"))
+        .and_then(|v| v.as_i64());
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
         .and_then(|v| v.as_i64())
-        .or_else(|| previous.map(|old| old.0))?;
+        .filter(|tokens| *tokens >= 0)
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_i64())
+        .filter(|tokens| *tokens >= 0)
+        .unwrap_or(0);
+    let prompt = match base_input {
+        Some(input) if input >= 0 => input
+            .saturating_add(cache_creation)
+            .saturating_add(cache_read),
+        _ => previous.map(|old| old.0)?,
+    };
     let completion = usage
         .get("completion_tokens")
         .or_else(|| usage.get("output_tokens"))
@@ -1649,6 +1679,8 @@ pub struct GatewayHandle {
     metrics: Arc<GatewayMetrics>,
     traces: Arc<RouteTraceStore>,
     sessions: Arc<SessionAffinityStore>,
+    /// M3：逐 key 429 冷却（与 `AppState` 共享；生命周期变化时可从命令层清空）。
+    key_cooldowns: Arc<KeyCooldownTable>,
     /// M40-S2：装配时的路由是否为空（`runtime` 为 `None` 时的 fallback）。
     initial_route_is_empty: bool,
     /// M39-S1 的运行时快照（热更新后会变）；`mode` 按它取**当前**真实路由。
@@ -1705,6 +1737,21 @@ impl GatewayHandle {
     /// M2：显式清空会话 pin（密钥生命周期或运维需要时）。
     pub fn clear_session_pins(&self) -> usize {
         self.sessions.clear()
+    }
+
+    /// M3：当前进程的 key 冷却条数（只用于运维状态与集成测试；不含 key 明文）。
+    pub fn key_cooldown_count(&self) -> usize {
+        self.key_cooldowns.len()
+    }
+
+    /// M3：显式清空全部 key 冷却（密钥 / 站点生命周期变化时）。
+    ///
+    /// 冷却按 `(site_id, key_id)` 记录，而本地 key id 在删除后可能被复用；
+    /// 保守地全量清空比留下一个会把新 key 误判为限流的旧条目安全。
+    pub fn clear_key_cooldowns(&self) -> usize {
+        let count = self.key_cooldowns.len();
+        self.key_cooldowns.clear();
+        count
     }
 
     /// M40-S2：M39-S1 的运行时 generation（单上游 / 无 runtime ⇒ 0）。
@@ -1933,7 +1980,11 @@ fn build_upstream_client(
 ) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(timeout.connect)
-        .read_timeout(timeout.read);
+        .read_timeout(timeout.read)
+        // 密钥都写在请求头上（Bearer / X-Api-Key）。跨主机重定向时 reqwest 只保证
+        // 去掉 Authorization / Cookie，不认识 X-Api-Key；直接禁止上游重定向，
+        // 让 3xx 原样返回，避免站点密钥被跟随到另一个主机。
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(proxy_url) = proxy_url {
         crate::proxy::validate_proxy_url(proxy_url)?;
         let proxy = reqwest::Proxy::all(proxy_url.to_string()).map_err(|e| {
@@ -2055,6 +2106,7 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
         )
         .map_err(Error::Store)?,
     );
+    let key_cooldowns = Arc::new(KeyCooldownTable::new());
     let breaker = Arc::new(Mutex::new(Breaker::new(config.breaker.clone())));
     let runtime_for_handle = config.runtime.clone();
     let route_for_handle = config.route.clone();
@@ -2067,7 +2119,7 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
         metrics: Arc::clone(&metrics),
         traces: Arc::clone(&traces),
         sessions: Arc::clone(&sessions),
-        key_cooldowns: Arc::new(KeyCooldownTable::new()),
+        key_cooldowns: Arc::clone(&key_cooldowns),
         breaker: Arc::clone(&breaker),
         round_robin: Arc::new(Mutex::new(RoundRobinState::default())),
         guards: Arc::new(Mutex::new(HashMap::new())),
@@ -2199,6 +2251,7 @@ pub async fn start_with_v6(config: GatewayConfig, v6_mode: V6BindMode) -> Result
         metrics,
         traces,
         sessions,
+        key_cooldowns,
         initial_route_is_empty,
         runtime: runtime_for_handle,
         breaker,
@@ -2245,10 +2298,14 @@ struct AppState {
     stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// 取出请求里的本地令牌。支持 `Authorization: Bearer`、`X-Tianshu-Relay-Token`，
-/// 以及旧版 `X-KeyRelay-Token`（兼容一个版本，避免已投递的本地网关客户端升级后 401）。
+/// 取出请求里的本地令牌。支持 `Authorization: Bearer`、`X-Api-Key`、
+/// `X-Tianshu-Relay-Token`，以及旧版 `X-KeyRelay-Token`（兼容一个版本，避免已投递的
+/// 本地网关客户端升级后 401）。
+///
+/// `X-Api-Key` 是 Anthropic SDK 的标准认证头。这里接受的是**本地网关令牌**，
+/// 不是上游 Anthropic key；后续构造上游请求时会无条件换成本次命中的站点密钥。
 fn presented_token(headers: &HeaderMap) -> Option<String> {
-    for name in ["x-tianshu-relay-token", "x-keyrelay-token"] {
+    for name in ["x-tianshu-relay-token", "x-keyrelay-token", "x-api-key"] {
         if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
             // P3-6：两个令牌头都要 trim（与 Bearer 路径同口径）。
             return Some(value.trim().to_string());
@@ -2385,14 +2442,27 @@ fn is_stopping(state: &AppState) -> bool {
 /// M43-S1：认证入口——`/health` 与 `/proxy` **共用**（T3b）。
 ///
 /// 顺序（逐字，见 spec §4.3）：
-/// 1. 取 presented token（两种头 + 旧版头，trim + scheme 大小写不敏感）；取不到 ⇒ None；
+/// 1. 取 presented token（专用头 / `X-Api-Key` / Bearer，trim + scheme 大小写不敏感）；
+///    取不到 ⇒ None；
 /// 2. 与**运行态集合**逐条 `constant_time_eq`（**不早退**——不泄露命中的是第几条）；
 ///    `grace_until` 已过 ⇒ 该条不参与匹配；
 /// 3. 集合为空 ⇒ 与 `config.token` 常量时间比较（legacy 回退，行为与今天逐字相同）；
 /// 4. 其余 ⇒ None（401）。
 fn authenticate(headers: &HeaderMap, state: &AppState) -> Option<AuthIdentity> {
-    let presented = presented_token(headers)?;
-    let presented_hash = sha256_hex(&presented);
+    authenticate_with_presented(headers, state).map(|(identity, _)| identity)
+}
+
+/// 与 [`authenticate`] 同一判据，但把认证成功的**明文令牌**一并返回给代理路径。
+///
+/// 明文只用于「上游请求头脱敏」：调用方可能把本地令牌塞进任意自定义头，
+/// 仅靠 `config.token` 无法识别运行时令牌。它不会进入 `AuthIdentity`、轨迹或日志，
+/// 由调用方以 [`Zeroizing`] 持有并在请求结束后清零。
+fn authenticate_with_presented(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Option<(AuthIdentity, Zeroizing<String>)> {
+    let presented = Zeroizing::new(presented_token(headers)?);
+    let presented_hash = sha256_hex(presented.as_str());
     let entries = match state.tokens.read() {
         Ok(guard) => guard.clone(),
         Err(_) => {
@@ -2417,14 +2487,17 @@ fn authenticate(headers: &HeaderMap, state: &AppState) -> Option<AuthIdentity> {
             }
             // **不早退**：走完整个集合（响应时间不泄露「命中的是第几条」）。
         }
-        return matched;
+        return matched.map(|identity| (identity, presented));
     }
     // 集合为空 ⇒ legacy 单令牌回退。
     if constant_time_eq(Some(presented.as_str()), state.config.token.as_str()) {
-        Some(AuthIdentity {
-            token_id: None,
-            label: None,
-        })
+        Some((
+            AuthIdentity {
+                token_id: None,
+                label: None,
+            },
+            presented,
+        ))
     } else {
         None
     }
@@ -2504,14 +2577,31 @@ impl TraceCompletion {
         let status = response.status().as_u16();
         let final_kind = local_error_code(&response).unwrap_or("response");
         let (parts, body) = response.into_parts();
-        let body = TraceBody {
-            inner: body,
-            completion: Some(BodyCompletion {
+        // 204 / HEAD / 本就为空的响应体不会再被 hyper 轮询；此时 PinnedDrop
+        // 只能记录 body_dropped。直接按已结束处理，避免把正常空响应误报成断开。
+        let already_ended = body.is_end_stream()
+            || matches!(status, 204 | 304)
+            || body.size_hint().exact() == Some(0);
+        let completion = if already_ended {
+            BodyCompletion {
                 store: Arc::clone(&self.store),
                 draft,
                 status,
                 final_kind,
-            }),
+            }
+            .finish("body_end");
+            None
+        } else {
+            Some(BodyCompletion {
+                store: Arc::clone(&self.store),
+                draft,
+                status,
+                final_kind,
+            })
+        };
+        let body = TraceBody {
+            inner: body,
+            completion,
         };
         Response::from_parts(parts, Body::new(body))
     }
@@ -2670,7 +2760,9 @@ async fn proxy_inner(
     draft: &mut RouteTraceDraft,
 ) -> Response {
     // ① 令牌校验：不通过就**不转发**。M43-S1：与 `/health` 共用 `authenticate()`。
-    let Some(identity) = authenticate(request.headers(), &state) else {
+    // 同时保留明文令牌到请求结束，供上游头脱敏使用（不进身份结构 / 轨迹 / 日志）。
+    let Some((identity, presented_token)) = authenticate_with_presented(request.headers(), &state)
+    else {
         return unauthorized("缺少或错误的本地令牌");
     };
     draft.token_id = identity.token_id;
@@ -2984,7 +3076,12 @@ async fn proxy_inner(
             }
         }
         let url = format!("{}{}{}", state.config.base_url, path, query);
-        let headers = upstream_headers(&state.config, &inbound, &state.config.api_key);
+        let headers = upstream_headers(
+            &state.config,
+            &inbound,
+            &state.config.api_key,
+            presented_token.as_str(),
+        );
         return forward_to(
             &state,
             method,
@@ -3148,7 +3245,30 @@ async fn proxy_inner(
         reorder_by_effective_latency(sendable, &|site_id| ewma.get(&site_id).copied());
     // M3：冷却 key 排到队尾，但绝不删除；全部都在冷却时仍按原顺序尝试。
     // 排序稳定，未命中冷却的部署保持逐字不变。
+    //
+    // M3 复审：`weighted_pick` 对 HalfOpen 探针是无条件优先的。若一个冷却中的
+    // key 恰好也是探针，它会绕过上面的队尾排序被立刻发送。只要还存在任何未冷却
+    // 候选，就撤掉冷却候选的探针标记；全部候选都冷却时才保留探针，让恢复仍有可能。
     let cooldown_now = Instant::now();
+    let quota_now = unix_now_secs();
+    let any_not_cooling = sendable.iter().any(|candidate| {
+        !state.key_cooldowns.is_cooling(
+            candidate.upstream.site_id,
+            candidate.upstream.key_id,
+            cooldown_now,
+        )
+    });
+    if any_not_cooling {
+        for candidate in &mut sendable {
+            if state.key_cooldowns.is_cooling(
+                candidate.upstream.site_id,
+                candidate.upstream.key_id,
+                cooldown_now,
+            ) {
+                candidate.probe = false;
+            }
+        }
+    }
     sendable.sort_by_key(|candidate| {
         let cooling = u8::from(state.key_cooldowns.is_cooling(
             candidate.upstream.site_id,
@@ -3159,7 +3279,7 @@ async fn proxy_inner(
             .upstream
             .key_id
             .and_then(|key_id| view.key_quotas().get(&key_id))
-            .map(|snapshot| snapshot.sort_key())
+            .map(|snapshot| snapshot.sort_key_at(quota_now))
             .unwrap_or(1);
         (cooling, quota)
     });
@@ -3172,7 +3292,7 @@ async fn proxy_inner(
                     .upstream
                     .key_id
                     .and_then(|key_id| view.key_quotas().get(&key_id))
-                    .map(|snapshot| snapshot.rank());
+                    .map(|snapshot| snapshot.rank_at(quota_now));
                 RouteCandidate {
                     site_id: candidate.upstream.site_id,
                     key_id: candidate.upstream.key_id,
@@ -3181,6 +3301,7 @@ async fn proxy_inner(
                         Some(quota::QuotaRank::NearLimit) => "quota_near_limit",
                         Some(quota::QuotaRank::Exhausted) => "quota_exhausted_soft",
                         Some(quota::QuotaRank::Unlimited) => "quota_unlimited",
+                        Some(quota::QuotaRank::Stale) => "quota_stale",
                         _ => "quota_unknown",
                     },
                 }
@@ -3252,7 +3373,7 @@ async fn proxy_inner(
                             .upstream
                             .key_id
                             .and_then(|key_id| view.key_quotas().get(&key_id))
-                            .map(|quota| quota.rank() != quota::QuotaRank::Exhausted)
+                            .map(|quota| quota.rank_at(quota_now) != quota::QuotaRank::Exhausted)
                             .unwrap_or(true)
                 })
                 .map(|candidate| candidate.upstream)
@@ -3439,7 +3560,7 @@ async fn proxy_inner(
             }
         };
         let url = format!("{}{}{}", upstream.base_url, path, query);
-        let headers = upstream_headers(&state.config, &inbound, key);
+        let headers = upstream_headers(&state.config, &inbound, key, presented_token.as_str());
 
         // M46-S4：预算计数点——本地保护已放行，本次 `send_once` 就是一次真实
         // 上游尝试。本地拒绝的分支在上面 `continue` 了，根本到不了这里。
@@ -3837,17 +3958,29 @@ fn bearer_value(key: &str) -> Zeroizing<String> {
     Zeroizing::new(format!("Bearer {key}"))
 }
 
-/// 重建发往上游的请求头：**丢掉**调用方的 `Authorization`，换成该上游的站点密钥；
-/// 另外把「值里带着本地令牌」的头也丢掉——不管它叫什么名字，本地令牌都不许发给上游
-/// （M4-S2 复审 P2-2 的双头形态）。
-fn upstream_headers(config: &GatewayConfig, inbound: &HeaderMap, key: &str) -> HeaderMap {
+/// 重建发往上游的请求头：**丢掉**调用方的 `Authorization` / `X-Api-Key`，换成该上游的
+/// 站点密钥；另外把「值里带着本地令牌」的头也丢掉——不管它叫什么名字，本地令牌都不许
+/// 发给上游（M4-S2 复审 P2-2 的双头形态）。
+///
+/// 原生 Anthropic 路径同时写 `X-Api-Key` 与 `Authorization`，两者都是同一把站点密钥：
+/// 前者兼容 Anthropic 官方 SDK / 原生服务，后者兼容只认 Bearer 的中转站。写两个同名
+/// 语义的头不会扩大凭据边界——客户端原来的 `X-Api-Key` 已在上面被丢弃。
+fn upstream_headers(
+    config: &GatewayConfig,
+    inbound: &HeaderMap,
+    key: &str,
+    presented_token: &str,
+) -> HeaderMap {
     let local_token = config.token.as_str();
     let mut headers = HeaderMap::new();
     for (name, value) in inbound.iter() {
         if should_strip_request_header(name.as_str()) {
             continue;
         }
-        if value.to_str().is_ok_and(|text| text.contains(local_token)) {
+        if value.to_str().is_ok_and(|text| {
+            (!presented_token.is_empty() && text.contains(presented_token))
+                || (!local_token.is_empty() && text.contains(local_token))
+        }) {
             continue;
         }
         headers.insert(name.clone(), value.clone());
@@ -3858,6 +3991,12 @@ fn upstream_headers(config: &GatewayConfig, inbound: &HeaderMap, key: &str) -> H
         HeaderValue::from_str(bearer.as_str())
             .unwrap_or_else(|_| HeaderValue::from_static("Bearer ")),
     );
+    if config.upstream_protocol == UpstreamProtocol::AnthropicMessages {
+        headers.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_str(key).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
+    }
     headers
 }
 
@@ -5132,7 +5271,7 @@ mod tests {
     }
 
     #[test]
-    fn presented_token_reads_both_headers() {
+    fn presented_token_reads_supported_headers() {
         let mut headers = HeaderMap::new();
         assert_eq!(presented_token(&headers), None);
 
@@ -5144,6 +5283,14 @@ mod tests {
             presented_token(&headers).as_deref(),
             Some("xyz"),
             "专用头优先于 Authorization"
+        );
+
+        // 标准 Anthropic SDK 只发 x-api-key；它承载的是本地网关令牌。
+        let mut anthropic = HeaderMap::new();
+        anthropic.insert("x-api-key", HeaderValue::from_static("agent-local-token"));
+        assert_eq!(
+            presented_token(&anthropic).as_deref(),
+            Some("agent-local-token")
         );
 
         let mut headers = HeaderMap::new();
@@ -5264,8 +5411,10 @@ mod tests {
     fn credential_shaped_request_headers_are_not_forwarded() {
         for name in [
             "authorization",
+            "x-api-key",
             "X-Tianshu-Relay-Token",
             "X-KeyRelay-Token",
+            "X-Tianshu-Session",
             "Cookie",
             "Proxy-Authorization",
             "Host",
@@ -5278,6 +5427,60 @@ mod tests {
         for name in ["content-type", "accept", "user-agent", "x-request-id"] {
             assert!(!should_strip_request_header(name), "「{name}」该转发");
         }
+    }
+
+    #[test]
+    fn upstream_headers_replace_anthropic_credentials_and_redact_agent_token() {
+        let mut config = GatewayConfig::single_upstream(
+            0,
+            "local-gateway-token".to_string(),
+            String::new(),
+            Zeroizing::new("site-secret".to_string()),
+            "test".to_string(),
+        );
+        config.upstream_protocol = UpstreamProtocol::AnthropicMessages;
+        let mut inbound = HeaderMap::new();
+        inbound.insert("x-api-key", HeaderValue::from_static("real-anthropic-key"));
+        inbound.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer agent-token"),
+        );
+        inbound.insert(
+            "x-tianshu-session",
+            HeaderValue::from_static("stable-client-session"),
+        );
+        inbound.insert(
+            "x-custom-auth",
+            HeaderValue::from_static("prefix agent-token suffix"),
+        );
+        inbound.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let outbound = upstream_headers(&config, &inbound, "site-secret", "agent-token");
+        assert_eq!(
+            outbound.get("x-api-key").and_then(|v| v.to_str().ok()),
+            Some("site-secret"),
+            "x-api-key 必须换成本次命中的站点 key"
+        );
+        assert_eq!(
+            outbound.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer site-secret")
+        );
+        assert!(
+            outbound.get("x-tianshu-session").is_none(),
+            "本地会话标识不得转发"
+        );
+        assert!(
+            outbound.get("x-custom-auth").is_none(),
+            "携带运行态令牌的自定义头必须脱敏"
+        );
+        assert_eq!(
+            outbound.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let all = format!("{outbound:?}");
+        assert!(!all.contains("real-anthropic-key"), "{all}");
+        assert!(!all.contains("agent-token"), "{all}");
+        assert!(!all.contains("stable-client-session"), "{all}");
     }
 
     #[tokio::test]
@@ -5533,6 +5736,7 @@ mod tests {
                 session::DEFAULT_SESSION_TTL,
                 [0; 32],
             )),
+            key_cooldowns: Arc::new(KeyCooldownTable::new()),
             initial_route_is_empty: true,
             runtime: None,
             breaker: Arc::new(Mutex::new(Breaker::new(BreakerPolicy::default()))),
@@ -5692,12 +5896,26 @@ mod tests {
     fn extract_usage_from_json_accepts_anthropic_native_usage() {
         let body = br#"{"type":"message","usage":{"input_tokens":9,"output_tokens":2}}"#;
         assert_eq!(extract_usage_from_json(body), Some((9, 2, 11)));
+        let cached = br#"{"type":"message","usage":{"input_tokens":9,"cache_creation_input_tokens":100,"cache_read_input_tokens":50,"output_tokens":2}}"#;
+        assert_eq!(
+            extract_usage_from_json(cached),
+            Some((159, 2, 161)),
+            "cache creation/read are billed input and must be counted"
+        );
         let nested = br#"{"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}"#;
         assert_eq!(extract_usage_from_json(nested), Some((12, 1, 13)));
         let delta = br#"{"type":"message_delta","usage":{"output_tokens":7}}"#;
         assert_eq!(
-            merge_usage_from_json(delta, Some((12, 1, 13))),
-            Some((12, 7, 19))
+            merge_usage_from_json(delta, Some((159, 1, 160))),
+            Some((159, 7, 166)),
+            "output-only delta must carry the full cached prompt forward"
+        );
+        let cache_only_delta =
+            br#"{"type":"message_delta","usage":{"cache_read_input_tokens":50,"output_tokens":8}}"#;
+        assert_eq!(
+            merge_usage_from_json(cache_only_delta, Some((159, 7, 166))),
+            Some((159, 8, 167)),
+            "repeated cache fields without a fresh base input must not double-count"
         );
         assert_eq!(
             merge_usage_from_json(delta, None),
@@ -5785,6 +6003,28 @@ mod tests {
         let log = log.lock().unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!((log[0].prompt_tokens, log[0].total_tokens), (1, 3));
+    }
+
+    #[test]
+    fn sse_usage_merges_anthropic_cache_inputs_without_double_counting() {
+        let (mut capture, log) = capture_for(true, fixed_clock(1));
+        // message_start: 基础输入 + 缓存创建 + 缓存读取
+        capture.feed(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":50,\"output_tokens\":1}}}\n\n",
+        );
+        // message_delta: 只带最终输出 → 完整缓存输入必须从前值延续
+        capture.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n");
+        capture.flush();
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            (
+                log[0].prompt_tokens,
+                log[0].completion_tokens,
+                log[0].total_tokens
+            ),
+            (159, 7, 166)
+        );
     }
 
     #[test]

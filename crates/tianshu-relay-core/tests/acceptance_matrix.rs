@@ -696,12 +696,14 @@ async fn rate_limit_is_retried_with_retry_after() {
 /// 端到端重放行为由 `gateway_acceptance` / `gateway_failover` 证明；这里保留刷新侧的联动验证。
 #[tokio::test]
 async fn server_error_fails_over_or_reports() {
-    // ① 网关路径（纯函数）：429 与 5xx 切，4xx 不切
+    // ① 网关路径（纯函数）：`should_failover` 表示「记入上游健康失败」。
+    // 429 与 5xx 都记失败，但只有 429 获得**同请求重放**资格（见 status_allows_replay）；
+    // 5xx 原样返回，绝不重放。4xx 既不记健康失败也不重放。
     for status in [429u16, 500, 502, 503, 504] {
-        assert!(should_failover(status), "{status} 应当切换上游");
+        assert!(should_failover(status), "{status} 应当记入上游健康失败");
     }
     for status in [400u16, 401, 403, 404, 422] {
-        assert!(!should_failover(status), "{status} 不该切换上游");
+        assert!(!should_failover(status), "{status} 不该记入可故障切换");
     }
 
     // ② 刷新路径：5xx 记失败、不中断整轮、不当成需要登录

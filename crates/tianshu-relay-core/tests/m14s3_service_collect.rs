@@ -213,9 +213,10 @@ async fn newapi_refresh_writes_key_quota_without_usage_samples() {
     assert_eq!(summary.sites_ok, 1);
 
     // keys.quota_used = used_quota / quota_per_unit = 500000/500000 = 1.0 USD
+    // quota_limit = (used_quota + remain_quota) / quota_per_unit = 10.0 USD
     let row = service.store().get_key(key_id).unwrap().unwrap();
     assert_eq!(row.quota_used, Some(1.0));
-    assert_eq!(row.quota_limit, Some(9.0));
+    assert_eq!(row.quota_limit, Some(10.0));
 
     // NewAPI 不写 usage_samples（无日趋势端点）
     let samples = service.store().recent_key_usage(key_id, 30).unwrap();

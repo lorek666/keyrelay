@@ -287,9 +287,12 @@ pub struct KeyMeta {
     /// NewAPI 取 `list_keys` 的 `used_quota / quota_per_unit`；Sub2API 取 `list_keys` 的 `quota_used`。
     /// 与 [`Balance::known`] 同纪律：界面不得把 `None` 渲染成 `0.00`。
     pub quota_used: Option<f64>,
-    /// 该 key 的限额（M14-S3）。
+    /// 该 key 的总额度（M14-S3）。
     ///
-    /// NewAPI 取 `remain_quota / quota_per_unit`（`unlimited_quota=true` ⇒ `None`）；
+    /// NewAPI 只有 `remain_quota`（剩余），没有单独总额字段；适配器在
+    /// `used_quota` 与 `remain_quota` 同时存在时重建
+    /// `(used_quota + remain_quota) / quota_per_unit`，任一缺失 ⇒ `None`
+    ///（`unlimited_quota=true` 同为 `None`，由适配器能力另行表达）。
     /// Sub2API 取 `list_keys` 的 `quota`。`None` = 不限或未知。
     pub quota_limit: Option<f64>,
     /// `quota_used` / `quota_limit` 的币种（M14-S3）。NewAPI / Sub2API 均为 `"USD"`。

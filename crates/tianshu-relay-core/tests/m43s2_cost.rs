@@ -46,7 +46,7 @@ fn schema_v9_to_v10_adds_cost_tables_and_flag() {
     let path = dir.path().join("old.db");
     {
         let store = Store::open(&path).expect("建库");
-        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.schema_version().unwrap(), 12);
     }
     // 把库降级成「v9 的形态」：删掉两张新表、去掉 cost_reported、版本号回退。
     {
@@ -60,7 +60,7 @@ fn schema_v9_to_v10_adds_cost_tables_and_flag() {
     }
     // 重新打开 ⇒ 迁移补齐
     let store = Store::open(&path).expect("重开");
-    assert_eq!(store.schema_version().unwrap(), 11);
+    assert_eq!(store.schema_version().unwrap(), 12);
     assert!(store.model_price_list().is_ok(), "model_prices 必须存在");
     assert!(store.site_bills(30).is_ok(), "site_bills 必须存在");
     // cost_reported 列存在且老行取 0

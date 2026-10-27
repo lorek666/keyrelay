@@ -16,7 +16,8 @@ use crate::site::KeyStatus;
 ///
 /// 版本号只是「将来需要非幂等迁移」的锚点：新表由每次打开的幂等 `DDL` 建出。
 /// M39-S1 之后下一个用版本号的是 M40-S1（顺延为 8）。
-const SCHEMA_VERSION: i64 = 11;
+/// M3 复审后 v11 → v12：NewAPI `quota_limit` 从「剩余」改写为「总额」。
+const SCHEMA_VERSION: i64 = 12;
 
 /// 「已回收」——**本地**密钥生命周期状态（M7-S4 / FR-2）。
 ///
@@ -1214,6 +1215,18 @@ impl Store {
             "source",
             "TEXT NOT NULL DEFAULT 'manual'",
         )?;
+        // M3 复审（11 → 12）：NewAPI 历史行把 `remain_quota` 写进了 `quota_limit`；
+        // 新语义要求 `quota_limit = used + remaining`。只在升级时做一次加法，
+        // 避免每次打开重复累加。Sub2API 的 `quota` 本来就是总额，不动。
+        if version < 12 {
+            conn.execute(
+                "UPDATE keys SET quota_limit = quota_used + quota_limit \
+                 WHERE quota_used IS NOT NULL AND quota_limit IS NOT NULL \
+                   AND site_id IN (SELECT id FROM sites WHERE kind IN ('newapi', 'new-api'))",
+                [],
+            )
+            .map_err(|e| Error::Store(format!("迁移 NewAPI 额度总额失败: {e}")))?;
+        }
 
         // 版本号仍然只在升级时写，保留它作为「将来需要非幂等迁移」的锚点。
         if version < SCHEMA_VERSION {
@@ -4034,6 +4047,61 @@ mod tests {
     }
 
     #[test]
+    fn newapi_quota_limit_migration_converts_remaining_to_total_once() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("quota-v11.db");
+        let (newapi_key, sub2api_key) = {
+            let store = Store::open(&path).expect("建库");
+            let newapi = store
+                .upsert_site("newapi", "https://newapi.example.com", "newapi")
+                .unwrap();
+            let sub2api = store
+                .upsert_site("sub2api", "https://sub2api.example.com", "sub2api")
+                .unwrap();
+            let newapi_key = store
+                .insert_key(newapi, "n", "kr/newapi/1/secret", Some("1"), None)
+                .unwrap();
+            let sub2api_key = store
+                .insert_key(sub2api, "s", "kr/sub2api/1/secret", Some("2"), None)
+                .unwrap();
+            // v11 语义：NewAPI 的 9.0 是剩余额度；Sub2API 的 10.0 已经是总额。
+            store
+                .update_key_usage(newapi_key, Some(1.0), Some(9.0), Some("USD"))
+                .unwrap();
+            store
+                .update_key_usage(sub2api_key, Some(2.5), Some(10.0), Some("USD"))
+                .unwrap();
+            store
+                .lock()
+                .unwrap()
+                .pragma_update(None, "user_version", 11)
+                .unwrap();
+            (newapi_key, sub2api_key)
+        };
+
+        let store = Store::open(&path).expect("重新打开 v11 库");
+        assert_eq!(store.schema_version().unwrap(), 12);
+        assert_eq!(
+            store.get_key(newapi_key).unwrap().unwrap().quota_limit,
+            Some(10.0),
+            "NewAPI：used(1) + remain(9) ⇒ 总额 10"
+        );
+        assert_eq!(
+            store.get_key(sub2api_key).unwrap().unwrap().quota_limit,
+            Some(10.0),
+            "Sub2API 的 quota 本来就是总额，不得重复相加"
+        );
+        drop(store);
+
+        let store = Store::open(&path).expect("再次打开");
+        assert_eq!(
+            store.get_key(newapi_key).unwrap().unwrap().quota_limit,
+            Some(10.0),
+            "迁移只能执行一次"
+        );
+    }
+
+    #[test]
     fn catalog_price_migration_preserves_manual_prices_and_only_removes_imported_ones() {
         let dir = tempfile::tempdir().expect("临时目录");
         let path = dir.path().join("prices.db");
@@ -5289,8 +5357,8 @@ mod tests {
         let store = Store::open(&path).expect("重新打开 v7 旧库");
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(
-            SCHEMA_VERSION, 11,
-            "M47-S2 占用 v11（M43-S2 占 v10、M43-S1 占 v9、M40-S1 占 v8）"
+            SCHEMA_VERSION, 12,
+            "M3 修复占用 v12（M47-S2 占 v11、M43-S2 占 v10、M43-S1 占 v9、M40-S1 占 v8）"
         );
         let columns = usage_columns(&store);
         for expected in ["at", "key_id", "status", "latency_ms", "attempts", "stream"] {
@@ -5353,7 +5421,7 @@ mod tests {
 
         let store = Store::open(&path).expect("重新打开 v8 旧库");
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 11, "当前 schema 应为 v11");
+        assert_eq!(SCHEMA_VERSION, 12, "当前 schema 应为 v12");
         // v9 产物：令牌表 + 归因两列。
         let columns = usage_columns(&store);
         for expected in ["token_id", "agent_label"] {

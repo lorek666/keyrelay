@@ -1568,7 +1568,8 @@
         "quota_near_limit": "额度接近上限",
         "quota_exhausted_soft": "额度已到上限（软排序）",
         "quota_unlimited": "额度不限",
-        "quota_unknown": "额度未知"
+        "quota_unknown": "额度未知",
+        "quota_stale": "额度快照已过期（不参与排序）"
       },
       "end": {
         "response_started": "已开始响应",

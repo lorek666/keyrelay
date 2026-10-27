@@ -108,6 +108,7 @@
 
 - 默认监听 `127.0.0.1:8787`（仅 loopback，不对外暴露）。
 - agent 侧 base_url 指到本地即可，用的 token 是本地签发的 `local-` token（可撤销）；真实站点 key 留在保险库，不进 agent 配置。
+- 本地认证可用 `Authorization: Bearer <本地 token>`、`X-Tianshu-Relay-Token`，或 Anthropic SDK 常用的 `X-Api-Key: <本地 token>`。客户端原来的认证头会被网关丢弃并替换为站点 key；`X-Tianshu-Session` 只用于本地会话粘性，不会发给任何上游。
 - 兼容端点：`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`、`GET /v1/models`（含 SSE 流式透传）。
 - 换站只需改网关后端，agent 侧零改动。
 

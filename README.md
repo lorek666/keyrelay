@@ -117,6 +117,7 @@
 - 默认监听 `127.0.0.1:8787`（仅 loopback），agent 侧 base_url 指到本地即可。
 - 兼容端点：`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`、`GET /v1/models`（含 SSE 流式透传）。
 - agent 只用本地签发的 `local-` token（可撤销）；真实站点 key 留在保险库。
+- 本地认证接受 `Authorization: Bearer <本地 token>`、`X-Tianshu-Relay-Token`，以及 Anthropic SDK 标准的 `X-Api-Key: <本地 token>`。网关会剥离客户端携带的认证头，统一换成当次命中的站点 key；`X-Tianshu-Session` 只用于本地会话粘性，绝不转发给上游。
 - 路由：站点/模型路由表；上游 429 或确认未送达的连接失败可按优先级切换。5xx 原样返回、不在本次请求内换站重放，但会记录失败并参与熔断，冷却后探活回归。
 - 上游协议：默认 OpenAI Chat；可在设置中显式选择 Anthropic Messages 同协议直通（实验）。不自动猜测站点协议，协议不匹配会在发送前拒绝。
 - 成本控制：硬预算（v1 按 USD 计）、重试预算、分站点超时、分 agent 路由规则。

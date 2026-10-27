@@ -800,15 +800,20 @@ pub struct CreateKeyArgs {
 #[tauri::command]
 pub fn logout_site(state: State<'_, AppState>, site_id: i64) -> Result<(), String> {
     state.service.logout(site_id).map_err(|e| e.to_string())?;
-    clear_gateway_session_pins(&state);
+    clear_gateway_runtime_affinity(&state);
     Ok(())
 }
 
-/// M2：key/site 生命周期变化后，旧会话 pin 不再可靠；只清运行态内存。
-fn clear_gateway_session_pins(state: &AppState) {
+/// key/site/令牌生命周期变化后，旧会话 pin 与 key 冷却都不再可靠；只清运行态内存。
+///
+/// 冷却按 `(site_id, key_id)` 记录，而 key id 删除后可能复用：保守地全量清空，
+/// 避免新 key 继承旧 key 的 429 `Retry-After`。会话 pin 同理按 token id 作用域，
+/// 令牌轮换 / 吊销后必须清掉，不能让它活到 30 分钟 TTL。
+fn clear_gateway_runtime_affinity(state: &AppState) {
     if let Ok(guard) = state.gateway.lock() {
         if let Some(run) = guard.as_ref() {
             run.handle.clear_session_pins();
+            run.handle.clear_key_cooldowns();
         }
     }
 }
@@ -3430,6 +3435,8 @@ pub async fn gateway_rotate_token(
             run.token_grace_until = grace_until_unix;
         }
     }
+    // 同一 token_id 的凭据已经轮换：旧 pin 不能让新凭据继续沿用旧路由。
+    clear_gateway_runtime_affinity(&state);
     Ok(gateway_status_of(&state))
 }
 
@@ -3928,7 +3935,7 @@ pub async fn rotate_key(
         .rotate_key(key_id, tianshu_relay_core::site::KeySpec::named(name))
         .await
         .map_err(|e| e.to_string())?;
-    clear_gateway_session_pins(&state);
+    clear_gateway_runtime_affinity(&state);
     let (revoke, revoke_reason) = match &run.revoke {
         tianshu_relay_core::service::RevokeOutcome::Revoked => ("revoked".to_string(), None),
         tianshu_relay_core::service::RevokeOutcome::SkippedNoRemoteId => {
@@ -4297,7 +4304,7 @@ pub async fn revoke_key(
         .map_err(|e| e.to_string())?;
     // M2：密钥生命周期变化后旧 pin 不再可靠（本地自增 id 可能复用）。
     // 清空是保守且便宜的；失败不影响已经完成的撤销结果。
-    clear_gateway_session_pins(&state);
+    clear_gateway_runtime_affinity(&state);
     Ok(RevokeReportDto::from(report))
 }
 
@@ -4323,12 +4330,16 @@ pub async fn unbind_agent(
                 .to_string(),
         );
     }
-    state
+    let outcome = state
         .service
         .unbind(&agent_id, also_revoke)
         .await
-        .map(UnbindOutcomeDto::from)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // `also_revoke=true` 可能删掉本地 key 行（id 可复用）：清掉旧 pin 与冷却。
+    if also_revoke {
+        clear_gateway_runtime_affinity(&state);
+    }
+    Ok(UnbindOutcomeDto::from(outcome))
 }
 
 /// 清空钥匙串里属于本产品的条目（FR-8:191）。
@@ -4832,6 +4843,8 @@ pub fn gateway_token_revoke(
             }
         }
     }
+    // 吊销后同 token_id 不再有凭据：清掉旧 pin 与 key 冷却。
+    clear_gateway_runtime_affinity(&state);
     let row = state
         .service
         .store()
