@@ -907,7 +907,13 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let found = probe_cline_cli(dir.path());
+        let mut found = probe_cline_cli(dir.path());
+        // macOS 首次执行临时脚本会触发 provenance/安全扫描（实测 8–15s），
+        // 在满载 CI 上会超过 probe 的 5s 版本超时。用户是手动重试的，测试也重试
+        // 一次以只验证“脚本可解析出版本”，不把系统首次扫描时间当成产品回归。
+        if found.version.is_none() {
+            found = probe_cline_cli(dir.path());
+        }
         assert!(found.found);
         assert_eq!(found.version.as_deref(), Some("1.2.3"));
         // 生产侧候选路径里 `.local/bin` 一段是写死的 `/` 拼接，Windows 上与
