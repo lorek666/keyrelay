@@ -55,6 +55,9 @@ type Props = {
   /** M4：显式上游协议；缺省 = openai_chat（兼容旧调用点）。 */
   upstreamProtocol?: "openai_chat" | "anthropic_messages";
   onUpstreamProtocolChange?: (protocol: "openai_chat" | "anthropic_messages") => void;
+  /** M5：可解释路由模板；缺省 balanced。 */
+  routingPreset?: "balanced" | "cost" | "latency";
+  onRoutingPresetChange?: (preset: "balanced" | "cost" | "latency") => void;
   /** 密钥健康巡检间隔（秒，M46-UI B-237）：0 = 关，非 0 时 60..=86400。 */
   keyHealthIntervalSecs: number;
   /** 按 agent 路由规则 JSON（M46-S7）：空 = 无规则，走全局加权。 */
@@ -201,6 +204,11 @@ export function GatewayRouteTracesPanel({ running }: { running: boolean }) {
   const sites = useQuery({ queryKey: ["sites"], queryFn: listSites });
   const names = new Map((sites.data ?? []).map((site) => [site.id, site.displayName]));
   const siteName = (id: number) => names.get(id) ?? `#${id}`;
+  const rows = traces.data ?? [];
+  const failed = rows.filter((trace) => trace.finalStatus < 200 || trace.finalStatus >= 300).length;
+  const averageMs = rows.length
+    ? Math.round(rows.reduce((sum, trace) => sum + trace.totalMs, 0) / rows.length)
+    : null;
   return (
     <div className="gateway-metrics" data-route-traces>
       <div className="row row-between">
@@ -215,6 +223,16 @@ export function GatewayRouteTracesPanel({ running }: { running: boolean }) {
         </button>
       </div>
       <p className="muted">{t("gateway.traces.privacy")}</p>
+      {running && rows.length > 0 ? (
+        <dl className="kv" data-route-trace-summary>
+          <dt>{t("gateway.traces.summary.requests")}</dt>
+          <dd className="mono">{rows.length}</dd>
+          <dt>{t("gateway.traces.summary.failed")}</dt>
+          <dd className="mono">{failed}</dd>
+          <dt>{t("gateway.traces.summary.average")}</dt>
+          <dd className="mono">{averageMs == null ? "—" : `${averageMs} ms`}</dd>
+        </dl>
+      ) : null}
       {!running ? <p className="muted">{t("gateway.traces.notRunning")}</p> : null}
       {running && traces.isLoading ? <p className="muted">{t("common.loading")}</p> : null}
       {traces.isError ? (
@@ -509,6 +527,8 @@ export default function GatewayCard({
   onSessionAffinityChange,
   upstreamProtocol = "openai_chat",
   onUpstreamProtocolChange,
+  routingPreset = "balanced",
+  onRoutingPresetChange,
   keyHealthIntervalSecs,
   routingRules,
   onToggle,
@@ -1353,6 +1373,24 @@ export default function GatewayCard({
         </select>
       </label>
       <p className="muted">{t("gateway.upstreamProtocolHint")}</p>
+
+      <label className="field">
+        <span>{t("gateway.routingPresetLabel")}</span>
+        <select
+          className="input"
+          value={routingPreset}
+          onChange={(e) =>
+            onRoutingPresetChange?.(
+              e.target.value as "balanced" | "cost" | "latency",
+            )
+          }
+        >
+          <option value="balanced">{t("gateway.routingPresetBalanced")}</option>
+          <option value="cost">{t("gateway.routingPresetCost")}</option>
+          <option value="latency">{t("gateway.routingPresetLatency")}</option>
+        </select>
+      </label>
+      <p className="muted">{t("gateway.routingPresetHint")}</p>
 
       {/*
         M46-UI B-255：按 agent 路由规则改为结构化编辑器（agent 下拉取令牌

@@ -271,6 +271,7 @@ fn config(
         max_attempts: 0,
         session_affinity: false,
         upstream_protocol: tianshu_relay_core::gateway::session::UpstreamProtocol::OpenAiChat,
+        routing_preset: tianshu_relay_core::routing::RoutingPreset::Balanced,
         key_quotas: std::collections::HashMap::new(),
         guard_policy: guard,
         keys_by_ref,

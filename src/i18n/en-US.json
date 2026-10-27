@@ -1576,6 +1576,11 @@
         "body_error": "Response body error",
         "body_dropped": "Body end not observed (possibly disconnected)",
         "request_cancelled": "Cancelled before response"
+      },
+      "summary": {
+        "requests": "Recent requests",
+        "failed": "Non-2xx",
+        "average": "Average total time"
       }
     },
     "statusFailed": "Could not read gateway status: {error}",
@@ -1600,7 +1605,12 @@
     "upstreamProtocolLabel": "Upstream protocol (experimental, restart required)",
     "upstreamProtocolChat": "OpenAI Chat (default, existing translation)",
     "upstreamProtocolAnthropic": "Anthropic Messages (native pass-through)",
-    "upstreamProtocolHint": "OpenAI Chat is the default. Only an explicit Anthropic selection sends /v1/messages natively; other inbound protocols are rejected before any upstream request. The site protocol is never auto-detected."
+    "upstreamProtocolHint": "OpenAI Chat is the default. Only an explicit Anthropic selection sends /v1/messages natively; other inbound protocols are rejected before any upstream request. The site protocol is never auto-detected.",
+    "routingPresetLabel": "Routing preset (restart required)",
+    "routingPresetBalanced": "Balanced (use configured top_n)",
+    "routingPresetCost": "Cost (at least 3 candidates, weighted by rate)",
+    "routingPresetLatency": "Low latency (pick one by EWMA)",
+    "routingPresetHint": "Presets only combine existing top_n, rate, and EWMA ordering; budgets, breakers, replay rules, and safety constraints do not change."
   },
   "confirm": {
     "cancel": "Cancel",

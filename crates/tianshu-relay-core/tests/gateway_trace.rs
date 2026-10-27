@@ -105,6 +105,7 @@ async fn start_with_options(
         max_attempts: 0,
         session_affinity,
         upstream_protocol,
+        routing_preset: tianshu_relay_core::routing::RoutingPreset::Balanced,
         key_quotas: std::collections::HashMap::new(),
         guard_policy: SiteGuardPolicy::default(),
         runtime: None,

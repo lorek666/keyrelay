@@ -1046,6 +1046,7 @@ export default function SettingsPage() {
             maxAttempts={draft.gatewayMaxAttempts}
             sessionAffinity={draft.gatewaySessionAffinity}
             upstreamProtocol={draft.gatewayUpstreamProtocol}
+            routingPreset={draft.gatewayRoutingPreset}
             keyHealthIntervalSecs={draft.gatewayKeyHealthIntervalSecs}
             routingRules={draft.routingRules}
             onToggle={(enabled) => setDraft({ ...draft, gatewayEnabled: enabled })}
@@ -1079,6 +1080,9 @@ export default function SettingsPage() {
             }
             onUpstreamProtocolChange={(gatewayUpstreamProtocol) =>
               setDraft({ ...draft, gatewayUpstreamProtocol })
+            }
+            onRoutingPresetChange={(gatewayRoutingPreset) =>
+              setDraft({ ...draft, gatewayRoutingPreset })
             }
             onKeyHealthIntervalChange={(gatewayKeyHealthIntervalSecs) =>
               setDraft({ ...draft, gatewayKeyHealthIntervalSecs })

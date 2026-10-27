@@ -639,6 +639,8 @@ pub struct GatewayConfig {
     pub key_quotas: HashMap<i64, KeyQuotaSnapshot>,
     /// M4：显式上游协议；默认 OpenAI Chat。首版只支持原生 Anthropic。
     pub upstream_protocol: UpstreamProtocol,
+    /// M5：可解释路由模板。
+    pub routing_preset: crate::routing::RoutingPreset,
     /// M39-S3 §4.2：每站并发/限速策略。
     pub guard_policy: SiteGuardPolicy,
     /// `key_ref` → 明文。**仅进程内**；`Debug` 不打印（见下方手写 `Debug`）。
@@ -1062,6 +1064,7 @@ impl GatewayConfig {
             session_affinity: false,
             key_quotas: HashMap::new(),
             upstream_protocol: UpstreamProtocol::OpenAiChat,
+            routing_preset: crate::routing::RoutingPreset::Balanced,
             guard_policy: SiteGuardPolicy::default(),
             keys_by_ref: HashMap::new(),
             catalog: None,
@@ -2564,6 +2567,16 @@ impl http_body::Body for TraceBody {
     type Data = bytes::Bytes;
     type Error = axum::Error;
 
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        // 必须委托：否则 hyper 会把原本有 Content-Length 的本地 JSON 错误
+        // 退化成 chunked，改变既有线协议（全量 envelope 测试曾抓到）。
+        self.inner.size_hint()
+    }
+
     fn poll_frame(
         self: std::pin::Pin<&mut Self>,
         context: &mut std::task::Context<'_>,
@@ -3256,7 +3269,10 @@ async fn proxy_inner(
             })
             .unwrap_or_default(),
     );
-    let top_n = state.config.lb_top_n;
+    let top_n = state
+        .config
+        .routing_preset
+        .effective_lb_top_n(state.config.lb_top_n, sendable.len());
     let first = if pinned_upstream.is_some() {
         // pin 命中时不读轮转计数器，避免为一次固定选择消耗全局 cursor。
         pinned_upstream

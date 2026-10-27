@@ -1576,6 +1576,11 @@
         "body_error": "响应体错误",
         "body_dropped": "未观察到响应体结束（可能断开）",
         "request_cancelled": "请求在响应前取消"
+      },
+      "summary": {
+        "requests": "最近请求",
+        "failed": "非 2xx",
+        "average": "平均总耗时"
       }
     },
     "statusFailed": "读不到网关状态：{error}",
@@ -1600,7 +1605,12 @@
     "upstreamProtocolLabel": "上游协议（实验，需重启网关）",
     "upstreamProtocolChat": "OpenAI Chat（默认，兼容现有翻译）",
     "upstreamProtocolAnthropic": "Anthropic Messages（同协议直通）",
-    "upstreamProtocolHint": "默认使用 OpenAI Chat。只有明确选择 Anthropic 后，/v1/messages 才会按原协议直发；其他入站协议会在发送前被拒绝。不会自动探测站点协议。"
+    "upstreamProtocolHint": "默认使用 OpenAI Chat。只有明确选择 Anthropic 后，/v1/messages 才会按原协议直发；其他入站协议会在发送前被拒绝。不会自动探测站点协议。",
+    "routingPresetLabel": "路由模板（需重启网关）",
+    "routingPresetBalanced": "均衡（使用已配置的 top_n）",
+    "routingPresetCost": "省钱（至少 3 个候选，按倍率加权）",
+    "routingPresetLatency": "低延迟（按 EWMA 选一个）",
+    "routingPresetHint": "模板只组合现有 top_n、倍率与 EWMA 排序，不改变预算、熔断、重放或安全约束。"
   },
   "confirm": {
     "cancel": "取消",

@@ -6463,6 +6463,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         config.upstream_protocol =
             crate::gateway::session::UpstreamProtocol::parse(&settings.gateway_upstream_protocol)
                 .unwrap_or(crate::gateway::session::UpstreamProtocol::OpenAiChat);
+        config.routing_preset =
+            crate::routing::RoutingPreset::parse(&settings.gateway_routing_preset)
+                .unwrap_or(crate::routing::RoutingPreset::Balanced);
         config.guard_policy = crate::routing::SiteGuardPolicy {
             max_concurrency: settings.gateway_per_site_concurrency,
             rate_limit_per_sec: settings.gateway_per_site_rate_limit,

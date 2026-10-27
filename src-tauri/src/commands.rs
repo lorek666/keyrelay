@@ -508,6 +508,8 @@ pub struct SettingsDto {
     gateway_session_affinity: bool,
     /// M4：openai_chat | anthropic_messages（默认 openai_chat）。
     gateway_upstream_protocol: String,
+    /// M5：balanced | cost | latency。
+    gateway_routing_preset: String,
     // M46-S7：按 agent 路由规则 JSON（默认空 = 无规则；camelCase `routingRules`）。
     routing_rules: String,
     // ---- M6-S5：FR-9 界面与隐私 ----
@@ -2535,6 +2537,7 @@ fn settings_from_dto(dto: &SettingsDto) -> tianshu_relay_core::settings::Setting
         gateway_max_attempts: dto.gateway_max_attempts,
         gateway_session_affinity: dto.gateway_session_affinity,
         gateway_upstream_protocol: dto.gateway_upstream_protocol.clone(),
+        gateway_routing_preset: dto.gateway_routing_preset.clone(),
         routing_rules: dto.routing_rules.clone(),
         theme: dto.theme.clone(),
         language: dto.language.clone(),
@@ -2579,6 +2582,7 @@ fn settings_to_dto(settings: &tianshu_relay_core::settings::Settings) -> Setting
         gateway_max_attempts: settings.gateway_max_attempts,
         gateway_session_affinity: settings.gateway_session_affinity,
         gateway_upstream_protocol: settings.gateway_upstream_protocol.clone(),
+        gateway_routing_preset: settings.gateway_routing_preset.clone(),
         routing_rules: settings.routing_rules.clone(),
         theme: settings.theme.clone(),
         language: settings.language.clone(),
@@ -3015,6 +3019,7 @@ fn gateway_transition(
         || prev.gateway_max_attempts != next.gateway_max_attempts
         || prev.gateway_session_affinity != next.gateway_session_affinity
         || prev.gateway_upstream_protocol != next.gateway_upstream_protocol
+        || prev.gateway_routing_preset != next.gateway_routing_preset
         || prev.routing_rules != next.routing_rules
     {
         GatewayTransition::Restart

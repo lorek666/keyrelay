@@ -85,6 +85,11 @@ const KEY_GATEWAY_MAX_ATTEMPTS: &str = "gateway_max_attempts";
 const KEY_GATEWAY_SESSION_AFFINITY: &str = "gateway_session_affinity";
 // M4：显式上游协议（默认 openai_chat；首版支持 anthropic_messages）。
 const KEY_GATEWAY_UPSTREAM_PROTOCOL: &str = "gateway_upstream_protocol";
+// M5：可解释路由模板（balanced / cost / latency）。
+const KEY_GATEWAY_ROUTING_PRESET: &str = "gateway_routing_preset";
+pub const ROUTING_PRESET_BALANCED: &str = "balanced";
+pub const ROUTING_PRESET_COST: &str = "cost";
+pub const ROUTING_PRESET_LATENCY: &str = "latency";
 pub const UPSTREAM_PROTOCOL_CHAT: &str = "openai_chat";
 pub const UPSTREAM_PROTOCOL_ANTHROPIC: &str = "anthropic_messages";
 // M46-S7：按 agent 路由规则 JSON（空 = 无规则；schema 见 routing.rs）。
@@ -167,6 +172,8 @@ pub struct Settings {
     pub gateway_session_affinity: bool,
     /// M4：显式上游协议。默认 Chat；仅支持已验收的同协议窄路径。
     pub gateway_upstream_protocol: String,
+    /// M5：路由模板，只组合已有 top_n / 倍率 / EWMA 排序。
+    pub gateway_routing_preset: String,
     /// 按 agent 路由规则 JSON（M46-S7）：**默认空（无规则，走全局加权）**。
     /// Schema 见 `crate::routing::parse_routing_rules`；非法值由 `validate` 拒绝，
     /// 不落库。保存后下次启动网关生效。
@@ -267,6 +274,7 @@ impl Default for Settings {
             // M2：默认关闭，只有用户显式开启且请求带可靠会话 id 时生效。
             gateway_session_affinity: false,
             gateway_upstream_protocol: UPSTREAM_PROTOCOL_CHAT.to_string(),
+            gateway_routing_preset: ROUTING_PRESET_BALANCED.to_string(),
             // M46-S7：空 = 无规则（默认行为与今天逐字相同）。
             routing_rules: String::new(),
 
@@ -364,6 +372,14 @@ impl Settings {
             return Err(Error::Store(format!(
                 "每站限流 burst 必须在 0..={GATEWAY_PER_SITE_BURST_MAX} 之间（0 = 关）"
             )));
+        }
+        if !matches!(
+            self.gateway_routing_preset.as_str(),
+            ROUTING_PRESET_BALANCED | ROUTING_PRESET_COST | ROUTING_PRESET_LATENCY
+        ) {
+            return Err(Error::Store(
+                "网关路由模板只支持 balanced、cost 或 latency".to_string(),
+            ));
         }
         if !matches!(
             self.gateway_upstream_protocol.as_str(),
@@ -704,6 +720,14 @@ impl Settings {
                         settings.gateway_upstream_protocol = value.to_string();
                     }
                 }
+                KEY_GATEWAY_ROUTING_PRESET => {
+                    if matches!(
+                        value,
+                        ROUTING_PRESET_BALANCED | ROUTING_PRESET_COST | ROUTING_PRESET_LATENCY
+                    ) {
+                        settings.gateway_routing_preset = value.to_string();
+                    }
+                }
                 // M46-S7：规则 JSON 原样收下（解析只在 validate 与 gateway_config 做；
                 // from_pairs 的「非法项退回默认」口径不适用于整串 JSON——非法串的
                 // 唯一 gate 是 validate）。
@@ -889,6 +913,10 @@ impl Settings {
                 KEY_GATEWAY_UPSTREAM_PROTOCOL,
                 self.gateway_upstream_protocol.clone(),
             ),
+            (
+                KEY_GATEWAY_ROUTING_PRESET,
+                self.gateway_routing_preset.clone(),
+            ),
             (KEY_ROUTING_RULES, self.routing_rules.clone()),
             (KEY_THEME, self.theme.clone()),
             (KEY_LANGUAGE, self.language.clone()),
@@ -931,7 +959,7 @@ impl Settings {
         Ok(Self::from_pairs(borrowed))
     }
 
-    pub const KEYS: [&'static str; 39] = [
+    pub const KEYS: [&'static str; 40] = [
         KEY_REFRESH_INTERVAL,
         KEY_BALANCE_THRESHOLD,
         KEY_DRIFT_ON_START,
@@ -954,6 +982,7 @@ impl Settings {
         KEY_GATEWAY_MAX_ATTEMPTS,
         KEY_GATEWAY_SESSION_AFFINITY,
         KEY_GATEWAY_UPSTREAM_PROTOCOL,
+        KEY_GATEWAY_ROUTING_PRESET,
         KEY_ROUTING_RULES,
         KEY_THEME,
         KEY_LANGUAGE,
@@ -1111,6 +1140,12 @@ mod tests {
         assert!(settings.validate().is_ok());
         settings.gateway_upstream_protocol = "auto".into();
         assert!(settings.validate().is_err(), "协议不得自动猜");
+        let mut settings = Settings::default();
+        assert_eq!(settings.gateway_routing_preset, ROUTING_PRESET_BALANCED);
+        settings.gateway_routing_preset = ROUTING_PRESET_COST.into();
+        assert!(settings.validate().is_ok());
+        settings.gateway_routing_preset = "smart".into();
+        assert!(settings.validate().is_err(), "模板必须显式且可解释");
     }
 
     #[test]
@@ -1316,6 +1351,7 @@ mod tests {
             gateway_max_attempts: 0,
             gateway_session_affinity: false,
             gateway_upstream_protocol: UPSTREAM_PROTOCOL_CHAT.to_string(),
+            gateway_routing_preset: ROUTING_PRESET_BALANCED.to_string(),
             routing_rules: String::new(),
             theme: "dark".to_string(),
             language: "en-US".to_string(),

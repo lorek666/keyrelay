@@ -992,6 +992,44 @@ pub fn should_failover(status: u16) -> bool {
     status_failure_policy(status).health == HealthUpdate::RecordFailure
 }
 
+/// M5：可解释的路由模板；只组合已有排序参数，不引入隐藏打分或机器学习。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutingPreset {
+    Balanced,
+    Cost,
+    Latency,
+}
+
+impl RoutingPreset {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "balanced" => Some(Self::Balanced),
+            "cost" => Some(Self::Cost),
+            "latency" => Some(Self::Latency),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::Cost => "cost",
+            Self::Latency => "latency",
+        }
+    }
+
+    /// `candidate_count` 是本请求当前可发送的候选数。`cost` 必须覆盖全部
+    /// 合法候选才能比默认前三名更偏向低倍率；`balanced` 完全尊重用户配置；
+    /// `latency` 只取 EWMA 重排后的第一名。
+    pub fn effective_lb_top_n(self, configured: usize, candidate_count: usize) -> usize {
+        match self {
+            Self::Balanced => configured,
+            Self::Cost => configured.max(candidate_count).max(1),
+            Self::Latency => 1,
+        }
+    }
+}
+
 /// 熔断键（M39-S3 §4.4）：`(site_id, model)`。
 ///
 /// - 有 model 的请求 ⇒ `(site_id, Some(model))`：站点 A 的 `gpt-x` 失败**不**熔断 A 的 `claude-y`；
@@ -1893,5 +1931,28 @@ mod tests {
             ],
             "同 rank 的同站 key 彼此顺序不变（站内轮换不被打乱）"
         );
+    }
+}
+
+#[cfg(test)]
+mod m5_routing_preset_tests {
+    use super::RoutingPreset;
+
+    #[test]
+    fn routing_preset_is_explicit_and_only_rebalances_existing_top_n() {
+        assert_eq!(
+            RoutingPreset::parse("balanced"),
+            Some(RoutingPreset::Balanced)
+        );
+        assert_eq!(RoutingPreset::parse("cost"), Some(RoutingPreset::Cost));
+        assert_eq!(
+            RoutingPreset::parse("latency"),
+            Some(RoutingPreset::Latency)
+        );
+        assert_eq!(RoutingPreset::parse("smart"), None);
+        assert_eq!(RoutingPreset::Balanced.effective_lb_top_n(2, 10), 2);
+        assert_eq!(RoutingPreset::Cost.effective_lb_top_n(1, 10), 10);
+        assert_eq!(RoutingPreset::Cost.effective_lb_top_n(5, 3), 5);
+        assert_eq!(RoutingPreset::Latency.effective_lb_top_n(5, 10), 1);
     }
 }
