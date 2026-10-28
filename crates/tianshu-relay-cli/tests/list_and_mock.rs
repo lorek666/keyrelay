@@ -153,6 +153,66 @@ fn mock_agent_keymissing_when_field_absent() {
 }
 
 #[test]
+fn kimi_mock_is_scoped_and_accepts_dotted_toml() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let home = dir.path().join("home");
+    let cfg = home.join(".kimi-code").join("config.toml");
+    fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+
+    // 别家 provider 的 api_key 不算 keyrelay 已投递。
+    fs::write(
+        &cfg,
+        r#"default_model = "other/model"
+[providers.other]
+api_key = "sk-other-2222"
+"#,
+    )
+    .unwrap();
+    let out = Command::new(cli_bin())
+        .args([
+            "mock-agent",
+            "--channel",
+            "kimi-code",
+            "--home",
+            home.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "别家 provider 不应被当成 keyrelay: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // dotted key + 表头尾随注释都是合法 TOML，且归属 keyrelay。
+    fs::write(
+        &cfg,
+        r#"default_model = "keyrelay/kimi-k3" # keep
+providers.keyrelay.api_key = "sk-mine-3333" # old
+providers.keyrelay.base_url = "https://old.example.com/v1"
+"#,
+    )
+    .unwrap();
+    let out = Command::new(cli_bin())
+        .args([
+            "mock-agent",
+            "--channel",
+            "kimi-code",
+            "--home",
+            home.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dotted key 应被识别: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn list_keys_outputs_seeded_key_without_secret() {
     let dir = tempfile::tempdir().expect("tmp");
     let home = dir.path().join("home");

@@ -199,13 +199,37 @@ fn build_after(
             QoderWriter::FIELD_MODEL.to_string(),
             Value::String(model.to_string()),
         );
-        let mut model_entry = Map::new();
+        let models = provider
+            .entry("models".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let array = models
+            .as_array_mut()
+            .ok_or_else(|| Error::inject(path, "providers.keyrelay.models 不是数组，拒绝改写"))?;
+        // 保留同一模型的既有条目：Qoder 的模型条目除我们写的字段外还可能带
+        // thinking / vision / 用户改过的显示名。只更新本适配器拥有的字段，
+        // 不因一次换 key 把整条元数据清空。
+        let existing = array
+            .iter()
+            .find(|entry| entry.get("model").and_then(Value::as_str) == Some(model))
+            .and_then(Value::as_object)
+            .cloned();
+        array.retain(|entry| entry.get("model").and_then(Value::as_str) != Some(model));
+        let mut model_entry = existing.unwrap_or_default();
         model_entry.insert("model".to_string(), Value::String(model.to_string()));
-        model_entry.insert("displayName".to_string(), Value::String(model.to_string()));
-        let mut capabilities = Map::new();
-        capabilities.insert("tools".to_string(), Value::Bool(true));
-        capabilities.insert("vision".to_string(), Value::Bool(false));
-        model_entry.insert("capabilities".to_string(), Value::Object(capabilities));
+        model_entry
+            .entry("displayName".to_string())
+            .or_insert_with(|| Value::String(model.to_string()));
+        let capabilities = model_entry
+            .entry("capabilities".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(capabilities) = capabilities.as_object_mut() {
+            capabilities
+                .entry("tools".to_string())
+                .or_insert(Value::Bool(true));
+            capabilities
+                .entry("vision".to_string())
+                .or_insert(Value::Bool(false));
+        }
         if let Some(meta) = meta {
             model_entry.insert(
                 "contextWindow".to_string(),
@@ -216,13 +240,6 @@ fn build_after(
                 Value::Number(serde_json::Number::from(meta.max_output_tokens)),
             );
         }
-        let models = provider
-            .entry("models".to_string())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        let array = models
-            .as_array_mut()
-            .ok_or_else(|| Error::inject(path, "providers.keyrelay.models 不是数组，拒绝改写"))?;
-        array.retain(|entry| entry.get("model").and_then(Value::as_str) != Some(model));
         array.push(Value::Object(model_entry));
 
         let top_model = object_entry(&mut root, "model", path)?;
@@ -290,6 +307,58 @@ mod tests {
         assert_eq!(parsed["providers"]["mine"]["apiKey"], "keep");
         assert_eq!(parsed["theme"], "dark");
         assert_eq!(parsed["providers"]["keyrelay"]["apiKey"], SECRET);
+    }
+
+    #[test]
+    fn preserves_existing_model_metadata_on_reapply() {
+        let dir = tmp();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            json!({
+                "providers": {
+                    "keyrelay": {
+                        "displayName": "My Relay",
+                        "firstPayloadTimeoutMs": 12_345,
+                        "routing": {"compact": "kimi-k3"},
+                        "models": [{
+                            "model": "kimi-k3",
+                            "displayName": "My K3",
+                            "capabilities": {"tools": false, "thinking": {"modes": ["enabled"]}},
+                            "contextWindow": 999_000,
+                            "customFlag": "keep"
+                        }]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let writer = QoderWriter::with_path_and_channel(
+            &path,
+            DeliveryChannel::Qoder,
+            BASE,
+            Some("kimi-k3"),
+            None,
+        );
+        let after = writer.plan(SECRET).unwrap().after;
+        let parsed: Value = serde_json::from_str(&after).unwrap();
+        let entry = &parsed["providers"]["keyrelay"]["models"][0];
+        assert_eq!(parsed["providers"]["keyrelay"]["apiKey"], SECRET);
+        assert_eq!(parsed["providers"]["keyrelay"]["displayName"], "My Relay");
+        assert_eq!(
+            parsed["providers"]["keyrelay"]["firstPayloadTimeoutMs"],
+            12_345
+        );
+        assert_eq!(
+            parsed["providers"]["keyrelay"]["routing"]["compact"],
+            "kimi-k3"
+        );
+        assert_eq!(entry["displayName"], "My K3");
+        assert_eq!(entry["capabilities"]["tools"], false);
+        assert_eq!(entry["capabilities"]["thinking"]["modes"][0], "enabled");
+        assert_eq!(entry["contextWindow"], 999_000);
+        assert_eq!(entry["customFlag"], "keep");
     }
 
     #[test]

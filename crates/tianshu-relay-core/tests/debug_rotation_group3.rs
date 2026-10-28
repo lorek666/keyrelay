@@ -305,6 +305,90 @@ async fn p1_12_rotation_keeps_the_codex_model() {
     assert!(!auth_after.contains(OLD_SECRET), "旧密钥必须从 auth 里消失");
 }
 
+// ============================================================ P1-15（新通道轮换）
+
+/// 这些通道的 writer 在 `model=None` 时 fail-closed（schema 要求条目必须有
+/// 模型），轮换必须从现盘目标文件把模型读回来，而不是先建新 key、再停在
+/// 第②步。测试同时覆盖五个落点与各自的模型字段位置。
+#[tokio::test]
+async fn p1_15_rotation_keeps_models_for_schema_required_channels() {
+    let f = setup_rotatable().await;
+    let channels = [
+        DeliveryChannel::Droid,
+        DeliveryChannel::CodeBuddy,
+        DeliveryChannel::WorkBuddy,
+        DeliveryChannel::WorkBuddyAi,
+        DeliveryChannel::Crush,
+    ];
+    for channel in channels {
+        f.service.grant_consent(f.key_id, channel).unwrap();
+        f.service
+            .apply_delivery_with_model(f.key_id, channel, Some(MODEL))
+            .unwrap();
+    }
+
+    f.mock.push(create_key_ok());
+    f.mock.push(delete_ok());
+    let run = f
+        .service
+        .rotate_key(f.key_id, KeySpec::named("codex/rotated"))
+        .await
+        .expect("轮换");
+    assert!(run.completed(), "轮换应走完: {:?}", run.stop_reason);
+    let mut got = run.reinjected.clone();
+    got.sort();
+    let mut want: Vec<String> = channels.iter().map(|c| c.as_str().to_string()).collect();
+    want.sort();
+    assert_eq!(got, want, "五个通道都必须重注入");
+
+    for channel in channels {
+        let path = f.home.join(channel.relative_target());
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains(NEW_SECRET), "{} 应拿到新密钥", path.display());
+        assert!(
+            !text.contains(OLD_SECRET),
+            "{} 的旧密钥应消失",
+            path.display()
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let model = match channel {
+            DeliveryChannel::Droid => parsed["customModels"]
+                .as_array()
+                .and_then(|arr| {
+                    arr.iter().find(|entry| {
+                        entry["id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("custom:keyrelay/"))
+                    })
+                })
+                .and_then(|entry| entry["model"].as_str()),
+            DeliveryChannel::CodeBuddy
+            | DeliveryChannel::WorkBuddy
+            | DeliveryChannel::WorkBuddyAi => {
+                let models = match &parsed {
+                    serde_json::Value::Array(items) => Some(items),
+                    serde_json::Value::Object(map) => map.get("models").and_then(|v| v.as_array()),
+                    _ => None,
+                };
+                models
+                    .and_then(|arr| {
+                        arr.iter()
+                            .find(|entry| entry["vendor"].as_str() == Some("keyrelay"))
+                    })
+                    .and_then(|entry| entry["id"].as_str())
+            }
+            DeliveryChannel::Crush => parsed["models"]["large"]["model"].as_str(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            model,
+            Some(MODEL),
+            "{} 轮换后必须保留模型名: {text}",
+            channel.as_str()
+        );
+    }
+}
+
 // ============================================================ P1-13
 
 #[tokio::test]

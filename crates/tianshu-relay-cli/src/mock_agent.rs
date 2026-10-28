@@ -1,16 +1,18 @@
 //! `mock-agent` 子命令：只读解析注入产物，校验密钥字段在（mock 首 token）。
 //!
-//! **只读**：不写、不创建文件、不联网。按通道分流（11 通道，M14-S1 起）：
-//! - JSON 通道（codex / claude-code / opencode(-jsonc) / claude-desktop / pi）：`serde_json` 解析后定位密钥字段；
+//! **只读**：不写、不创建文件、不联网。按通道分流（28 通道）：
+//! - JSON 通道（codex / claude-code / opencode(-jsonc) / claude-desktop / pi 等）：
+//!   `serde_json` 解析后定位密钥字段；
 //! - dotenv 通道（gemini-cli）：行级扫描 `GEMINI_API_KEY=`；
-//! - TOML 通道（grok-build）：行级扫描 `[models.custom]` 段内 `api_key =`；
+//! - TOML 通道（grok-build / kimi-code）：在归属段内读取，Kimi 用 TOML 解析器
+//!   展开 dotted key，不把别家 provider 的 `api_key` 当成本通道；
 //! - 标记块通道（openclaw / hermes / mcode）：定位受管块后校验密钥行。
 //!
 //! 退出码：0 字段在 / 1 字段缺失 / 2 文件不存在或解析失败。
 
 use std::path::{Path, PathBuf};
 
-use tianshu_relay_core::delivery::{hermes, mcode, openclaw, DeliveryChannel};
+use tianshu_relay_core::delivery::{hermes, kimi_code, mcode, openclaw, DeliveryChannel};
 
 /// mock 校验结论。`main` 据此映射退出码。
 #[derive(Debug)]
@@ -74,7 +76,7 @@ pub fn check(channel: DeliveryChannel, home: &Path) -> MockOutcome {
         DeliveryChannel::Qoder | DeliveryChannel::QoderCn => {
             check_json_nested(&text, &["providers", "keyrelay", "apiKey"])
         }
-        DeliveryChannel::KimiCode => check_toml_key(&text, "api_key"),
+        DeliveryChannel::KimiCode => check_kimi(&text),
         DeliveryChannel::Droid => {
             check_json_array_entry(&text, "customModels", "custom:keyrelay/", "apiKey")
         }
@@ -82,6 +84,18 @@ pub fn check(channel: DeliveryChannel, home: &Path) -> MockOutcome {
             check_json_array_entry(&text, "models", "keyrelay", "apiKey")
         }
         DeliveryChannel::Crush => check_json_nested(&text, &["providers", "keyrelay", "api_key"]),
+    }
+}
+
+/// Kimi Code：只认 `[providers.keyrelay]`（或 dotted key 展开后的同一归属）
+/// 的 `api_key`；别家 provider 的 `api_key` 不算。与其它通道一致，这里只验
+/// 「密钥字段在」，不把 `default_model` 当成密钥投递的必要条件（只换 key 的
+/// 投递可以保留用户原有默认模型）。
+fn check_kimi(text: &str) -> MockOutcome {
+    if kimi_code::has_field(text, "api_key") {
+        MockOutcome::Ok
+    } else {
+        MockOutcome::KeyMissing("providers.keyrelay 缺少 api_key 字段".to_string())
     }
 }
 

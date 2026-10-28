@@ -125,6 +125,24 @@ impl DeliveryWriter for DroidWriter {
     }
 }
 
+/// 从现有 Droid 配置里取出 keyrelay 条目的 model，供轮换复用。
+pub fn model_from_text(text: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(text).ok()?;
+    parsed
+        .get("customModels")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter().find(|item| {
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.starts_with(DroidWriter::ID_PREFIX))
+            })
+        })
+        .and_then(|entry| entry.get("model"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 fn build_after(
     before: &str,
     api_key: &str,
@@ -154,18 +172,25 @@ fn build_after(
     let models = entry
         .as_array_mut()
         .ok_or_else(|| Error::inject(path, "customModels 不是数组，拒绝改写"))?;
+    // 保留同一模型的既有条目：Droid 的自定义模型条目允许用户改显示名、
+    // 上下文/输出上限和图片支持等；换 key 只应换连接字段。
+    let id = format!("{}{}", DroidWriter::ID_PREFIX, model);
+    let existing = models
+        .iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id.as_str()))
+        .and_then(Value::as_object)
+        .cloned();
     models.retain(|entry| {
         !entry
             .get("id")
             .and_then(Value::as_str)
             .is_some_and(|id| id.starts_with(DroidWriter::ID_PREFIX))
     });
-
-    let id = format!("{}{}", DroidWriter::ID_PREFIX, model);
-    let mut item = Map::new();
+    let mut item = existing.unwrap_or_default();
     item.insert("model".to_string(), Value::String(model.to_string()));
     item.insert("id".to_string(), Value::String(id.clone()));
-    item.insert("displayName".to_string(), Value::String(model.to_string()));
+    item.entry("displayName".to_string())
+        .or_insert_with(|| Value::String(model.to_string()));
     item.insert(
         DroidWriter::FIELD_BASE_URL.to_string(),
         Value::String(base_url.to_string()),
@@ -188,7 +213,8 @@ fn build_after(
             Value::Number(serde_json::Number::from(meta.max_output_tokens)),
         );
     }
-    item.insert("noImageSupport".to_string(), Value::Bool(true));
+    item.entry("noImageSupport".to_string())
+        .or_insert(Value::Bool(true));
     models.push(Value::Object(item));
 
     let session = root
@@ -277,6 +303,51 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e["id"] == "custom:keyrelay/glm-5"));
+    }
+
+    #[test]
+    fn preserves_existing_model_metadata_on_reapply() {
+        let dir = tmp();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            json!({
+                "customModels": [{
+                    "id": "custom:keyrelay/glm-5",
+                    "model": "glm-5",
+                    "displayName": "My GLM",
+                    "maxContextLimit": 999_000,
+                    "noImageSupport": false,
+                    "customFlag": "keep"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let writer = DroidWriter::with_path(&path, BASE, Some("glm-5"), None);
+        let after = writer.plan(SECRET).unwrap().after;
+        let parsed: Value = serde_json::from_str(&after).unwrap();
+        let entry = &parsed["customModels"][0];
+        assert_eq!(entry["apiKey"], SECRET);
+        assert_eq!(entry["displayName"], "My GLM");
+        assert_eq!(entry["maxContextLimit"], 999_000);
+        assert_eq!(entry["noImageSupport"], false);
+        assert_eq!(entry["customFlag"], "keep");
+    }
+
+    #[test]
+    fn plan_is_idempotent() {
+        let dir = tmp();
+        let writer = DroidWriter::with_path(
+            dir.path().join("settings.json"),
+            BASE,
+            Some("glm-5"),
+            crate::model_meta::lookup("glm-5"),
+        );
+        let first = writer.plan(SECRET).unwrap();
+        std::fs::write(writer.path(), &first.after).unwrap();
+        let second = writer.plan(SECRET).unwrap();
+        assert_eq!(second.after, first.after);
     }
 
     #[test]

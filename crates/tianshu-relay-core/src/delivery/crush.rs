@@ -122,6 +122,20 @@ impl DeliveryWriter for CrushWriter {
     }
 }
 
+/// 从现有 Crush 配置里取出 keyrelay large pick 的 model，供轮换复用。
+pub fn model_from_text(text: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(text).ok()?;
+    let large = parsed.get("models")?.get("large")?;
+    (large.get("provider").and_then(Value::as_str) == Some(CrushWriter::PROVIDER_KEY))
+        .then(|| {
+            large
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten()
+}
+
 fn build_after(
     before: &str,
     api_key: &str,
@@ -163,27 +177,32 @@ fn build_after(
             Value::String(api_key.to_string()),
         );
         *provider = updated;
-        let mut item = Map::new();
-        item.insert("id".to_string(), Value::String(model.to_string()));
-        item.insert("name".to_string(), Value::String(model.to_string()));
-        let context = meta.map(|m| m.context_window).unwrap_or(200_000);
-        let output = meta.map(|m| m.max_output_tokens).unwrap_or(16_384);
-        item.insert(
-            "context_window".to_string(),
-            Value::Number(serde_json::Number::from(context)),
-        );
-        item.insert(
-            "default_max_tokens".to_string(),
-            Value::Number(serde_json::Number::from(output)),
-        );
-        item.insert("can_reason".to_string(), Value::Bool(false));
         let models = provider
             .entry("models".to_string())
             .or_insert_with(|| Value::Array(Vec::new()));
         let array = models
             .as_array_mut()
             .ok_or_else(|| Error::inject(path, "providers.keyrelay.models 不是数组，拒绝改写"))?;
+        // 同一模型的条目可能带用户调过的窗口 / 输出上限 / 思考开关；
+        // 只更新 keyrelay 拥有的字段，别把整条元数据替换成默认值。
+        let existing = array
+            .iter()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(model))
+            .and_then(Value::as_object)
+            .cloned();
         array.retain(|entry| entry.get("id").and_then(Value::as_str) != Some(model));
+        let mut item = existing.unwrap_or_default();
+        item.insert("id".to_string(), Value::String(model.to_string()));
+        item.entry("name".to_string())
+            .or_insert_with(|| Value::String(model.to_string()));
+        let context = meta.map(|m| m.context_window).unwrap_or(200_000);
+        let output = meta.map(|m| m.max_output_tokens).unwrap_or(16_384);
+        item.entry("context_window".to_string())
+            .or_insert_with(|| Value::Number(serde_json::Number::from(context)));
+        item.entry("default_max_tokens".to_string())
+            .or_insert_with(|| Value::Number(serde_json::Number::from(output)));
+        item.entry("can_reason".to_string())
+            .or_insert(Value::Bool(false));
         array.push(Value::Object(item));
     }
 
@@ -264,6 +283,55 @@ mod tests {
         let parsed: Value = serde_json::from_str(&after).unwrap();
         assert_eq!(parsed["providers"]["mine"]["type"], "openai");
         assert_eq!(parsed["models"]["small"]["provider"], "mine");
+    }
+
+    #[test]
+    fn preserves_existing_model_metadata_on_reapply() {
+        let dir = tmp();
+        let path = dir.path().join("crush.json");
+        std::fs::write(
+            &path,
+            json!({
+                "providers": {
+                    "keyrelay": {
+                        "models": [{
+                            "id": "glm-5",
+                            "name": "My GLM",
+                            "context_window": 999_000,
+                            "can_reason": true,
+                            "customFlag": "keep"
+                        }]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let writer = CrushWriter::with_path(&path, BASE, Some("glm-5"), None);
+        let after = writer.plan(SECRET).unwrap().after;
+        let parsed: Value = serde_json::from_str(&after).unwrap();
+        let entry = &parsed["providers"]["keyrelay"]["models"][0];
+        assert_eq!(parsed["providers"]["keyrelay"]["api_key"], SECRET);
+        assert_eq!(entry["name"], "My GLM");
+        assert_eq!(entry["context_window"], 999_000);
+        assert_eq!(entry["can_reason"], true);
+        assert_eq!(entry["customFlag"], "keep");
+        assert_eq!(parsed["models"]["large"]["model"], "glm-5");
+    }
+
+    #[test]
+    fn plan_is_idempotent() {
+        let dir = tmp();
+        let writer = CrushWriter::with_path(
+            dir.path().join("crush.json"),
+            BASE,
+            Some("glm-5"),
+            crate::model_meta::lookup("glm-5"),
+        );
+        let first = writer.plan(SECRET).unwrap();
+        std::fs::write(writer.path(), &first.after).unwrap();
+        let second = writer.plan(SECRET).unwrap();
+        assert_eq!(second.after, first.after);
     }
 
     #[test]

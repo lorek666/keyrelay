@@ -4501,13 +4501,11 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// DEBUG P1-12：轮换要保留的 Codex 模型——读**现盘** `config.toml` 的顶层
     /// `model`，而不是凭空给一个。
     ///
-    /// 为什么只在这里读盘、不改 `codex_config` 的 `model=None` 语义：其余 18 条
-    /// 通道在 `model=None` 时只插不删、模型本来就保留，只有 Codex config 是
-    /// strip 后重写型；把 writer 改成「None 时保留原模型」会改变所有
-    /// `codex-config` 直接投递的语义（用户想清掉模型时也清不掉），而轮换的
-    /// 语义恰恰是「只换密钥，不动模型」——保留应当是轮换这一步的责任，不是
-    /// writer 的。读不到文件 / 没有顶层 model 时返回 `None`（退回旧行为），
-    /// 预检会把真正写不进的情形拦在建新 key 之前。
+    /// 为什么只在这里读盘、不改 `codex_config` 的 `model=None` 语义：把 writer
+    /// 改成「None 时保留原模型」会改变所有 `codex-config` 直接投递的语义
+    /// （用户想清掉模型时也清不掉），而轮换的语义恰恰是「只换密钥，不动模型」——
+    /// 保留应当是轮换这一步的责任，不是 writer 的。读不到文件 / 没有顶层 model
+    /// 时返回 `None`（退回旧行为），预检会把真正写不进的情形拦在建新 key 之前。
     fn rotation_codex_model(&self) -> Option<String> {
         let path = self
             .home
@@ -4516,12 +4514,34 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         delivery::codex_config::top_model_from_text(&text)
     }
 
-    /// 轮换时某通道用的模型：只有 Codex 两通道透传现盘模型（auth 写入器本身
-    /// 不写模型，透传无害；config 靠它保留），其余通道一律 `None`——它们在
-    /// `None` 时只插不删，透传反而会把模型写进本来没有模型的通道。
-    fn rotation_model_for(channel: DeliveryChannel, codex_model: &Option<String>) -> Option<&str> {
+    /// 轮换时某通道用的模型。模型不是绑定表里的字段，因此从**现盘目标文件**读取：
+    /// - Codex config 是 strip 后重写型，必须透传顶层 model；
+    /// - Droid / CodeBuddy / WorkBuddy / WorkBuddy AI / Crush 的 writer 在
+    ///   `model=None` 时按 fail-closed 拒绝（这些 schema 的条目必须有 model），
+    ///   轮换必须从上次投递的 keyrelay 条目里把 model 找回来；
+    /// - 其余通道 writer 在 `None` 时只插不删，模型本来就保留，不需要透传。
+    ///
+    /// 读不到文件 / 找不到 keyrelay 条目时返回 `None`；预检会让轮换在建新 key
+    /// 之前失败，而不是先建一把新 key 再停在第②步。
+    fn rotation_model_for_channel(&self, channel: DeliveryChannel) -> Option<String> {
+        // 只读该通道的白名单落点（`home.join(relative_target)`），不读绑定表里的
+        // 任意路径：模型推导不该成为「读数据库里一条被篡改路径」的入口。
+        let path = self.home.join(channel.relative_target());
         match channel {
-            DeliveryChannel::CodexAuthJson | DeliveryChannel::CodexConfig => codex_model.as_deref(),
+            DeliveryChannel::CodexAuthJson | DeliveryChannel::CodexConfig => {
+                self.rotation_codex_model()
+            }
+            DeliveryChannel::Droid => std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| delivery::droid::model_from_text(&text)),
+            DeliveryChannel::CodeBuddy
+            | DeliveryChannel::WorkBuddy
+            | DeliveryChannel::WorkBuddyAi => std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| delivery::workbuddy::model_from_text(&text)),
+            DeliveryChannel::Crush => std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| delivery::crush::model_from_text(&text)),
             _ => None,
         }
     }
@@ -4533,20 +4553,16 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     ///
     /// 为什么是 `plan()` 而不是 `apply_delivery`：`plan()` 不落盘、不读钥匙串、不改任何状态，
     /// 因此「预检」不会产生任何需要回滚的东西。**预检失败不建新 key** 是这条的全部意义。
-    fn rotation_precheck(
-        &self,
-        key_id: i64,
-        targets: &[RotationTarget],
-        codex_model: &Option<String>,
-    ) -> Vec<BlockedTarget> {
+    fn rotation_precheck(&self, key_id: i64, targets: &[RotationTarget]) -> Vec<BlockedTarget> {
         let mut blocked = Vec::new();
         for target in targets {
             let channel = target.channel;
             let variant = target.variant.as_deref();
+            let model = self.rotation_model_for_channel(channel);
             let writer = match self.prepare_delivery(
                 key_id,
                 channel,
-                Self::rotation_model_for(channel, codex_model),
+                model.as_deref(),
                 delivery::DeliverySource::Site,
                 variant,
             ) {
@@ -4606,7 +4622,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             let precheck = writer.plan(delivery::PLACEHOLDER_KEY).and_then(|_| {
                 let opts = self.delivery_field_options(
                     key_id,
-                    Self::rotation_model_for(channel, codex_model),
+                    model.as_deref(),
                     &delivery::DeliverySource::Site,
                 )?;
                 delivery::validate_plan_fields(
@@ -4813,8 +4829,6 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         // 认不出通道这件事上面已经拒绝过了，循环里不该再有一个「理论上不可达」的分支。
         // DEBUG P1-13：这里是目标（含变体），不是通道——变体在循环里全程携带。
         let (targets, _) = self.rotation_targets(key_id)?;
-        // DEBUG P1-12：现盘 Codex 模型在预检与重注入两处共用同一份读数。
-        let codex_model = self.rotation_codex_model();
 
         // ①′ 预检（§9-8 / P2-3）：**在 `create_key` 之前**证明「每个通道都写得进去」。
         //
@@ -4824,7 +4838,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         //
         // 空跑用的是 `PLACEHOLDER_KEY`（不是任何真实密钥形态）且只调 `plan()`：
         // `plan()` 读目标文件、生成 `Patch`，**不落盘、不读钥匙串**⇒ 对站点与本地都无副作用。
-        let blocked = self.rotation_precheck(key_id, &targets, &codex_model);
+        let blocked = self.rotation_precheck(key_id, &targets);
         if !blocked.is_empty() {
             return Err(Error::Inject {
                 path: blocked
@@ -4906,6 +4920,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 let mode_auth = self.rotation_delivery_mode(key_id, &channel)?;
                 let mode_config =
                     self.rotation_delivery_mode(key_id, &DeliveryChannel::CodexConfig)?;
+                let codex_model = self.rotation_codex_model();
                 if mode_auth == mode_config {
                     let bundle_result = match mode_auth.as_str() {
                         "gateway" => {
@@ -4996,6 +5011,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             // 同意门禁、原子写、回读校验都在 `apply_delivery_in_with_variant` 内，
             // 轮换不放宽其中任何一项；旧 key 不回收的好行为由失败分支保证。
             let mode = self.rotation_delivery_mode(key_id, &channel)?;
+            let model = self.rotation_model_for_channel(channel);
             let result = match mode.as_str() {
                 "gateway" => {
                     let local_url = format!("http://127.0.0.1:{}", port);
@@ -5009,7 +5025,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     self.apply_delivery_in_with_variant(
                         new_key.id,
                         channel,
-                        Self::rotation_model_for(channel, &codex_model),
+                        model.as_deref(),
                         delivery::DeliverySource::Gateway(&endpoint),
                         target.variant.as_deref(),
                     )
@@ -5017,7 +5033,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 _ => self.apply_delivery_in_with_variant(
                     new_key.id,
                     channel,
-                    Self::rotation_model_for(channel, &codex_model),
+                    model.as_deref(),
                     delivery::DeliverySource::Site,
                     target.variant.as_deref(),
                 ),

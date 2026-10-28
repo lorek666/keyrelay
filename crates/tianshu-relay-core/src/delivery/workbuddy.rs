@@ -158,6 +158,22 @@ impl WorkBuddyWriter {
     }
 }
 
+/// 从现有 models.json 里取出 keyrelay 条目的 id，供轮换复用。
+pub fn model_from_text(text: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(text).ok()?;
+    let models = match &parsed {
+        Value::Array(items) => Some(items),
+        Value::Object(map) => map.get("models").and_then(Value::as_array),
+        _ => None,
+    }?;
+    models
+        .iter()
+        .find(|item| item.get("vendor").and_then(Value::as_str) == Some(WorkBuddyWriter::VENDOR))
+        .and_then(|entry| entry.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 fn build_after(
     before: &str,
     api_key: &str,
@@ -374,6 +390,22 @@ mod tests {
             writer.target_path(),
             dir.path().join(".workbuddy-ai").join("models.json")
         );
+    }
+
+    #[test]
+    fn plan_is_idempotent() {
+        let dir = tmp();
+        let writer = WorkBuddyWriter::with_path(
+            dir.path().join("models.json"),
+            DeliveryChannel::WorkBuddy,
+            BASE,
+            Some("glm-5"),
+            crate::model_meta::lookup("glm-5"),
+        );
+        let first = writer.plan(SECRET).unwrap();
+        std::fs::write(writer.path(), &first.after).unwrap();
+        let second = writer.plan(SECRET).unwrap();
+        assert_eq!(second.after, first.after);
     }
 
     #[test]

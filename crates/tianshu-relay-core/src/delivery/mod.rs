@@ -1104,20 +1104,7 @@ fn scoped_verify_present(channel: DeliveryChannel, qualified: &str, text: &str) 
             };
             Some(json_walk(&parsed, &path).is_some())
         }
-        DeliveryChannel::KimiCode => {
-            let (section, key) = if leaf == kimi_code::KimiCodeWriter::FIELD_DEFAULT_MODEL {
-                (toml_top_slice(text), leaf)
-            } else {
-                (
-                    match toml_section_slice(text, "[providers.keyrelay]") {
-                        Some(section) => section,
-                        None => return Some(false),
-                    },
-                    leaf,
-                )
-            };
-            Some(text_contains_key(section, key))
-        }
+        DeliveryChannel::KimiCode => Some(kimi_code::has_field(text, leaf)),
         DeliveryChannel::Droid => {
             let parsed = match serde_json::from_str::<serde_json::Value>(text) {
                 Ok(v) => v,
@@ -1685,14 +1672,7 @@ pub fn import_existing_fields(
             }
             DeliveryChannel::GrokBuild => toml_section_slice(text, "[models.custom]")
                 .and_then(|section| scan_line_value(section, leaf)),
-            DeliveryChannel::KimiCode => {
-                let slice = if leaf == kimi_code::KimiCodeWriter::FIELD_DEFAULT_MODEL {
-                    Some(toml_top_slice(text))
-                } else {
-                    toml_section_slice(text, "[providers.keyrelay]")
-                };
-                slice.and_then(|part| scan_line_value(part, leaf))
-            }
+            DeliveryChannel::KimiCode => kimi_code::value_from_text(text, leaf),
             _ => scan_line_value(text, leaf),
         };
         if let Some(value) = value {
@@ -1905,7 +1885,7 @@ pub fn restart_hint_detail(channel: DeliveryChannel) -> RestartHintDetail {
             source: Source::CcSwitchUnverified,
             action: Action::RelaunchDesktopApp,
         },
-        // 其余 14 条：P1-6 不细化，穷举列出（新增通道时这里编译失败，不得静默
+        // 其余 22 条：P1-6 不细化，穷举列出（新增通道时这里编译失败，不得静默
         // 落入通用说法）。OpenCode / OpenClaw / Hermes / Pi / MCode 在 cc-switch
         // FAQ 里是“共存模式（在工具内选模型）”，但 KeyRelay 是换 key 不是并存
         // 添加，该说法不能直接转成“无需重启”，故不抄表、仍保守标注。
@@ -3417,6 +3397,40 @@ mod tests {
         assert_eq!(got[0].masked, "custom");
         assert_eq!(got[1].masked, "gpt-4o");
         assert_eq!(got[2].masked, "https://toml.example.com");
+    }
+
+    #[test]
+    fn kimi_import_and_verify_are_scoped_and_parse_valid_toml_forms() {
+        let text = "# Kimi Code\ndefault_model = \"keyrelay/kimi-k3\" # keep\nproviders.keyrelay.api_key = \"sk-old-1111\"\nproviders.keyrelay.base_url = \"https://old.example.com/v1\"\n";
+        let expected = vec![
+            "providers.keyrelay.api_key".to_string(),
+            "providers.keyrelay.base_url".to_string(),
+            "default_model".to_string(),
+        ];
+        let got = import_existing_fields(DeliveryChannel::KimiCode, &expected, text);
+        assert_eq!(got.len(), 3, "合法 dotted key 应能导入: {got:?}");
+        assert_eq!(got[0].masked, "…1111");
+        assert_eq!(got[1].masked, "https://old.example.com/v1");
+        assert_eq!(got[2].masked, "keyrelay/kimi-k3");
+        assert!(field_present_in_scope(
+            DeliveryChannel::KimiCode,
+            "providers.keyrelay.api_key",
+            text
+        ));
+        assert!(field_present_in_scope(
+            DeliveryChannel::KimiCode,
+            "default_model",
+            text
+        ));
+
+        // 别家 provider 的同名字段不算本通道已写入。
+        let other = "[providers.other]\napi_key = \"sk-other-2222\"\nbase_url = \"https://other.example.com/v1\"\n";
+        assert!(!field_present_in_scope(
+            DeliveryChannel::KimiCode,
+            "providers.keyrelay.api_key",
+            other
+        ));
+        assert!(import_existing_fields(DeliveryChannel::KimiCode, &expected, other).is_empty());
     }
 
     #[test]

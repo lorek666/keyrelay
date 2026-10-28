@@ -99,14 +99,14 @@ fn restart_hint_table_is_verbatim() {
 /// P1-6：分表逐条钉住（取值 + 来源标注 + 动作），三者缺一不可。
 ///
 /// 三分法对照：抄 cc-switch（未实测）4 条通道——Claude Code、Gemini、Grok、
-/// Claude Desktop；已实测 0 条；未实测 16 条通道（含 Codex 两条：其桌面按钮 /
+/// Claude Desktop；已实测 0 条；未实测 23 条通道（含 Codex 两条：其桌面按钮 /
 /// 终端手动 / daemon 三分法是本项目 P1-5 结论、不是 cc-switch 原话，故不标抄表）。
 #[test]
 fn restart_hint_detail_table_is_verbatim() {
     use RestartAction as Action;
     use RestartHint as Hint;
     use RestartHintSource as Source;
-    // B-292：ClineDesktop 已下线，不在本表，故表长 19（不是 20）。
+    // B-292：ClineDesktop 已下线，不在本表；28 条通道里可投递的 27 条进表。
     let table: [(DeliveryChannel, Hint, Source, Action); 27] = [
         (
             DeliveryChannel::CodexAuthJson,

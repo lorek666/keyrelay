@@ -6348,12 +6348,21 @@ mod tests {
         // 显式适配器表：根路径通道（Anthropic SDK / Gemini SDK 自己拼版本前缀）
         // 不带 /v1；OpenAI 兼容通道带 /v1。Gemini CLI 必须走根路径，否则
         // @google/genai 会拼出 /v1/v1beta/models/...。
-        use tianshu_relay_core::delivery::{
-            agent_endpoint_spec, gateway_base_url_for, DeliveryChannel,
-        };
+        use tianshu_relay_core::delivery::{gateway_base_url_for, DeliveryChannel};
         let url = "http://127.0.0.1:19387";
+        // 独立列出根路径通道，不从被测的 `agent_endpoint_spec` 反推期望值；
+        // 否则表写错时测试会跟着一起错（自证）。
+        let root_channels = [
+            DeliveryChannel::ClaudeCodeSettings,
+            DeliveryChannel::ClaudeDesktop,
+            DeliveryChannel::GeminiCli,
+        ];
         for channel in DeliveryChannel::ALL {
-            let expected = format!("{url}{}", agent_endpoint_spec(channel).base_path);
+            let expected = if root_channels.contains(&channel) {
+                url.to_string()
+            } else {
+                format!("{url}/v1")
+            };
             assert_eq!(
                 gateway_base_url_for(&channel, url),
                 expected,

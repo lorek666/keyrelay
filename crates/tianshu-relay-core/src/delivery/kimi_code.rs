@@ -126,6 +126,25 @@ impl DeliveryWriter for KimiCodeWriter {
     }
 }
 
+/// 从现有 TOML 里读取本通道的字段。解析器会展开 dotted key、忽略表头尾随注释，
+/// 因此回读/导入不依赖某一具体书写形态。
+pub fn value_from_text(text: &str, field: &str) -> Option<String> {
+    let doc: DocumentMut = text.parse().ok()?;
+    let item = if field == KimiCodeWriter::FIELD_DEFAULT_MODEL {
+        doc.get(field)?
+    } else {
+        doc.get("providers")?
+            .get(KimiCodeWriter::PROVIDER_KEY)?
+            .get(field)?
+    };
+    item.as_str().map(str::to_string)
+}
+
+/// 回读/导入用：字段是否在 keyrelay 归属内（不是全文同名键）。
+pub fn has_field(text: &str, field: &str) -> bool {
+    value_from_text(text, field).is_some()
+}
+
 fn build_after(
     before: &str,
     api_key: &str,
@@ -181,11 +200,18 @@ fn build_after(
             .ok_or_else(|| Error::inject(path, "models 的 keyrelay 条目不是表，拒绝改写"))?;
         model_table.insert("provider", value(KimiCodeWriter::PROVIDER_KEY));
         model_table.insert("model", value(model));
-        let context = meta
-            .map(|m| m.context_window)
-            .unwrap_or(KimiCodeWriter::DEFAULT_CONTEXT);
-        model_table.insert("max_context_size", value(context as i64));
-        model_table.insert("display_name", value(model));
+        // display_name / max_context_size 是用户可在 Kimi 里改的元数据：
+        // 有 meta 时用名单值刷新，没有 meta 时保留现值；只有新条目才填默认。
+        if let Some(meta) = meta {
+            model_table.insert("max_context_size", value(meta.context_window as i64));
+        } else {
+            model_table
+                .entry("max_context_size")
+                .or_insert(value(KimiCodeWriter::DEFAULT_CONTEXT as i64));
+        }
+        model_table
+            .entry("display_name")
+            .or_insert_with(|| value(model));
         doc[KimiCodeWriter::FIELD_DEFAULT_MODEL] = value(key);
     }
 
@@ -245,13 +271,79 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "[models.\"keyrelay/kimi-k3\"]\nprovider = \"old\"\ncustom_headers = { x = \"y\" }\n",
+            "[models.\"keyrelay/kimi-k3\"]\nprovider = \"old\"\ndisplay_name = \"My K3\"\nmax_context_size = 999000\ncustom_headers = { x = \"y\" }\n",
         )
         .unwrap();
         let writer = KimiCodeWriter::with_path(&path, BASE, Some("kimi-k3"), None);
         let after = writer.plan(SECRET).unwrap().after;
         assert!(after.contains("custom_headers"), "{after}");
         assert!(after.contains("provider = \"keyrelay\""), "{after}");
+        assert!(after.contains("display_name = \"My K3\""), "{after}");
+        assert!(after.contains("max_context_size = 999000"), "{after}");
+    }
+
+    #[test]
+    fn preserves_unknown_keys_on_an_existing_provider_table() {
+        let dir = tmp();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[providers.keyrelay]\ncustom_headers = { X-Mine = \"1\" }\nenv = { HTTPS_PROXY = \"http://proxy:8080\" }\ndefault_model = \"relay/old\"\n",
+        )
+        .unwrap();
+        let writer = KimiCodeWriter::with_path(&path, BASE, None, None);
+        let after = writer.plan(SECRET).unwrap().after;
+        assert!(after.contains("custom_headers"), "{after}");
+        assert!(after.contains("HTTPS_PROXY"), "{after}");
+        assert!(after.contains("default_model = \"relay/old\""), "{after}");
+        assert!(
+            after.contains("api_key = \"sk-kimi-0123456789abcdef\""),
+            "{after}"
+        );
+    }
+
+    #[test]
+    fn readback_accepts_dotted_keys_and_header_comments() {
+        let text = "# my Kimi config\ndefault_model = \"keyrelay/kimi-k3\" # my default\nproviders.keyrelay.api_key = \"sk-old-1111\" # old key\nproviders.keyrelay.base_url = \"https://old.example.com/v1\"\n";
+        assert_eq!(
+            value_from_text(text, KimiCodeWriter::FIELD_API_KEY).as_deref(),
+            Some("sk-old-1111")
+        );
+        assert_eq!(
+            value_from_text(text, KimiCodeWriter::FIELD_BASE_URL).as_deref(),
+            Some("https://old.example.com/v1")
+        );
+        assert_eq!(
+            value_from_text(text, KimiCodeWriter::FIELD_DEFAULT_MODEL).as_deref(),
+            Some("keyrelay/kimi-k3")
+        );
+        assert!(has_field(text, KimiCodeWriter::FIELD_API_KEY));
+    }
+
+    #[test]
+    fn readback_is_scoped_to_the_keyrelay_provider() {
+        let other = "[providers.other]\napi_key = \"sk-other-2222\"\nbase_url = \"https://other.example.com/v1\"\n";
+        assert!(!has_field(other, KimiCodeWriter::FIELD_API_KEY));
+        assert!(!has_field(other, KimiCodeWriter::FIELD_BASE_URL));
+        // provider 段里的 default_model 不是顶层默认模型，不能误认。
+        let nested_default = "[providers.keyrelay]\ndefault_model = \"not-the-top-level-one\"\n";
+        assert_eq!(
+            value_from_text(nested_default, KimiCodeWriter::FIELD_DEFAULT_MODEL),
+            None
+        );
+    }
+
+    #[test]
+    fn readback_accepts_inline_tables() {
+        let text = "providers = { keyrelay = { api_key = \"sk-inline-3333\", base_url = \"https://inline.example.com/v1\" } }\ndefault_model = \"keyrelay/kimi-k3\"\n";
+        assert_eq!(
+            value_from_text(text, KimiCodeWriter::FIELD_API_KEY).as_deref(),
+            Some("sk-inline-3333")
+        );
+        assert_eq!(
+            value_from_text(text, KimiCodeWriter::FIELD_BASE_URL).as_deref(),
+            Some("https://inline.example.com/v1")
+        );
     }
 
     #[test]
