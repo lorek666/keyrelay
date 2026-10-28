@@ -1483,6 +1483,14 @@ const AGENT_CHANNELS: Record<string, string> = {
   // B-292：Cline Desktop 已下线，不再属于可投递通道——旧绑定行至此查不到通道，
   // 批量改指页按「无法识别通道」列出（行本身不隐藏），不再为其发起新的投递计划。
   "dsh": "dsh",
+  qoder: "qoder",
+  "qoder-cn": "qoder-cn",
+  "kimi-code": "kimi-code",
+  droid: "droid",
+  codebuddy: "codebuddy",
+  workbuddy: "workbuddy",
+  "workbuddy-ai": "workbuddy-ai",
+  crush: "crush",
 };
 
 /**
@@ -2731,8 +2739,8 @@ export async function detectAgents(): Promise<AgentStatus[]> {
       ],
       installUrl: "https://example.com/install",
     });
-    // 与真实后端检测清单的区别：后端 detect_agents 返回 20 条检测规格（含已下线
-    // 的 cline-desktop 检测保留），浏览器 mock 只按可投递的 19 条 AGENT_CHANNELS
+    // 与真实后端检测清单的区别：后端 detect_agents 返回 28 条检测规格（含已下线
+    // 的 cline-desktop 检测保留），浏览器 mock 只按可投递的 27 条 AGENT_CHANNELS
     // 出——只给 5 条会让其余行落到「状态未知」，浏览器预览里就看不到完整的工作台。
     const installedMock: Record<string, AgentStatus> = {
       "codex-auth-json": {
@@ -2872,7 +2880,7 @@ export type AgentUpdateOutcome = {
  */
 export async function checkAgentUpdates(): Promise<AgentUpdateStatus[]> {
   if (!hasTauri) {
-    // 浏览器预览：与 spec §4.3 的 mock 口径一致 —— 19 条、顺序同后端（= AGENT_CHANNELS 的值序）。
+    // 浏览器预览：与 spec §4.3 的 mock 口径一致 —— 27 条、顺序同后端（= AGENT_CHANNELS 的值序）。
     // codex 两个通道可更新、claude 可更新、dsh 已最新、grok 不支持检查、其余未安装。
     const notInstalled = (channel: string): AgentUpdateStatus => ({
       channel,

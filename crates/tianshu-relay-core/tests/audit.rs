@@ -82,8 +82,17 @@ fn full_delivery_flow_stays_clean() {
         if channel == DeliveryChannel::ClineDesktop {
             continue;
         }
-        // Continue 的条目必须有模型名（Continue 的 schema 必填），其余通道不需要
-        let model = (channel == DeliveryChannel::OpenClaw).then_some("gpt-4o");
+        // 这些通道的配置条目必须有模型名；其余通道不需要。
+        let model = matches!(
+            channel,
+            DeliveryChannel::OpenClaw
+                | DeliveryChannel::Droid
+                | DeliveryChannel::CodeBuddy
+                | DeliveryChannel::WorkBuddy
+                | DeliveryChannel::WorkBuddyAi
+                | DeliveryChannel::Crush
+        )
+        .then_some("gpt-4o");
         // P0-3：DSH 投递要求至少一个 profile 引用 KEYRELAY_API_KEY，
         // 否则 apply 在落盘前拒绝；本用例测的是审计不泄漏而非引用校验，
         // 因此先给 DSH 备一个已引用的 profile。

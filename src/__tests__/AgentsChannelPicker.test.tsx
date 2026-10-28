@@ -10,7 +10,7 @@ import zhCN from "../i18n/zh-CN.json";
  * M31-S1：本文件从「卡片网格」改成「单列工作台」的行列表断言。
  *
  * **不是删掉旧断言，而是换成等价强度的行断言**：
- * ① 19 行且顺序与 `CHANNELS` 一致（B-292：Cline Desktop 已下线，旧断言 20 张卡片作废）；
+ * ① 27 行且顺序与 `CHANNELS` 一致（B-292：Cline Desktop 已下线；新增 8 条通道后为 27 张卡片）；
  * ② 每行有 `data-agent-channel` 与 `data-agent-name`，并显示名称与目标文件（旧断言：每张卡含 label + agent）；
  * ③ 页面不再有旧的「通道」下拉（旧断言：无 combobox）；
  * ④ 旧 M30 的卡片网格 `.agent-grid` / `[data-agent-channel]` 按钮形态已被行列表取代。
@@ -71,10 +71,10 @@ const rows = () =>
   Array.from(document.querySelectorAll<HTMLElement>("[data-agent-channel]"));
 
 describe("M31-S1 Agent 工作台（行列表）", () => {
-  it("① 19 行且顺序与 CHANNELS 完全一致", async () => {
+  it("① 27 行且顺序与 CHANNELS 完全一致", async () => {
     renderPage();
     await waitFor(() => expect(rows().length).toBe(CHANNELS.length));
-    expect(CHANNELS.length).toBe(19);  // B-292：Cline Desktop 已下线
+    expect(CHANNELS.length).toBe(27);  // B-292：Cline Desktop 已下线；新增 8 条通道
     expect(rows().map((r) => r.getAttribute("data-agent-channel"))).toEqual(
       CHANNELS.map((c) => c.id),
     );

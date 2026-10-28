@@ -1,4 +1,4 @@
-//! Agent 工作台的核心层（M31-S1）：20 种 agent 的「装没装 + 版本 + 安装命令」。
+//! Agent 工作台的核心层（M31-S1）：28 种 agent 的「装没装 + 版本 + 安装命令」。
 //!
 //! # 纪律
 //!
@@ -86,8 +86,8 @@ macro_rules! inst {
     };
 }
 
-/// 20 条 agent 清单。**顺序与 `DeliveryChannel::ALL` 逐位一致**（测试钉住）。
-static SPECS: [AgentSpec; 20] = [
+/// 28 条 agent 清单。**顺序与 `DeliveryChannel::ALL` 逐位一致**（测试钉住）。
+static SPECS: [AgentSpec; 28] = [
     AgentSpec {
         channel: "codex-auth-json",
         name: "Codex",
@@ -337,9 +337,98 @@ static SPECS: [AgentSpec; 20] = [
         installs: &[inst!("npm", "npm install -g @deepseek-ai/dsh")],
         install_url: "https://www.npmjs.com/package/@deepseek-ai/dsh",
     },
+    AgentSpec {
+        channel: "qoder",
+        name: "Qoder",
+        probe: Probe::Cli {
+            bins: &["qodercli"],
+            version_args: V,
+        },
+        config_path: Some(".qoder/settings.json"),
+        installs: &[inst!("npm", "npm install -g @qoder-ai/qodercli")],
+        install_url: "https://qoder.com",
+    },
+    AgentSpec {
+        channel: "qoder-cn",
+        name: "Qoder CN",
+        probe: Probe::Cli {
+            bins: &["qoderclicn"],
+            version_args: V,
+        },
+        config_path: Some(".qoder-cn/settings.json"),
+        installs: &[inst!("npm", "npm install -g @qodercn-ai/qoderclicn")],
+        install_url: "https://qoder.cn",
+    },
+    AgentSpec {
+        channel: "kimi-code",
+        name: "Kimi Code",
+        probe: Probe::Cli {
+            bins: &["kimi"],
+            version_args: V,
+        },
+        config_path: Some(".kimi-code/config.toml"),
+        installs: &[inst!("npm", "npm install -g @moonshot-ai/kimi-code")],
+        install_url: "https://www.kimi.com/coding",
+    },
+    AgentSpec {
+        channel: "droid",
+        name: "Droid",
+        probe: Probe::Cli {
+            bins: &["droid"],
+            version_args: V,
+        },
+        config_path: Some(".factory/settings.json"),
+        installs: &[inst!(
+            "script",
+            "curl -fsSL https://app.factory.ai/cli | sh"
+        )],
+        install_url: "https://factory.ai",
+    },
+    AgentSpec {
+        channel: "codebuddy",
+        name: "CodeBuddy Code",
+        probe: Probe::Cli {
+            bins: &["codebuddy", "cbc"],
+            version_args: V,
+        },
+        config_path: Some(".codebuddy/models.json"),
+        installs: &[inst!("npm", "npm install -g @tencent-ai/codebuddy-code")],
+        install_url: "https://codebuddy.ai",
+    },
+    AgentSpec {
+        channel: "workbuddy",
+        name: "WorkBuddy",
+        probe: Probe::App {
+            bundles: &["WorkBuddy"],
+        },
+        config_path: Some(".workbuddy/models.json"),
+        installs: &[inst!("brew", "brew install --cask workbuddy-cn")],
+        install_url: "https://www.workbuddy.ai",
+    },
+    AgentSpec {
+        channel: "workbuddy-ai",
+        name: "WorkBuddy AI",
+        probe: Probe::App {
+            bundles: &["WorkBuddy AI"],
+        },
+        config_path: Some(".workbuddy-ai/models.json"),
+        installs: &[inst!("brew", "brew install --cask workbuddy-ai")],
+        install_url: "https://www.workbuddy.ai",
+    },
+    AgentSpec {
+        channel: "crush",
+        name: "Crush",
+        probe: Probe::Cli {
+            bins: &["crush"],
+            version_args: V,
+        },
+        config_path: Some(".config/crush/crush.json"),
+        installs: &[inst!("npm", "npm install -g @charmland/crush")],
+        install_url: "https://github.com/charmbracelet/crush",
+    },
 ];
 
-/// 全部 20 条（顺序与 `DeliveryChannel::ALL` 逐位一致）。
+/// 全部 28 条（顺序与 `DeliveryChannel::ALL` 逐位一致）。
 pub fn specs() -> &'static [AgentSpec] {
     &SPECS
 }
@@ -366,7 +455,7 @@ pub fn detect_agents(home: &Path) -> Vec<AgentStatus> {
             .zip(specs().iter())
             .map(|(handle, spec)| match handle.join() {
                 Ok(status) => status,
-                // 探测 panic 不该让整页崩：降级成「未安装 + 说明」，其余 19 条照常。
+                // 探测 panic 不该让整页崩：降级成「未安装 + 说明」，其余 27 条照常。
                 Err(_) => AgentStatus {
                     channel: spec.channel.to_string(),
                     installed: false,
@@ -942,7 +1031,7 @@ mod tests {
     #[test]
     fn specs_cover_exactly_the_delivery_channels_in_order() {
         use crate::delivery::DeliveryChannel;
-        assert_eq!(specs().len(), 20, "spec §4.1：恰好 20 条");
+        assert_eq!(specs().len(), 28, "spec §4.1：恰好 28 条");
         let channels: Vec<&str> = specs().iter().map(|spec| spec.channel).collect();
         let expected: Vec<&str> = DeliveryChannel::ALL.iter().map(|c| c.as_str()).collect();
         assert_eq!(channels, expected, "顺序与 DeliveryChannel::ALL 逐位一致");
@@ -1258,9 +1347,9 @@ mod tests {
             status.install_url.as_deref(),
             Some("https://example.invalid")
         );
-        // detect_agents 也应当能在空 HOME 上跑完 20 条（不 panic）
+        // detect_agents 也应当能在空 HOME 上跑完 28 条（不 panic）
         let all = detect_agents(home);
-        assert_eq!(all.len(), 20);
+        assert_eq!(all.len(), 28);
         assert!(all.iter().all(|s| !s.install_commands.is_empty()));
     }
 

@@ -208,9 +208,5 @@ fn list_channels_exits_0_and_lists_all() {
         "list-channels 应与 DeliveryChannel::ALL 逐字一致"
     );
     assert_eq!(lines.len(), DeliveryChannel::ALL.len());
-    assert_eq!(
-        lines.len(),
-        20,
-        "M14-S3 起 19 通道（M25-S1 加 codex-config 变 20）"
-    );
+    assert_eq!(lines.len(), 28, "新增 8 条通道后 list-channels 应有 28 条");
 }

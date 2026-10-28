@@ -97,7 +97,7 @@
 
 ## 支持的 Agent
 
-投递覆盖 20 个渠道（19 个可直写，1 个例外见注）：
+投递覆盖 28 个渠道（27 个可直写，1 个例外见注）：
 
 | Agent | 备注 |
 | ---- | ---- |
@@ -106,6 +106,8 @@
 | OpenCode | `.json` 与 `.jsonc` 是两个落点，预览里自选其一，产品不猜优先级 |
 | Gemini CLI、Grok、OpenClaw、Hermes、MCode、Pi | |
 | Cursor、Cline、Qwen Code、DeepSeek、Trae、MiMoCode、DeepSeek Harness | |
+| Qoder、Qoder CN、Kimi Code、Droid、CodeBuddy Code | |
+| WorkBuddy、WorkBuddy AI、Crush | |
 | Cline 桌面版 | ⚠️ 暂不支持文件直写，请走 `cline auth` CLI |
 
 每个 agent 的生效策略不同（有的新会话即生效，有的需重启），注入前界面会标注。

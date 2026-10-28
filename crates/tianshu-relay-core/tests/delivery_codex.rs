@@ -448,8 +448,17 @@ fn every_deliverable_channel_produces_a_plan() {
         if channel == DeliveryChannel::ClineDesktop {
             continue;
         }
-        // Continue 的条目必须有模型名（Continue 的 schema 必填），其余通道不需要
-        let model = (channel == DeliveryChannel::OpenClaw).then_some("gpt-4o");
+        // 这些通道的配置条目必须有模型名；其余通道不需要。
+        let model = matches!(
+            channel,
+            DeliveryChannel::OpenClaw
+                | DeliveryChannel::Droid
+                | DeliveryChannel::CodeBuddy
+                | DeliveryChannel::WorkBuddy
+                | DeliveryChannel::WorkBuddyAi
+                | DeliveryChannel::Crush
+        )
+        .then_some("gpt-4o");
         let plan = f
             .service
             .delivery_plan_with_model(f.key_id, channel, model)

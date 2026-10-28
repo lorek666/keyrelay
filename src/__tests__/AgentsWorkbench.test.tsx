@@ -9,7 +9,7 @@ import zhCN from "../i18n/zh-CN.json";
 /**
  * M31-S1：Agent 单列工作台的行为。
  *
- * 钉死：19 行顺序（B-292：Cline Desktop 已下线）、已安装显示版本、未安装显示「未安装」+「安装」、
+ * 钉死：27 行顺序（B-292：Cline Desktop 已下线）、已安装显示版本、未安装显示「未安装」+「安装」、
  * 安装弹窗展示命令、每行 key/model **互不影响**、localStorage 恢复、
  * 切换站点不串台、展开行把**自己的**参数交给 deliveryPlan、未安装行不调 deliveryPlan。
  */
@@ -116,15 +116,15 @@ beforeEach(() => {
 });
 
 describe("M31-S1 Agent 工作台", () => {
-  it("① 19 行、顺序与 CHANNELS 一致", async () => {
+  it("① 27 行、顺序与 CHANNELS 一致", async () => {
     renderPage();
-    await waitFor(() => expect(rows().length).toBe(19));
+    await waitFor(() => expect(rows().length).toBe(27));
     expect(rows().map((r) => r.getAttribute("data-agent-channel"))).toEqual(CHANNELS.map((c) => c.id));
   });
 
   it("② 已安装行显示版本；未安装行显示「未安装」+「安装」且没有密钥下拉", async () => {
     renderPage();
-    await waitFor(() => expect(rows().length).toBe(19));
+    await waitFor(() => expect(rows().length).toBe(27));
     await waitFor(() => expect(row("codex-auth-json").textContent).toContain("0.162.1"));
 
     expect(keySelect("codex-auth-json")).not.toBeNull();
@@ -287,9 +287,9 @@ describe("M31-S1 Agent 工作台", () => {
 
   // ------------------------------------------------------------------ M32-S1
 
-  it("⑫ 19 行都没有 .agent-row-target，页面文本不含 ~/.mimocode/", async () => {
+  it("⑫ 27 行都没有 .agent-row-target，页面文本不含 ~/.mimocode/", async () => {
     renderPage();
-    await waitFor(() => expect(rows().length).toBe(19));
+    await waitFor(() => expect(rows().length).toBe(27));
 
     expect(document.querySelectorAll(".agent-row-target").length).toBe(0);
     expect(document.body.textContent ?? "").not.toContain("~/.mimocode/");

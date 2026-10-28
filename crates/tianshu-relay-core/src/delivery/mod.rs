@@ -14,23 +14,30 @@ pub mod cline;
 pub mod cline_desktop;
 pub mod codex_auth;
 pub mod codex_config;
+pub mod crush;
 pub mod cursor;
 pub mod deepseek;
+pub mod droid;
 pub mod dsh;
 pub mod gemini_cli;
 pub mod grok_build;
 pub mod hermes;
 pub mod json_text;
+pub mod kimi_code;
 pub mod mcode;
 pub mod mimo_code;
 pub mod model_check;
 pub mod openclaw;
 pub mod opencode;
 pub mod pi;
+pub mod qoder;
 pub mod qwen_code;
 pub mod trae;
+pub mod workbuddy;
 
 use std::path::{Path, PathBuf};
+
+use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::inject::Patch;
@@ -86,10 +93,26 @@ pub enum DeliveryChannel {
     ClineDesktop,
     /// `~/.dsh/.credentials.yaml`（M14-S3）
     DeepSeekHarness,
+    /// `~/.qoder/settings.json`
+    Qoder,
+    /// `~/.qoder-cn/settings.json`
+    QoderCn,
+    /// `~/.kimi-code/config.toml`
+    KimiCode,
+    /// `~/.factory/settings.json`
+    Droid,
+    /// `~/.codebuddy/models.json`
+    CodeBuddy,
+    /// `~/.workbuddy/models.json`
+    WorkBuddy,
+    /// `~/.workbuddy-ai/models.json`
+    WorkBuddyAi,
+    /// `~/.config/crush/crush.json`
+    Crush,
 }
 
 impl DeliveryChannel {
-    pub const ALL: [DeliveryChannel; 20] = [
+    pub const ALL: [DeliveryChannel; 28] = [
         DeliveryChannel::CodexAuthJson,
         DeliveryChannel::CodexConfig,
         DeliveryChannel::ClaudeCodeSettings,
@@ -110,6 +133,14 @@ impl DeliveryChannel {
         DeliveryChannel::MiMoCode,
         DeliveryChannel::ClineDesktop,
         DeliveryChannel::DeepSeekHarness,
+        DeliveryChannel::Qoder,
+        DeliveryChannel::QoderCn,
+        DeliveryChannel::KimiCode,
+        DeliveryChannel::Droid,
+        DeliveryChannel::CodeBuddy,
+        DeliveryChannel::WorkBuddy,
+        DeliveryChannel::WorkBuddyAi,
+        DeliveryChannel::Crush,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -134,6 +165,14 @@ impl DeliveryChannel {
             DeliveryChannel::MiMoCode => "mimo-code",
             DeliveryChannel::ClineDesktop => "cline-desktop",
             DeliveryChannel::DeepSeekHarness => "dsh",
+            DeliveryChannel::Qoder => "qoder",
+            DeliveryChannel::QoderCn => "qoder-cn",
+            DeliveryChannel::KimiCode => "kimi-code",
+            DeliveryChannel::Droid => "droid",
+            DeliveryChannel::CodeBuddy => "codebuddy",
+            DeliveryChannel::WorkBuddy => "workbuddy",
+            DeliveryChannel::WorkBuddyAi => "workbuddy-ai",
+            DeliveryChannel::Crush => "crush",
         }
     }
 
@@ -159,6 +198,14 @@ impl DeliveryChannel {
             "mimo-code" => Ok(DeliveryChannel::MiMoCode),
             "cline-desktop" => Ok(DeliveryChannel::ClineDesktop),
             "dsh" => Ok(DeliveryChannel::DeepSeekHarness),
+            "qoder" => Ok(DeliveryChannel::Qoder),
+            "qoder-cn" => Ok(DeliveryChannel::QoderCn),
+            "kimi-code" => Ok(DeliveryChannel::KimiCode),
+            "droid" => Ok(DeliveryChannel::Droid),
+            "codebuddy" => Ok(DeliveryChannel::CodeBuddy),
+            "workbuddy" => Ok(DeliveryChannel::WorkBuddy),
+            "workbuddy-ai" => Ok(DeliveryChannel::WorkBuddyAi),
+            "crush" => Ok(DeliveryChannel::Crush),
             other => Err(Error::NotFound(format!("未知的投递通道: {other}"))),
         }
     }
@@ -196,6 +243,14 @@ impl DeliveryChannel {
             DeliveryChannel::MiMoCode => "mimo-code",
             DeliveryChannel::ClineDesktop => "cline-desktop",
             DeliveryChannel::DeepSeekHarness => "dsh",
+            DeliveryChannel::Qoder => "qoder",
+            DeliveryChannel::QoderCn => "qoder-cn",
+            DeliveryChannel::KimiCode => "kimi-code",
+            DeliveryChannel::Droid => "droid",
+            DeliveryChannel::CodeBuddy => "codebuddy",
+            DeliveryChannel::WorkBuddy => "workbuddy",
+            DeliveryChannel::WorkBuddyAi => "workbuddy-ai",
+            DeliveryChannel::Crush => "crush",
         }
     }
 
@@ -246,6 +301,14 @@ impl DeliveryChannel {
                 .join("settings")
                 .join("providers.json"),
             DeliveryChannel::DeepSeekHarness => PathBuf::from(".dsh").join(".credentials.yaml"),
+            DeliveryChannel::Qoder => PathBuf::from(".qoder").join("settings.json"),
+            DeliveryChannel::QoderCn => PathBuf::from(".qoder-cn").join("settings.json"),
+            DeliveryChannel::KimiCode => PathBuf::from(".kimi-code").join("config.toml"),
+            DeliveryChannel::Droid => PathBuf::from(".factory").join("settings.json"),
+            DeliveryChannel::CodeBuddy => PathBuf::from(".codebuddy").join("models.json"),
+            DeliveryChannel::WorkBuddy => PathBuf::from(".workbuddy").join("models.json"),
+            DeliveryChannel::WorkBuddyAi => PathBuf::from(".workbuddy-ai").join("models.json"),
+            DeliveryChannel::Crush => PathBuf::from(".config").join("crush").join("crush.json"),
         }
     }
 }
@@ -402,6 +465,13 @@ fn opencode_qualified_field(provider_id: &str, field: &str) -> String {
 /// - dsh：恒定只有 `KEYRELAY_API_KEY`——**无端点字段**：`DshWriter` 收了 `base_url` 却不写
 ///   （DSH 的 endpoint 在用户自配的 profile 文件里），`has_endpoint` / `has_model` /
 ///   `has_meta` 对它一律无效；DSH 引用校验见 `dsh.rs` 的 P0-3 节（本项已实现）。
+/// - qoder / qoder-cn：`providers.keyrelay.apiKey` / `.baseUrl` / `.model`，有模型时
+///   另写 `model.name`。
+/// - kimi-code：`api_key` / `base_url`，有模型时另写 `default_model`。
+/// - droid：`model` / `apiKey` / `baseUrl` / `sessionModel`（`sessionModel` 是
+///   `sessionDefaultSettings.model` 的展示别名）。
+/// - codebuddy / workbuddy / workbuddy-ai：`id` / `apiKey` / `url`。
+/// - crush：`api_key` / `base_url`，有模型时另写 `model` / `provider`。
 pub fn expected_fields(channel: DeliveryChannel, opts: &FieldSetOptions<'_>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |key: String| out.push(key);
@@ -626,6 +696,46 @@ pub fn expected_fields(channel: DeliveryChannel, opts: &FieldSetOptions<'_>) -> 
         DeliveryChannel::DeepSeekHarness => {
             // 只有密钥字段：base_url / model / meta 输入对它一律无效（见本节头部）。
             push(dsh::DshWriter::FIELD_API_KEY.to_string());
+        }
+        DeliveryChannel::Qoder | DeliveryChannel::QoderCn => {
+            push(qoder::QoderWriter::provider_path(
+                qoder::QoderWriter::FIELD_API_KEY,
+            ));
+            push(qoder::QoderWriter::provider_path(
+                qoder::QoderWriter::FIELD_BASE_URL,
+            ));
+            if model {
+                push(qoder::QoderWriter::provider_path(
+                    qoder::QoderWriter::FIELD_MODEL,
+                ));
+                push(format!("model.{}", qoder::QoderWriter::FIELD_MODEL_NAME));
+            }
+        }
+        DeliveryChannel::KimiCode => {
+            push(kimi_code::KimiCodeWriter::FIELD_API_KEY.to_string());
+            push(kimi_code::KimiCodeWriter::FIELD_BASE_URL.to_string());
+            if model {
+                push(kimi_code::KimiCodeWriter::FIELD_DEFAULT_MODEL.to_string());
+            }
+        }
+        DeliveryChannel::Droid => {
+            push(droid::DroidWriter::FIELD_MODEL.to_string());
+            push(droid::DroidWriter::FIELD_API_KEY.to_string());
+            push(droid::DroidWriter::FIELD_BASE_URL.to_string());
+            push(droid::DroidWriter::FIELD_SESSION_MODEL.to_string());
+        }
+        DeliveryChannel::CodeBuddy | DeliveryChannel::WorkBuddy | DeliveryChannel::WorkBuddyAi => {
+            push(workbuddy::WorkBuddyWriter::FIELD_ID.to_string());
+            push(workbuddy::WorkBuddyWriter::FIELD_API_KEY.to_string());
+            push(workbuddy::WorkBuddyWriter::FIELD_URL.to_string());
+        }
+        DeliveryChannel::Crush => {
+            push(crush::CrushWriter::FIELD_API_KEY.to_string());
+            push(crush::CrushWriter::FIELD_BASE_URL.to_string());
+            if model {
+                push(crush::CrushWriter::FIELD_MODEL.to_string());
+                push(crush::CrushWriter::FIELD_PROVIDER.to_string());
+            }
         }
     }
     out
@@ -978,6 +1088,100 @@ fn scoped_verify_present(channel: DeliveryChannel, qualified: &str, text: &str) 
             };
             Some(present)
         }
+        DeliveryChannel::Qoder | DeliveryChannel::QoderCn => {
+            let parsed = match serde_json::from_str::<serde_json::Value>(text) {
+                Ok(v) => v,
+                Err(_) => return Some(false),
+            };
+            let path = if leaf == qoder::QoderWriter::FIELD_MODEL_NAME {
+                vec!["model".to_string(), leaf.to_string()]
+            } else {
+                vec![
+                    "providers".to_string(),
+                    qoder::QoderWriter::PROVIDER_KEY.to_string(),
+                    leaf.to_string(),
+                ]
+            };
+            Some(json_walk(&parsed, &path).is_some())
+        }
+        DeliveryChannel::KimiCode => {
+            let (section, key) = if leaf == kimi_code::KimiCodeWriter::FIELD_DEFAULT_MODEL {
+                (toml_top_slice(text), leaf)
+            } else {
+                (
+                    match toml_section_slice(text, "[providers.keyrelay]") {
+                        Some(section) => section,
+                        None => return Some(false),
+                    },
+                    leaf,
+                )
+            };
+            Some(text_contains_key(section, key))
+        }
+        DeliveryChannel::Droid => {
+            let parsed = match serde_json::from_str::<serde_json::Value>(text) {
+                Ok(v) => v,
+                Err(_) => return Some(false),
+            };
+            if leaf == droid::DroidWriter::FIELD_SESSION_MODEL {
+                return Some(
+                    parsed
+                        .get("sessionDefaultSettings")
+                        .and_then(|v| v.get("model"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|v| v.starts_with("custom:keyrelay/")),
+                );
+            }
+            let present = parsed
+                .get("customModels")
+                .and_then(Value::as_array)
+                .and_then(|arr| {
+                    arr.iter().find(|item| {
+                        item.get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| id.starts_with("custom:keyrelay/"))
+                    })
+                })
+                .is_some_and(|entry| entry.get(leaf).is_some());
+            Some(present)
+        }
+        DeliveryChannel::CodeBuddy | DeliveryChannel::WorkBuddy | DeliveryChannel::WorkBuddyAi => {
+            let parsed = match serde_json::from_str::<serde_json::Value>(text) {
+                Ok(v) => v,
+                Err(_) => return Some(false),
+            };
+            let models = match &parsed {
+                Value::Array(items) => Some(items),
+                Value::Object(map) => map.get("models").and_then(Value::as_array),
+                _ => None,
+            };
+            Some(
+                models
+                    .and_then(|arr| {
+                        arr.iter().find(|item| {
+                            item.get("vendor").and_then(Value::as_str)
+                                == Some(workbuddy::WorkBuddyWriter::VENDOR)
+                        })
+                    })
+                    .is_some_and(|entry| entry.get(leaf).is_some()),
+            )
+        }
+        DeliveryChannel::Crush => {
+            let parsed = match serde_json::from_str::<serde_json::Value>(text) {
+                Ok(v) => v,
+                Err(_) => return Some(false),
+            };
+            let path = if matches!(leaf, "model" | "provider") {
+                vec!["models".to_string(), "large".to_string(), leaf.to_string()]
+            } else {
+                vec![
+                    "providers".to_string(),
+                    crush::CrushWriter::PROVIDER_KEY.to_string(),
+                    leaf.to_string(),
+                ]
+            };
+            Some(json_walk(&parsed, &path).is_some())
+        }
         // GeminiCli：见本函数文档，`.env` 行首赋值即归属，走回退。
         DeliveryChannel::GeminiCli => None,
     }
@@ -1238,6 +1442,73 @@ fn scoped_json_values(
         DeliveryChannel::ClineDesktop => {
             vec!["providers".into(), "keyrelay".into(), "settings".into()]
         }
+        DeliveryChannel::WorkBuddy | DeliveryChannel::WorkBuddyAi | DeliveryChannel::CodeBuddy => {
+            let models = match parsed {
+                serde_json::Value::Array(items) => Some(items),
+                serde_json::Value::Object(map) => map.get("models").and_then(Value::as_array),
+                _ => None,
+            };
+            let Some(entry) = models.and_then(|arr| {
+                arr.iter().find(|item| {
+                    item.get("vendor").and_then(Value::as_str)
+                        == Some(workbuddy::WorkBuddyWriter::VENDOR)
+                })
+            }) else {
+                return Some(Vec::new());
+            };
+            let mut out = Vec::new();
+            collect_json_values(entry, &mut vec!["models".to_string()], channel, &mut out);
+            return Some(out);
+        }
+        DeliveryChannel::Droid => {
+            let Some(entry) = parsed
+                .get("customModels")
+                .and_then(Value::as_array)
+                .and_then(|arr| {
+                    arr.iter().find(|item| {
+                        item.get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| id.starts_with("custom:keyrelay/"))
+                    })
+                })
+            else {
+                return Some(Vec::new());
+            };
+            let mut out = Vec::new();
+            collect_json_values(
+                entry,
+                &mut vec!["customModels".to_string()],
+                channel,
+                &mut out,
+            );
+            return Some(out);
+        }
+        DeliveryChannel::Crush => {
+            let mut out = Vec::new();
+            if let Some(provider) = parsed
+                .get("providers")
+                .and_then(|v| v.get(crush::CrushWriter::PROVIDER_KEY))
+            {
+                collect_json_values(
+                    provider,
+                    &mut vec![
+                        "providers".to_string(),
+                        crush::CrushWriter::PROVIDER_KEY.to_string(),
+                    ],
+                    channel,
+                    &mut out,
+                );
+            }
+            if let Some(large) = parsed.get("models").and_then(|v| v.get("large")) {
+                collect_json_values(
+                    large,
+                    &mut vec!["models".to_string(), "large".to_string()],
+                    channel,
+                    &mut out,
+                );
+            }
+            return Some(out);
+        }
         _ => return None,
     };
     let Some(subtree) = json_walk(parsed, &scope) else {
@@ -1414,6 +1685,14 @@ pub fn import_existing_fields(
             }
             DeliveryChannel::GrokBuild => toml_section_slice(text, "[models.custom]")
                 .and_then(|section| scan_line_value(section, leaf)),
+            DeliveryChannel::KimiCode => {
+                let slice = if leaf == kimi_code::KimiCodeWriter::FIELD_DEFAULT_MODEL {
+                    Some(toml_top_slice(text))
+                } else {
+                    toml_section_slice(text, "[providers.keyrelay]")
+                };
+                slice.and_then(|part| scan_line_value(part, leaf))
+            }
             _ => scan_line_value(text, leaf),
         };
         if let Some(value) = value {
@@ -1433,7 +1712,7 @@ pub fn import_existing_fields(
 ///   `NotNeeded`：`NotNeeded` 的语义是「每次运行都重读」，而 cc-switch FAQ 说的是
 ///   provider 热切，且本项未在真机上验证运行中会话是否重读 env；`NotNeeded` 仍被
 ///   `restart_hint_does_not_use_not_needed_yet` 禁止，未经实测不得标。
-/// - 其余 19 条：仍为 `Needed`（启动时读配置）。其中 Codex / Gemini / Grok /
+/// - 其余 27 条：仍为 `Needed`（启动时读配置）。其中 Codex / Gemini / Grok /
 ///   Claude Desktop 的具体动作见 `restart_hint_detail`；其余通道只有通用说法。
 ///   保守方向（M7-S3 spec §8）不变：多提示一次重启无害；反过来（说「改完即生效」
 ///   而其实没生效）会让用户以为投递失败。
@@ -1460,23 +1739,56 @@ pub fn restart_hint(channel: DeliveryChannel) -> RestartHint {
         // B-292：ClineDesktop 已下线，此取值已无投递语义，仅为穷举 match 保留，
         // 不得据此向用户承诺任何生效方式（投递面已无该通道，见下线测试）。
         | DeliveryChannel::ClineDesktop
-        | DeliveryChannel::DeepSeekHarness => RestartHint::Needed,
+        | DeliveryChannel::DeepSeekHarness
+        | DeliveryChannel::Qoder
+        | DeliveryChannel::QoderCn
+        | DeliveryChannel::KimiCode
+        | DeliveryChannel::Droid
+        | DeliveryChannel::CodeBuddy
+        | DeliveryChannel::WorkBuddy
+        | DeliveryChannel::WorkBuddyAi
+        | DeliveryChannel::Crush => RestartHint::Needed,
     }
 }
 
-/// 按 channel 决定网关 base_url 是否带 `/v1`（P1-5 / P1-2）。
+/// 一个 Agent 的网关端点形状。**数据，不是探测结果**。
 ///
-/// Claude Code（Anthropic SDK）的 `ANTHROPIC_BASE_URL` 不带 `/v1`——SDK 自己拼 `/v1/messages`，
-/// 给它带 `/v1` 会变成 `/v1/v1/messages`。OpenAI / Codex 等 SDK 的 base_url 带 `/v1`（SDK 拼 `/chat/completions`）。
+/// Magpie 的每个适配器自己决定 `gw()` 还是 `gw()+"/v1"`；这里把同一件事收成
+/// 显式表（`agent_endpoint_spec`），避免新增通道时在多个 `match` 里各写一遍、
+/// 也避免把「某个 SDK 会不会自己拼 `/v1`」猜成运行期行为。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentEndpointSpec {
+    /// 追加到网关 origin 后的路径：`""` 或 `"/v1"`。
+    pub base_path: &'static str,
+}
+
+/// 每个通道的显式端点形状。
+///
+/// 三条根路径通道的 SDK 自己拼协议前缀，不能再给 `/v1`：
+/// - Claude Code / Claude Desktop：Anthropic SDK 拼 `/v1/messages`；
+/// - Gemini CLI：`@google/genai` 拼 `/v1beta/models/...`，所以 `GOOGLE_GEMINI_BASE_URL`
+///   必须是网关根地址（Magpie / CC Switch / Stone 均如此）。
+///
+/// 其余通道（OpenAI Chat / Responses、Qoder、Kimi、Droid、CodeBuddy、WorkBuddy、
+/// Crush 等）由各自 SDK 拼 `/chat/completions` 一类路径，base URL 带 `/v1`。
+pub fn agent_endpoint_spec(channel: DeliveryChannel) -> AgentEndpointSpec {
+    match channel {
+        DeliveryChannel::ClaudeCodeSettings
+        | DeliveryChannel::ClaudeDesktop
+        | DeliveryChannel::GeminiCli => AgentEndpointSpec { base_path: "" },
+        _ => AgentEndpointSpec { base_path: "/v1" },
+    }
+}
+
+/// 按 channel 决定网关 base_url。等价于「网关 origin + 该通道适配器的 `base_path`」。
 ///
 /// P1-2：`service::rotate_key` 构造 Gateway endpoint 时也调它，保证轮换后 base_url 与原投递同口径。
 pub fn gateway_base_url_for(channel: &DeliveryChannel, local_url: &str) -> String {
-    match channel {
-        DeliveryChannel::ClaudeCodeSettings | DeliveryChannel::ClaudeDesktop => {
-            local_url.to_string()
-        }
-        _ => format!("{}/v1", local_url),
-    }
+    format!(
+        "{}{}",
+        local_url.trim_end_matches('/'),
+        agent_endpoint_spec(*channel).base_path
+    )
 }
 
 /// 生效策略（章程 §3.3 冻结）。
@@ -1613,7 +1925,15 @@ pub fn restart_hint_detail(channel: DeliveryChannel) -> RestartHintDetail {
         // B-292：ClineDesktop 已下线，此分表行已无投递语义，仅为穷举 match 保留，
         // 不得据此向用户承诺任何生效方式。
         | DeliveryChannel::ClineDesktop
-        | DeliveryChannel::DeepSeekHarness => RestartHintDetail {
+        | DeliveryChannel::DeepSeekHarness
+        | DeliveryChannel::Qoder
+        | DeliveryChannel::QoderCn
+        | DeliveryChannel::KimiCode
+        | DeliveryChannel::Droid
+        | DeliveryChannel::CodeBuddy
+        | DeliveryChannel::WorkBuddy
+        | DeliveryChannel::WorkBuddyAi
+        | DeliveryChannel::Crush => RestartHintDetail {
             hint: Hint::Needed,
             source: Source::Unverified,
             action: Action::RestartAgent,
@@ -2234,6 +2554,57 @@ pub fn resolve_for_binding_with_meta(
             ))
         }
         DeliveryChannel::DeepSeekHarness => Ok(Box::new(dsh::DshWriter::new(home, base_url))),
+        DeliveryChannel::Qoder => Ok(Box::new(qoder::QoderWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::QoderCn => Ok(Box::new(qoder::QoderWriter::with_model_cn(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::KimiCode => Ok(Box::new(kimi_code::KimiCodeWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::Droid => Ok(Box::new(droid::DroidWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::CodeBuddy => Ok(Box::new(workbuddy::WorkBuddyWriter::with_model(
+            home,
+            DeliveryChannel::CodeBuddy,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::WorkBuddy => Ok(Box::new(workbuddy::WorkBuddyWriter::with_model(
+            home,
+            DeliveryChannel::WorkBuddy,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::WorkBuddyAi => Ok(Box::new(workbuddy::WorkBuddyWriter::with_model(
+            home,
+            DeliveryChannel::WorkBuddyAi,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
+        DeliveryChannel::Crush => Ok(Box::new(crush::CrushWriter::with_model(
+            home,
+            base_url,
+            model_owned.as_deref(),
+            meta,
+        ))),
     }
 }
 
@@ -2248,7 +2619,8 @@ pub fn resolve_for_binding_with_meta(
 /// 拿到它就等于拿到「以本机身份经网关转发」的能力。
 #[derive(Clone, PartialEq, Eq)]
 pub struct GatewayEndpoint {
-    /// 网关的本地地址，**含 `/v1` 前缀**（网关只服务 `/health` 与 `/v1/*`）。
+    /// 网关的本地地址，按通道适配器的端点形状生成：根路径或带 `/v1`；
+    /// 不再假设网关只服务 `/v1/*`（Gemini 入站走 `/v1beta/*`）。
     pub base_url: String,
     pub token: String,
 }
@@ -2624,7 +2996,15 @@ mod tests {
                 "trae",
                 "mimo-code",
                 "cline-desktop",
-                "dsh"
+                "dsh",
+                "qoder",
+                "qoder-cn",
+                "kimi-code",
+                "droid",
+                "codebuddy",
+                "workbuddy",
+                "workbuddy-ai",
+                "crush"
             ]
         );
         assert_eq!(DeliveryChannel::OpenCode.agent_id(), "opencode");
@@ -2647,7 +3027,7 @@ mod tests {
             );
             seen.push(id);
         }
-        assert_eq!(seen.len(), 20);
+        assert_eq!(seen.len(), 28);
     }
 
     #[test]
@@ -2711,7 +3091,7 @@ mod tests {
             );
             seen.push(target);
         }
-        assert_eq!(seen.len(), 20);
+        assert_eq!(seen.len(), 28);
     }
 
     #[test]
@@ -2823,7 +3203,7 @@ mod tests {
 
     #[test]
     fn restart_hint_table_is_verbatim() {
-        // P1-6 生效分表：Claude Code 新会话即生效（DependsOnNewSession），其余 19 条
+        // P1-6 生效分表：Claude Code 新会话即生效（DependsOnNewSession），其余 27 条
         // 仍按「需要重启」保守标注（DependsOnNewSession 已随 ShellBlock 删除一说作废，
         // 现为 Claude Code 的热切取值；逐条对照见 delivery_restart_hint 集成测试）。
         assert_eq!(
@@ -2842,7 +3222,7 @@ mod tests {
                 channel.as_str()
             );
         }
-        assert_eq!(DeliveryChannel::ALL.len(), 20);
+        assert_eq!(DeliveryChannel::ALL.len(), 28);
     }
 
     #[test]
@@ -3258,6 +3638,7 @@ mod tests {
                 || lower.contains("api_base")
                 || lower.contains("apibase")
                 || lower.contains("endpoint")
+                || lower == "url"
         };
 
         let home = tempfile::tempdir().expect("临时 home");
@@ -3317,7 +3698,7 @@ mod tests {
 
     #[test]
     fn required_field_table_matches_writer_fields() {
-        // 矩阵：19 条可投递通道 × 5 种构造输入（无端点无模型 / 纯空白端点无模型 /
+        // 矩阵：27 条可投递通道 × 5 种构造输入（无端点无模型 / 纯空白端点无模型 /
         // 有端点无模型 / 有端点有模型 / 有端点有模型有 meta）。表与 writer 的 `fields()` 必须逐字相等（含顺序）：
         // 任一侧改了一行都会在这里红，而不是等到线上投递才被整单校验拦下。
         // DEBUG-G7 补齐小残留：纯空白端点一格——助手口径须与 writer 的 trim 门禁
@@ -3403,7 +3784,7 @@ mod tests {
                 checked += 1;
             }
         }
-        // B-292：ClineDesktop 已下线，不计入本矩阵（19 条 × 5 种构造输入）。
+        // B-292：ClineDesktop 已下线，不计入本矩阵（27 条 × 5 种构造输入）。
         assert_eq!(checked, (DeliveryChannel::ALL.len() - 1) * 6);
         // opencode 限定键的 provider 段：点号 provider 与带点 provider（方括号形态）
         // 都要与 writer 的 qualified_field 逐字一致。

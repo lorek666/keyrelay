@@ -4143,7 +4143,7 @@ pub fn autostart_set(state: State<'_, AppState>, enabled: bool) -> Result<Autost
 pub async fn detect_agents(
     state: State<'_, AppState>,
 ) -> Result<Vec<tianshu_relay_core::agents::AgentStatus>, String> {
-    // 20 条探测内部已是并行，但每条都要等 `--version`（单条上限 5s）。
+    // 28 条探测内部已是并行，但每条都要等 `--version`（单条上限 5s）。
     // 放到 blocking 线程池执行，避免占住 IPC/窗口主线程：只克隆一个 PathBuf，
     // 不把 `State` 移进闭包。
     let home = state.service.home().to_path_buf();
@@ -6344,15 +6344,32 @@ mod tests {
     }
 
     #[test]
-    fn gateway_base_url_for_omits_v1_for_claude_code_only() {
-        // P1-5：Claude Code（Anthropic SDK）的 ANTHROPIC_BASE_URL 不带 /v1（SDK 自己拼 /v1/messages），
-        // 给它带 /v1 会变成 /v1/v1/messages。其他通道（OpenAI/Codex 等）带 /v1。
-        use tianshu_relay_core::delivery::{gateway_base_url_for, DeliveryChannel};
+    fn gateway_base_url_for_uses_each_channels_declared_endpoint_shape() {
+        // 显式适配器表：根路径通道（Anthropic SDK / Gemini SDK 自己拼版本前缀）
+        // 不带 /v1；OpenAI 兼容通道带 /v1。Gemini CLI 必须走根路径，否则
+        // @google/genai 会拼出 /v1/v1beta/models/...。
+        use tianshu_relay_core::delivery::{
+            agent_endpoint_spec, gateway_base_url_for, DeliveryChannel,
+        };
         let url = "http://127.0.0.1:19387";
+        for channel in DeliveryChannel::ALL {
+            let expected = format!("{url}{}", agent_endpoint_spec(channel).base_path);
+            assert_eq!(
+                gateway_base_url_for(&channel, url),
+                expected,
+                "通道 {} 的端点形状不一致",
+                channel.as_str()
+            );
+        }
         assert_eq!(
             gateway_base_url_for(&DeliveryChannel::ClaudeCodeSettings, url),
             url
         );
+        assert_eq!(
+            gateway_base_url_for(&DeliveryChannel::ClaudeDesktop, url),
+            url
+        );
+        assert_eq!(gateway_base_url_for(&DeliveryChannel::GeminiCli, url), url);
         assert_eq!(
             gateway_base_url_for(&DeliveryChannel::CodexAuthJson, url),
             format!("{url}/v1")
@@ -6360,10 +6377,6 @@ mod tests {
         assert_eq!(
             gateway_base_url_for(&DeliveryChannel::GrokBuild, url),
             format!("{url}/v1")
-        );
-        assert_eq!(
-            gateway_base_url_for(&DeliveryChannel::ClaudeDesktop, url),
-            url.to_string()
         );
     }
 

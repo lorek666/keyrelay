@@ -24,11 +24,7 @@ fn list_channels_matches_all_exactly() {
     let want: Vec<&str> = DeliveryChannel::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(got, want);
     assert_eq!(got.len(), DeliveryChannel::ALL.len());
-    assert_eq!(
-        got.len(),
-        20,
-        "M14-S3 起 19 通道（M25-S1 加 codex-config 变 20）"
-    );
+    assert_eq!(got.len(), 28, "新增 8 条通道后 list-channels 应有 28 条");
 }
 
 #[test]
@@ -76,8 +72,20 @@ fn mock_agent_ok_after_smoke_apply_for_every_channel() {
             .unwrap();
         }
 
-        // M14-S3 起 19 通道均不要求 model。
-        let model_arg: Vec<&str> = Vec::new();
+        // 这些通道的配置条目必须有模型名；其余通道不要求。
+        let model_arg: Vec<&str> = if matches!(
+            channel,
+            DeliveryChannel::Droid
+                | DeliveryChannel::CodeBuddy
+                | DeliveryChannel::WorkBuddy
+                | DeliveryChannel::WorkBuddyAi
+                | DeliveryChannel::Crush
+                | DeliveryChannel::OpenClaw
+        ) {
+            vec!["--model", "gpt-4o"]
+        } else {
+            Vec::new()
+        };
         let apply = Command::new(cli_bin())
             .args([
                 "apply-delivery",

@@ -31,15 +31,15 @@ fn real_home() -> PathBuf {
 }
 
 #[test]
-fn specs_cover_the_twenty_channels_in_agents_order() {
+fn specs_cover_the_twenty_eight_channels_in_agents_order() {
     let update_channels: Vec<&str> = agent_updates::specs()
         .iter()
         .map(|spec| spec.channel)
         .collect();
     let agent_channels: Vec<&str> = agents::specs().iter().map(|spec| spec.channel).collect();
 
-    assert_eq!(update_channels.len(), 20, "更新表必须是 20 条");
-    assert_eq!(agent_channels.len(), 20);
+    assert_eq!(update_channels.len(), 28, "更新表必须是 28 条");
+    assert_eq!(agent_channels.len(), 28);
     assert_eq!(
         update_channels, agent_channels,
         "更新表的 channel 顺序必须与 agents::specs() 逐位一致"
@@ -101,7 +101,7 @@ fn real_network_check_returns_statuses_without_panicking() {
         &real_home, &statuses, None,
     ));
 
-    assert_eq!(result.len(), 20, "检查结果必须 20 条");
+    assert_eq!(result.len(), 28, "检查结果必须 28 条");
     let channels: Vec<&str> = result.iter().map(|row| row.channel.as_str()).collect();
     let expected: Vec<&str> = agent_updates::specs()
         .iter()
@@ -137,7 +137,7 @@ fn real_network_check_returns_statuses_without_panicking() {
         .iter()
         .filter(|row| row.latest_version.is_some())
         .count();
-    println!("真实检查：{with_latest}/20 个通道拿到了最新版本");
+    println!("真实检查：{with_latest}/28 个通道拿到了最新版本");
     for row in result
         .iter()
         .filter(|row| row.installed || row.latest_version.is_some() || row.state == "error")

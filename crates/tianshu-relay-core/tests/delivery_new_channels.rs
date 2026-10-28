@@ -87,7 +87,16 @@ fn mode_of(path: &Path) -> u32 {
 /// Continue 的条目必须有模型名（Continue 的 schema 必填；TianshuRelay 不编造默认模型），
 /// 其余通道不需要。对 `ALL` 循环的用例统一从这里取。
 fn model_for(channel: DeliveryChannel) -> Option<&'static str> {
-    (channel == DeliveryChannel::OpenClaw).then_some("gpt-4o")
+    matches!(
+        channel,
+        DeliveryChannel::OpenClaw
+            | DeliveryChannel::Droid
+            | DeliveryChannel::CodeBuddy
+            | DeliveryChannel::WorkBuddy
+            | DeliveryChannel::WorkBuddyAi
+            | DeliveryChannel::Crush
+    )
+    .then_some("gpt-4o")
 }
 
 fn target_of(f: &Fixture, channel: DeliveryChannel) -> PathBuf {

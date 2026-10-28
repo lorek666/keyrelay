@@ -71,7 +71,49 @@ pub fn check(channel: DeliveryChannel, home: &Path) -> MockOutcome {
             check_json_nested(&text, &["providers", "keyrelay", "settings", "apiKey"])
         }
         DeliveryChannel::DeepSeekHarness => check_yaml_ref_key(&text, "KEYRELAY_API_KEY"),
+        DeliveryChannel::Qoder | DeliveryChannel::QoderCn => {
+            check_json_nested(&text, &["providers", "keyrelay", "apiKey"])
+        }
+        DeliveryChannel::KimiCode => check_toml_key(&text, "api_key"),
+        DeliveryChannel::Droid => {
+            check_json_array_entry(&text, "customModels", "custom:keyrelay/", "apiKey")
+        }
+        DeliveryChannel::CodeBuddy | DeliveryChannel::WorkBuddy | DeliveryChannel::WorkBuddyAi => {
+            check_json_array_entry(&text, "models", "keyrelay", "apiKey")
+        }
+        DeliveryChannel::Crush => check_json_nested(&text, &["providers", "keyrelay", "api_key"]),
     }
+}
+
+/// 数组条目：`customModels` 按 `id` 前缀匹配，`models` 按 `vendor` 匹配。
+fn check_json_array_entry(text: &str, key: &str, marker: &str, field: &str) -> MockOutcome {
+    let v: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => return MockOutcome::Fatal(format!("JSON 解析失败: {e}")),
+    };
+    let entries = match &v {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(map) => match map.get(key).and_then(|v| v.as_array()) {
+            Some(items) => items,
+            None => return MockOutcome::KeyMissing(format!("缺少 {key} 数组")),
+        },
+        _ => return MockOutcome::Fatal("顶层不是对象或数组".into()),
+    };
+    for entry in entries {
+        let matched = entry
+            .get("id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v.starts_with(marker))
+            || entry.get("vendor").and_then(|v| v.as_str()) == Some(marker);
+        if matched {
+            return match entry.get(field).and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => MockOutcome::Ok,
+                Some(_) => MockOutcome::KeyMissing(format!("{field} 为空字符串")),
+                None => MockOutcome::KeyMissing(format!("缺少 {field} 字段")),
+            };
+        }
+    }
+    MockOutcome::KeyMissing("没有找到 keyrelay 条目".to_string())
 }
 
 /// openclaw 双形态：干净文件写结构化 JSON（`models.providers.keyrelay.api_key`），

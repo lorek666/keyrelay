@@ -16,7 +16,7 @@ import zhCN from "../i18n/zh-CN.json";
  * ③ 成功：提示含新旧版本；重取后徽标消失、版本更新；`updateAgent` 只调用一次（pending 防重复）。
  * ④ 失败：展示 attempts 的退出码与 `outputTail`；行仍显示可更新；不崩溃。
  * ⑤ `autoUpdate:false` 的可更新行只有徽标，没有可点击的「更新」按钮。
- * ⑥ `checkAgentUpdates` 失败：汇总卡显示错误 + 重试按钮，工作台 19 行照常渲染（B-292）。
+ * ⑥ `checkAgentUpdates` 失败：汇总卡显示错误 + 重试按钮，工作台 27 行照常渲染（B-292）。
  *
  * 不依赖网络：所有查询都 mock 成固定数据；`updateAgent` 在用例内按需换实现。
  */
@@ -217,7 +217,7 @@ describe("M34-S1 Agent 更新", () => {
   });
 
   it("DEBUG-G6 P1-18：汇总计数按投递通道过滤，Cline Desktop 更新行不计入且标注下线", async () => {
-    // 后端仍产出 cline-desktop 更新行（检测保留），但 19 个投递通道里没有它：
+    // 后端仍产出 cline-desktop 更新行（检测保留），但 27 个投递通道里没有它：
     // 汇总“可更新”必须仍是 3（codex / claude / dsh），而不是被它抬成 4；
     // 且汇总卡要出现“检测保留、投递已下线”标注，行上绝无它的更新按钮。
     const notInstalledUpdate = (channel: string) => ({
@@ -494,7 +494,7 @@ describe("M34-S1 Agent 更新", () => {
     expect(text).not.toContain("未知");
   });
 
-  it("⑥ checkAgentUpdates 失败：汇总卡显示错误 + 重试，19 行照常渲染", async () => {
+  it("⑥ checkAgentUpdates 失败：汇总卡显示错误 + 重试，27 行照常渲染", async () => {
     const { checkAgentUpdates } = await import("../lib/api");
     (checkAgentUpdates as unknown as { mockRejectedValueOnce: (e: Error) => void }).mockRejectedValueOnce(
       new Error("网络不可用"),
@@ -511,7 +511,7 @@ describe("M34-S1 Agent 更新", () => {
     expect(Array.from(card.querySelectorAll("button")).some((b) => (b.textContent ?? "").includes("重试"))).toBe(
       true,
     );
-    // 工作台 19 行照常渲染（B-292）
+    // 工作台 27 行照常渲染（B-292）
     expect(rows().length).toBe(CHANNELS.length);
   });
 });

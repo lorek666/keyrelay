@@ -59,7 +59,16 @@ fn setup() -> Fixture {
 /// Continue 的条目必须有模型名（Continue 的 schema 必填；TianshuRelay 不编造默认模型），
 /// 其余通道不需要。对 `ALL` 循环的用例统一从这里取。
 fn model_for(channel: DeliveryChannel) -> Option<&'static str> {
-    (channel == DeliveryChannel::OpenClaw).then_some("gpt-4o")
+    matches!(
+        channel,
+        DeliveryChannel::OpenClaw
+            | DeliveryChannel::Droid
+            | DeliveryChannel::CodeBuddy
+            | DeliveryChannel::WorkBuddy
+            | DeliveryChannel::WorkBuddyAi
+            | DeliveryChannel::Crush
+    )
+    .then_some("gpt-4o")
 }
 
 fn deliver(f: &Fixture, channel: DeliveryChannel) -> PathBuf {
@@ -68,7 +77,7 @@ fn deliver(f: &Fixture, channel: DeliveryChannel) -> PathBuf {
         .apply_delivery_with_model(f.key_id, channel, model_for(channel))
         .unwrap();
     f.service
-        .delivery_plan(f.key_id, channel)
+        .delivery_plan_with_model(f.key_id, channel, model_for(channel))
         .unwrap()
         .target_path
 }

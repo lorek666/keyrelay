@@ -292,6 +292,35 @@ const NPM_MIMOCODE: UpdateStrategy = UpdateStrategy {
     argv: &["npm", "install", "-g", "mimocode@latest"],
     timeout_secs: 240,
 };
+const NPM_QODER: UpdateStrategy = UpdateStrategy {
+    label: "npm",
+    argv: &["npm", "install", "-g", "@qoder-ai/qodercli@latest"],
+    timeout_secs: 240,
+};
+
+const NPM_QODER_CN: UpdateStrategy = UpdateStrategy {
+    label: "npm",
+    argv: &["npm", "install", "-g", "@qodercn-ai/qoderclicn@latest"],
+    timeout_secs: 240,
+};
+
+const NPM_KIMI_CODE: UpdateStrategy = UpdateStrategy {
+    label: "npm",
+    argv: &["npm", "install", "-g", "@moonshot-ai/kimi-code@latest"],
+    timeout_secs: 240,
+};
+
+const NPM_CODEBUDDY: UpdateStrategy = UpdateStrategy {
+    label: "npm",
+    argv: &["npm", "install", "-g", "@tencent-ai/codebuddy-code@latest"],
+    timeout_secs: 240,
+};
+
+const NPM_CRUSH: UpdateStrategy = UpdateStrategy {
+    label: "npm",
+    argv: &["npm", "install", "-g", "@charmland/crush@latest"],
+    timeout_secs: 240,
+};
 
 const BREW_CLAUDE: UpdateStrategy = UpdateStrategy {
     label: "Homebrew",
@@ -344,6 +373,11 @@ static REASONIX_STRATEGIES: &[UpdateStrategy] = &[NPM_REASONIX];
 static TRAE_STRATEGIES: &[UpdateStrategy] = &[BREW_TRAE];
 static MIMOCODE_STRATEGIES: &[UpdateStrategy] = &[NPM_MIMOCODE];
 static CLINE_DESKTOP_STRATEGIES: &[UpdateStrategy] = &[BREW_CLINE_APP];
+static QODER_STRATEGIES: &[UpdateStrategy] = &[NPM_QODER];
+static QODER_CN_STRATEGIES: &[UpdateStrategy] = &[NPM_QODER_CN];
+static KIMI_CODE_STRATEGIES: &[UpdateStrategy] = &[NPM_KIMI_CODE];
+static CODEBUDDY_STRATEGIES: &[UpdateStrategy] = &[NPM_CODEBUDDY];
+static CRUSH_STRATEGIES: &[UpdateStrategy] = &[NPM_CRUSH];
 
 // ---- 更新源（同一 agent 的多个落点共用同一源；检查时按源去重） ----
 
@@ -415,9 +449,29 @@ const SRC_DSH: UpdateSource = UpdateSource {
     kind: UpdateSourceKind::Npm,
     id: "@deepseek-ai/dsh",
 };
+const SRC_QODER: UpdateSource = UpdateSource {
+    kind: UpdateSourceKind::Npm,
+    id: "@qoder-ai/qodercli",
+};
+const SRC_QODER_CN: UpdateSource = UpdateSource {
+    kind: UpdateSourceKind::Npm,
+    id: "@qodercn-ai/qoderclicn",
+};
+const SRC_KIMI_CODE: UpdateSource = UpdateSource {
+    kind: UpdateSourceKind::Npm,
+    id: "@moonshot-ai/kimi-code",
+};
+const SRC_CODEBUDDY: UpdateSource = UpdateSource {
+    kind: UpdateSourceKind::Npm,
+    id: "@tencent-ai/codebuddy-code",
+};
+const SRC_CRUSH: UpdateSource = UpdateSource {
+    kind: UpdateSourceKind::Npm,
+    id: "@charmland/crush",
+};
 
-/// 20 条静态表（spec §5 逐字；顺序与 [`agents::specs`] 逐位一致，测试钉住）。
-static SPECS: [AgentUpdateSpec; 20] = [
+/// 28 条静态表（spec §5 逐字；顺序与 [`agents::specs`] 逐位一致，测试钉住）。
+static SPECS: [AgentUpdateSpec; 28] = [
     AgentUpdateSpec {
         channel: "codex-auth-json",
         source: Some(SRC_CODEX),
@@ -538,9 +592,59 @@ static SPECS: [AgentUpdateSpec; 20] = [
         strategies: &[],
         manual_url: "https://www.npmjs.com/package/@deepseek-ai/dsh",
     },
+    // 新增通道的 npm 包名先经 registry 核对；Droid / WorkBuddy / WorkBuddy AI
+    // 只提供手动更新入口（桌面安装器 / 厂商文档），不把未验证的 argv 放进白名单。
+    AgentUpdateSpec {
+        channel: "qoder",
+        source: Some(SRC_QODER),
+        strategies: QODER_STRATEGIES,
+        manual_url: "https://qoder.com",
+    },
+    AgentUpdateSpec {
+        channel: "qoder-cn",
+        source: Some(SRC_QODER_CN),
+        strategies: QODER_CN_STRATEGIES,
+        manual_url: "https://qoder.cn",
+    },
+    AgentUpdateSpec {
+        channel: "kimi-code",
+        source: Some(SRC_KIMI_CODE),
+        strategies: KIMI_CODE_STRATEGIES,
+        manual_url: "https://www.kimi.com/coding",
+    },
+    AgentUpdateSpec {
+        channel: "droid",
+        source: None,
+        strategies: &[],
+        manual_url: "https://factory.ai",
+    },
+    AgentUpdateSpec {
+        channel: "codebuddy",
+        source: Some(SRC_CODEBUDDY),
+        strategies: CODEBUDDY_STRATEGIES,
+        manual_url: "https://codebuddy.ai",
+    },
+    AgentUpdateSpec {
+        channel: "workbuddy",
+        source: None,
+        strategies: &[],
+        manual_url: "https://www.workbuddy.ai",
+    },
+    AgentUpdateSpec {
+        channel: "workbuddy-ai",
+        source: None,
+        strategies: &[],
+        manual_url: "https://www.workbuddy.ai",
+    },
+    AgentUpdateSpec {
+        channel: "crush",
+        source: Some(SRC_CRUSH),
+        strategies: CRUSH_STRATEGIES,
+        manual_url: "https://github.com/charmbracelet/crush",
+    },
 ];
 
-/// 20 条，顺序与 [`agents::specs`] 逐位一致。
+/// 28 条，顺序与 [`agents::specs`] 逐位一致。
 pub fn specs() -> &'static [AgentUpdateSpec] {
     &SPECS
 }
@@ -952,7 +1056,7 @@ fn dedupe_sources() -> Vec<UpdateSource> {
 
 /// 只读检查（spec §4.1）。`statuses` 由调用方先跑 [`agents::detect_agents`] 得到。
 ///
-/// 单个更新源失败只影响对应通道，不整体报错；返回 20 条、顺序与 [`specs`] 一致。
+/// 单个更新源失败只影响对应通道，不整体报错；返回 28 条、顺序与 [`specs`] 一致。
 pub async fn check_agent_updates(
     home: &Path,
     statuses: &[AgentStatus],
@@ -1364,7 +1468,7 @@ mod tests {
     fn specs_cover_all_channels_in_order() {
         let channels: Vec<&str> = specs().iter().map(|spec| spec.channel).collect();
         let agent_channels: Vec<&str> = agents::specs().iter().map(|spec| spec.channel).collect();
-        assert_eq!(channels.len(), 20);
+        assert_eq!(channels.len(), 28);
         assert_eq!(channels, agent_channels);
         // manual_url 一律来自 agents::specs()[i].install_url
         for (update, agent) in specs().iter().zip(agents::specs()) {
@@ -1864,9 +1968,9 @@ mod tests {
     #[test]
     fn dedupe_sources_merges_shared_agents() {
         let sources = dedupe_sources();
-        // 20 条通道里 19 条有源（grok-build 没有），其中 codex / opencode 各有两个
-        // 落点共用同一源 ⇒ 19 − 2 = 17 个不同源。
-        assert_eq!(sources.len(), 17);
+        // 28 条通道里 24 条有源（Droid / WorkBuddy / WorkBuddy AI / grok-build 为手动），
+        // 其中 codex / opencode 各有两个落点共用同一源 ⇒ 24 − 2 = 22 个不同源。
+        assert_eq!(sources.len(), 22);
         let codex = sources
             .iter()
             .filter(|source| source.id == "@openai/codex")

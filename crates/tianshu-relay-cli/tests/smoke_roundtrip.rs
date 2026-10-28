@@ -16,10 +16,21 @@ use tianshu_relay_core::delivery::DeliveryChannel;
 
 const REAL_KEY: &str = "sk-test-0123456789abcdef";
 
-/// M14-S1 起 Continue 通道已删，11 通道均不要求 model（OpenCode 系列的 model 是可选）。
-/// 保留函数形参以便未来某通道重新要求 model 时只改这一处。
-fn model_arg(_channel: DeliveryChannel) -> Vec<&'static str> {
-    Vec::new()
+/// 这些通道的配置条目必须有模型名；其余通道不要求。
+fn model_arg(channel: DeliveryChannel) -> Vec<&'static str> {
+    if matches!(
+        channel,
+        DeliveryChannel::Droid
+            | DeliveryChannel::CodeBuddy
+            | DeliveryChannel::WorkBuddy
+            | DeliveryChannel::WorkBuddyAi
+            | DeliveryChannel::Crush
+            | DeliveryChannel::OpenClaw
+    ) {
+        vec!["--model", "gpt-4o"]
+    } else {
+        Vec::new()
+    }
 }
 
 fn cli_bin() -> PathBuf {
@@ -168,7 +179,8 @@ fn smoke_roundtrip_target_absent_then_rollback_removes() {
 
 #[test]
 fn smoke_roundtrip_target_present_then_rollback_byte_identical() {
-    let original = b"{\n  \"user_comment\": \"keep my own bytes\"\n}\n".to_vec();
+    let json_original = b"{\n  \"user_comment\": \"keep my own bytes\"\n}\n".to_vec();
+    let toml_original = b"user_comment = \"keep my own bytes\"\n".to_vec();
 
     for channel in DeliveryChannel::ALL {
         // B-292：同上，ClineDesktop 已下线，跳过 smoke 投递。
@@ -187,6 +199,11 @@ fn smoke_roundtrip_target_present_then_rollback_byte_identical() {
             .unwrap();
         }
         let target = t.home.join(channel.relative_target());
+        let original = if channel == DeliveryChannel::KimiCode {
+            toml_original.clone()
+        } else {
+            json_original.clone()
+        };
         // 预置原内容（ASCII，字节比对基准）
         fs::create_dir_all(target.parent().unwrap()).expect("parent");
         fs::write(&target, &original).expect("pre-write");

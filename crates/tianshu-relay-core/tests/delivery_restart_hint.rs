@@ -55,8 +55,8 @@ fn tree_snapshot_detects_changes() {
 fn restart_hint_covers_every_channel() {
     assert_eq!(
         DeliveryChannel::ALL.len(),
-        20,
-        "M14-S3：ALL 由 17 变 19（M25-S1 加 codex-config 变 20）"
+        28,
+        "新增 Qoder/Qoder CN/Kimi Code/Droid/CodeBuddy/WorkBuddy/WorkBuddy AI/Crush 后为 28"
     );
     // 穷举 match 由编译器保证「每个变体都有取值」；这里钉住「七个通道各不相同地可达」
     let mut hints: Vec<&'static str> = Vec::new();
@@ -67,12 +67,12 @@ fn restart_hint_covers_every_channel() {
             RestartHint::DependsOnNewSession => "new-session",
         });
     }
-    assert_eq!(hints.len(), 20);
+    assert_eq!(hints.len(), 28);
 }
 
 #[test]
 fn restart_hint_table_is_verbatim() {
-    // P1-6 生效分表：Claude Code 新会话即生效，其余 19 条仍标 Needed。
+    // P1-6 生效分表：Claude Code 新会话即生效，其余 27 条仍标 Needed。
     // （旧 M14-S1 “所有通道都标 Needed” 一说已作废。）
     assert_eq!(
         restart_hint(DeliveryChannel::ClaudeCodeSettings),
@@ -107,7 +107,7 @@ fn restart_hint_detail_table_is_verbatim() {
     use RestartHint as Hint;
     use RestartHintSource as Source;
     // B-292：ClineDesktop 已下线，不在本表，故表长 19（不是 20）。
-    let table: [(DeliveryChannel, Hint, Source, Action); 19] = [
+    let table: [(DeliveryChannel, Hint, Source, Action); 27] = [
         (
             DeliveryChannel::CodexAuthJson,
             Hint::Needed,
@@ -221,6 +221,54 @@ fn restart_hint_detail_table_is_verbatim() {
         ),
         (
             DeliveryChannel::DeepSeekHarness,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::Qoder,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::QoderCn,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::KimiCode,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::Droid,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::CodeBuddy,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::WorkBuddy,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::WorkBuddyAi,
+            Hint::Needed,
+            Source::Unverified,
+            Action::RestartAgent,
+        ),
+        (
+            DeliveryChannel::Crush,
             Hint::Needed,
             Source::Unverified,
             Action::RestartAgent,

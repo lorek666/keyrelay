@@ -87,17 +87,17 @@ describe("Delivery", () => {
     const history = screen.getByRole("tab", { name: "记录与回滚" });
     expect(configure).toHaveAttribute("aria-selected", "true");
     expect(history).toHaveAttribute("aria-selected", "false");
-    expect(screen.getByText("支持的 Agent（19）")).toBeTruthy();
+    expect(screen.getByText("支持的 Agent（27）")).toBeTruthy();
     expect(screen.queryByText("/a/b.json")).toBeNull();
 
     fireEvent.click(history);
     await waitFor(() => expect(screen.getByText("投递记录（1）")).toBeTruthy());
     expect(screen.getByText("/a/b.json")).toBeTruthy();
-    expect(screen.getByText("支持的 Agent（19）")).not.toBeVisible();
+    expect(screen.getByText("支持的 Agent（27）")).not.toBeVisible();
     expect(history).toHaveAttribute("aria-selected", "true");
 
     fireEvent.click(configure);
-    expect(screen.getByText("支持的 Agent（19）")).toBeVisible();
+    expect(screen.getByText("支持的 Agent（27）")).toBeVisible();
     expect(screen.getByText("/a/b.json")).not.toBeVisible();
   });
 
@@ -149,7 +149,7 @@ describe("Delivery", () => {
     fireEvent.change(search, { target: { value: "Codex Config" } });
     expect(document.querySelectorAll("[data-agent-channel]")).toHaveLength(1);
     expect(document.querySelector("[data-agent-channel='codex-config']")).not.toBeNull();
-    expect(screen.getByText("支持的 Agent（19）")).toBeTruthy();
+    expect(screen.getByText("支持的 Agent（27）")).toBeTruthy();
 
     fireEvent.change(search, { target: { value: "" } });
     fireEvent.click(screen.getByRole("checkbox", { name: "只看已安装" }));
@@ -162,6 +162,6 @@ describe("Delivery", () => {
     fireEvent.click(within(panel).getByRole("button", { name: "清除筛选" }));
     expect(search).toHaveValue("");
     expect(screen.getByRole("checkbox", { name: "只看已安装" })).not.toBeChecked();
-    expect(document.querySelectorAll("[data-agent-channel]")).toHaveLength(19);
+    expect(document.querySelectorAll("[data-agent-channel]")).toHaveLength(27);
   });
 });

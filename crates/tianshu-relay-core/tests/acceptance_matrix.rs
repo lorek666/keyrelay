@@ -72,7 +72,12 @@ fn login_ok() -> HttpResponse {
 /// §10：某通道该传什么 `model`。判据来自 [`DeliveryChannel`]，不是硬编码通道名。
 fn model_for(channel: DeliveryChannel) -> Option<&'static str> {
     match channel {
-        DeliveryChannel::OpenClaw => Some("gpt-4o"),
+        DeliveryChannel::OpenClaw
+        | DeliveryChannel::Droid
+        | DeliveryChannel::CodeBuddy
+        | DeliveryChannel::WorkBuddy
+        | DeliveryChannel::WorkBuddyAi
+        | DeliveryChannel::Crush => Some("gpt-4o"),
         _ => None,
     }
 }
@@ -253,7 +258,9 @@ fn inject_rollback_roundtrip_is_byte_identical() {
     let f = setup();
     // 原内容用 ASCII：这是一份「字节级比对」的基准，混进多字节字符只会让
     // 「逐字节还原」这件事的读起来变糊（且 b"" 字面量不接受非 ASCII）。
-    let original = b"{\n  \"user_comment\": \"keep my own bytes\"\n}\n".to_vec();
+    // TOML 通道用合法的 TOML 种子；其余通道沿用 JSON 种子。
+    let json_original = b"{\n  \"user_comment\": \"keep my own bytes\"\n}\n".to_vec();
+    let toml_original = b"user_comment = \"keep my own bytes\"\n".to_vec();
 
     for channel in DeliveryChannel::ALL {
         // B-292：ClineDesktop 已下线，不再投递，跳过。
@@ -262,6 +269,11 @@ fn inject_rollback_roundtrip_is_byte_identical() {
         }
         let model = model_for(channel);
         let name = channel.as_str();
+        let original = if channel == DeliveryChannel::KimiCode {
+            toml_original.clone()
+        } else {
+            json_original.clone()
+        };
 
         // P0-3：DSH 投递要求至少一个 profile 引用 KEYRELAY_API_KEY，
         // 否则 apply 在落盘前拒绝；本用例测的是注入/回滚字节比对而非

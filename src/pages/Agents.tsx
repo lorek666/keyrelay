@@ -87,6 +87,14 @@ export const CHANNELS = [
   { id: "trae", label: "Trae（~/.trae/config.json）", agent: "trae" },
   { id: "mimo-code", label: "MiMo Code（~/.mimocode/mimocode.json）", agent: "mimo-code" },
   { id: "dsh", label: "DeepSeek Harness（~/.dsh/.credentials.yaml）", agent: "dsh" },
+  { id: "qoder", label: "Qoder（~/.qoder/settings.json）", agent: "qoder" },
+  { id: "qoder-cn", label: "Qoder CN（~/.qoder-cn/settings.json）", agent: "qoder-cn" },
+  { id: "kimi-code", label: "Kimi Code（~/.kimi-code/config.toml）", agent: "kimi-code" },
+  { id: "droid", label: "Droid（~/.factory/settings.json）", agent: "droid" },
+  { id: "codebuddy", label: "CodeBuddy Code（~/.codebuddy/models.json）", agent: "codebuddy" },
+  { id: "workbuddy", label: "WorkBuddy（~/.workbuddy/models.json）", agent: "workbuddy" },
+  { id: "workbuddy-ai", label: "WorkBuddy AI（~/.workbuddy-ai/models.json）", agent: "workbuddy-ai" },
+  { id: "crush", label: "Crush（~/.config/crush/crush.json）", agent: "crush" },
 ];
 
 /**
@@ -298,7 +306,7 @@ export default function Agents() {
   );
   // DEBUG-G6 P1-18：汇总只计投递通道（CHANNELS）。后端仍产出 Cline Desktop
   // 更新行（检测保留、投递已下线，见 agents.rs / agent_updates.rs），此前全量
-  // 计数会让用户看到“可更新 1”却在 19 行里找不到任何更新按钮。
+  // 计数会让用户看到“可更新 1”却在 27 行里找不到任何更新按钮。
   const updateCounts = useMemo(() => {
     const known = new Set(CHANNELS.map((c) => c.id));
     const rows = (updatesQuery.data ?? []).filter((u) => known.has(u.channel));
@@ -781,7 +789,7 @@ export default function Agents() {
             const status = agentByChannel.get(c.id);
             // M34-S1：更新检查结果（没有检查结果时 `undefined`，行上不渲染任何更新控件）。
             const update = updateByChannel.get(c.id);
-            // 后端应返回 20 条；缺一条时是「状态未知」，绝不能当成「未安装」——
+            // 后端应返回 28 条；缺一条时是「状态未知」，绝不能当成「未安装」——
             // 那会给出一个装了也白装的安装按钮，且把已装环境说成没装。
             const known = status !== undefined;
             const installed = status?.installed === true;
@@ -1647,6 +1655,12 @@ const CLI_LAUNCH_COMMANDS: Record<string, string> = {
   "qwen-code": "qwen",
   deepseek: "reasonix",
   "mimo-code": "mimocode",
+  qoder: "qodercli",
+  "qoder-cn": "qoderclicn",
+  "kimi-code": "kimi",
+  droid: "droid",
+  codebuddy: "codebuddy",
+  crush: "crush",
 };
 
 function RestartSection({ channel }: { channel: string }) {

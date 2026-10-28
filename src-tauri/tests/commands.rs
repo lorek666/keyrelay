@@ -1813,15 +1813,15 @@ fn report_ui_ready_writes_a_millisecond_timestamp_setting() {
 
 // ---------- M34-S1：Agent 更新检查与白名单一键更新 ----------
 
-/// `check_agent_updates` 可达、返回 20 条、顺序与 `agents::specs()` 一致。
+/// `check_agent_updates` 可达、返回 28 条、顺序与 `agents::specs()` 一致。
 ///
-/// 会真的联网（每个源 8s 超时）；**失败也必须是「20 条 + 逐条 state」而不是整体 Err**，
+/// 会真的联网（每个源 8s 超时）；**失败也必须是「28 条 + 逐条 state」而不是整体 Err**，
 /// 这条测试同时钉住「单个源失败不影响整体」的契约形状。
 #[test]
-fn check_agent_updates_returns_twenty_rows_in_specs_order() {
+fn check_agent_updates_returns_twenty_eight_rows_in_specs_order() {
     let value = invoke("check_agent_updates").expect("check_agent_updates 应成功");
     let rows = value.as_array().expect("返回值必须是数组");
-    assert_eq!(rows.len(), 20, "检查结果必须是 20 条");
+    assert_eq!(rows.len(), 28, "检查结果必须是 28 条");
 
     let channels: Vec<&str> = rows
         .iter()
