@@ -308,9 +308,7 @@ fn inject_rollback_roundtrip_is_byte_identical() {
         f.service
             .grant_consent(f.key_id, channel)
             .unwrap_or_else(|e| panic!("{name} 记录同意失败: {e}"));
-        let created = f
-            .service
-            .apply_delivery_with_model(f.key_id, channel, model)
+        let created = apply_delivery_retry_on_busy(&f, channel, model)
             .unwrap_or_else(|e| panic!("{name} 注入失败: {e}"));
         let after_create =
             fs::read(&target).unwrap_or_else(|e| panic!("{name} 注入后文件必须存在: {e}"));
@@ -342,9 +340,7 @@ fn inject_rollback_roundtrip_is_byte_identical() {
         // ---- 形态二：目标已存在 ⇒ 回滚后逐字节等于原内容
         fs::create_dir_all(target.parent().expect("有父目录")).expect("建父目录");
         fs::write(&target, &original).expect("预置原内容");
-        let again = f
-            .service
-            .apply_delivery_with_model(f.key_id, channel, model)
+        let again = apply_delivery_retry_on_busy(&f, channel, model)
             .unwrap_or_else(|e| panic!("{name} 第二次注入失败: {e}"));
         let after_second = fs::read(&target).expect("读注入后内容");
         assert_ne!(after_second, original, "{name} 的注入没有改动文件（空跑）");
@@ -872,12 +868,13 @@ async fn concurrent_inject_same_file_is_rejected() {
     );
 }
 
-/// 仅对 `FileBusy` 做有界重试的单通道 apply 包装（幂等测试独用）。
+/// 仅对 `FileBusy` 做有界重试的单通道 apply 包装（幂等与回滚字节比对测试共用）。
 ///
 /// 背景：ac1b130 的 macOS CI 上，本文件 `injection_is_idempotent_across_channels`
-/// 在 claude-code-settings 的二投处偶发 `FileBusy(settings.json)`；而此前三轮
-/// macOS CI 同测试通过，其间 acceptance_matrix 与 inject 锁生产代码零改动；
-/// 本地 Linux 上单测 20 遍、整目标并行 5 遍均未复现。
+/// 在 claude-code-settings 的二投处偶发 `FileBusy(settings.json)`；2026-10-28 的
+/// macOS CI 上 `inject_rollback_roundtrip_is_byte_identical` 又在 codex-config 的
+/// 二投处偶发同类错误。此前多轮 macOS CI 同测试通过，其间 acceptance_matrix 与
+/// inject 锁生产代码零改动；本地 Linux 上单测 20 遍、整目标并行 5 遍均未复现。
 /// 结论只能是“未定位的瞬时锁竞争抖动”，不是确定性回归——本包装不声称根因。
 /// 已排除的项：锁键是完整归一化目标路径、每测试独用 tempdir 夹具，故不存在
 /// 跨测试同路径撞锁；首投守卫是函数局部 RAII，顺序双投不存在自撞；回滚不取锁、
