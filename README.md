@@ -134,7 +134,7 @@ Tianshu Relay covers **28 delivery channels**, 27 of which support direct file w
 
 | Agent | Notes |
 | --- | --- |
-| Codex CLI | `auth.json` and `config.toml` delivered together |
+| Codex CLI / Codex Desktop (ChatGPT app) | Share `~/.codex`; `auth.json` and `config.toml` delivered together |
 | Claude Code, Claude Desktop | Write to their respective settings files |
 | OpenCode | `.json` and `.jsonc` are separate targets; choose one in preview |
 | Gemini CLI, Grok, OpenClaw, Hermes, MCode, Pi | Written in each tool's native format |

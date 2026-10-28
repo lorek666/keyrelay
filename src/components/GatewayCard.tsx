@@ -1547,17 +1547,17 @@ export default function GatewayCard({
           step={1}
           value={healthIntervalText}
           onChange={(e) => setHealthIntervalText(e.target.value)}
-          onBlur={() => {
-            const parsed = Number(healthIntervalText);
+          onBlur={(e) => {
+            // 同采集间隔：以 DOM 当前值为准，避免 change→blur 同拍时拿到旧闭包。
+            const raw = e.currentTarget.value;
+            const parsed = Number(raw);
             const clamped = !Number.isFinite(parsed)
               ? 0
               : Math.trunc(parsed) <= 0
                 ? 0
                 : Math.min(86400, Math.max(60, Math.trunc(parsed)));
             setHealthIntervalText(String(clamped));
-            setHealthClamped(
-              clamped !== parsed || String(clamped) !== healthIntervalText,
-            );
+            setHealthClamped(clamped !== parsed || String(clamped) !== raw);
             if (clamped !== keyHealthIntervalSecs) {
               onKeyHealthIntervalChange(clamped);
             }
@@ -1599,13 +1599,16 @@ export default function GatewayCard({
           value={intervalText}
           onChange={(e) => setIntervalText(e.target.value)}
           // 越界/非数字 ⇒ **失焦时钳制**并提示（不边打边改，否则用户输 `5` 想输 `50` 会被打断）
-          onBlur={() => {
-            const parsed = Number(intervalText);
+          onBlur={(e) => {
+            // 以 DOM 当前值为准，不读闭包里的 intervalText：同一拍内先 change 再
+            // blur 时（自动化/快速点保存），React 可能还没重渲染，闭包仍是旧值。
+            const raw = e.currentTarget.value;
+            const parsed = Number(raw);
             const clamped = Number.isFinite(parsed)
               ? Math.min(86400, Math.max(30, Math.trunc(parsed)))
               : 1800;
             setIntervalText(String(clamped));
-            setClamped(clamped !== parsed || String(clamped) !== intervalText);
+            setClamped(clamped !== parsed || String(clamped) !== raw);
             if (clamped !== modelsMinIntervalSecs) onModelsIntervalChange(clamped);
           }}
         />

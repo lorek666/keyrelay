@@ -133,7 +133,7 @@
 
 | Agent | 说明 |
 | --- | --- |
-| Codex CLI | `auth.json` 与 `config.toml` 一次投递 |
+| Codex CLI / Codex 桌面版（ChatGPT 应用） | 共用 `~/.codex`；`auth.json` 与 `config.toml` 一次投递 |
 | Claude Code、Claude Desktop | 写入各自的设置文件 |
 | OpenCode | `.json` 与 `.jsonc` 两个落点，预览时自选其一 |
 | Gemini CLI、Grok、OpenClaw、Hermes、MCode、Pi | 按各自格式写入 |

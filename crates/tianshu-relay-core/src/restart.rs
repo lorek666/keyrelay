@@ -35,11 +35,12 @@
 //! 的清单项，不得渲染成已通过。VM 上没有真机应用可测，daemon 是否重载新配置只能由用户
 //! 在真机上另行确认（例如新开一次会话确认配置已生效）。
 //!
-//! 身份常量未经真机核实（VM 上没有 macOS/Windows 应用可测）：Codex 的 bundle id 与桌面
-//! 进程名按 LoongPort「重开 ChatGPT 桌面应用」的口径取，Claude Desktop 的 bundle id 按其
-//! 桌面应用取。它们集中在 [`spec`] 一个函数里，真机验收时若实测不符，只改这里；且流程是
-//! fail-closed 的——bundle 退出请求失败时轮询 + 强制杀仍会走，拉起失败时返回明确错误，
-//! 绝不会把「没拉起来」报成成功。
+//! 身份常量集中在 [`spec`] 一个函数里：Codex 桌面版的 macOS bundle id 已按本机
+//! `/Applications/ChatGPT.app` 实测修正为 `com.openai.codex`（2026-10-28，旧值
+//! `com.openai.chat` 会导致退出和拉起都失败）；Windows 映像名与 Linux 进程名仍未
+//! 真机验证。Claude Desktop 的 bundle id 按其桌面应用取。流程仍是 fail-closed 的——
+//! bundle 退出请求失败时轮询 + 强制杀仍会走，拉起失败时返回明确错误，绝不会把
+//! 「没拉起来」报成成功。
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -118,7 +119,8 @@ impl RestartPlatform {
 /// 一个重启目标的全部平台身份。字段集中在这里，真机核实后只改 [`spec`]。
 pub struct RestartSpec {
     pub target: RestartTarget,
-    /// macOS 退出请求与拉起用的 bundle id（见模块文档：未经真机核实）。
+    /// macOS 退出请求与拉起用的 bundle id（Codex 已按 `ChatGPT.app` 真机实测；
+    /// 其它目标仍以真机验收为准）。
     pub bundle_id: Option<&'static str>,
     /// macOS 进程名（`pkill -x` / 出现轮询用）。
     pub mac_process: &'static str,
@@ -140,9 +142,11 @@ pub fn spec(target: RestartTarget) -> RestartSpec {
     match target {
         RestartTarget::Codex => RestartSpec {
             target,
-            // ChatGPT 桌面应用（LoongPort 口径：tier 切换时重开的是 ChatGPT 桌面应用）。
-            // 若 Codex 独立桌面包的 bundle id 与此不同，真机验收时以实测为准改这里。
-            bundle_id: Some("com.openai.chat"),
+            // Codex 桌面版实际安装为 /Applications/ChatGPT.app；2026-10-28 真机
+            // Info.plist 的 CFBundleIdentifier 是 com.openai.codex（旧值
+            // com.openai.chat 是错的，退出与拉起都会失败）。Windows 映像名仍按
+            // ChatGPT.exe，待真机复核。
+            bundle_id: Some("com.openai.codex"),
             mac_process: "ChatGPT",
             windows_image: "ChatGPT.exe",
             linux_process: "chatgpt",
@@ -814,7 +818,7 @@ mod tests {
                 "osascript".to_string(),
                 vec![
                     "-e".to_string(),
-                    "tell application id \"com.openai.chat\" to quit".to_string()
+                    "tell application id \"com.openai.codex\" to quit".to_string()
                 ]
             )]
         );
@@ -822,7 +826,7 @@ mod tests {
             launch_command(RestartPlatform::MacOs, &s),
             (
                 "open".to_string(),
-                vec!["-b".to_string(), "com.openai.chat".to_string()]
+                vec!["-b".to_string(), "com.openai.codex".to_string()]
             )
         );
         // 拉起不带任何 CLI 参数：argv 除 bundle 外只有 -b。

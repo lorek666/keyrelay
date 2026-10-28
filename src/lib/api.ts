@@ -2756,8 +2756,8 @@ export async function detectAgents(): Promise<AgentStatus[]> {
         installUrl: "https://chatgpt.com/codex",
       },
       "codex-config": {
-        // 与 codex-auth-json 共用同一个 `codex` 二进制：真实后端两条通道的探测结果必然同时为
-        // installed。mock 里不补这一条会让「可更新 3」与页面上的 2 个徽标对不上（M34-S1 视觉走查）。
+        // 与 codex-auth-json 共用同一套 Codex 配置/探测（CLI 或桌面 App）：真实后端两条通道
+        // 的探测结果必然同时为 installed。mock 里不补这一条会让「可更新 3」与页面上的 2 个徽标对不上（M34-S1 视觉走查）。
         channel: "codex-config",
         installed: true,
         version: "0.162.1",

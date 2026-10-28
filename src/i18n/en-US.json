@@ -760,7 +760,7 @@
         "newSession": "A new session picks it up; no process restart needed. A running session may not re-read it—open a new session to confirm when unsure.",
         "restartTerminalOrCli": "Takes effect after restarting the terminal or the CLI.",
         "relaunchDesktopApp": "Takes effect only after fully quitting and reopening the app (closing the window while it stays in the background does not count).",
-        "codexSplit": "Three separate places: relaunch the ChatGPT desktop app with the one-click restart button; a codex session in your terminal is not affected by the button and must be reopened manually; the app-server daemon needs separate verification—closing the terminal is not enough.",
+        "codexSplit": "Three separate places: relaunch the Codex desktop app (the ChatGPT app) with the one-click restart button; a codex session in your terminal is not affected by the button and must be reopened manually; the app-server daemon needs separate verification—closing the terminal is not enough.",
         "restartAgent": "Takes effect after restarting the agent."
       }
     },
@@ -785,15 +785,15 @@
       "daemonNote": "External reports say the shared app-server keeps the old config in memory since CLI 0.157, so killing the window alone may not apply the change; open a fresh session to confirm the new config is in effect.",
       "cliTitle": "Terminal launch command",
       "cliHint": "This app does not launch terminal processes for you: run this command in your terminal to reopen the session.",
-      "codexTitle": "Restart the ChatGPT desktop app",
-      "codexHint": "This button quits and relaunches the ChatGPT desktop app (which shares the ~/.codex config with Codex CLI), not the codex session in your terminal; a terminal session only reads the new config after you reopen it with the command below.",
-      "codexConfirmTitle": "Confirm restart of the ChatGPT desktop app",
-      "codexConfirmBody": "Restarting will fully quit the ChatGPT desktop app and launch it again. Any desktop session in progress will be interrupted and unsaved work may be lost. Continue?",
+      "codexTitle": "Restart the Codex desktop app (ChatGPT)",
+      "codexHint": "This button quits and relaunches the Codex desktop app (the ChatGPT app; it shares the ~/.codex config with Codex CLI), not the codex session in your terminal; a terminal session only reads the new config after you reopen it with the command below.",
+      "codexConfirmTitle": "Confirm restart of the Codex desktop app (ChatGPT)",
+      "codexConfirmBody": "Restarting will fully quit the Codex desktop app (the ChatGPT app) and launch it again. Any desktop session in progress will be interrupted and unsaved work may be lost. Continue?",
       "codexConfirmCliNote": "A codex session running in your terminal is not affected by this button: it keeps running on the old config and must be reopened with the launch command below before it reads the new config.",
       "codexCliHint": "A codex session running in your terminal is not affected by this button: it keeps running on the old config. Reopen it yourself with the launch command below; only then does it read the new config.",
-      "codexResultWasRunning": "The ChatGPT desktop app was running before restart; it was quit and launched again.",
-      "codexResultWasNotRunning": "The ChatGPT desktop app was not running before restart; it was launched directly.",
-      "codexResultAppeared": "The new ChatGPT desktop app process has appeared; this only means the desktop app was relaunched — a codex session in your terminal still needs to be reopened before it reads the new config."
+      "codexResultWasRunning": "The Codex desktop app (ChatGPT) was running before restart; it was quit and launched again.",
+      "codexResultWasNotRunning": "The Codex desktop app (ChatGPT) was not running before restart; it was launched directly.",
+      "codexResultAppeared": "The new Codex desktop app (ChatGPT) process has appeared; this only means the desktop app was relaunched — a codex session in your terminal still needs to be reopened before it reads the new config."
     },
     "btn": {
       "apply": "Deliver",

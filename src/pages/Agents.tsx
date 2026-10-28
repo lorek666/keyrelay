@@ -68,8 +68,8 @@ import { useTranslation, translate, getCurrentDict } from "../i18n";
  * M14-S2：`label` 含文件路径（技术描述），中英同形，暂不抽——i18n:skip
  */
 export const CHANNELS = [
-  { id: "codex-auth-json", label: "Codex CLI（~/.codex/auth.json）", agent: "codex" },
-  { id: "codex-config", label: "Codex Config（~/.codex/config.toml）", agent: "codex-config" },
+  { id: "codex-auth-json", label: "Codex CLI / 桌面版（~/.codex/auth.json）", agent: "codex" }, // i18n:skip
+  { id: "codex-config", label: "Codex Config / 桌面版（~/.codex/config.toml）", agent: "codex-config" }, // i18n:skip
   { id: "claude-code-settings", label: "Claude Code（~/.claude/settings.json）", agent: "claude-code" },
   { id: "opencode", label: "OpenCode（~/.config/opencode/opencode.json）", agent: "opencode" },
   { id: "opencode-jsonc", label: "OpenCode JSONC（~/.config/opencode/opencode.jsonc）", agent: "opencode-jsonc" },
@@ -98,7 +98,7 @@ export const CHANNELS = [
 ];
 
 /**
- * 从 `"Codex CLI（~/.codex/auth.json）"` 取展示名称（括号前）。
+ * 从 `"Codex CLI / 桌面版（~/.codex/auth.json）"` 取展示名称（括号前）。
  *
  * 落点标签是「Agent 名（目标文件）」形态；M32-S1 起界面不再显示目标路径，
  * 因此只返回名称。没有括号时整串当名称。
@@ -1624,8 +1624,8 @@ function UpdateAttempts({ outcome }: { outcome: AgentUpdateOutcome }) {
  * 一键重启区（投递改进 P1-5）。
  *
  * 第一批只做两类目标：Codex（两条通道共用一个桌面重启）与 Claude Desktop，都是
- * 「完全退出重开」。Codex 行的标题/确认/结果文案必须点名实际目标 ChatGPT 桌面应用，
- * 不得复用「Codex CLI」之名；终端 codex 会话不受按钮影响，靠可复制命令自行重开。
+ * 「完全退出重开」。Codex 行的标题/确认/结果文案必须点名实际目标 Codex 桌面版
+ * （ChatGPT 应用），不得复用「Codex CLI」之名；终端 codex 会话不受按钮影响，靠可复制命令自行重开。
  * 其余 CLI 类 agent 不给重启按钮，只给可复制的启动命令——
  * 应用绝不替用户拉终端进程（启动命令的 bin 名与后端 agents.rs 的探测 bin 同源）。
  * App / 扩展类通道（Cursor、Trae、Cline、DSH）既无重启按钮也无

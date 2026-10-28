@@ -24,6 +24,12 @@ pub enum Probe {
     /// macOS 应用包：`/Applications/<bundle>.app`、`~/Applications/<bundle>.app`。
     /// 版本从 `Contents/Info.plist` 的 `CFBundleShortVersionString` 读取。
     App { bundles: &'static [&'static str] },
+    /// 先查 CLI，CLI 不存在时再查 macOS 应用包（Codex 桌面版与 CLI 共用配置）。
+    CliOrApp {
+        bins: &'static [&'static str],
+        version_args: &'static [&'static str],
+        bundles: &'static [&'static str],
+    },
     /// 编辑器扩展目录：`~/.vscode/extensions/<prefix>*`（也查 `.vscode-insiders`、`.cursor`），
     /// 版本从扩展的 `package.json` 的 `version` 读取。
     Extension { prefixes: &'static [&'static str] },
@@ -91,9 +97,13 @@ static SPECS: [AgentSpec; 28] = [
     AgentSpec {
         channel: "codex-auth-json",
         name: "Codex",
-        probe: Probe::Cli {
+        probe: Probe::CliOrApp {
             bins: &["codex"],
             version_args: V,
+            // Codex 桌面版本机实测安装为 /Applications/ChatGPT.app（bundle id
+            // com.openai.codex）。先查 CLI，保留原有版本/更新语义；CLI 不在时
+            // 用桌面 App 兜底，避免只装桌面版的用户被误判为未安装。
+            bundles: &["ChatGPT"],
         },
         config_path: Some(".codex/auth.json"),
         installs: &[
@@ -108,9 +118,10 @@ static SPECS: [AgentSpec; 28] = [
     AgentSpec {
         channel: "codex-config",
         name: "Codex",
-        probe: Probe::Cli {
+        probe: Probe::CliOrApp {
             bins: &["codex"],
             version_args: V,
+            bundles: &["ChatGPT"],
         },
         config_path: Some(".codex/config.toml"),
         installs: &[
@@ -530,6 +541,11 @@ pub fn probe_cline_cli(home: &Path) -> ClineCliProbe {
 pub fn detect_one(spec: &AgentSpec, home: &Path) -> AgentStatus {
     match spec.probe {
         Probe::Cli { bins, version_args } => detect_cli(spec, home, bins, version_args),
+        Probe::CliOrApp {
+            bins,
+            version_args,
+            bundles,
+        } => detect_cli_or_app(spec, home, bins, version_args, bundles),
         Probe::App { bundles } => detect_app(spec, home, bundles),
         Probe::Extension { prefixes } => detect_extension(spec, home, prefixes),
     }
@@ -594,6 +610,35 @@ fn detect_cli(
         }
     }
     status(spec, false, None, None, config_only_detail(spec, home))
+}
+
+/// CLI 优先、macOS 应用包兜底。Codex 桌面版与 CLI 共用 `~/.codex`，但只装
+/// 桌面版（`/Applications/ChatGPT.app`）的用户没有 PATH 里的 `codex`，不能
+/// 因此判成未安装。CLI 存在时保留 CLI 版本，避免把桌面应用版本 `26.x`
+/// 拿去和 npm 上的 `codex` 版本比较。
+fn detect_cli_or_app(
+    spec: &AgentSpec,
+    home: &Path,
+    bins: &[&'static str],
+    version_args: &[&'static str],
+    bundles: &[&'static str],
+) -> AgentStatus {
+    let cli = detect_cli(spec, home, bins, version_args);
+    if cli.installed {
+        return cli;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let app = detect_app(spec, home, bundles);
+        if app.installed {
+            return app;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = bundles;
+
+    cli
 }
 
 /// 「配置还在，但程序没找到」的说明（spec §4.1 的 installed 判据）。
@@ -1061,8 +1106,12 @@ mod tests {
                 );
                 assert!(!install.command.trim().is_empty());
             }
-            // CLI 探测必须有 bin 与 version 参数
-            if let Probe::Cli { bins, version_args } = spec.probe {
+            // CLI 或 CLI+App 探测必须有 bin 与 version 参数
+            if let Probe::Cli { bins, version_args }
+            | Probe::CliOrApp {
+                bins, version_args, ..
+            } = spec.probe
+            {
                 assert!(!bins.is_empty(), "{} 没有 bin", spec.channel);
                 assert!(!version_args.is_empty());
             }
@@ -1289,6 +1338,61 @@ mod tests {
             .as_deref()
             .unwrap()
             .ends_with("DeepSeek Harness.app"));
+    }
+
+    /// Codex 桌面版与 CLI 共用 `~/.codex`：CLI 不在 PATH 时，必须能从
+    /// `/Applications/ChatGPT.app`（或 `~/Applications/ChatGPT.app`）识别出已安装。
+    #[test]
+    fn codex_probe_falls_back_to_the_desktop_app() {
+        let spec = specs()
+            .iter()
+            .find(|s| s.channel == "codex-auth-json")
+            .unwrap();
+        assert_eq!(
+            spec.probe,
+            Probe::CliOrApp {
+                bins: &["codex"],
+                version_args: V,
+                bundles: &["ChatGPT"],
+            }
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cli_or_app_detects_a_desktop_bundle_when_cli_is_absent() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let home = dir.path();
+        let app = home.join("Applications").join("Codex Test App.app");
+        std::fs::create_dir_all(app.join("Contents")).expect("建目录");
+        std::fs::write(
+            app.join("Contents/Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>CFBundleShortVersionString</key><string>26.1007.30912</string>
+</dict></plist>"#,
+        )
+        .expect("写 plist");
+        let spec = AgentSpec {
+            channel: "codex-auth-json",
+            name: "Codex",
+            probe: Probe::CliOrApp {
+                bins: &["kr-no-such-codex-cli"],
+                version_args: V,
+                bundles: &["Codex Test App"],
+            },
+            config_path: Some(".codex/auth.json"),
+            installs: &[inst!("npm", "npm i -g x")],
+            install_url: "https://example.invalid",
+        };
+        let status = detect_one(&spec, home);
+        assert!(status.installed, "{status:?}");
+        assert_eq!(status.version.as_deref(), Some("26.1007.30912"));
+        assert!(status
+            .source
+            .as_deref()
+            .unwrap()
+            .ends_with("Codex Test App.app"));
     }
 
     #[test]

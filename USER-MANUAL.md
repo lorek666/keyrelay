@@ -1,6 +1,6 @@
 # 天枢 Relay 用户手册
 
-> 适用版本：v0.2.1（下载见 [Releases](https://github.com/lorek666/keyrelay/releases/latest)）
+> 适用版本：v0.2.2（下载见 [Releases](https://github.com/lorek666/keyrelay/releases/latest)）
 >
 > 本手册讲“怎么用”。一句话了解产品请看 [README.md](README.md)。
 
@@ -83,13 +83,13 @@
 - **回读校验**：写后回读解析校验，失败自动回滚本次事务。
 - **受管字段隔离**：只改受管字段；你手工写过的其他内容、格式与注释原样保留；重名冲突先报冲突让用户确认。
 - **回滚**：注入后 agent 起不来，在变更历史里点回滚，恢复到注入前字节一致的配置。
-- **重启**：本产品不替你重启 agent 进程，以免打断正在跑的任务；是否需要重启以界面标注为准。
+- **重启**：Codex 桌面版与 Claude Desktop 可在界面一键重启；其他 agent 不会替你重启，以免打断正在跑的任务；是否需要重启以界面标注为准。
 
 ### 4.3 支持的 Agent
 
 | Agent | 备注 |
 | ---- | ---- |
-| Codex CLI | `auth.json` 与 `config.toml` 一次投递（同一把 key 走两个文件） |
+| Codex CLI、Codex 桌面版（ChatGPT 应用） | 共用 `~/.codex`；`auth.json` 与 `config.toml` 一次投递（同一把 key 走两个文件） |
 | Claude Code、Claude Desktop | |
 | OpenCode | `.json` 与 `.jsonc` 是两个落点，预览里自选其一，产品不猜优先级 |
 | Gemini CLI、Grok、OpenClaw、Hermes、MCode、Pi | |
