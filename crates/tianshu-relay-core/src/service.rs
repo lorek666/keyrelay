@@ -714,6 +714,31 @@ pub struct UnbindOutcome {
     pub note: Option<String>,
 }
 
+/// 解析路径的已存在前缀，再把尚不存在的尾部按原名拼回去。
+///
+/// `canonicalize` 要求整条路径都存在；测试里的临时 home、或用户还没创建过
+/// 配置目录的 home 都可以合法地不存在。直接退化为原路径会漏掉已有前缀里的
+/// 符号链接，因此这里只解析真正存在的部分。
+fn canonicalize_with_missing_tail(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    while std::fs::symlink_metadata(existing).is_err() {
+        let Some(name) = existing.file_name() else {
+            break;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            break;
+        };
+        existing = parent;
+    }
+    let mut canonical = std::fs::canonicalize(existing)?;
+    for part in missing.iter().rev() {
+        canonical.push(part);
+    }
+    Ok(canonical)
+}
+
 /// 当前 unix 秒。
 ///
 /// 只给 [`TianshuRelayService::dispatch_notifications`]、[`TianshuRelayService::rotation_due`] 与用量 drain 用：
@@ -8669,21 +8694,33 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         // 时目标字符串仍在 home 下，但写盘会跟随链接跑到 home 外。沿最近的
         // 已存在祖先做 canonicalize，要求它仍在 canonical home 内；目标本身
         // 的最终 symlink 仍由 `inject::write_atomic` 单独拒绝。
-        let home_canon = std::fs::canonicalize(&self.home).unwrap_or_else(|_| self.home.clone());
+        //
+        // home 或目标父目录可以合法地尚未创建（测试装配、首次投递）；此时
+        // 只把已存在的前缀解析成真实路径，再拼回不存在的尾部。不能因为
+        // “最近的已存在祖先”是 home 之外的临时目录，就把正常路径误判成越界。
+        let home_canon =
+            canonicalize_with_missing_tail(&self.home).map_err(|err| Error::Inject {
+                path: target.display().to_string(),
+                reason: format!("无法解析用户目录，拒绝写入: {err}"),
+            })?;
         let mut ancestor = target.parent().unwrap_or(target);
-        while !ancestor.exists() {
+        while std::fs::symlink_metadata(ancestor).is_err() && ancestor != self.home {
             let Some(parent) = ancestor.parent() else {
                 break;
             };
-            if parent == ancestor {
+            if !parent.starts_with(&self.home) {
                 break;
             }
             ancestor = parent;
         }
-        let ancestor_canon = std::fs::canonicalize(ancestor).map_err(|err| Error::Inject {
-            path: target.display().to_string(),
-            reason: format!("无法解析目标父目录，拒绝写入: {err}"),
-        })?;
+        let ancestor_canon = if ancestor == self.home {
+            home_canon.clone()
+        } else {
+            canonicalize_with_missing_tail(ancestor).map_err(|err| Error::Inject {
+                path: target.display().to_string(),
+                reason: format!("无法解析目标父目录，拒绝写入: {err}"),
+            })?
+        };
         if !ancestor_canon.starts_with(&home_canon) {
             return Err(Error::Inject {
                 path: target.display().to_string(),
@@ -8916,6 +8953,24 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Inject { .. }), "{err:?}");
         assert!(err.to_string().contains("符号链接"), "{err}");
+    }
+
+    /// 回归：macOS/Windows CI 的测试临时 home 并不存在。父目录检查不能把
+    /// “最近的已存在祖先”一路退到系统临时目录，再误判为逃出 home。
+    #[test]
+    fn checked_target_allows_a_missing_home_and_missing_config_dir() {
+        let parent = tempfile::tempdir().unwrap();
+        let home = parent.path().join("not-created");
+        assert!(!home.exists());
+        let service = TianshuRelayService::new(
+            Store::open_in_memory().unwrap(),
+            MockTransport::new(vec![]),
+            test_config_with_home(home.clone()),
+        );
+        let target = home.join(".codex").join("auth.json");
+        assert!(service
+            .checked_target(DeliveryChannel::CodexAuthJson, &target)
+            .is_ok());
     }
 
     #[test]
