@@ -27,7 +27,10 @@ pub enum MockOutcome {
 
 /// 按 channel 校验 `home/<relative_target>` 里的密钥字段。
 pub fn check(channel: DeliveryChannel, home: &Path) -> MockOutcome {
-    let target: PathBuf = home.join(channel.relative_target());
+    let target: PathBuf = match channel {
+        DeliveryChannel::KimiCode => kimi_code::KimiCodeWriter::config_path(home),
+        _ => home.join(channel.relative_target()),
+    };
     let text = match std::fs::read_to_string(&target) {
         Ok(t) => t,
         Err(e) => {
@@ -78,10 +81,10 @@ pub fn check(channel: DeliveryChannel, home: &Path) -> MockOutcome {
         }
         DeliveryChannel::KimiCode => check_kimi(&text),
         DeliveryChannel::Droid => {
-            check_json_array_entry(&text, "customModels", "custom:keyrelay/", "apiKey")
+            check_json_array_entry(&text, "customModels", "custom:keyrelay/", "apiKey", true)
         }
         DeliveryChannel::CodeBuddy | DeliveryChannel::WorkBuddy | DeliveryChannel::WorkBuddyAi => {
-            check_json_array_entry(&text, "models", "keyrelay", "apiKey")
+            check_json_array_entry(&text, "models", "keyrelay", "apiKey", false)
         }
         DeliveryChannel::Crush => check_json_nested(&text, &["providers", "keyrelay", "api_key"]),
     }
@@ -99,8 +102,15 @@ fn check_kimi(text: &str) -> MockOutcome {
     }
 }
 
-/// 数组条目：`customModels` 按 `id` 前缀匹配，`models` 按 `vendor` 匹配。
-fn check_json_array_entry(text: &str, key: &str, marker: &str, field: &str) -> MockOutcome {
+/// 数组条目：`customModels` 按 `id` 前缀匹配，`models` 按 `vendor` 精确匹配。
+/// `id_prefix` 明确区分两种语义，不能让 `id = "keyrelay-old"` 冒充我们的条目。
+fn check_json_array_entry(
+    text: &str,
+    key: &str,
+    marker: &str,
+    field: &str,
+    id_prefix: bool,
+) -> MockOutcome {
     let v: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => return MockOutcome::Fatal(format!("JSON 解析失败: {e}")),
@@ -114,11 +124,14 @@ fn check_json_array_entry(text: &str, key: &str, marker: &str, field: &str) -> M
         _ => return MockOutcome::Fatal("顶层不是对象或数组".into()),
     };
     for entry in entries {
-        let matched = entry
-            .get("id")
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| v.starts_with(marker))
-            || entry.get("vendor").and_then(|v| v.as_str()) == Some(marker);
+        let matched = if id_prefix {
+            entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v.starts_with(marker))
+        } else {
+            entry.get("vendor").and_then(|v| v.as_str()) == Some(marker)
+        };
         if matched {
             return match entry.get(field).and_then(|v| v.as_str()) {
                 Some(s) if !s.is_empty() => MockOutcome::Ok,
@@ -657,6 +670,54 @@ mod tests {
         .unwrap();
         assert!(matches!(
             check(DeliveryChannel::Pi, d.path()),
+            MockOutcome::Ok
+        ));
+    }
+
+    #[test]
+    fn workbuddy_rejects_an_id_prefix_lookalike_without_our_vendor() {
+        let d = tmp_home();
+        let p = d.path().join(DeliveryChannel::WorkBuddy.relative_target());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            r#"[{"id":"keyrelay-old","vendor":"mine","apiKey":"sk-not-ours"}]"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::WorkBuddy, d.path()),
+            MockOutcome::KeyMissing(_)
+        ));
+    }
+
+    #[test]
+    fn kimi_empty_api_key_is_missing() {
+        let d = tmp_home();
+        let p = d.path().join(".kimi-code").join("config.toml");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            "[providers.keyrelay]\napi_key = \"\"\nbase_url = \"https://x\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::KimiCode, d.path()),
+            MockOutcome::KeyMissing(_)
+        ));
+    }
+
+    #[test]
+    fn kimi_legacy_path_is_checked() {
+        let d = tmp_home();
+        std::fs::create_dir_all(d.path().join(".kimi")).unwrap();
+        let p = d.path().join(".kimi").join("config.toml");
+        std::fs::write(
+            &p,
+            "[providers.keyrelay]\napi_key = \"sk-legacy\"\nbase_url = \"https://x\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            check(DeliveryChannel::KimiCode, d.path()),
             MockOutcome::Ok
         ));
     }

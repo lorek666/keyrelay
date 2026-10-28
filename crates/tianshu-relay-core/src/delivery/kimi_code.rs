@@ -1,13 +1,16 @@
-//! Kimi Code 通道：`~/.kimi-code/config.toml`。
+//! Kimi Code 通道：`~/.kimi-code/config.toml`；旧 kimi-cli 用 `~/.kimi/config.toml`。
 //!
 //! Kimi Code 的 provider 表（Magpie `kimi.go`）：
 //! `[providers.<id>]` 带 `type` / `base_url` / `api_key`，模型表
 //! `[models."<id>/<model>"]` 指向该 provider；顶层 `default_model` 选默认模型。
 //! 这里只改 keyrelay 自己的表，用户已有 provider / model / 其他顶层键原样保留。
+//!
+//! 路径选择与 Magpie 相同：`~/.kimi-code` 存在就用新 CLI 的；否则 `~/.kimi`
+//! 存在就用旧 kimi-cli 的；两者都不存在时新建 `~/.kimi-code`。
 
 use std::path::{Path, PathBuf};
 
-use toml_edit::{value, DocumentMut, Item, Table};
+use toml_edit::{value, DocumentMut, Item, Table, TableLike};
 
 use super::json_text::read_text_or_empty;
 use super::{literal_field, masked_field, DeliveryChannel, DeliveryField, DeliveryWriter};
@@ -30,12 +33,7 @@ impl KimiCodeWriter {
     const DEFAULT_CONTEXT: u32 = 128_000;
 
     pub fn new(home: &Path, base_url: &str) -> Self {
-        Self::with_path(
-            home.join(".kimi-code").join("config.toml"),
-            base_url,
-            None,
-            None,
-        )
+        Self::with_path(Self::config_path(home), base_url, None, None)
     }
 
     pub fn with_model(
@@ -44,12 +42,20 @@ impl KimiCodeWriter {
         model: Option<&str>,
         meta: Option<ModelMeta>,
     ) -> Self {
-        Self::with_path(
-            home.join(".kimi-code").join("config.toml"),
-            base_url,
-            model,
-            meta,
-        )
+        Self::with_path(Self::config_path(home), base_url, model, meta)
+    }
+
+    /// 新 CLI 的 `~/.kimi-code` 优先；没有时回落到旧 kimi-cli 的 `~/.kimi`。
+    pub fn config_path(home: &Path) -> PathBuf {
+        let current = home.join(".kimi-code");
+        if current.is_dir() {
+            return current.join("config.toml");
+        }
+        let legacy = home.join(".kimi");
+        if legacy.is_dir() {
+            return legacy.join("config.toml");
+        }
+        current.join("config.toml")
     }
 
     pub fn with_path(
@@ -134,10 +140,15 @@ pub fn value_from_text(text: &str, field: &str) -> Option<String> {
         doc.get(field)?
     } else {
         doc.get("providers")?
+            .as_table_like()?
             .get(KimiCodeWriter::PROVIDER_KEY)?
+            .as_table_like()?
             .get(field)?
     };
-    item.as_str().map(str::to_string)
+    item.as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// 回读/导入用：字段是否在 keyrelay 归属内（不是全文同名键）。
@@ -168,54 +179,64 @@ fn build_after(
             .map_err(|_| Error::inject(path, "TOML 解析失败，拒绝改写"))?
     };
 
-    if !doc.contains_key("providers") {
-        doc.insert("providers", Item::Table(Table::new()));
-    }
-    let providers = doc["providers"]
-        .as_table_mut()
-        .ok_or_else(|| Error::inject(path, "providers 不是表，拒绝改写"))?;
-    if !providers.contains_key(KimiCodeWriter::PROVIDER_KEY) {
-        providers.insert(KimiCodeWriter::PROVIDER_KEY, Item::Table(Table::new()));
-    }
-    let provider = providers[KimiCodeWriter::PROVIDER_KEY]
-        .as_table_mut()
-        .ok_or_else(|| Error::inject(path, "providers.keyrelay 不是表，拒绝改写"))?;
+    let providers = ensure_table_like(&mut doc, "providers", path)?;
+    let provider = ensure_child_table_like(providers, KimiCodeWriter::PROVIDER_KEY, path)?;
     provider.insert("type", value("kimi"));
     provider.insert(KimiCodeWriter::FIELD_BASE_URL, value(base_url));
     provider.insert(KimiCodeWriter::FIELD_API_KEY, value(api_key));
 
     if let Some(model) = model {
         let key = KimiCodeWriter::model_key(model);
-        if !doc.contains_key("models") {
-            doc.insert("models", Item::Table(Table::new()));
-        }
-        let models = doc["models"]
-            .as_table_mut()
-            .ok_or_else(|| Error::inject(path, "models 不是表，拒绝改写"))?;
-        let item = models
-            .entry(&key)
-            .or_insert_with(|| Item::Table(Table::new()));
-        let model_table = item
-            .as_table_mut()
-            .ok_or_else(|| Error::inject(path, "models 的 keyrelay 条目不是表，拒绝改写"))?;
+        let models = ensure_table_like(&mut doc, "models", path)?;
+        let model_table = ensure_child_table_like(models, &key, path)?;
         model_table.insert("provider", value(KimiCodeWriter::PROVIDER_KEY));
         model_table.insert("model", value(model));
         // display_name / max_context_size 是用户可在 Kimi 里改的元数据：
         // 有 meta 时用名单值刷新，没有 meta 时保留现值；只有新条目才填默认。
         if let Some(meta) = meta {
             model_table.insert("max_context_size", value(meta.context_window as i64));
-        } else {
-            model_table
-                .entry("max_context_size")
-                .or_insert(value(KimiCodeWriter::DEFAULT_CONTEXT as i64));
+        } else if !model_table.contains_key("max_context_size") {
+            model_table.insert(
+                "max_context_size",
+                value(KimiCodeWriter::DEFAULT_CONTEXT as i64),
+            );
         }
-        model_table
-            .entry("display_name")
-            .or_insert_with(|| value(model));
+        if !model_table.contains_key("display_name") {
+            model_table.insert("display_name", value(model));
+        }
         doc[KimiCodeWriter::FIELD_DEFAULT_MODEL] = value(key);
     }
 
     Ok(doc.to_string())
+}
+
+/// 取（或创建）一个 TOML 表/内联表。回读已经接受 inline table，
+/// 写入必须接受同一形态，否则「预览能读、落盘拒绝」。
+fn ensure_table_like<'a>(
+    doc: &'a mut DocumentMut,
+    key: &str,
+    path: &Path,
+) -> Result<&'a mut dyn TableLike> {
+    if !doc.contains_key(key) {
+        doc.insert(key, Item::Table(Table::new()));
+    }
+    doc.get_mut(key)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| Error::inject(path, format!("{key} 不是表，拒绝改写")))
+}
+
+fn ensure_child_table_like<'a>(
+    parent: &'a mut dyn TableLike,
+    key: &str,
+    path: &Path,
+) -> Result<&'a mut dyn TableLike> {
+    if !parent.contains_key(key) {
+        parent.insert(key, Item::Table(Table::new()));
+    }
+    parent
+        .get_mut(key)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| Error::inject(path, format!("{key} 不是表，拒绝改写")))
 }
 
 #[cfg(test)]
@@ -343,6 +364,57 @@ mod tests {
         assert_eq!(
             value_from_text(text, KimiCodeWriter::FIELD_BASE_URL).as_deref(),
             Some("https://inline.example.com/v1")
+        );
+    }
+
+    #[test]
+    fn empty_api_key_is_not_treated_as_present() {
+        let text =
+            "[providers.keyrelay]\napi_key = \"\"\nbase_url = \"https://old.example.com/v1\"\n";
+        assert_eq!(value_from_text(text, KimiCodeWriter::FIELD_API_KEY), None);
+        assert!(!has_field(text, KimiCodeWriter::FIELD_API_KEY));
+    }
+
+    #[test]
+    fn writes_into_inline_tables_accepted_by_readback() {
+        let dir = tmp();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "providers = { keyrelay = { api_key = \"sk-old-1111\", base_url = \"https://old.example.com/v1\" } }\ndefault_model = \"keyrelay/kimi-k3\"\n",
+        )
+        .unwrap();
+        let after = KimiCodeWriter::with_path(&path, BASE, Some("kimi-k3"), None)
+            .plan(SECRET)
+            .unwrap()
+            .after;
+        assert_eq!(
+            value_from_text(&after, KimiCodeWriter::FIELD_API_KEY).as_deref(),
+            Some(SECRET)
+        );
+        assert_eq!(
+            value_from_text(&after, KimiCodeWriter::FIELD_DEFAULT_MODEL).as_deref(),
+            Some("keyrelay/kimi-k3")
+        );
+    }
+
+    #[test]
+    fn config_path_prefers_kimi_code_and_falls_back_to_legacy() {
+        let dir = tmp();
+        let home = dir.path();
+        assert_eq!(
+            KimiCodeWriter::config_path(home),
+            home.join(".kimi-code").join("config.toml")
+        );
+        std::fs::create_dir_all(home.join(".kimi")).unwrap();
+        assert_eq!(
+            KimiCodeWriter::config_path(home),
+            home.join(".kimi").join("config.toml")
+        );
+        std::fs::create_dir_all(home.join(".kimi-code")).unwrap();
+        assert_eq!(
+            KimiCodeWriter::config_path(home),
+            home.join(".kimi-code").join("config.toml")
         );
     }
 

@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 
 use super::json_text::{read_text_or_empty, JsonStyle};
 use super::{literal_field, masked_field, DeliveryChannel, DeliveryField, DeliveryWriter};
+use super::{SecondaryPatch, SecondaryTarget};
 use crate::error::{Error, Result};
 use crate::inject::Patch;
 use crate::model_meta::ModelMeta;
@@ -150,11 +151,50 @@ impl DeliveryWriter for WorkBuddyWriter {
         )?;
         Ok(Patch::secret_bearing(self.path.clone(), before, after))
     }
+
+    fn secondary_targets(&self) -> Vec<SecondaryTarget> {
+        if self.channel != DeliveryChannel::CodeBuddy {
+            return Vec::new();
+        }
+        vec![SecondaryTarget {
+            path: self.settings_path(),
+            field_names: vec!["model".to_string()],
+            expected_fields: vec!["model".to_string()],
+        }]
+    }
+
+    fn secondary_plans(&self, _api_key: &str) -> Result<Vec<SecondaryPatch>> {
+        if self.channel != DeliveryChannel::CodeBuddy {
+            return Ok(Vec::new());
+        }
+        let Some(model) = self.model.as_deref() else {
+            return Err(Error::inject(
+                &self.path,
+                "CodeBuddy 需要模型名：settings.json 的 model 不能为空",
+            ));
+        };
+        let path = self.settings_path();
+        let before = read_text_or_empty(&path)?;
+        let after = build_settings_after(&before, model, &path)?;
+        Ok(vec![SecondaryPatch {
+            target_path: path.clone(),
+            fields: vec![literal_field("model", model)],
+            patch: Patch::new(path, before, after),
+        }])
+    }
 }
 
 impl WorkBuddyWriter {
     fn chat_url(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+    }
+
+    /// CodeBuddy 的会话首模型，与 models.json 同目录。
+    fn settings_path(&self) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("settings.json")
     }
 }
 
@@ -221,17 +261,38 @@ fn build_after(
         _ => return Err(Error::inject(path, "顶层必须是对象或数组，拒绝改写")),
     };
 
-    let mut entry = models
+    let existing = models
         .iter()
         .find(|entry| entry.get("vendor").and_then(Value::as_str) == Some(WorkBuddyWriter::VENDOR))
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let old_id = existing
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let ours: Vec<String> = models
+        .iter()
+        .filter(|entry| {
+            entry.get("vendor").and_then(Value::as_str) == Some(WorkBuddyWriter::VENDOR)
+        })
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let mut entry = existing;
     models.retain(|entry| {
         entry.get("vendor").and_then(Value::as_str) != Some(WorkBuddyWriter::VENDOR)
     });
+    // 同一个 id 重投时保留用户改过的显示名；换模型时名称必须跟着换，
+    // 否则 picker 会把新模型显示成旧名字。
+    if old_id != model {
+        entry.insert("name".to_string(), Value::String(model.to_string()));
+    } else {
+        entry
+            .entry("name".to_string())
+            .or_insert_with(|| Value::String(model.to_string()));
+    }
     entry.insert("id".to_string(), Value::String(model.to_string()));
-    entry.insert("name".to_string(), Value::String(model.to_string()));
     entry.insert(
         "vendor".to_string(),
         Value::String(WorkBuddyWriter::VENDOR.to_string()),
@@ -248,8 +309,17 @@ fn build_after(
         )),
     );
     entry.insert("supportsToolCall".to_string(), Value::Bool(true));
-    entry.insert("supportsImages".to_string(), Value::Bool(false));
-    entry.insert("supportsReasoning".to_string(), Value::Bool(false));
+    entry
+        .entry("supportsImages".to_string())
+        .or_insert(Value::Bool(false));
+    // 思考能力只有名单明确给出时才改成 true；未知不把用户已有的 true 降级。
+    if meta.is_some_and(|meta| meta.thinking.is_some()) {
+        entry.insert("supportsReasoning".to_string(), Value::Bool(true));
+    } else {
+        entry
+            .entry("supportsReasoning".to_string())
+            .or_insert(Value::Bool(false));
+    }
     if let Some(meta) = meta {
         entry.insert(
             "maxInputTokens".to_string(),
@@ -269,6 +339,40 @@ fn build_after(
         )]));
     }
 
+    // CodeBuddy/WorkBuddy 的对象形态会带一个 availableModels 列表（字符串数组）。
+    // 列表非空时它才是 picker 的实际来源：旧的 keyrelay id 必须删掉，否则
+    // 换模型后 picker 仍会显示/选中旧 id。空列表按既有语义保持不动。
+    if let Value::Object(map) = &mut root {
+        if let Some(Value::Array(available)) = map.get_mut("availableModels") {
+            if !available.is_empty() && available.iter().all(Value::is_string) {
+                available.retain(|item| {
+                    item.as_str()
+                        .is_none_or(|id| !ours.iter().any(|old| old == id))
+                });
+                if !available.iter().any(|item| item.as_str() == Some(model)) {
+                    available.push(Value::String(model.to_string()));
+                }
+            }
+        }
+    }
+
+    serialize_value(&root, &style)
+}
+
+/// CodeBuddy 的 `settings.json`：只改会话首模型 `model`，其余键原样保留。
+fn build_settings_after(before: &str, model: &str, path: &Path) -> Result<String> {
+    let style = JsonStyle::detect(before);
+    let mut root: Value = if before.trim().is_empty() {
+        Value::Object(Map::new())
+    } else {
+        serde_json::from_str(before).map_err(|e| {
+            Error::inject(path, format!("settings.json 不是合法 JSON，拒绝改写: {e}"))
+        })?
+    };
+    let map = root
+        .as_object_mut()
+        .ok_or_else(|| Error::inject(path, "CodeBuddy settings.json 顶层必须是对象，拒绝改写"))?;
+    map.insert("model".to_string(), Value::String(model.to_string()));
     serialize_value(&root, &style)
 }
 
@@ -333,6 +437,87 @@ mod tests {
         assert_eq!(ours["id"], "kimi-k3");
         assert_eq!(ours["apiKey"], SECRET);
         assert_eq!(ours["url"], "http://127.0.0.1:19387/v1/chat/completions");
+    }
+
+    #[test]
+    fn codebuddy_updates_non_empty_available_models_and_settings_model() {
+        let dir = tmp();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            json!({
+                "models": [{"id":"old","vendor":"keyrelay","apiKey":"old","name":"My old"}],
+                "availableModels": ["mine", "old"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            json!({"model":"gpt-5","language":"中文","permissions":{"allow":["Bash(ls)"]}})
+                .to_string(),
+        )
+        .unwrap();
+        let writer = WorkBuddyWriter::with_path(
+            &path,
+            DeliveryChannel::CodeBuddy,
+            BASE,
+            Some("kimi-k3"),
+            None,
+        );
+        let after = writer.plan(SECRET).unwrap().after;
+        let parsed: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(parsed["availableModels"], json!(["mine", "kimi-k3"]));
+        let ours = parsed["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["vendor"] == "keyrelay")
+            .unwrap();
+        assert_eq!(ours["name"], "kimi-k3");
+
+        let secondary = writer.secondary_plans(SECRET).unwrap();
+        assert_eq!(secondary.len(), 1);
+        let settings_after: Value = serde_json::from_str(&secondary[0].patch.after).unwrap();
+        assert_eq!(settings_after["model"], "kimi-k3");
+        assert_eq!(settings_after["language"], "中文");
+        assert_eq!(settings_after["permissions"]["allow"][0], "Bash(ls)");
+    }
+
+    #[test]
+    fn workbuddy_preserves_user_name_flags_and_disabled() {
+        let dir = tmp();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            json!([{
+                "id":"glm-5",
+                "vendor":"keyrelay",
+                "apiKey":"old",
+                "name":"My GLM",
+                "supportsImages":true,
+                "supportsReasoning":true,
+                "disabled":true,
+                "note":"keep"
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let writer = WorkBuddyWriter::with_path(
+            &path,
+            DeliveryChannel::WorkBuddy,
+            BASE,
+            Some("glm-5"),
+            None,
+        );
+        let after = writer.plan(SECRET).unwrap().after;
+        let parsed: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(parsed[0]["name"], "My GLM");
+        assert_eq!(parsed[0]["supportsImages"], true);
+        assert_eq!(parsed[0]["supportsReasoning"], true);
+        assert_eq!(parsed[0]["disabled"], true);
+        assert_eq!(parsed[0]["note"], "keep");
     }
 
     #[test]

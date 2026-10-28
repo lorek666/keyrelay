@@ -9,7 +9,7 @@ use std::fs;
 use std::sync::Arc;
 
 use serde_json::json;
-use tianshu_relay_core::delivery::DeliveryChannel;
+use tianshu_relay_core::delivery::{DeliveryChannel, DeliverySource, GatewayEndpoint};
 use tianshu_relay_core::service::{ServiceConfig, TianshuRelayService};
 use tianshu_relay_core::site::transport::{HttpResponse, MockTransport};
 use tianshu_relay_core::site::{Credentials, KeySpec};
@@ -51,11 +51,15 @@ fn delete_ok() -> HttpResponse {
 }
 
 async fn setup() -> Fixture {
+    setup_with_base(BASE).await
+}
+
+async fn setup_with_base(base_url: &str) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     fs::create_dir_all(&home).unwrap();
     let store = Store::open(&dir.path().join("tianshu-relay.db")).unwrap();
-    let site_id = store.upsert_site("newapi", BASE, "测试站").unwrap();
+    let site_id = store.upsert_site("newapi", base_url, "测试站").unwrap();
     let reference = secret_ref("key", 1, "secret");
     let key_id = store
         .insert_key(site_id, "codex/daily", &reference, Some("1"), None)
@@ -145,6 +149,37 @@ async fn a_broken_target_blocks_the_rotation_before_a_new_key_exists() {
         0,
         "预检失败 ⇒ 站点上**一把新 key 都没有**（这正是 P2-3 的判据）"
     );
+}
+
+#[tokio::test]
+async fn gateway_mode_precheck_uses_the_gateway_endpoint_when_site_base_is_empty() {
+    let f = setup_with_base("").await;
+    f.service
+        .grant_consent(f.key_id, DeliveryChannel::Crush)
+        .unwrap();
+    let endpoint = GatewayEndpoint {
+        base_url: "http://127.0.0.1:19387/v1".to_string(),
+        token: "gateway-test-token".to_string(),
+    };
+    f.service
+        .apply_delivery_in(
+            f.key_id,
+            DeliveryChannel::Crush,
+            Some("gpt-4o"),
+            DeliverySource::Gateway(&endpoint),
+        )
+        .unwrap();
+
+    f.mock.push(create_key_ok());
+    f.mock.push(delete_ok());
+    let run = f
+        .service
+        .rotate_key(f.key_id, KeySpec::named("codex/rotated"))
+        .await
+        .expect("网关模式且站点 base_url 为空时，预检应使用网关端点而不是站点端点");
+
+    assert!(run.completed(), "{:?}", run.stop_reason);
+    assert_eq!(created_on_site(&f), 1, "只建一把");
 }
 
 #[tokio::test]

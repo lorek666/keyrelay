@@ -2720,13 +2720,38 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let writer = self.prepare_delivery(key_id, channel, model, source, variant)?;
         let api_key = self.secret_for_source(key_id, source)?;
         let patch = writer.plan(&api_key)?;
-        let target_path = writer.target_path();
+        let target_path = self.checked_target(channel, &writer.target_path())?;
+        let secondary_targets = writer.secondary_targets();
+        let secondary_plans = writer.secondary_plans(&api_key)?;
+        if secondary_targets.len() != secondary_plans.len() {
+            return Err(Error::Store(format!(
+                "通道 {} 的伴生文件声明与补丁数量不一致：{} vs {}",
+                channel.as_str(),
+                secondary_targets.len(),
+                secondary_plans.len()
+            )));
+        }
         // P0-1：plan 阶段整单校验——字段集与必填表不一致时整单拒绝，
         // 此时一个字节都还没写（`DeliveryPlan` 也不会生成）。
         let field_options = self.delivery_field_options(key_id, model, &source)?;
         let fields = writer.fields(&api_key);
         delivery::validate_plan_fields(channel, &fields, &field_options, &target_path)?;
-        let consent = self.consent_state(channel, &target_path)?;
+        for secondary in &secondary_plans {
+            self.checked_target(channel, &secondary.target_path)?;
+            delivery::validate_secondary_fields(
+                channel,
+                &secondary.fields,
+                &secondary.target_path,
+            )?;
+        }
+        let mut consent = self.consent_state(channel, &target_path)?;
+        for secondary in &secondary_targets {
+            if !consent.is_granted() {
+                break;
+            }
+            let path = self.checked_target(channel, &secondary.path)?;
+            consent = self.consent_state(channel, &path)?;
+        }
         if !preview_only {
             self.log(observability::event_with_payload(
                 Level::Debug,
@@ -2744,6 +2769,18 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let mut secrets: Vec<String> = vec![api_key.to_string()];
         secrets.extend(self.previous_secrets_for_target(&target_path, key_id));
         let secret_refs: Vec<&str> = secrets.iter().map(|s| s.as_str()).collect();
+        let mut preview = delivery::diff_preview(&patch.before, &patch.after, &secret_refs);
+        for secondary in &secondary_plans {
+            let mut sec_secrets: Vec<String> = vec![api_key.to_string()];
+            sec_secrets.extend(self.previous_secrets_for_target(&secondary.target_path, key_id));
+            let sec_refs: Vec<&str> = sec_secrets.iter().map(|s| s.as_str()).collect();
+            preview.push_str(&format!("# {}\n", secondary.target_path.display()));
+            preview.push_str(&delivery::diff_preview(
+                &secondary.patch.before,
+                &secondary.patch.after,
+                &sec_refs,
+            ));
+        }
         // P0-3：DSH 通道的引用校验结果随预览一起展示（已引用 / 未引用及
         // 去向），而不是只在 apply 时才报错。预览本身不因未引用而失败——
         // 硬拒绝在 apply 落盘前（见 `apply_delivery_in`）；非 DSH 通道为 None。
@@ -2776,7 +2813,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             target_exists: target_path.exists(),
             mode,
             fields,
-            preview: delivery::diff_preview(&patch.before, &patch.after, &secret_refs),
+            preview,
             consent,
             target_path,
             dsh_credential_reference,
@@ -2811,13 +2848,20 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         )?;
         let target = self.checked_target(channel, &writer.target_path())?;
         // 记录同意**不需要**读钥匙串：用户此刻同意的是「写哪些键」，不是「密钥是否存在」。
-        let fields = writer.field_names();
-        self.store.grant_consent(
-            channel.agent_id(),
-            channel.as_str(),
-            &target.display().to_string(),
-            &fields,
-        )?;
+        let mut grants: Vec<(std::path::PathBuf, Vec<String>)> =
+            vec![(target.clone(), writer.field_names())];
+        for secondary in writer.secondary_targets() {
+            let path = self.checked_target(channel, &secondary.path)?;
+            grants.push((path, secondary.field_names));
+        }
+        for (path, fields) in &grants {
+            self.store.grant_consent(
+                channel.agent_id(),
+                channel.as_str(),
+                &path.display().to_string(),
+                fields,
+            )?;
+        }
         self.log(observability::event_with_payload(
             Level::Info,
             "delivery",
@@ -2826,6 +2870,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 "agent_id": channel.agent_id(),
                 "channel": channel.as_str(),
                 "target_path": target.display().to_string(),
+                "companion_paths": grants.iter().skip(1)
+                    .map(|(path, _)| path.display().to_string())
+                    .collect::<Vec<_>>(),
             }),
         ));
         Ok(())
@@ -2853,11 +2900,17 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let _ = key_id;
         let (variant_target, _) = delivery::resolve_variant_target(channel, &self.home, variant)?;
         let target = self.checked_target(channel, &variant_target)?;
-        self.store.revoke_consent(
-            channel.agent_id(),
-            channel.as_str(),
-            &target.display().to_string(),
-        )?;
+        let mut targets = vec![target];
+        for path in delivery::secondary_target_paths(channel, &self.home) {
+            targets.push(self.checked_target(channel, &path)?);
+        }
+        for path in &targets {
+            self.store.revoke_consent(
+                channel.agent_id(),
+                channel.as_str(),
+                &path.display().to_string(),
+            )?;
+        }
         self.log(observability::event_with_payload(
             Level::Info,
             "delivery",
@@ -2865,7 +2918,9 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             serde_json::json!({
                 "agent_id": channel.agent_id(),
                 "channel": channel.as_str(),
-                "target_path": target.display().to_string(),
+                "target_paths": targets.iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
             }),
         ));
         Ok(())
@@ -3013,49 +3068,89 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         };
         // ① 同意（未同意时**不读钥匙串、不落盘**）
         let writer = self.prepare_delivery(key_id, channel, model, source, variant)?;
-        let target = self.checked_target(channel, &writer.target_path())?;
-        if !self.consent_state(channel, &target)?.is_granted() {
-            self.log(observability::event_with_payload(
-                Level::Warn,
-                "delivery",
-                "投递被拒绝：缺少用户同意",
-                serde_json::json!({ "channel": channel.as_str() }),
-            ));
-            return Err(Error::ConsentRequired {
-                agent_id: channel.agent_id().to_string(),
-                channel: channel.as_str().to_string(),
-                target_path: target.display().to_string(),
-            });
+        let primary_target = self.checked_target(channel, &writer.target_path())?;
+        let secondary_targets = writer.secondary_targets();
+        let mut targets = vec![primary_target.clone()];
+        for secondary in &secondary_targets {
+            targets.push(self.checked_target(channel, &secondary.path)?);
+        }
+        for target in &targets {
+            if !self.consent_state(channel, target)?.is_granted() {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "delivery",
+                    "投递被拒绝：缺少用户同意",
+                    serde_json::json!({ "channel": channel.as_str() }),
+                ));
+                return Err(Error::ConsentRequired {
+                    agent_id: channel.agent_id().to_string(),
+                    channel: channel.as_str().to_string(),
+                    target_path: target.display().to_string(),
+                });
+            }
         }
 
         // ② 取锁。**必须在确认同意之前**：否则用户可以在我们等锁的时候撤销同意，
-        //    而我们醒来后照写不误（M1-S2 复审 P1-2）。
+        //    而我们醒来后照写不误（M1-S2 复审 P1-2）。顺序固定：主文件 → 伴生文件。
         let lock_dir = inject::default_lock_dir();
-        let guard = inject::lock::FileLock::acquire(&target, &lock_dir)?;
+        let mut guards: Vec<inject::lock::FileLock> = Vec::with_capacity(targets.len());
+        for target in &targets {
+            guards.push(inject::lock::FileLock::acquire(target, &lock_dir)?);
+        }
 
         // ③ 在锁内**重新**确认同意（第一次检查在取锁之前，那一次是为了避免无谓取锁）
-        if !self.consent_state(channel, &target)?.is_granted() {
-            self.log(observability::event_with_payload(
-                Level::Warn,
-                "delivery",
-                "投递被拒绝：取锁期间同意被撤销",
-                serde_json::json!({ "channel": channel.as_str() }),
-            ));
-            return Err(Error::ConsentRequired {
-                agent_id: channel.agent_id().to_string(),
-                channel: channel.as_str().to_string(),
-                target_path: target.display().to_string(),
-            });
+        for target in &targets {
+            if !self.consent_state(channel, target)?.is_granted() {
+                self.log(observability::event_with_payload(
+                    Level::Warn,
+                    "delivery",
+                    "投递被拒绝：取锁期间同意被撤销",
+                    serde_json::json!({ "channel": channel.as_str() }),
+                ));
+                return Err(Error::ConsentRequired {
+                    agent_id: channel.agent_id().to_string(),
+                    channel: channel.as_str().to_string(),
+                    target_path: target.display().to_string(),
+                });
+            }
         }
 
         // ④ 取密钥并生成计划（网关模式取的是本地令牌，见 `secret_for_source`）
         let api_key = self.secret_for_source(key_id, source)?;
-        let patch = writer.plan(&api_key)?;
+        let primary_patch = writer.plan(&api_key)?;
+        let secondary_plans = writer.secondary_plans(&api_key)?;
+        if secondary_targets.len() != secondary_plans.len() {
+            return Err(Error::Store(format!(
+                "通道 {} 的伴生文件声明与补丁数量不一致：{} vs {}",
+                channel.as_str(),
+                secondary_targets.len(),
+                secondary_plans.len()
+            )));
+        }
+        let mut patches = vec![primary_patch];
+        let mut secondary_expected: Vec<(PathBuf, Vec<String>)> = Vec::new();
+        for secondary in &secondary_plans {
+            delivery::validate_secondary_fields(
+                channel,
+                &secondary.fields,
+                &secondary.target_path,
+            )?;
+            secondary_expected.push((
+                secondary.target_path.clone(),
+                delivery::expected_secondary_fields(channel),
+            ));
+            patches.push(secondary.patch.clone());
+        }
 
         // P0-1：plan 阶段整单校验——在落盘之前拒绝，不动磁盘。
         let field_options = self.delivery_field_options(key_id, model, &source)?;
         let expected = delivery::expected_fields(channel, &field_options);
-        delivery::validate_plan_fields(channel, &writer.fields(&api_key), &field_options, &target)?;
+        delivery::validate_plan_fields(
+            channel,
+            &writer.fields(&api_key),
+            &field_options,
+            &primary_target,
+        )?;
 
         // P0-3：DSH 凭据引用校验——与 P0-1 同链路（plan/apply 共用
         // `dsh::check_credential_reference`，只读 profile 文件，绝不改写
@@ -3072,7 +3167,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     "投递被拒绝：DSH 凭据未被任何 profile 引用",
                     serde_json::json!({ "channel": channel.as_str() }),
                 ));
-                return Err(delivery::dsh::unreferenced_error(&check, &target));
+                return Err(delivery::dsh::unreferenced_error(&check, &primary_target));
             }
         }
 
@@ -3091,12 +3186,10 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             )?;
         }
 
-        // ⑤ 写入（加锁已在上面完成；预检 → 备份 → 原子写 → 回读校验 → 失败补偿在 apply 内部）
-        let journal = match inject::apply_holding_lock(
-            &[patch],
-            &self.backup_dir,
-            std::slice::from_ref(&guard),
-        ) {
+        // ⑤ 写入（加锁已在上面完成；预检 → 备份 → 原子写 → 回读校验 → 失败补偿在 apply 内部）。
+        // 主文件与伴生文件一次 `apply_holding_lock`：一个 journal，任一文件预检/写入失败
+        // 都按整单回滚，不留下「主文件新 key、伴生文件旧模型」的半注入。
+        let journal = match inject::apply_holding_lock(&patches, &self.backup_dir, &guards) {
             Ok(journal) => journal,
             Err(err) => {
                 self.log(observability::event_with_payload(
@@ -3109,9 +3202,8 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             }
         };
 
-        // P0-1：apply 后回读比对——落盘文件里的字段集与必填表不一致即视为投递失败，
-        // 走与记账失败相同的补偿路径（回滚已写入的文件），不得报成功。
-        if let Err(err) = delivery::verify_applied_fields(channel, &expected, &target) {
+        // P0-1：apply 后回读比对——主文件与伴生文件分别检查；任一失败都回滚整单。
+        if let Err(err) = delivery::verify_applied_fields(channel, &expected, &primary_target) {
             return match inject::rollback(&journal) {
                 Ok(()) => Err(Error::Store(format!(
                     "投递后回读比对失败，已自动回滚（文件内容未改动）: {err}"
@@ -3120,6 +3212,18 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     "投递后回读比对失败且自动回滚也失败，需要人工处理: {err} / {rollback_err}"
                 ))),
             };
+        }
+        for (target, expected_fields) in &secondary_expected {
+            if let Err(err) = delivery::verify_secondary_fields(channel, expected_fields, target) {
+                return match inject::rollback(&journal) {
+                    Ok(()) => Err(Error::Store(format!(
+                        "伴生文件投递后回读比对失败，已自动回滚（文件内容未改动）: {err}"
+                    ))),
+                    Err(rollback_err) => Err(Error::Store(format!(
+                        "伴生文件投递后回读比对失败且自动回滚也失败，需要人工处理: {err} / {rollback_err}"
+                    ))),
+                };
+            }
         }
 
         // ⑥ 记账：变更记录 + 投递绑定。两者都不含密钥。
@@ -3130,7 +3234,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             self.store.record_binding(
                 channel.agent_id(),
                 key_id,
-                &target.display().to_string(),
+                &primary_target.display().to_string(),
                 &journal.id,
                 delivery_mode,
             )
@@ -3171,13 +3275,13 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             format!("投递完成: {}", channel.as_str()),
             serde_json::json!({
                 "journal_id": journal.id,
-                "target_path": target.display().to_string(),
+                "target_path": primary_target.display().to_string(),
             }),
         ));
 
         Ok(DeliveryOutcome {
             channel,
-            target_path: target,
+            target_path: primary_target,
             backup_path: journal.entries.first().and_then(|e| e.backup.clone()),
             journal_id: journal.id,
         })
@@ -4507,11 +4611,28 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 保留应当是轮换这一步的责任，不是 writer 的。读不到文件 / 没有顶层 model
     /// 时返回 `None`（退回旧行为），预检会把真正写不进的情形拦在建新 key 之前。
     fn rotation_codex_model(&self) -> Option<String> {
-        let path = self
-            .home
-            .join(DeliveryChannel::CodexConfig.relative_target());
-        let text = std::fs::read_to_string(path).ok()?;
+        let text = self.read_rotation_target(DeliveryChannel::CodexConfig)?;
         delivery::codex_config::top_model_from_text(&text)
+    }
+
+    /// 读轮换目标文件，但**先拒绝符号链接**。
+    ///
+    /// 轮换模型推导发生在 `rotation_precheck` 的符号链接检查之前；若这里直接
+    /// `read_to_string`，会先跟随链接读到真实文件。读取本身无写副作用，但
+    /// 它会把「目标其实是符号链接」的事实掩盖到后一步，且与 `apply` 的
+    /// fail-closed 口径不一致。统一在这里用 `symlink_metadata` 判定。
+    fn read_rotation_target(&self, channel: DeliveryChannel) -> Option<String> {
+        self.read_rotation_path(&self.home.join(channel.relative_target()))
+    }
+
+    fn read_rotation_path(&self, path: &std::path::Path) -> Option<String> {
+        if std::fs::symlink_metadata(path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        std::fs::read_to_string(path).ok()
     }
 
     /// 轮换时某通道用的模型。模型不是绑定表里的字段，因此从**现盘目标文件**读取：
@@ -4526,22 +4647,25 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     fn rotation_model_for_channel(&self, channel: DeliveryChannel) -> Option<String> {
         // 只读该通道的白名单落点（`home.join(relative_target)`），不读绑定表里的
         // 任意路径：模型推导不该成为「读数据库里一条被篡改路径」的入口。
-        let path = self.home.join(channel.relative_target());
         match channel {
             DeliveryChannel::CodexAuthJson | DeliveryChannel::CodexConfig => {
                 self.rotation_codex_model()
             }
-            DeliveryChannel::Droid => std::fs::read_to_string(path)
-                .ok()
+            DeliveryChannel::Droid => self
+                .read_rotation_target(channel)
                 .and_then(|text| delivery::droid::model_from_text(&text)),
             DeliveryChannel::CodeBuddy
             | DeliveryChannel::WorkBuddy
-            | DeliveryChannel::WorkBuddyAi => std::fs::read_to_string(path)
-                .ok()
+            | DeliveryChannel::WorkBuddyAi => self
+                .read_rotation_target(channel)
                 .and_then(|text| delivery::workbuddy::model_from_text(&text)),
-            DeliveryChannel::Crush => std::fs::read_to_string(path)
-                .ok()
-                .and_then(|text| delivery::crush::model_from_text(&text)),
+            DeliveryChannel::Crush => {
+                let config = self.read_rotation_target(channel);
+                let data =
+                    self.read_rotation_path(&delivery::crush::CrushWriter::data_path(&self.home));
+                config
+                    .and_then(|config| delivery::crush::model_from_texts(&config, data.as_deref()))
+            }
             _ => None,
         }
     }
@@ -4555,18 +4679,20 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 因此「预检」不会产生任何需要回滚的东西。**预检失败不建新 key** 是这条的全部意义。
     fn rotation_precheck(&self, key_id: i64, targets: &[RotationTarget]) -> Vec<BlockedTarget> {
         let mut blocked = Vec::new();
+        // P1：预检必须和实际重注入用**同一来源**。旧实现固定 `DeliverySource::Site`，
+        // 于是网关模式的绑定会用站点 base_url 跑预检：站点 base_url 为空时新适配器
+        // 直接拒绝；站点 base_url 非空时又验不到网关端点。网关端点只需要端口，
+        // token 用占位串（writer 只校验非空，预检不读钥匙串）。
+        let gateway_port = self
+            .settings()
+            .map(|settings| settings.gateway_port)
+            .map_err(|err| crate::redact::scrub(&err.to_string()));
         for target in targets {
             let channel = target.channel;
             let variant = target.variant.as_deref();
             let model = self.rotation_model_for_channel(channel);
-            let writer = match self.prepare_delivery(
-                key_id,
-                channel,
-                model.as_deref(),
-                delivery::DeliverySource::Site,
-                variant,
-            ) {
-                Ok(writer) => writer,
+            let mode = match self.rotation_delivery_mode(key_id, &channel) {
+                Ok(mode) => mode,
                 Err(err) => {
                     blocked.push(BlockedTarget {
                         channel: target.display_name(),
@@ -4576,6 +4702,44 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     continue;
                 }
             };
+            let endpoint = if mode == "gateway" {
+                let port = match &gateway_port {
+                    Ok(port) => *port,
+                    Err(reason) => {
+                        blocked.push(BlockedTarget {
+                            channel: target.display_name(),
+                            target: target.target_path.clone(),
+                            reason: format!("读取网关设置失败，无法预检网关模式: {reason}"),
+                        });
+                        continue;
+                    }
+                };
+                Some(delivery::GatewayEndpoint {
+                    base_url: delivery::gateway_base_url_for(
+                        &channel,
+                        &format!("http://127.0.0.1:{port}"),
+                    ),
+                    token: delivery::PLACEHOLDER_KEY.to_string(),
+                })
+            } else {
+                None
+            };
+            let source = match &endpoint {
+                Some(endpoint) => delivery::DeliverySource::Gateway(endpoint),
+                None => delivery::DeliverySource::Site,
+            };
+            let writer =
+                match self.prepare_delivery(key_id, channel, model.as_deref(), source, variant) {
+                    Ok(writer) => writer,
+                    Err(err) => {
+                        blocked.push(BlockedTarget {
+                            channel: target.display_name(),
+                            target: target.target_path.clone(),
+                            reason: crate::redact::scrub(&err.to_string()),
+                        });
+                        continue;
+                    }
+                };
             let display_name = target.display_name();
             let target = writer.target_path();
             // P2-2 / DEBUG-REPORT-v3 §2-2：`plan()` 只验「文件写得进」，验不出「同意被撤销」
@@ -4617,14 +4781,72 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 });
                 continue;
             }
+            let mut secondary_blocked = false;
+            for secondary in writer.secondary_targets() {
+                let path = match self.checked_target(channel, &secondary.path) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        blocked.push(BlockedTarget {
+                            channel: display_name.clone(),
+                            target: secondary.path.display().to_string(),
+                            reason: crate::redact::scrub(&err.to_string()),
+                        });
+                        secondary_blocked = true;
+                        break;
+                    }
+                };
+                match self.consent_state(channel, &path) {
+                    Ok(state) if state.is_granted() => {}
+                    Ok(state) => {
+                        let label = match state {
+                            crate::delivery::ConsentState::Revoked { .. } => "同意已被撤销",
+                            crate::delivery::ConsentState::Missing => "尚未同意",
+                            crate::delivery::ConsentState::Granted { .. } => unreachable!(),
+                        };
+                        blocked.push(BlockedTarget {
+                            channel: display_name.clone(),
+                            target: path.display().to_string(),
+                            reason: format!(
+                                "伴生文件{label}，轮换会在建新密钥后才停在这里——每重试一次站点多一把"
+                            ),
+                        });
+                        secondary_blocked = true;
+                        break;
+                    }
+                    Err(err) => {
+                        blocked.push(BlockedTarget {
+                            channel: display_name.clone(),
+                            target: path.display().to_string(),
+                            reason: crate::redact::scrub(&err.to_string()),
+                        });
+                        secondary_blocked = true;
+                        break;
+                    }
+                }
+                if path.is_symlink() {
+                    blocked.push(BlockedTarget {
+                        channel: display_name.clone(),
+                        target: path.display().to_string(),
+                        reason: "伴生文件是符号链接，轮换会在建新密钥后才在写入时失败".to_string(),
+                    });
+                    secondary_blocked = true;
+                    break;
+                }
+            }
+            if secondary_blocked {
+                continue;
+            }
             // P0-1：轮换预检同样跑整单校验——writer 回归在建新 key 之前就暴露，
             // 而不是等到重注入那一步才停在半路。
             let precheck = writer.plan(delivery::PLACEHOLDER_KEY).and_then(|_| {
-                let opts = self.delivery_field_options(
-                    key_id,
-                    model.as_deref(),
-                    &delivery::DeliverySource::Site,
-                )?;
+                for secondary in writer.secondary_plans(delivery::PLACEHOLDER_KEY)? {
+                    delivery::validate_secondary_fields(
+                        channel,
+                        &secondary.fields,
+                        &secondary.target_path,
+                    )?;
+                }
+                let opts = self.delivery_field_options(key_id, model.as_deref(), &source)?;
                 delivery::validate_plan_fields(
                     channel,
                     &writer.fields(delivery::PLACEHOLDER_KEY),
@@ -8443,6 +8665,34 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 ),
             });
         }
+        // 词法 `starts_with` 不能拦住父目录符号链接：`~/.codex -> /tmp/evil`
+        // 时目标字符串仍在 home 下，但写盘会跟随链接跑到 home 外。沿最近的
+        // 已存在祖先做 canonicalize，要求它仍在 canonical home 内；目标本身
+        // 的最终 symlink 仍由 `inject::write_atomic` 单独拒绝。
+        let home_canon = std::fs::canonicalize(&self.home).unwrap_or_else(|_| self.home.clone());
+        let mut ancestor = target.parent().unwrap_or(target);
+        while !ancestor.exists() {
+            let Some(parent) = ancestor.parent() else {
+                break;
+            };
+            if parent == ancestor {
+                break;
+            }
+            ancestor = parent;
+        }
+        let ancestor_canon = std::fs::canonicalize(ancestor).map_err(|err| Error::Inject {
+            path: target.display().to_string(),
+            reason: format!("无法解析目标父目录，拒绝写入: {err}"),
+        })?;
+        if !ancestor_canon.starts_with(&home_canon) {
+            return Err(Error::Inject {
+                path: target.display().to_string(),
+                reason: format!(
+                    "投递目标的父目录经符号链接后越出用户目录（解析为 {}），拒绝写入",
+                    ancestor_canon.display()
+                ),
+            });
+        }
         Ok(target.to_path_buf())
     }
 
@@ -8653,6 +8903,21 @@ mod tests {
     /// M2-S2 复审指出：`checked_target` 的拒绝分支在端到端路径上**不可达**
     /// （写入器自己拼的路径永远与白名单一致），因此既有测试对它零覆盖——
     /// 把它改坏也不会有任何测试失败。这里直接调私有方法把三条拒绝路径钉住。
+    #[test]
+    #[cfg(unix)]
+    fn checked_target_rejects_a_parent_symlink_that_escapes_home() {
+        let service = service_with_blocking();
+        let outside = tempfile::tempdir().unwrap();
+        let link = service.home.join(".codex");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let target = link.join("auth.json");
+        let err = service
+            .checked_target(DeliveryChannel::CodexAuthJson, &target)
+            .unwrap_err();
+        assert!(matches!(err, Error::Inject { .. }), "{err:?}");
+        assert!(err.to_string().contains("符号链接"), "{err}");
+    }
+
     #[test]
     fn checked_target_rejects_a_path_outside_the_whitelist() {
         let service = service_with_blocking();

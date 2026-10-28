@@ -471,7 +471,7 @@ fn opencode_qualified_field(provider_id: &str, field: &str) -> String {
 /// - droid：`model` / `apiKey` / `baseUrl` / `sessionModel`（`sessionModel` 是
 ///   `sessionDefaultSettings.model` 的展示别名）。
 /// - codebuddy / workbuddy / workbuddy-ai：`id` / `apiKey` / `url`。
-/// - crush：`api_key` / `base_url`，有模型时另写 `model` / `provider`。
+/// - crush：主文件 `api_key` / `base_url`；伴生 data 文件 `model` / `provider`。
 pub fn expected_fields(channel: DeliveryChannel, opts: &FieldSetOptions<'_>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |key: String| out.push(key);
@@ -732,10 +732,8 @@ pub fn expected_fields(channel: DeliveryChannel, opts: &FieldSetOptions<'_>) -> 
         DeliveryChannel::Crush => {
             push(crush::CrushWriter::FIELD_API_KEY.to_string());
             push(crush::CrushWriter::FIELD_BASE_URL.to_string());
-            if model {
-                push(crush::CrushWriter::FIELD_MODEL.to_string());
-                push(crush::CrushWriter::FIELD_PROVIDER.to_string());
-            }
+            // `models.large` 的 pick 写在 Crush 的 data file，属于伴生文件；
+            // 主文件只写 provider/endpoint/key。
         }
     }
     out
@@ -757,7 +755,35 @@ pub fn validate_plan_fields(
     opts: &FieldSetOptions<'_>,
     target: &Path,
 ) -> Result<()> {
-    let expected = expected_fields(channel, opts);
+    validate_fields_against(
+        channel.as_str(),
+        &expected_fields(channel, opts),
+        fields,
+        target,
+    )
+}
+
+/// 伴生文件的整单校验：字段表由 [`expected_secondary_fields`] 独立给出，
+/// 不复用主文件的 `expected_fields`。
+pub(crate) fn validate_secondary_fields(
+    channel: DeliveryChannel,
+    fields: &[DeliveryField],
+    target: &Path,
+) -> Result<()> {
+    validate_fields_against(
+        channel.as_str(),
+        &expected_secondary_fields(channel),
+        fields,
+        target,
+    )
+}
+
+fn validate_fields_against(
+    channel_name: &str,
+    expected: &[String],
+    fields: &[DeliveryField],
+    target: &Path,
+) -> Result<()> {
     let mut actual: Vec<&str> = fields.iter().map(|f| f.key.as_str()).collect();
     actual.sort_unstable();
     let mut duplicates: Vec<&str> = Vec::new();
@@ -798,7 +824,7 @@ pub fn validate_plan_fields(
         target,
         format!(
             "通道 {} 投递字段整单校验失败：{}；目标 {}；该单已拒绝，未写入任何内容",
-            channel.as_str(),
+            channel_name,
             parts.join("；"),
             target.display()
         ),
@@ -1217,6 +1243,73 @@ pub fn verify_applied_fields(
         target,
         format!(
             "通道 {} 投递后回读比对失败：文件中缺失字段 [{}]；目标 {}；该单视为投递失败",
+            channel.as_str(),
+            missing.join(", "),
+            target.display()
+        ),
+    ))
+}
+
+/// 伴生文件的回读校验。
+///
+/// 主文件表与伴生文件表是两套 schema：Crush 的 data 文件在 `models.large`，
+/// CodeBuddy 的 `settings.json` 在顶层 `model`。不能复用主文件的
+/// `verify_applied_fields`（它按主文件路径找 `models` 数组）。
+pub fn verify_secondary_fields(
+    channel: DeliveryChannel,
+    expected: &[String],
+    target: &Path,
+) -> Result<()> {
+    let text = std::fs::read_to_string(target).map_err(|e| {
+        Error::inject(
+            target,
+            format!(
+                "通道 {} 伴生文件投递后回读失败：{e}；目标 {}；该单视为投递失败",
+                channel.as_str(),
+                target.display()
+            ),
+        )
+    })?;
+    let missing: Vec<&str> = match channel {
+        DeliveryChannel::Crush => expected
+            .iter()
+            .map(|k| k.as_str())
+            .filter(|k| !scoped_verify_present(channel, k, &text).unwrap_or(false))
+            .collect(),
+        DeliveryChannel::CodeBuddy => {
+            let parsed: Value = serde_json::from_str(&text).map_err(|e| {
+                Error::inject(
+                    target,
+                    format!(
+                        "通道 {} settings.json 投递后不是合法 JSON：{e}；该单视为投递失败",
+                        channel.as_str()
+                    ),
+                )
+            })?;
+            let object = parsed.as_object().ok_or_else(|| {
+                Error::inject(
+                    target,
+                    format!(
+                        "通道 {} settings.json 顶层不是对象；该单视为投递失败",
+                        channel.as_str()
+                    ),
+                )
+            })?;
+            expected
+                .iter()
+                .map(|k| k.as_str())
+                .filter(|k| object.get(*k).is_none())
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::inject(
+        target,
+        format!(
+            "通道 {} 伴生文件投递后回读比对失败：文件中缺失字段 [{}]；目标 {}；该单视为投递失败",
             channel.as_str(),
             missing.join(", "),
             target.display()
@@ -2061,7 +2154,45 @@ pub fn allowed_targets(channel: DeliveryChannel, home: &Path) -> Vec<PathBuf> {
                 home.join(cline_variant_relative_target(os, "Cursor")),
             ]
         }
+        DeliveryChannel::Crush => vec![
+            home.join(channel.relative_target()),
+            crush::CrushWriter::data_path(home),
+        ],
+        DeliveryChannel::CodeBuddy => vec![
+            home.join(channel.relative_target()),
+            home.join(".codebuddy").join("settings.json"),
+        ],
+        DeliveryChannel::KimiCode => vec![
+            kimi_code::KimiCodeWriter::config_path(home),
+            home.join(".kimi").join("config.toml"),
+        ],
         _ => vec![home.join(channel.relative_target())],
+    }
+}
+
+/// 同通道必须一起写的伴生文件（与 [`DeliveryWriter::secondary_targets`] 同源）。
+///
+/// 供撤销同意、轮换预检这类**不构造 writer** 的路径列全目标；生产写路径仍以
+/// writer 的 `secondary_targets()` 为准，避免两处路径漂移。
+pub fn secondary_target_paths(channel: DeliveryChannel, home: &Path) -> Vec<PathBuf> {
+    match channel {
+        DeliveryChannel::Crush => vec![crush::CrushWriter::data_path(home)],
+        DeliveryChannel::CodeBuddy => {
+            vec![home.join(".codebuddy").join("settings.json")]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// 伴生文件的必填字段表（与主文件表分开，便于独立测试钉住）。
+pub fn expected_secondary_fields(channel: DeliveryChannel) -> Vec<String> {
+    match channel {
+        DeliveryChannel::Crush => vec![
+            crush::CrushWriter::FIELD_MODEL.to_string(),
+            crush::CrushWriter::FIELD_PROVIDER.to_string(),
+        ],
+        DeliveryChannel::CodeBuddy => vec!["model".to_string()],
+        _ => Vec::new(),
     }
 }
 
@@ -2085,6 +2216,9 @@ pub fn resolve_variant_target(
     match (channel, variant) {
         (_, None) | (_, Some("default")) => match channel {
             DeliveryChannel::Cline => Ok((home.join(channel.relative_target()), "code")),
+            DeliveryChannel::KimiCode => {
+                Ok((kimi_code::KimiCodeWriter::config_path(home), "default"))
+            }
             _ => Ok((home.join(channel.relative_target()), "default")),
         },
         (DeliveryChannel::Cline, Some("code")) => {
@@ -2329,6 +2463,33 @@ pub struct CodexDeliveryOutcome {
     pub config: DeliveryOutcome,
 }
 
+/// 一个通道的**伴生文件**（同一通道必须一起写的第二个落点）。
+///
+/// 目前只有两类：
+/// - Crush：provider 在 `~/.config/crush/crush.json`，模型 pick 在 Crush 的
+///   data file（`~/.local/share/crush/crush.json`），后者优先；
+/// - CodeBuddy：模型清单在 `~/.codebuddy/models.json`，会话首模型在
+///   `~/.codebuddy/settings.json` 的 `model`。
+///
+/// 伴生文件与主文件必须**同一 journal 原子写**，否则半注入会让 agent 读到
+/// 新 key + 旧模型（或旧 key + 新模型）。同意也按各自目标路径记录。
+#[derive(Clone, Debug)]
+pub struct SecondaryTarget {
+    pub path: PathBuf,
+    /// 记录同意用的字段名（不需要密钥）。
+    pub field_names: Vec<String>,
+    /// 写盘前整单校验的字段表。由写入器提供，但测试会独立钉住。
+    pub expected_fields: Vec<String>,
+}
+
+/// 伴生文件的补丁与预览字段。
+#[derive(Clone, Debug)]
+pub struct SecondaryPatch {
+    pub target_path: PathBuf,
+    pub fields: Vec<DeliveryField>,
+    pub patch: Patch,
+}
+
 /// 通道实现。
 pub trait DeliveryWriter: Send + Sync {
     fn channel(&self) -> DeliveryChannel;
@@ -2345,6 +2506,17 @@ pub trait DeliveryWriter: Send + Sync {
 
     /// 生成补丁。返回的 `Patch.after` **含密钥明文**，调用方不得打印它。
     fn plan(&self, api_key: &str) -> Result<Patch>;
+
+    /// 同一通道必须一起写的伴生文件。默认没有。
+    fn secondary_targets(&self) -> Vec<SecondaryTarget> {
+        Vec::new()
+    }
+
+    /// 伴生文件的补丁。调用方只在 `secondary_targets()` 非空时调用；
+    /// 默认实现返回空，保持所有既有写入器零改动。
+    fn secondary_plans(&self, _api_key: &str) -> Result<Vec<SecondaryPatch>> {
+        Ok(Vec::new())
+    }
 }
 
 /// 按通道解析出写入器。`home` 显式传入以便测试重定向（不读环境变量）。
@@ -3709,6 +3881,42 @@ mod tests {
     }
 
     // ==================================================== P0-1：必填表测试
+
+    #[test]
+    fn companion_targets_match_the_declared_field_tables() {
+        let home = tempfile::tempdir().expect("临时 home");
+        for channel in [DeliveryChannel::Crush, DeliveryChannel::CodeBuddy] {
+            let writer = resolve_for_binding_with_meta(
+                channel,
+                home.path(),
+                "https://relay.example.com",
+                "keyrelay",
+                Some("gpt-4o"),
+                None,
+            )
+            .expect("resolve");
+            let secondary = writer.secondary_targets();
+            assert_eq!(secondary.len(), 1, "{}", channel.as_str());
+            assert!(
+                secondary[0].path.starts_with(home.path()),
+                "{} 的伴生文件越出 home",
+                channel.as_str()
+            );
+            assert_eq!(
+                secondary[0].expected_fields,
+                expected_secondary_fields(channel),
+                "{} 的伴生字段表漂移",
+                channel.as_str()
+            );
+            assert_eq!(
+                secondary[0].field_names,
+                expected_secondary_fields(channel),
+                "{} 的伴生同意字段漂移",
+                channel.as_str()
+            );
+        }
+        assert!(expected_secondary_fields(DeliveryChannel::OpenCode).is_empty());
+    }
 
     #[test]
     fn required_field_table_matches_writer_fields() {

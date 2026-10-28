@@ -482,6 +482,95 @@ fn empty_base_url_writes_only_the_key_end_to_end() {
     );
 }
 
+/// 同一通道的两个落点必须一起写、一起回滚：Crush 的 provider 在 config、
+/// pick 在 data file；CodeBuddy 的清单在 models.json、会话模型在 settings.json。
+#[test]
+fn companion_files_are_written_and_rolled_back_together() {
+    let f = setup();
+    for channel in [DeliveryChannel::Crush, DeliveryChannel::CodeBuddy] {
+        let primary = target_of(&f, channel);
+        fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        let companion = match channel {
+            DeliveryChannel::Crush => {
+                tianshu_relay_core::delivery::crush::CrushWriter::data_path(&f.home)
+            }
+            DeliveryChannel::CodeBuddy => primary.parent().unwrap().join("settings.json"),
+            _ => unreachable!(),
+        };
+        fs::create_dir_all(companion.parent().unwrap()).unwrap();
+        let primary_before = if channel == DeliveryChannel::CodeBuddy {
+            "{\n  \"models\": [],\n  \"availableModels\": [\"mine\"]\n}\n".to_string()
+        } else {
+            "{}\n".to_string()
+        };
+        let companion_before = if channel == DeliveryChannel::Crush {
+            "{\n  \"recent_models\": {\"large\": [{\"model\": \"mine\"}]}\n}\n"
+        } else {
+            "{\n  \"language\": \"中文\"\n}\n"
+        };
+        fs::write(&primary, &primary_before).unwrap();
+        fs::write(&companion, companion_before).unwrap();
+
+        f.service.grant_consent(f.key_id, channel).unwrap();
+        let outcome = f
+            .service
+            .apply_delivery_with_model(f.key_id, channel, Some("gpt-4o"))
+            .unwrap();
+
+        let primary_after = fs::read_to_string(&primary).unwrap();
+        let companion_after = fs::read_to_string(&companion).unwrap();
+        match channel {
+            DeliveryChannel::Crush => {
+                assert!(primary_after.contains(SECRET), "{primary_after}");
+                let parsed: serde_json::Value = serde_json::from_str(&companion_after).unwrap();
+                assert_eq!(parsed["models"]["large"]["provider"], "keyrelay");
+                assert_eq!(parsed["models"]["large"]["model"], "gpt-4o");
+                assert_eq!(parsed["recent_models"]["large"][0]["model"], "mine");
+            }
+            DeliveryChannel::CodeBuddy => {
+                let primary_json: serde_json::Value = serde_json::from_str(&primary_after).unwrap();
+                assert_eq!(
+                    primary_json["availableModels"],
+                    serde_json::json!(["mine", "gpt-4o"])
+                );
+                let companion_json: serde_json::Value =
+                    serde_json::from_str(&companion_after).unwrap();
+                assert_eq!(companion_json["model"], "gpt-4o");
+                assert_eq!(companion_json["language"], "中文");
+            }
+            _ => unreachable!(),
+        }
+
+        f.service.rollback_delivery(&outcome.journal_id).unwrap();
+        assert_eq!(fs::read_to_string(&primary).unwrap(), primary_before);
+        assert_eq!(fs::read_to_string(&companion).unwrap(), companion_before);
+    }
+}
+
+#[test]
+fn kimi_legacy_directory_is_delivered_without_creating_kimi_code() {
+    let f = setup();
+    fs::create_dir_all(f.home.join(".kimi")).unwrap();
+    f.service
+        .grant_consent(f.key_id, DeliveryChannel::KimiCode)
+        .unwrap();
+    let outcome = f
+        .service
+        .apply_delivery_with_model(f.key_id, DeliveryChannel::KimiCode, Some("kimi-k3"))
+        .unwrap();
+    assert_eq!(
+        outcome.target_path,
+        f.home.join(".kimi").join("config.toml")
+    );
+    let text = fs::read_to_string(&outcome.target_path).unwrap();
+    assert!(text.contains(SECRET), "{text}");
+    assert!(text.contains("keyrelay/kimi-k3"), "{text}");
+    assert!(
+        !f.home.join(".kimi-code").exists(),
+        "已有 legacy ~/.kimi 时不得另建 ~/.kimi-code"
+    );
+}
+
 // ============================================================ 泄漏
 
 #[test]

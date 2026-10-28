@@ -350,7 +350,13 @@ async fn p1_15_rotation_keeps_models_for_schema_required_channels() {
             "{} 的旧密钥应消失",
             path.display()
         );
-        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let model_path = if channel == DeliveryChannel::Crush {
+            tianshu_relay_core::delivery::crush::CrushWriter::data_path(&f.home)
+        } else {
+            path.clone()
+        };
+        let model_text = fs::read_to_string(&model_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&model_text).unwrap();
         let model = match channel {
             DeliveryChannel::Droid => parsed["customModels"]
                 .as_array()
@@ -383,7 +389,7 @@ async fn p1_15_rotation_keeps_models_for_schema_required_channels() {
         assert_eq!(
             model,
             Some(MODEL),
-            "{} 轮换后必须保留模型名: {text}",
+            "{} 轮换后必须保留模型名: {model_text}",
             channel.as_str()
         );
     }

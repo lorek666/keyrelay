@@ -1,9 +1,10 @@
-//! Crush 通道：`~/.config/crush/crush.json`。
+//! Crush 通道：provider 在 `~/.config/crush/crush.json`，模型 pick 在
+//! Crush 的 data file（默认 `~/.local/share/crush/crush.json`）。
 //!
-//! Crush 的 provider 条目（Magpie `agents.go` 的 crush 分支）：
+//! Crush 先读 config、再读 data file，后者优先；所以两边必须同一 journal 一起写。
+//! provider 条目（Magpie `agents.go` 的 crush 分支）：
 //! `providers.<id>` 带 `type` / `name` / `base_url` / `api_key` / `models`，
-//! 当前选中的大模型在 `models.large`（`{provider, model}`）。只合并 keyrelay
-//! 自己的 provider 和 large pick，用户的其他 provider / 设置保持原样。
+//! 当前选中的大模型在 data file 的 `models.large`（`{provider, model}`）。
 
 use std::path::{Path, PathBuf};
 
@@ -12,12 +13,14 @@ use serde_json::{Map, Value};
 
 use super::json_text::{object_entry, parse_object, read_text_or_empty, JsonStyle};
 use super::{literal_field, masked_field, DeliveryChannel, DeliveryField, DeliveryWriter};
+use super::{SecondaryPatch, SecondaryTarget};
 use crate::error::{Error, Result};
 use crate::inject::Patch;
 use crate::model_meta::ModelMeta;
 
 pub struct CrushWriter {
     path: PathBuf,
+    data_path: PathBuf,
     base_url: String,
     model: Option<String>,
     meta: Option<ModelMeta>,
@@ -31,8 +34,9 @@ impl CrushWriter {
     pub const FIELD_PROVIDER: &'static str = "provider";
 
     pub fn new(home: &Path, base_url: &str) -> Self {
-        Self::with_path(
+        Self::with_paths(
             home.join(".config").join("crush").join("crush.json"),
+            Self::data_path(home),
             base_url,
             None,
             None,
@@ -45,8 +49,9 @@ impl CrushWriter {
         model: Option<&str>,
         meta: Option<ModelMeta>,
     ) -> Self {
-        Self::with_path(
+        Self::with_paths(
             home.join(".config").join("crush").join("crush.json"),
+            Self::data_path(home),
             base_url,
             model,
             meta,
@@ -59,8 +64,25 @@ impl CrushWriter {
         model: Option<&str>,
         meta: Option<ModelMeta>,
     ) -> Self {
+        let path = path.into();
+        // 单元测试用的自定义落点：伴生 data 文件放同目录，避免写到真实 home。
+        let data_path = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("crush-data.json");
+        Self::with_paths(path, data_path, base_url, model, meta)
+    }
+
+    pub fn with_paths(
+        path: impl Into<PathBuf>,
+        data_path: impl Into<PathBuf>,
+        base_url: &str,
+        model: Option<&str>,
+        meta: Option<ModelMeta>,
+    ) -> Self {
         Self {
             path: path.into(),
+            data_path: data_path.into(),
             base_url: base_url.to_string(),
             model: model
                 .map(str::trim)
@@ -72,6 +94,25 @@ impl CrushWriter {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Crush 的 data file。默认 `~/.local/share/crush/crush.json`；
+    /// 只接受落在 `home` 内的 `XDG_DATA_HOME`（白名单校验会再兜底）。
+    pub fn data_path(home: &Path) -> PathBuf {
+        if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+            let dir = PathBuf::from(dir);
+            if dir.is_absolute() && dir.starts_with(home) {
+                return dir.join("crush").join("crush.json");
+            }
+        }
+        home.join(".local")
+            .join("share")
+            .join("crush")
+            .join("crush.json")
+    }
+
+    fn data_path_for_self(&self) -> PathBuf {
+        self.data_path.clone()
     }
 }
 
@@ -85,27 +126,17 @@ impl DeliveryWriter for CrushWriter {
     }
 
     fn field_names(&self) -> Vec<String> {
-        let mut names = vec![
+        vec![
             Self::FIELD_API_KEY.to_string(),
             Self::FIELD_BASE_URL.to_string(),
-        ];
-        if self.model.is_some() {
-            names.push(Self::FIELD_MODEL.to_string());
-            names.push(Self::FIELD_PROVIDER.to_string());
-        }
-        names
+        ]
     }
 
     fn fields(&self, api_key: &str) -> Vec<DeliveryField> {
-        let mut fields = vec![
+        vec![
             masked_field(Self::FIELD_API_KEY, api_key),
             literal_field(Self::FIELD_BASE_URL, &self.base_url),
-        ];
-        if let Some(model) = &self.model {
-            fields.push(literal_field(Self::FIELD_MODEL, model));
-            fields.push(literal_field(Self::FIELD_PROVIDER, Self::PROVIDER_KEY));
-        }
-        fields
+        ]
     }
 
     fn plan(&self, api_key: &str) -> Result<Patch> {
@@ -120,20 +151,71 @@ impl DeliveryWriter for CrushWriter {
         )?;
         Ok(Patch::secret_bearing(self.path.clone(), before, after))
     }
+
+    fn secondary_targets(&self) -> Vec<SecondaryTarget> {
+        vec![SecondaryTarget {
+            path: self.data_path_for_self(),
+            field_names: vec![
+                Self::FIELD_MODEL.to_string(),
+                Self::FIELD_PROVIDER.to_string(),
+            ],
+            expected_fields: vec![
+                Self::FIELD_MODEL.to_string(),
+                Self::FIELD_PROVIDER.to_string(),
+            ],
+        }]
+    }
+
+    fn secondary_plans(&self, _api_key: &str) -> Result<Vec<SecondaryPatch>> {
+        let path = self.data_path_for_self();
+        let Some(model) = self.model.as_deref() else {
+            return Err(Error::inject(
+                &self.path,
+                "Crush 通道需要模型名：models.large 的 pick 必须指明 model",
+            ));
+        };
+        let before = read_text_or_empty(&path)?;
+        let after = build_data_after(&before, model, &path)?;
+        Ok(vec![SecondaryPatch {
+            target_path: path.clone(),
+            fields: vec![
+                literal_field(Self::FIELD_MODEL, model),
+                literal_field(Self::FIELD_PROVIDER, Self::PROVIDER_KEY),
+            ],
+            patch: Patch::secret_bearing(path, before, after),
+        }])
+    }
 }
 
 /// 从现有 Crush 配置里取出 keyrelay large pick 的 model，供轮换复用。
+///
+/// 优先看 `models.large`；若用户把 large 切到了别的 provider，则回退到
+/// `providers.keyrelay.models[0].id`——那仍是上次投递的 keyrelay 模型，
+/// 轮换不该因为用户临时切了个 pick 就无模型可用。
 pub fn model_from_text(text: &str) -> Option<String> {
     let parsed: Value = serde_json::from_str(text).ok()?;
-    let large = parsed.get("models")?.get("large")?;
-    (large.get("provider").and_then(Value::as_str) == Some(CrushWriter::PROVIDER_KEY))
-        .then(|| {
-            large
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .flatten()
+    if let Some(large) = parsed.get("models").and_then(|m| m.get("large")) {
+        if large.get("provider").and_then(Value::as_str) == Some(CrushWriter::PROVIDER_KEY) {
+            if let Some(model) = large.get("model").and_then(Value::as_str) {
+                return Some(model.to_string());
+            }
+        }
+    }
+    parsed
+        .get("providers")
+        .and_then(|p| p.get(CrushWriter::PROVIDER_KEY))
+        .and_then(|p| p.get("models"))
+        .and_then(Value::as_array)
+        .and_then(|models| models.first())
+        .and_then(|entry| entry.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Crush data file 的 pick 优先于 config；两个文件都读，按 Crush 的合并顺序取值。
+pub fn model_from_texts(config: &str, data: Option<&str>) -> Option<String> {
+    data.and_then(model_from_text)
+        .or_else(|| model_from_text(config))
 }
 
 fn build_after(
@@ -206,8 +288,28 @@ fn build_after(
         array.push(Value::Object(item));
     }
 
+    // `models.large` 不再写进 config：Crush 的 data file 优先，写在这里会被它覆盖。
+    // 已有 config 里的旧 pick 保持原样（作为 data file 不存在时的回退）。
+    serialize_object(&root, &style)
+}
+
+/// 写 Crush 的 data file：整对象替换 `models.large`，只保留 keyrelay 自己写入的
+/// `reasoning_effort`。Crush picker 会把 max_tokens / think / temperature 等
+/// 模型专属设置一起存在这个对象里；换了模型后这些设置不能跟着新模型走。
+fn build_data_after(before: &str, model: &str, path: &Path) -> Result<String> {
+    let style = JsonStyle::detect(before);
+    let mut root = parse_object(before, path)?;
     let models = object_entry(&mut root, "models", path)?;
-    let large = object_entry(models, "large", path)?;
+    let keep_effort = models
+        .get("large")
+        .and_then(Value::as_object)
+        .filter(|large| {
+            large.get("provider").and_then(Value::as_str) == Some(CrushWriter::PROVIDER_KEY)
+        })
+        .and_then(|large| large.get("reasoning_effort"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut large = Map::new();
     large.insert(
         CrushWriter::FIELD_PROVIDER.to_string(),
         Value::String(CrushWriter::PROVIDER_KEY.to_string()),
@@ -216,7 +318,10 @@ fn build_after(
         CrushWriter::FIELD_MODEL.to_string(),
         Value::String(model.to_string()),
     );
-
+    if let Some(effort) = keep_effort {
+        large.insert("reasoning_effort".to_string(), Value::String(effort));
+    }
+    models.insert("large".to_string(), Value::Object(large));
     serialize_object(&root, &style)
 }
 
@@ -253,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_provider_and_large_pick() {
+    fn writes_provider_to_config_and_pick_to_data_file() {
         let dir = tmp();
         let writer = CrushWriter::with_path(
             dir.path().join("crush.json"),
@@ -265,8 +370,14 @@ mod tests {
         let parsed: Value = serde_json::from_str(&patch.after).unwrap();
         assert_eq!(parsed["providers"]["keyrelay"]["api_key"], SECRET);
         assert_eq!(parsed["providers"]["keyrelay"]["base_url"], BASE);
-        assert_eq!(parsed["models"]["large"]["provider"], "keyrelay");
-        assert_eq!(parsed["models"]["large"]["model"], "glm-5");
+        assert!(parsed.get("models").and_then(|m| m.get("large")).is_none());
+
+        let data = writer.secondary_plans(SECRET).unwrap();
+        assert_eq!(data.len(), 1);
+        let pick: Value = serde_json::from_str(&data[0].patch.after).unwrap();
+        assert_eq!(pick["models"]["large"]["provider"], "keyrelay");
+        assert_eq!(pick["models"]["large"]["model"], "glm-5");
+        assert_eq!(data[0].target_path, dir.path().join("crush-data.json"));
     }
 
     #[test]
@@ -316,7 +427,7 @@ mod tests {
         assert_eq!(entry["context_window"], 999_000);
         assert_eq!(entry["can_reason"], true);
         assert_eq!(entry["customFlag"], "keep");
-        assert_eq!(parsed["models"]["large"]["model"], "glm-5");
+        assert!(parsed.get("models").and_then(|m| m.get("large")).is_none());
     }
 
     #[test]
