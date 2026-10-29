@@ -3182,6 +3182,12 @@ export interface UpdateInfo {
   body?: string;
 }
 
+/** 下载进度。`total` 为 null 时上游没给 Content-Length，只能显示不确定态。 */
+export interface UpdateDownloadProgress {
+  downloaded: number;
+  total: number | null;
+}
+
 /**
  * 检查更新。返回 `null` = 当前已是最新版本。
  *
@@ -3212,8 +3218,12 @@ export async function checkForUpdates(): Promise<UpdateInfo | null> {
  * 必须先调用 `checkForUpdates()` 并拿到非 null 的结果——但本函数不持有那个
  * 对象（JS 侧 `Update` 对象不可序列化），所以在 Tauri 环境下重新检查一次再下载。
  * 两次检查之间的时间窗口很小（用户刚点了按钮），版本不会变。
+ *
+ * `onProgress` 只接收字节数，不包含 URL、路径等内部信息。
  */
-export async function downloadAndInstallUpdate(): Promise<void> {
+export async function downloadAndInstallUpdate(
+  onProgress?: (progress: UpdateDownloadProgress) => void,
+): Promise<void> {
   if (!hasTauri) {
     await mock(undefined);
     return;
@@ -3223,7 +3233,16 @@ export async function downloadAndInstallUpdate(): Promise<void> {
   if (!result) {
     throw new Error(translate(getCurrentDict(), "common.noUpdate"));
   }
-  await result.downloadAndInstall();
+  let downloaded = 0;
+  let total: number | null = null;
+  await result.downloadAndInstall((event) => {
+    if (event.event === "Started") {
+      total = event.data.contentLength ?? null;
+    } else if (event.event === "Progress") {
+      downloaded += event.data.chunkLength;
+    }
+    onProgress?.({ downloaded, total });
+  });
 }
 
 /**

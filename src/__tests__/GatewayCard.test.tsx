@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
 import GatewayCard from "../components/GatewayCard";
@@ -23,6 +23,7 @@ vi.mock("../lib/api", async (importOriginal) => {
     listStoredKeys: vi.fn(),
     listChannelBindings: vi.fn(),
     gatewayTokenList: vi.fn(),
+    gatewayRotateToken: vi.fn(),
     deliveryPlan: vi.fn(),
     applyDelivery: vi.fn(),
   };
@@ -33,6 +34,7 @@ import {
   deliveryPlan,
   type DeliveryPlan,
   gatewayRouteTraces,
+  gatewayRotateToken,
   gatewayStatus,
   gatewayTokenList,
   listChannelBindings,
@@ -132,6 +134,7 @@ beforeEach(() => {
   vi.mocked(listStoredKeys).mockResolvedValue([]);
   vi.mocked(listChannelBindings).mockResolvedValue([]);
   vi.mocked(gatewayTokenList).mockResolvedValue([]);
+  vi.mocked(gatewayRotateToken).mockResolvedValue(status());
 });
 
 describe("GatewayCard 高级设置分组", () => {
@@ -891,6 +894,35 @@ describe("网关批量改指与状态真实性", () => {
     await waitFor(() => expect(phaseLine()?.dataset.gatewayPhase).toBe("error"));
     expect(phaseLine()?.textContent).toContain("IPC down");
     expect(phaseLine()?.textContent).not.toBe(zhCN.gateway.phase.stopped);
+  });
+});
+
+describe("网关令牌轮换确认", () => {
+  it("先弹出应用内确认，确认后才调用轮换；不依赖 window.confirm", async () => {
+    vi.mocked(gatewayStatus).mockResolvedValue(
+      status({
+        running: true,
+        phase: "running",
+        url: "http://127.0.0.1:8787",
+        token: "kr-gw-test",
+        site: "示例站",
+        tokenPersistent: true,
+      }),
+    );
+    renderCard();
+    await waitFor(() => expect(phaseLine()?.dataset.gatewayPhase).toBe("running"));
+
+    fireEvent.click(screen.getByRole("button", { name: zhCN.gateway.btn.rotate }));
+    const dialog = screen.getByRole("dialog", {
+      name: zhCN.gateway.rotateConfirmTitle,
+    });
+    expect(vi.mocked(gatewayRotateToken)).not.toHaveBeenCalled();
+    expect(within(dialog).getByText(zhCN.gateway.rotateConfirmBody)).toBeInTheDocument();
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: zhCN.gateway.btn.rotate }),
+    );
+    await waitFor(() => expect(vi.mocked(gatewayRotateToken)).toHaveBeenCalledTimes(1));
   });
 });
 

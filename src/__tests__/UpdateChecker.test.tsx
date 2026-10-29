@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import UpdateChecker from "../components/UpdateChecker";
 import { I18nProvider } from "../i18n";
 import zhCN from "../i18n/zh-CN.json";
@@ -7,12 +7,14 @@ import zhCN from "../i18n/zh-CN.json";
 vi.mock("../lib/api", () => ({
   checkForUpdates: vi.fn(),
   downloadAndInstallUpdate: vi.fn(),
+  relaunchApp: vi.fn(),
 }));
 
-import { checkForUpdates, downloadAndInstallUpdate } from "../lib/api";
+import { checkForUpdates, downloadAndInstallUpdate, relaunchApp } from "../lib/api";
 
 const mockedCheck = vi.mocked(checkForUpdates);
 const mockedInstall = vi.mocked(downloadAndInstallUpdate);
+const mockedRelaunch = vi.mocked(relaunchApp);
 
 // M14-S2：UpdateChecker 现在用 useTranslation，渲染时需包 I18nProvider。
 // 默认 zh-CN + 预加载字典，断言不变（spec §10 复审要点：既有断言仍绿）。
@@ -29,6 +31,7 @@ describe("UpdateChecker", () => {
     vi.clearAllMocks();
     mockedCheck.mockResolvedValue(null);
     mockedInstall.mockResolvedValue(undefined);
+    mockedRelaunch.mockResolvedValue(undefined);
   });
 
   it("idle: 初始渲染显示「检查更新」按钮", () => {
@@ -90,6 +93,91 @@ describe("UpdateChecker", () => {
     fireEvent.click(screen.getByText("下载并安装"));
     await waitFor(() => {
       expect(screen.getByText("下载中…")).toBeInTheDocument();
+    });
+  });
+
+  it("downloading-progress: 有 Content-Length 时显示百分比", async () => {
+    mockedCheck.mockResolvedValue({
+      version: "0.2.3",
+      currentVersion: "0.2.2",
+    });
+    mockedInstall.mockImplementation(async (onProgress) => {
+      onProgress?.({ downloaded: 5, total: 10 });
+      await new Promise(() => {});
+    });
+    renderComponent();
+    fireEvent.click(screen.getByText("检查更新"));
+    await waitFor(() => screen.getByText("下载并安装"));
+    fireEvent.click(screen.getByText("下载并安装"));
+    await waitFor(() => {
+      expect(screen.getByText("下载中 50%")).toBeInTheDocument();
+    });
+  });
+
+  it("installed: 安装完成后显示应用内重启确认，不依赖 window.confirm", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    mockedCheck.mockResolvedValue({
+      version: "0.2.3",
+      currentVersion: "0.2.2",
+    });
+    renderComponent();
+    fireEvent.click(screen.getByText("检查更新"));
+    await waitFor(() => screen.getByText("下载并安装"));
+    fireEvent.click(screen.getByText("下载并安装"));
+
+    const dialog = await screen.findByRole("dialog", { name: zhCN.update.installedTitle });
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(
+      within(dialog).getByText(zhCN.update.installedBody.replace("{version}", "0.2.3")),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: zhCN.update.restartNow }),
+    );
+    await waitFor(() => expect(mockedRelaunch).toHaveBeenCalledTimes(1));
+    confirmSpy.mockRestore();
+  });
+
+  it("installed: 取消重启后保留「重启后生效」提示，并可再次打开确认框", async () => {
+    mockedCheck.mockResolvedValue({
+      version: "0.2.3",
+      currentVersion: "0.2.2",
+    });
+    renderComponent();
+    fireEvent.click(screen.getByText("检查更新"));
+    await waitFor(() => screen.getByText("下载并安装"));
+    fireEvent.click(screen.getByText("下载并安装"));
+
+    const dialog = await screen.findByRole("dialog", { name: zhCN.update.installedTitle });
+    fireEvent.click(within(dialog).getByRole("button", { name: zhCN.confirm.cancel }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(
+      screen.getByText(zhCN.update.installedHint.replace("{version}", "0.2.3")),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: zhCN.update.restartNow }));
+    expect(
+      await screen.findByRole("dialog", { name: zhCN.update.installedTitle }),
+    ).toBeInTheDocument();
+  });
+
+  it("installed: 自动重启失败时显示可操作的错误提示", async () => {
+    mockedCheck.mockResolvedValue({
+      version: "0.2.3",
+      currentVersion: "0.2.2",
+    });
+    mockedRelaunch.mockRejectedValue(new Error("spawn failed"));
+    renderComponent();
+    fireEvent.click(screen.getByText("检查更新"));
+    await waitFor(() => screen.getByText("下载并安装"));
+    fireEvent.click(screen.getByText("下载并安装"));
+
+    const dialog = await screen.findByRole("dialog", { name: zhCN.update.installedTitle });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: zhCN.update.restartNow }),
+    );
+    await waitFor(() => {
+      expect(screen.getByText(zhCN.update.restartFailed)).toBeInTheDocument();
     });
   });
 

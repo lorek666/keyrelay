@@ -556,6 +556,7 @@ export default function GatewayCard({
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [rotated, setRotated] = useState(false);
+  const [rotateConfirmOpen, setRotateConfirmOpen] = useState(false);
   // 采集间隔的**输入框草稿**：允许用户先输 `5` 再输 `50`，失焦时才钳制到 [30, 86400]。
   const [intervalText, setIntervalText] = useState(String(modelsMinIntervalSecs));
   const [clamped, setClamped] = useState(false);
@@ -964,9 +965,9 @@ export default function GatewayCard({
               onClick={() => {
                 // P3-12 / DEBUG-REPORT-v3 §3-12：重新生成令牌是危险操作（旧令牌
                 // 立即失效，指向网关的通道要重投、agent 要重启）——二次确认，避免误点。
-                if (window.confirm(t("gateway.rotateConfirm"))) {
-                  rotate.mutate();
-                }
+                // 用应用内 ConfirmDialog：macOS WKWebView 不实现 window.confirm，
+                // 原生 confirm 会静默返回 false，按钮看起来像坏了。
+                setRotateConfirmOpen(true);
               }}
             >
               <RefreshCw size={14} aria-hidden />{" "}
@@ -1743,6 +1744,20 @@ export default function GatewayCard({
           </div>
         </div>
       ) : null}
+
+      <ConfirmDialog
+        open={rotateConfirmOpen}
+        title={t("gateway.rotateConfirmTitle")}
+        confirmLabel={rotate.isPending ? t("gateway.btn.rotating") : t("gateway.btn.rotate")}
+        confirmDisabled={rotate.isPending}
+        onCancel={() => setRotateConfirmOpen(false)}
+        onConfirm={() => {
+          setRotateConfirmOpen(false);
+          rotate.mutate();
+        }}
+      >
+        <p>{t("gateway.rotateConfirmBody")}</p>
+      </ConfirmDialog>
 
       <ConfirmDialog
         open={revokeTarget !== null}

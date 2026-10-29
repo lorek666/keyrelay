@@ -4863,7 +4863,7 @@ dependencies = [
 
 [[package]]
 name = "tianshu-relay"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -4878,7 +4878,7 @@ dependencies = [
 
 [[package]]
 name = "tianshu-relay-cli"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -4887,7 +4887,7 @@ dependencies = [
 
 [[package]]
 name = "tianshu-relay-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aes-gcm",
  "async-trait",
