@@ -3096,7 +3096,7 @@ async fn proxy_inner(
                 );
             }
         }
-        let url = format!("{}{}{}", state.config.base_url, path, query);
+        let url = upstream_url(&state.config.base_url, &path, &query, translate_proto);
         let headers = upstream_headers(
             &state.config,
             &inbound,
@@ -3580,7 +3580,7 @@ async fn proxy_inner(
                 continue;
             }
         };
-        let url = format!("{}{}{}", upstream.base_url, path, query);
+        let url = upstream_url(&upstream.base_url, &path, &query, translate_proto);
         let headers = upstream_headers(&state.config, &inbound, key, presented_token.as_str());
 
         // M46-S4：预算计数点——本地保护已放行，本次 `send_once` 就是一次真实
@@ -4216,6 +4216,20 @@ fn gemini_model_from_path(path: &str) -> Option<String> {
         .strip_suffix(":streamGenerateContent")
         .or_else(|| rest.strip_suffix(":generateContent"))?;
     (!model.is_empty()).then(|| model.to_string())
+}
+
+/// Translated request bodies are OpenAI Chat, so their upstream endpoint must match.
+/// Protocol-specific query parameters belong to the inbound API and are not forwarded.
+fn upstream_url(
+    base_url: &str,
+    inbound_path: &str,
+    inbound_query: &str,
+    translate_proto: Option<translate::Protocol>,
+) -> String {
+    match translate_proto {
+        Some(_) => format!("{base_url}/v1/chat/completions"),
+        None => format!("{base_url}{inbound_path}{inbound_query}"),
+    }
 }
 
 /// M42-S2a：翻译协议的响应渲染。

@@ -88,6 +88,24 @@ impl FakeUpstream {
         let body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
         serde_json::from_str(body).unwrap_or(Value::Null)
     }
+    /// 上游实际收到的请求行里的 target（路径 + query）。
+    ///
+    /// 翻译后的请求体是 OpenAI Chat，上游端点必须跟着换成 `/v1/chat/completions`；
+    /// 入站协议专属的 query 不得转发。
+    fn last_request_target(&self) -> String {
+        let raw = self
+            .seen
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default();
+        raw.lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("")
+            .to_string()
+    }
 }
 
 fn http_post(url: &str, token: &str, path: &str, body: &str) -> (u16, String) {
@@ -253,6 +271,7 @@ async fn anthropic_e2e_on_the_routed_path() {
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["type"], "message", "{v}");
     assert_eq!(v["content"][0]["text"], "好");
+    assert_eq!(up.last_request_target(), "/v1/chat/completions");
 
     let sent = up.last_body();
     assert_eq!(sent["messages"][0]["role"], "system");
@@ -288,6 +307,7 @@ async fn gemini_e2e_takes_the_model_from_the_path() {
     assert_eq!(status, 200, "{resp}");
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["candidates"][0]["content"]["parts"][0]["text"], "答");
+    assert_eq!(up.last_request_target(), "/v1/chat/completions");
 
     let sent = up.last_body();
     // **model 必须从 path 填进来**（不能是空串）
@@ -408,15 +428,20 @@ async fn chat_body_is_forwarded_byte_for_byte() {
     // 刻意保留空格与数字形态：任何重序列化都会改掉它们
     let body =
         r#"{"model":"gpt-5.6", "messages":[{"role":"user","content":"hi"}], "temperature":0.50}"#;
+    let path = "/v1/chat/completions?trace=pass-through";
 
     let (status, _) = tokio::task::spawn_blocking({
         let (url, token) = (url.clone(), token.clone());
         let body = body.to_string();
-        move || http_post(&url, &token, "/v1/chat/completions", &body)
+        move || http_post(&url, &token, path, &body)
     })
     .await
     .unwrap();
     assert_eq!(status, 200);
+    assert_eq!(
+        up.last_request_target(),
+        "/v1/chat/completions?trace=pass-through"
+    );
 
     let raw = up.seen.lock().unwrap().last().cloned().unwrap_or_default();
     assert!(raw.ends_with(body), "Chat body 必须逐字节直通:\n{raw}");
