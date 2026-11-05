@@ -2,7 +2,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -409,6 +409,98 @@ fn spawn_holding_sse(frame: String) -> SseUpstream {
     }
 }
 
+/// 假上游：把 `frames` 全部发完后**保持连接不关**，直到返回的 `release` 被置位。
+/// 供「收到 `[DONE]` 后下游必须自行收尾、上游连接仍然开着」用例。
+fn spawn_sse_holding_after_frames(
+    frames: Vec<String>,
+) -> (SseUpstream, Arc<(Mutex<bool>, Condvar)>) {
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let rec = Arc::clone(&seen);
+    let signal = Arc::clone(&release);
+    thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            let rec = Arc::clone(&rec);
+            let frames = frames.clone();
+            let signal = Arc::clone(&signal);
+            // 每连接一个线程：占着的连接不能挡住后续连接的 accept。
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match s.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if String::from_utf8_lossy(&buf).contains("\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                rec.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf).to_string());
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                );
+                for frame in &frames {
+                    let body = frame.as_bytes();
+                    let _ = s.write_all(format!("{:x}\r\n", body.len()).as_bytes());
+                    let _ = s.write_all(body);
+                    let _ = s.write_all(b"\r\n");
+                    let _ = s.flush();
+                }
+                // 帧已全部发出（含 [DONE]），但**不关连接**：下游必须自己收尾。
+                let (lock, cvar) = &*signal;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    let (next, timeout) = cvar
+                        .wait_timeout(released, Duration::from_secs(10))
+                        .unwrap();
+                    released = next;
+                    if timeout.timed_out() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (
+        SseUpstream {
+            base_url: format!("http://{addr}"),
+            seen,
+        },
+        release,
+    )
+}
+
+/// 读到真实 EOF 为止，返回 `(原始字节, 是否正常 EOF)`。
+/// 读超时/读错误 ⇒ `false`，用来区分「下游自己收尾」与「下游卡住等上游」。
+fn stream_read_until_eof(addr: &str, token: &str, path: &str, body: &str) -> (String, bool) {
+    let mut s = TcpStream::connect(addr).expect("连接");
+    s.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("设置读超时");
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => return (String::from_utf8_lossy(&out).to_string(), true),
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(_) => return (String::from_utf8_lossy(&out).to_string(), false),
+        }
+    }
+}
+
 /// 只读响应头（流式 body 还没到也不等），返回状态行。
 fn read_status_line(addr: &str, tok: &str, path: &str, body: &str) -> String {
     let mut s = TcpStream::connect(addr).expect("连接");
@@ -433,6 +525,33 @@ fn read_status_line(addr: &str, tok: &str, path: &str, body: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn done_closes_downstream_while_upstream_connection_stays_open() {
+    // 上游把正文、finish_reason、usage 和 [DONE] 全发完，然后**保持连接不关**。
+    // 下游必须在 [DONE] 后自己收尾，而不是一直占着连接和站点并发许可等上游关闭。
+    let (up, release) = spawn_sse_holding_after_frames(vec![chat_sse("完成", true)]);
+    let h = start_gw(&up).await;
+    let addr = h.addr.to_string();
+    let body = json!({"model":"gpt-5.6","input":[],"stream":true}).to_string();
+    let (raw, eof) = tokio::task::spawn_blocking(move || {
+        stream_read_until_eof(&addr, TOKEN, "/v1/responses", &body)
+    })
+    .await
+    .unwrap();
+    let (released, wake) = &*release;
+    *released.lock().unwrap() = true;
+    wake.notify_all();
+
+    let text = body_of(&raw);
+    assert!(
+        text.contains("response.completed"),
+        "应发送正常结束帧: {text}"
+    );
+    assert!(!text.contains("event: error"), "不得额外发送错误: {text}");
+    assert!(eof, "收到 [DONE] 后下游 EOF 不应等待上游关闭: {text}");
+    h.shutdown_and_wait().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
