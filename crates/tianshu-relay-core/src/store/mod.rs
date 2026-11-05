@@ -2648,7 +2648,8 @@ impl Store {
                    ON p.model = u.model
                   AND p.effective_from = (
                         SELECT MAX(q.effective_from) FROM model_prices q
-                         WHERE q.model = u.model AND q.effective_from <= u.at
+                         WHERE q.model = u.model AND q.currency = p.currency
+                           AND q.effective_from <= u.at
                       )
                  WHERE u.at >= ?1 AND (?2 IS NULL OR u.site_id = ?2)
                  GROUP BY d, u.site_id, u.model, u.token_id, u.agent_label, p.currency
@@ -2700,7 +2701,8 @@ impl Store {
                    ON p.model = u.model
                   AND p.effective_from = (
                         SELECT MAX(q.effective_from) FROM model_prices q
-                         WHERE q.model = u.model AND q.effective_from <= u.at
+                         WHERE q.model = u.model AND q.currency = p.currency
+                           AND q.effective_from <= u.at
                       )
                  WHERE u.at >= ?1
                  GROUP BY u.agent_label, p.currency

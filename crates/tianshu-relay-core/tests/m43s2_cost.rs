@@ -31,6 +31,16 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
+fn local_day(days_from_today: i64) -> String {
+    let conn = rusqlite::Connection::open_in_memory().expect("SQLite 日期连接");
+    conn.query_row(
+        "SELECT date('now', 'localtime', ?1)",
+        [format!("{days_from_today:+} days")],
+        |row| row.get(0),
+    )
+    .expect("本地日期")
+}
+
 fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("临时目录");
     let store = Store::open(&dir.path().join("t.db")).expect("建库");
@@ -145,6 +155,47 @@ fn usage_daily_prices_by_effective_time_and_splits_currencies() {
 }
 
 #[test]
+fn cost_aggregates_select_latest_price_per_currency() {
+    let (_dir, store) = store();
+    let usage_at = now() - 60;
+    store
+        .model_price_upsert("gpt-4o", 1.0, 1.0, "USD", usage_at - 200)
+        .expect("USD 旧价格");
+    store
+        .model_price_upsert("gpt-4o", 2.0, 2.0, "CNY", usage_at - 100)
+        .expect("CNY 较晚首个价格");
+    store
+        .insert_gateway_usage(&usage(usage_at, "gpt-4o", 1_000_000, 0, "codex"))
+        .expect("用量");
+
+    let daily = store.usage_daily(90, None).expect("日聚合");
+    assert_eq!(daily.len(), 2, "每个币种各一行：{daily:?}");
+    let usd_daily = daily
+        .iter()
+        .find(|row| row.currency.as_deref() == Some("USD"))
+        .expect("USD 日成本");
+    assert!((usd_daily.estimated_cost.unwrap_or(0.0) - 1.0).abs() < 1e-9);
+    let cny_daily = daily
+        .iter()
+        .find(|row| row.currency.as_deref() == Some("CNY"))
+        .expect("CNY 日成本");
+    assert!((cny_daily.estimated_cost.unwrap_or(0.0) - 2.0).abs() < 1e-9);
+
+    let by_agent = store.usage_by_agent(90).expect("agent 聚合");
+    assert_eq!(by_agent.len(), 2, "每个币种各一行：{by_agent:?}");
+    let usd_agent = by_agent
+        .iter()
+        .find(|row| row.currency.as_deref() == Some("USD"))
+        .expect("USD agent 成本");
+    assert!((usd_agent.estimated_cost.unwrap_or(0.0) - 1.0).abs() < 1e-9);
+    let cny_agent = by_agent
+        .iter()
+        .find(|row| row.currency.as_deref() == Some("CNY"))
+        .expect("CNY agent 成本");
+    assert!((cny_agent.estimated_cost.unwrap_or(0.0) - 2.0).abs() < 1e-9);
+}
+
+#[test]
 fn future_price_does_not_price_earlier_usage() {
     let (_dir, store) = store();
     // 价格从**明天**起生效 ⇒ 今天的用量不可定价（不是 0）
@@ -216,10 +267,12 @@ fn usage_by_agent_groups_by_label_and_currency() {
 #[test]
 fn site_bills_overwrite_the_same_day() {
     let (_dir, store) = store();
+    let today = local_day(0);
+    let yesterday = local_day(-1);
     store
         .site_bill_upsert(
             1,
-            "2026-10-01",
+            &today,
             Some(3.5),
             Some("USD"),
             Some(10),
@@ -229,7 +282,7 @@ fn site_bills_overwrite_the_same_day() {
     store
         .site_bill_upsert(
             1,
-            "2026-10-01",
+            &today,
             Some(4.5),
             Some("USD"),
             Some(12),
@@ -242,10 +295,10 @@ fn site_bills_overwrite_the_same_day() {
     assert_eq!(rows[0].requests, Some(12));
     // 站点没给金额 ⇒ NULL（不是 0）
     store
-        .site_bill_upsert(1, "2026-10-02", None, None, None, "newapi-log-self")
+        .site_bill_upsert(1, &yesterday, None, None, None, "newapi-log-self")
         .expect("写空");
     let rows = store.site_bills(30).expect("列");
-    let missing = rows.iter().find(|r| r.day == "2026-10-02").expect("缺失日");
+    let missing = rows.iter().find(|r| r.day == yesterday).expect("缺失日");
     assert_eq!(missing.amount, None);
     assert_eq!(missing.currency, None);
 }
@@ -253,6 +306,8 @@ fn site_bills_overwrite_the_same_day() {
 #[test]
 fn key_usage_totals_distinguishes_unreported_cost() {
     let (_dir, store) = store();
+    let today = local_day(0);
+    let yesterday = local_day(-1);
     let key = store
         .insert_key(1, "key-a", "kr/key/1/secret", None, None)
         .expect("建 key");
@@ -262,7 +317,7 @@ fn key_usage_totals_distinguishes_unreported_cost() {
             key,
             1,
             &tianshu_relay_core::site::KeyDailyUsage {
-                date: "2026-10-01".into(),
+                date: yesterday.clone(),
                 requests: 1,
                 input_tokens: 10,
                 output_tokens: 5,
@@ -281,7 +336,7 @@ fn key_usage_totals_distinguishes_unreported_cost() {
             key,
             1,
             &tianshu_relay_core::site::KeyDailyUsage {
-                date: "2026-10-02".into(),
+                date: today,
                 requests: 1,
                 input_tokens: 1,
                 output_tokens: 1,
