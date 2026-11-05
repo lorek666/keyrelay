@@ -3,6 +3,9 @@
 //! 「钥匙串」在这里用 `MemoryVault` 代替：迁移逻辑只依赖 `Vault` trait，
 //! 不需要真的读写系统钥匙串（真机迁移见 `docs/evidence/` 的手工记录）。
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 use tianshu_relay_core::service::GATEWAY_TOKEN_REF;
 use tianshu_relay_core::store::Store;
 use tianshu_relay_core::vault::migrate::{
@@ -180,6 +183,37 @@ fn the_gateway_token_is_migrated_like_any_other_secret() {
 
 // ============================================================ M38-S2（B-219）状态与上限
 
+/// 一个「首轮部分失败、次轮可恢复」的源：验证显式重试不覆盖目标端新值。
+struct PartialRetrySource {
+    inner: MemoryVault,
+    fail_read_b: AtomicBool,
+    fail_delete_a: AtomicBool,
+}
+
+impl Vault for PartialRetrySource {
+    fn backend_name(&self) -> &'static str {
+        "partial-retry-test"
+    }
+    fn probe(&self) -> tianshu_relay_core::Result<()> {
+        Ok(())
+    }
+    fn put(&self, key: &str, secret: &str) -> tianshu_relay_core::Result<()> {
+        self.inner.put(key, secret)
+    }
+    fn get(&self, key: &str) -> tianshu_relay_core::Result<Option<String>> {
+        if key == "kr/key/2/secret" && self.fail_read_b.load(Ordering::SeqCst) {
+            return Err(Error::Vault("模拟读取失败".into()));
+        }
+        self.inner.get(key)
+    }
+    fn delete(&self, key: &str) -> tianshu_relay_core::Result<()> {
+        if key == "kr/key/1/secret" && self.fail_delete_a.load(Ordering::SeqCst) {
+            return Err(Error::Vault("模拟删除失败".into()));
+        }
+        self.inner.delete(key)
+    }
+}
+
 /// 一个「删除源条目必失败」的源：验证 cleanup_pending 与 failed 的分离。
 struct NoDeleteSource {
     inner: MemoryVault,
@@ -200,6 +234,57 @@ impl Vault for NoDeleteSource {
     }
     fn delete(&self, _key: &str) -> tianshu_relay_core::Result<()> {
         Err(Error::Vault("模拟删除失败".into()))
+    }
+}
+
+/// 一个能在「检查/原子插入」这个竞态窗口上停住的目标后端。
+///
+/// 旧实现是「先 `get` 再 `put`」，屏障正好卡在这两步之间：
+/// 屏障期间并发写入目标新值，旧实现回写时就会把它覆盖掉。
+/// 新实现走 `put_if_absent` 的原子路径，同一屏障下新值必须存活。
+struct RacingTarget {
+    inner: Arc<LocalVault>,
+    check_or_insert_started: mpsc::Sender<()>,
+    allow_check_or_insert: Mutex<mpsc::Receiver<()>>,
+}
+
+impl RacingTarget {
+    fn pause_at_race_window(&self) -> tianshu_relay_core::Result<()> {
+        self.check_or_insert_started
+            .send(())
+            .map_err(|e| Error::Vault(format!("通知目标竞争测试屏障失败: {e}")))?;
+        self.allow_check_or_insert
+            .lock()
+            .map_err(|_| Error::Vault("目标竞争测试屏障锁中毒".into()))?
+            .recv()
+            .map_err(|e| Error::Vault(format!("等待目标竞争测试屏障失败: {e}")))?;
+        Ok(())
+    }
+}
+
+impl Vault for RacingTarget {
+    fn backend_name(&self) -> &'static str {
+        "racing-target-test"
+    }
+    fn probe(&self) -> tianshu_relay_core::Result<()> {
+        Ok(())
+    }
+    fn put(&self, key: &str, secret: &str) -> tianshu_relay_core::Result<()> {
+        self.inner.put(key, secret)
+    }
+    fn put_if_absent(&self, key: &str, secret: &str) -> tianshu_relay_core::Result<bool> {
+        self.pause_at_race_window()?;
+        self.inner.put_if_absent(key, secret)
+    }
+    fn get(&self, key: &str) -> tianshu_relay_core::Result<Option<String>> {
+        let value = self.inner.get(key)?;
+        if value.is_none() {
+            self.pause_at_race_window()?;
+        }
+        Ok(value)
+    }
+    fn delete(&self, key: &str) -> tianshu_relay_core::Result<()> {
+        self.inner.delete(key)
     }
 }
 
@@ -229,6 +314,58 @@ impl Vault for EchoingFailSource {
     fn delete(&self, key: &str) -> tianshu_relay_core::Result<()> {
         self.inner.delete(key)
     }
+}
+
+/// M45-S6：并发写目标新值时，迁移不得覆盖它。
+///
+/// 用 `RacingTarget` 的屏障把迁移卡在「检查目标 / 原子插入」窗口，
+/// 期间从外部写入目标新值，再放行迁移。
+#[test]
+fn concurrent_target_value_is_not_overwritten_during_migration() {
+    let dir = temp_dir();
+    let reference = "kr/key/1/secret";
+    let source = Arc::new(MemoryVault::new());
+    source.put(reference, "sk-old-source-value").unwrap();
+    let inner = Arc::new(LocalVault::open_temp(dir.path()).unwrap());
+    let (race_started_tx, race_started_rx) = mpsc::channel();
+    let (allow_race_tx, allow_race_rx) = mpsc::channel();
+    let target = Arc::new(RacingTarget {
+        inner: Arc::clone(&inner),
+        check_or_insert_started: race_started_tx,
+        allow_check_or_insert: Mutex::new(allow_race_rx),
+    });
+    let migration_source = Arc::clone(&source);
+    let migration_target = Arc::clone(&target);
+    let migration = std::thread::spawn(move || {
+        import_refs(
+            migration_source.as_ref(),
+            migration_target.as_ref(),
+            &[reference.to_string()],
+        )
+    });
+
+    race_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("迁移应进入目标检查或原子插入");
+    inner
+        .put(reference, "sk-new-target-value")
+        .expect("并发写入目标新值");
+    allow_race_tx.send(()).unwrap();
+
+    let report = migration
+        .join()
+        .expect("迁移线程不应 panic")
+        .expect("迁移调用应返回报告");
+    assert_eq!(report.failed.len(), 1, "并发目标写入必须形成冲突");
+    assert_eq!(report.failed[0].0, reference);
+    assert_eq!(
+        inner.get(reference).unwrap().as_deref(),
+        Some("sk-new-target-value")
+    );
+    assert_eq!(
+        source.get(reference).unwrap().as_deref(),
+        Some("sk-old-source-value")
+    );
 }
 
 #[test]
@@ -330,6 +467,47 @@ fn a_cleanup_only_failure_still_sets_the_marker() {
         source.inner.get("kr/key/1/secret").unwrap().as_deref(),
         Some("sk-cleanup-12345678")
     );
+}
+
+/// M45-S6：部分迁移后的显式重试，不得用源端旧凭据覆盖目标端后来更新的新值。
+#[test]
+fn explicit_retry_does_not_overwrite_a_newer_target_value() {
+    let dir = temp_dir();
+    let source = PartialRetrySource {
+        inner: MemoryVault::new(),
+        fail_read_b: AtomicBool::new(true),
+        fail_delete_a: AtomicBool::new(true),
+    };
+    source.put("kr/key/1/secret", "old-source-value").unwrap();
+    source.put("kr/key/2/secret", "other-value").unwrap();
+    let target = LocalVault::open_temp(dir.path()).unwrap();
+    let refs = vec!["kr/key/1/secret".to_string(), "kr/key/2/secret".to_string()];
+
+    let first = migrate_once(&source, &target, refs.clone()).unwrap();
+    assert_eq!(first.report.cleanup_pending.len(), 1);
+    assert_eq!(first.report.failed.len(), 1);
+    assert!(target.meta_get(MIGRATION_MARKER).unwrap().is_none());
+
+    target
+        .put("kr/key/1/secret", "new-target-value")
+        .expect("更新目标");
+    source.fail_read_b.store(false, Ordering::SeqCst);
+    source.fail_delete_a.store(false, Ordering::SeqCst);
+
+    let retry = retry_migration(&source, &target, refs).unwrap();
+    assert_eq!(retry.report.failed.len(), 1, "冲突必须阻止静默完成");
+    assert_eq!(retry.report.failed[0].0, "kr/key/1/secret");
+    assert_eq!(
+        target.get("kr/key/1/secret").unwrap().as_deref(),
+        Some("new-target-value"),
+        "重试不得覆盖目标端新值"
+    );
+    assert_eq!(
+        source.inner.get("kr/key/1/secret").unwrap().as_deref(),
+        Some("old-source-value"),
+        "冲突时必须保留源端旧值"
+    );
+    assert!(target.meta_get(MIGRATION_MARKER).unwrap().is_none());
 }
 
 #[test]
