@@ -153,6 +153,9 @@ fn error_kind(err: &Error) -> &'static str {
     match err {
         Error::FingerprintMismatch(_) => "指纹不匹配",
         Error::AuthFailed(_) => "认证失败",
+        // M45-S5/S8：与「认证失败」分开——用户登出/取消后迟到的旧结果不是站点拒绝，
+        // 不该按失败记账，更不该提示用户重新登录。
+        Error::Cancelled(_) => "操作已取消",
         Error::CaptchaRequired => "需要人机验证",
         Error::SecondFactorRequired { .. } => "需要二次验证",
         Error::RateLimited { .. } => "被限流",
@@ -994,6 +997,10 @@ pub struct TianshuRelayService<T: HttpTransport + Clone + 'static> {
     /// 用户点「立即刷新」三者重叠时，在途峰值会翻倍（实测 8）。用 async-aware 的
     /// `tokio::sync::Mutex` 串行化（不得用 `std::sync::Mutex` 跨 `.await`）。
     refresh_lock: tokio::sync::Mutex<()>,
+    /// 串行化登出与异步续期结果提交，避免旧响应复活已删除的会话。
+    session_write_lock: Mutex<()>,
+    /// 登出/取消验证码后推进；跨 await 的旧登录结果不能提交到新代次。
+    session_generations: Mutex<HashMap<i64, u64>>,
     /// DEBUG-G7 补齐 P2-C9（B-282）：桌面通道“停 → 写盘”与重启的服务层互斥锁。
     ///
     /// 为什么必须在服务层（而不只留命令层 `restart_op`）：轮换直调服务层
@@ -1399,6 +1406,8 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             captcha_phases: Mutex::new(HashMap::new()),
             webview_creds: Mutex::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
+            session_write_lock: Mutex::new(()),
+            session_generations: Mutex::new(HashMap::new()),
             restart_write_op: Arc::new(std::sync::Mutex::new(())),
         };
         // M13-S1：启动时从钥匙串恢复持久化 session，重启免登。best-effort，不阻断启动。
@@ -1472,10 +1481,39 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 幂等：没登录过 / 条目已删 / 站点不存在都返回 `Ok(())`（`vault.delete` 幂等；
     /// `set_site_health` 对不存在的站点报错，这里忽略——退出登录不该因为站点被删而失败）。
     pub fn logout(&self, site_id: i64) -> Result<()> {
+        let _guard = self
+            .session_write_lock
+            .lock()
+            .map_err(|_| Error::Store("会话更新锁已中毒".into()))?;
+        // 先推进代次：此后任何拿着旧代次回来的续期结果都会被拒绝，
+        // 不会把刚清掉的会话和保险库条目写回去。
+        self.advance_session_generation(site_id)?;
         self.sessions.invalidate(site_id);
         self.vault.delete(&self.session_ref(site_id))?;
         let _ = self.store.set_site_health(site_id, "unknown");
         Ok(())
+    }
+
+    fn current_session_generation(&self, site_id: i64) -> Result<u64> {
+        let _write_guard = self
+            .session_write_lock
+            .lock()
+            .map_err(|_| Error::Store("会话更新锁已中毒".into()))?;
+        let mut generations = self
+            .session_generations
+            .lock()
+            .map_err(|_| Error::Store("会话代次锁已中毒".into()))?;
+        Ok(*generations.entry(site_id).or_default())
+    }
+
+    fn advance_session_generation(&self, site_id: i64) -> Result<u64> {
+        let mut generations = self
+            .session_generations
+            .lock()
+            .map_err(|_| Error::Store("会话代次锁已中毒".into()))?;
+        let generation = generations.entry(site_id).or_default();
+        *generation = generation.wrapping_add(1);
+        Ok(*generation)
     }
 
     /// 会话过期信息（B-121）：JWT `exp` ⇒ 精确；无 JWT（旧版 NewAPI 的 cookie-only 会话）⇒ `None`。
@@ -2342,7 +2380,27 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 continue;
             }
             let adapter = self.registry.adapter(kind);
-            match adapter.refresh_session(&site.base_url, &session).await {
+            // 续期请求飞出去之前先记下代次；回来后若代次变了（用户登出过），
+            // 这个迟到的响应必须被丢弃，不能把会话写回缓存和保险库。
+            let generation = self.current_session_generation(site.id)?;
+            let result = adapter.refresh_session(&site.base_url, &session).await;
+            let _guard = self
+                .session_write_lock
+                .lock()
+                .map_err(|_| Error::Store("会话更新锁已中毒".into()))?;
+            let current_generation = self
+                .session_generations
+                .lock()
+                .map_err(|_| Error::Store("会话代次锁已中毒".into()))?
+                .get(&site.id)
+                .copied()
+                .unwrap_or_default();
+            if current_generation != generation
+                || self.sessions.get(site.id).as_ref() != Some(&session)
+            {
+                continue;
+            }
+            match result {
                 Ok(Some(new_session)) => {
                     let stored = new_session.to_stored();
                     let _ = self.store.set_site_health(site.id, HEALTH_OK);
