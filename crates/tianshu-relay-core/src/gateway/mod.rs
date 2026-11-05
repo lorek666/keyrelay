@@ -4533,6 +4533,9 @@ fn streaming_translate_response(
                         {
                             return; // 客户端断开
                         }
+                        if is_done {
+                            return;
+                        }
                     }
                 }
                 Ok(None) => {
