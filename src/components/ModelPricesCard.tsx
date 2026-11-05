@@ -8,6 +8,7 @@ import {
   type ModelPrice,
 } from "../lib/api";
 import { useTranslation } from "../i18n";
+import { localDateInputValue, localDateStartUnixSeconds } from "../lib/localDate";
 
 /**
  * M43-S2：模型单价表（M45-S3 由 Settings 页原样搬出，逻辑零改动）。
@@ -23,7 +24,7 @@ export default function ModelPricesCard() {
   const [input, setInput] = useState("");
   const [output, setOutput] = useState("");
   const [currency, setCurrency] = useState("USD");
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(() => localDateInputValue(new Date()));
   const [error, setError] = useState<string | null>(null);
 
   const upsert = useMutation({
@@ -33,7 +34,7 @@ export default function ModelPricesCard() {
         inputPerMtok: Number(input),
         outputPerMtok: Number(output),
         currency,
-        effectiveFrom: Math.floor(new Date(`${date}T00:00:00`).getTime() / 1000),
+        effectiveFrom: localDateStartUnixSeconds(date),
       }),
     onSuccess: async () => {
       setError(null);
@@ -88,7 +89,7 @@ export default function ModelPricesCard() {
         <button
           type="button"
           className="btn btn-primary"
-          disabled={!model.trim() || !input || !output || upsert.isPending}
+          disabled={!model.trim() || !input || !output || !date || upsert.isPending}
           onClick={() => upsert.mutate()}
         >
           {t("settings.prices.save")}
