@@ -95,12 +95,40 @@ pub fn import_refs(
             Ok(Some(value)) => {
                 // 明文只在栈上活很短一段，用完清零。
                 let value = Zeroizing::new(value);
-                if let Err(err) = target.put(reference, value.as_str()) {
-                    report.failed.push((
-                        reference.clone(),
-                        crate::redact::scrub(&format!("写入失败: {err}")),
-                    ));
-                    continue;
+                // 条件写入：**只在目标没有该引用时**写入。
+                // 用 `put` 会在「部分迁移后重试」时把目标端后来更新的新值覆盖回源端旧值。
+                match target.put_if_absent(reference, value.as_str()) {
+                    Ok(true) => {}
+                    Ok(false) => match target.get(reference) {
+                        // 目标已有相同值 ⇒ 上次已写过，正常继续收尾（删源条目）。
+                        Ok(Some(existing)) if existing == *value => {}
+                        Ok(Some(_)) => {
+                            report
+                                .failed
+                                .push((reference.clone(), "目标已有不同值，拒绝覆盖".into()));
+                            continue;
+                        }
+                        Ok(None) => {
+                            report
+                                .failed
+                                .push((reference.clone(), "目标写入状态发生变化，未迁移".into()));
+                            continue;
+                        }
+                        Err(err) => {
+                            report.failed.push((
+                                reference.clone(),
+                                crate::redact::scrub(&format!("读取目标失败: {err}")),
+                            ));
+                            continue;
+                        }
+                    },
+                    Err(err) => {
+                        report.failed.push((
+                            reference.clone(),
+                            crate::redact::scrub(&format!("条件写入目标失败: {err}")),
+                        ));
+                        continue;
+                    }
                 }
                 match target.get(reference) {
                     Ok(Some(back)) if back == *value => {

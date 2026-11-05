@@ -231,6 +231,28 @@ impl Vault for LocalVault {
         Ok(())
     }
 
+    /// 原子条件写入：靠 SQLite 的 `ON CONFLICT(ref) DO NOTHING` + `execute` 返回的
+    /// 影响行数判定，**不是**先 `get` 再 `put`（那中间有竞态窗口）。
+    fn put_if_absent(&self, key: &str, secret: &str) -> Result<bool> {
+        if !is_valid_secret_ref(key) {
+            return Err(Error::Vault(
+                "密钥引用必须形如 kr/<scope>/<id>/<field>".into(),
+            ));
+        }
+        let sealed = seal::seal(&self.dek, key, secret)?;
+        let now = now_secs();
+        let conn = self.lock()?;
+        let inserted = conn
+            .execute(
+                "INSERT INTO vault_secrets(ref, seal, created_at, updated_at)
+                 VALUES(?1, ?2, ?3, ?3)
+                 ON CONFLICT(ref) DO NOTHING",
+                params![key, sealed, now],
+            )
+            .map_err(|e| Error::Vault(format!("条件写入密文失败: {e}")))?;
+        Ok(inserted == 1)
+    }
+
     fn get(&self, key: &str) -> Result<Option<String>> {
         if !is_valid_secret_ref(key) {
             return Err(Error::Vault(

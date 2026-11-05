@@ -55,6 +55,14 @@ pub trait Vault: Send + Sync {
 
     fn put(&self, key: &str, secret: &str) -> Result<()>;
 
+    /// 原子地仅在引用不存在时写入；返回 `false` 表示引用已存在且未被修改。
+    ///
+    /// 默认失败关闭：后端必须提供真正原子的实现，**不能用 `get` 后 `put` 模拟**
+    /// ——那正是「迁移重试覆盖目标新值」这个缺陷的形态。
+    fn put_if_absent(&self, _key: &str, _secret: &str) -> Result<bool> {
+        Err(Error::Vault("保险库不支持原子条件写入".into()))
+    }
+
     /// 不存在返回 `Ok(None)`（**不是**错误）。
     fn get(&self, key: &str) -> Result<Option<String>>;
 
@@ -121,6 +129,18 @@ impl Vault for MemoryVault {
         Self::check_ref(key)?;
         self.lock()?.insert(key.to_string(), secret.to_string());
         Ok(())
+    }
+
+    fn put_if_absent(&self, key: &str, secret: &str) -> Result<bool> {
+        Self::check_ref(key)?;
+        use std::collections::btree_map::Entry;
+        match self.lock()?.entry(key.to_string()) {
+            Entry::Occupied(_) => Ok(false),
+            Entry::Vacant(entry) => {
+                entry.insert(secret.to_string());
+                Ok(true)
+            }
+        }
     }
 
     fn get(&self, key: &str) -> Result<Option<String>> {
