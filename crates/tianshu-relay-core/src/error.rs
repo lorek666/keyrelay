@@ -24,6 +24,13 @@ pub enum Error {
     #[error("认证失败: {0}")]
     AuthFailed(String),
 
+    /// 用户登出/取消后，较早开始的异步操作返回了迟到结果。
+    ///
+    /// 与 [`Self::AuthFailed`] 分开：这不是站点拒绝了什么，而是**本地已经作废了这次操作**，
+    /// 调用方该做的是丢弃结果、不记账、不改状态，而不是提示用户重新登录。
+    #[error("操作已取消: {0}")]
+    Cancelled(String),
+
     /// 站点要求人机验证，本产品不绕过，需转 WebView 人工完成
     #[error("需要人工完成验证码")]
     CaptchaRequired,
