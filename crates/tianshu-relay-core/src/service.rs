@@ -1001,6 +1001,12 @@ pub struct TianshuRelayService<T: HttpTransport + Clone + 'static> {
     session_write_lock: Mutex<()>,
     /// 登出/取消验证码后推进；跨 await 的旧登录结果不能提交到新代次。
     session_generations: Mutex<HashMap<i64, u64>>,
+    /// 验证码挑战代次：挑战被替换或终结时推进。
+    ///
+    /// 与 `session_generations` 互补：后者管「这次登录还算不算数」，前者管
+    /// 「这个挑战还算不算数」。同一次登出会同时推进两者，所以迟到的 WebView
+    /// 凭据回传、迟到的「我已过完」提交都无法落到下一个挑战上。
+    captcha_challenge_generations: Mutex<HashMap<i64, u64>>,
     /// DEBUG-G7 补齐 P2-C9（B-282）：桌面通道“停 → 写盘”与重启的服务层互斥锁。
     ///
     /// 为什么必须在服务层（而不只留命令层 `restart_op`）：轮换直调服务层
@@ -1408,6 +1414,7 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
             refresh_lock: tokio::sync::Mutex::new(()),
             session_write_lock: Mutex::new(()),
             session_generations: Mutex::new(HashMap::new()),
+            captcha_challenge_generations: Mutex::new(HashMap::new()),
             restart_write_op: Arc::new(std::sync::Mutex::new(())),
         };
         // M13-S1：启动时从钥匙串恢复持久化 session，重启免登。best-effort，不阻断启动。
@@ -1480,15 +1487,25 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     ///
     /// 幂等：没登录过 / 条目已删 / 站点不存在都返回 `Ok(())`（`vault.delete` 幂等；
     /// `set_site_health` 对不存在的站点报错，这里忽略——退出登录不该因为站点被删而失败）。
+    ///
+    /// **登出必须使在途的异步操作失效**：续期、普通登录、WebView 登录、验证码完成
+    /// 都是「起飞 → 回来写状态」的形状，登出只清当前状态是挡不住它们的——它们回来时
+    /// 照样会把刚清掉的会话和保险库条目写回去，把用户刚退出的站点重新变成已登录。
+    /// 所以这里在写锁内推进两套代次，任何拿着旧代次回来的结果都会被 [`Error::Cancelled`] 拒绝。
     pub fn logout(&self, site_id: i64) -> Result<()> {
         let _guard = self
             .session_write_lock
             .lock()
             .map_err(|_| Error::Store("会话更新锁已中毒".into()))?;
-        // 先推进代次：此后任何拿着旧代次回来的续期结果都会被拒绝，
+        // 先推进代次：此后任何拿着旧代次回来的续期/登录结果都会被拒绝，
         // 不会把刚清掉的会话和保险库条目写回去。
         self.advance_session_generation(site_id)?;
+        self.advance_captcha_challenge_generation(site_id)?;
         self.sessions.invalidate(site_id);
+        // 相位与 B 路凭据槽同生命周期：登出后没有「等待人工验证」这回事，
+        // 半截凭据也不能留给下一次登录复用。
+        self.set_captcha_phase(site_id, CaptchaPhase::Idle);
+        self.clear_webview_creds(site_id);
         self.vault.delete(&self.session_ref(site_id))?;
         let _ = self.store.set_site_health(site_id, "unknown");
         Ok(())
@@ -1514,6 +1531,82 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         let generation = generations.entry(site_id).or_default();
         *generation = generation.wrapping_add(1);
         Ok(*generation)
+    }
+
+    fn advance_captcha_challenge_generation(&self, site_id: i64) -> Result<u64> {
+        let mut generations = self
+            .captcha_challenge_generations
+            .lock()
+            .map_err(|_| Error::Store("验证码挑战代次锁已中毒".into()))?;
+        let generation = generations.entry(site_id).or_default();
+        *generation = generation.wrapping_add(1);
+        Ok(*generation)
+    }
+
+    /// 验证码窗口启动/完成操作的原子代次快照：会话代次 + 当前验证码挑战代次。
+    ///
+    /// 窗口层在 `captcha_begin` 时取一次，之后每个异步回调（导航回传、自动完成、
+    /// 关窗取消）都带着这份快照回来校验——任一变化即说明「这个窗口已经不是当前的了」。
+    /// 两个代次必须在**同一把写锁内**一起读，否则会出现「读会话代次时是新的、
+    /// 读挑战代次时已被下一次操作换掉」的拼接快照。
+    pub fn captcha_operation_generations(&self, site_id: i64) -> Result<(u64, u64)> {
+        let _write_guard = self
+            .session_write_lock
+            .lock()
+            .map_err(|_| Error::Store("会话更新锁已中毒".into()))?;
+        let session_generation = self
+            .session_generations
+            .lock()
+            .map_err(|_| Error::Store("会话代次锁已中毒".into()))?
+            .get(&site_id)
+            .copied()
+            .unwrap_or_default();
+        let captcha_generation = self
+            .captcha_challenge_generations
+            .lock()
+            .map_err(|_| Error::Store("验证码挑战代次锁已中毒".into()))?
+            .get(&site_id)
+            .copied()
+            .unwrap_or_default();
+        Ok((session_generation, captcha_generation))
+    }
+
+    /// 只在两套代次都仍是调用方拿到的那一份时才执行 `operation`。
+    ///
+    /// 写锁把「校验代次」与「写状态」合成一个原子段——否则校验通过之后、写之前
+    /// 仍可能被登出插进来，等于没校验。迟到的旧代次统一报 [`Error::Cancelled`]
+    /// （不是失败：用户没做错什么，只是这个结果已经过期了）。
+    fn with_current_captcha_generations<R>(
+        &self,
+        site_id: i64,
+        expected_session: u64,
+        expected_captcha: u64,
+        operation: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        let _write_guard = self
+            .session_write_lock
+            .lock()
+            .map_err(|_| Error::Store("会话更新锁已中毒".into()))?;
+        let current_session = self
+            .session_generations
+            .lock()
+            .map_err(|_| Error::Store("会话代次锁已中毒".into()))?
+            .get(&site_id)
+            .copied()
+            .unwrap_or_default();
+        let current_captcha = self
+            .captcha_challenge_generations
+            .lock()
+            .map_err(|_| Error::Store("验证码挑战代次锁已中毒".into()))?
+            .get(&site_id)
+            .copied()
+            .unwrap_or_default();
+        if current_session != expected_session || current_captcha != expected_captcha {
+            return Err(Error::Cancelled(
+                "登录或验证码挑战已被后续操作替换".to_string(),
+            ));
+        }
+        operation()
     }
 
     /// 会话过期信息（B-121）：JWT `exp` ⇒ 精确；无 JWT（旧版 NewAPI 的 cookie-only 会话）⇒ `None`。
@@ -2012,6 +2105,10 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 调用方拿到的是 `Err`、本地却已经「登录上了」，且 `sites.health` 会永远停在
     /// `needs_login`——那条「请重新登录」的提示再也消不掉。
     pub async fn login(&self, site_id: i64, cred: Credentials) -> Result<()> {
+        // 登录同样是「起飞 → 回来写状态」：请求在飞的那几百毫秒里用户可能已经登出。
+        // 代次在请求发出**之前**取，回来后三处会动状态的地方各自校验一次。
+        let (session_generation, captcha_generation) =
+            self.captcha_operation_generations(site_id)?;
         let site = self.site(site_id)?;
         let kind = self.kind_of(&site)?;
         // `custom-openai-compatible` 没有登录流程（只填 base_url 就能用），
@@ -2046,16 +2143,35 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                     site_id,
                     url: captcha::captcha_page_url(&site.base_url)?,
                 };
-                let next = captcha::step(
-                    self.captcha_phase(site_id),
-                    CaptchaEvent::LoginRejected { challenge },
-                );
-                self.set_captcha_phase(site_id, next);
+                self.with_current_captcha_generations(
+                    site_id,
+                    session_generation,
+                    captcha_generation,
+                    || {
+                        // 新挑战 ⇒ 旧挑战作废：推进挑战代次，之前那个窗口的
+                        // 凭据回传 / 「我已过完」都不能落到这个新挑战上。
+                        self.advance_captcha_challenge_generation(site_id)?;
+                        let next = captcha::step(
+                            self.captcha_phase(site_id),
+                            CaptchaEvent::LoginRejected { challenge },
+                        );
+                        self.set_captcha_phase(site_id, next);
+                        Ok(())
+                    },
+                )?;
                 // 错误类型**不变**（S2 §9）：前端据此弹人工验证的入口。
                 // 这里**不写**「登录失败」事件：人工态不是失败（S2 §5 T12）。
                 return Err(Error::CaptchaRequired);
             }
             Err(err) => {
+                // 迟到的失败同样是「过期结果」：登出之后才回来的 401 不是
+                // 「登录失败」，写一条失败事件只会让用户以为自己密码错了。
+                self.with_current_captcha_generations(
+                    site_id,
+                    session_generation,
+                    captcha_generation,
+                    || Ok(()),
+                )?;
                 self.log(observability::event_with_payload(
                     Level::Warn,
                     "site",
@@ -2067,22 +2183,31 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         };
         // 登录真的成功了：清掉可能挂着的相位（否则会出现「会话已建立、还在等人工验证」
         // 的僵尸态）。这条转移不在 T1–T8 里——那八条覆盖的是「登录被拒」的分支。
-        self.set_captcha_phase(site_id, CaptchaPhase::Idle);
-        self.store.set_site_health(site_id, HEALTH_OK)?;
-        // 先序列化（session 即将被 move 进 cache）：M13-S1 持久化到钥匙串。
-        // best-effort：序列化/写钥匙串失败不掩盖登录成功——内存会话已可用，只是下次重启没得恢复。
-        let stored = session.to_stored();
-        self.sessions.put(site_id, session)?;
-        if let Ok(s) = stored {
-            if let Err(err) = self.vault.put(&self.session_ref(site_id), &s) {
-                self.log(observability::event_with_payload(
-                    Level::Warn,
-                    "vault",
-                    format!("持久化会话失败: {err}"),
-                    serde_json::json!({ "site_id": site_id }),
-                ));
-            }
-        }
+        self.with_current_captcha_generations(
+            site_id,
+            session_generation,
+            captcha_generation,
+            || {
+                self.advance_captcha_challenge_generation(site_id)?;
+                self.set_captcha_phase(site_id, CaptchaPhase::Idle);
+                self.store.set_site_health(site_id, HEALTH_OK)?;
+                // 先序列化（session 即将被 move 进 cache）：M13-S1 持久化到钥匙串。
+                // best-effort：序列化/写钥匙串失败不掩盖登录成功——内存会话已可用，只是下次重启没得恢复。
+                let stored = session.to_stored();
+                self.sessions.put(site_id, session)?;
+                if let Ok(s) = stored {
+                    if let Err(err) = self.vault.put(&self.session_ref(site_id), &s) {
+                        self.log(observability::event_with_payload(
+                            Level::Warn,
+                            "vault",
+                            format!("持久化会话失败: {err}"),
+                            serde_json::json!({ "site_id": site_id }),
+                        ));
+                    }
+                }
+                Ok(())
+            },
+        )?;
         self.log(observability::event_with_payload(
             Level::Info,
             "site",
@@ -2103,6 +2228,28 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         site_id: i64,
         creds: crate::site::webview_creds::WebviewCredentials,
     ) -> Result<()> {
+        let (session_generation, captcha_generation) =
+            self.captcha_operation_generations(site_id)?;
+        self.store_webview_creds_for_generations(
+            site_id,
+            creds,
+            session_generation,
+            captcha_generation,
+        )
+    }
+
+    /// 仅接受同时属于当前会话与当前验证码挑战的 B 路凭据。
+    ///
+    /// 窗口层的导航回调跨了 `await`（回传 URL 到达 → 异步补 `cf_clearance`），
+    /// 期间登出或新挑战都可能已经把相位清掉。带着旧代次回来的凭据不能落进
+    /// 新挑战的槽里——否则用户在新窗口里什么也没做，旧窗口的凭据却替他把会话接上了。
+    pub fn store_webview_creds_for_generations(
+        &self,
+        site_id: i64,
+        creds: crate::site::webview_creds::WebviewCredentials,
+        session_generation: u64,
+        captcha_generation: u64,
+    ) -> Result<()> {
         // 先判能力位：不支持的站点类型恒报 `Unsupported`（与 M26-S1 的「不适用」面板同口径），
         // 不能因为「相位恰好不是人工态」就把它说成「不在等待人工验证」——那会误导用户。
         let site = self.site(site_id)?;
@@ -2112,28 +2259,35 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
                 "该站点类型不支持 WebView 凭据回传（B 路）".to_string(),
             ));
         }
-        if !matches!(
-            self.captcha_phase(site_id),
-            CaptchaPhase::AwaitingHuman { .. }
-        ) {
-            return Err(Error::AuthFailed(
-                "该站点当前不在等待人工验证：收到的凭据已忽略".to_string(),
-            ));
-        }
-        // 防御：调用方可能没校验，这里再验一次形态（错误文案不含值）。
-        crate::site::webview_creds::validate_access_token(&creds.access_token)?;
-        let mut map = self
-            .webview_creds
-            .lock()
-            .map_err(|_| Error::Store("凭据槽锁不可用".to_string()))?;
-        map.insert(
+        self.with_current_captcha_generations(
             site_id,
-            StoredWebviewCredentials {
-                creds,
-                captured_at: std::time::Instant::now(),
+            session_generation,
+            captcha_generation,
+            || {
+                if !matches!(
+                    self.captcha_phase(site_id),
+                    CaptchaPhase::AwaitingHuman { .. }
+                ) {
+                    return Err(Error::AuthFailed(
+                        "该站点当前不在等待人工验证：收到的凭据已忽略".to_string(),
+                    ));
+                }
+                // 防御：调用方可能没校验，这里再验一次形态（错误文案不含值）。
+                crate::site::webview_creds::validate_access_token(&creds.access_token)?;
+                let mut map = self
+                    .webview_creds
+                    .lock()
+                    .map_err(|_| Error::Store("凭据槽锁不可用".to_string()))?;
+                map.insert(
+                    site_id,
+                    StoredWebviewCredentials {
+                        creds,
+                        captured_at: std::time::Instant::now(),
+                    },
+                );
+                Ok(())
             },
-        );
-        Ok(())
+        )
     }
 
     /// 测试用：凭据槽里的条数（清槽路径的判据 —— 不能只断言相位）。
@@ -2161,69 +2315,100 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 钥匙串 → 相位 `Idle` → 清槽 → Info 事件（**只带 site_id**）。
     /// 失败时槽**保留**（允许用户重试），只有 TTL 过期才清。
     pub fn complete_webview_login(&self, site_id: i64, cf_clearance: Option<String>) -> Result<()> {
-        if !matches!(
-            self.captcha_phase(site_id),
-            CaptchaPhase::AwaitingHuman { .. }
-        ) {
-            return Err(Error::AuthFailed(
-                "该站点当前不在等待人工验证：无法完成 WebView 登录".to_string(),
-            ));
-        }
-        let stored = {
-            let mut map = self
-                .webview_creds
-                .lock()
-                .map_err(|_| Error::Store("凭据槽锁不可用".to_string()))?;
-            match map.get(&site_id) {
-                None => {
+        let (session_generation, captcha_generation) =
+            self.captcha_operation_generations(site_id)?;
+        self.complete_webview_login_for_generations(
+            site_id,
+            cf_clearance,
+            session_generation,
+            captcha_generation,
+        )
+    }
+
+    /// 完成指定会话及验证码挑战代次的 WebView 登录。
+    ///
+    /// 读槽、构造会话、写缓存这一整段都在写锁内：否则「校验通过」与「写会话」之间
+    /// 仍能被登出插进来，等于没校验。
+    pub fn complete_webview_login_for_generations(
+        &self,
+        site_id: i64,
+        cf_clearance: Option<String>,
+        session_generation: u64,
+        captcha_generation: u64,
+    ) -> Result<()> {
+        self.with_current_captcha_generations(
+            site_id,
+            session_generation,
+            captcha_generation,
+            || {
+                if !matches!(
+                    self.captcha_phase(site_id),
+                    CaptchaPhase::AwaitingHuman { .. }
+                ) {
                     return Err(Error::AuthFailed(
-                        "还没有收到 WebView 回传的凭据：请先在打开的页面里登录".to_string(),
-                    ))
-                }
-                Some(stored) if stored.captured_at.elapsed() > WEBVIEW_CREDS_TTL => {
-                    map.remove(&site_id);
-                    return Err(Error::AuthFailed(
-                        "WebView 回传的凭据已过期（超过 10 分钟），请重新打开页面登录".to_string(),
+                        "该站点当前不在等待人工验证：无法完成 WebView 登录".to_string(),
                     ));
                 }
-                Some(stored) => stored.creds.clone(),
-            }
-        };
+                let stored = {
+                    let mut map = self
+                        .webview_creds
+                        .lock()
+                        .map_err(|_| Error::Store("凭据槽锁不可用".to_string()))?;
+                    match map.get(&site_id) {
+                        None => {
+                            return Err(Error::AuthFailed(
+                                "还没有收到 WebView 回传的凭据：请先在打开的页面里登录".to_string(),
+                            ))
+                        }
+                        Some(stored) if stored.captured_at.elapsed() > WEBVIEW_CREDS_TTL => {
+                            map.remove(&site_id);
+                            return Err(Error::AuthFailed(
+                                "WebView 回传的凭据已过期（超过 10 分钟），请重新打开页面登录"
+                                    .to_string(),
+                            ));
+                        }
+                        Some(stored) => stored.creds.clone(),
+                    }
+                };
 
-        let mut creds = stored;
-        // cf_clearance 由壳层从 `window.cookies()` 补（HttpOnly，JS 读不到）。
-        // 非法 ⇒ 忽略（不阻断登录；没有 cf 时 Bearer 会话通常仍可用，只是过不了 CF 挑战）。
-        if let Some(cf) = cf_clearance {
-            if crate::site::webview_creds::validate_cf_clearance(&cf).is_ok() {
-                creds.cf_clearance = Some(cf);
-            }
-        }
-        let session = crate::site::webview_creds::session_from_webview_credentials(&creds)?;
+                let mut creds = stored;
+                // cf_clearance 由壳层从 `window.cookies()` 补（HttpOnly，JS 读不到）。
+                // 非法 ⇒ 忽略（不阻断登录；没有 cf 时 Bearer 会话通常仍可用，只是过不了 CF 挑战）。
+                if let Some(cf) = cf_clearance {
+                    if crate::site::webview_creds::validate_cf_clearance(&cf).is_ok() {
+                        creds.cf_clearance = Some(cf);
+                    }
+                }
+                let session = crate::site::webview_creds::session_from_webview_credentials(&creds)?;
 
-        // 镜像 `login` 的 B-61 顺序：先 health，再缓存，再钥匙串（best-effort）。
-        self.store.set_site_health(site_id, HEALTH_OK)?;
-        let stored_json = session.to_stored();
-        self.sessions.put(site_id, session)?;
-        if let Ok(s) = stored_json {
-            if let Err(err) = self.vault.put(&self.session_ref(site_id), &s) {
+                // 这个挑战到此终结：推进挑战代次，让旧窗口的迟到回调全部作废。
+                self.advance_captcha_challenge_generation(site_id)?;
+                // 镜像 `login` 的 B-61 顺序：先 health，再缓存，再钥匙串（best-effort）。
+                self.store.set_site_health(site_id, HEALTH_OK)?;
+                let stored_json = session.to_stored();
+                self.sessions.put(site_id, session)?;
+                if let Ok(s) = stored_json {
+                    if let Err(err) = self.vault.put(&self.session_ref(site_id), &s) {
+                        self.log(observability::event_with_payload(
+                            Level::Warn,
+                            "vault",
+                            format!("持久化会话失败: {err}"),
+                            serde_json::json!({ "site_id": site_id }),
+                        ));
+                    }
+                }
+                self.set_captcha_phase(site_id, CaptchaPhase::Idle);
+                self.clear_webview_creds(site_id);
+                // 只带 site_id：凭据值、UA、cf_clearance 一律不进事件表。
                 self.log(observability::event_with_payload(
-                    Level::Warn,
-                    "vault",
-                    format!("持久化会话失败: {err}"),
+                    Level::Info,
+                    "site",
+                    "WebView 登录凭据已接入：会话已建立",
                     serde_json::json!({ "site_id": site_id }),
                 ));
-            }
-        }
-        self.set_captcha_phase(site_id, CaptchaPhase::Idle);
-        self.clear_webview_creds(site_id);
-        // 只带 site_id：凭据值、UA、cf_clearance 一律不进事件表。
-        self.log(observability::event_with_payload(
-            Level::Info,
-            "site",
-            "WebView 登录凭据已接入：会话已建立",
-            serde_json::json!({ "site_id": site_id }),
-        ));
-        Ok(())
+                Ok(())
+            },
+        )
     }
 
     /// 清掉某站点的 B 路凭据槽（与相位同生命周期）。
@@ -2290,6 +2475,35 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
         site_id: i64,
         cookies: Vec<(String, String)>,
     ) -> Result<()> {
+        let (session_generation, captcha_generation) =
+            self.captcha_operation_generations(site_id)?;
+        self.complete_newapi_webview_login_for_generations(
+            site_id,
+            cookies,
+            session_generation,
+            captcha_generation,
+        )
+        .await
+    }
+
+    /// 完成指定会话及验证码挑战代次的 NewAPI WebView 登录。
+    ///
+    /// 这个函数跨了两次 `await`（`refresh_session` 与旧版兜底的 `balance`），所以
+    /// 代次校验分散在三个提交点上：请求回来、兜底之前、写状态之前。任何一处发现
+    /// 代次变了就立刻放弃——**不再发下一个请求**，也不再动状态。
+    pub async fn complete_newapi_webview_login_for_generations(
+        &self,
+        site_id: i64,
+        cookies: Vec<(String, String)>,
+        session_generation: u64,
+        captcha_generation: u64,
+    ) -> Result<()> {
+        self.with_current_captcha_generations(
+            site_id,
+            session_generation,
+            captcha_generation,
+            || Ok(()),
+        )?;
         if !matches!(
             self.captcha_phase(site_id),
             CaptchaPhase::AwaitingHuman { .. }
@@ -2309,33 +2523,80 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
 
         let cookie_session = captcha::session_from_captcha_cookies(&cookies);
         let adapter = self.registry.adapter(kind);
-        let refreshed = adapter
+        let refreshed = match adapter
             .refresh_session(&site.base_url, &cookie_session)
-            .await?;
+            .await
+        {
+            Ok(refreshed) => refreshed,
+            Err(err) => {
+                // 登出之后才回来的 401 不是「凭据被拒」，是过期结果：按取消上抛，
+                // 调用方据此静默收尾，而不是弹一条「登录失败」。
+                self.with_current_captcha_generations(
+                    site_id,
+                    session_generation,
+                    captcha_generation,
+                    || Ok(()),
+                )?;
+                return Err(err);
+            }
+        };
         let (session, message) = match refreshed {
             Some(new_session) => (new_session, "NewAPI 登录凭据已接入：会话已建立"),
             None => {
                 // 旧版：cookie-only 兜底。探测失败 ⇒ 原错误上抛，**不**改任何状态。
-                adapter.balance(&site.base_url, &cookie_session).await?;
+                self.with_current_captcha_generations(
+                    site_id,
+                    session_generation,
+                    captcha_generation,
+                    || Ok(()),
+                )?;
+                if let Err(err) = adapter.balance(&site.base_url, &cookie_session).await {
+                    self.with_current_captcha_generations(
+                        site_id,
+                        session_generation,
+                        captcha_generation,
+                        || Ok(()),
+                    )?;
+                    return Err(err);
+                }
                 (cookie_session, "NewAPI 登录凭据已接入：Cookie 会话已建立")
             }
         };
 
         // —— 只有走到这里才动状态 ——
-        self.store.set_site_health(site_id, HEALTH_OK)?;
-        let stored = session.to_stored();
-        self.sessions.put(site_id, session)?;
-        if let Ok(s) = stored {
-            if let Err(err) = self.vault.put(&self.session_ref(site_id), &s) {
-                self.log(observability::event_with_payload(
-                    Level::Warn,
-                    "vault",
-                    format!("持久化会话失败: {err}"),
-                    serde_json::json!({ "site_id": site_id }),
-                ));
-            }
-        }
-        self.set_captcha_phase(site_id, CaptchaPhase::Idle);
+        self.with_current_captcha_generations(
+            site_id,
+            session_generation,
+            captcha_generation,
+            || {
+                // 相位必须仍是人工态：代次没变但相位被别处改掉的情况（取消、新登录）
+                // 同样不能把会话接上。
+                if !matches!(
+                    self.captcha_phase(site_id),
+                    CaptchaPhase::AwaitingHuman { .. }
+                ) {
+                    return Err(Error::Cancelled(
+                        "登出后，之前发起的登录结果已失效".to_string(),
+                    ));
+                }
+                self.advance_captcha_challenge_generation(site_id)?;
+                self.store.set_site_health(site_id, HEALTH_OK)?;
+                let stored = session.to_stored();
+                self.sessions.put(site_id, session)?;
+                if let Ok(s) = stored {
+                    if let Err(err) = self.vault.put(&self.session_ref(site_id), &s) {
+                        self.log(observability::event_with_payload(
+                            Level::Warn,
+                            "vault",
+                            format!("持久化会话失败: {err}"),
+                            serde_json::json!({ "site_id": site_id }),
+                        ));
+                    }
+                }
+                self.set_captcha_phase(site_id, CaptchaPhase::Idle);
+                Ok(())
+            },
+        )?;
         // 只带 site_id：token / refresh cookie 一律不进事件表。
         self.log(observability::event_with_payload(
             Level::Info,
@@ -2454,60 +2715,143 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// cookie **不落库、不进事件、不进诊断导出**（S2 §5 红线）：本函数里它只经过
     /// `validate` / `session_from_captcha_cookies` 两条**纯内存**路径。
     pub fn complete_captcha(&self, site_id: i64, cookies: Vec<(String, String)>) -> Result<()> {
-        let phase = self.captcha_phase(site_id);
-        if !matches!(phase, CaptchaPhase::AwaitingHuman { .. }) {
-            // T7：不在人工态时收到 cookie ⇒ 忽略（**不得**把「没经过挑战的 cookie」当会话）。
-            return Err(Error::AuthFailed(
-                "该站点当前不在等待人工验证：收到的 cookie 已忽略".to_string(),
-            ));
-        }
-        let validated = captcha::validate_captcha_cookies(&cookies);
-        // T4 / T5：ok 才回 `Idle`；失败留在人工态（先落相位，再决定要不要上抛）。
-        let next = captcha::step(
-            phase,
-            CaptchaEvent::CookiesSubmitted {
-                ok: validated.is_ok(),
-            },
-        );
-        self.set_captcha_phase(site_id, next);
-        validated?;
-        let session = captcha::session_from_captcha_cookies(&cookies);
-        // P1-8：cookie-only 会话在 Sub2API（要 `Authorization` 头）上不可用，不报 ok。
-        // 标成 `needs_login`：下一次请求会 401，但 health 已如实标记，不谎报「会话已接上」。
-        // 覆盖原会话成 cookie-only：触发 captcha 时原会话通常已失效（401 触发 captcha），
-        // 覆盖影响有限；若原 Bearer 仍有效，captcha 不会触发。
-        self.store.set_site_health(site_id, HEALTH_NEEDS_LOGIN)?;
-        let stored = session.to_stored();
-        self.sessions.put(site_id, session)?;
-        if let Ok(s) = stored {
-            if let Err(err) = self.vault.put(&self.session_ref(site_id), &s) {
+        let (session_generation, captcha_generation) =
+            self.captcha_operation_generations(site_id)?;
+        self.complete_captcha_for_generations(
+            site_id,
+            cookies,
+            session_generation,
+            captcha_generation,
+        )
+    }
+
+    /// 完成指定会话及验证码挑战代次的 cookie 验证。
+    pub fn complete_captcha_for_generations(
+        &self,
+        site_id: i64,
+        cookies: Vec<(String, String)>,
+        session_generation: u64,
+        captcha_generation: u64,
+    ) -> Result<()> {
+        self.with_current_captcha_generations(
+            site_id,
+            session_generation,
+            captcha_generation,
+            || {
+                let phase = self.captcha_phase(site_id);
+                if !matches!(phase, CaptchaPhase::AwaitingHuman { .. }) {
+                    // T7：不在人工态时收到 cookie ⇒ 忽略（**不得**把「没经过挑战的 cookie」当会话）。
+                    return Err(Error::AuthFailed(
+                        "该站点当前不在等待人工验证：收到的 cookie 已忽略".to_string(),
+                    ));
+                }
+                let validated = captcha::validate_captcha_cookies(&cookies);
+                // 挑战真的被用掉了（校验通过）⇒ 推进代次，旧窗口后续的迟到提交作废。
+                // 校验失败时相位留在人工态（用户可重试同一个挑战），代次不动。
+                if validated.is_ok() {
+                    self.advance_captcha_challenge_generation(site_id)?;
+                }
+                // T4 / T5：ok 才回 `Idle`；失败留在人工态（先落相位，再决定要不要上抛）。
+                let next = captcha::step(
+                    phase,
+                    CaptchaEvent::CookiesSubmitted {
+                        ok: validated.is_ok(),
+                    },
+                );
+                self.set_captcha_phase(site_id, next);
+                validated?;
+                let session = captcha::session_from_captcha_cookies(&cookies);
+                // P1-8：cookie-only 会话在 Sub2API（要 `Authorization` 头）上不可用，不报 ok。
+                // 标成 `needs_login`：下一次请求会 401，但 health 已如实标记，不谎报「会话已接上」。
+                // 覆盖原会话成 cookie-only：触发 captcha 时原会话通常已失效（401 触发 captcha），
+                // 覆盖影响有限；若原 Bearer 仍有效，captcha 不会触发。
+                self.store.set_site_health(site_id, HEALTH_NEEDS_LOGIN)?;
+                let stored = session.to_stored();
+                self.sessions.put(site_id, session)?;
+                if let Ok(s) = stored {
+                    if let Err(err) = self.vault.put(&self.session_ref(site_id), &s) {
+                        self.log(observability::event_with_payload(
+                            Level::Warn,
+                            "vault",
+                            format!("持久化会话失败: {err}"),
+                            serde_json::json!({ "site_id": site_id }),
+                        ));
+                    }
+                }
+                // **成功**才留痕：人工验证真的完成——但 cookie-only 会话不可用，文案如实。
+                // 进入人工态 / 取消 / 校验失败都**不写**事件（S2 §5 T12）。
                 self.log(observability::event_with_payload(
-                    Level::Warn,
-                    "vault",
-                    format!("持久化会话失败: {err}"),
+                    Level::Info,
+                    "site",
+                    "人机验证已通过：cookie 已更新，需重新登录获取访问令牌",
                     serde_json::json!({ "site_id": site_id }),
                 ));
-            }
-        }
-        // **成功**才留痕：人工验证真的完成——但 cookie-only 会话不可用，文案如实。
-        // 进入人工态 / 取消 / 校验失败都**不写**事件（S2 §5 T12）。
-        self.log(observability::event_with_payload(
-            Level::Info,
-            "site",
-            "人机验证已通过：cookie 已更新，需重新登录获取访问令牌",
-            serde_json::json!({ "site_id": site_id }),
-        ));
-        Ok(())
+                Ok(())
+            },
+        )
     }
 
     /// 用户关窗 / 取消（M8-S2 T6 / §9 第 4 条）：相位回 `Idle`。
     ///
     /// **不留半截会话**：不写缓存、不写钥匙串、不写事件；不在人工态时是 no-op（T8 幂等）。
     pub fn cancel_captcha(&self, site_id: i64) {
-        let next = captcha::step(self.captcha_phase(site_id), CaptchaEvent::Cancelled);
+        let Ok(_write_guard) = self.session_write_lock.lock() else {
+            return;
+        };
+        let _ = self.cancel_captcha_locked(site_id);
+    }
+
+    /// 仅取消仍属于指定会话和验证码挑战的操作。
+    ///
+    /// 返回 `Ok(false)` 表示「代次已经变了，这次取消什么也没做」——旧窗口的迟到关闭
+    /// 不能把用户刚发起的新挑战一起取消掉。窗口层据此决定要不要真的销毁窗口。
+    pub fn cancel_captcha_for_generations(
+        &self,
+        site_id: i64,
+        expected_session: u64,
+        expected_captcha: u64,
+    ) -> Result<bool> {
+        let _write_guard = self
+            .session_write_lock
+            .lock()
+            .map_err(|_| Error::Store("会话更新锁已中毒".into()))?;
+        let current_session = self
+            .session_generations
+            .lock()
+            .map_err(|_| Error::Store("会话代次锁已中毒".into()))?
+            .get(&site_id)
+            .copied()
+            .unwrap_or_default();
+        let current_captcha = self
+            .captcha_challenge_generations
+            .lock()
+            .map_err(|_| Error::Store("验证码挑战代次锁已中毒".into()))?
+            .get(&site_id)
+            .copied()
+            .unwrap_or_default();
+        if (current_session, current_captcha) != (expected_session, expected_captcha) {
+            return Ok(false);
+        }
+        self.cancel_captcha_locked(site_id)?;
+        Ok(true)
+    }
+
+    /// 取消的实体（调用方必须已持有 `session_write_lock`）。
+    ///
+    /// 不在人工态时是**真正的 no-op**：不推进代次。否则一次多余的关窗事件
+    /// 就会把别的在途登录判成过期，用户会看到莫名其妙的「操作已取消」。
+    fn cancel_captcha_locked(&self, site_id: i64) -> Result<()> {
+        let phase = self.captcha_phase(site_id);
+        if !matches!(phase, CaptchaPhase::AwaitingHuman { .. }) {
+            return Ok(());
+        }
+        self.advance_session_generation(site_id)?;
+        self.advance_captcha_challenge_generation(site_id)?;
+        let next = captcha::step(phase, CaptchaEvent::Cancelled);
         self.set_captcha_phase(site_id, next);
         // B 路：取消 ⇒ 丢弃已回传的凭据（与相位同生命周期，M28-S1 §2.1.5）。
         self.clear_webview_creds(site_id);
+        Ok(())
     }
 
     pub async fn list_keys(&self, site_id: i64) -> Result<Vec<KeyMeta>> {
@@ -2648,6 +2992,13 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 写入点是**共用**的：定时刷新与用户手动操作（看余额、读明文、删密钥）撞上失效会话
     /// 都会走到这里。这是有意的——会话死了就是死了，不该只在刷新轮才可见。
     fn on_auth_error(&self, site_id: i64, err: Error) -> Error {
+        // 守卫（当前不可达）：`is_auth_failure` 只认 `AuthFailed`，而 `Cancelled` 是
+        // 代次校验的结果、根本不会走到这里。但两者在语义上都是「这个会话不能用了」，
+        // 将来若有人把 `Cancelled` 并进 `is_auth_failure`，一次正常的取消就会把
+        // 站点错标成「需要重新登录」并删掉保险库条目——所以在这里先挡住。
+        if matches!(err, Error::Cancelled(_)) {
+            return err;
+        }
         if is_auth_failure(&err) {
             self.sessions.invalidate(site_id);
             self.mark_needs_login(site_id);
@@ -2691,6 +3042,14 @@ impl<T: HttpTransport + Clone + 'static> TianshuRelayService<T> {
     /// 若不联动清理，旧站点的会话会被套用到新站点上，造成跨站串号。
     /// 相位同理：一个「等待人工验证」的僵尸相位会让新站点直接拿到旧站点的挑战。
     pub fn remove_site(&self, site_id: i64) -> Result<()> {
+        // 删站同样是「使在途操作失效」：一个还在飞的登录请求回来时，站点已经没了，
+        // 而 rowid 会复用——不推进代次的话，它写回的会话会落到新站点身上。
+        let _write_guard = self
+            .session_write_lock
+            .lock()
+            .map_err(|_| Error::Store("会话更新锁已中毒".into()))?;
+        self.advance_session_generation(site_id)?;
+        self.advance_captcha_challenge_generation(site_id)?;
         self.sessions.invalidate(site_id);
         self.set_captcha_phase(site_id, CaptchaPhase::Idle);
         self.clear_webview_creds(site_id);
@@ -8828,7 +9187,7 @@ mod tests {
         assert!(!should_overwrite_model_mirror(false, None));
     }
     use super::*;
-    use crate::site::transport::{HttpResponse, MockTransport};
+    use crate::site::transport::{HttpRequest, HttpResponse, MockTransport};
     use serde_json::json;
 
     // ============================================ M9-S2（错误词表）
@@ -12145,5 +12504,647 @@ mod tests {
         let rows = service.sites().expect("列站点");
         assert!(!rows[0].session_persisted, "退出后 persisted 必须 false");
         assert_eq!(rows[0].health, "unknown", "health 必须回到 unknown");
+    }
+
+    // ============================================ M45-S8：登出使在途登录与验证码失效
+    //
+    // 这一组用例的共同形状：**让请求卡在「已发出、响应还没回来」的位置**，此时登出，
+    // 再放行。断言点永远是「迟到的结果没有写回任何状态」，而不是「返回了某个错误码」——
+    // 前者才是用户能感知的缺陷（刚退出的站点自己又变回已登录）。
+    //
+    // 卡点用 `BlockingTransport` 的 `Notify` 做，不用 sleep：慢机器上不会假绿。
+
+    /// 可以让测试把某一次请求卡住的传输层。
+    ///
+    /// 命中 `blocked_path` 的**第一次**请求会先通知 `started`，然后等 `release`。
+    /// 之后放行到内层 `MockTransport`，响应照常返回。
+    #[derive(Clone)]
+    struct BlockingTransport {
+        inner: MockTransport,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        block_next: Arc<std::sync::atomic::AtomicBool>,
+        blocked_path: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpTransport for BlockingTransport {
+        async fn request(&self, req: HttpRequest) -> Result<HttpResponse> {
+            if req.url.ends_with(self.blocked_path)
+                && self
+                    .block_next
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.request(req).await
+        }
+    }
+
+    /// 一个已进入人工态的 NewAPI 站点，且 `blocked_path` 上的下一次请求会被卡住。
+    async fn blocking_newapi_awaiting_human(
+        blocked_path: &'static str,
+    ) -> (
+        TianshuRelayService<BlockingTransport>,
+        i64,
+        Arc<crate::vault::MemoryVault>,
+        BlockingTransport,
+    ) {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let home = dir.keep();
+        let vault = Arc::new(crate::vault::MemoryVault::new());
+        let inner = MockTransport::new(vec![
+            HttpResponse::json(
+                200,
+                json!({"success": true, "data": {"system_name": "示例 NewAPI", "version": "1.0.0-rc.45"}}),
+            )
+            .expect("构造响应"),
+            HttpResponse::json(200, json!({"success": true, "data": {"enabled": false}}))
+                .expect("构造响应"),
+            HttpResponse::json(200, json!({"success": false, "message": "请输入验证码"}))
+                .expect("构造响应"),
+        ]);
+        let transport = BlockingTransport {
+            inner,
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            block_next: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            blocked_path,
+        };
+        let service = TianshuRelayService::new(
+            Store::open_in_memory().expect("内存库"),
+            transport.clone(),
+            ServiceConfig {
+                vault: Arc::clone(&vault) as Arc<dyn crate::vault::Vault>,
+                home: home.clone(),
+                backup_dir: home.join("backups"),
+                data_dir: None,
+            },
+        );
+        let site = service
+            .add_site("https://newapi.example.com")
+            .await
+            .expect("站点");
+        assert_eq!(site.kind, "newapi");
+        assert!(matches!(
+            service
+                .login(
+                    site.id,
+                    crate::site::Credentials::new("me@example.com", "pw-12345678")
+                )
+                .await,
+            Err(Error::CaptchaRequired)
+        ));
+        (service, site.id, vault, transport)
+    }
+
+    #[tokio::test]
+    async fn logout_invalidates_an_in_flight_login_response() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let home = dir.keep();
+        let vault = Arc::new(crate::vault::MemoryVault::new());
+        let inner = MockTransport::new(vec![
+            status_response(),
+            encryption_disabled_response(),
+            login_response(),
+        ]);
+        let transport = BlockingTransport {
+            inner,
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            block_next: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            blocked_path: "/api/user/login",
+        };
+        let service = TianshuRelayService::new(
+            Store::open_in_memory().expect("内存库"),
+            transport.clone(),
+            ServiceConfig {
+                vault: Arc::clone(&vault) as Arc<dyn crate::vault::Vault>,
+                home: home.clone(),
+                backup_dir: home.join("backups"),
+                data_dir: None,
+            },
+        );
+        let site = service
+            .add_site("https://relay.example.com")
+            .await
+            .expect("站点");
+        let site_id = site.id;
+        let service = Arc::new(service);
+        let started = transport.started.notified();
+        let login_service = Arc::clone(&service);
+        let login = tokio::spawn(async move {
+            login_service
+                .login(site_id, crate::site::Credentials::new("me", "pw-12345678"))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started)
+            .await
+            .expect("登录请求必须到达假传输层");
+
+        service.logout(site_id).expect("登出应先完成");
+        transport.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), login)
+            .await
+            .expect("旧登录请求必须结束")
+            .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled(_))), "{result:?}");
+        assert!(
+            service.sessions.get(site_id).is_none(),
+            "旧登录不得恢复缓存"
+        );
+        assert!(
+            !vault.has(&service.session_ref(site_id)).expect("读钥匙串"),
+            "旧登录不得恢复 vault 条目"
+        );
+        assert_eq!(service.sites().expect("站点")[0].health, HEALTH_UNKNOWN);
+
+        // 登出之后重新登录仍然要能成功：代次机制不该把新登录也一起拒掉。
+        transport.inner.push(encryption_disabled_response());
+        transport.inner.push(login_response());
+        service
+            .login(site_id, crate::site::Credentials::new("me", "pw-12345678"))
+            .await
+            .expect("登出后新登录仍可成功");
+        assert!(service.sessions.get(site_id).is_some());
+        assert_eq!(service.sites().expect("站点")[0].health, HEALTH_OK);
+    }
+
+    #[tokio::test]
+    async fn logout_classifies_a_late_login_failure_as_cancelled_without_logging_failure() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let home = dir.keep();
+        let vault = Arc::new(crate::vault::MemoryVault::new());
+        let inner = MockTransport::new(vec![
+            status_response(),
+            encryption_disabled_response(),
+            HttpResponse::json(401, json!({"success": false, "message": "bad credentials"}))
+                .expect("构造响应"),
+        ]);
+        let transport = BlockingTransport {
+            inner,
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            block_next: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            blocked_path: "/api/user/login",
+        };
+        let service = TianshuRelayService::new(
+            Store::open_in_memory().expect("内存库"),
+            transport.clone(),
+            ServiceConfig {
+                vault: Arc::clone(&vault) as Arc<dyn crate::vault::Vault>,
+                home: home.clone(),
+                backup_dir: home.join("backups"),
+                data_dir: None,
+            },
+        );
+        let site = service
+            .add_site("https://relay.example.com")
+            .await
+            .expect("站点");
+        let service = Arc::new(service);
+        let started = transport.started.notified();
+        let login_service = Arc::clone(&service);
+        let login = tokio::spawn(async move {
+            login_service
+                .login(site.id, crate::site::Credentials::new("me", "pw-12345678"))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started)
+            .await
+            .expect("登录请求必须到达假传输层");
+
+        service.logout(site.id).expect("登出应先完成");
+        transport.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), login)
+            .await
+            .expect("旧登录请求必须结束")
+            .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled(_))), "{result:?}");
+        assert!(
+            service
+                .recent_events(100)
+                .expect("事件表")
+                .iter()
+                .all(|event| !event.message.contains("登录失败")),
+            "登出后的迟到错误不得写入登录失败事件"
+        );
+        assert!(service.sessions.get(site.id).is_none());
+        assert!(!vault.has(&service.session_ref(site.id)).expect("读钥匙串"));
+        assert_eq!(service.sites().expect("站点")[0].health, HEALTH_UNKNOWN);
+    }
+
+    #[tokio::test]
+    async fn logout_invalidates_an_in_flight_newapi_webview_login() {
+        let (service, site_id, vault, transport) =
+            blocking_newapi_awaiting_human("/api/user/auth/refresh").await;
+        transport.inner.push(json_ok_with(json!({
+            "success": true,
+            "data": {"access_token": newapi_jwt(now_secs() + 900), "user": {"id": 42}}
+        })));
+        let service = Arc::new(service);
+        let started = transport.started.notified();
+        let webview_service = Arc::clone(&service);
+        let webview_login = tokio::spawn(async move {
+            webview_service
+                .complete_newapi_webview_login(site_id, webview_cookies())
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started)
+            .await
+            .expect("WebView refresh 必须到达假传输层");
+
+        service.logout(site_id).expect("登出应先完成");
+        transport.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), webview_login)
+            .await
+            .expect("旧 WebView 登录必须结束")
+            .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled(_))), "{result:?}");
+        assert!(service.sessions.get(site_id).is_none(), "不得恢复缓存");
+        assert!(
+            !vault.has(&service.session_ref(site_id)).expect("读钥匙串"),
+            "不得恢复 vault 条目"
+        );
+        assert_eq!(service.sites().expect("站点")[0].health, HEALTH_UNKNOWN);
+        assert_eq!(service.captcha_phase(site_id), CaptchaPhase::Idle);
+    }
+
+    #[tokio::test]
+    async fn logout_classifies_a_late_newapi_webview_failure_as_cancelled() {
+        let (service, site_id, vault, transport) =
+            blocking_newapi_awaiting_human("/api/user/auth/refresh").await;
+        transport.inner.push(
+            HttpResponse::json(401, json!({"success": false, "message": "expired"}))
+                .expect("构造响应"),
+        );
+        let service = Arc::new(service);
+        let started = transport.started.notified();
+        let webview_service = Arc::clone(&service);
+        let webview_login = tokio::spawn(async move {
+            webview_service
+                .complete_newapi_webview_login(site_id, webview_cookies())
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started)
+            .await
+            .expect("WebView refresh 必须到达假传输层");
+
+        service.logout(site_id).expect("登出应先完成");
+        transport.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), webview_login)
+            .await
+            .expect("旧 WebView 登录必须结束")
+            .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled(_))), "{result:?}");
+        assert!(service.sessions.get(site_id).is_none());
+        assert!(!vault.has(&service.session_ref(site_id)).expect("读钥匙串"));
+        assert_eq!(service.sites().expect("站点")[0].health, HEALTH_UNKNOWN);
+    }
+
+    #[tokio::test]
+    async fn logout_after_newapi_refresh_404_skips_balance_fallback() {
+        let (service, site_id, vault, transport) =
+            blocking_newapi_awaiting_human("/api/user/auth/refresh").await;
+        transport
+            .inner
+            .push(HttpResponse::json(404, json!({"message": "not found"})).expect("构造响应"));
+
+        let service = Arc::new(service);
+        let started = transport.started.notified();
+        let webview_service = Arc::clone(&service);
+        let webview_login = tokio::spawn(async move {
+            webview_service
+                .complete_newapi_webview_login(site_id, webview_cookies())
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started)
+            .await
+            .expect("WebView refresh 必须到达假传输层");
+
+        service.logout(site_id).expect("登出应先完成");
+        transport.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), webview_login)
+            .await
+            .expect("旧 WebView 登录必须结束")
+            .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled(_))), "{result:?}");
+        assert!(
+            transport
+                .inner
+                .requests()
+                .iter()
+                .all(|request| !request.url.ends_with("/api/user/self")),
+            "logout 后不得发起旧版 balance fallback"
+        );
+        assert!(service.sessions.get(site_id).is_none());
+        assert!(!vault.has(&service.session_ref(site_id)).expect("读钥匙串"));
+        assert_eq!(service.sites().expect("站点")[0].health, HEALTH_UNKNOWN);
+    }
+
+    #[tokio::test]
+    async fn logout_classifies_a_late_newapi_balance_fallback_failure_as_cancelled() {
+        let (service, site_id, vault, transport) =
+            blocking_newapi_awaiting_human("/api/user/self").await;
+        transport
+            .inner
+            .push(HttpResponse::json(404, json!({"message": "not found"})).expect("构造响应"));
+        transport
+            .inner
+            .push(HttpResponse::new(500, b"upstream down".to_vec()));
+        let service = Arc::new(service);
+        let started = transport.started.notified();
+        let webview_service = Arc::clone(&service);
+        let webview_login = tokio::spawn(async move {
+            webview_service
+                .complete_newapi_webview_login(site_id, webview_cookies())
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started)
+            .await
+            .expect("WebView balance fallback 必须到达假传输层");
+
+        service.logout(site_id).expect("登出应先完成");
+        transport.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), webview_login)
+            .await
+            .expect("旧 WebView 登录必须结束")
+            .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled(_))), "{result:?}");
+        assert!(service.sessions.get(site_id).is_none());
+        assert!(!vault.has(&service.session_ref(site_id)).expect("读钥匙串"));
+        assert_eq!(service.sites().expect("站点")[0].health, HEALTH_UNKNOWN);
+    }
+
+    /// 旧挑战的代次不能提交进新挑战：登出后再登录拿到新挑战，旧窗口的回调必须被拒。
+    #[tokio::test]
+    async fn old_webview_generations_cannot_commit_into_a_new_captcha_phase() {
+        let (service, site_id, vault, handle) =
+            blocking_newapi_awaiting_human("/api/user/auth/refresh").await;
+        let (old_session_generation, old_challenge_generation) = service
+            .captcha_operation_generations(site_id)
+            .expect("代次");
+        service.logout(site_id).expect("旧挑战登出");
+
+        handle.inner.push(encryption_disabled_response());
+        handle.inner.push(
+            HttpResponse::json(200, json!({"success": false, "message": "请输入验证码"}))
+                .expect("构造响应"),
+        );
+        assert!(matches!(
+            service
+                .login(
+                    site_id,
+                    crate::site::Credentials::new("me@example.com", "pw-12345678")
+                )
+                .await,
+            Err(Error::CaptchaRequired)
+        ));
+
+        assert!(
+            !service
+                .cancel_captcha_for_generations(
+                    site_id,
+                    old_session_generation,
+                    old_challenge_generation,
+                )
+                .expect("取消"),
+            "旧窗口的迟到关闭不得取消新挑战"
+        );
+        assert!(matches!(
+            service.captcha_phase(site_id),
+            CaptchaPhase::AwaitingHuman { .. }
+        ));
+        let err = service
+            .complete_newapi_webview_login_for_generations(
+                site_id,
+                webview_cookies(),
+                old_session_generation,
+                old_challenge_generation,
+            )
+            .await
+            .expect_err("旧挑战代次不得进入新挑战");
+        assert!(matches!(err, Error::Cancelled(_)), "{err:?}");
+        assert!(service.sessions.get(site_id).is_none());
+        assert!(!vault.has(&service.session_ref(site_id)).expect("读钥匙串"));
+        assert_eq!(
+            service.captcha_phase(site_id),
+            CaptchaPhase::AwaitingHuman {
+                site_id,
+                challenge: CaptchaChallenge {
+                    site_id,
+                    url: "https://newapi.example.com/login".to_string(),
+                },
+            }
+        );
+    }
+
+    /// `Idle` 状态下的取消必须是**真正的 no-op**：否则一次多余的关窗事件
+    /// 就会把别的在途登录判成过期。
+    #[tokio::test]
+    async fn cancelling_an_idle_captcha_does_not_advance_session_generations() {
+        let (service, site_id, _vault, _handle) = sub2api_awaiting_human().await;
+        service.cancel_captcha(site_id);
+        let generations = service
+            .captcha_operation_generations(site_id)
+            .expect("代次");
+        assert_eq!(service.captcha_phase(site_id), CaptchaPhase::Idle);
+
+        service.cancel_captcha(site_id);
+
+        assert_eq!(
+            service
+                .captcha_operation_generations(site_id)
+                .expect("代次"),
+            generations,
+            "Idle 状态的取消必须是真正 no-op，不得使其它在途登录失效"
+        );
+    }
+
+    /// 旧窗口的导航回调不能把凭据写进新挑战的槽里。
+    #[tokio::test]
+    async fn old_bearer_callback_cannot_store_credentials_in_a_replaced_challenge() {
+        let (service, site_id, vault, transport) = sub2api_awaiting_human().await;
+        let (old_session_generation, old_challenge_generation) = service
+            .captcha_operation_generations(site_id)
+            .expect("代次");
+        // helper 为其它用例预留了 list_keys 响应；本用例再次登录前先消耗它。
+        transport
+            .request(HttpRequest::new(
+                crate::site::transport::Method::Get,
+                "https://sub.example.com/mock-fixture-drain",
+            ))
+            .await
+            .expect("消耗 fixture 中未使用的 list_keys 响应");
+        transport.push(
+            HttpResponse::json(400, json!({"code": 400, "message": "captcha required"}))
+                .expect("构造响应"),
+        );
+        assert!(matches!(
+            service
+                .login(
+                    site_id,
+                    crate::site::Credentials::new("me@example.com", "pw-12345678")
+                )
+                .await,
+            Err(Error::CaptchaRequired)
+        ));
+
+        let current_generations = service
+            .captcha_operation_generations(site_id)
+            .expect("代次");
+        assert_eq!(current_generations.0, old_session_generation);
+        assert_ne!(current_generations.1, old_challenge_generation);
+        let err = service
+            .store_webview_creds_for_generations(
+                site_id,
+                webview_creds_fixture(),
+                old_session_generation,
+                old_challenge_generation,
+            )
+            .expect_err("旧窗口的导航回调不能写入新挑战凭据槽");
+        assert!(matches!(err, Error::Cancelled(_)), "{err:?}");
+        assert_eq!(service.webview_creds_len_for_test(), 0);
+        assert!(service.sessions.get(site_id).is_none());
+        assert!(!vault.has(&service.session_ref(site_id)).expect("读钥匙串"));
+        assert!(matches!(
+            service.captcha_phase(site_id),
+            CaptchaPhase::AwaitingHuman { .. }
+        ));
+    }
+
+    /// 登出必须清掉 B 路凭据槽与相位，并让迟到的提交被相位检查挡住。
+    #[tokio::test]
+    async fn logout_clears_webview_credentials_and_rejects_late_captcha_completion() {
+        let (service, site_id, vault, _handle) = sub2api_awaiting_human().await;
+        service
+            .store_webview_creds(site_id, webview_creds_fixture())
+            .expect("存入 B 路凭据");
+        service.logout(site_id).expect("登出");
+
+        assert_eq!(service.captcha_phase(site_id), CaptchaPhase::Idle);
+        assert_eq!(service.webview_creds_len_for_test(), 0);
+        assert!(
+            matches!(
+                service.complete_webview_login(site_id, None),
+                Err(Error::AuthFailed(_))
+            ),
+            "迟到 B 路提交必须被相位检查拒绝"
+        );
+        assert!(
+            matches!(
+                service.complete_captcha(site_id, vec![("session".into(), "late".into())]),
+                Err(Error::AuthFailed(_))
+            ),
+            "壳层 await 后迟到的 cookie 提交必须被相位检查拒绝"
+        );
+        assert!(service.sessions.get(site_id).is_none());
+        assert!(!vault.has(&service.session_ref(site_id)).expect("读钥匙串"));
+        assert_eq!(service.sites().expect("站点")[0].health, HEALTH_UNKNOWN);
+    }
+
+    /// S5 的回归：登出发生在续期请求「已发出、未回来」的窗口里时，迟到的
+    /// 续期结果不能把会话、钥匙串、health 任何一样写回去。
+    #[tokio::test]
+    async fn logout_wins_against_an_in_flight_refresh_response() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let home = dir.keep();
+        let vault = Arc::new(crate::vault::MemoryVault::new());
+        let inner = MockTransport::new(vec![
+            HttpResponse::json(
+                200,
+                json!({"success": true, "data": {"system_name": "示例 NewAPI", "version": "1.0.0-rc.45"}}),
+            )
+            .expect("构造响应"),
+            HttpResponse::json(200, json!({"success": true, "data": {"enabled": false}}))
+                .expect("构造响应"),
+            HttpResponse::json(200, json!({"success": false, "message": "请输入验证码"}))
+                .expect("构造响应"),
+        ]);
+        let transport = BlockingTransport {
+            inner: inner.clone(),
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            block_next: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            blocked_path: "/api/user/auth/refresh",
+        };
+        let service = TianshuRelayService::new(
+            Store::open_in_memory().expect("内存库"),
+            transport.clone(),
+            ServiceConfig {
+                vault: Arc::clone(&vault) as Arc<dyn crate::vault::Vault>,
+                home: home.clone(),
+                backup_dir: home.join("backups"),
+                data_dir: None,
+            },
+        );
+        let site = service
+            .add_site("https://newapi.example.com")
+            .await
+            .expect("站点");
+        assert!(matches!(
+            service
+                .login(
+                    site.id,
+                    crate::site::Credentials::new("me@example.com", "pw-12345678")
+                )
+                .await,
+            Err(Error::CaptchaRequired)
+        ));
+        // 放一个即将过期的会话，让续期轮真的会发请求。
+        let stale_session = cookie_session(Some(newapi_jwt(now_secs() + 60)), true);
+        service
+            .sessions
+            .put(site.id, stale_session.clone())
+            .expect("放会话");
+        vault
+            .put(
+                &crate::vault::secret_ref("site", site.id, "session"),
+                &stale_session.to_stored().expect("序列化会话"),
+            )
+            .expect("写持久化会话");
+        inner.push(json_ok_with(json!({
+            "success": true,
+            "data": {"access_token": newapi_jwt(now_secs() + 900), "user": {"id": 42}}
+        })));
+
+        let service = Arc::new(service);
+        let started = transport.started.notified();
+        let refresh_service = Arc::clone(&service);
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let completed_task = Arc::clone(&completed);
+        let refresh = tokio::spawn(async move {
+            let result = refresh_service.refresh_sessions_if_needed().await;
+            completed_task.notify_one();
+            result
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started)
+            .await
+            .expect("续期请求必须到达假传输层");
+
+        service.logout(site.id).expect("登出");
+        transport.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), completed.notified())
+            .await
+            .expect("续期任务必须在释放请求后完成");
+        refresh
+            .await
+            .expect("任务句柄")
+            .expect("续期流程应正常收尾");
+
+        assert_eq!(service.session_expiry(site.id), None, "旧续期不能恢复缓存");
+        assert!(
+            vault
+                .get(&crate::vault::secret_ref("site", site.id, "session"))
+                .expect("读钥匙串")
+                .is_none(),
+            "旧续期不能恢复保险库凭据"
+        );
+        assert_eq!(
+            service.sites().expect("站点")[0].health,
+            HEALTH_UNKNOWN,
+            "登出后的状态不能被旧续期改回 ok"
+        );
     }
 }
