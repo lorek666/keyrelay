@@ -57,6 +57,13 @@ pub struct AppState {
     ///
     /// 与 `gateway_op` 同款（必须是异步锁：要跨 `await` 持有）。
     pub captcha_op: tokio::sync::Mutex<()>,
+    /// 创建验证码窗口时的会话/挑战代次快照；任一变化都会使旧窗口失效。
+    ///
+    /// `captcha_op` 只能串行化「同时发生」的调用，挡不住「先起飞、后变化」的回调：
+    /// 窗口是在命令返回**之后**才被用户操作的，导航回传、后台 watcher、关窗事件都
+    /// 可能在登出之后才到达。这里记下窗口出生时的代次，让每个迟到回调都能自证
+    /// 「我还是当前那个窗口」，而不是靠相位猜。
+    pub captcha_window_generations: std::sync::Mutex<std::collections::HashMap<i64, (u64, u64)>>,
     /// 把两次重启串起来（投递改进 P1-5）。
     ///
     /// 重启是「停旧 → 拉新」的序列：两个并发重启交错时，第二个的退出请求可能杀掉
@@ -463,6 +470,7 @@ fn state_with_config(
         gateway: std::sync::Mutex::new(None),
         gateway_op: tokio::sync::Mutex::new(()),
         captcha_op: tokio::sync::Mutex::new(()),
+        captcha_window_generations: std::sync::Mutex::new(std::collections::HashMap::new()),
         restart_op: tokio::sync::Mutex::new(()),
         // 真实结果由 `setup` 里的 `tray::build` 覆盖；测试里永远保持 false
         tray_available: std::sync::atomic::AtomicBool::new(false),

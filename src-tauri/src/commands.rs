@@ -797,11 +797,25 @@ pub struct CreateKeyArgs {
 ///
 /// 复用既有 `TianshuRelayService::logout`（幂等：站点不存在也不报错）。
 /// 删除失败返回错误（`Error::Vault`），调用方据此显示可读原因。
+///
+/// **登出同时收窗**：服务层的代次已经让这个验证码窗口的所有迟到回调失效，但窗口
+/// 还开着会让用户以为「还能在那儿继续登录」。`destroy()` 不发 `CloseRequested`，
+/// 所以这次关闭不会被误记成一次「取消」。
 #[tauri::command]
-pub fn logout_site(state: State<'_, AppState>, site_id: i64) -> Result<(), String> {
-    state.service.logout(site_id).map_err(|e| e.to_string())?;
+pub fn logout_site<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    site_id: i64,
+) -> Result<(), String> {
+    let result = state.service.logout(site_id).map_err(|e| e.to_string());
+    if let Ok(mut generations) = state.captcha_window_generations.lock() {
+        generations.remove(&site_id);
+    }
+    if let Some(window) = app.get_webview_window(&captcha_window_label(site_id)) {
+        let _ = window.destroy();
+    }
     clear_gateway_runtime_affinity(&state);
-    Ok(())
+    result
 }
 
 /// key/site/令牌生命周期变化后，旧会话 pin 与 key 冷却都不再可靠；只清运行态内存。
@@ -4916,6 +4930,8 @@ async fn watch_cookies_for_auto_complete<R: tauri::Runtime>(
     label: String,
     base_url: String,
     site_id: i64,
+    session_generation: u64,
+    challenge_generation: u64,
 ) {
     const INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
     const MAX_RUNTIME: std::time::Duration = std::time::Duration::from_secs(10 * 60);
@@ -4945,6 +4961,15 @@ async fn watch_cookies_for_auto_complete<R: tauri::Runtime>(
         let Some(state) = app.try_state::<AppState>() else {
             break; // 应用正在退出
         };
+        // 登出 / 新挑战已经把这个 watcher 判成过期：它不得再读 cookie、不得再写状态。
+        // 光看相位不够——新挑战的相位同样是 `AwaitingHuman`，旧 watcher 会以为自己还有效。
+        if !captcha_generations_are_current(
+            &state,
+            site_id,
+            (session_generation, challenge_generation),
+        ) {
+            break;
+        }
         if !captcha_submit_is_allowed(&state.service.captcha_phase(site_id)) {
             break; // 已被取消 / 已接上 / 相位变了：watcher 不再写任何状态
         }
@@ -4958,6 +4983,14 @@ async fn watch_cookies_for_auto_complete<R: tauri::Runtime>(
         let Some(host) = site_host_of(&base_url) else {
             break;
         };
+        // 读 cookie 之前再查一次：上面几步都可能跨了 await（窗口查询、URL 读取）。
+        if !captcha_generations_are_current(
+            &state,
+            site_id,
+            (session_generation, challenge_generation),
+        ) {
+            break;
+        }
         let Ok(cookies) = window.cookies() else {
             continue; // 读失败：不关窗，下一轮再试
         };
@@ -4976,15 +5009,41 @@ async fn watch_cookies_for_auto_complete<R: tauri::Runtime>(
         }
         last_attempt = Some(fingerprint);
         attempts += 1;
-        match complete_captcha_window(&app, &state, site_id).await {
+        match complete_captcha_window(
+            &app,
+            &state,
+            site_id,
+            session_generation,
+            challenge_generation,
+        )
+        .await
+        {
             Ok(()) => {
-                emit_captcha_auto(&app, site_id, "completed", None);
+                if captcha_auto_event_is_current(
+                    &state,
+                    site_id,
+                    (session_generation, challenge_generation),
+                    true,
+                ) {
+                    emit_captcha_auto(&app, site_id, "completed", None);
+                }
                 return;
             }
             Err(message) => {
                 // 失败不关窗、相位留人工态（`complete_captcha_window` 保证）；
                 // 错误串来自完整流程（含 scrub），不含 cookie / token。
                 // 第一次失败静默（见 `attempts` 的注释）：只在第二次及以后上报。
+                //
+                // 上报前还要确认「这个失败属于当前挑战」：旧窗口的失败事件落到新挑战上，
+                // 用户会在刚打开的新窗口旁边看到一条莫名其妙的「自动接入失败」。
+                if !captcha_auto_event_is_current(
+                    &state,
+                    site_id,
+                    (session_generation, challenge_generation),
+                    false,
+                ) {
+                    break;
+                }
                 if attempts > 1 {
                     emit_captcha_auto(&app, site_id, "failed", Some(message));
                 }
@@ -5027,8 +5086,16 @@ pub async fn captcha_begin<R: tauri::Runtime>(
     state: State<'_, AppState>,
     site_id: i64,
 ) -> Result<CaptchaChallengeDto, String> {
-    // P3-15：与 captcha_complete / captcha_cancel 串行（三个命令共用 `captcha_op`）
-    let _op = state.captcha_op.lock().await;
+    // 窗口出生时的代次快照：之后所有异步回调（导航回传、自动完成、关窗取消）
+    // 都带着它回来校验，任一变化即说明「这个窗口已经不是当前的了」。
+    let generations = state
+        .service
+        .captcha_operation_generations(site_id)
+        .map_err(|e| e.to_string())?;
+    let (session_generation, challenge_generation) = generations;
+    // P3-15：与 captcha_complete / captcha_cancel 串行（三个命令共用 `captcha_op`）。
+    // 排队期间代次可能已经变了，所以拿到锁之后还要再校验一次。
+    let _op = lock_current_captcha_operation(&state, site_id, generations).await?;
 
     // ① 相位必须是「等待人工验证」——不在人工态时明确拒绝，而不是打开一个空白窗口
     let challenge = state
@@ -5056,12 +5123,43 @@ pub async fn captcha_begin<R: tauri::Runtime>(
     );
 
     let label = captcha_window_label(site_id);
+    let mut has_current_window = false;
     if let Some(existing) = app.get_webview_window(&label) {
-        // 窗口已存在（可能被隐藏过）：show + 聚焦。P1-7：旧实现只 set_focus，
-        // macOS 对不可见窗口 set_focus 是空操作 ⇒ 关闭后再也打不开。
-        let _ = existing.show();
-        let _ = existing.set_focus();
-    } else {
+        // 同一个 label 上的窗口可能是**上一个挑战**留下的。代次不匹配就销毁重建：
+        // 否则用户看到的是旧挑战的页面，而它的回调带着旧代次，永远提交不进来。
+        let is_current = state
+            .captcha_window_generations
+            .lock()
+            .ok()
+            .and_then(|generations| generations.get(&site_id).copied())
+            == Some((session_generation, challenge_generation));
+        if is_current {
+            // 窗口已存在（可能被隐藏过）：show + 聚焦。P1-7：旧实现只 set_focus，
+            // macOS 对不可见窗口 set_focus 是空操作 ⇒ 关闭后再也打不开。
+            let _ = existing.show();
+            let _ = existing.set_focus();
+            if state
+                .service
+                .captcha_operation_generations(site_id)
+                .map_err(|e| e.to_string())?
+                != generations
+            {
+                return Err("登出、取消或新挑战后，旧验证码操作已失效".to_string());
+            }
+            has_current_window = true;
+        } else {
+            let _ = existing.destroy();
+        }
+    }
+    if !has_current_window {
+        if state
+            .service
+            .captcha_operation_generations(site_id)
+            .map_err(|e| e.to_string())?
+            != generations
+        {
+            return Err("登出、取消或新挑战后，旧验证码操作已失效".to_string());
+        }
         let url = challenge
             .url
             .parse::<tauri::Url>()
@@ -5132,7 +5230,16 @@ pub async fn captcha_begin<R: tauri::Runtime>(
                             // 成功/失败都拦下这次导航（`tianshu-relay-creds://` 不是可加载的页面）。
                             // store 失败只意味着「窗口里这次登录不被接受」：不 panic、不写日志值。
                             if let Some(state) = app_for_nav.try_state::<AppState>() {
-                                if state.service.store_webview_creds(site_id, creds).is_ok() {
+                                if state
+                                    .service
+                                    .store_webview_creds_for_generations(
+                                        site_id,
+                                        creds,
+                                        session_generation,
+                                        challenge_generation,
+                                    )
+                                    .is_ok()
+                                {
                                     // M36-S1：**不在导航回调里同步执行**（会阻塞 WebView）。
                                     // 异步补 cf_clearance → 接上会话 → 成功即 strip + destroy，
                                     // 再把结果广播给主界面；失败不关窗，用户可手动接入/取消。
@@ -5143,15 +5250,26 @@ pub async fn captcha_begin<R: tauri::Runtime>(
                                                 &app_for_auto,
                                                 &state,
                                                 site_id,
+                                                session_generation,
+                                                challenge_generation,
                                             )
                                             .await
                                             {
-                                                Ok(()) => emit_captcha_auto(
-                                                    &app_for_auto,
-                                                    site_id,
-                                                    "completed",
-                                                    None,
-                                                ),
+                                                Ok(()) => {
+                                                    if captcha_auto_event_is_current(
+                                                        &state,
+                                                        site_id,
+                                                        (session_generation, challenge_generation),
+                                                        true,
+                                                    ) {
+                                                        emit_captcha_auto(
+                                                            &app_for_auto,
+                                                            site_id,
+                                                            "completed",
+                                                            None,
+                                                        );
+                                                    }
+                                                }
                                                 Err(message) => {
                                                     // P2-1：`login_script.js` 的 `sent`
                                                     // 只在单个 document 内生效——登录后整页跳转
@@ -5160,8 +5278,11 @@ pub async fn captcha_begin<R: tauri::Runtime>(
                                                     // `complete_captcha_window` 必然失败。这种
                                                     // 「已经完成/已取消」的失败**不是失败**，
                                                     // 静默返回，不再 emit failed。
-                                                    if captcha_submit_is_allowed(
-                                                        &state.service.captcha_phase(site_id),
+                                                    if captcha_auto_event_is_current(
+                                                        &state,
+                                                        site_id,
+                                                        (session_generation, challenge_generation),
+                                                        false,
                                                     ) {
                                                         emit_captcha_auto(
                                                             &app_for_auto,
@@ -5187,6 +5308,22 @@ pub async fn captcha_begin<R: tauri::Runtime>(
         let window = builder
             .build()
             .map_err(|e| format!("打开人机验证窗口失败: {e}"))?;
+        // 建窗可能耗时（WebView 初始化）：这期间用户可能已经登出或取消了。
+        // 代次变了就把刚建好的窗口立刻收掉，别留一个永远提交不进来的空窗。
+        if state
+            .service
+            .captcha_operation_generations(site_id)
+            .map_err(|e| e.to_string())?
+            != generations
+        {
+            let _ = window.destroy();
+            return Err("登出、取消或新挑战后，旧验证码操作已失效".to_string());
+        }
+        state
+            .captcha_window_generations
+            .lock()
+            .map_err(|_| "验证码窗口代次锁不可用".to_string())?
+            .insert(site_id, generations);
 
         // M36-S1：cookie 型站点启动后台 watcher（每 500ms 看一次会话凭据 cookie）。
         // 只在新窗口时启动：同站点重复 `captcha_begin` 走「聚焦已有窗口」分支，
@@ -5206,6 +5343,8 @@ pub async fn captcha_begin<R: tauri::Runtime>(
                     label_for_watch,
                     base_url_for_watch,
                     site_id,
+                    session_generation,
+                    challenge_generation,
                 )
                 .await;
             });
@@ -5218,7 +5357,18 @@ pub async fn captcha_begin<R: tauri::Runtime>(
         window.on_window_event(move |event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                 if let Some(state) = app_for_close.try_state::<AppState>() {
-                    state.service.cancel_captcha(site_id);
+                    // 旧窗口的迟到关闭不能取消掉用户刚发起的新挑战：代次不匹配时
+                    // 服务层返回 `false`，窗口代次表也不会被清。
+                    let _ = state.service.cancel_captcha_for_generations(
+                        site_id,
+                        session_generation,
+                        challenge_generation,
+                    );
+                    clear_captcha_window_generation_if_current(
+                        &state,
+                        site_id,
+                        (session_generation, challenge_generation),
+                    );
                 }
             }
         });
@@ -5252,11 +5402,18 @@ async fn complete_captcha_window<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
     site_id: i64,
+    session_generation: u64,
+    challenge_generation: u64,
 ) -> Result<(), String> {
     // P3-15：整段（读相位 → 抓 cookie → 提交）都在锁内。修前这里没有锁，
     // 用户可以在「接上会话中」点取消（`captcha_cancel` 是另一个命令），
     // 于是取消与提交交错：要么取消被覆盖，要么会话在取消之后被接上。
-    let _op = state.captcha_op.lock().await;
+    //
+    // 排队等锁期间代次可能已经变了（登出、新挑战）：拿到锁后再校验一次，
+    // 过期就直接放弃，连相位都不读。
+    let _op =
+        lock_current_captcha_operation(state, site_id, (session_generation, challenge_generation))
+            .await?;
 
     // ① 相位必须是「等待人工验证」（T7：不在人工态的提交一律拒绝，不建会话）
     if !captcha_submit_is_allowed(&state.service.captcha_phase(site_id)) {
@@ -5326,7 +5483,12 @@ async fn complete_captcha_window<R: tauri::Runtime>(
             }
             state
                 .service
-                .complete_webview_login(site_id, cf_clearance)
+                .complete_webview_login_for_generations(
+                    site_id,
+                    cf_clearance,
+                    session_generation,
+                    challenge_generation,
+                )
                 .map_err(|e| e.to_string())?;
 
             // ⑥' 成功后清掉页面里的两个续期键（尽力而为：失败不阻断——incognito + destroy
@@ -5377,13 +5539,23 @@ async fn complete_captcha_window<R: tauri::Runtime>(
     if cookie_login_uses_newapi_exchange(kind) {
         state
             .service
-            .complete_newapi_webview_login(site_id, pairs)
+            .complete_newapi_webview_login_for_generations(
+                site_id,
+                pairs,
+                session_generation,
+                challenge_generation,
+            )
             .await
             .map_err(|e| e.to_string())?;
     } else {
         state
             .service
-            .complete_captcha(site_id, pairs)
+            .complete_captcha_for_generations(
+                site_id,
+                pairs,
+                session_generation,
+                challenge_generation,
+            )
             .map_err(|e| e.to_string())?;
     }
 
@@ -5400,7 +5572,18 @@ pub async fn captcha_complete<R: tauri::Runtime>(
     state: State<'_, AppState>,
     site_id: i64,
 ) -> Result<(), String> {
-    complete_captcha_window(&app, &state, site_id).await
+    let (session_generation, challenge_generation) = state
+        .service
+        .captcha_operation_generations(site_id)
+        .map_err(|e| e.to_string())?;
+    complete_captcha_window(
+        &app,
+        &state,
+        site_id,
+        session_generation,
+        challenge_generation,
+    )
+    .await
 }
 
 /// 取消人工验证（关窗）：相位回 `Idle`，窗口关闭。幂等（T6 / T8）。
@@ -5412,11 +5595,25 @@ pub async fn captcha_cancel<R: tauri::Runtime>(
 ) -> Result<(), String> {
     // P3-15：与 captcha_begin / captcha_complete 串行。取不到锁就一直等——「取消」是
     // 幂等的（service 层不在人工态时是 no-op），排队执行不会产生副作用。
-    let _op = state.captcha_op.lock().await;
+    let generations = state
+        .service
+        .captcha_operation_generations(site_id)
+        .map_err(|err| err.to_string())?;
+    let _op = lock_current_captcha_operation(&state, site_id, generations).await?;
 
-    state.service.cancel_captcha(site_id);
-    if let Some(window) = app.get_webview_window(&captcha_window_label(site_id)) {
-        let _ = window.destroy();
+    if !state
+        .service
+        .cancel_captcha_for_generations(site_id, generations.0, generations.1)
+        .map_err(|err| err.to_string())?
+    {
+        return Err("登出或新挑战后，旧验证码取消操作已失效".to_string());
+    }
+    // 只有确认「清掉的就是当前窗口的代次」才销毁窗口：否则可能把用户刚打开的
+    // 新挑战窗口一起关掉。
+    if clear_captcha_window_generation_if_current(&state, site_id, generations) {
+        if let Some(window) = app.get_webview_window(&captcha_window_label(site_id)) {
+            let _ = window.destroy();
+        }
     }
     Ok(())
 }
@@ -5431,6 +5628,101 @@ fn captcha_submit_is_allowed(phase: &tianshu_relay_core::site::captcha::CaptchaP
         phase,
         tianshu_relay_core::site::captcha::CaptchaPhase::AwaitingHuman { .. }
     )
+}
+
+// ---- M45-S8：验证码操作的代次校验（登出 / 新挑战使旧窗口失效）----
+
+/// 取 `captcha_op` 锁，**并且**确认拿到锁之后代次仍是调用方期望的那一份。
+///
+/// 只取锁是不够的：命令排队等锁期间用户可能已经登出，此时排在前面的操作
+/// 已经把相位和代次都改过了；不校验的话，这个排队者会带着旧认知继续写状态。
+async fn lock_current_captcha_operation<'a>(
+    state: &'a AppState,
+    site_id: i64,
+    expected: (u64, u64),
+) -> Result<tokio::sync::MutexGuard<'a, ()>, String> {
+    lock_captcha_operation(&state.captcha_op, expected, || {
+        state
+            .service
+            .captcha_operation_generations(site_id)
+            .map_err(|err| err.to_string())
+    })
+    .await
+}
+
+/// [`lock_current_captcha_operation`] 的可测内核：锁从参数来，代次从闭包来。
+///
+/// 抽出来是为了让「排队等到锁之后必须重新校验代次」这条能被单测钉住——
+/// 内联写法只有读代码才能验证。
+async fn lock_captcha_operation<'a>(
+    captcha_op: &'a tokio::sync::Mutex<()>,
+    expected: (u64, u64),
+    current_generations: impl FnOnce() -> Result<(u64, u64), String>,
+) -> Result<tokio::sync::MutexGuard<'a, ()>, String> {
+    let operation = captcha_op.lock().await;
+    if current_generations()? != expected {
+        return Err("登出、取消或新挑战后，旧验证码操作已失效".to_string());
+    }
+    Ok(operation)
+}
+
+fn captcha_generations_are_current(state: &AppState, site_id: i64, expected: (u64, u64)) -> bool {
+    state
+        .service
+        .captcha_operation_generations(site_id)
+        .is_ok_and(|current| current == expected)
+}
+
+/// 只有「表里记的仍是这份代次」才清掉并返回 `true`。
+///
+/// 返回 `false` 意味着该站点已经属于更新的窗口：调用方**不得**销毁窗口，
+/// 否则会把用户刚打开的新挑战一起关掉。
+fn clear_captcha_window_generation_if_current(
+    state: &AppState,
+    site_id: i64,
+    expected: (u64, u64),
+) -> bool {
+    let Ok(mut generations) = state.captcha_window_generations.lock() else {
+        return false;
+    };
+    if generations.get(&site_id) != Some(&expected) {
+        return false;
+    }
+    generations.remove(&site_id);
+    true
+}
+
+fn captcha_auto_event_is_current(
+    state: &AppState,
+    site_id: i64,
+    expected: (u64, u64),
+    completed: bool,
+) -> bool {
+    let Ok(current) = state.service.captcha_operation_generations(site_id) else {
+        return false;
+    };
+    let phase = state.service.captcha_phase(site_id);
+    captcha_auto_event_generations_match(expected, current, &phase, completed)
+}
+
+/// 自动完成事件的判据（纯函数，单独可测）：这次结果还该不该播给用户。
+///
+/// - 成功：挑战代次应当**恰好推进一格**且相位回到 `Idle`（服务层落地时推进的）。
+///   推进更多格说明之后又开了新挑战，这条「完成」已经过期。
+/// - 失败：代次必须**原封不动**且相位仍是人工态。代次变了说明旧窗口的失败
+///   属于一个已经不存在的挑战，播出去只会让用户困惑。
+fn captcha_auto_event_generations_match(
+    expected: (u64, u64),
+    current: (u64, u64),
+    phase: &tianshu_relay_core::site::captcha::CaptchaPhase,
+    completed: bool,
+) -> bool {
+    if completed {
+        current == (expected.0, expected.1.wrapping_add(1))
+            && matches!(phase, tianshu_relay_core::site::captcha::CaptchaPhase::Idle)
+    } else {
+        current == expected && captcha_submit_is_allowed(phase)
+    }
 }
 
 // ---- M15-S1：模型检测（bazaarlink probe）----
@@ -6757,6 +7049,90 @@ mod tests {
         assert!(captcha_submit_is_allowed(&awaiting));
         // 取消之后相位回 `Idle` ⇒ 提交必须被拒（修前这条竞态会让会话被接上）
         assert!(!captcha_submit_is_allowed(&CaptchaPhase::Idle));
+    }
+
+    // ---- M45-S8：排队等锁期间代次变了，就必须拒绝 ----
+
+    /// 排队等到 `captcha_op` 之后，代次已经不是当初那一份 ⇒ 必须报错退出。
+    ///
+    /// 修前只取锁不校验：用户在「打开窗口」排队期间点了登出，排在前面的操作
+    /// 已经把代次推进过，这个排队者却仍会按旧认知继续写状态。
+    #[tokio::test]
+    async fn queued_captcha_operation_is_rejected_after_generation_changes() {
+        use std::future::Future as _;
+        use std::task::Poll;
+
+        let captcha_op = tokio::sync::Mutex::new(());
+        let generations = std::sync::Arc::new(std::sync::Mutex::new((0, 0)));
+        let held_operation = captcha_op.lock().await;
+        let current_generations = std::sync::Arc::clone(&generations);
+        let operation = lock_captcha_operation(&captcha_op, (0, 0), move || {
+            Ok(*current_generations.lock().expect("代次锁"))
+        });
+        tokio::pin!(operation);
+
+        // 先确认它确实在排队（而不是已经拿到锁跑完了）
+        std::future::poll_fn(|cx| {
+            assert!(
+                operation.as_mut().poll(cx).is_pending(),
+                "旧操作应当排在 captcha_op 锁后"
+            );
+            Poll::Ready(())
+        })
+        .await;
+
+        *generations.lock().expect("代次锁") = (1, 1);
+        drop(held_operation);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), operation)
+            .await
+            .expect("排队操作必须结束")
+            .expect_err("拿锁后必须拒绝过期代次");
+        assert!(error.contains("旧验证码操作已失效"), "{error}");
+    }
+
+    /// 旧 watcher 的失败事件不得落到新挑战上；当前挑战的失败仍要上报。
+    #[test]
+    fn stale_captcha_operation_cannot_emit_failure_for_a_replacement_challenge() {
+        use tianshu_relay_core::site::captcha::CaptchaPhase;
+        use tianshu_relay_core::site::CaptchaChallenge;
+
+        let old_generations = (3, 7);
+        let replacement_generations = (3, 8);
+        let replacement_phase = CaptchaPhase::AwaitingHuman {
+            site_id: 1,
+            challenge: CaptchaChallenge {
+                site_id: 1,
+                url: "https://relay.example.com/login".to_string(),
+            },
+        };
+
+        assert!(
+            !captcha_auto_event_generations_match(
+                old_generations,
+                replacement_generations,
+                &replacement_phase,
+                false,
+            ),
+            "旧 watcher 在新挑战仍等待时不得发失败事件"
+        );
+        assert!(
+            captcha_auto_event_generations_match(
+                old_generations,
+                old_generations,
+                &replacement_phase,
+                false,
+            ),
+            "当前挑战的失败仍可上报"
+        );
+        assert!(
+            captcha_auto_event_generations_match(
+                old_generations,
+                (old_generations.0, old_generations.1 + 1),
+                &CaptchaPhase::Idle,
+                true,
+            ),
+            "当前挑战成功完成后的事件仍可上报"
+        );
     }
 }
 
